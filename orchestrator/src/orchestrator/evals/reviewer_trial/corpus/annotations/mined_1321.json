@@ -24,5 +24,43 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "AFK hardening: Persist L1 escalations across orchestrator restart",
+      "description": "Modify dismiss_all_pending() to exclude level=1 escalations so they survive orchestrator restarts. Currently startup auto-dismisses ALL pending escalations including L1 (steward\u2192human), causing ~75% of L1s to be lost on restart over multi-day runs (75/103 over 23 days in reify).",
+      "test_strategy": "",
+      "details": "**File:** escalation/src/escalation/queue.py:358-379\n\n**Change:** In `dismiss_all_pending()`, filter `level=1` out of the pending list before dismissing. The escalation schema (models.py:27) already has `level: int = 0` so the data is there; the only change is the filter.\n\n**Caller:** orchestrator/src/orchestrator/harness.py:2203-2220 `_dismiss_stale_escalations()` (called at startup line 418). Update log message to reflect \"L0 dismissed, L1 preserved\".\n\n**Tests:** Add unit test for dismiss_all_pending that creates one L0 + one L1 pending escalation, calls dismiss, asserts L1 still pending and L0 dismissed.\n\n**Why:** Over 23 days in reify, 75 of 103 L1 escalations were lost to \"auto-dismissed: orchestrator restarted\". For 8-day AFK runs where the orchestrator may restart multiple times, this loss is catastrophic \u2014 L1s represent the things the steward could not handle and need human attention. They must persist across restarts.\n\n**Out of scope:** L0 behavior unchanged. L1 persistence is purely additive \u2014 does not modify or replace existing L0 dismissal logic.",
+      "authored": false,
+      "id": "1321",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-14T17:57:21.362Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "escalation/src/escalation/queue.py",
+      "escalation/tests/test_queue.py",
+      "orchestrator/src/orchestrator/harness.py",
+      "orchestrator/tests/test_stale_escalation_cleanup.py"
+    ],
+    "base_sha": "467b7448c1697117e7680de40bf9e03b41147815",
+    "branch_sha": "a5389c5ac3ec623aa903697ba055354ff1572ec7",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "b7fb91542bc3d26c8b61537c6f18b72581707bce",
+      "merge_base_sha": "467b7448c1697117e7680de40bf9e03b41147815",
+      "diff_reproduces_from": "git diff 467b7448c1 b7fb91542b",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

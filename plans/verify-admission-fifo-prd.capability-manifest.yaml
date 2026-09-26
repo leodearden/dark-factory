@@ -1,0 +1,83 @@
+prd: plans/verify-admission-fifo-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 5628
+  title: Ordered task-verify admission gate with recorded wait (behaviour-preserving
+    default)
+  capabilities:
+  - name: gate-is-the-only-new-acquirer-path
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/verify.py::_admission_slot
+      is the sole production caller of shared.verify_admission.acquire_task_slot (git
+      grep 2026-09-18); α wraps it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'class [A-Za-z_]*AdmissionGate'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: plan-event-type-registered
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/event_store.py::EventType
+      is a StrEnum; α adds the member and run_scoped_verification (which already takes
+      event_store) emits it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_admission_plan
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: order-knob-hot-reloadable
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS
+      already lists the seven verify_admission_* keys; α adds three
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_admission_order
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: workflow-passes-event-store-to-task-verify
+    binding: capability→producer — run_scoped_verification(event_store=...) parameter
+      exists on main; the two workflow.py task-verify call sites do not pass it today;
+      α wires both
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: proved by boundary scenario 11 (end-to-end row in a real event store),
+        not by a grep
+  - name: ordering-and-cancellation-semantics
+    binding: built+bound by α — boundary scenarios 1-10,12 run against the real flock
+      in a tmp slots_dir
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; judged by α's own tests
+- label: β
+  task_id: 5629
+  title: Flip Dark Factory task-verify admission to arrival order (config)
+  capabilities:
+  - name: order-knob-exists-and-validates-arrival
+    binding: producer:task-α upstream — the knob and its Literal validation are α's
+      deliverable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^verify_admission_order:[[:space:]]*['"]?arrival
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: present
+- label: δ
+  task_id: 5630
+  title: Decide whether to cancel a plan's still-waiting legs when an earlier leg
+    goes red
+  capabilities:
+  - name: per-leg-rc-granted-at-plan-id-recorded
+    binding: producer:task-α upstream (event payload carries plan_id and per-leg granted_at,
+      held_secs, rc, timed_out); policy tag from β upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a measurement-and-decision leaf; its output is a filed task or a recorded
+        declination

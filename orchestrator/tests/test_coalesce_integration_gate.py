@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, hangs_until
 from _workflow_helpers import FakeScheduler
 from test_merge_queue_coalesce import (
     _events_of_type,
@@ -41,33 +42,44 @@ if TYPE_CHECKING:
 # ─── Test helpers ─────────────────────────────────────────────────────────────
 
 
-def _task_targeted_gate(
-    target_task_id: str,
-    gate_release: asyncio.Event,
-    gate_entered: asyncio.Event,
-):
-    """Context manager that gates LocalRunner.run_merge_verify for a specific task.
+def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier:
+    """A ``VerifyPort`` that parks *target_task_id*'s solo verify on *gate_release*.
 
-    Unlike _gated_verify (blocks the FIRST call positionally, regardless of
-    which request it is), this blocks only when LocalRunner._task_id ==
-    target_task_id.  All other tasks receive an immediate passed=True result.
+    Injected as ``SpeculativeMergeWorker(..., verifier=...)``.  A dispatched
+    single reaches it through the ``LocalRunner(run_scoped=self._verifier
+    .run_scoped, task_id=req.task_id)`` built in
+    ``merge_queue.py::SpeculativeMergeWorker._dispatch_item``, and
+    ``verify_runner.py::LocalRunner.run_merge_verify`` forwards that ``task_id``
+    into ``run_scoped``, so the script selects exactly one request rather than
+    blocking the first verify positionally.  Every other task verifies green immediately.
 
     A dispatch-order change therefore produces a deterministic TimeoutError
-    (gate_entered never fires) rather than deadlocking by blocking the wrong
-    request (train instead of solo → train never lands → mark_done never fires
-    → all_done/train_done never set → the release condition never triggers).
+    from :func:`_await_parked_verify` rather than deadlocking by blocking the
+    wrong request (train instead of solo → train never lands → mark_done never
+    fires → all_done/train_done never set → the release never triggers).
+
+    The TRAIN's own verify does not pass through here at all:
+    ``merge_queue.py::_do_train_merge`` calls ``_run_post_merge_verify``
+    without a ``verifier=``, so it takes the production verifier — bound by
+    conftest's autouse ``_mock_merge_queue_verification`` to passed=True — and
+    lands while the gate is still held.
     """
-    from unittest.mock import MagicMock, patch
+    return FakeVerifier(scripts={target_task_id: hangs_until(gate_release)})
 
-    from orchestrator.verify_runner import LocalRunner
 
-    async def _patched(self_runner, merge_sha, spec):
-        if self_runner._task_id == target_task_id:
-            gate_entered.set()
-            await gate_release.wait()
-        return MagicMock(passed=True, summary='', test_output=None)
+async def _await_parked_verify(
+    verifier: FakeVerifier, task_id: str, *, timeout: float = 120,
+) -> None:
+    """Wait until *verifier* has been asked to verify *task_id*.
 
-    return patch.object(LocalRunner, 'run_merge_verify', _patched)
+    ``FakeVerifier.run_scoped`` appends the id to ``verified`` and only then
+    awaits its script's release event, with no await in between, so the id
+    appearing means that verify is now parked on the gate.  This is the
+    injected-port equivalent of the old ``gate_entered`` handshake.
+    """
+    async with asyncio.timeout(timeout):
+        while task_id not in verifier.verified:
+            await asyncio.sleep(0.01)
 
 
 def _no_predecessor_interlock():
@@ -120,7 +132,6 @@ class TestScenario1:
       (d) the train entry is visible in worker.snapshot() while gated (verifying state)
       (e) after gate_release all 3 member files appear on main
       (f) FakeScheduler.provenance has kind='merged' + shared SHA for all 3 members (β)
-      (g) _handle_superseded parks status='merge-deferred', never 'done' (α consumer)
       (h) MCP member is merge_status-observable via event-store tier: the member
           entered via enqueue_merge_request has a merge_finalized record with
           state='superseded' + superseded_by=train_id; the train has a train_merged event.
@@ -138,7 +149,7 @@ class TestScenario1:
         tmp_path: Path,
     ):
         import contextlib
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import patch
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
@@ -147,7 +158,6 @@ class TestScenario1:
             SpeculativeMergeWorker,
             enqueue_merge_request,
         )
-        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
         # 3 disjoint-file branches (each touches a unique file → line-stackable).
         # Branch names are BARE (no 'task/' prefix): create_worktree('ig1') creates
@@ -305,42 +315,6 @@ class TestScenario1:
         )
         merged_sha = next(iter(merge_shas))
 
-        # (g) α workflow consumer: _handle_superseded parks as merge-deferred, never done.
-        # Mirror the _Fixture pattern from test_workflow_merge_superseded: build a minimal
-        # TaskWorkflow backed by a mock scheduler and drive _handle_superseded directly.
-        _asgn = MagicMock()
-        _asgn.task_id = 'probe-alpha'
-        _asgn.task = {
-            'id': 'probe-alpha', 'title': 'Probe', 'description': 'α probe',
-            'metadata': {},
-        }
-        _asgn.modules = []  # empty → _resolve_module_configs returns [] safely
-
-        _sched_probe = MagicMock()
-        _sched_probe.set_task_status = AsyncMock()
-
-        _wf_probe = TaskWorkflow(
-            assignment=_asgn,
-            config=coalesce_config,
-            git_ops=git_ops,
-            scheduler=_sched_probe,
-            briefing=MagicMock(),
-            mcp=MagicMock(),
-        )
-        _wf_probe.event_store = None  # None-safe: skip event emission
-
-        alpha_result = await _wf_probe._handle_superseded(
-            MergeOutcome('superseded', superseded_by=train_id)
-        )
-        assert alpha_result == WorkflowOutcome.MERGE_DEFERRED, (
-            f'α consumer: expected MERGE_DEFERRED, got {alpha_result!r}'
-        )
-        _sched_probe.set_task_status.assert_any_await('probe-alpha', 'merge-deferred')
-        assert not any(
-            call.args == ('probe-alpha', 'done')
-            for call in _sched_probe.set_task_status.await_args_list
-        ), 'α consumer: set_task_status must never be called with "done" on superseded outcome'
-
         # (h) ε surface: req1 (entered via enqueue_merge_request) is merge_status-observable.
         # _on_finalized fires when req1.result resolves; it writes a merge_finalized row
         # with state='superseded' and superseded_by=train_id to the event store.
@@ -453,8 +427,11 @@ class TestScenario2:
 
         factory = build_train_callback_factory(scheduler)
         queue: asyncio.Queue = asyncio.Queue()
+        gate_release = asyncio.Event()
+        verifier = _solo_gate('ig_s23', gate_release)
         worker = SpeculativeMergeWorker(
             git_ops, queue, event_store=es, train_callback_factory=factory,
+            verifier=verifier,
         )
 
         req1 = _make_req('ig_s21', 'ig_s21', wt1, coalesce_config)
@@ -464,19 +441,14 @@ class TestScenario2:
         await queue.put(req2)
         await queue.put(req3)
 
-        gate_release = asyncio.Event()
-        gate_entered = asyncio.Event()
-
-        with _no_predecessor_interlock(), _task_targeted_gate(
-            'ig_s23', gate_release, gate_entered,
-        ):
+        with _no_predecessor_interlock():
             worker_task = asyncio.create_task(worker.run())
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=120)
+            await _await_parked_verify(verifier, 'ig_s23')
 
             # (b) s23's future must be UNRESOLVED — it is not absorbed.
-            # GREEN timing: when gate_entered fires, the verifier is blocked at
-            # ig_s23's run_scoped_verification (the FIRST call to the patched fn).
+            # GREEN timing: once the injected verifier has been asked about
+            # ig_s23, that solo's verify is parked on gate_release.
             # ig_s23 was dequeued by the merger (as a solo) before the
             # GroupMergeRequest, but its result has NOT been delivered yet because
             # the verifier is suspended.  s23 is therefore neither superseded
@@ -504,12 +476,11 @@ class TestScenario2:
             )
 
             # GREEN fix: wait for the 2-member train to land WHILE the gate is
-            # still held.  The gate blocks ig_s23's advance_main (verifier is
-            # suspended at run_scoped_verification for ig_s23), preventing it from
-            # racing with the train's rebase_onto_main.  The train's
-            # run_scoped_verification is the 2ND call to the patched fn → passes
-            # immediately (gate only blocks the first call), so the train CAN land
-            # while the gate is held.  Only release the gate AFTER train_done fires.
+            # still held.  The gate blocks ig_s23's advance_main (the injected
+            # verifier is parked on that solo's run_scoped), preventing it from
+            # racing with the train's rebase_onto_main.  The train's own verify
+            # never reaches the injected port (see _solo_gate), so the train CAN
+            # land while the gate is held.  Only release it AFTER train_done fires.
             await asyncio.wait_for(train_done.wait(), timeout=60)
             gate_release.set()
 
@@ -559,7 +530,7 @@ class TestScenario3:
       (a) train_coalesced event member_task_ids == {s32, s33} (s31 excluded)
       (b) exclusions list has exactly 1 entry for s31's request_id with a
           reason that contains 'blocked'
-      (c) s31's future is UNRESOLVED at gate_entered — it was NOT absorbed
+      (c) s31's future is UNRESOLVED while its verify is parked — NOT absorbed
       (d) after gate_release the 2-member train lands; s32/s33 files on main
       (e) s31 resolves independently after worker.stop() (never 'superseded')
 
@@ -571,8 +542,8 @@ class TestScenario3:
     seeded before the worker starts.  The branch 'ig_s31' in the event data
     matches req1.branch so _default_coalesce_exclusion_reason returns
     'recent_terminal_blocked' for s31 → it is excluded from the train.
-    Timing mirrors scenario 2: the gate blocks s31's run_scoped_verification
-    (the FIRST call); the train's verify is the SECOND call and passes
+    Timing mirrors scenario 2: the injected verifier parks s31's own
+    run_scoped; the train's verify does not reach the port at all and passes
     immediately → train lands while the gate is still held.
     """
 
@@ -636,8 +607,11 @@ class TestScenario3:
 
         factory = build_train_callback_factory(scheduler)
         queue: asyncio.Queue = asyncio.Queue()
+        gate_release = asyncio.Event()
+        verifier = _solo_gate('ig_s31', gate_release)
         worker = SpeculativeMergeWorker(
             git_ops, queue, event_store=es, train_callback_factory=factory,
+            verifier=verifier,
         )
 
         req1 = _make_req('ig_s31', 'ig_s31', wt1, coalesce_config)
@@ -647,20 +621,15 @@ class TestScenario3:
         await queue.put(req2)
         await queue.put(req3)
 
-        gate_release = asyncio.Event()
-        gate_entered = asyncio.Event()
-
-        with _no_predecessor_interlock(), _task_targeted_gate(
-            'ig_s31', gate_release, gate_entered,
-        ):
+        with _no_predecessor_interlock():
             worker_task = asyncio.create_task(worker.run())
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=120)
+            await _await_parked_verify(verifier, 'ig_s31')
 
-            # (c) s31's future must be UNRESOLVED at gate_entered — excluded, not absorbed.
+            # (c) s31's future must be UNRESOLVED while parked — excluded, not absorbed.
             assert not req1.result.done(), (
-                's31 must remain solo (future unresolved at gate_entered); '
-                'expected s31 NOT absorbed into the train'
+                's31 must remain solo (future unresolved while its verify is '
+                'parked); expected s31 NOT absorbed into the train'
             )
 
             # (a) train_coalesced event member_task_ids == {s32, s33} (excludes s31).
@@ -951,12 +920,20 @@ class TestBookkeeping:
         for _ in range(10):
             await asyncio.sleep(0)
 
-        # (A) _speculation_slot must NOT be locked — no permit leaked.
-        # For depth=1 (K=1), not locked() ↔ value == 1.
-        assert not worker._speculation_slot.locked(), (
-            '_speculation_slot must be unlocked after the train lands; '
+        # (A) Every speculation slot must be back — no permit leaked.
+        # snapshot()['speculation']['slot_available'] reads the very semaphore
+        # locked() used to read (merge_speculation_controller.py::PermitLedger
+        # .slot_available wraps _speculation_slot), and comparing it against
+        # the ledger's own depth is stricter than locked(): at K > 1 a partial
+        # leak leaves the semaphore unlocked and this assertion still fires.
+        spec = worker.snapshot()['speculation']
+        assert spec['slot_available'] == spec['depth'], (
+            'every speculation slot must be available after the train lands; '
             'a coalesced train bypasses the speculative look-ahead so no '
-            'permit should be left acquired'
+            f'permit should be left acquired; got {spec!r}'
+        )
+        assert worker.speculation_accounting_violations() == [], (
+            'permit/cap conservation must hold after the train lands'
         )
 
         # (B) _merge_ahead_cap must NOT be locked — no cap was acquired/leaked.
@@ -964,6 +941,9 @@ class TestBookkeeping:
         # cap_permit field at all (the GroupMergeRequest continue fires
         # before the acquire site), so the verifier never releases it either.
         # Both sides are clean.
+        #
+        # Read privately because snapshot() exposes no merge-ahead-cap key
+        # (task 5446).
         assert not worker._merge_ahead_cap.locked(), (
             '_merge_ahead_cap must be unlocked after the train lands; '
             'trains are structurally exempt from Mechanism 1 (DecidedItem has no '

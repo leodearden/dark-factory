@@ -52,6 +52,17 @@ depends on it, duplicating shared schema via idempotent `CREATE TABLE IF NOT EXI
 Tripwire: a plan that saturates even the 180-turn architect cap means the leaf is over-scoped
 — decompose, don't retry (the task-2169 lesson).
 
+## Leaf review vocabulary
+
+Every leaf is authored and reviewed against `docs/code-quality.md` — quality is the cost
+and risk of the next agent change; fourteen named heuristics with agreed readings. Cite the
+heuristics by name in a leaf's brief where they bind, especially *files make internal sense
+in isolation* and *no file too large — no cheating by stitching files together with imports*
+for any leaf that splits or extracts a module. G7 still gates against
+`docs/legibility/design-invariants.md`, the checkable subset; the quality document is the
+definition those invariants serve, and it is the single normative copy — point at it, never
+restate it in a PRD.
+
 ## Memory namespace
 
 `project_id="dark_factory"`. Load-bearing records for this overlay:

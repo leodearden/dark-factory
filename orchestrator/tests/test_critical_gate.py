@@ -69,12 +69,16 @@ class TestRecordRunnerUnavailableDelegation:
         import asyncio
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from _merge_lane_fakes import FakeClock, FakeVerifier
+
+        from orchestrator.merge_lane import MergeLane
 
         git_ops = MagicMock()
         git_ops.project_root = None
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker = MergeLane(
+            git_ops=git_ops, queue=q, verifier=FakeVerifier(), clock=FakeClock(),
+        )
         worker._unreachable_escalate_after_n = escalate_after_n
         return worker
 

@@ -10,6 +10,8 @@ import pytest
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     CorpusManifest,
+    FixtureContext,
+    FixtureTaskRecord,
     GroundTruthIssue,
 )
 
@@ -233,3 +235,101 @@ class TestSplitProvenanceRoundTrip:
         assert loaded.split_seed is None
         assert loaded.diffs[0].split is None
         assert loaded.diffs[0].provenance is None
+
+
+def _make_context(authored: bool = False) -> FixtureContext:
+    return FixtureContext(
+        task=FixtureTaskRecord(
+            id=None if authored else '1030',
+            title='Include scorer cost in TrialReport totals',
+            description='match_issues() discards result.cost_usd.',
+            test_strategy='Assert the report total includes the scorer cost.',
+            details='' if authored else 'Fix: return (matches, unmatched, match_cost_usd).',
+            authored=authored,
+            record_source=None if authored else {'path': '.taskmaster/tasks/tasks.db'},
+        ),
+        changed_files=['orchestrator/tests/test_workflow_e2e.py'],
+        base_sha=None if authored else 'a' * 40,
+        branch_sha=None if authored else 'b' * 40,
+        base_sha_reason='synthetic diff never applied to any commit' if authored else None,
+        plan=None,
+        plan_reason='no plan.json survives',
+        verification=None if authored else {'diff_reproduces': True},
+    )
+
+
+class TestFixtureContextRoundTrip:
+    """Annotation files round-trip an optional `context` block; fixtures without one still load."""
+
+    def test_context_defaults_to_none(self) -> None:
+        assert _make_diff().context is None
+
+    def test_save_writes_context_into_annotation_and_load_restores_it(
+        self, tmp_path: Path,
+    ) -> None:
+        diff = _make_diff()
+        diff.context = _make_context()
+        CorpusManifest(diffs=[diff]).save(tmp_path / 'manifest.json')
+
+        ann_raw = json.loads((tmp_path / 'annotations' / 'test_diff.json').read_text())
+        assert ann_raw['context']['task']['title'] == diff.context.task.title
+        assert ann_raw['context']['base_sha'] == 'a' * 40
+
+        loaded = CorpusManifest.load(tmp_path / 'manifest.json').get_diff('test_diff')
+        assert loaded is not None
+        assert loaded.context == diff.context
+
+    def test_authored_context_round_trips_with_null_shas(self, tmp_path: Path) -> None:
+        diff = _make_diff()
+        diff.context = _make_context(authored=True)
+        CorpusManifest(diffs=[diff]).save(tmp_path / 'manifest.json')
+
+        loaded = CorpusManifest.load(tmp_path / 'manifest.json').get_diff('test_diff')
+        assert loaded is not None
+        assert loaded.context is not None
+        assert loaded.context.task.authored is True
+        assert loaded.context.base_sha is None
+        assert loaded.context.base_sha_reason == 'synthetic diff never applied to any commit'
+        assert loaded.context.branch_sha is None
+
+    def test_fixture_without_context_still_loads(self, tmp_path: Path) -> None:
+        CorpusManifest(diffs=[_make_diff()]).save(tmp_path / 'manifest.json')
+        ann_path = tmp_path / 'annotations' / 'test_diff.json'
+        assert 'context' not in json.loads(ann_path.read_text())
+
+        loaded = CorpusManifest.load(tmp_path / 'manifest.json').get_diff('test_diff')
+        assert loaded is not None
+        assert loaded.context is None
+
+    def test_from_dict_tolerates_missing_optional_keys(self) -> None:
+        ctx = FixtureContext.from_dict({'task': {'title': 'T'}})
+        assert ctx.task.title == 'T'
+        assert ctx.task.description == ''
+        assert ctx.task.authored is False
+        assert ctx.changed_files == []
+        assert ctx.base_sha is None
+        assert ctx.plan is None
+
+    def test_every_committed_fixture_carries_a_context(self) -> None:
+        manifest_path = (
+            Path(__file__).parent.parent
+            / 'src' / 'orchestrator' / 'evals' / 'reviewer_trial'
+            / 'corpus' / 'manifest.json'
+        )
+        if not manifest_path.exists():
+            pytest.skip('Corpus manifest not found')
+        manifest = CorpusManifest.load(manifest_path)
+
+        missing = [d.diff_id for d in manifest.diffs if d.context is None]
+        assert not missing, f'fixtures without context: {missing}'
+        for d in manifest.diffs:
+            assert d.context is not None
+            assert d.context.task.title
+            assert d.context.changed_files, d.diff_id
+            assert d.context.task.authored is (d.source != 'mined'), d.diff_id
+            if d.source == 'mined':
+                assert d.context.base_sha and d.context.branch_sha, d.diff_id
+            elif d.context.base_sha is None:
+                assert d.context.base_sha_reason, d.diff_id
+            if d.context.plan is None:
+                assert d.context.plan_reason, d.diff_id

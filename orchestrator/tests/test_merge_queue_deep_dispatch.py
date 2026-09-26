@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _merge_lane_census import queued_in_lane, queued_request_ids
 
 from orchestrator import merge_liveness, merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -232,6 +233,15 @@ def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
+    """Whether ``snapshot()`` still reports *wt* on the merge-worktree ledger.
+
+    ``owned_merge_worktrees`` is that ledger's public view: the resolved path
+    strings ``_touch_owned_merge_worktrees`` heartbeats.
+    """
+    return str(wt.resolve()) in worker.snapshot()['owned_merge_worktrees']
 
 
 # ── event capture (from test_merge_queue_depth_telemetry.py:163-181) ──────────
@@ -1294,7 +1304,14 @@ class TestDeepChainPlacementBuild:
         assert conflicts == []
         assert store.events_of(EventType.merge_attempt) == []
         assert all(not r.result.done() for r in queued_reqs)
-        assert list(worker._lane_buffers['normal']) == queued_reqs, 'queue untouched'
+        assert queued_in_lane(worker) == [r.task_id for r in queued_reqs], 'queue untouched'
+        # ORDER above, IDENTITY here.  A request object silently replaced by a
+        # fresh one carrying the same task id — what this module's coalesce /
+        # duplicate-submission machinery can produce — reads identical on task
+        # ids; request_id is minted per object, so it does not.
+        assert queued_request_ids(worker) == [r.request_id for r in queued_reqs], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
 
         await merge_liveness.release_chain_build_lane(
             git_ops, res.lane, warm=res.lane_warm,
@@ -1952,7 +1969,7 @@ class TestRunInflightVerifyChainRedirect:
             outcome=None if passed else _fail_verify_result(), raises=raises,
         )
 
-        assert ephemeral not in worker._owned_merge_worktrees
+        assert not _owns_merge_worktree(worker, ephemeral)
         assert cleaned == [ephemeral]
 
     async def test_adopting_tip_pass_hands_the_ephemeral_worktree_onward(
@@ -1972,7 +1989,7 @@ class TestRunInflightVerifyChainRedirect:
         )
 
         assert cleaned == [], 'the adopting exit hands the tree to the finalize half'
-        assert ephemeral in worker._owned_merge_worktrees, (
+        assert _owns_merge_worktree(worker, ephemeral), (
             'still REGISTERED, so the heartbeat keeps it alive and the I6 '
             'ledger stays consistent until the finalize half disposes of it'
         )
@@ -2061,9 +2078,8 @@ class TestDeepTipVerifyNeverAdopts:
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
-            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
-        )
+        queued_reqs = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
+        worker._lane_buffers['normal'].extend(queued_reqs)
         store = _CapturingEventStore()
         worker._event_store = store
         item = _make_item(
@@ -2082,7 +2098,6 @@ class TestDeepTipVerifyNeverAdopts:
             monkeypatch, outcome=None if passed else _fail_verify_result(),
             raises=raises,
         )
-        queued_reqs = list(worker._lane_buffers['normal'])
         main_before = await _rev_parse(git_repo, 'main')
 
         res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
@@ -2152,12 +2167,24 @@ class TestDeepTipVerifyNeverAdopts:
         no conflict rendered for any of them — build_chain's decision-4 purity
         surviving all the way through its first real caller.
         """
-        _git_ops, worker, _item, _chain, _res, store, queued = await self._fixture(
+        _git_ops, worker, item, _chain, _res, store, queued = await self._fixture(
             git_repo, monkeypatch, passed=False,
         )
 
         assert worker._chain_halving_state == 1, '3 built items -> max(1, 3 // 2)'
-        assert list(worker._lane_buffers['normal']) == queued, 'same items, same order'
+        # snapshot() reports the lane buffer AND the undrained outer queue, both
+        # `queued`, so the red tip this arm REQUEUED is visible at the tail — a
+        # fact the lane buffer alone could not report. The chained members are
+        # still there, still in order, ahead of it.
+        assert queued_in_lane(worker) == [*(r.task_id for r in queued), '101'], (
+            'same items, same order, with the requeued tip behind them'
+        )
+        # ORDER above, IDENTITY here: request_id is minted per ``MergeRequest``
+        # object, so this also says the tip at the tail is the very request
+        # that was requeued rather than a fresh one for task 101.
+        assert queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the same request OBJECTS, not fresh ones wearing their task ids'
         assert all(not r.result.done() for r in queued)
         assert store.events_of(EventType.merge_attempt) == []
 
@@ -2178,7 +2205,10 @@ class TestDeepTipVerifyNeverAdopts:
         )
 
         assert worker._chain_halving_state is None
-        assert list(worker._lane_buffers['normal']) == queued
+        assert queued_in_lane(worker) == [r.task_id for r in queued]
+        assert queued_request_ids(worker) == [r.request_id for r in queued], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_finalize_disposes_the_entry_without_a_phantom_head(
@@ -2282,6 +2312,24 @@ class _StubRemoteAllocator:
     async def cancel_and_release(self, _lease) -> bool:
         self._held = False
         return True
+
+    # -- the read side `snapshot()` goes through --------------------------------
+    # `_queued_in_lane` and `_owns_merge_worktree` read placement off
+    # `snapshot()`, which reads `host_names` UNCONDITIONALLY for
+    # `occupancy.hosts_total` (merge_queue.py::SpeculativeMergeWorker.snapshot)
+    # whenever an allocator is installed.  Without it, the first scene to pair
+    # this stub with one of those readers fails with an AttributeError from
+    # inside snapshot() instead of with a placement mismatch.
+    #
+    # `host_states()` is deliberately NOT provided, for the same reason its
+    # twin in test_merge_queue_deep_integration_gate.py dropped it: the `hosts`
+    # block comes from `_host_states_block`, whose first statement is
+    # `if not isinstance(self._host_allocator, HostAllocator): return []`, so
+    # it stays `[]` for any duck-typed double however much it offers.
+
+    @property
+    def host_names(self) -> list[str]:
+        return [self._lease.name]
 
 
 class _DeepScene:

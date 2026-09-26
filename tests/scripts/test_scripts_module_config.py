@@ -61,12 +61,12 @@ on sys.path.
 from __future__ import annotations
 
 import pathlib
-import shlex
 import tomllib
 from collections.abc import Callable
 from typing import Any
 
 import pytest
+import verify_command_invariants as vci
 from module_budget_family import min_budget
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
@@ -198,8 +198,14 @@ def _root_carve_outs_naming(segment: str) -> list[str]:
 # `pyright <targets>` with no subcommand at all, so the anchor is the program
 # name itself. Nothing else about the two invocations differs for these
 # purposes.
-_RUFF = 'ruff check'
-_PYRIGHT = 'pyright'
+#
+# All three keyword constants in this section (_PYTEST included) are ALIASED
+# from the shared parser rather than restated as literals (task 3745): the
+# keyword is what selects that parser's anchor, so it belongs to the shared
+# contract, while _NARROWING_FLAGS below is this file's own policy and stays
+# local. The local names keep every helper and test below reading unchanged.
+_RUFF = vci.RUFF
+_PYRIGHT = vci.PYRIGHT
 
 # pytest's invocation is `pytest <targets>` with no subcommand, so — like
 # pyright's and unlike ruff's — the anchor is the program name itself. Note the
@@ -215,7 +221,26 @@ _PYRIGHT = 'pyright'
 # pyright. The pytest gate's real failure mode is a MISSING target, which
 # assertions (2)-(5) of test_scripts_full_suite_pytest_covers_scripts_tests
 # test directly.
-_PYTEST = 'pytest'
+_PYTEST = vci.PYTEST
+
+# The pytest flags in the commands THIS FILE parses that consume the following
+# token, so `positional_targets` drops the value instead of admitting it as a
+# phantom target. Required since task 5408 put `-n auto --dist loadgroup` on
+# scripts/orchestrator.yaml's test_command: without this set, `auto` and
+# `loadgroup` arrive as scripts suites and
+# test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites — which
+# compares by SET EQUALITY, not membership — fails naming two flag values as
+# missing directories.
+#
+# The worked precedent is test_skills_module_config_decision.py::
+# _PYTEST_VALUE_FLAGS, which already contains both and is why that guard's
+# target-EXISTS check never went red on the same change. Deliberately NOT
+# widened to that guard's full table: a flag listed here that no command this
+# file parses actually uses would read as coverage of a command shape this file
+# never sees, which is the same objection the _NARROWING_FLAGS comment below
+# records against copying ruff's spellings to pyright. This file's ruff and
+# pyright keywords keep the naive `-`-prefix filter, unchanged.
+_PYTEST_VALUE_FLAGS = frozenset({'-n', '--dist'})
 
 # Flag PREFIXES that narrow what a directory-wide target actually gets checked,
 # per checker. Prefix-matched, so each entry covers both the `--flag value` and
@@ -275,8 +300,9 @@ _NARROWING_FLAGS = {
 def _segment(cmd: str, keyword: str) -> str:
     """The ``&&``-chained segment of *cmd* that actually invokes *keyword*.
 
-    Reuses the production splitter (``verify_cmd.split_top_level_and``, which
-    is quote-aware) rather than a naive ``str.split('&&')``.
+    Delegates to ``verify_command_invariants`` (task 3745), which reuses the
+    production splitter (``verify_cmd.split_top_level_and``, which is
+    quote-aware) rather than a naive ``str.split('&&')``.
 
     Chaining is an ESTABLISHED pattern here, not a hypothetical:
     ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
@@ -286,31 +312,24 @@ def _segment(cmd: str, keyword: str) -> str:
     that shape — tokenising the whole chain would otherwise read ``&&``,
     ``python3`` and the checker's own arguments as lint/type targets.
     """
-    segments = verify_cmd.split_top_level_and(cmd)
-    matching = [s for s in segments if keyword in s]
-    assert len(matching) == 1, (
-        f'expected exactly one `{keyword}` segment in {cmd!r}, got {matching!r}'
-    )
-    return matching[0]
+    return vci.required_segment(cmd, keyword)
 
 
 def _anchor_split(cmd: str, keyword: str) -> tuple[list[str], list[str]]:
     """*keyword*'s segment of *cmd*, split at the checker anchor into (pre, post).
 
     The ANCHOR is the last whitespace-separated token of *keyword* (see the
-    ``_RUFF``/``_PYRIGHT`` comment above) and belongs to neither half. Sole
-    implementation of the anchor location and the anchor-presence assertion, so
-    every caller that cares about position shares one notion of where the
-    wrapper stops and the checker starts.
+    ``_RUFF``/``_PYRIGHT`` comment above) and belongs to neither half.
+
+    Since task 3745 the SOLE implementation of the anchor location and the
+    anchor-presence assertion is ``verify_command_invariants.anchor_split``,
+    and this is the delegating wrapper — kept so ``_pre_anchor_tokens`` and
+    ``_post_anchor_tokens`` stay untouched one-liners over a ``(cmd, keyword)``
+    signature. The shared helper takes an already-extracted SEGMENT, because
+    picking the segment is a policy this file makes with ``_segment`` and the
+    skills guard makes differently.
     """
-    anchor = keyword.split()[-1]
-    tokens = shlex.split(_segment(cmd, keyword))
-    assert anchor in tokens, (
-        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
-        "checker's own arguments cannot be located"
-    )
-    at = tokens.index(anchor)
-    return tokens[:at], tokens[at + 1:]
+    return vci.anchor_split(_segment(cmd, keyword), keyword)
 
 
 def _pre_anchor_tokens(cmd: str, keyword: str) -> list[str]:
@@ -348,7 +367,7 @@ def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
     return _anchor_split(cmd, keyword)[1]
 
 
-def _targets(cmd: str, keyword: str) -> list[str]:
+def _targets(cmd: str, keyword: str, *, value_flags: frozenset[str] = frozenset()) -> list[str]:
     """The positional path arguments *keyword*'s segment of *cmd* checks.
 
     Substring checks alone cannot carry the anti-copy-paste assertions:
@@ -357,8 +376,35 @@ def _targets(cmd: str, keyword: str) -> list[str]:
     lint and the type command. Splitting out the actual targets and testing
     LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
     what makes those assertions real.
+
+    *value_flags* DEFAULTS TO EMPTY, which is byte-for-byte the naive
+    ``-``-prefix filter this file had for all three keywords before task 5408
+    (task 3745, pinned by ``test_verify_command_invariants.py``): a
+    space-separated flag VALUE is admitted as a phantom target, harmless wherever
+    the caller reads the list only for what it CONTAINS. The ruff and pyright
+    call sites keep that default and are unchanged by 5408.
+
+    THE PYTEST CALL SITE NO LONGER CAN, and the reason is the ONE assertion in
+    this file that compares two target lists by SET EQUALITY rather than
+    membership —
+    ``test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites``.
+    A phantom on one side alone fails an equality. When task 5408 put
+    ``-n auto --dist loadgroup`` on ``scripts/orchestrator.yaml``'s
+    test_command, ``auto`` and ``loadgroup`` arrived as targets on the module
+    side only and that guard went red reporting two flag values as scripts
+    suites. Supplying the set is the repair ``vci.positional_targets``' own
+    docstring names ("Widening the set is the caller's call"), and the precedent
+    is already in this directory as ``test_skills_module_config_decision.py::
+    _PYTEST_VALUE_FLAGS``.
+
+    THE TWO ALTERNATIVES WERE REJECTED. Loosening that assertion to membership
+    would discard the BIDIRECTIONAL claim it exists to hold — widening either
+    side alone is precisely what must fail. Appending the flags to the root
+    fleet chain's trailing segment so the phantoms matched on both sides would
+    parallelise the fleet fallback as a side effect of a parsing workaround,
+    against a chain whose members do not all declare pytest-xdist.
     """
-    return [t for t in _post_anchor_tokens(cmd, keyword) if not t.startswith('-')]
+    return vci.positional_targets(_segment(cmd, keyword), keyword, value_flags=value_flags)
 
 
 def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
@@ -374,9 +420,14 @@ def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
     collision, and
     ``test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments``
     for the four cases that pin it.
+
+    The post-anchor SCOPE is passed explicitly to the shared scanner rather than
+    being one of its defaults (task 3745): ``_ruff_exclude_flags`` in
+    ``test_root_lint_covers_nonmember_py.py`` passes WHOLE-segment tokens to the
+    same function, and a shared helper that chose a scope for both would have
+    silently reverted one of them.
     """
-    prefixes = _NARROWING_FLAGS[keyword]
-    return [t for t in _post_anchor_tokens(cmd, keyword) if t.startswith(prefixes)]
+    return vci.flag_args(_post_anchor_tokens(cmd, keyword), _NARROWING_FLAGS[keyword])
 
 
 def _uv_project_member(cmd: str, keyword: str) -> str | None:
@@ -408,7 +459,10 @@ def _uv_project_member(cmd: str, keyword: str) -> str | None:
 
 
 # Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
-# untouched by the task-3456 generalization above.
+# untouched by the task-3456 generalization above. Task 3745 applied the same
+# shape one level up: the generic helpers now DELEGATE to the shared
+# verify_command_invariants module, and keeping their names and signatures is
+# what leaves every call site in this file — these wrappers included — unchanged.
 def _ruff_segment(cmd: str) -> str:
     return _segment(cmd, _RUFF)
 
@@ -443,8 +497,16 @@ def _pytest_targets(cmd: str) -> list[str]:
     substring appears to prove. Splitting out the positional targets is what
     makes "the directory is collected" a claim about what pytest will actually
     do rather than about which characters occur in the string.
+
+    THE SINGLE HOME for this file's pytest target extraction, and since task 5408
+    that is load-bearing rather than tidy: it is where ``_PYTEST_VALUE_FLAGS`` is
+    applied, so every pytest target read in this file — module command and root
+    fleet chain segment alike — drops ``-n``/``--dist`` values instead of
+    admitting them as phantom suites. A caller that reached for
+    ``_targets(cmd, _PYTEST)`` directly would silently skip that policy, which is
+    exactly the drift ``verify_command_invariants``' own docstring is about.
     """
-    return _targets(cmd, _PYTEST)
+    return _targets(cmd, _PYTEST, value_flags=_PYTEST_VALUE_FLAGS)
 
 
 def _dir_key(target: str) -> str:
@@ -1275,9 +1337,32 @@ def test_type_gates_resolve_pyright_without_npx(
     scripts-module-specific guard would put a repo-wide invariant in a file
     whose ownership and lock scope are module-local — the confusion
     ``tests/scripts/test_module_verify_budgets.py``'s own PLACEMENT docstring
-    warns about. That file is the established home for the promoted form, and
-    it was GENERALISED FROM these per-module guards after both existed rather
-    than bolted on ahead of them.
+    warns about.
+
+    The promoted form (task 4369) lives in the NEW sibling
+    ``tests/scripts/test_module_type_check_invocation.py`` — NOT
+    ``test_module_verify_budgets.py``, which is about budgets and was never a
+    candidate for this. That file's
+    ``test_no_discovered_module_config_shells_a_guarded_command_through_npx``
+    and ``test_every_discovered_pyright_type_gate_resolves_through_uv_run``
+    walk all nine configs ``config._discover_module_configs`` returns, and it
+    was GENERALISED FROM these per-module guards after both existed rather
+    than bolted on ahead of them. Only two of this guard's five assertions
+    were promoted repo-wide: the exact-token ``npx`` ban, and the "pyright
+    segment begins ``uv run``" positive half. The other three — the
+    ``--project <member>`` selector requirement, the
+    ``[tool.uv.workspace].members`` check, and the post-anchor pyright
+    config-redirect ban — stay HERE, because the seven workspace members
+    declare ``uv run --directory <member> ...``, not ``--project``, so a
+    repo-wide ``--project`` requirement would be RED for seven of nine
+    configs on a tree with no defect.
+
+    This guard is RETAINED on purpose, not subsumed by that promotion, on the
+    same "guards in this family must be able to fail independently"
+    principle the budgets promotion itself followed: if
+    ``test_module_type_check_invocation.py`` is ever deleted or its
+    collection breaks, ``scripts`` and ``tests/scripts`` — the only two
+    configs with any npx history — must not become the only unguarded ones.
     """
     discovered = discover_module_configs()
 
@@ -1664,7 +1749,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
     )
     wanted = {_dir_key(OWN_TESTS_DIR), _dir_key(SIBLING_TESTS_DIR)}
     segments = [s for s in verify_cmd.split_top_level_and(root_cmd) if _PYTEST in s]
-    matching = [s for s in segments if wanted & set(_dir_keys(_targets(s, _PYTEST)))]
+    matching = [s for s in segments if wanted & set(_dir_keys(_pytest_targets(s)))]
     assert len(matching) == 1, (
         f'expected exactly one pytest segment naming {sorted(wanted)!r} in the '
         f'repo-root fleet chain, got {matching!r} out of {segments!r}. Zero '
@@ -1672,7 +1757,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
         'than one means the two trees were split across segments, which this '
         'guard cannot compare as a single unit'
     )
-    return _targets(matching[0], _PYTEST)
+    return _pytest_targets(matching[0])
 
 
 def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(

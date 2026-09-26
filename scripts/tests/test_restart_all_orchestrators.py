@@ -11,8 +11,11 @@ write directly into a tmp fleet dir (ORCH_FLEET_DIR).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
+import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -31,10 +34,12 @@ import pytest
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
     PIPE_CLOSING_LEAKER_SRC,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     fleet_dir_redirect_violation_reason,
+    load_scaled_grace,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -81,6 +86,7 @@ since this fake is already per-unit-state-based.
 import json
 import os
 import sys
+import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
 
@@ -95,6 +101,36 @@ def _save(state):
         json.dump(state, f)
 
 
+def _observe_lease(args):
+    """Snapshot the in-flight fleet-redeploy lease as of THIS call (task 4755).
+
+    This fake is the only vantage point a test has on the lease while it is
+    actually held: it runs as a descendant of restart-all-orchestrators.sh,
+    mid-sweep, whereas the test process only ever sees the before and after.
+
+    `pid_cmdline` is what turns "pid is a plausible integer" into "pid is the
+    sweep's own": the lease names a pid, and the process wearing that pid
+    right now is read straight out of /proc. Resolved HERE rather than in the
+    test because the pid is only guaranteed to still be running while the
+    sweep that recorded it is mid-flight.
+    """
+    obs = {"args": args, "observed_at": time.time(), "lease": None, "pid_cmdline": None}
+    try:
+        with open(os.environ.get("ORCH_FLEET_LEASE", "")) as f:
+            obs["lease"] = json.load(f)
+    except (OSError, ValueError):
+        return obs
+    pid = obs["lease"].get("pid") if isinstance(obs["lease"], dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return obs
+        obs["pid_cmdline"] = raw.replace(b"\\x00", b" ").decode(errors="replace").strip()
+    return obs
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -103,6 +139,7 @@ def main(argv):
 
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
+    state.setdefault("lease_observations", []).append(_observe_lease(args))
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
@@ -217,12 +254,12 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
     mktemp + `mv -f` idiom -- rather than `Path.write_text`, which truncates
     the target file before writing its new content. That truncate-then-write
     window is a torn read for any concurrent reader: this function is also
-    called from a background `threading.Timer` thread by `_heartbeat_timeline`
-    (below) WHILE the spawned script polls this same file every
+    called from the `_rewrites_on_gate_polls` watcher thread (below) WHILE
+    the spawned script polls this same file every
     ORCH_DRAIN_POLL_INTERVAL_SECS, and a poll landing inside the window would
     see a zero-length file -- drain_check.py's `_read_heartbeat` turns a
     `ValueError` from the empty/partial JSON into "absent", a verdict no
-    timeline scheduled. `os.replace` is a same-filesystem rename, atomic on
+    rewrite asked for. `os.replace` is a same-filesystem rename, atomic on
     POSIX, so a concurrent reader always observes either the old content or
     the full new content, never a partial write (reviewer_comprehensive #2).
     """
@@ -280,6 +317,63 @@ def _load_state(state_path):
     return json.loads(state_path.read_text())
 
 
+def _read_poll_trace(path, *, complete_only=False):
+    """Read the drain poll ledger, as one ``(verdict, unit)`` pair per poll.
+
+    The ledger is written by restart-all-orchestrators.sh's
+    ``drain_check_verdict`` when ``ORCH_DRAIN_POLL_TRACE_FILE`` is set: one
+    append-only TSV line per drain poll, so its LENGTH is a load-independent
+    count of what the spawned script actually did inside the gate.
+
+    Returns the EMPTY LIST when the file does not exist, so a test whose
+    ledger never appeared fails on its own assertion message rather than on a
+    bare FileNotFoundError that says nothing about what was being proven.
+
+    ``complete_only`` is for a reader racing the script (the
+    `_rewrites_on_gate_polls` watcher): it drops the text after the last
+    newline, a record still being appended, which must never count. A
+    finished ledger is read whole, so a torn final record still fails the
+    field-count check below instead of vanishing.
+    """
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return []
+    if complete_only:
+        text = text[: text.rfind("\n") + 1]
+    records = []
+    for raw_line in text.splitlines():
+        fields = raw_line.split("\t")
+        assert len(fields) == 2, (
+            f"poll-trace records are <verdict>\\t<unit>, exactly two fields; "
+            f"got {raw_line!r} in {path}"
+        )
+        records.append((fields[0], fields[1]))
+    return records
+
+
+def _assert_poll_ledger(polls, *, at_least, verdict, unit, too_few, context):
+    """Assert the poll ledger's COUNT and its VOCABULARY, as two assertions.
+
+    Never one fused assertion: a short ledger means the script was killed or
+    returned before polling that often, a wrong record means
+    drain_check_verdict wrote the wrong thing. Unrelated causes, so a fused
+    message describing only the first sends the next reader chasing a timeout
+    for a defect that has nothing to do with timing.
+    """
+    assert len(polls) >= at_least, (
+        f"drain poll ledger holds {len(polls)} record(s), expected >= "
+        f"{at_least}. {too_few} ledger={polls!r} {context}"
+    )
+    assert all(p == (verdict, unit) for p in polls), (
+        f"the ledger's COUNT is fine ({len(polls)} >= {at_least}); its "
+        f"vocabulary or field order is not. Every record must be "
+        f"({verdict!r}, {unit!r}) -- look at drain_check_verdict's trace "
+        f"write in restart-all-orchestrators.sh, NOT at any timeout. "
+        f"ledger={polls!r} {context}"
+    )
+
+
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     _df_fleet_dir_redirect, tmp_path_factory,
 ):
@@ -313,8 +407,13 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     reason = fleet_dir_redirect_violation_reason(value, tmp_path_factory.getbasetemp())
     assert reason is None, reason
 
-    # The genuinely per-root half: this proves THIS rootdir's conftest bound the
-    # fixture that set the variable checked above.
+    # The genuinely per-root half: this proves THIS rootdir's conftest bound a
+    # LIVE instance of the fixture -- which then either ESTABLISHED the value
+    # checked above or ADOPTED one another root's instance had already
+    # established (df_pytest_isolation.fleet_dir_redirect_target, task 4890).
+    # The two are indistinguishable from here, deliberately: what this pins is
+    # that the yielded path and the env var AGREE, which is exactly what
+    # stopped holding in a two-root session before adoption existed.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or "").resolve()
 
 
@@ -487,7 +586,30 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # the grace must outlast the timeout (or the script force-fires mid-test and
     # the assertion below fails), and must stay small enough that a poller which
     # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
-    spawn_timeout = 3
+    # That design is what makes the load-scaling below a ONE-line change:
+    # wait_proof_grace_secs derives from this same (now scaled) binding, so the
+    # grace-outlasts-timeout invariant holds automatically at every load -- at
+    # base 3 the grace is the 30s floor, at the 22 cap it is 88, always >= 4x.
+    #
+    # BASE 3 IS PRESERVED DELIBERATELY, not widened (task 4890): load_scaled_grace
+    # floors at its base, so an unloaded run is byte-identical and this test still
+    # takes ~3s there. The cap is WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the
+    # grace DERIVED from this binding must stay inside
+    # LEAK_SELF_TERMINATION_CEILING_SECS -- see that constant's derivation.
+    #
+    # THE MEASURED MECHANISM (task 4218): a flat 3s had to cover bash start +
+    # script parse + the fake systemctl's python3 (list-units) + drain_check.py's
+    # own python3 before the defer `echo` in restart-all-orchestrators.sh is even
+    # reached. The one observed failure's stdout ended exactly at the preceding
+    # "Restarting 1 orchestrator unit(s)" line, which is the signature of the
+    # budget expiring before that echo. The MIRROR test in
+    # tests/scripts/test_orchestrator_watchdog.py::
+    # test_boundary4_defers_busy_unit_while_others_proceed carries a comment
+    # recording that 8s was already measured as insufficient for the same defer
+    # line under load and was raised to 20 -- this site's 3s was 2.7x tighter
+    # still. Freshness is NOT the mechanism: `classify` needs now - ts_epoch > 120
+    # for stale, unreachable inside a 3s budget.
+    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
@@ -507,7 +629,21 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # here is how the task-3799 rename would silently half-land -- the defer
     # assertion would just stop matching the name the fixture actually used.
     assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
-        f"expected a stable defer-prefix line; got stdout={stdout!r}"
+        f"expected a stable defer-prefix line; got stdout={stdout!r} "
+        f"stderr={_decode(exc_info.value.stderr)!r} "
+        f"(spawn_timeout={spawn_timeout}s, load-scaled from base 3). "
+        f"TWO mechanisms produce this, and their stdout is byte-identical, so "
+        f"check both before touching a number: (1) the budget expired before "
+        f"the defer `echo` was reached -- stdout ending at the preceding "
+        f"'Restarting N orchestrator unit(s)' line is the tell, and the "
+        f"remedy is the load scaling already applied here, so log the RESOLVED "
+        f"budget above and check whether it hit the cap rather than widening "
+        f"the base; (2) restart-all-orchestrators.sh coerces ANY non-zero exit "
+        f"of drain_check.py to raw=\"absent\", after which drain_await_fresh "
+        f"polls SILENTLY for up to ORCH_DRAIN_UNKNOWN_GRACE_SECS (default 120, "
+        f"deliberately left unset by this test) and prints nothing at all. "
+        f"Do NOT pin that grace to disambiguate -- it trades a silent stall "
+        f"for an equally confusing spurious restart."
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
@@ -662,6 +798,235 @@ def test_absent_heartbeat_restarts_after_zero_grace(tmp_path):
     )
 
 
+def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
+    """ABSENT + BOUNDED: the unknown grace TERMINATES, and the restart follows.
+
+    The complement of test_unknown_grace_withholds_restart_while_absent below,
+    which proves the wait is REAL by being killed inside it and so can never
+    observe its end. Nothing else covers that end: the only other top-level
+    absent elapse test uses a grace of 0, where drain_await_fresh breaks on
+    its FIRST elapsed-check and the loop never sleeps. Here the grace is a
+    small NONZERO 3s and the run COMPLETES -- >= 2 ledger polls catch the loop
+    iterating, the proceed line shows the grace elapsed, and the restart shows
+    the gate opened anyway (I4 fail-toward-convergence).
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for UNIT_R at all.
+
+    unknown_grace = 3
+    # This run must FINISH, so the budget covers the grace, its polls, the
+    # python3 spawns and the restart verify. load_scaled_grace with its DEFAULT
+    # cap, NOT WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS: that cap exists to bound a
+    # grace DERIVED from a spawn timeout via wait_proof_grace_secs, so an
+    # escaped poller self-terminates inside LEAK_SELF_TERMINATION_CEILING_SECS.
+    # Nothing here derives a grace from this number and nothing is killed, so
+    # borrowing that cap would only under-budget a loaded host.
+    timeout = load_scaled_grace(20)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(unknown_grace),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+        timeout=timeout,
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert (
+        f"proceeding with restart of {UNIT_R}: heartbeat absent "
+        f"after {unknown_grace}s grace"
+    ) in result.stdout, (
+        f"the grace must ELAPSE and say so: that line is the only "
+        f"operator-visible evidence the bounded wait ended rather than never "
+        f"having started. got stdout={result.stdout!r}"
+    )
+    _assert_poll_ledger(
+        _read_poll_trace(trace_path),
+        at_least=2, verdict="absent", unit=UNIT_R,
+        too_few=(
+            f"the {unknown_grace}s grace must have been POLLED through rather "
+            f"than slept through in one shot: >= 2 polls is what proves "
+            f"drain_await_fresh's loop body ran."
+        ),
+        context=f"timeout={timeout}s stdout={result.stdout!r}",
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"a bounded wait must END in the restart it was holding back; got "
+        f"calls={state['calls']!r} stdout={result.stdout!r}"
+    )
+
+
+def test_an_unwritable_poll_trace_never_aborts_the_redeploy(tmp_path):
+    """A mis-typed ORCH_DRAIN_POLL_TRACE_FILE must not take down the fleet.
+
+    The ledger is an OBSERVABILITY knob; nothing about a fleet redeploy
+    depends on it succeeding. The hazard is that restart-all-orchestrators.sh
+    runs under `set -euo pipefail` while drain_check_verdict is only ever
+    invoked via command substitution assigned to a plain variable --
+    `_DRAIN_VERDICT="$(...)"` in drain_await_fresh, `verdict="$(...)"` in
+    drain_gate -- so a failed `>>` that lands as that function's LAST command
+    fails the assignment and aborts the ENTIRE run. An operator who
+    fat-fingers a path would lose the redeploy, not just the trace.
+
+    What this pins is the OBSERVABLE property -- a mis-typed path costs the
+    operator the trace and nothing else -- not one spelling of the guard, so
+    it holds however drain_check_verdict is ordered internally.
+
+    Fresh + IDLE heartbeat, so the run completes on drain_gate's shortest path
+    -- which still makes drain_await_fresh's ONE opening drain_check_verdict
+    call, so the trace write IS exercised. The knob points inside a directory
+    that does not exist: the likeliest operator typo, and no permissions games
+    needed to reproduce it.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "no-such-dir" / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"an unwritable trace path must never take down a fleet redeploy; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"the redeploy must not merely survive the failed trace write, it "
+        f"must still do its JOB; got calls={state['calls']!r} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # LOUD, not silent: the operator set the knob and gets no trace, so the
+    # reason must reach stderr (no-silent-fail-soft). Asserted on the PATH
+    # rather than on libc's wording, which is locale- and bash-version
+    # dependent.
+    assert str(trace_path) in result.stderr, (
+        f"a swallowed trace-write failure leaves the operator with no trace "
+        f"and no reason; expected {str(trace_path)!r} to appear in stderr. "
+        f"got stderr={result.stderr!r}"
+    )
+    assert not trace_path.exists(), (
+        f"nothing should have been created at {str(trace_path)!r} -- if it "
+        f"exists, this test is no longer exercising the unwritable path"
+    )
+
+
+def test_the_poll_ledger_records_idle_on_the_gate_fast_path(tmp_path):
+    """Pins the ledger's field ORDER, and a token other than "absent".
+
+    Every other ledger assertion drives the ABSENT path, where drain_check.py
+    prints the very token the gate acts on and the two fields never coincide
+    by accident but the vocabulary is never exercised beyond one word. An
+    idle unit takes drain_gate's shortest path: drain_await_fresh's one
+    opening poll reads idle, its `while` body is never entered, drain_gate
+    returns. So exactly one record, and the count pins that shape too.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    polls = _read_poll_trace(trace_path)
+    assert polls == [("idle", UNIT_R)], (
+        f"the fast path is exactly one poll, recorded <verdict>\\t<unit> in "
+        f"that order; got {polls!r} stdout={result.stdout!r}"
+    )
+
+
+def test_a_drain_check_that_cannot_run_is_traced_as_the_coerced_absent(tmp_path):
+    """The ledger records what the GATE acted on, not what drain_check.py said.
+
+    Here drain_check.py says nothing at all: ORCH_DRAIN_FRESH_WINDOW_SECS is
+    passed straight through to its --fresh-window, so a non-numeric value
+    makes argparse exit 2 with an empty stdout and drain_check_verdict's
+    `|| raw="absent"` fail-toward-convergence fallback supplies the verdict.
+    The heartbeat on disk is fresh and IDLE, so an "absent" in the ledger can
+    only have come from that coercion -- and the run must still complete and
+    restart, since an unreadable verdict is exactly the case the gate is
+    built to fail forward through.
+
+    This is the REACHABLE half of the coercion. The other arm -- exit 0 with
+    an unrecognized token -- cannot be driven from the script's public
+    surface: drain_check.py's main() prints one of four literals and returns
+    0, and this harness deliberately does not shim `python3` (a fake first on
+    bin_dir would also shadow the fake systemctl's own `#!/usr/bin/env
+    python3` shebang, see _rewrites_on_gate_polls). It stays a defensive backstop
+    against a future drain_check.py change.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bad_window = "not-a-number"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            # 0, so the grace breaks on its first elapsed-check: one poll.
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+            "ORCH_DRAIN_FRESH_WINDOW_SECS": bad_window,
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"a drain_check.py that cannot run must not abort the redeploy; got "
+        f"rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    polls = _read_poll_trace(trace_path)
+    assert polls == [("absent", UNIT_R)], (
+        f"the heartbeat is fresh and idle, so 'absent' here can only be the "
+        f"coerced verdict the gate acted on -- anything else means the "
+        f"ledger is recording drain_check.py's raw reading instead. got "
+        f"{polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert bad_window in result.stderr, (
+        f"drain_check_verdict leaves the subprocess's stderr unsuppressed so "
+        f"an unreadable verdict is not silent; expected {bad_window!r} in "
+        f"stderr. got stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"fail-toward-convergence: an unreadable verdict still restarts; got "
+        f"calls={state['calls']!r} stdout={result.stdout!r}"
+    )
+
+
 def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
     """STALE (I4 fail-toward-convergence): a unit whose heartbeat exists but
     is older than the freshness window still restarts once
@@ -693,11 +1058,22 @@ def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
 def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     """Proves the unknown-grace wait is a REAL bounded wait, not an instant
     fail-open: an absent heartbeat with a large ORCH_DRAIN_UNKNOWN_GRACE_SECS
-    is NOT restarted before the test's own short subprocess timeout fires.
-    This is the opposite fail-direction from the busy/defer path (which
-    protects an in-flight merge), but unknown status still gets a bounded
-    grace rather than restarting on the very first check."""
+    is NOT restarted before the test's own short subprocess timeout fires,
+    AND the script is caught POLLING while it withholds that restart. This is
+    the opposite fail-direction from the busy/defer path (which protects an
+    in-flight merge), but unknown status still gets a bounded grace rather
+    than restarting on the very first check.
+
+    The negative assertion alone proves nothing -- a subprocess killed before
+    it ever reached the gate satisfies it just as well -- and neither does one
+    poll, which is exactly what an instant fail-open (check once, return)
+    produces. TWO polls prove `drain_await_fresh`'s `while` body ran: sleep
+    ORCH_DRAIN_POLL_INTERVAL_SECS, then re-poll. The ledger witnesses that
+    LOAD-INDEPENDENTLY -- it counts what the script did, not how long the
+    test's own clock happened to run.
+    """
     fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
@@ -706,7 +1082,17 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     # ONE binding feeding BOTH the grace and the timeout -- see
     # test_defer_withholds_restart_while_busy above. This is the test named in
     # every sampled orphan's PYTEST_CURRENT_TEST (task 3798).
-    spawn_timeout = 3
+    #
+    # Load-scaled for the same measured reason as that sibling, and it matters
+    # MORE here (task 4890 amendment). This test's only behavioural assertion
+    # is NEGATIVE, so a flat 3s budget that expires before the script even
+    # reaches the drain gate makes it pass VACUOUSLY -- proving nothing about
+    # the bounded wait it is named for, and proving nothing SILENTLY, which is
+    # a worse outcome than the flake fixed next door. Base 3 is preserved, not
+    # widened, so an unloaded run stays byte-identical; the cap is
+    # WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the grace derived from this
+    # same binding must stay inside LEAK_SELF_TERMINATION_CEILING_SECS.
+    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
@@ -717,11 +1103,59 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
                     wait_proof_grace_secs(spawn_timeout)
                 ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
             },
             timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)
+    # NON-VACUITY, part 1 of 2: the DOORSTEP. Without it the negative
+    # assertion below is satisfied just as well by a subprocess killed before
+    # it ever entered the wait (task 4890 amendment). There is no drain line
+    # to assert on and that is by contract, not oversight:
+    # restart-all-orchestrators.sh's `drain_await_fresh` "prints nothing to
+    # stdout" while it polls, and the one line the absent path ever emits --
+    # "proceeding with restart of <unit>: heartbeat absent after Ns grace" --
+    # is printed when the grace ELAPSES, which must never happen here. So the
+    # strongest witness AVAILABLE ON STDOUT is the last line before the gate:
+    # it is echoed immediately ahead of the per-unit loop that calls
+    # `drain_gate`, so reaching it proves the subprocess cleared bash start,
+    # script parse and the fake systemctl's `list-units`.
+    assert f"Restarting 1 orchestrator unit(s): {UNIT_R}" in stdout, (
+        f"the script was killed before it reached the per-unit drain gate, so "
+        f"the no-restart assertion below would hold VACUOUSLY. Raise nothing "
+        f"by hand: spawn_timeout={spawn_timeout}s is already load-scaled from "
+        f"base 3, so check whether it hit the "
+        f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS cap before touching a number. "
+        f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
+    )
+    # NON-VACUITY, part 2 of 2: INSIDE the gate (task 4486). The doorstep
+    # witness above is silent about everything past it -- a python3 spawn, a
+    # poll interval, another spawn -- so a kill landing there still proves no
+    # bounded wait. The ledger closes that window; >= 2 rather than 1 is
+    # argued in the docstring.
+    # HEADROOM, measured here over 3 runs at loadavg 579 on 32 cores (factor
+    # 18.1, so the budget sat at the 22s cap): poll 2 landed at 1.6 / 2.4 /
+    # 3.9s. Only the spawns scale with load -- ~1.0s of that is the fixed
+    # ORCH_DRAIN_POLL_INTERVAL_SECS below. So the thin end is a burst
+    # load_scaled_grace's 1-minute loadavg has not registered yet: factor 1.0
+    # budgets 3.0s, which the 3.9s run above would have missed.
+    _assert_poll_ledger(
+        _read_poll_trace(trace_path),
+        at_least=2, verdict="absent", unit=UNIT_R,
+        too_few=(
+            f"the script was killed without polling the drain gate twice, so "
+            f"'a REAL bounded wait, not an instant fail-open' is UNPROVEN: "
+            f"one poll (or none) is exactly what a fail-open produces. Raise "
+            f"nothing by hand -- spawn_timeout={spawn_timeout}s is already "
+            f"load-scaled from base 3, so check whether it hit the "
+            f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS "
+            f"(={WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s) cap first."
+        ),
+        context=(
+            f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
+        ),
+    )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
         f"restart must NOT have been recorded yet; got calls={state['calls']!r} "
@@ -748,56 +1182,80 @@ _HB_IDLE = {"merge_idle": True}  # fresh + drained
 # can't carry a call-time value.
 _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 
-# Every timeline below polls at this cadence; named so the offsets DERIVED
-# from it (immediately below) move together with it instead of each test
+# Every test below polls at this cadence; named so the poll counts DERIVED
+# from it (_polls_outlasting) move together with it instead of each test
 # repeating a bare "1" string for ORCH_DRAIN_POLL_INTERVAL_SECS
 # (reviewer_comprehensive #1).
-_TIMELINE_POLL_INTERVAL_SECS = 1
-# The delay before a timeline's FIRST transition. It must clear both the
-# subprocess's own startup and drain_gate's first heartbeat read -- fast under
-# no load (~0.2s observed) but NOT bounded -- with margin to spare: if a
-# loaded box pushes that first read out past this point, the read observes
-# the ALREADY-flipped heartbeat instead of the pre-timeline value, and every
-# assertion that depends on the pre-flip behaviour (starting with the initial
-# "deferring" line every one of these tests asserts on) fails for a reason
-# unrelated to the drain_gate branch under test. Three poll intervals rather
-# than a bare `2.0`, so the margin scales if the poll interval ever does.
-_FIRST_TRANSITION_DELAY_SECS = 3 * _TIMELINE_POLL_INTERVAL_SECS
+_DRAIN_POLL_INTERVAL_SECS = 1
+# ONE binding feeding both the grace and the timeout -- see
+# test_defer_withholds_restart_while_busy. Here the grace is a
+# MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
+# in-loop resume regresses, the run silently consumes the spawn timeout
+# instead of force-firing early and looking like a pass.
+_IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS = 15
+# Longer than the worst spawn-to-first-poll latency measured under load (2.80s
+# at loadavg ~90 on 32 cores, task 5838) and than the 3s wall-clock offset the
+# old timer-driven rewrites fired at.
+_SLOW_START_SECS = 4
+# Small, so each counted run (see _polls_outlasting) is a handful of polls. At
+# least 2 because of the ONE wall-clock race the counted tests keep: the
+# watcher's first rewrite reacts to the gate's first busy poll and must land
+# before the busy loop's last pre-force poll, and bash's whole-second $SECONDS
+# can shrink an F-second deadline to about F-1 seconds, one poll interval at
+# F=2. Losing that race force-fires with no stale/absent detour, so the test
+# fails rather than passes. If it ever flakes, raise this constant, which only
+# adds polls via _polls_outlasting. Never put a wall-clock offset back.
+_SHORT_FORCE_FIRE_SECS = 2
+
+
+@dataclasses.dataclass(frozen=True)
+class _Rewrite:
+    """Rewrite the heartbeat to `to` once the gate has polled `after` `polls`
+    times since the previous rewrite."""
+
+    after: str  # a drain verdict: "busy" | "idle" | "stale" | "absent"
+    to: dict | None  # `_write_heartbeat` kwargs; None unlinks, driving "absent"
+    polls: int = 1
+
+
+# How often the rewrite watcher re-reads the ledger. Responsiveness only: a
+# rewrite that lands late just adds polls of the state it replaces.
+_REWRITE_WATCH_INTERVAL_SECS = 0.02
 
 
 @contextlib.contextmanager
-def _heartbeat_timeline(fleet_dir, unit, timeline):
-    """Rewrite <fleet_dir>/<unit>.json on a schedule while `_run_script` blocks.
+def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
+    """Apply `rewrites` to <fleet_dir>/<unit>.json in order, each once the
+    drain gate has polled the verdict it waits for, while `_run_script` blocks.
 
     `drain_check.py` classifies a verdict purely from the on-disk heartbeat
-    JSON (scripts/drain_check.py `classify`), so a single static file can
+    JSON (scripts/drain_check.py::classify), so a single static file can
     never exercise a mid-poll verdict CHANGE -- busy->idle, busy->stale->idle,
-    or a stale<->busy oscillation. This helper drives those transitions by
-    rewriting the file on a schedule while the spawned script polls it.
+    or a stale<->busy oscillation. One watcher thread drives those
+    transitions, triggered by the gate's own poll ledger at `trace_path`
+    (the script's ORCH_DRAIN_POLL_TRACE_FILE).
 
-    `timeline` is an ordered ``(label, delay_secs, overrides)`` sequence. Each
-    entry arms one ``threading.Timer(delay_secs, ...)``, all started together
-    at context entry so every delay is an offset from the SAME t0 -- callers'
-    timings are relative to script start, and `_run_script` must be invoked
-    INSIDE this block. ``overrides`` is forwarded to `_write_heartbeat` as
-    kwargs; ``overrides is None`` instead UNLINKS <fleet_dir>/<unit>.json
-    (missing_ok=True), driving the verdict to "absent".
+    WHY THE LEDGER AND NOT A CLOCK. restart-all-orchestrators.sh::
+    drain_check_verdict appends a record only AFTER python3 has READ the
+    heartbeat, and records the verdict the gate then acts on. A record
+    therefore proves the gate has acted on the state that produced it, so a
+    rewrite it triggers can never land before the read it depends on,
+    however loaded the host. An offset from spawn can: nothing bounds when
+    the script's first poll lands (see _SLOW_START_SECS).
 
-    Yields a `fired` list that each transition appends its label to on
-    success -- callers' non-vacuity handle in BOTH directions: a transition a
-    test depends on asserts its label IS in `fired`; a counterfactual "trap"
-    transition the correct code must never reach asserts its label is NOT in
-    `fired`.
+    THE CALLER INVARIANT. Each rewrite counts the records appended since the
+    previous rewrite fired, and a poll already in flight when that rewrite
+    landed may still have read the state it replaced. So `after` must be a
+    verdict the PREVIOUS heartbeat state cannot produce: then every counted
+    record is a read of the state just written.
 
-    Cancels and joins every timer on the way out, and asserts that no
-    transition raised -- collected into a list rather than left to escape
-    silently on a background thread, so a failed rewrite can never masquerade
-    as a passing test. If the with-BODY also raised (e.g. `_run_script`
-    raising `subprocess.TimeoutExpired` during a RED-proof mutant run), that
-    exception is the more diagnostic of the two and is left to propagate
-    as-is -- any collected transition errors are folded into it as a note
-    instead of being raised as a separate `AssertionError` that would bump
-    the body's own failure down to `__context__` (reviewer_comprehensive #3).
+    A rewrite whose trigger never arrives is not an error: a trap rewrite
+    must never fire on correct code, and the callers' ledger assertions
+    report everything else. An exception on the watcher thread is collected
+    and surfaced on exit, so a failed rewrite can never masquerade as a
+    passing test: as an AssertionError, or, if the with-body raised too (a
+    `subprocess.TimeoutExpired` from `_run_script`, say), as a note on that
+    exception, which is the more diagnostic of the two and stays primary.
 
     Rewriting real heartbeat JSON, rather than shimming a fake `python3` onto
     PATH to script drain_check.py's own output, is deliberate: this module's
@@ -808,70 +1266,63 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
     `#!/usr/bin/env python3`: bin_dir is already first on PATH, so a fake
     `python3` placed there would shadow it too.
     """
-    fired = []
+    stop = threading.Event()
     errors = []
 
-    def _apply(label, overrides):
+    def _position_once_triggered(rewrite, since):
+        while True:
+            records = _read_poll_trace(trace_path, complete_only=True)
+            if records[since:].count((rewrite.after, unit)) >= rewrite.polls:
+                return len(records)
+            if stop.wait(_REWRITE_WATCH_INTERVAL_SECS):
+                return None
+
+    def _watch():
         try:
-            if overrides is None:
-                (Path(fleet_dir) / f"{unit}.json").unlink(missing_ok=True)
-            else:
-                _write_heartbeat(fleet_dir, unit, **overrides)
-            fired.append(label)
+            position = 0
+            for rewrite in rewrites:
+                position = _position_once_triggered(rewrite, position)
+                if position is None:
+                    return
+                if rewrite.to is None:
+                    (Path(fleet_dir) / f"{unit}.json").unlink(missing_ok=True)
+                else:
+                    _write_heartbeat(fleet_dir, unit, **rewrite.to)
         except Exception as exc:  # collected, not raised -- see docstring
-            errors.append((label, exc))
+            errors.append(exc)
 
-    timers = []
-    for label, delay_secs, overrides in timeline:
-        timer = threading.Timer(delay_secs, _apply, args=(label, overrides))
-        timer.daemon = True
-        timers.append(timer)
-    for timer in timers:
-        timer.start()
-
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
     try:
-        yield fired
+        yield
     finally:
-        for timer in timers:
-            timer.cancel()
-        for timer in timers:
-            timer.join(timeout=5)
+        stop.set()
+        watcher.join(timeout=5)
         if errors:
             in_flight = sys.exc_info()[1]
             if in_flight is not None:
-                in_flight.add_note(
-                    f"ALSO: heartbeat timeline transition(s) raised: {errors!r}"
-                )
+                in_flight.add_note(f"ALSO: heartbeat rewrite(s) raised: {errors!r}")
             else:
-                raise AssertionError(
-                    f"heartbeat timeline transition(s) raised: {errors!r}"
-                )
+                raise AssertionError(f"heartbeat rewrite(s) raised: {errors!r}")
 
 
-def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
-    """Shared preamble + spawn for the busy-unit drain-gate timeline tests
-    below (reviewer_comprehensive #4).
+def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
+    """Run restart-all-orchestrators.sh --drain on a busy UNIT_R, applying
+    `rewrites` as the gate polls, and return (result, state, polls).
 
-    Every one of them starts UNIT_R busy, drives one or more scheduled
-    heartbeat transitions across a run of restart-all-orchestrators.sh
-    --drain via `_heartbeat_timeline`, and inspects the result -- only the
-    timeline and a couple of env knobs actually differ between them. This
-    factors out the rest (fake systemctl setup, the initial busy heartbeat,
-    and the timeline-wrapped `_run_script` call) so a caller is left with
-    just its own timeline, knobs, and assertions.
-
-    `knobs` are merged into `_run_script`'s env on top of
+    `knobs` are merged into `_run_script`'s env over
     {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
-    str(_TIMELINE_POLL_INTERVAL_SECS)}, both of which every caller wants and
-    none of them varies.
-
-    Returns (result, state, fired) so a caller can assert directly on all
-    three without re-deriving any of them: `state` is
-    _load_state(state_path) (the fake systemctl's recorded calls) and
-    `fired` is the timeline's own non-vacuity list (see
-    _heartbeat_timeline's docstring).
+    str(_DRAIN_POLL_INTERVAL_SECS)}. `state` is the fake systemctl's
+    recorded state and `polls` the gate's finished poll ledger, as read by
+    `_read_poll_trace`.
     """
+    assert "ORCH_DRAIN_POLL_TRACE_FILE" not in knobs, (
+        "_run_busy_unit_through OWNS ORCH_DRAIN_POLL_TRACE_FILE: its rewrite "
+        "watcher must read the very ledger the script writes. Assert on the "
+        "returned `polls` instead of passing the knob."
+    )
     fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
@@ -879,16 +1330,82 @@ def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
 
     env = {
         "RESTART_VERIFY_TIMEOUT": "5",
-        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
+        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_DRAIN_POLL_INTERVAL_SECS),
+        "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
     }
     env.update(knobs)
 
-    with _heartbeat_timeline(fleet_dir, UNIT_R, timeline) as fired:
+    with _rewrites_on_gate_polls(fleet_dir, UNIT_R, trace_path, rewrites):
         result = _run_script(
             bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=spawn_timeout,
         )
 
-    return result, _load_state(state_path), fired
+    return result, _load_state(state_path), _read_poll_trace(trace_path)
+
+
+def _polls_outlasting(secs: int) -> int:
+    """How many polls of a new verdict carry drain_gate past `secs` seconds
+    of its force-fire clock.
+
+    drain_gate's busy loop checks the force-fire deadline F at the TOP of
+    each iteration and sleeps one poll interval before every poll, so:
+      (i) the busy loop alone makes at most ceil(F/interval) polls before it
+          force-fires;
+      (ii) the k-th poll of a new verdict, counting from the busy loop's
+          first poll of it, lands at least k-1 intervals after the defer
+          anchor: the next poll, drain_await_fresh's opening read, needs no
+          sleep, and each later one has one.
+    Both bounds come from the script's own sleeps, so host load can only
+    strengthen them. The ceil(secs/interval)+1 polls returned here are
+    therefore more than the busy loop alone can make before a `secs`
+    deadline, and put the script at least `secs` past its defer anchor.
+    """
+    return math.ceil(secs / _DRAIN_POLL_INTERVAL_SECS) + 1
+
+
+def _assert_resumed_from_the_busy_loop(result, state, polls):
+    """Assert drain_gate's IN-LOOP resume: defer on a busy read, then resume
+    on an idle read taken straight from the busy poll loop.
+
+    `polls` is `_read_poll_trace` output. The ledger is what pins the ORDER
+    in which the gate observed the unit's states; stdout only implies it.
+    """
+    context = (
+        f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.returncode == 0, context
+    assert polls[:1] == [("busy", UNIT_R)], (
+        f"the gate's FIRST poll must read {UNIT_R} busy. A first poll of "
+        f"anything else means the drain landed before the gate ever saw the "
+        f"unit busy -- the 2026-09-23 merge-gate red (task 5348 sighting 1): "
+        f"no defer line, rc 0, restart recorded. An EMPTY ledger instead "
+        f"means the script never wrote ORCH_DRAIN_POLL_TRACE_FILE: the knob "
+        f"did not reach it, or the write failed (see stderr). {context}"
+    )
+    assert len(polls) >= 2, (
+        f"an in-loop resume takes at least two polls: the busy read that "
+        f"deferred and the idle read that resumed. Fewer means the script "
+        f"left the gate without its busy loop ever polling. {context}"
+    )
+    assert polls == [("busy", UNIT_R)] * (len(polls) - 1) + [("idle", UNIT_R)], (
+        f"the ledger's COUNT is fine; its shape is not. Every poll after the "
+        f"first busy one must read busy until one final idle: a stale/absent "
+        f"record is a detour through drain_await_fresh (the OTHER resume "
+        f"site), and a ledger ending on busy is a force-fire. {context}"
+    )
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
+        f"expected a defer line before the resume; {context}"
+    )
+    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
+        f"expected the in-loop idle resume line; {context}"
+    )
+    assert "force-restarting" not in result.stdout.lower(), (
+        f"expected a resume, not a force-fire; {context}"
+    )
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r} "
+        f"{context}"
+    )
 
 
 def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
@@ -897,40 +1414,43 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     the `verdict == "idle"` arm reached straight from its busy poll loop,
     before any stale/absent handoff). A unit that goes busy, then drains
     WHILE deferred, must resume the restart from inside the poll loop rather
-    than waiting out the full busy grace."""
-    # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Here the grace is a
-    # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
-    # in-loop resume regresses, the run silently consumes the spawn timeout
-    # instead of force-firing early and looking like a pass.
-    spawn_timeout = 15
+    than waiting out the full busy grace. The drain lands only after the
+    gate's first busy poll, so the defer-then-resume order does not depend on
+    how fast the script starts."""
+    spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS
 
-    result, state, fired = _busy_unit_drain_run(
-        tmp_path, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_IDLE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
     )
 
-    assert result.returncode == 0, (
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    _assert_resumed_from_the_busy_loop(result, state, polls)
+
+
+def test_a_slow_start_still_defers_before_the_drain_lands(tmp_path):
+    """The test above with the gate's first poll landing AFTER the drain, as
+    host load makes it land: the 2026-09-23 merge-gate red.
+
+    BASH_ENV is sourced by bash before the script's first line, so the late
+    start is charged against the same spawn budget real slowness is, and
+    modelling it needs no change to FAKE_SYSTEMCTL_SRC, whose verbatim mirror
+    lives in tests/scripts/test_orchestrator_watchdog.py. The budget is the
+    test above's plus the deterministic stall, so the load-dependent part of
+    the run keeps exactly that test's headroom.
+    """
+    slow_start = tmp_path / "slow-start.sh"
+    slow_start.write_text(f"sleep {_SLOW_START_SECS}\n")
+    spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS + _SLOW_START_SECS
+
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_IDLE)],
+        spawn_timeout=spawn_timeout,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
+        BASH_ENV=str(slow_start),
     )
-    # Non-vacuity: proves the gate really deferred first, rather than sailing
-    # through an idle first read.
-    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
-        f"expected a defer line before the resume; got stdout={result.stdout!r}"
-    )
-    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
-        f"expected the in-loop idle resume line; got stdout={result.stdout!r}"
-    )
-    assert "force-restarting" not in result.stdout.lower(), (
-        f"expected a resume, not a force-fire; got stdout={result.stdout!r}"
-    )
-    assert ["--user", "restart", UNIT_R] in state["calls"], (
-        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
-    )
-    assert "idle" in fired, (
-        f"the scheduled idle transition never landed: fired={fired!r}"
-    )
+
+    _assert_resumed_from_the_busy_loop(result, state, polls)
 
 
 @pytest.mark.parametrize(
@@ -964,8 +1484,8 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     # the point is that the run finishes long before this busy grace would.
     spawn_timeout = 15
 
-    result, state, fired = _busy_unit_drain_run(
-        tmp_path, [(verdict_label, _FIRST_TRANSITION_DELAY_SECS, overrides)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=overrides)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS="0",
@@ -979,7 +1499,8 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     # drain_await_fresh, above the defer line -- prints a byte-identical
     # "proceeding" line but returns BEFORE any defer line, so this is what
     # proves the IN-LOOP re-classification block ran, not the top-level path
-    # with the unit simply starting stale/absent.
+    # with the unit simply starting stale/absent. The rewrite waits for the
+    # gate's first busy poll, so correct code cannot reach that top-level path.
     assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
         f"expected a defer line before the re-classification; got "
         f"stdout={result.stdout!r}"
@@ -997,8 +1518,9 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert verdict_label in fired, (
-        f"the scheduled {verdict_label} transition never landed: fired={fired!r}"
+    assert (verdict_label, UNIT_R) in polls, (
+        f"the gate never READ the {verdict_label} rewrite: ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
@@ -1016,19 +1538,19 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     drain_await_fresh call nested inside drain_gate's busy poll loop (rather
     than from drain_gate's own opening await), had no test at all (only the
     top-level entry point had a same-shaped zero-grace test; neither entry
-    had a nonzero one). A heartbeat that STAYS stale (no further scheduled
-    transition -- unlike this file's other timelines, this one deliberately
-    lets the grace genuinely elapse instead of racing a later flip) with a
-    small nonzero grace forces at least one real sleep-and-recheck cycle
-    before the grace elapses.
+    had a nonzero one). A heartbeat that STAYS stale once the gate has seen
+    it busy (no further rewrite -- unlike the tests below, which hand the
+    gate a fresh reading afterwards, this one deliberately lets the grace
+    genuinely elapse) with a small nonzero grace forces at least one real
+    sleep-and-recheck cycle before the grace elapses.
     """
     # ONE binding feeding both the grace and the timeout -- see
     # test_defer_withholds_restart_while_busy. Deliberately unreachable here.
     spawn_timeout = 15
     unknown_grace = 3
 
-    result, state, fired = _busy_unit_drain_run(
-        tmp_path, [("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_STALE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(unknown_grace),
@@ -1054,8 +1576,9 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert "stale" in fired, (
-        f"the scheduled stale transition never landed: fired={fired!r}"
+    assert ("stale", UNIT_R) in polls, (
+        f"the gate never READ the stale rewrite: ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
@@ -1083,27 +1606,35 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     in-loop resume site's (drain_gate's `verdict == "idle"` arm reached
     straight from the busy poll loop, pinned by
     test_busy_unit_that_drains_mid_defer_resumes_and_restarts), so the two
-    can't be told apart by text. They're told apart by an ORDERING
-    INEQUALITY instead: ORCH_RESTART_FORCE_FIRE_AFTER_SECS=5 is deliberately
-    SMALLER than the scheduled idle flip at t=8, and drain_await_fresh never
-    consults the force-fire clock. A resume observed at ~t=8 is therefore
-    only reachable from INSIDE drain_await_fresh -- had control stayed in
-    the outer busy loop, it would have force-fired at t=5 instead. Do not
-    "simplify" the 5-vs-8 relationship; it is the assertion.
+    can't be told apart by text. They're told apart by a POLL COUNT instead,
+    in the script's own clock (see _polls_outlasting): drain_await_fresh
+    never consults the force-fire clock, and the idle rewrite waits for one
+    more stale/absent poll than the outer busy loop can make before its
+    _SHORT_FORCE_FIRE_SECS deadline. Had control stayed in that loop, it
+    would have force-fired before the idle was ever written, so a resume
+    line with no force line proves the idle was read INSIDE
+    drain_await_fresh. Do not "simplify" the idle rewrite's
+    `polls=_polls_outlasting(...)` count; it is the assertion.
+
+    That proof reads the script's own clock, but REACHING the scenario is
+    not load-proof: the stale/absent rewrite must still win the one race
+    documented at _SHORT_FORCE_FIRE_SECS. Losing it force-fires with no
+    detour, which fails the force-line assertion here and can never pass it.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
-    # unit resumes on its own at t=8, well inside it); ONE binding still
-    # feeds it from spawn_timeout, per test_defer_withholds_restart_while_busy.
+    # unit drains on its own a few polls into it); ONE binding still feeds it
+    # from spawn_timeout, per test_defer_withholds_restart_while_busy.
     spawn_timeout = 20
+    outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, polls = _run_busy_unit_through(
         tmp_path,
         [
-            (verdict_label, _FIRST_TRANSITION_DELAY_SECS, overrides),
-            ("idle", 8.0, _HB_IDLE),
+            _Rewrite(after="busy", to=overrides),
+            _Rewrite(after=verdict_label, to=_HB_IDLE, polls=outlasting),
         ],
         spawn_timeout=spawn_timeout,
-        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="5",
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(_SHORT_FORCE_FIRE_SECS),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(wait_proof_grace_secs(spawn_timeout)),
     )
 
@@ -1117,7 +1648,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
         f"expected the post-await idle resume line; got stdout={result.stdout!r}"
     )
-    # THE SITE-2 PROOF -- see the docstring's ordering-inequality argument.
+    # THE SITE-2 PROOF -- see the docstring's poll-count argument.
     assert "force-restarting" not in result.stdout.lower(), (
         f"expected the resume to come from inside drain_await_fresh, not a "
         f"force-fire; got stdout={result.stdout!r}"
@@ -1131,8 +1662,19 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert fired == [verdict_label, "idle"], (
-        f"expected both scheduled transitions to land in order; got fired={fired!r}"
+    busy, unfresh, idle = ("busy", UNIT_R), (verdict_label, UNIT_R), ("idle", UNIT_R)
+    assert busy in polls and polls == (
+        [busy] * polls.count(busy) + [unfresh] * polls.count(unfresh) + [idle]
+    ), (
+        f"expected one or more busy polls, then {verdict_label} polls, then "
+        f"exactly one idle poll; ledger={polls!r} stdout={result.stdout!r}"
+    )
+    assert polls.count(unfresh) >= outlasting, (
+        f"the ledger's shape is fine; its {verdict_label} run is not. The idle "
+        f"rewrite waits for {outlasting} {verdict_label} polls, so a shorter "
+        f"run means something other than that count released it, and the "
+        f"site-2 proof above no longer holds. ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
@@ -1145,80 +1687,434 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     must NOT get a fresh force-fire deadline on the second busy reading --
     the deadline is anchored to when the unit FIRST went busy.
 
-    A scheduled idle "trap" at t=15 is what makes this a TEXT-level
-    assertion rather than a wall-clock one, which is deliberately NOT
-    "simplified" into a timing check. The trap must sit strictly BETWEEN two
-    deadlines that differ only by whether the anchor reset, so the margin on
-    BOTH sides is the point (reviewer_comprehensive #1: the original t=12
-    trap, timed to sit just after an elapsed(8) >= FORCE_FIRE(6) force-fire,
-    measured as little as ~1.5s clear of the correct-path exit under 2x CPU
-    oversubscription). FORCE_FIRE=10 here (not 6) is what buys that margin:
-    it holds the correct path's force-fire a couple of poll cycles AFTER
-    busy is redetected at t~8 instead of on the very next check, which pushes
-    the reset path's hypothetical deadline out to ~18-19 and opens a wider
-    window to place the trap in.
-      - Anchor PRESERVED (correct): busy is redetected at t~8-9, still short
-        of the UNRESET deadline (start~0 + FORCE_FIRE(10) = ~10). The outer
-        loop force-fires the first time elapsed reaches 10 -- around
-        t~10-11 -- and never reads the heartbeat again, so the t=15 trap is
-        unreachable: `fired` stays ["stale", "busy"].
-      - Anchor RESET (the regression): start_secs restarts at t~8-9, so the
-        new deadline is ~8-9 + FORCE_FIRE(10) = ~18-19 -- AFTER the trap.
-        The loop keeps polling past t=15, its own (unguarded-by-FORCE_FIRE)
-        idle check reads the trap's heartbeat, and it prints "resuming
-        restart of <unit>: drained" with NO force line (the reset deadline
-        would not have been reached until t~18-19).
-    The two counterfactuals differ in OUTPUT, not merely in duration, so the
-    assertions below are text-level: exactly two defer lines (the initial
-    one plus the re-defer after the stale interlude -- itself independent
-    corroboration that the oscillation happened), a force line present, a
-    resume line absent, and "idle-trap" absent from `fired`.
+    The unit goes stale once the gate has seen it busy, comes back busy once
+    the gate has polled the stale state _polls_outlasting(F) times (F =
+    _SHORT_FORCE_FIRE_SECS), and drains -- the idle TRAP -- once the gate
+    has polled busy again. By _polls_outlasting's lemma, that counted stale
+    run alone carries the script at least F seconds past its first defer, so
+    the two counterfactuals differ in what the script does next, measured in
+    its own clock:
+      - Anchor PRESERVED (correct): elapsed already exceeds F when the unit
+        re-defers, so the very next loop-top check force-fires. Exactly one
+        busy poll follows the stale run and the trap is never read: a force
+        line and no resume line.
+      - Anchor RESET (the regression): elapsed restarts at 0, so the loop
+        polls again, reads the trap and prints "resuming restart of <unit>:
+        drained". Even if the trap lands late, the ledger shows a second busy
+        poll after the stale run.
+    Every assertion below reads what the script itself did, its stdout and
+    its own poll ledger: exactly two defer lines (the initial one plus the
+    re-defer after the stale interlude, itself independent corroboration
+    that the oscillation happened), a force line PRESENT, a resume line
+    ABSENT, and a ledger that ends on the stale run followed by exactly one
+    busy poll. Host load cannot turn a reset anchor into a pass. REACHING
+    the oscillation is not load-proof, though: the first (busy->stale)
+    rewrite must win the one race documented at _SHORT_FORCE_FIRE_SECS.
+    Losing it force-fires after a single defer, which fails the defer-count
+    assertion.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
-    # unit resumes busy on its own at t=8, well inside it). Capped at 22
-    # (rather than pushed higher for even more trap margin) because
-    # wait_proof_grace_secs(22)=88 is the largest multiple of this spawn
-    # timeout that still stays inside LEAK_SELF_TERMINATION_CEILING_SECS
-    # (90s, df_pytest_isolation.py). That ceiling is load-bearing: a poll
-    # loop that escapes its kill must expire while pytest's tmpdir -- and so
-    # the fake `systemctl` on its PATH -- still exists, or its expiry falls
-    # through to /usr/bin/systemctl and restarts REAL units.
-    spawn_timeout = 22
+    # unit comes back busy on its own a few polls into it), so this site wants
+    # the LARGEST spawn timeout a wait-proving test may legally take -- which
+    # is precisely what WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS is defined to be.
+    # The 22 -> wait_proof_grace_secs(22)=88 <= 90 derivation, and why that
+    # ceiling is load-bearing, live ONCE at that constant in
+    # df_pytest_isolation and are deliberately not re-spelled here (task 4890
+    # amendment): a bare literal would survive a move of
+    # WAIT_PROOF_GRACE_MULTIPLIER or LEAK_SELF_TERMINATION_CEILING_SECS with a
+    # silently-wrong comment, out of reach of
+    # test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits, which
+    # pins the constant but cannot see a copy of its arithmetic.
+    spawn_timeout = WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS
+    outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, polls = _run_busy_unit_through(
         tmp_path,
         [
-            ("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE),
-            ("busy", 8.0, _HB_BUSY),
-            ("idle-trap", 15.0, _HB_IDLE),
+            _Rewrite(after="busy", to=_HB_STALE),
+            _Rewrite(after="stale", to=_HB_BUSY, polls=outlasting),
+            _Rewrite(after="busy", to=_HB_IDLE),  # the TRAP -- see the docstring
         ],
         spawn_timeout=spawn_timeout,
-        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="10",
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(_SHORT_FORCE_FIRE_SECS),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(wait_proof_grace_secs(spawn_timeout)),
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r}"
+    assert result.returncode == 0, f"{context} stderr={result.stderr!r}"
+    defer_count = result.stdout.count(f"deferring restart of {UNIT_R}: mid-merge")
+    assert defer_count == 2, (
+        f"expected exactly two defer lines (initial + re-defer after the "
+        f"stale interlude), which also independently catches a disabled "
+        f"stale/absent handoff; got count={defer_count} {context}"
+    )
+    # THE ANCHOR PROOF -- see the docstring's two counterfactuals.
+    assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
+        f"expected NO resume line -- one here means start_secs was reset "
+        f"on the busy-resumption arm; {context}"
+    )
+    assert f"force-restarting {UNIT_R}" in result.stdout, (
+        f"expected the preserved anchor to force-fire on the loop-top check "
+        f"right after the re-defer: the counted stale run had already carried "
+        f"the script past F={_SHORT_FORCE_FIRE_SECS}s; {context}"
+    )
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+    stale, busy = ("stale", UNIT_R), ("busy", UNIT_R)
+    assert polls.count(stale) >= outlasting, (
+        f"the ledger holds {polls.count(stale)} stale poll(s), expected >= "
+        f"{outlasting}: the busy rewrite waits for that many, so fewer means "
+        f"something other than that count ended the stale run, and the "
+        f"script may not have been past F={_SHORT_FORCE_FIRE_SECS}s when it "
+        f"re-deferred. {context}"
+    )
+    assert polls[-2:] == [stale, busy], (
+        f"the ledger's stale COUNT is fine; its ending is not. After the "
+        f"stale run the gate must poll busy exactly ONCE -- the re-defer read "
+        f"-- and then force-fire. A second poll means the loop kept polling "
+        f"past F, i.e. start_secs was reset on the busy-resumption arm. "
+        f"{context}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The in-flight fleet-redeploy lease (task 4755), producer side.
+#
+# INVARIANT: for as long as a sweep is running, `$ORCH_FLEET_LEASE` names a
+# live lease recording the sweep's own pid, the epoch it started, and the unit
+# it is currently restarting -- and it is gone again on every exit path the
+# shell can catch. The three readers (the watchdog's staleness backstop, the
+# merge-landed coordinator, and the watchdog's liveness probe) all stand down
+# while that file is live, which is how the fleet stops redeploying on top of
+# its own in-flight sweep.
+#
+# This half of the suite owns MID-SWEEP observation and SIGNAL handling,
+# matching how the two suites already divide; the exit-path lifecycle
+# assertions that pair with the clock stamp live in
+# tests/scripts/test_restart_all_orchestrators.py.
+# ---------------------------------------------------------------------------
+
+UNIT_S = synthetic_unit("solar")
+
+
+def _lease_observations(state_path):
+    """Every mid-sweep lease snapshot the fake systemctl recorded, in order."""
+    return _load_state(state_path).get("lease_observations", [])
+
+
+@contextlib.contextmanager
+def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args, env=None):
+    """Spawn the sweep, yield (popen, pgid) once its lease is on disk, always reap.
+
+    A foreground `run_in_new_session` cannot serve the signal tests: they need
+    to signal a sweep that is still running, and the only way to know one has
+    got as far as acquiring its lease is to watch for the file. Session
+    isolation and the group kill are kept -- `start_new_session=True` plus a
+    pgid frozen at spawn is exactly `run_in_new_session`'s own defence, and for
+    the same task-845 reason (`os.getpgid` on a reaped-and-recycled pid resolves
+    the NEW owner's group). The `finally` is what honours the task-3798 leaked
+    drain-process guard: whatever the test did or failed to do, the whole group
+    is SIGKILLed before the test returns.
+    """
+    full_env = dict(os.environ)
+    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
+    full_env["ORCH_FLEET_LEASE"] = str(lease_path)
+    if env:
+        full_env.update(env)
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT), *extra_args],
+        env=full_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        deadline = time.monotonic() + load_scaled_grace(
+            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+        )
+        while not lease_path.exists():
+            assert proc.poll() is None, (
+                f"the sweep exited (rc={proc.returncode}) before writing a lease at "
+                f"{lease_path}"
+            )
+            assert time.monotonic() < deadline, (
+                f"no lease appeared at {lease_path} while the sweep ran"
+            )
+            time.sleep(0.05)
+        yield proc, pgid
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=10)
+
+
+def test_lease_is_held_mid_sweep_and_names_the_sweeps_own_pid(tmp_path):
+    """(a) While the sweep runs, the lease records {pid, started_ts, current_unit}.
+
+    `pid` is asserted to be the SWEEP's pid, not merely a positive integer:
+    the fake reads /proc/<pid>/cmdline at observation time, and a lease whose
+    pid names some other process would silently defeat every reader -- all
+    three of them stand down only while that pid is alive, so a wrong pid is
+    either a lease that never expires or one that never holds.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir,
+        env={"RESTART_VERIFY_TIMEOUT": "5", "ORCH_FLEET_LEASE": str(lease_path)},
     )
 
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    defer_count = result.stdout.count(f"deferring restart of {UNIT_R}: mid-merge")
-    assert defer_count == 2, (
-        f"expected exactly two defer lines (initial + re-defer after the "
-        f"stale interlude), which also independently catches a disabled "
-        f"stale/absent handoff; got count={defer_count} stdout={result.stdout!r}"
+    observations = [o for o in _lease_observations(state_path) if o["lease"] is not None]
+    assert observations, (
+        f"no systemctl call observed a lease on disk; the sweep must hold one "
+        f"for its whole run. observations={_lease_observations(state_path)!r} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert f"force-restarting {UNIT_R}" in result.stdout, (
-        f"expected the anchor to force-fire once elapsed(~8-9) >= 10; got "
-        f"stdout={result.stdout!r}"
+    for obs in observations:
+        lease = obs["lease"]
+        assert set(lease) == {"pid", "started_ts", "current_unit"}, (
+            f"lease body must carry exactly pid/started_ts/current_unit; got {lease!r}"
+        )
+        assert isinstance(lease["pid"], int) and lease["pid"] > 0, (
+            f"pid must be a positive int; got {lease['pid']!r}"
+        )
+        assert obs["pid_cmdline"] is not None and "restart-all-orchestrators.sh" in obs["pid_cmdline"], (
+            f"the lease pid {lease['pid']} must be the sweep's own process; "
+            f"/proc said {obs['pid_cmdline']!r}"
+        )
+        assert isinstance(lease["started_ts"], (int, float)), (
+            f"started_ts must be numeric; got {lease['started_ts']!r}"
+        )
+        assert 0 <= obs["observed_at"] - lease["started_ts"] < 300, (
+            f"started_ts {lease['started_ts']!r} is not a plausible epoch for a "
+            f"sweep observed at {obs['observed_at']!r}"
+        )
+
+
+def test_lease_current_unit_advances_in_ordered_units_order(tmp_path):
+    """(b) `current_unit` names the unit being restarted RIGHT NOW.
+
+    This is the field the liveness probe scopes its suppression on, so a lease
+    that named only "some sweep is running" would force a blanket liveness
+    disable -- which I5 forbids. Two units, with SELF_UNIT among them, also
+    pins the deferred-self ordering: ordered_units puts everything except
+    SELF_UNIT first in enumeration order and appends SELF_UNIT last, so
+    current_unit must walk [UNIT_S, UNIT_R] even though list-units reported
+    [UNIT_R, UNIT_S].
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path,
+        running_units=[UNIT_R, UNIT_S],
+        units={UNIT_R: {"scenario": "fresh"}, UNIT_S: {"scenario": "fresh"}},
     )
-    # THE ANCHOR PROOF -- see the docstring's two counterfactuals.
-    assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
-        f"expected NO resume line -- one here means start_secs was reset "
-        f"on the busy-resumption arm; got stdout={result.stdout!r}"
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_FLEET_LEASE": str(lease_path),
+            "SELF_UNIT": UNIT_R,
+        },
     )
-    assert "idle-trap" not in fired, (
-        f"the idle-trap transition fired, meaning the script was still "
-        f"running at t=15 -- the anchor must have been reset: fired={fired!r}"
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert ["--user", "restart", UNIT_R] in state["calls"], (
-        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    observations = [o for o in _lease_observations(state_path) if o["lease"] is not None]
+    # Dedup CONSECUTIVE repeats only: each unit is the subject of several
+    # systemctl calls, and what is under test is the order of the transitions,
+    # not how many calls each unit happened to make.
+    walk = []
+    for obs in observations:
+        value = obs["lease"]["current_unit"]
+        if not walk or walk[-1] != value:
+            walk.append(value)
+    assert walk == ["", UNIT_S, UNIT_R], (
+        f"current_unit must start empty (the lease is acquired before any unit "
+        f"is enumerated), then follow ordered_units with SELF_UNIT={UNIT_R} "
+        f"last; got {walk!r} from observations={observations!r}"
+    )
+    # The gate runs BEFORE the restart, so a unit deferred for its whole busy
+    # grace is still correctly named as current -- pinned by the fact that the
+    # unit's very first observed call already sees its own name.
+    first_for_self = next(
+        o for o in observations if o["args"][:2] == ["restart", UNIT_R]
+    )
+    assert first_for_self["lease"]["current_unit"] == UNIT_R, (
+        f"the lease must already name {UNIT_R} by the time it is restarted; "
+        f"got {first_for_self!r}"
+    )
+
+
+def test_sigterm_mid_sweep_releases_the_lease(tmp_path):
+    """(g) A SIGTERMed sweep releases its lease.
+
+    The script had NO trap before this task, and an untrapped SIGTERM kills
+    the shell WITHOUT running an EXIT trap -- so this fails against a naive
+    `trap lease_release EXIT` alone. Operators stop a sweep this way
+    (`systemctl --user stop`, a killed transient unit), and a lease left
+    behind by one suppresses every redeploy tier until the max-age bound
+    expires.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # Busy heartbeat + a grace far longer than this test: the sweep parks in
+    # drain_gate's defer loop, which is what gives us a sweep to signal.
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+
+    with _sweep_in_background(
+        bin_dir, state_path, fleet_dir, lease_path, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                wait_proof_grace_secs(load_scaled_grace(
+                    10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+                ))
+            ),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+        },
+    ) as (proc, pgid):
+        assert lease_path.exists()
+        # The GROUP, so the foreground `sleep` dies too: bash defers a trap
+        # until the running foreground command returns, so signalling the
+        # shell alone would stall the release for a whole poll interval.
+        os.killpg(pgid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=30)
+
+    assert not lease_path.exists(), (
+        f"a SIGTERMed sweep must release its lease; {lease_path} still holds "
+        f"{lease_path.read_text()!r}. stdout={stdout!r} stderr={stderr!r}"
+    )
+
+
+def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
+    """(h) SIGKILL strands the lease -- BY DESIGN, and the reason for the bound.
+
+    Not a defect and not a gap to be closed: SIGKILL is uncatchable, so no
+    amount of trapping can make the producer clean up after one. This test
+    exists so that a future reader finding a stranded lease reads it as the
+    ANTICIPATED case rather than a bug, and so the reader-side max-age bound
+    (ORCH_FLEET_LEASE_MAX_AGE_SECS) can never be deleted as redundant: it is
+    the ONLY thing standing between a SIGKILLed sweep and a wedged fleet.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+
+    with _sweep_in_background(
+        bin_dir, state_path, fleet_dir, lease_path, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                wait_proof_grace_secs(load_scaled_grace(
+                    10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+                ))
+            ),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+        },
+    ) as (proc, pgid):
+        held = json.loads(lease_path.read_text())
+        os.killpg(pgid, signal.SIGKILL)
+        proc.communicate(timeout=30)
+        assert wait_pid_gone(proc.pid), "the SIGKILLed sweep must actually be gone"
+
+    assert lease_path.exists(), (
+        "SIGKILL is uncatchable, so the lease MUST still be here -- if this "
+        "ever starts passing by removal, something other than the script is "
+        "deleting leases, and the reader-side max-age bound is being asked to "
+        "cover a case it was never given"
+    )
+    assert json.loads(lease_path.read_text()) == held, (
+        "the stranded lease must be byte-equal to what the sweep held"
+    )
+
+
+def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
+    """(f)+(j) Trap COVERAGE, asserted structurally -- the only way it can be.
+
+    MEASURED, not assumed (2026-09-21): drain_gate's `_drain_validate_verdict`
+    defensive `exit 1` is unreachable from outside the script, so it cannot be
+    driven by a behavioural test at all. drain_check_verdict whitelists its own
+    subprocess's output through a `case idle|busy|stale|absent` and coerces
+    anything else to "absent", and drain_await_fresh sets _DRAIN_VERDICT only
+    from that function -- so no heartbeat, no drain_check.py behaviour and no
+    PATH shim can produce an unrecognised verdict. Driving the script with a
+    `python3` on PATH that printed `bogus-verdict` and exited 0 produced
+    `heartbeat absent after 0s grace` and exit 0, never the `BUG(task 3852)`
+    abort. The branch is a backstop against a future IN-script refactor, which
+    is precisely the change this test protects the lease against.
+
+    So the checkable invariant is coverage rather than any one path: the EXIT
+    trap is installed before execution can reach ANY function body, hence
+    before every `exit` inside one. Two structural facts carry that:
+
+    * the trap is installed before `mapfile -t running_units`, the first
+      top-level statement after the definitions -- so no function has yet been
+      CALLED, however early its `exit` sits in the file; and
+    * the only `exit` textually before the trap is the argument-parse one,
+      which is also (j): a rejected argument must leave NO lease, because
+      acquisition happens after parsing.
+    """
+    lines = SCRIPT.read_text().splitlines()
+
+    def _sole_index(pattern, what):
+        hits = [i for i, line in enumerate(lines) if re.search(pattern, line)]
+        assert len(hits) == 1, (
+            f"expected exactly one {what} line matching {pattern!r}; got "
+            f"{[(i + 1, lines[i]) for i in hits]!r}"
+        )
+        return hits[0]
+
+    trap_at = _sole_index(r"^trap lease_release EXIT$", "EXIT-trap install")
+    acquire_at = _sole_index(r"^lease_acquire$", "top-level lease_acquire call")
+    enumerate_at = _sole_index(r"^mapfile -t running_units", "unit-enumeration")
+
+    assert trap_at < acquire_at, (
+        "the trap must be installed BEFORE the lease is acquired: an exit "
+        "between the two is then harmless (rm -f is idempotent), whereas the "
+        "reverse order strands a lease on any failure inside lease_acquire"
+    )
+    assert acquire_at < enumerate_at, (
+        "the lease must be held for the whole sweep, so it is acquired before "
+        "any unit is enumerated"
+    )
+    assert trap_at < enumerate_at, (
+        "the trap must be installed before the first top-level statement that "
+        "calls a function -- otherwise an `exit` inside a function body (e.g. "
+        "_drain_validate_verdict's defensive abort) escapes the release"
+    )
+
+    pre_trap_exits = [
+        (i + 1, lines[i]) for i, line in enumerate(lines[:trap_at])
+        if re.match(r"^\s*exit \d+\s*$", line)
+    ]
+    assert len(pre_trap_exits) == 1, (
+        f"exactly one exit may precede the trap -- the argument-parse "
+        f"rejection, which must write no lease; got {pre_trap_exits!r}"
+    )
+    reject_at = _sole_index(r"unexpected argument", "argument-rejection")
+    assert reject_at < trap_at < acquire_at, (
+        f"the argument rejection (line {reject_at + 1}) must stay ahead of the "
+        f"trap and the acquisition, so an unknown argument never writes a lease"
     )

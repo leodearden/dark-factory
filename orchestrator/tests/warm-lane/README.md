@@ -27,12 +27,22 @@ at that HEAD:
 | `test_helpers.sh` | 459 | `2ac7b723b7` | 2026-07-28 |
 | `test_warm_lane_disk_guard.sh` | 432 | `3662006952` | 2026-07-11 |
 | `test_thin_warm_lane.sh` | 440 | `2ac7b723b7` | 2026-07-28 |
-| `test_warm_lane_degenerate_ref.sh` | 550 | `5b8a44ad6e` | 2026-07-05 |
+| `test_warm_lane_degenerate_ref.sh` | 645 | `d1fea3e2c0` | 2026-09-17 |
 | `test_warm_lane_sizing_lifecycle.sh` | 672 | `62c0f188c5` | 2026-07-26 |
 | `test_provision_warm_lane_fs.sh` | 1140 | `b37e00eaa6` | 2026-07-11 |
 | `test_warm_lane_gc_sweep.sh` | 1230 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_gc.sh` | 1939 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_audit.sh` | 1999 | `973fde7955` | 2026-07-28 |
+
+**The `test_warm_lane_degenerate_ref.sh` row is a PARTIAL re-sync, not a new
+anchor.** The `8489b49bfaefddd4abbe875a970661220dacbd57` HEAD above still
+governs every other row. That one file was re-synced by **task 5566** at reify
+HEAD `63ac8d9b4b5faf761bf3fbe79339d56120f31431` (2026-09-17), where reify's task
+7244 landed the K1–K6 block; nothing else was re-copied at that HEAD. The port
+is `warm-lane-degenerate-ref-check.sh`'s test half — see
+[`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+"Delta 11" for what moved on the script side, and Delta 7 below for the two ways
+the ported block diverges.
 
 `test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
 reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
@@ -202,6 +212,53 @@ block-list docstring entry go with it.
 All 15 remaining blocks are kept, including Block I's
 `command -v mkfs.xfs && xfs_info && xfs_db` skip guard, verbatim.
 
+### Delta 7 — `test_warm_lane_degenerate_ref.sh`: the K1–K6 block's placement and one re-pointed sentence
+
+Added by **task 5566**, which ported reify's "Amendment (esc-7244-16) —
+conventional-commit citation-form coverage" block (the
+`fixture_branch_at_message_commit` helper plus 11 asserts). The block's CODE —
+fixtures, messages, `run_helper` calls, assertions — is **verbatim**. Two
+things about it are not, and both are prose:
+
+1. **Placement.** Here the block sits after the `--branch-prefix`
+   regex-metacharacter-safety amendment and before `step-9`. In reify's file it
+   is wedged between the `--branch-prefix`/`-C` amendment's comment header and
+   that amendment's own body, which splits one block across another. Nothing
+   executable depends on the position — every block builds its own fixture repo
+   under its own `mktemp -d` and the helper is defined before its first use —
+   so the port takes the placement that reads correctly. The file's block index
+   at the top names the new block, and reads **K1–K6** where reify's says
+   K1–K4; the block has six cases.
+2. **K6's last sentence.** reify's points at
+   `docs/design/warm-lane-degenerate-ref-seam.md` §4b for why dark-factory's
+   consumer tolerates a foreign tip reading `landed`. That doc is reify-side and
+   has no dark-factory counterpart, so the REASON travels instead of the
+   pointer. What travels is the MEASUREMENT (81 of 427 live-pool refs flipped
+   `degenerate` → `landed`, none the reverse), **not** a claim that a false
+   `landed` is cheap at both dark-factory call sites — it is not, and an
+   earlier draft of this item and of the K6 comment asserted that it was
+   (corrected by this task's amendment pass). The two sites are asymmetric,
+   and both act on `degenerate` rather than on `landed`:
+
+   | Site | Acts on `degenerate` by | Cost of a false `landed` |
+   |---|---|---|
+   | `git_ops.py::_abort_lane_acquisition` | `_delete_branch_if_on_main` | a retained, stale branch |
+   | `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done | **a phantom-done task** — the exact failure that guard's own comment ("a degenerate branch carries ZERO task work") cites as its reason to exist |
+
+   The harness site's only degeneracy-specific backstop is the independent
+   `_branch_is_degenerate(branch, metadata)` disjunct, which is **fail-open**:
+   `orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+   returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
+   40-hex sha. So the backstop is not unconditional, and K6's fixture — a
+   foreign on-main tip whose subject cites task 51 — is precisely the shape
+   that would phantom-complete task 51 there.
+
+   The tradeoff still favours the widening: a false `degenerate` costs
+   re-dispatched landed work or a deleted branch on EVERY ref of that shape,
+   and the measured corpus had 81 of them against zero contrived K6-shaped
+   flips. K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a
+   goal.
+
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
 α's relocation of `provision-warm-lane-fs.sh` changed its `REPO_ROOT` to a
@@ -241,6 +298,16 @@ floor equals its measured count. `test_thin_warm_lane.sh`'s Block C df-delta
 assert is not a deduction — it is gated on `REIFY_WARM_LANE_MOUNT`, which the
 driver always strips, so 45 is both its floor and its measured count there.
 
+`test_warm_lane_degenerate_ref.sh`'s floor moved **70 → 81** when task 5566
+ported reify's K1–K6 conventional-commit block (esc-7244-16). It is **not** one
+of the two legitimate deductions: the block carries no skip guard and needs only
+`git`, so 81 is both floor and measured count on any host satisfying
+`REQUIRED_HOST_TOOLS`. Both sides were RE-MEASURED on this branch —
+`Results: 70 passed, 0 failed` before the port, `Results: 81 passed, 0 failed`
+after the script was rewired onto `lib_task_citation.sh` — and the block is
+NON-VACUOUS by construction: against the pre-port inline predicate the same file
+reports `Results: 75 passed, 6 failed` (K1/K5/K6, two asserts each).
+
 The driver also strips **every `REIFY_*` key** from the subprocess environment
 (a prefix rule, not a name list, so it cannot drift as leaves β/γ/δ/ε add
 seams). This host also develops reify, and the exposure was measured, not
@@ -268,12 +335,12 @@ Every figure here is therefore load-qualified, not idle-baseline — and so is
 the 2026-07-30 column, taken during a comparable brief quiet window on a day
 whose median was 92. Do not expect to reproduce either without a cap.
 
-| Ported test | asserts | wall-clock | 2026-07-30 | ratio |
+| Ported test | asserts at the sitting | wall-clock | 2026-07-30 | ratio |
 |---|---|---|---|---|
 | `test_thin_warm_lane.sh` | 45 | 0.57s | 0.46s | 1.24x |
 | `test_warm_lane_disk_guard.sh` | 62 | 1.04s | 1.04s | 1.00x |
 | `test_warm_lane_sizing_lifecycle.sh` | 65 | 1.38s | 1.07s | 1.29x |
-| `test_warm_lane_degenerate_ref.sh` | 70 | 1.73s | 1.23s | 1.41x |
+| `test_warm_lane_degenerate_ref.sh` † | 70 | 1.73s | 1.23s | 1.41x |
 | `test_provision_warm_lane_fs.sh` | 111 | 1.89s | 1.49s | 1.27x |
 | `test_warm_lane_gc_sweep.sh` | 86 | 15.01s | 6.73s | **2.23x** |
 | `test_warm_lane_audit.sh` | 228 | 14.34s | 12.93s | 1.11x |
@@ -282,6 +349,35 @@ whose median was 92. Do not expect to reproduce either without a cap.
 
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
 acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks.
+
+**† `test_warm_lane_degenerate_ref.sh` now runs 81 asserts** (task 5566's K1–K6
+block). Every cell in its row is a 2026-08-05 figure at 70 asserts and is left
+exactly as measured, because this table's whole value is that its eight rows
+come from ONE sitting — a figure spliced in from another would silently destroy
+the property the caption above establishes. The header column is named "asserts
+at the sitting" for the same reason, and the **881** total is that sitting's,
+not the files' current sum (892).
+
+**The re-measurement, and what it can and cannot say.** Re-run on
+**2026-09-17** at the new assert count, together with two anchors from the table
+above so the figures are comparable to *something*. The host was at loadavg
+**165.9 rising to 436.8 on 32 cores** across the sitting — no cap was in force,
+which the caption above says is the sole condition under which this box goes
+quiet. Median of three runs each:
+
+| Ported test | asserts | 2026-09-17 median | 2026-08-05 | dilation |
+|---|---|---|---|---|
+| `test_thin_warm_lane.sh` | 45 | 9.65s | 0.57s | 16.9x |
+| `test_warm_lane_disk_guard.sh` | 62 | 12.62s | 1.04s | 12.1x |
+| `test_warm_lane_degenerate_ref.sh` | 81 | 24.06s | 1.73s | 13.9x |
+
+Read the **dilation** column, never the absolute seconds: at ~14x the whole
+sitting is host state, not suite cost. What it establishes is that the
+degenerate-ref suite's dilation (13.9x) sits **between** its two unchanged
+neighbours' (12.1x and 16.9x) — so at 81 asserts its cost relative to the
+files that did not change is where it was at 70, and the K block bought no
+disproportionate time. A 1.73s-comparable absolute figure was **not** obtainable
+and is not fabricated here.
 
 **Read the two bold ratios as a cross-DAY comparison, not as a regression.**
 The `ratio` column divides a 2026-08-05 figure by a 2026-07-30 one, so it

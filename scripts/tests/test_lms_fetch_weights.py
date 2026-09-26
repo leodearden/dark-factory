@@ -329,3 +329,64 @@ def test_every_committed_non_placeholder_arm_builds_a_fetch_argv():
     # Derived, never a literal count -- see the twin assertion in
     # test_lms_serve.py.  Step 22's Open Q3 resolution made the old `== 7` red.
     assert built == [a.arm_id for a in manifest.arms if not a.is_placeholder]
+
+
+# ---------------------------------------------------------------------------
+# the transient-unit prefix is PUBLIC, shared API (task 4301)
+#
+# `lms_slate_run` builds its own submit argv from this same helper rather than
+# authoring a second copy of the compliant form.  Two authored copies of a
+# systemd-run invocation is how the flags a re-derivation most often drops
+# (`--collect`, `--working-directory`) come back: one copy gets fixed and the
+# other keeps the bug.  So the name is pinned as an EXPORT here, not merely as
+# an implementation detail of `fetch_argv`.
+# ---------------------------------------------------------------------------
+
+
+def test_transient_unit_prefix_is_public_shared_api():
+    setenv = ['--setenv=LMS_BASELINE_DIR=/run/user/1000/lms-baselines']
+
+    prefix = lms_fetch_weights.transient_unit_prefix('lms-slate-run', setenv)
+
+    assert prefix == [
+        'systemd-run', '--user',
+        '--collect',
+        '--unit=lms-slate-run',
+        f'--working-directory={lms_fetch_weights.REPO_ROOT}',
+        *setenv,
+        '--',
+    ]
+
+
+def test_transient_unit_prefix_emits_no_setenv_when_given_none():
+    prefix = lms_fetch_weights.transient_unit_prefix('lms-slate-run', [])
+
+    assert not any(element.startswith('--setenv=') for element in prefix)
+    assert prefix[-1] == '--'
+
+
+def test_promoting_the_prefix_left_both_existing_builders_unchanged():
+    """The rename is a promotion, not a behaviour change: both in-module
+    callers must still begin with the compliant prefix and end in the same
+    payloads they did before."""
+    arm = _arm()
+    fetch_prefix = lms_fetch_weights.transient_unit_prefix(
+        lms_fetch_weights.fetch_unit_name(arm),
+        [
+            '--setenv=HF_TOKEN=hf_measured_value',
+            f'--setenv=HF_HOME={lms_fetch_weights.HOST_HF_CACHE}',
+        ],
+    )
+    pull_prefix = lms_fetch_weights.transient_unit_prefix(
+        lms_fetch_weights.pull_unit_name(arm), [],
+    )
+
+    fetch = lms_fetch_weights.fetch_argv(arm, TOKEN_ENV)
+    pull = lms_fetch_weights.pull_image_argv(arm)
+
+    assert fetch == fetch_prefix + [
+        'uvx', '--from', 'huggingface_hub', 'hf', 'download', arm.model_ref,
+    ]
+    assert pull == pull_prefix + [
+        'docker', 'pull', lms_fetch_weights.image_ref(arm),
+    ]

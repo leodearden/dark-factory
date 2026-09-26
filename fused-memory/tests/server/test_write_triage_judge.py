@@ -24,15 +24,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import subprocess
+import sys
 import types
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import write_triage
+from fused_memory.server import write_triage_judge as judge_module
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -53,12 +58,15 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _FIELD_CHARS,
+    _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
     JudgeOutputError,
     _call_llm,
+    _provider_credentials,
     build_judge_prompt,
     judge_write,
     parse_judge_verdict,
@@ -119,12 +127,274 @@ class TestJudgeVerdictVocabulary:
         """Each judge word lands on the outcome the ack contract publishes."""
         assert JUDGE_VERDICTS[word] == outcome
 
-    def test_the_outcome_constants_come_from_write_triage(self) -> None:
-        """The values are the ones beta publishes, whatever they are spelled."""
-        assert JUDGE_VERDICTS['restates'] == write_triage.OUTCOME_RESTATED
-        assert JUDGE_VERDICTS['amends'] == write_triage.OUTCOME_AMENDED
-        assert JUDGE_VERDICTS['contests'] == write_triage.OUTCOME_CONTESTED
-        assert JUDGE_VERDICTS['distinct'] == write_triage.OUTCOME_STORED
+
+# ---------------------------------------------------------------------------
+# the worked examples that teach the vocabulary
+# ---------------------------------------------------------------------------
+
+#: The committed curator corpus the judge is MEASURED against. Named here so
+#: the leakage guard below can ask whether an exemplar was drawn from it.
+CALIBRATION_FIXTURE_PATH = (
+    Path(__file__).parent.parent / 'fixtures' / 'write_triage_calibration.jsonl'
+)
+
+
+@pytest.fixture(scope='module')
+def records() -> list[dict]:
+    """The committed curator corpus, parsed with the stdlib.
+
+    Parsed here rather than through the eval script's loader, so a loader bug
+    cannot mask a data defect (and vice versa) — the discipline the sibling
+    suite's own ``records`` fixture states.
+    """
+    assert CALIBRATION_FIXTURE_PATH.exists(), (
+        f'fixture missing: {CALIBRATION_FIXTURE_PATH}'
+    )
+    return [
+        json.loads(line)
+        for line in CALIBRATION_FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+class TestJudgeExemplars:
+    """The vocabulary's worked examples, held as DATA rather than as prose.
+
+    Four words with no worked example is what the 2026-08-27 measurement
+    indicts: 31 of 75 duplicates were answered ``stored`` with the correct
+    canonical sitting in the slate, i.e. ``restates``/``amends`` were
+    under-produced. A vocabulary word the model has never seen USED is the one
+    it under-produces, so full verdict coverage is the invariant that targets
+    the defect rather than a tidiness rule.
+
+    Structured records, not a pre-formatted blob (heuristic 12): declaring
+    ``entry``/``candidate``/``verdict`` as separate fields is what lets
+    vocabulary closure, verdict coverage and corpus disjointness be CHECKED
+    here instead of grepped for in a string. The renderer owns the formatting.
+    """
+
+    def test_the_exemplars_are_structured_records(self) -> None:
+        """Three separate fields per record — the data carries no formatting.
+
+        A pre-formatted blob would reduce every assertion below to substring
+        grepping, and would move the prompt's layout out of the renderer and
+        into the data, where two exemplars can disagree about it.
+        """
+        exemplars = judge_module.JUDGE_EXEMPLARS
+        assert isinstance(exemplars, tuple), 'exemplars are an ordered, frozen tuple'
+        assert exemplars, 'an empty exemplar tuple teaches nothing'
+        for exemplar in exemplars:
+            fields = (exemplar.entry, exemplar.candidate, exemplar.verdict)
+            for field in fields:
+                assert isinstance(field, str) and field.strip(), (
+                    f'every field is a non-empty string: {exemplar!r}'
+                )
+                assert '\n' not in field, (
+                    f'line breaks are the renderer\'s business, not the data\'s: '
+                    f'{exemplar!r}'
+                )
+            assert len(set(fields)) == len(fields), (
+                f'the three fields are distinct values, not one blob repeated: '
+                f'{exemplar!r}'
+            )
+
+    def test_every_exemplar_verdict_is_in_the_closed_vocabulary(self) -> None:
+        """An out-of-vocabulary exemplar teaches a word the parser REJECTS.
+
+        ``parse_judge_verdict`` raises on anything outside ``JUDGE_VERDICTS``
+        and ``write_triage`` counts that raise as a fail-open — so the damage
+        surfaces as a storm escalation describing an outage, not as a bad
+        verdict anyone would trace back to a typo in a prompt example.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert exemplar.verdict in JUDGE_VERDICTS, (
+                f'{exemplar.verdict!r} is not one of {sorted(JUDGE_VERDICTS)}'
+            )
+
+    def test_every_verdict_has_at_least_one_worked_example(self) -> None:
+        """Coverage is the invariant aimed at the measured defect.
+
+        Derived from ``JUDGE_VERDICTS`` rather than spelled as four literals,
+        so a fifth word added to the vocabulary arrives here already demanding
+        its example instead of shipping unexemplified.
+        """
+        covered = {exemplar.verdict for exemplar in judge_module.JUDGE_EXEMPLARS}
+        assert covered == set(JUDGE_VERDICTS), (
+            f'verdicts with no worked example: {sorted(set(JUDGE_VERDICTS) - covered)}'
+        )
+
+    def test_no_exemplar_text_is_drawn_from_the_eval_corpus(
+        self, records: list[dict],
+    ) -> None:
+        """Exemplars are prompt content; fixture records are a MEASUREMENT.
+
+        Hand-writing an exemplar is ordinary prompt engineering — nothing is
+        scored against it. Drawing one from the corpus the judge is scored on
+        is training on the test set, and would make the accuracy report
+        unreadable as evidence. This is the one way an exemplar can corrupt a
+        measurement, so it is asserted rather than remembered.
+        """
+        corpus = '\n'.join(str(record.get('content', '')) for record in records)
+        assert corpus.strip(), 'the corpus parsed empty — the guard would be vacuous'
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in corpus, (
+                    f'exemplar {field_name} is drawn from the eval corpus — '
+                    f'that is training on the test set: {text!r}'
+                )
+
+    def test_each_exemplar_renders_as_an_answered_pair(self) -> None:
+        """The PAIRING is the property. The three fields separately are not.
+
+        A pair rendered without its verdict is a riddle, and a verdict
+        rendered without its pair is an assertion — so what has to hold is
+        that each exemplar's three fields reach the model AS ONE BLOCK.
+        Checking the fields individually cannot see that: all four verdict
+        words already appear in the vocabulary bullets above the examples, so
+        ``exemplar.verdict in prompt`` is true whatever the renderer emits.
+        Measured by simulation — a ``_render_exemplars`` that dropped its
+        ``answer:`` line entirely, shipping four unanswered riddles, left the
+        per-field version of this test green.
+
+        Asserted as the contiguous triple, which is executable structure and
+        not a wording pin. It restates ``_render_exemplars``' block layout on
+        purpose — that layout IS the contract between the tuple and the model
+        — while leaving the prompt's prose around the examples free to be
+        reworded. It subsumes the per-field presence check, so there is no
+        longer a separate one.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            block = (
+                f'new entry: {exemplar.entry}\n'
+                f'candidate: {exemplar.candidate}\n'
+                f'answer: {exemplar.verdict}'
+            )
+            assert block in JUDGE_SYSTEM_PROMPT, (
+                f'exemplar does not reach the model as an ANSWERED pair — its '
+                f'fields may all be present but not together: {block!r}'
+            )
+
+    def test_the_exemplars_render_once_each_in_declaration_order(self) -> None:
+        """A REPRODUCIBLE measurement needs a prompt that does not move.
+
+        This suite has been bitten once already by an iteration order moving
+        between two processes — the committed `.json`/`.md` confusion-row
+        disagreement that
+        ``test_the_committed_markdown_is_the_render_of_the_committed_json``
+        now pins. A tuple cannot reorder itself, so what is left to check is
+        that the RENDERER walks it in order and does not double-render.
+
+        Asserted on ``entry``, which uniquely identifies an exemplar and
+        occurs nowhere else in the prompt. ``candidate`` and ``verdict``
+        deliberately recur — one candidate is shared by all four exemplars, so
+        the only variable is the relationship, and each verdict word already
+        appears three to five times in the vocabulary section above the
+        examples. Counting occurrences of either would measure the prompt's
+        prose, not the renderer's determinism.
+        """
+        prompt = JUDGE_SYSTEM_PROMPT
+        positions = []
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert prompt.count(exemplar.entry) == 1, (
+                f'exemplar rendered {prompt.count(exemplar.entry)} times, not '
+                f'once: {exemplar.entry!r}'
+            )
+            positions.append(prompt.index(exemplar.entry))
+        assert positions == sorted(positions), (
+            f'the render walks JUDGE_EXEMPLARS out of declaration order: '
+            f'{positions}'
+        )
+
+    def test_the_user_prompt_carries_no_exemplar_text(self) -> None:
+        """Exemplars are constant, so they are paid for ONCE, system-side.
+
+        Two reasons beyond the token bill. ``scripts/check_write_triage_attach_target.py``
+        is the behavioural gate probe for flip-predicate item 1; its
+        ``_echoes_argument`` / ``_swap_verdict`` controls attribute a
+        rendering difference to a SPECIFIC candidate in the user turn, and
+        constant example lines there would be extra material those controls
+        would have to reason around. And the system half is the half a
+        provider can cache — rendered per call, the exemplars would be paid
+        for on all 102 cases of an eval run instead of once.
+
+        Verdict WORDS are excluded: ``build_judge_prompt`` names the closed
+        vocabulary by design, which is a different thing from carrying an
+        example.
+        """
+        candidates = [
+            _result('mem-aaa', 0.9, content='first candidate body'),
+            _result('mem-bbb', 0.8, content='second candidate body'),
+        ]
+        prompt = build_judge_prompt('the new entry text', candidates)
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in prompt, (
+                    f'exemplar {field_name} leaked into the per-call user turn: '
+                    f'{text!r}'
+                )
+
+    def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
+        """PRD C1 bounds the whole call, and the exemplars spend against it.
+
+        The worst case is not hypothetical: the calibration fixture holds a
+        ~9k-char canonical, so a full slate of over-long candidates plus an
+        over-long entry is what a real call looks like when the corpus is at
+        its largest. Built rather than arithmetic, so the scaffolding between
+        the fields is counted too.
+
+        BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
+        a construction the production path never makes bounds nothing. Two
+        details were missing when this test used 5-char stand-in ids and no
+        attach target, and together they cost 209 chars, enough to put the
+        real call over a budget this test reported as met. Both are now
+        asserted rather than assumed, because either could be quietly undone
+        by an edit that still left the test green: candidate ids are the
+        36-char uuids every record actually carries (all 104 in
+        ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+        ``build_judge_prompt`` renders ``- id:`` UN-elided), and
+        ``attach_target_id`` is passed, because ``judge_write`` forwards it on
+        EVERY call — so its line is part of the worst case, not an extra.
+
+        THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
+        field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
+        ``_FIELD_CHARS`` PLUS ``_ELIDED_MARKER`` — so the input that elides
+        renders 9 chars wider per field, 54 across a full slate, than the
+        input that merely fills. A worst case built at the cap is therefore
+        not the worst case; it is the widest input that never trips the
+        behaviour this budget exists to bound.
+
+        The ceiling is a module constant, not a literal here, so the budget
+        has one home — raising it is an edit to the thing being budgeted,
+        made next to the C1 rationale, rather than a number quietly relaxed in
+        a test.
+        """
+        maximal = 'x' * (_FIELD_CHARS + 1)
+        candidates = [
+            _result(str(uuid.uuid4()), 0.9, content=maximal)
+            for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+        ]
+        assert {len(c.id) for c in candidates} == {36}, (
+            'the slate must carry the 36-char uuids production carries — a '
+            'shorter stand-in id under-measures every candidate line'
+        )
+        rendered = build_judge_prompt(
+            maximal, candidates, attach_target_id=candidates[0].id,
+        )
+        assert _ELIDED_MARKER in rendered, (
+            'the worst case must be an ELIDED render — otherwise it misses '
+            'the marker _elide appends, and under-measures the real ceiling'
+        )
+        assert f'  attach_target: {candidates[0].id}' in rendered, (
+            'the attach_target line is rendered on every production call, so '
+            'a worst case measured without it is not the worst case'
+        )
+        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
+        assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
+            f'worst-case prompt is {worst_case} chars against a budget of '
+            f'{judge_module._PROMPT_CHAR_BUDGET}'
+        )
 
 
 class TestParseJudgeVerdict:
@@ -138,10 +408,6 @@ class TestParseJudgeVerdict:
     read exactly like a healthy one answering "nothing matched".
     """
 
-    def test_judge_output_error_is_an_exception_subclass(self) -> None:
-        """Module-local, so a caller can distinguish it from a transport error."""
-        assert issubclass(JudgeOutputError, Exception)
-
     @pytest.mark.parametrize(
         ('word', 'outcome'),
         [
@@ -154,6 +420,34 @@ class TestParseJudgeVerdict:
     )
     def test_a_bare_json_object_round_trips(self, word: str, outcome: str) -> None:
         """The happy path: exactly what `response_format=json_object` returns."""
+        assert parse_judge_verdict(_payload(word)) == outcome
+
+    @pytest.mark.parametrize(
+        ('word', 'outcome'),
+        [
+            ('Restates', OUTCOME_RESTATED),
+            (' restates ', OUTCOME_RESTATED),
+            ('RESTATES', OUTCOME_RESTATED),
+            ('\nAmends\n', OUTCOME_AMENDED),
+            ('  Contests', OUTCOME_CONTESTED),
+            ('Distinct\t', OUTCOME_STORED),
+        ],
+        ids=['title-case', 'padded', 'upper', 'newline-wrapped',
+             'leading-space', 'trailing-tab'],
+    )
+    def test_case_and_whitespace_are_normalised(
+        self, word: str, outcome: str,
+    ) -> None:
+        """`.strip().lower()` is load-bearing, and nothing else pinned it.
+
+        Every other case in this class is already bare lowercase, so deleting
+        the normalisation left the whole suite green while turning a model
+        that answered `"Restates"` — an entirely reasonable thing for an LLM
+        to emit through a JSON schema that does not enumerate the casing —
+        into a `JudgeOutputError` on EVERY middle-band write. That is a
+        counted fail-open per write, which surfaces as a storm escalation
+        describing an outage that is not happening.
+        """
         assert parse_judge_verdict(_payload(word)) == outcome
 
     def test_a_fenced_json_block_parses(self) -> None:
@@ -298,6 +592,58 @@ def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> Band
     return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
 
 
+#: The repo root, reached from `<repo>/fused-memory/tests/server/`.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: The flip gate's own attach-target checker, and the tree it reads.
+_PROBE_PATH = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
+_JUDGE_SRC_ROOT = _REPO_ROOT / 'fused-memory' / 'src'
+
+
+def _marked_ids(candidates: list[MemoryResult], attach_target_id: str) -> set[str]:
+    """Which candidate ids the attach-target mark names, read from the DIFF.
+
+    Diffed against the same slate rendered with no target rather than grepped
+    for a mark's spelling: what the invariant asserts is that naming a target
+    changes the rendering in a way attributable to a specific candidate, which
+    is exactly what `check_write_triage_attach_target.py::_swap_verdict`
+    measures. A test keyed on the literal mark text would instead pin the
+    mechanism and pass for a marker that names the wrong record.
+    """
+    unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+    marked = build_judge_prompt(
+        'new', candidates, attach_target_id=attach_target_id,
+    )
+    added = set(marked.splitlines()) - set(unmarked.splitlines())
+    return {
+        candidate.id
+        for candidate in candidates
+        for line in added
+        if candidate.id in line
+    }
+
+
+def _added_lines(candidates: list[MemoryResult], attach_target_id: str) -> list[str]:
+    """The lines naming a target ADDS to the rendering, in order.
+
+    A LIST, not a set. `_marked_ids` answers "which candidates does the mark
+    name", which is the right question for a marker that names the wrong
+    record — but it cannot see a marker that names TWO records whose ids
+    happen to collapse, and a set-valued assertion reads the same either way.
+    The count is its own invariant: AT MOST ONE candidate is ever marked, so
+    a second mark has to show up as a visible extra element rather than be
+    absorbed. Spelling-independent — it diffs against the same slate rendered
+    with no target instead of grepping for the mark's text.
+    """
+    unmarked = build_judge_prompt(
+        'new', candidates, attach_target_id=None,
+    ).splitlines()
+    marked = build_judge_prompt(
+        'new', candidates, attach_target_id=attach_target_id,
+    ).splitlines()
+    return [line for line in marked if line not in unmarked]
+
+
 class TestSelectJudgeCandidates:
     """Which of the retrieved results the judge actually gets to see.
 
@@ -378,14 +724,34 @@ class TestSelectJudgeCandidates:
         result set at all. The parent is what the attach targets, so when the
         hoisted id is absent the CHILD that carried the evidence must stay —
         dropping both would leave the judge with no view of the match at all.
+
+        The child is scored BELOW every peer on purpose. Scored above them it
+        is plain top-1, an unconditional `sorted(...)[:n]` returns the same
+        slate, and the branch this test names is never the reason it passes —
+        which is why deleting the `PARENT_ID_KEY` fallback outright used to
+        leave the whole suite green. At 0.55 against six records at
+        0.90..0.85 the rescue arm is the ONLY thing that can put it in.
+
+        The eviction victim is asserted too. The sibling
+        `test_the_bands_winner_is_always_present` checks membership and
+        `len <= n`, so a rescue that dropped the STRONGEST candidate instead
+        of the weakest would satisfy both it and a bare `in` check here.
         """
         child = _result(
-            'child-1', 0.97,
+            'child-1', 0.55,
             extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
         )
-        results = [child, *[_result(f'm{i}', 0.90 - i / 100) for i in range(6)]]
-        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
-        assert 'child-1' in [r.id for r in selected]
+        peers = [_result(f'm{i}', 0.90 - i / 100) for i in range(6)]
+        selected = select_judge_candidates(
+            [child, *peers], 3, canonical_id='parent-1',
+        )
+        ids = [r.id for r in selected]
+        assert 'child-1' in ids
+        # The rescue EVICTS rather than widens: still exactly n.
+        assert len(selected) == 3
+        # And it evicts the WEAKEST of the window (m2 at 0.88), not an
+        # arbitrary one — m0 and m1 are the two strongest and both survive.
+        assert ids == ['m0', 'm1', 'child-1']
 
     def test_an_empty_input_returns_empty_without_raising(self) -> None:
         """Nothing to compare is a decision, not a failure."""
@@ -495,6 +861,272 @@ class TestBuildJudgePrompt:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
 
+    # --- the attach target (gate item 1, option (b)) -------------------------
+    #
+    # `select_judge_candidates` guarantees the band's winner is in the slate
+    # but NOT where it sits: the hoisted-parent rescue APPENDS the evidence
+    # child, so the attach target is LAST there and first on a flat slate.
+    # Position is therefore not a sound encoding of "the candidate this
+    # verdict will be filed against" — the prompt has to name it.
+    # `plans/write-triage-attach-target-contradiction.md` §2 carries the
+    # measurement; `scripts/check_write_triage_flip_preconditions.sh` item 1
+    # is the gate that reads it.
+
+    def test_the_named_candidate_is_the_only_one_marked(self) -> None:
+        """A flat slate: the mark lands on the id it was asked for, alone."""
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        marked = _marked_ids(candidates, 'm1')
+        assert marked == {'m1'}
+
+    def test_a_hoisted_parent_marks_the_child_that_carries_the_evidence(
+        self,
+    ) -> None:
+        """The canonical id can be absent from the slate ENTIRELY.
+
+        `_canonical_id_of` hoists a child winner to its parent id, so
+        `decision.canonical_id` names a record retrieval never returned. The
+        child carrying `PARENT_ID_KEY` is the one the judge is really looking
+        at, and a naive `r.id == canonical_id` marker marks NOTHING here —
+        which is the silent version of the defect, not a fix for it.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        candidates = [_result('m0', 0.90), _result('m1', 0.89), child]
+        assert 'parent-1' not in [c.id for c in candidates]
+        assert _marked_ids(candidates, 'parent-1') == {'child-1'}
+
+    def test_the_target_is_marked_wherever_it_sits_in_the_slate(self) -> None:
+        """Built through `select_judge_candidates`, so the rescue produces it.
+
+        The rescue appends (`[*selected[: max(n - 1, 0)], winner]`), so the
+        attach target lands LAST. A marker keyed on position — `candidates[0]`
+        — marks the wrong record on exactly this slate, and the gate's own
+        report says so.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        results = [*[_result(f'm{i}', 0.90 - i / 100) for i in range(6)], child]
+        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
+        assert [r.id for r in selected] == ['m0', 'm1', 'child-1']
+        assert _marked_ids(selected, 'parent-1') == {'child-1'}
+
+    def test_an_unrecognised_target_marks_nothing_and_does_not_perturb(
+        self,
+    ) -> None:
+        """The mark MATCHES against the slate; it does not echo its argument.
+
+        This is the control `scripts/check_write_triage_attach_target.py`
+        applies (`_echoes_argument`): an implementation that merely
+        interpolates the value satisfies a swap test while binding no verdict
+        to any candidate. A matcher recognises neither nonce and renders the
+        same prompt for both — and the same prompt as for no target at all.
+        """
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+        first = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-1',
+        )
+        second = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-2',
+        )
+        assert first == unmarked
+        assert second == unmarked
+        assert first == second
+        assert 'not-on-this-slate-1' not in first
+        assert 'not-on-this-slate-2' not in second
+
+    def test_two_targets_on_one_slate_render_differently(self) -> None:
+        """The swap test the gate applies: the rendering DEPENDS on the target.
+
+        Necessary and not sufficient on its own — hence the echo control
+        above — but a prompt that renders identically for two different attach
+        targets has told the model nothing about which candidate the verdict
+        will be filed against.
+        """
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        first = build_judge_prompt('new', candidates, attach_target_id='m0')
+        second = build_judge_prompt('new', candidates, attach_target_id='m2')
+        assert first != second
+        first_only = set(first.splitlines()) - set(second.splitlines())
+        second_only = set(second.splitlines()) - set(first.splitlines())
+        assert any('m0' in line for line in first_only)
+        assert any('m2' in line for line in second_only)
+
+    # --- AT MOST ONE candidate is ever marked -------------------------------
+    #
+    # The two clauses above ("is this the id?" / "does this carry that
+    # `parent_id`?") are both true SOMEWHERE on a slate holding a canonical
+    # parent AND one of its children, and that is the ordinary consolidated-
+    # topic case, not an exotic one: `_canonical_id_of` hoists a child winner
+    # to its parent id and `retrieve_candidates` returns children un-filtered,
+    # so parent+child co-occurrence in the top-n is expected. Deciding the
+    # question per candidate marks EVERY one of them, and the constant
+    # instruction sentence — "The candidate marked `attach_target` is the one
+    # this verdict will be filed against" — is then simply false. The target
+    # has to be resolved ONCE for the whole slate, with the same ORDERED
+    # precedence `select_judge_candidates`' rescue arm uses.
+
+    def test_a_parent_and_its_child_on_one_slate_are_marked_once(self) -> None:
+        """The regression: two clauses, both true, must still yield ONE mark."""
+        child = _result(
+            'child-1', 0.95,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        selected = select_judge_candidates(
+            [_result('parent-1', 0.90), child], 5, canonical_id='parent-1',
+        )
+        assert {r.id for r in selected} == {'parent-1', 'child-1'}
+        assert _marked_ids(selected, 'parent-1') == {'parent-1'}
+        assert _added_lines(selected, 'parent-1') == [
+            '  attach_target: parent-1',
+        ]
+
+    def test_several_children_do_not_multiply_the_mark(self) -> None:
+        """More children of the same parent must not mean more marks.
+
+        A consolidated topic accretes amendments, so three children of one
+        parent is the steady state rather than the edge. Per-candidate
+        evaluation scales the defect with the topic's age.
+        """
+        children = [
+            _result(
+                f'child-{i}', 0.95 - i / 100,
+                extra_metadata={
+                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
+                },
+            )
+            for i in range(3)
+        ]
+        candidates = [*children, _result('parent-1', 0.80)]
+        assert _marked_ids(candidates, 'parent-1') == {'parent-1'}
+        assert _added_lines(candidates, 'parent-1') == [
+            '  attach_target: parent-1',
+        ]
+
+    def test_an_exact_id_wins_over_a_child_that_points_at_it(self) -> None:
+        """Precedence is EXACT-ID-FIRST, and does not depend on slate order.
+
+        The same ordered `next(...) or next(...)` the rescue arm uses: the
+        `PARENT_ID_KEY` clause is the FALLBACK for a hoisted parent that is
+        absent from the slate, not a co-equal alternative. A resolver that
+        merely took the first candidate satisfying EITHER clause would mark
+        the child whenever the child outranks its parent — which is the
+        common case, since the child is why the parent was hoisted.
+        """
+        def _slate(child_first: bool) -> list[MemoryResult]:
+            child = _result(
+                'child-1', 0.95,
+                extra_metadata={
+                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
+                },
+            )
+            parent = _result('parent-1', 0.90)
+            return [child, parent] if child_first else [parent, child]
+
+        for child_first in (True, False):
+            candidates = _slate(child_first)
+            assert _marked_ids(candidates, 'parent-1') == {'parent-1'}, (
+                f'child_first={child_first}'
+            )
+            assert _added_lines(candidates, 'parent-1') == [
+                '  attach_target: parent-1',
+            ], f'child_first={child_first}'
+
+    def test_the_single_mark_holds_on_the_shapes_that_already_worked(
+        self,
+    ) -> None:
+        """Regression guard: neither existing shape may lose or gain a mark.
+
+        The flat exact-id slate and the HOISTED slate (the parent id absent
+        entirely, only the child carrying `PARENT_ID_KEY`) are what the two
+        clauses exist for. Resolving one target for the whole slate must leave
+        both marking exactly what they marked before — the fallback clause is
+        narrowed in precedence, not removed.
+        """
+        flat = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        assert _marked_ids(flat, 'm1') == {'m1'}
+        assert _added_lines(flat, 'm1') == ['  attach_target: m1']
+
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        hoisted = [_result('m0', 0.90), _result('m1', 0.89), child]
+        assert 'parent-1' not in [c.id for c in hoisted]
+        assert _marked_ids(hoisted, 'parent-1') == {'child-1'}
+        assert _added_lines(hoisted, 'parent-1') == [
+            '  attach_target: child-1',
+        ]
+
+    def test_the_echo_control_still_holds_on_a_parent_and_child_slate(
+        self,
+    ) -> None:
+        """Resolving one target must not turn the marker into an echo.
+
+        Same control as `test_an_unrecognised_target_marks_nothing_and_does_
+        not_perturb`, re-applied to the slate the fix is about: an id naming
+        no candidate — and no `PARENT_ID_KEY` pointing at it — still renders
+        exactly as no target at all, and two such nonces render identically.
+        That is what `check_write_triage_attach_target.py::_echoes_argument`
+        separates a real marker from a free-text parameter by.
+        """
+        child = _result(
+            'child-1', 0.95,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        candidates = [child, _result('parent-1', 0.90)]
+        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+        first = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-1',
+        )
+        second = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-2',
+        )
+        assert first == unmarked
+        assert second == unmarked
+        assert first == second
+        assert 'not-on-this-slate-1' not in first
+        assert 'not-on-this-slate-2' not in second
+
+
+class TestAttachTargetGateProbe:
+    """The flip gate's own checker, run against this worktree's source.
+
+    `scripts/check_write_triage_flip_preconditions.sh` item 1 delegates to
+    `scripts/check_write_triage_attach_target.py`, which asserts the INVARIANT
+    (a verdict binds to a determinate candidate) rather than any mechanism.
+    Running the gate's own probe as the oracle is what keeps this suite and
+    the gate from ever disagreeing about whether item 1 is closed — nothing
+    about the invariant is re-implemented here.
+    """
+
+    def test_the_probe_reports_a_clean_pass(self) -> None:
+        """Exit 0, and NOT the `PASS-NEEDS-CONFIRMATION` downgrade.
+
+        The downgrade means the marker echoed its argument and was forgiven
+        only because the parameter is target-NAMED; it demands an operator
+        eyeball before the flip. A marker that matches against the slate earns
+        the clean pass instead.
+        """
+        if not _PROBE_PATH.exists():
+            pytest.skip(f'attach-target probe not present at {_PROBE_PATH}')
+        completed = subprocess.run(
+            [sys.executable, str(_PROBE_PATH), '--src-root', str(_JUDGE_SRC_ROOT)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert (
+            'PASS  the judge path binds a verdict to a determinate candidate'
+            in completed.stdout
+        ), completed.stdout
+        assert 'PASS-NEEDS-CONFIRMATION' not in completed.stdout, completed.stdout
+
 
 # ---------------------------------------------------------------------------
 # defensive config resolvers
@@ -540,9 +1172,6 @@ class TestResolveJudgeEnabled:
     operator would turn `enabled` on, silently get stub behaviour, and read
     the resulting all-`stored` ack stream as evidence the corpus is novel.
     """
-
-    def test_the_default_is_on(self) -> None:
-        assert _DEFAULT_JUDGE_ENABLED is True
 
     @pytest.mark.parametrize('value', [True, False])
     def test_a_configured_bool_is_used(self, value: bool) -> None:
@@ -823,11 +1452,31 @@ class TestEveryResolverReadsLive:
 # ---------------------------------------------------------------------------
 
 
+def _client_double() -> MagicMock:
+    """A client double that is its own async context manager, like the SDKs.
+
+    `AsyncOpenAI.__aenter__` and `AsyncAnthropic.__aenter__` both `return
+    self` (read off openai 2.31.0 / anthropic 0.92.0), so `async with
+    client as c` binds the SAME object. A bare `MagicMock` instead returns a
+    FRESH child from `__aenter__`, which would make every `create` assertion
+    in this file inspect a different mock than the one `_call_llm` called —
+    passing or failing for reasons that have nothing to do with the code.
+
+    `__aexit__` returns False, because the real ones do: releasing a client
+    must not suppress an in-flight exception (see `TestTheClientIsReleased`).
+    """
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
 def _openai_client(content: str | None) -> MagicMock:
     """A fake ``AsyncOpenAI`` yielding *content* as the message body.
 
     Same construction shape as ``test_classifier.py::_make_mock_client`` — the
-    established openai double in this repo.
+    established openai double in this repo, plus the async-CM protocol the
+    client is used through.
     """
     message = MagicMock()
     message.content = content
@@ -835,7 +1484,7 @@ def _openai_client(content: str | None) -> MagicMock:
     choice.message = message
     response = MagicMock()
     response.choices = [choice]
-    client = MagicMock()
+    client = _client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
     return client
 
@@ -857,7 +1506,7 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
     response = MagicMock()
     response.content = blocks
-    client = MagicMock()
+    client = _client_double()
     client.messages.create = AsyncMock(return_value=response)
     return client
 
@@ -874,6 +1523,118 @@ def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespac
     )
 
 
+def _creds_svc(**providers: object) -> types.SimpleNamespace:
+    """A service double carrying an `llm.providers.<name>` section per kwarg."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(),
+            llm=types.SimpleNamespace(
+                provider='openai',
+                model='m',
+                providers=types.SimpleNamespace(**providers),
+            ),
+        ),
+    )
+
+
+class TestProviderCredentials:
+    """The config -> SDK-kwargs hop, which had no coverage at all.
+
+    Replacing the whole body of `_provider_credentials` with `return {}` left
+    the suite green, so neither the `api_url` -> `base_url` RENAME nor the
+    `api_key` passthrough was pinned by anything. The rename is the part that
+    matters: both SDKs take `base_url`, so forwarding `api_url` verbatim is a
+    `TypeError` inside `_call_llm` — landing in `triage_write`'s fail-open arm
+    as a counted failure on every middle-band write, for a deployment that
+    pins a local OpenAI-compatible endpoint.
+    """
+
+    def test_a_configured_section_maps_onto_the_sdk_kwarg_names(self) -> None:
+        """`api_url` becomes `base_url`; `api_key` keeps its name."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-pinned', api_url='http://localhost:8000/v1',
+            ),
+        )
+        assert _provider_credentials(service, 'openai') == {
+            'api_key': 'sk-pinned',
+            'base_url': 'http://localhost:8000/v1',
+        }
+
+    def test_either_leaf_alone_is_forwarded(self) -> None:
+        """Pinning a key without an endpoint (and vice versa) is a real config."""
+        key_only = _creds_svc(openai=types.SimpleNamespace(api_key='sk-only'))
+        assert _provider_credentials(key_only, 'openai') == {'api_key': 'sk-only'}
+        url_only = _creds_svc(anthropic=types.SimpleNamespace(api_url='http://h/v1'))
+        assert _provider_credentials(url_only, 'anthropic') == {'base_url': 'http://h/v1'}
+
+    @pytest.mark.parametrize(
+        ('label', 'service'),
+        [
+            ('no providers section', _svc(llm=types.SimpleNamespace(
+                provider='openai', model='m', providers=None,
+            ))),
+            ('no entry for this provider', _creds_svc(
+                anthropic=types.SimpleNamespace(api_key='sk-other'),
+            )),
+            ('entry with neither leaf', _creds_svc(
+                openai=types.SimpleNamespace(),
+            )),
+            ('no llm section', _svc()),
+            ('unspecced mock', Mock()),
+        ],
+        ids=['no-providers', 'other-provider-only', 'empty-entry',
+             'no-llm', 'unspecced-mock'],
+    )
+    def test_an_unconfigured_provider_yields_an_empty_dict(
+        self, label: str, service: object,
+    ) -> None:
+        """Empty is a FIRST-CLASS result: both SDKs fall back to the env.
+
+        That is how this deployment is actually configured (`OPENAI_API_KEY`
+        in the shell, nothing in config.yaml), so raising here would break the
+        shipped path rather than a misconfigured one. `other-provider-only`
+        also pins that a sibling provider's key is not handed to the arm that
+        was actually selected.
+        """
+        assert _provider_credentials(service, 'openai') == {}, label
+
+    @pytest.mark.parametrize('value', ['', None, 0, b'sk-bytes', object()])
+    def test_a_blank_or_non_string_leaf_is_not_forwarded(self, value: object) -> None:
+        """An empty string must not be sent as a credential.
+
+        `AsyncOpenAI(api_key='')` does NOT fall back to the environment — it
+        authenticates with an empty key and 401s, which reads as an outage
+        rather than as the empty-leaf config that caused it. Dropping it
+        restores the env fallback, which is the behaviour an operator who
+        cleared the leaf is asking for.
+        """
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key=value, api_url=value),
+        )
+        assert _provider_credentials(service, 'openai') == {}
+
+    @pytest.mark.asyncio
+    async def test_the_credentials_reach_the_sdk_constructor(self) -> None:
+        """The resolved kwargs are what the client is actually built with."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key='sk-wire', api_url='http://h/v1'),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_provider='openai', judge_model='test-model',
+        )
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+            await judge_write(
+                memory_service=service,
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+        }
+
+
 class TestJudgeWriteDecisionsThatAreNotFailures:
     """Two paths answer `stored` WITHOUT raising, and they must not be counted.
 
@@ -883,6 +1644,70 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
     would guarantee a storm escalation describing a failure that is not
     happening, which trains an operator to ignore the alarm.
     """
+
+    @pytest.mark.asyncio
+    async def test_the_disabled_branch_says_so_in_the_log(self, caplog) -> None:
+        """An unlogged kill switch is indistinguishable from a novel corpus.
+
+        This branch returns `stored` with no log line, no counter and nothing
+        on the ack to tell it apart — reproducing exactly the state
+        `_DEFAULT_JUDGE_ENABLED = True` is justified against in its own
+        comment: "the operator would flip `enabled`, get stub behaviour, and
+        read the all-`stored` ack stream as evidence the corpus is novel".
+        Defaulting the knob to True does not help the operator who sets it to
+        False and then reads the logs.
+
+        INFO, not a counter: the reviewer is right that counting this would be
+        wrong. It is a decision, not a failure, and routing it through the
+        fail-open counter would fire a storm escalation describing an outage
+        that is not happening.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(judge_enabled=False),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == OUTCOME_STORED
+        disabled = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'judge_enabled' in r.getMessage()
+        ]
+        assert disabled, [r.getMessage() for r in caplog.records]
+        message = disabled[0].getMessage()
+        assert OUTCOME_STORED in message, message
+
+    @pytest.mark.asyncio
+    async def test_the_enabled_path_emits_no_such_record(self, caplog) -> None:
+        """One line per write is affordable only while the switch is ENGAGED."""
+        client = _openai_client(_payload('restates'))
+        with caplog.at_level(logging.INFO), \
+                patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert not [
+            r for r in caplog.records if 'judge_enabled' in r.getMessage()
+        ], [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_the_empty_slate_branch_stays_quiet(self, caplog) -> None:
+        """Deliberately NOT logged: it is per-write and would be noise.
+
+        The kill switch is an operator ACTION and is worth a line per write
+        while it is engaged; "this write matched nothing comparable" is the
+        ordinary case and would drown it.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision(None), candidates=[],
+            )
+        assert verdict == OUTCOME_STORED
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_a_disabled_judge_answers_stored_and_makes_no_call(self) -> None:
@@ -930,6 +1755,104 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
         client.chat.completions.create.assert_not_awaited()
 
 
+class TestJudgeWriteNamesTheAttachTarget:
+    """The band names the target; the prompt has to say which candidate it is.
+
+    `select_judge_candidates` guarantees the winner is IN the slate but not
+    WHERE — the hoisted-parent rescue appends it — so a judge shown an
+    unmarked slate is answering about a set, while the attach touches exactly
+    one record in it. Gate item 1
+    (`scripts/check_write_triage_flip_preconditions.sh`) is that gap.
+    """
+
+    @staticmethod
+    def _sent_prompt(client: MagicMock) -> str:
+        """The user turn that actually reached the provider."""
+        messages = client.chat.completions.create.await_args.kwargs['messages']
+        return next(m['content'] for m in messages if m['role'] == 'user')
+
+    @pytest.mark.asyncio
+    async def test_the_bands_hoisted_winner_is_marked_in_the_sent_prompt(
+        self,
+    ) -> None:
+        """`decision.canonical_id` names a parent absent from the slate.
+
+        Read off the prompt the fake provider was actually handed, not off a
+        patched renderer — what matters is what the model sees.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('parent-1'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89), child],
+            )
+        prompt = self._sent_prompt(client)
+        marked = [line for line in prompt.splitlines() if 'attach_target:' in line]
+        assert marked == ['  attach_target: child-1'], prompt
+
+    @pytest.mark.asyncio
+    async def test_a_decision_naming_nothing_marks_nothing(self) -> None:
+        """A band decision with no canonical id must not mark an arbitrary row.
+
+        Marking `candidates[0]` "because something has to be the target" is
+        the exact defect: it would tell the model a record is the attach
+        target when nothing said so.
+        """
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision(None),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
+            )
+        prompt = self._sent_prompt(client)
+        assert [line for line in prompt.splitlines() if 'attach_target:' in line] == []
+
+    @pytest.mark.asyncio
+    async def test_the_selector_and_the_renderer_are_given_the_same_id(self) -> None:
+        """ONE expression for "the band's winner" on this path.
+
+        The selector guarantees the winner is present and the renderer marks
+        it; feeding them different ids would let the prompt mark a record the
+        selector never promised to keep, and neither call site would look
+        wrong on its own.
+        """
+        client = _openai_client(_payload('restates'))
+        with (
+            patch('openai.AsyncOpenAI', return_value=client),
+            patch.object(
+                judge_module, 'select_judge_candidates',
+                wraps=judge_module.select_judge_candidates,
+            ) as selector,
+            patch.object(
+                judge_module, 'build_judge_prompt',
+                wraps=judge_module.build_judge_prompt,
+            ) as renderer,
+        ):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
+            )
+        assert selector.call_args.kwargs['canonical_id'] == 'm1'
+        assert renderer.call_args.kwargs['attach_target_id'] == 'm1'
+        assert (
+            renderer.call_args.kwargs['attach_target_id']
+            == selector.call_args.kwargs['canonical_id']
+        )
+
+
 class TestJudgeWriteOpenAIArm:
     """The shipped arm: `llm.provider` is openai on this deployment."""
 
@@ -972,7 +1895,7 @@ class TestJudgeWriteOpenAIArm:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs['model'] == 'pinned-model'
         assert kwargs['temperature'] == 0.0
-        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
         assert kwargs['response_format'] == {'type': 'json_object'}
         assert kwargs['messages'][0] == {
             'role': 'system', 'content': JUDGE_SYSTEM_PROMPT,
@@ -1032,8 +1955,33 @@ class TestJudgeWriteAnthropicArm:
         kwargs = client.messages.create.call_args.kwargs
         assert kwargs['system'] == JUDGE_SYSTEM_PROMPT
         assert kwargs['model'] == 'pinned-model'
-        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
         assert [m['role'] for m in kwargs['messages']] == ['user']
+
+    @pytest.mark.asyncio
+    async def test_this_arm_is_pinned_deterministic_like_the_other(self) -> None:
+        """`temperature=0.0` on BOTH arms — the openai one already had it.
+
+        Omitting it here does not mean "unset": Anthropic's default is 1.0,
+        so this arm was sampling. `_call_llm`'s own docstring scopes only
+        `response_format` to one provider, so the asymmetry contradicts the
+        module's stated contract as well as the openai arm.
+
+        It is not cosmetic. This is a classifier answering ONE word from a
+        closed vocabulary under a 64-token cap with no JSON mode on this arm,
+        so sampling buys nothing and raises the odds of a preamble or a
+        truncated payload — each of which is a `JudgeOutputError`, and
+        therefore a COUNTED fail-open on the write path rather than a bad
+        answer.
+        """
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert client.messages.create.call_args.kwargs['temperature'] == 0.0
 
     @pytest.mark.asyncio
     async def test_a_non_text_first_block_does_not_crash_the_read(self) -> None:
@@ -1053,6 +2001,129 @@ class TestJudgeWriteAnthropicArm:
         assert verdict == OUTCOME_RESTATED
 
 
+class TestTheClientIsReleased:
+    """The SDK client is built per middle-band write and must not be leaked.
+
+    `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
+    write. Neither defines `__del__` (verified against openai 2.31.0), so an
+    unclosed client abandons an `httpx` connection pool — sockets and TLS
+    state — to the garbage collector, on a path that runs once per write in a
+    single long-lived server process.
+
+    The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
+    to a config that hot-reloads would pin a stale `model`/`api_url` past a
+    reload the operator was told had applied, silently turning a green-tier
+    knob into a restart-only one. That rationale is fully preserved by
+    closing the client at the end of the call, which is what these tests pin.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released_on_the_happy_path(self) -> None:
+        client = (_openai_client(_payload('restates')))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released_on_the_happy_path(self) -> None:
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('amends'))],
+        )
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('provider', 'ctor', 'attr'),
+        [
+            ('openai', 'openai.AsyncOpenAI', 'chat'),
+            ('anthropic', 'anthropic.AsyncAnthropic', 'messages'),
+        ],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_client_is_released_on_the_timeout_path(
+        self, provider: str, ctor: str, attr: str,
+    ) -> None:
+        """The WORST case, and the one an `await ...; close()` shape misses.
+
+        `asyncio.wait_for` CANCELS the in-flight request, so a close written
+        after the awaited call never runs — the pool is abandoned precisely
+        when the provider is slow, i.e. exactly when writes are piling up.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = _client_double()
+        if provider == 'openai':
+            client.chat.completions.create = AsyncMock(side_effect=_hang)
+        else:
+            client.messages.create = AsyncMock(side_effect=_hang)
+        with patch(ctor, return_value=client), pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc(provider, judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_transport_raises(self) -> None:
+        """A release must not depend on the call having succeeded."""
+        client = _client_double()
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('module_name', 'attr'),
+        [('openai', 'AsyncOpenAI'), ('anthropic', 'AsyncAnthropic')],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_real_clients_exit_does_not_swallow_an_exception(
+        self, module_name: str, attr: str,
+    ) -> None:
+        """A NEW dependency the `async with` introduces, pinned against the SDKs.
+
+        `async with` delegates the suppression decision to the object: an
+        `__aexit__` returning True swallows the in-flight exception. That
+        would hand `triage_write` a silent success and destroy `_call_llm`'s
+        "NO try/except ANYWHERE" property — no `exc_info` log, no counted
+        fail-open, and a broken judge reading exactly like a healthy one
+        answering "nothing matched" (INV-4).
+
+        The doubles above cannot pin this, because a double asserts only what
+        it was told to return. So this asks the REAL client classes, which is
+        where the contract actually lives, and it is what would fail if an SDK
+        upgrade ever started suppressing. No network: `__aexit__` closes the
+        transport and returns.
+        """
+        module = pytest.importorskip(module_name)
+        client = getattr(module, attr)(api_key='sk-not-used')
+        suppressed = await client.__aexit__(
+            RuntimeError, RuntimeError('boom'), None,
+        )
+        assert not suppressed, (
+            f'{attr}.__aexit__ returned {suppressed!r}; a truthy value would '
+            f'make `async with` swallow a judge failure into a silent `stored`'
+        )
+
+
 class TestJudgeWriteFailuresRaise:
     """Every failure PROPAGATES. `triage_write` owns the fail-open counting.
 
@@ -1064,7 +2135,7 @@ class TestJudgeWriteFailuresRaise:
 
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -1086,12 +2157,36 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
             await judge_write(
                 memory_service=_judge_svc(judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_hang_past_the_timeout_raises_on_the_anthropic_arm_too(
+        self,
+    ) -> None:
+        """The timeout is per-ARM, and only the openai arm was pinned.
+
+        `_call_llm` wraps each arm in its own `asyncio.wait_for`, so a bound
+        that was dropped from one of them would leave that deployment on the
+        SDK's 600s default while this suite stayed green — the wedge described
+        in the openai case above, reachable by flipping one config key.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = _client_double()
+        client.messages.create = AsyncMock(side_effect=_hang)
+        with patch('anthropic.AsyncAnthropic', return_value=client), \
+                pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc('anthropic', judge_timeout_seconds=0.01),
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
@@ -1187,7 +2282,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):

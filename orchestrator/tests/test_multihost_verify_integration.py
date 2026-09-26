@@ -35,6 +35,18 @@ injected clock) and measure observed, rather than computed, overlap.
   B8  liveness-margin guard — check_merge_liveness_margin
 
 Headline λ gate (queueing-model + provenance): test_queueing_model_direction_and_provenance_and_zero_drift
+
+NOTE on seams (PRD plans/merge-lane-quality-prd.md task γ)
+---------------------------------------------------------
+Nothing here reaches into the merge lane.  The verify PORT is injected
+(``FakeVerifier``), which is also what the per-land cross-check's local
+trust anchor runs on -- ``_run_post_merge_verify`` builds its ``LocalRunner``
+with ``run_scoped=verifier.run_scoped``, so the injected port IS that leg's
+verdict and ``verifier.verified`` is the exact cross-check ran/skipped
+signal.  The host-monitor scenarios drive a RUNNING ``MergeLane`` over a real
+git repository, take their fault from the remote runner's own transport, and
+observe it through ``snapshot()['hosts']``, the escalation queue, the event
+store and the ``MergeOutcome`` futures.
 """
 from __future__ import annotations
 
@@ -42,19 +54,33 @@ import asyncio
 import contextlib
 import logging
 import math
+import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, passes
+from _orch_helpers import wait_responsive
+from test_merge_queue_concurrent_verify import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    PYPROJECT_DEFAULT_TIMEOUT,
+    _inject_two_host_allocator,
+    _make_branch_with_file,
+    _timeout_mark_offenders,
+    _worst_per_method_wait_budget,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
+    PRODUCTION_CLOCK,
+    MergeRequest,
     PersistentWorktreeConfigError,
-    SpeculativeItem,
-    SpeculativeMergeWorker,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
@@ -648,10 +674,10 @@ class _FakeEscalationQueue:
 
     def __init__(self) -> None:
         self.submitted: list[Any] = []
-        self._has_open_l1: bool = False
+        self.open_l1: bool = False
 
     def has_open_l1(self, task_id: str) -> bool:
-        return self._has_open_l1
+        return self.open_l1
 
     def make_id(self, task_id: str) -> str:
         return f'{task_id}-esc-{len(self.submitted)}'
@@ -758,7 +784,7 @@ class TestDriftDivergenceAlarm:
         assert pool.is_quarantined('laptop'), 'laptop must be quarantined after DIVERGE'
 
         # --- Second check with dedup flag set → no second submit, quarantine held ---
-        esc_queue._has_open_l1 = True
+        esc_queue.open_l1 = True
         result2 = await detector.check(sha, _make_spec())
 
         # Laptop quarantined → eligible_remote()=None → INCONCLUSIVE (no submit path)
@@ -1123,380 +1149,15 @@ class TestQueueingModelAndProvenance:
 
 
 # ---------------------------------------------------------------------------
-# 1795/step-15 RED: _reprobe_loop lifecycle + capstone USER-OBSERVABLE SIGNAL
-# ---------------------------------------------------------------------------
-
-
-def _make_minimal_worker() -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker with no real git ops needed."""
-    git_ops = MagicMock()
-    git_ops.project_root = None
-    # GitOps.cleanup_merge_worktree is async, and a bare MagicMock attribute is
-    # not awaitable.  _finalize_inflight's RUNNER_UNAVAILABLE branch reaches it
-    # via _release_or_cleanup (task 3251), so the stand-in must model the
-    # coroutine or every RU finalize test dies on "MagicMock can't be used in
-    # 'await' expression" long before its own assertions run.
-    git_ops.cleanup_merge_worktree = AsyncMock()
-    q: asyncio.Queue = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-    worker._shutdown_timeout = 2.0
-    return worker
-
-
-def _make_minimal_escalation_queue():
-    """Minimal fake escalation queue used in capstone tests."""
-    class _FakeEQ:
-        def __init__(self):
-            self._seq = 0
-            self._open_l1 = False
-            self._by_task: dict = {}
-            self.submitted: list = []
-            self.resolved: list = []
-
-        def has_open_l1(self, task_id: str) -> bool:
-            return self._by_task.get(task_id, False)
-
-        def make_id(self, task_id: str) -> str:
-            self._seq += 1
-            return f'esc-{self._seq}'
-
-        def submit(self, esc) -> None:
-            self.submitted.append(esc)
-            # track open L1s by task_id
-            if getattr(esc, 'level', 0) == 1:
-                self._by_task[esc.task_id] = True
-
-        def get_by_task(self, task_id: str, status: str | None = None) -> list:
-            return []
-
-        def resolve(self, esc_id: str, resolution: str, **kw) -> None:
-            self.resolved.append((esc_id, resolution))
-
-        def seed_open_l1(self, task_id: str) -> None:
-            """Mark task_id as having an open L1 alarm (simulates streak-path alarm having fired)."""
-            self._by_task[task_id] = True
-    return _FakeEQ()
-
-
-@pytest.mark.asyncio
-class TestReprobeLoopLifecycle:
-    """_reprobe_loop task lifecycle in SpeculativeMergeWorker.run()/stop() (task 1795 step-15).
-
-    RED until step-16 GREEN adds _reprobe_task and _reprobe_loop to run()/stop().
-    """
-
-    async def test_reprobe_task_initially_none(self):
-        """_reprobe_task is None before run() is called."""
-        worker = _make_minimal_worker()
-        # step-16 will set this to None in __init__; until then AttributeError is
-        # also an acceptable RED signal
-        val = getattr(worker, '_reprobe_task', 'MISSING')
-        assert val is None, (
-            f'_reprobe_task must be None before run(); got {val!r}'
-        )
-
-    async def test_reprobe_task_created_by_run(self):
-        """run() creates _reprobe_task as a live asyncio.Task."""
-        worker = _make_minimal_worker()
-        worker._reprobe_interval_s = 9999.0  # never fires during test
-
-        worker_task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0)  # yield control so run() can create its tasks
-
-        try:
-            # RED: _reprobe_task not created by run() yet
-            assert hasattr(worker, '_reprobe_task'), (
-                '_reprobe_task attribute must exist after run() starts'
-            )
-            assert worker._reprobe_task is not None, (
-                '_reprobe_task must not be None after run() starts'
-            )
-            assert not worker._reprobe_task.done(), (
-                '_reprobe_task must not be done immediately after run() starts'
-            )
-        finally:
-            await worker.stop()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker_task
-
-    async def test_reprobe_task_cancelled_by_stop(self):
-        """stop() cancels and awaits _reprobe_task so it is done after stop() returns."""
-        worker = _make_minimal_worker()
-        worker._reprobe_interval_s = 9999.0
-
-        worker_task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0)
-
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-        # RED: _reprobe_task not managed by stop() yet
-        assert hasattr(worker, '_reprobe_task'), (
-            '_reprobe_task attribute must exist'
-        )
-        assert worker._reprobe_task is not None and worker._reprobe_task.done(), (
-            '_reprobe_task must be done after stop()'
-        )
-
-    async def test_reprobe_loop_survives_health_exception(self):
-        """_reprobe_loop catches exceptions from health() so it never crashes the worker."""
-        worker = _make_minimal_worker()
-        worker._reprobe_interval_s = 0.01  # fire quickly
-
-        # Inject a fake allocator with a host whose health() always raises
-        crashing_runner = MagicMock()
-        crashing_runner.health = AsyncMock(side_effect=RuntimeError('ssh exploded'))
-
-        from orchestrator.merge_queue import _HostUnavailability
-        worker._runner_unavailable['bad-host'] = _HostUnavailability(
-            streak=5, first_unavailable_at=0.0, reason='test crash',
-        )
-
-        fake_alloc = MagicMock()
-        fake_alloc.quarantined_remote_runners = MagicMock(
-            return_value=[('bad-host', crashing_runner)]
-        )
-        fake_alloc.clear_quarantine = MagicMock()
-        worker._host_allocator = fake_alloc
-
-        worker_task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0)
-
-        # Let the reprobe loop fire at least once (tiny interval)
-        await asyncio.sleep(0.05)
-
-        # Worker must still be running (loop survived the exception)
-        assert not worker_task.done(), (
-            '_reprobe_loop exception must not crash the worker task'
-        )
-
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-
-@pytest.mark.asyncio
-class TestUnreachableHostCapstone:
-    """End-to-end user-observable signal for unreachable-host escalation + auto-recovery.
-
-    Tests the full flow: remote unreachable → dedup'd L1 escalation →
-    reprobe clears quarantine + recovery event → host re-enters pool.
-
-    RED: recovery assertions fail until step-16 wires _reprobe_loop into run().
-    """
-
-    async def test_n_ru_events_produce_exactly_one_escalation(self):
-        """N consecutive RunnerUnavailable finalize events → exactly one L1 escalation."""
-        import asyncio
-        from unittest.mock import patch
-
-        from orchestrator.merge_queue import (
-            InflightEntry,
-            InflightStatus,
-            InflightVerifyResult,
-            ItemLifecycleState,
-            MergeRequest,
-            RealMergeItem,
-        )
-        from orchestrator.verify_runner import HostLease
-
-        n = 2
-        worker = _make_minimal_worker()
-        worker._unreachable_escalate_after_n = n
-        eq = _make_minimal_escalation_queue()
-        worker._escalation_queue = eq
-
-        fake_alloc = MagicMock()
-        fake_alloc.quarantine_and_release = AsyncMock()
-        fake_alloc.release = AsyncMock()
-        fake_alloc.cancel_and_release = AsyncMock()
-        worker._host_allocator = fake_alloc
-
-        def _make_entry(host_name: str, reason: str):
-            loop = asyncio.get_running_loop()
-            config = OrchestratorConfig(
-                project_root=Path('/tmp/fake'),
-            )
-            req = MergeRequest(
-                task_id='task-cap',
-                branch=QueuedBranch.parse('task/cap', config.git.branch_prefix),
-                worktree=MagicMock(),
-                pre_rebased=False,
-                task_files=[],
-                module_configs=[],
-                config=config,
-                result=loop.create_future(),
-            )
-            fake_runner = MagicMock()
-            fake_runner.name = host_name
-            fake_runner.is_local = False
-            lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
-            item = RealMergeItem(
-                request=req,
-                merge_result=MagicMock(merge_commit='abc123'),
-                merge_wt=MagicMock(),
-                base_sha='base',
-                speculative=False,
-            )
-            # task 2169 kappa: production always reaches _finalize_inflight
-            # via the registered DISPATCHING -> VERIFYING dispatch path; an
-            # unregistered entry here would spuriously fire the best-effort
-            # "rejected transition" escalation on every kappa-wired
-            # _note_transition call, polluting this test's L1 escalation count.
-            worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
-
-            async def _ru_verify():
-                return InflightVerifyResult(
-                    outcome=None, merge_wt=item.merge_wt,
-                    status=InflightStatus.RUNNER_UNAVAILABLE, reason=reason,
-                )
-
-            vt = asyncio.ensure_future(_ru_verify())
-            return InflightEntry(
-                item=item, lease=lease, verify_task=vt, merge_wt=item.merge_wt,
-                was_speculative=False,
-            )
-
-        remerged = MagicMock(spec=SpeculativeItem)
-        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
-            for _ in range(n):
-                entry = _make_entry('remote-host', 'ssh: connect refused')
-                await worker._finalize_inflight(entry)
-
-        l1_escs = [e for e in eq.submitted if getattr(e, 'level', 0) == 1]
-        assert len(l1_escs) == 1, (
-            f'Expected exactly 1 L1 escalation after {n} RU events; got {len(l1_escs)}'
-        )
-        assert 'remote-host' in l1_escs[0].task_id or 'remote-host' in l1_escs[0].summary
-
-    async def test_reprobe_clears_quarantine_on_recovery(self):
-        """After health() returns True, clear_quarantine is called and recovery event emitted.
-
-        This exercises _reprobe_quarantined_hosts directly (already implemented in step-14).
-        The reprobe loop (step-16) will wire this to run automatically.
-        """
-        from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _HostUnavailability, _verify_host_unreachable_sentinel
-
-        worker = _make_minimal_worker()
-        es = _RecordingEventStore()
-        worker._event_store = es  # type: ignore[assignment]
-
-        eq = _make_minimal_escalation_queue()
-        worker._escalation_queue = eq
-
-        recovering_runner = MagicMock()
-        recovering_runner.health = AsyncMock(return_value=True)
-
-        fake_alloc = MagicMock()
-        fake_alloc.quarantined_remote_runners = MagicMock(
-            return_value=[('good-host', recovering_runner)]
-        )
-        fake_alloc.clear_quarantine = MagicMock()
-        # task 3043: reprobe is tracker-driven and re-engages via readmit(), so
-        # the double must answer the new allocator API honestly — a bare
-        # MagicMock would hand back a MagicMock "runner" for every name.
-        fake_alloc.remote_runner = MagicMock(
-            side_effect=lambda n: recovering_runner if n == 'good-host' else None
-        )
-        fake_alloc.is_parked = MagicMock(return_value=False)
-        fake_alloc.readmit = MagicMock()
-        worker._host_allocator = fake_alloc
-
-        now = 1000.0
-        worker._runner_unavailable['good-host'] = _HostUnavailability(
-            streak=3, first_unavailable_at=now - 300.0, reason='ssh timeout',
-        )
-        # Simulate the open L1 alarm that would have been filed by the streak-based
-        # path in _finalize_inflight (streak=3 >= default threshold=3).
-        eq.seed_open_l1(_verify_host_unreachable_sentinel('good-host'))
-
-        await worker._reprobe_quarantined_hosts(now)
-
-        # readmit(), not clear_quarantine(): recovery must also un-PARK the slot
-        # (task 3043) — clear_quarantine alone leaves a PARKED host unusable.
-        fake_alloc.readmit.assert_called_once_with('good-host')
-        assert 'good-host' not in worker._runner_unavailable
-
-        recovered_events = es.events_of(EventType.verify_host_recovered)
-        assert recovered_events, 'expected verify_host_recovered event after reprobe'
-
-    async def test_reprobe_loop_runs_automatically_and_clears_quarantine(self):
-        """USER-OBSERVABLE SIGNAL: _reprobe_loop started by run() fires automatically.
-
-        RED until step-16 wires _reprobe_loop into run() with a small interval.
-        """
-        from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _HostUnavailability, _verify_host_unreachable_sentinel
-
-        worker = _make_minimal_worker()
-        worker._reprobe_interval_s = 0.01  # fire almost immediately
-        worker._unreachable_escalate_after_secs = 9999.0  # only check via n-streak path
-
-        es = _RecordingEventStore()
-        worker._event_store = es  # type: ignore[assignment]
-
-        eq = _make_minimal_escalation_queue()
-        worker._escalation_queue = eq
-
-        # Remote runner that starts unhealthy then becomes healthy
-        remote_runner = MagicMock()
-        remote_runner.health = AsyncMock(return_value=False)
-
-        fake_alloc = MagicMock()
-        fake_alloc.quarantined_remote_runners = MagicMock(
-            return_value=[('loop-host', remote_runner)]
-        )
-        fake_alloc.clear_quarantine = MagicMock()
-        # task 3043: tracker-driven candidacy + readmit()-based re-engagement.
-        fake_alloc.remote_runner = MagicMock(
-            side_effect=lambda n: remote_runner if n == 'loop-host' else None
-        )
-        fake_alloc.is_parked = MagicMock(return_value=False)
-        fake_alloc.readmit = MagicMock()
-        worker._host_allocator = fake_alloc
-
-        now_base = 1000.0
-        worker._runner_unavailable['loop-host'] = _HostUnavailability(
-            streak=5, first_unavailable_at=now_base - 60.0, reason='unreachable',
-        )
-        # Simulate the open L1 that would have been filed by the streak path
-        # (streak=5 >= default threshold=3) so recovery path emits the event.
-        eq.seed_open_l1(_verify_host_unreachable_sentinel('loop-host'))
-
-        # Start the worker
-        worker_task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0)
-
-        # RED: _reprobe_task doesn't exist yet — this assertion will be checked below
-        # For now let the worker start and give the loop time to fire at least once
-        await asyncio.sleep(0.05)
-
-        # Flip the runner healthy
-        remote_runner.health = AsyncMock(return_value=True)
-
-        # Give the reprobe loop time to detect recovery
-        await asyncio.sleep(0.05)
-
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-        # RED: these assertions fail until _reprobe_loop is wired into run()
-        assert hasattr(worker, '_reprobe_task') and worker._reprobe_task is not None, (
-            '_reprobe_task must be created by run() (step-16)'
-        )
-        assert fake_alloc.readmit.called, (
-            'reprobe loop must have called readmit on recovery (task 3043: '
-            'clear_quarantine alone cannot un-PARK a stranded slot)'
-        )
-        recovered = es.events_of(EventType.verify_host_recovered)
-        assert recovered, 'reprobe loop must have emitted verify_host_recovered'
-
-
-# ---------------------------------------------------------------------------
-# 3043/step-15 RED: capstone — a speculative strand is auto-readmitted
+# Unreachable-host capstone (tasks 1795 / 3043).
+#
+# A remote verify host that goes away must be RECORDED, quarantined, alarmed
+# once, and re-admitted by the reprobe sweep with no orchestrator restart --
+# and the merge queue must keep flowing on the local trust anchor throughout.
+# Every scenario below drives a RUNNING lane over a real git repository: the
+# fault arrives where a real one does (the remote runner's own transport) and
+# every observation is a public one -- the MergeOutcome futures,
+# ``snapshot()['hosts']``, the escalation queue and the event store.
 # ---------------------------------------------------------------------------
 
 _INCIDENT_RU = (
@@ -1504,298 +1165,722 @@ _INCIDENT_RU = (
     'ssh: connect to host leo-laptop port 22: Connection timed out'
 )
 
+#: Poll ceiling for a state the lane reaches on its own. Generous: these run
+#: real git against a cold tmp repo.
+_LANE_SETTLE_TIMEOUT = 30.0
+_LANE_STOP_TIMEOUT = 30.0
 
-class _ControllableRemoteRunner:
-    """Remote verify runner whose reachability is flipped at runtime.
+#: Per-test ceiling for the host capstone, whose methods settle a real-git lane
+#: through several ``wait_responsive`` waits and a reprobe sweep.  Sized above
+#: the budget ``TestTimeoutMarkCoverage`` recomputes from this module's own
+#: source rather than from any figure written here; ``HEAVY_BARRIER_TEST_TIMEOUT``
+#: (300s) is NOT enough for it.  Why a mark at all: pytest-timeout's thread
+#: method ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
+#: then truncates the whole session against an innocent test -- so a
+#: slow-but-correct run under a too-tight default is strictly worse than the
+#: tail it would otherwise have reported (esc-3980-1, task 3492).
+HOST_CAPSTONE_TEST_TIMEOUT = 2 * HEAVY_BARRIER_TEST_TIMEOUT
 
-    ``reachable`` drives all three surfaces the strand/recovery path touches:
-    ``health()`` (the reprobe probe), ``cancel_verify()`` (rc 255 while down —
-    which is what PARKs the slot) and ``probe_clean()`` (False while down — the
-    bounded poll that decides whether the PARK is released).
+
+async def _setup_repo(repo: Path) -> None:
+    """Initialise a git repo with a single commit (README.md) on main."""
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def host_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def host_git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def host_git_ops(host_git_config: GitConfig, host_repo: Path) -> GitOps:
+    return GitOps(host_git_config, host_repo)
+
+
+@pytest.fixture
+def host_config(host_repo: Path, host_git_config: GitConfig) -> OrchestratorConfig:
+    """Operator config with the two unreachability thresholds turned down.
+
+    These are knobs the lane copies onto itself when it builds its OWN
+    allocator (``_ensure_host_allocator``), which is why ``_lane_with_remote``
+    lets it build one before swapping in the two-host allocator: driving the
+    alarm thresholds from config is what keeps these tests off the worker's
+    internals.  The reprobe CADENCE is the injected clock's job -- see
+    ``_ShortSleepClock`` for why config alone cannot set it.
+    """
+    return OrchestratorConfig(
+        project_root=host_repo,
+        git=host_git_config,
+        verify_host_unreachable_escalate_after_n=1,
+        verify_host_unreachable_escalate_after_secs=0.0,  # streak-only
+    )
+
+
+@contextlib.asynccontextmanager
+async def _running_lane(git_ops: GitOps, **ports: Any):
+    """A running lane over *git_ops*, stopped on the way out.
+
+    Teardown goes through ``stop()`` -- the lane's own shutdown protocol,
+    which resolves in-flight request futures, drains its queues, cleans merge
+    worktrees and releases leases, and is internally bounded so it cannot hang.
+    """
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    lane = MergeLane(git_ops, queue, **ports)
+    lane_task = asyncio.ensure_future(lane.run())
+    try:
+        yield lane, queue
+    finally:
+        # Exception, not BaseException: this must not swallow a CancelledError
+        # aimed at the enclosing test task (or a KeyboardInterrupt).
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(lane.stop(), timeout=_LANE_STOP_TIMEOUT)
+        lane_task.cancel()
+        await asyncio.gather(lane_task, return_exceptions=True)
+
+
+async def _until(predicate, *, what: str, timeout: float = _LANE_SETTLE_TIMEOUT) -> None:
+    """Wait for *predicate* to hold, or fail naming *what* was expected.
+
+    For a public observation that has no event to await on -- a host row
+    flipping out of quarantine, say.  The budget is charged in loop-RESPONSIVE
+    time via ``wait_responsive``, because this repo measured >=11x wall-clock
+    tails at load 246 on 32 cores and a raw ``loop.time()`` deadline converts
+    that starvation into a spurious red (task 3980; see ``wait_responsive``).
+    Byte-for-byte the same contract as the twin in
+    test_merge_speculation.py::_until -- two spellings of one wait policy would
+    be read as interchangeable by the next reader whether or not they were.
     """
 
-    def __init__(self, name: str = 'laptop', *, reachable: bool = False):
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+    await wait_responsive(_poll(), timeout=timeout, label=what)
+
+
+def _live_tasks_started_since(before: set[asyncio.Task]) -> set[asyncio.Task]:
+    """Still-running tasks created since *before* -- minus the waiter asking.
+
+    ``asyncio.current_task()`` is excluded because the caller polls this from
+    inside ``_until``, whose own poll coroutine is itself a task created after
+    *before* was captured: counting it would make the set permanently
+    non-empty and the wait unsatisfiable.  The enclosing test's task is already
+    in *before* (``all_tasks()`` includes the running one), so nothing else
+    needs excluding.
+    """
+    current = asyncio.current_task()
+    return {
+        task for task in asyncio.all_tasks()
+        if task not in before and task is not current and not task.done()
+    }
+
+
+async def _submitted(
+    git_ops: GitOps, config: OrchestratorConfig, task_id: str, filename: str, content: str,
+) -> MergeRequest:
+    """A request for a fresh branch carrying one committed file, unsubmitted."""
+    worktree = await _make_branch_with_file(git_ops, task_id, filename, content)
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+def _host_row(lane: MergeLane, name: str) -> dict[str, Any]:
+    """The per-host row ``snapshot()`` publishes for *name* (``{}`` when absent).
+
+    ``snapshot()['hosts']`` carries name, is_local, slot_state, quarantined,
+    quarantine_class, unavailable_since, unavailable_secs, streak and reason --
+    the whole host-monitor surface these tests assert on.
+    """
+    for host in lane.snapshot()['hosts']:
+        if host['name'] == name:
+            return host
+    return {}
+
+
+class _ShortSleepClock:
+    """``ClockPort`` on real time whose every sleep is capped at 20 ms.
+
+    The reprobe loop sleeps ``verify_host_reprobe_interval_s`` BEFORE its first
+    sweep, and the lane only learns that knob when it builds its own host
+    allocator -- which happens on the first verify, long after ``run()``
+    started the loop.  Under the production clock the first sleep is therefore
+    always the 120 s default and no sweep is observable in a test, whatever the
+    config says.  Capping the sleep (rather than faking the CLOCK, as
+    ``FakeClock`` does) keeps ``now``/``monotonic`` on real time, so every age,
+    heartbeat and worktree-reap threshold the lane evaluates still reads
+    honestly -- only the cadence is compressed.
+    """
+
+    _CAP_SECS = 0.02
+
+    def now(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def newest_content_mtime(self, root: Path) -> float | None:  # noqa: ARG002
+        return None
+
+    async def sleep(self, secs: float) -> None:
+        await asyncio.sleep(min(secs, self._CAP_SECS))
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        # UNCAPPED, unlike the sleep above: capping it would re-check the
+        # lane's halt and abandonment branches ~500x more often and reorder
+        # the halt-vs-verify interleaving this file's capstone measures. So
+        # this one method wants production semantics exactly, and delegates
+        # rather than restating them.
+        return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
+
+
+class _HostEscalationQueue:
+    """Escalation-queue double with PER-TASK open-L1 state.
+
+    The unreachability alarm dedups on ``has_open_l1(sentinel)`` and recovery
+    resolves through ``get_by_task``/``resolve``, so the single-flag double
+    above (which the drift detector's dedup is happy with) cannot express
+    either half of this contract.
+    """
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+        self.resolved: list[tuple[str, str]] = []
+        #: Every dedup consultation -- i.e. every time an alarm site reached
+        #: the point of deciding whether to file.  Counting these is what lets
+        #: a dedup test distinguish "suppressed N times" from "never retried".
+        self.open_l1_checks = 0
+        self._seq = 0
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{self._seq}'
+
+    def _open_l1s(self, task_id: str) -> list[Any]:
+        done = {esc_id for esc_id, _ in self.resolved}
+        return [
+            e for e in self.submitted
+            if getattr(e, 'task_id', None) == task_id
+            and getattr(e, 'level', 0) == 1
+            and e.id not in done
+        ]
+
+    def has_open_l1(self, task_id: str) -> bool:
+        self.open_l1_checks += 1
+        return bool(self._open_l1s(task_id))
+
+    def submit(self, esc: Any) -> None:
+        self.submitted.append(esc)
+
+    def get_by_task(self, task_id: str, status: str | None = None, **kw: Any) -> list[Any]:  # noqa: ARG002
+        return self._open_l1s(task_id)
+
+    def resolve(self, esc_id: str, resolution: str, **kw: Any) -> None:
+        self.resolved.append((esc_id, resolution))
+
+    def of_category(self, category: str) -> list[Any]:
+        return [e for e in self.submitted if getattr(e, 'category', None) == category]
+
+
+class _FlakyRemoteRunner:
+    """Remote verify runner whose reachability is flipped at runtime.
+
+    ``reachable`` drives every surface the strand/recovery path touches:
+    ``run_merge_verify`` (``RunnerUnavailable`` while down -- the transport
+    failure that records the host), ``health()`` (the reprobe probe),
+    ``cancel_verify()`` (rc 255 while down, which is what PARKs the slot) and
+    ``probe_clean()`` (False while down, the bounded poll that decides whether
+    the PARK is released).  ``health_error``, when set, is raised by
+    ``health()`` instead of answering.  ``verify_gate``, when set, holds
+    ``run_merge_verify`` open so a verify can be caught in flight.
+    """
+
+    def __init__(
+        self,
+        name: str = 'leo-laptop',
+        *,
+        reachable: bool = False,
+        health_error: BaseException | None = None,
+        verify_gate: asyncio.Event | None = None,
+    ) -> None:
         self.name = name
         self.is_local = False
         self.reachable = reachable
+        self.health_error = health_error
+        self.verify_gate = verify_gate
+        self.verified: list[str] = []
         self.health_calls = 0
-        self.cancel_calls = 0
+        self.entered = False
 
     async def health(self) -> bool:
         self.health_calls += 1
+        if self.health_error is not None:
+            raise self.health_error
         return self.reachable
 
+    async def run_merge_verify(self, merge_sha: str, spec: MergeVerifySpec) -> VerifyResult:
+        if self.verify_gate is not None:
+            self.entered = True
+            await self.verify_gate.wait()
+        if not self.reachable:
+            raise RunnerUnavailable(_INCIDENT_RU)
+        self.verified.append(merge_sha)
+        return _make_result(True)
+
     async def cancel_verify(self, *a: Any, **kw: Any) -> int:
-        self.cancel_calls += 1
         return 0 if self.reachable else 255
 
     async def probe_clean(self, *a: Any, **kw: Any) -> bool:
         return self.reachable
 
 
+@contextlib.asynccontextmanager
+async def _lane_with_remote(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    laptop: _FlakyRemoteRunner,
+    **ports: Any,
+):
+    """A running lane whose verify pool is (local trust anchor + *laptop*).
+
+    The lane copies the host-monitor knobs off the config when it builds its
+    own allocator, so one warm-up request is landed first -- ``hosts`` turning
+    non-empty in ``snapshot()`` is the public signal that the allocator now
+    exists -- and only then is the two-host allocator swapped in.
+    """
+    async with _running_lane(git_ops, clock=_ShortSleepClock(), **ports) as (lane, queue):
+        warmup = await _submitted(git_ops, config, 'hostwarm', 'hostwarm.py', 'w = 1\n')
+        await queue.put(warmup)
+        await wait_responsive(warmup.result, label='host-allocator warmup landing')
+        await _until(
+            lambda: bool(lane.snapshot()['hosts']),
+            what='the lane to build its host allocator',
+        )
+        _inject_two_host_allocator(lane, laptop)
+        yield lane, queue
+
+
 @pytest.mark.asyncio
-class TestSpeculativeStrandedHostAutoReadmission:
-    """END-TO-END: a speculative RunnerUnavailable can no longer strand a host.
+@pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT)
+class TestUnreachableHostCapstone:
+    """END-TO-END: an unreachable remote can neither strand itself nor stall the queue.
 
-    Reproduces the reify 2026-07-25 incident's user-observable signal against a
-    REAL :class:`HostAllocator` sharing ``worker._runner_quarantine``: the head
-    of the queue fails, the cascade cancels the OUTER ``_run_inflight_verify``
-    task (orphaning the inner verify, whose ``RunnerUnavailable`` is never
-    retrieved), and the follow-up ``cancel_and_release`` against the down host
-    leaves the slot PARKED — non-acquirable, unquarantined, untracked.  The
-    laptop then sat out of the pool for 3+ h ("verifying 1/2 hosts", zero
-    dispatch attempts) with nothing for the reprobe sweep to re-adopt, and only
-    an orchestrator restart could bring it back.
-
-    The promised signal after the fix: no orphan, both paths recorded, and ONE
-    reprobe sweep restores 2/2 capacity with no restart.
+    Reproduces the reify 2026-07-25 incident's user-observable signal: the
+    laptop sat out of the verify pool for 3+ h ("verifying 1/2 hosts", zero
+    dispatch attempts) with nothing for the reprobe sweep to re-adopt, and
+    only an orchestrator restart brought it back.  The promised signal after
+    the fix is what these tests assert: the strand is RECORDED and legible in
+    the snapshot, the work still lands on the local anchor, and one reprobe
+    sweep restores 2/2 capacity with no restart.
     """
 
-    # ── fixtures ────────────────────────────────────────────────────────────
+    @staticmethod
+    async def _strand_the_laptop(lane, queue, git_ops, config, verifier, gate):
+        """Park the local anchor, then push a request onto the down laptop.
 
-    def _make_item(self):
-        """A minimal RealMergeItem whose config carries a real project_root."""
-        from orchestrator.merge_queue import MergeRequest, RealMergeItem
-
-        loop = asyncio.get_running_loop()
-        config = OrchestratorConfig(project_root=Path('/tmp/fake-3043'))
-        req = MergeRequest(
-            task_id='task-cap',
-            branch=QueuedBranch.parse('task/cap', config.git.branch_prefix),
-            worktree=MagicMock(),
-            pre_rebased=False,
-            task_files=[],
-            module_configs=[],
-            config=config,
-            result=loop.create_future(),
-        )
-        return RealMergeItem(
-            request=req,
-            merge_result=MagicMock(merge_commit='abc123def456789abc1'),
-            merge_wt=MagicMock(),
-            base_sha='base123',
-            speculative=True,
-        )
-
-    def _make_eq_with_pending_l1s(self):
-        """The minimal capstone EQ, taught to report its own L1s as pending.
-
-        ``_make_minimal_escalation_queue``'s ``get_by_task`` returns ``[]``
-        unconditionally, so alarm RESOLUTION is unobservable through it.  The
-        capstone asserts the full recovery signal, so give it real pending-L1
-        semantics — everything else (dedup via ``has_open_l1``, ``submit``,
-        ``resolve``) is the shared fake's own behaviour.
+        ``acquire()`` hands out the local host first, so the only way to put
+        work on the remote is to have the local slot already busy -- which is
+        what the parked first verify does.  Releases the park on the way out
+        and returns both requests, quarantine already in place.
         """
-        eq = _make_minimal_escalation_queue()
-
-        def _get_by_task(task_id, status=None, **kw):  # noqa: ARG001
-            return [
-                e for e in eq.submitted
-                if getattr(e, 'task_id', None) == task_id and getattr(e, 'level', 0) == 1
-            ]
-
-        eq.get_by_task = _get_by_task
-        return eq
-
-    def _build(self, *, escalate_after_n: int):
-        """Bare worker + REAL HostAllocator sharing worker._runner_quarantine."""
-        from orchestrator.verify_runner import HostAllocator
-
-        worker = _make_minimal_worker()
-        worker._unreachable_escalate_after_n = escalate_after_n
-        worker._unreachable_escalate_after_secs = 0.0  # streak-only; no time trip
-        eq = self._make_eq_with_pending_l1s()
-        worker._escalation_queue = eq
-        es = _RecordingEventStore()
-        worker._event_store = es  # type: ignore[assignment]
-
-        laptop = _ControllableRemoteRunner('laptop', reachable=False)
-        alloc = HostAllocator([laptop], quarantine=worker._runner_quarantine)
-        worker._host_allocator = alloc
-
-        # Real PARK semantics, but with an injected no-op sleep and a short
-        # bound so the cancel-fail probe loop costs no wall clock.
-        _orig_cancel = alloc.cancel_and_release
-
-        async def _noop_sleep(_secs):
-            return None
-
-        async def _fast_cancel_and_release(lease, *, sleep=None, max_attempts=10):  # noqa: ARG001
-            return await _orig_cancel(lease, sleep=_noop_sleep, max_attempts=2)
-
-        alloc.cancel_and_release = _fast_cancel_and_release  # type: ignore[method-assign]
-        return worker, alloc, laptop, eq, es
-
-    async def _cancel_outer_midflight(self, worker, item, lease):
-        """Run the outer verify, then cancel it mid-flight (the cascade's route).
-
-        The head-failure cascade cancels the OUTER task; ``CancelledError`` is a
-        ``BaseException`` no handler in ``_run_inflight_verify`` catches, so the
-        outer never reaches its ``except RunnerUnavailable`` conversion.  The
-        inner surfaces the transport failure as it is torn down — the real shape
-        for an ssh push to a host that has gone away.
-
-        Returns ``(inner, outer)``.  The OUTER task is returned — and asserted
-        CANCELLED here — because the guard's most load-bearing property is that
-        its ``finally`` never swallows the in-flight ``CancelledError``: the
-        cascade's ``_entry.verify_task.cancelled()`` checks depend on it, and
-        this harness previously discarded the outer entirely (task 3043 amend,
-        reviewer test-coverage finding).
-        """
-        from unittest.mock import patch
-
-        captured: list = []
-
-        async def _fake_verify(*args, **kwargs):
-            captured.append(asyncio.current_task())
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                raise RunnerUnavailable(_INCIDENT_RU) from None
-
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01
-
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
-            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                if captured:
-                    break
-            assert captured, 'the patched verify never started'
-            outer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await outer
-            for _ in range(10):
-                await asyncio.sleep(0)
-        assert outer.cancelled() is True, (
-            'the outer _run_inflight_verify must end CANCELLED — a `return` in '
-            'the orphan guard would swallow the in-flight CancelledError and '
-            "silently break the cascade's verify_task.cancelled() checks"
+        req_a = await _submitted(git_ops, config, 'ru-a', 'ru_a.py', 'a = 1\n')
+        await queue.put(req_a)
+        await _until(lambda: 'ru-a' in verifier.verified, what="the local anchor's verify to enter")
+        req_b = await _submitted(git_ops, config, 'ru-b', 'ru_b.py', 'b = 2\n')
+        await queue.put(req_b)
+        await _until(
+            lambda: 'leo-laptop' in lane.snapshot()['occupancy']['inflight_by_host'],
+            what='the second request to be dispatched to the laptop',
         )
-        return captured[0], outer
+        # The RU verdict is only ADJUDICATED when the head of the in-flight
+        # deque finalizes, so release the parked anchor before waiting on it.
+        gate.set()
+        await _until(
+            lambda: bool(_host_row(lane, 'leo-laptop').get('quarantined')),
+            what='the unreachable laptop to be quarantined',
+        )
+        return req_a, req_b
+
+    async def test_an_unreachable_remote_is_recorded_alarmed_and_never_stalls_the_queue(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """RU on the remote -> recorded + quarantined + one L1 -> both branches still land."""
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, host_config, verifier, gate,
+            )
+
+            # (1) the strand is RECORDED and legible in the public host census --
+            #     RU-recoverable, not an operator-held divergence quarantine.
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantine_class'] == 'ru', row
+            assert row['streak'] >= 1, row
+            assert 'Connection timed out' in (row['reason'] or ''), row
+            assert row['unavailable_since'] is not None, row
+
+            # (2) exactly one dedup'd L1 alarm naming the host.
+            alarms = escalations.of_category('verify_host_unreachable')
+            assert len(alarms) == 1, escalations.submitted
+            assert alarms[0].level == 1 and alarms[0].severity == 'blocking'
+            assert 'leo-laptop' in alarms[0].summary
+
+            # (3) THE SIGNAL: the queue never stalls -- both branches land on the
+            #     surviving local trust anchor.
+            outcome_a = await wait_responsive(req_a.result, label='A lands on surviving anchor')
+            outcome_b = await wait_responsive(req_b.result, label='B lands on surviving anchor')
+            assert outcome_a.status == 'done', outcome_a
+            assert outcome_b.status == 'done', outcome_b
+
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=host_git_ops.project_root,
+        )
+        assert 'ru_a.py' in main_files and 'ru_b.py' in main_files
+
+    async def test_one_reprobe_sweep_readmits_the_recovered_host_without_a_restart(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """Host comes back -> quarantine cleared, alarm resolved, 2/2 capacity restored."""
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, host_config, verifier, gate,
+            )
+            await wait_responsive(req_a.result, label='stranded-laptop A resolves')
+            await wait_responsive(req_b.result, label='stranded-laptop B resolves')
+
+            # HOST RECOVERS -- no restart, no new allocator, no new lane.
+            laptop.reachable = True
+            await _until(
+                lambda: not _host_row(lane, 'leo-laptop').get('quarantined', True),
+                what='the reprobe sweep to re-admit the recovered laptop',
+            )
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantine_class'] is None and row['streak'] is None, row
+            assert row['slot_state'] == 'free', row
+            assert events.events_of(EventType.verify_host_recovered), events.events
+            assert escalations.resolved, 'the open L1 must be resolved on recovery'
+
+            # 2/2 capacity is genuinely back: park the local anchor again and the
+            # next request is dispatched to the laptop, which now verifies it.
+            second_gate = asyncio.Event()
+            verifier.scripts['back-a'] = VerifyScript(
+                result=passes().result, release=second_gate,
+            )
+            req_c = await _submitted(host_git_ops, host_config, 'back-a', 'back_a.py', 'c = 3\n')
+            await queue.put(req_c)
+            await _until(lambda: 'back-a' in verifier.verified, what="the anchor's verify to enter")
+            req_d = await _submitted(host_git_ops, host_config, 'back-b', 'back_b.py', 'd = 4\n')
+            await queue.put(req_d)
+            await _until(
+                lambda: bool(laptop.verified),
+                what='the re-admitted laptop to be handed a verify',
+            )
+            second_gate.set()
+            assert (await wait_responsive(req_c.result, label='C lands after re-admission')).status == 'done'
+            assert (await wait_responsive(req_d.result, label='D lands after re-admission')).status == 'done'
 
     @staticmethod
-    def _pending_verify_tasks() -> list:
-        return [
-            t for t in asyncio.all_tasks()
-            if not t.done()
-            and t is not asyncio.current_task()
-            and '_fake_verify' in getattr(getattr(t, 'get_coro', lambda: None)(), '__qualname__', '')
-        ]
+    def _tuned_config(
+        base: OrchestratorConfig, *, after_n: int, after_secs: float,
+    ) -> OrchestratorConfig:
+        """*base* with the two unreachability thresholds re-tuned."""
+        return base.model_copy(update={
+            'verify_host_unreachable_escalate_after_n': after_n,
+            'verify_host_unreachable_escalate_after_secs': after_secs,
+        })
 
-    # ── the capstone ────────────────────────────────────────────────────────
+    async def test_one_ru_below_the_streak_threshold_does_not_alarm(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """THRESHOLD: at escalate_after_n=2, ONE RU event records but stays quiet.
 
-    async def test_speculative_strand_is_recorded_and_auto_readmitted(self):
-        """Host DOWN at orchestrator start → strand recorded → one sweep restores 2/2."""
-        import gc
-
-        worker, alloc, laptop, eq, es = self._build(escalate_after_n=2)
-
-        # 1. Both slots in use: local anchor verifying the head + speculative remote.
-        local_lease = alloc.acquire_local(lambda: MagicMock())
-        assert local_lease is not None
-        laptop_lease = alloc.acquire_remote()
-        assert laptop_lease is not None and laptop_lease.name == 'laptop'
-        assert alloc.free_host_count() == 0, 'fixture: 2/2 hosts in use'
-
-        loop = asyncio.get_running_loop()
-        unhandled: list = []
-        prior_handler = loop.get_exception_handler()
-        loop.set_exception_handler(lambda _l, ctx: unhandled.append(ctx))
-        try:
-            # 2a. Head-failure cascade cancels the OUTER verify task.
-            inner, outer = await self._cancel_outer_midflight(
-                worker, self._make_item(), laptop_lease,
-            )
-            # The cascade reads exactly this predicate off its InflightEntry
-            # before manually re-queuing a downstream request.
-            assert outer.cancelled() is True
-            # 2b. …then releases the lease against the down host: cancel rc=255
-            #     and every probe_clean() False → slot PARKED, non-acquirable.
-            ok = await worker._cancel_and_release_tracked(laptop_lease)
-            assert ok is False, 'cancel against an unreachable host must report failure'
-            assert alloc.is_parked('laptop') is True, 'fixture: the slot is PARKED'
-
-            del inner
-            gc.collect()
-            await asyncio.sleep(0)
-            assert not [c for c in unhandled if 'never retrieved' in str(c.get('message', ''))], (
-                f'orphaned verify task exception was never retrieved: {unhandled}'
-            )
-        finally:
-            loop.set_exception_handler(prior_handler)
-
-        assert self._pending_verify_tasks() == [], 'an inner verify task outlived the outer'
-
-        # 3. The strand is now impossible: recorded AND quarantined AND legible.
-        assert 'laptop' in worker._runner_unavailable, (
-            'the cancelled-outer path must still record the host — otherwise the '
-            'reprobe sweep has no tracker entry to re-adopt'
-        )
-        assert 'laptop' in worker._runner_quarantine
-        entry = worker._runner_unavailable['laptop']
-        assert entry.streak == 2, (
-            'two RU-class removals were recorded (cancellation unwind + PARKed '
-            f'cancel_and_release); got streak={entry.streak}'
-        )
-        l1s = [e for e in eq.submitted if getattr(e, 'level', 0) == 1]
-        assert len(l1s) == 1, (
-            f'escalate_after_n=2 with streak=2 implies exactly one L1; got {len(l1s)}'
-        )
-
-        now = 5000.0
-        hosts = {h['name']: h for h in worker._host_states_block(now)}
-        assert hosts['laptop']['quarantine_class'] == 'ru', (
-            'the strand must be legible in the heartbeat as RU-recoverable, not '
-            'as an operator-held divergence quarantine'
-        )
-        assert hosts['laptop']['streak'] == 2
-        assert hosts['laptop']['slot_state'] == 'parked'
-
-        # 4. HOST RECOVERS — no restart, no new allocator, no new worker.
-        laptop.reachable = True
-        await worker._reprobe_quarantined_hosts(now + 120.0)
-
-        # 5. The promised signal.
-        assert 'laptop' not in worker._runner_quarantine
-        assert 'laptop' not in worker._runner_unavailable
-        assert alloc.is_parked('laptop') is False, 'recovery must un-PARK the slot'
-        regained = alloc.acquire_remote()
-        assert regained is not None and regained.name == 'laptop', (
-            '2/2 capacity must be restored WITHOUT an orchestrator restart'
-        )
-        assert eq.resolved, 'the open L1 must be resolved on recovery'
-        assert es.events_of(EventType.verify_host_recovered), (
-            'expected a verify_host_recovered event'
-        )
-
-    async def test_runner_unavailable_path_recovers_in_the_same_sweep(self):
-        """The PROPER RUNNER_UNAVAILABLE path is re-adopted by the same sweep.
-
-        Reprobe must own recovery for BOTH paths — the escaping-exception /
-        PARKED strand above and the ordinary RUNNER_UNAVAILABLE verdict here.
+        The capstone above runs at a threshold of 1, where `len(alarms) == 1`
+        is unfalsifiable for this property -- one event cannot distinguish a
+        respected threshold from an ignored one.  Here the host is recorded and
+        quarantined exactly as before (that is the first RU's own job, and it
+        is NOT gated on the threshold), and the L1 is withheld because the
+        streak has not reached 2.  A threshold read as "alarm on every RU"
+        fires here.
         """
-        worker, alloc, laptop, eq, es = self._build(escalate_after_n=1)
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+        config = self._tuned_config(host_config, after_n=2, after_secs=0.0)
 
-        lease = alloc.acquire_remote()
-        assert lease is not None and lease.name == 'laptop'
-        await alloc.quarantine_and_release(lease)
-        worker._quarantine_unreachable_host('laptop', _INCIDENT_RU, 4000.0)
+        async with _lane_with_remote(
+            host_git_ops, config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, config, verifier, gate,
+            )
 
-        assert 'laptop' in worker._runner_unavailable
-        assert 'laptop' in worker._runner_quarantine
-        assert alloc.acquire_remote() is None, 'a quarantined host must not be handed out'
-        assert len([e for e in eq.submitted if getattr(e, 'level', 0) == 1]) == 1
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantine_class'] == 'ru' and row['streak'] == 1, (
+                'the first RU must still RECORD and quarantine -- only the '
+                f'ALARM waits for the streak: {row!r}'
+            )
+            assert escalations.of_category('verify_host_unreachable') == [], (
+                'streak 1 of 2 must not alarm; the threshold was ignored: '
+                f'{escalations.submitted!r}'
+            )
 
-        laptop.reachable = True
-        await worker._reprobe_quarantined_hosts(4000.0 + 120.0)
+            assert (await wait_responsive(req_a.result, label='A lands')).status == 'done'
+            assert (await wait_responsive(req_b.result, label='B lands')).status == 'done'
 
-        assert 'laptop' not in worker._runner_quarantine
-        assert 'laptop' not in worker._runner_unavailable
-        regained = alloc.acquire_remote()
-        assert regained is not None and regained.name == 'laptop'
-        assert es.events_of(EventType.verify_host_recovered)
-        assert eq.resolved, 'the open L1 must be resolved on recovery'
+    async def test_repeated_alarm_opportunities_still_produce_exactly_one_l1(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """DEDUP: many alarm opportunities in one downtime episode -> ONE L1.
+
+        The time-based arm re-evaluates on EVERY failed reprobe sweep, so an
+        unreachable host offers the alarm a fresh opportunity several times a
+        second here.  Exactly one open L1 per host per downtime episode is the
+        contract; without the ``has_open_l1`` dedup this would file one per
+        sweep and bury the operator.  Counting alarms against a number of
+        opportunities the test itself OBSERVES (health_calls) is what makes the
+        `== 1` falsifiable.
+        """
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+        config = self._tuned_config(host_config, after_n=1, after_secs=0.001)
+
+        async with _lane_with_remote(
+            host_git_ops, config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, config, verifier, gate,
+            )
+            await wait_responsive(req_a.result, label='A lands')
+            await wait_responsive(req_b.result, label='B lands')
+
+            checks = escalations.open_l1_checks
+            await _until(
+                lambda: escalations.open_l1_checks >= checks + 5,
+                what='five more alarm attempts to reach the dedup',
+            )
+
+            alarms = escalations.of_category('verify_host_unreachable')
+            assert len(alarms) == 1, (
+                f'the alarm site was re-entered {escalations.open_l1_checks} '
+                f'times over one downtime episode; the dedup must hold it at '
+                f'one open L1: {alarms!r}'
+            )
+            assert alarms[0].level == 1 and alarms[0].severity == 'blocking'
+
+    async def test_a_cancel_against_a_down_host_parks_the_slot_and_reprobe_unparks_it(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """The PARKED-slot strand: caught in flight, legible, and self-healing.
+
+        The OTHER way a host leaves the pool.  A verify is already running on
+        the laptop when it goes down, so the cancel RPC fails and every
+        ``probe_clean`` poll fails with it -- ``cancel_and_release`` then leaves
+        the slot PARKED, the correct fail-closed state (a stale verify may
+        still be churning there) but one that writes only the slot, never the
+        quarantine set.  That is the shape that stranded the laptop silently in
+        the reify 2026-07-25 incident: non-acquirable, and invisible to a
+        sweep that looked for quarantine membership.
+
+        Three things are asserted that the RU capstone above cannot see: the
+        slot really is PARKED (not merely quarantined), the census SAYS
+        ``'parked'`` so an operator can tell the two strands apart, and one
+        reprobe sweep un-PARKs it -- which needs ``probe_clean`` to come back
+        clean, not just ``health``.
+        """
+        gate = asyncio.Event()
+        verify_gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={
+            'park-a': VerifyScript(result=fails(
+                category='test_failure', summary='head fails, cascading its successors',
+            ).result, release=gate),
+        })
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        # Reachable to begin with: the strand needs a verify caught IN FLIGHT,
+        # which an already-down host never grants.
+        laptop = _FlakyRemoteRunner(reachable=True, verify_gate=verify_gate)
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a = await _submitted(host_git_ops, host_config, 'park-a', 'park_a.py', 'a = 1\n')
+            await queue.put(req_a)
+            await _until(lambda: 'park-a' in verifier.verified, what="the local anchor's verify to enter")
+            req_b = await _submitted(host_git_ops, host_config, 'park-b', 'park_b.py', 'b = 2\n')
+            await queue.put(req_b)
+            await _until(
+                lambda: laptop.entered,
+                what="the laptop's verify to be caught in flight",
+            )
+
+            # The host dies UNDER the running verify, then its sole waiter
+            # walks away -- so the lane cancels a verify it can no longer reach.
+            laptop.reachable = False
+            gate.set()
+            # The RECORD, not the PARK, is the settled state: `cancel_and_release`
+            # parks the slot on the failed cancel and only then polls
+            # `probe_clean` to exhaustion, so the slot reads 'parked' for the
+            # whole probe loop -- seconds before the strand is detected. Waiting
+            # on the park alone would sample the middle of that loop.
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('quarantine_class') == 'ru',
+                what='the failed cancel to be recorded as an RU-class strand',
+            )
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['slot_state'] == 'parked', (
+                'the slot must stay PARKED: the cancel RPC failed, so a stale '
+                f'verify may still be running there and freeing it could '
+                f'double-dispatch onto a busy host: {row!r}'
+            )
+            assert row['streak'] >= 1 and row['unavailable_since'] is not None, row
+
+            # RECOVERY -- and it must take BOTH probes: a PARKED slot is only
+            # safe to free once the host also reports no stale verify running.
+            laptop.reachable = True
+            verify_gate.set()
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('slot_state') == 'free',
+                what='the reprobe sweep to un-PARK the recovered laptop',
+            )
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantined'] is False and row['quarantine_class'] is None, row
+            assert events.events_of(EventType.verify_host_recovered), events.events
+
+            # The queue never stalled: both requests resolve rather than
+            # hanging on a host the lane can no longer reach.
+            assert (await wait_responsive(
+                req_a.result, label='A resolves past the PARK',
+            )).status != 'done'
+
+    async def test_stop_leaves_no_lane_background_task_running(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """``stop()`` takes the lane's background loops down with it.
+
+        The reprobe loop is one asyncio task per lane, started by ``run()`` and
+        cancelled by ``stop()``.  A regression that stops cancelling it leaks
+        one live task per lane stop and announces itself only as an unasserted
+        "Task was destroyed but it is pending" warning at interpreter exit.
+        Observed as the absence of any surviving task this block created --
+        which covers the reprobe loop without naming it, so the assertion
+        survives the loop being renamed, merged into another, or joined by a
+        second one.
+        """
+        before = asyncio.all_tasks()
+
+        # Deliberately NOT `_lane_with_remote`: that injects `_ShortSleepClock`,
+        # which caps the reprobe loop's sleep at 20 ms, so the loop would fall
+        # out of its own `while self._running` within a tick of stop() whether
+        # or not anything cancelled it. On the production clock that sleep is
+        # the full interval, so a lost cancel keeps the task alive well past
+        # this wait -- which is what makes the assertion below bite.
+        async with _running_lane(host_git_ops, verifier=FakeVerifier()) as (lane, queue):
+            req = await _submitted(
+                host_git_ops, host_config, 'stopclean', 'stopclean.py', 's = 1\n',
+            )
+            await queue.put(req)
+            assert (await wait_responsive(
+                req.result, label='the lane is fully up and merging',
+            )).status == 'done'
+
+        # The context manager already awaited stop() and reaped run(); one more
+        # scheduling turn lets any cancellation it issued be delivered.
+        await _until(
+            lambda: not _live_tasks_started_since(before),
+            what='every task this lane started to finish after stop()',
+            timeout=_LANE_STOP_TIMEOUT,
+        )
+
+    async def test_a_raising_health_probe_never_crashes_the_lane(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """The reprobe sweep swallows a probe that raises, and the lane keeps merging."""
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, host_config, verifier, gate,
+            )
+            await wait_responsive(req_a.result, label='stranded-laptop A resolves')
+            await wait_responsive(req_b.result, label='stranded-laptop B resolves')
+
+            # Every subsequent sweep now explodes inside the probe.
+            probes = laptop.health_calls
+            laptop.health_error = RuntimeError('ssh exploded')
+            await _until(
+                lambda: laptop.health_calls >= probes + 3,
+                what='three more reprobe sweeps to hit the raising probe',
+            )
+
+            # THE SIGNAL: the lane is still merging -- a probe bug cannot take it down.
+            req_c = await _submitted(host_git_ops, host_config, 'crash-c', 'crash_c.py', 'c = 3\n')
+            await queue.put(req_c)
+            outcome_c = await wait_responsive(req_c.result, label='lane still merges past a raising probe')
+            assert outcome_c.status == 'done', outcome_c
+            assert _host_row(lane, 'leo-laptop')['quarantined'] is True, (
+                'a raising probe must leave the quarantine in place, not clear it'
+            )
 
 
 # ===========================================================================
@@ -1815,11 +1900,21 @@ class TestSpeculativeStrandedHostAutoReadmission:
 
 def _xcheck_config(*, cross_check: bool = True) -> OrchestratorConfig:
     """OrchestratorConfig with the fix-(b) knob explicit + a project_root the
-    cross-check LocalRunner's archive_root is derived from."""
+    cross-check LocalRunner's archive_root is derived from.
+
+    ``escalate_preexisting_main_break=False`` is the FIRST guard both
+    ``_classify_main_health_red`` and ``_spawn_main_health_probe`` apply
+    (merge_queue.py -- the two share a byte-identical guard block), so a
+    config that declines pre-existing-break classification is the operator
+    knob that keeps the probe out of these tests.  The cross-check verdict
+    itself is unaffected: main-health classification runs only AFTER a
+    failure has been adopted.
+    """
     return OrchestratorConfig(
         git=GitConfig(main_branch='main'),
         project_root=Path('/tmp/xcheck-fake'),
         verify_cross_check_remote_green=cross_check,
+        escalate_preexisting_main_break=False,
     )
 
 
@@ -1859,28 +1954,21 @@ def _remote_stub(result: VerifyResult, *, name: str = 'laptop') -> MagicMock:
     return stub
 
 
-def _local_runner_patch(*, result=None, raises=None, calls: list | None = None):
-    """Factory to patch orchestrator.merge_queue.LocalRunner.
+def _xcheck_verifier(*, result=None, raises=None) -> FakeVerifier:
+    """The local trust-anchor's verdict, injected as the verify PORT.
 
-    Every construction is recorded in *calls*; the instance's run_merge_verify
-    returns *result* (or raises *raises*).  In the REMOTE dispatch path the
-    local-path pool never builds a LocalRunner, so the ONLY construction is the
-    fix-(b) cross-check trust-anchor — making len(calls) an exact cross-check
-    ran/skipped signal.
+    The cross-check builds its LocalRunner with
+    ``run_scoped=verifier.run_scoped`` (merge_queue.py::_run_post_merge_verify),
+    so the injected port IS the local leg: it returns *result*, or raises
+    *raises*.  In the REMOTE dispatch path the local-path pool is never built,
+    so the ONLY scoped verify is the fix-(b) cross-check trust-anchor — making
+    ``verifier.verified`` an exact cross-check ran/skipped signal, the same one
+    the retired LocalRunner-construction counter carried.
     """
-    def _factory(*args, **kwargs):
-        if calls is not None:
-            calls.append((args, kwargs))
-        stub = MagicMock()
-        stub.name = 'local'
-        stub.is_local = True
-        if raises is not None:
-            stub.run_merge_verify = AsyncMock(side_effect=raises)
-        else:
-            stub.run_merge_verify = AsyncMock(return_value=result)
-        return stub
-
-    return _factory
+    return FakeVerifier(default=VerifyScript(
+        result=result if result is not None else _make_result(True),
+        error=raises,
+    ))
 
 
 @pytest.mark.asyncio
@@ -1891,7 +1979,7 @@ class TestPerLandCrossCheck:
     async def test_diverge_local_fail_withholds_land_quarantines_and_escalates(self, tmp_path):
         """knob ON, remote PASS + local FAIL -> land withheld + quarantine + SYNCHRONOUS
         halt + BORN-AT-L2 escalation + event (task 2886 fix 3)."""
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -1906,28 +1994,25 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
         halt_hook = Mock()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=local_fail, calls=lr_calls)), \
-             patch('orchestrator.merge_queue._classify_main_health_red',
-                   new=AsyncMock(return_value=None)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha01',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-                halt_hook=halt_hook,
-            )
+        verifier = _xcheck_verifier(result=local_fail)
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha01',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            halt_hook=halt_hook,
+            verifier=verifier,
+        )
 
         # (1) land withheld — the local (failing) verdict is adopted, merge_wt cleaned up
         assert outcome is not None
         assert outcome.status == 'blocked'
         git_ops.cleanup_merge_worktree.assert_awaited()
-        assert len(lr_calls) == 1, 'cross-check must build exactly one local trust-anchor'
+        assert len(verifier.verified) == 1, 'cross-check must run exactly one local trust-anchor verify'
 
         # (2) the merge queue was HALTED SYNCHRONOUSLY exactly once (fix 3: the halt
         #     precedes any FURTHER adoption — incident 83336a32 was +3s too late), with a
@@ -1960,7 +2045,7 @@ class TestPerLandCrossCheck:
         FLEET is NOT halted and the escalation is L1 blocking (not born-at-L2)
         (task 2886 reviewer robustness amendment — bound the halt blast radius so
         one flaky local verify cannot block every merge lane fleet-wide)."""
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -1977,21 +2062,19 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
         halt_hook = Mock()
 
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=local_infra_fail)), \
-             patch('orchestrator.merge_queue._classify_main_health_red',
-                   new=AsyncMock(return_value=None)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha07',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-                halt_hook=halt_hook,
-            )
+        verifier = _xcheck_verifier(result=local_infra_fail)
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha07',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            halt_hook=halt_hook,
+            verifier=verifier,
+        )
 
         # (1) the land is STILL withheld — fail-closed for THIS land.
         assert outcome is not None
@@ -2019,7 +2102,6 @@ class TestPerLandCrossCheck:
     async def test_diverge_halt_fires_before_escalation_and_return(self, tmp_path):
         """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
         blocked return, so no FURTHER adoption can occur before a human looks."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2042,21 +2124,19 @@ class TestPerLandCrossCheck:
         def halt_hook(reason: str) -> None:
             order.append('halt')
 
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(False))), \
-             patch('orchestrator.merge_queue._classify_main_health_red',
-                   new=AsyncMock(return_value=None)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha0h',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-                halt_hook=halt_hook,
-            )
+        verifier = _xcheck_verifier(result=_make_result(False))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha0h',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            halt_hook=halt_hook,
+            verifier=verifier,
+        )
 
         assert outcome is not None and outcome.status == 'blocked'
         assert 'halt' in order and 'submit' in order
@@ -2067,7 +2147,6 @@ class TestPerLandCrossCheck:
     async def test_diverge_halt_hook_none_is_safe(self, tmp_path):
         """fix 3 None-safety: non-production callers omit halt_hook (default None) — the
         divergence still withholds the land + files a born-at-L2 escalation, no crash."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2080,21 +2159,19 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(False))), \
-             patch('orchestrator.merge_queue._classify_main_health_red',
-                   new=AsyncMock(return_value=None)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha0n',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-                # halt_hook omitted -> None default (byte-identical non-production callers)
-            )
+        verifier = _xcheck_verifier(result=_make_result(False))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha0n',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            # halt_hook omitted -> None default (byte-identical non-production callers)
+            verifier=verifier,
+        )
 
         assert outcome is not None and outcome.status == 'blocked'
         assert 'laptop' in quarantine
@@ -2104,7 +2181,6 @@ class TestPerLandCrossCheck:
 
     async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
         """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2117,29 +2193,27 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(True), calls=lr_calls)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha02',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
+        verifier = _xcheck_verifier(result=_make_result(True))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha02',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
 
         assert outcome is None  # land proceeds
         assert quarantine == set()  # no quarantine on agree
         assert eq.submitted == []  # no escalation on agree
-        assert len(lr_calls) == 1  # cross-check ran
+        assert len(verifier.verified) == 1  # cross-check ran
         assert es.events_of(EventType.verdict_parity_ok)
 
     async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
         """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2152,22 +2226,21 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha03',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
+        verifier = _xcheck_verifier(result=_make_result(False))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha03',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
 
         assert outcome is None  # remote green stands, land proceeds
-        assert lr_calls == []  # local trust-anchor NEVER constructed
+        assert verifier.verified == []  # local trust-anchor NEVER asked to verify
         assert quarantine == set()
         assert eq.submitted == []
         assert not es.events_of(EventType.verify_cross_check_mismatch)
@@ -2175,7 +2248,6 @@ class TestPerLandCrossCheck:
 
     async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
         """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2188,19 +2260,18 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(raises=RunnerUnavailable('laptop closed'), calls=lr_calls)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha04',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
+        verifier = _xcheck_verifier(raises=RunnerUnavailable('laptop closed'))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha04',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
 
         assert outcome is None  # fail-safe: trust the remote green
         assert quarantine == set()  # no quarantine on a local infra hiccup
@@ -2209,7 +2280,6 @@ class TestPerLandCrossCheck:
 
     async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
         """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2226,30 +2296,28 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha05',
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
+        verifier = _xcheck_verifier(result=_make_result(False))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha05',
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
 
         # cold-baseline trivial-pass gate is fail-open -> land proceeds, and the
         # cross-check is skipped for a trivial pass (nothing was verified to compare).
         assert outcome is None
-        assert lr_calls == [], 'a trivial remote pass must not trigger a local cross-check'
+        assert verifier.verified == [], 'a trivial remote pass must not trigger a local cross-check'
         assert not es.events_of(EventType.verify_cross_check_mismatch)
         assert not es.events_of(EventType.verdict_parity_ok)
 
     async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
         """runner is None (local dispatch): the cross-check branch never runs."""
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2261,20 +2329,20 @@ class TestPerLandCrossCheck:
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        # Real local-path pool with a patched scoped verify returning PASS
-        # (mirrors the existing local-only wiring tests) — no cross-check side effects.
-        with patch('orchestrator.merge_queue.run_scoped_verification',
-                   new=AsyncMock(return_value=_make_result(True))):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha='mergesha06',
-                runner=None,  # LOCAL dispatch
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
+        # Real local-path pool whose scoped verify is the injected port,
+        # returning PASS — no cross-check side effects.
+        verifier = _xcheck_verifier(result=_make_result(True))
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha='mergesha06',
+            runner=None,  # LOCAL dispatch
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
 
         assert outcome is None
         assert quarantine == set()
@@ -2407,74 +2475,78 @@ class TestTwoHostFalseGreenCapstone:
             'the effective remote config breadth must be overridden to full by the spec'
         )
 
-    async def test_b_false_green_withheld_and_escalated_via_run_inflight_verify(self, tmp_path):
-        """(b) a remote FALSE-GREEN driven through the real _run_inflight_verify
-        caller does NOT land: the outcome is withheld/blocked, the remote is
-        quarantined in the worker's by-reference set, and a dedup'd
-        verify_cross_check_mismatch escalation is filed."""
-        from unittest.mock import patch
+    async def test_b_false_green_is_withheld_quarantined_and_halts_the_lane(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """(b) a remote FALSE-GREEN on a RUNNING lane does not land.
 
-        from orchestrator.merge_queue import ItemLifecycleState, RealMergeItem
-        from orchestrator.verify_runner import HostLease
+        The remote reports PASS while the local trust anchor FAILs, so the
+        cross-check concludes divergence: the branch is withheld, the remote is
+        quarantined in the by-reference set the allocator shares, a born-at-L2
+        verify_cross_check_mismatch escalation is filed with its telemetry, and
+        the lane is halted SYNCHRONOUSLY -- before any further adoption can
+        occur (incident 83336a32: the cross-check diverged +3 s AFTER the
+        CAS-advance).
+        """
+        anchor_gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={
+            # The parked anchor keeps the local slot busy so 'fg-b' is dispatched
+            # to the laptop; 'fg-b' is the cross-check's own local trust anchor,
+            # and it is the leg that disagrees.
+            'fg-a': VerifyScript(result=passes().result, release=anchor_gate),
+            'fg-b': VerifyScript(result=_make_result(False)),
+        })
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=True)
 
-        worker = _make_minimal_worker()
-        worker._git_ops = _xcheck_git_ops()
-        eq = _make_minimal_escalation_queue()
-        worker._escalation_queue = eq
-        es = _RecordingEventStore()
-        worker._event_store = es  # type: ignore[assignment]
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a = await _submitted(host_git_ops, host_config, 'fg-a', 'fg_a.py', 'a = 1\n')
+            await queue.put(req_a)
+            await _until(lambda: 'fg-a' in verifier.verified, what="the anchor's verify to enter")
+            req_b = await _submitted(host_git_ops, host_config, 'fg-b', 'fg_b.py', 'b = 2\n')
+            await queue.put(req_b)
+            await _until(
+                lambda: bool(events.events_of(EventType.verify_cross_check_mismatch)),
+                what='the cross-check to conclude divergence',
+            )
 
-        config = _xcheck_config(cross_check=True)
-        req = _xcheck_req(config, worktree=tmp_path)
-        item = RealMergeItem(
-            request=req,
-            merge_result=MagicMock(merge_commit='mergesha_fg'),
-            merge_wt=tmp_path,
-            base_sha='base-sha',
-            speculative=False,
+            # (b5) the divergence halted the lane SYNCHRONOUSLY -- observable
+            #      before the outcome is even delivered.
+            assert lane.snapshot()['is_wip_halted'] is True
+
+            # (b2) the diverging remote is quarantined in the set the allocator
+            #      shares by reference -- an operator-held divergence quarantine,
+            #      NOT the auto-recovering RU class.
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantined'] is True, row
+            assert row['quarantine_class'] == 'divergence', row
+
+            # (b3) exactly one dedup'd BORN-AT-L2 escalation (task 2886 fix 3:
+            #      level=2/critical, no longer level=1/blocking).
+            mismatch = escalations.of_category('verify_cross_check_mismatch')
+            assert len(mismatch) == 1, escalations.submitted
+            assert mismatch[0].agent_role == 'orchestrator-cross-check'
+            assert mismatch[0].level == 2
+            assert mismatch[0].severity == 'critical'
+            assert 'leo-laptop' in mismatch[0].detail
+
+            anchor_gate.set()
+
+            # (b1) the false-green does NOT land.
+            outcome_b = await wait_responsive(req_b.result, label='false-green must not land')
+            assert outcome_b.status != 'done', outcome_b
+
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=host_git_ops.project_root,
         )
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
-
-        # REMOTE lease whose runner reports a FALSE GREEN (PASS).
-        remote = _remote_stub(_make_result(True), name='leo-laptop')
-        lease = HostLease(name='leo-laptop', runner=remote, is_local=False)
-
-        # The LOCAL trust-anchor cross-check FAILs -> divergence -> fail-closed.
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=_make_result(False))), \
-             patch('orchestrator.merge_queue._resolve_dispatch_time_merge_base',
-                   new=AsyncMock(return_value=None)), \
-             patch('orchestrator.merge_queue._spawn_main_health_probe', return_value=False):
-            result = await worker._run_inflight_verify(item, lease)
-
-        # (b1) the false-green does NOT land — a blocked outcome is returned.
-        assert result.outcome is not None, (
-            'a remote false-green must not pass through _run_inflight_verify as a land'
+        assert 'fg_b.py' not in main_files, (
+            'the branch behind a remote false-green must never reach main'
         )
-        assert result.outcome.status == 'blocked'
 
-        # (b2) the diverging remote is quarantined in the worker's by-reference set
-        # (the same set shared with the HostAllocator — task 2822 fix b's first use).
-        assert 'leo-laptop' in worker._runner_quarantine
-
-        # (b3) a dedup'd BORN-AT-L2 verify_cross_check_mismatch escalation was filed
-        # (task 2886 fix 3: level=2/critical, no longer level=1/blocking).
-        mismatch = [e for e in eq.submitted if getattr(e, 'category', None) == 'verify_cross_check_mismatch']
-        assert len(mismatch) == 1, f'expected 1 cross-check escalation, got {eq.submitted}'
-        assert mismatch[0].agent_role == 'orchestrator-cross-check'
-        assert mismatch[0].level == 2
-        assert mismatch[0].severity == 'critical'
-        assert 'leo-laptop' in mismatch[0].detail
-
-        # (b4) distinct mismatch telemetry emitted through the real caller.
-        assert es.events_of(EventType.verify_cross_check_mismatch)
-
-        # (b5) fix 3: the concluded divergence SYNCHRONOUSLY halted the merge queue
-        # (worker.operator_halt threaded in as halt_hook) so no FURTHER adoption can
-        # occur before a human looks — the halt is not deferred to the async escalation
-        # gate (incident 83336a32: cross-check diverged +3s AFTER CAS-advance).
-        assert worker._operator_halt.is_set()
-        assert worker.is_wip_halted
 
 # ===========================================================================
 # task 3173 step-9: THE HEADLINE REGRESSION.
@@ -2498,6 +2570,14 @@ class TestTwoHostFalseGreenCapstone:
 # ===========================================================================
 
 
+#: What ``_summarize_checks`` published for host B's leg in the measured case:
+#: SIGKILLed at 0.31 s having emitted zero diagnostics.
+_KILLED_LEG_SUMMARY = (
+    'Failures: lint leg killed by signal 9 after 0.31s; '
+    'no diagnostics produced; verdict indeterminate'
+)
+
+
 @pytest.mark.asyncio
 class TestIndeterminateLocalLegDoesNotVeto:
     """The new INDETERMINATE arm, plus its own fail-CLOSED controls.
@@ -2509,11 +2589,6 @@ class TestIndeterminateLocalLegDoesNotVeto:
     pinned by this class's OWN controls below, which drive the same
     `_run_post_merge_verify` callee through `_drive`.
     """
-
-    _KILLED_LEG_SUMMARY = (
-        'Failures: lint leg killed by signal 9 after 0.31s; '
-        'no diagnostics produced; verdict indeterminate'
-    )
 
     @staticmethod
     async def _drive(tmp_path, *, local_category: str, merge_sha: str,
@@ -2530,7 +2605,6 @@ class TestIndeterminateLocalLegDoesNotVeto:
         (rather than deriving ``[local_category]``) keeps the fail-CLOSED
         "not recorded" case drivable.
         """
-        from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -2546,36 +2620,32 @@ class TestIndeterminateLocalLegDoesNotVeto:
         local_fail.lint_output = ''
         local_fail.type_output = ''
         local_fail.summary = (
-            TestIndeterminateLocalLegDoesNotVeto._KILLED_LEG_SUMMARY
-            if local_summary is None else local_summary
+            _KILLED_LEG_SUMMARY if local_summary is None else local_summary
         )
         eq = _FakeEscalationQueue()
         es = _RecordingEventStore()
         quarantine: set[str] = set()
 
-        lr_calls: list = []
-        with patch('orchestrator.merge_queue.LocalRunner',
-                   _local_runner_patch(result=local_fail, calls=lr_calls)), \
-             patch('orchestrator.merge_queue._classify_main_health_red',
-                   new=AsyncMock(return_value=None)):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=es,  # type: ignore[arg-type]
-                merge_sha=merge_sha,
-                runner=remote,
-                escalation_queue=eq,
-                quarantine=quarantine,
-            )
-        return outcome, git_ops, eq, es, quarantine, lr_calls
+        verifier = _xcheck_verifier(result=local_fail)
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,  # type: ignore[arg-type]
+            merge_sha=merge_sha,
+            runner=remote,
+            escalation_queue=eq,
+            quarantine=quarantine,
+            verifier=verifier,
+        )
+        return outcome, git_ops, eq, es, quarantine, verifier
 
     # -- the new INDETERMINATE arm ----------------------------------------
 
     async def test_indeterminate_local_leg_does_not_veto_completed_remote_pass(self, tmp_path):
         """THE MEASURED CASE: a killed local leg must not discard host A's
         completed PASS, and must not blame the branch for it."""
-        outcome, git_ops, eq, es, quarantine, lr_calls = await self._drive(
+        outcome, git_ops, eq, es, quarantine, verifier = await self._drive(
             tmp_path, local_category='infra_kill', merge_sha='b1ac2c7f',
             local_failing_legs=['infra_kill'],
         )
@@ -2595,7 +2665,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert eq.submitted == []
 
         # (5) the cross-check DID run; it is recorded as inconclusive, not a mismatch.
-        assert len(lr_calls) == 1
+        assert len(verifier.verified) == 1
         inconclusive = es.events_of(EventType.verify_cross_check_inconclusive)
         assert len(inconclusive) == 1, (
             f'expected exactly one inconclusive event, got {es.events}'
@@ -2817,3 +2887,67 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert 'laptop' in quarantine
         assert len(eq.submitted) == 1
         assert es.events_of(EventType.verify_cross_check_mismatch)
+
+
+# ===========================================================================
+# Task 5030 amendment: the timeout-mark guard, generalised to THIS module.
+# ===========================================================================
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a ``@pytest.mark.timeout`` mark whose value clears that budget.
+
+    Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
+    its own copy -- but both resolve ``Path(__file__)`` against their own
+    source, so neither reaches this module.  That mattered here the moment
+    γ7 replaced this file's mock-driven host tests with real-git lane-settling
+    polls: ``TestUnreachableHostCapstone`` went from trivially fast to a
+    computed 360s budget against a 300s default, with no mark anywhere in the
+    file.
+
+    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
+    than reimplemented: they are deliberately pure (source text in, offender
+    list out, class resolver injected as ``globals().get``) precisely so they
+    can be driven with foreign input, and a third copy would be free to drift
+    from the marks it audits.
+
+    The computed budget is a conservative FLOOR over call SHAPES: it bills
+    ``wait_responsive`` / ``asyncio.wait_for`` / ``_await_outcome`` sites and
+    nothing else, so this module's ``_until(...)`` polls -- which do bound
+    their own budget, through ``wait_responsive`` one frame down -- are not
+    counted. An unrecognised shape can only under-count, never fabricate a
+    wait, so a class this guard passes may still deserve a wider mark than the
+    floor demands; a class it fails is genuinely under-marked.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a ``timeout`` mark whose value clears its own computed budget.
+
+        Recomputes from source; no figure written anywhere in this file is
+        load-bearing for the assertion.  (For orientation only, current at the
+        time of writing: 360s for TestUnreachableHostCapstone against its
+        HOST_CAPSTONE_TEST_TIMEOUT mark -- if the comment on that constant
+        disagrees with this guard, the guard is right.)
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+        offenders = _timeout_mark_offenders(budgets, globals().get)
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure -- strictly worse than the flake being '
+            'fixed. Add @pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT) '
+            'directly above each offending class.'
+        )

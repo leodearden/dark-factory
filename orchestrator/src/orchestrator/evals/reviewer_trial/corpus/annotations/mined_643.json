@@ -32,5 +32,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Fix proactive sample pool and remove dead Recently Completed elif branch",
+      "description": "Three related issues in fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:\n1. sample_pool uses active_tasks only, excluding done tasks that the Stage 2 prompt instructs the agent to review for missing knowledge capture. Fix by including filtered.done_tasks in the sample pool.\n2. The elif branch (done_count>0 but done_tasks empty) is dead code since filter_task_tree always populates done_tasks when done_count>0. Remove the branch.\n3. The test in test_stages.py:1647 asserting '15' in payload is weak and tests an impossible state (FilteredTaskTree with done_tasks=[] but done_count=15). Replace with a test that verifies done task titles appear in the Recently Completed section via the primary code path.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "643",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-13T00:38:16.267Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py",
+      "fused-memory/tests/test_stages.py"
+    ],
+    "base_sha": "d6557f83a846e6baa798d53b70526ec455804a49",
+    "branch_sha": "8a5c04a535b7582714340f79065080d69aa8ac92",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "7be9fa51659fa73cd67a63ef071558f7819f5128",
+      "merge_base_sha": "d6557f83a846e6baa798d53b70526ec455804a49",
+      "diff_reproduces_from": "git diff d6557f83a8 7be9fa5165",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

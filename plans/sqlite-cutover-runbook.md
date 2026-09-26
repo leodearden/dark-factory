@@ -1,5 +1,16 @@
 # SQLite Task Backend Cutover Runbook
 
+> **HISTORICAL — the cutover completed on 2026-05-06. This runbook is
+> retained as a record of how it was done, not as a procedure to run.**
+> `SqliteTaskBackend` is the sole production backend; `tasks.db` is the
+> live store and there is no on-disk `tasks.json` to migrate from. The
+> Step 1 migration script (`migrate_tasks_json_to_sqlite.py`) was
+> **deleted** under task 4682 — it had been unrunnable since the
+> flat-schema change (`e27642c44f`) dropped `parent_id` and
+> `_TOP_LEVEL_SENTINEL`, and its `--replace` path was a standing hazard
+> to the live `tasks.db`. Read task state through the fused-memory MCP
+> tools instead.
+
 Phase 2 of `plans/do-1-on-a-happy-pony.md` is on main behind
 `taskmaster.backend_mode='taskmaster'` (default). This runbook is the
 sitting that flips it to `'sqlite'`. Plan on ~4–6 hours of attention
@@ -236,6 +247,8 @@ Taskmaster code:
 - Backend: `fused-memory/src/fused_memory/backends/sqlite_task_backend.py`
 - Comparator: `fused-memory/src/fused_memory/backends/dual_compare_backend.py`
 - Migration: `fused-memory/scripts/migrate_tasks_json_to_sqlite.py`
+  — **deleted** under task 4682; see the header note. Recover from
+  git history (last present at `7cd79d88cf`) if ever needed.
 - Memory:
   - `project_fused_memory_restart_procedure.md` — restart script details
   - `feedback_graceful_shutdown_patience.md` — orchestrator drain

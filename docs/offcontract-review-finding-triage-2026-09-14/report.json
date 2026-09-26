@@ -1,0 +1,644 @@
+{
+  "sweep": "offcontract-review-finding-triage",
+  "task_id": "5430",
+  "origin_escalation": "esc-2896-10",
+  "question": "For each of the 23 medium-and-above reviewer findings that the off-contract verdict shape silently dropped, is it (a) already fixed incidentally, (b) still a live defect on current main, or (c) not actually a defect / no longer applicable?",
+  "answer": null,
+  "roster_frozen_at": "2026-09-14",
+  "roster_source": "Transcribed from task 5430's own description, which is the authoritative enumeration. Each id is <task>-<category>-<corpus index>. 22 of 23 resolve to a live issue record in the frozen corpus/ in this directory; 2896-correctness-0 does not, because that verdict was overwritten by a re-review on 2026-09-12 and its headline survives only in the task description. Severity and category are as emitted, never re-graded here.",
+  "roster": [
+    {
+      "id": "2896-correctness-0",
+      "task": "2896",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "Storm-escalation dedup is broken: filed with task_id='' but queried by entity_uuid",
+      "corpus_record": "absent (overwritten 2026-09-12)",
+      "location_as_emitted": null,
+      "disposition": null
+    },
+    {
+      "id": "3031-integration-gap-0",
+      "task": "3031",
+      "severity_as_emitted": "medium",
+      "category": "integration-gap",
+      "headline": "report_ready_to_merge is not in the architect's tool allowlist — the exit is unreachable in production",
+      "corpus_record": "corpus/3031.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/mcp/plan_tools.py:863",
+      "disposition": null
+    },
+    {
+      "id": "3031-correctness-1",
+      "task": "3031",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "The enqueue exit's 'blocked + no escalation is LEAVE-shaped' rationale is contradicted by the sweep's EXISTS_OFF_MAIN upgrade",
+      "corpus_record": "corpus/3031.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/workflow.py:6090",
+      "disposition": null
+    },
+    {
+      "id": "3041-correctness-0",
+      "task": "3041",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "Tombstone coverage overclaimed as \"every recon path\"",
+      "corpus_record": "corpus/3041.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py:4",
+      "disposition": null
+    },
+    {
+      "id": "3041-architectural-coherence-1",
+      "task": "3041",
+      "severity_as_emitted": "medium",
+      "category": "architectural-coherence",
+      "headline": "New eviction order makes narrative reconstructions single-trim transient",
+      "corpus_record": "corpus/3041.json#/verdict/issues/1",
+      "location_as_emitted": "fused-memory/src/fused_memory/reconciliation/summary_pool.py:365",
+      "disposition": null
+    },
+    {
+      "id": "3064-efficiency-0",
+      "task": "3064",
+      "severity_as_emitted": "medium",
+      "category": "efficiency",
+      "headline": "get_statuses tool description grew 959 → 8,328 chars, loading ~2k tokens into every agent session",
+      "corpus_record": "corpus/3064.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/server/tools.py:3827",
+      "disposition": null
+    },
+    {
+      "id": "3075-correctness-0",
+      "task": "3075",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "The ASSIGNED preserve has no staleness bound and --disk-pressure cannot override it — a stuck record exempts a lane from reclaim permanently",
+      "corpus_record": "corpus/3075.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/scripts/warm-lane/warm-lane-gc.sh:694",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-0",
+      "task": "3142",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "filing_dispatch claims about a TASK are adjudicated as terminality, producing false 'mismatch' verdicts on ordinary 'filed task N' narration",
+      "corpus_record": "corpus/3142.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/services/completion_claim_gate.py:560",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-1",
+      "task": "3142",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "PR/issue '#N' references are read as task refs, so 'Merged PR #4521' escalates against an unrelated task",
+      "corpus_record": "corpus/3142.json#/verdict/issues/1",
+      "location_as_emitted": "fused-memory/src/fused_memory/services/completion_claim_gate.py:520",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-2",
+      "task": "3142",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "make_commit_probe() runs `git rev-parse --show-toplevel` synchronously on the event loop, defeating the to_thread wrapper directly below it",
+      "corpus_record": "corpus/3142.json#/verdict/issues/2",
+      "location_as_emitted": "fused-memory/src/fused_memory/server/tools.py:1697",
+      "disposition": null
+    },
+    {
+      "id": "3308-contract-drift-0",
+      "task": "3308",
+      "severity_as_emitted": "moderate",
+      "category": "contract-drift",
+      "headline": "Implementation deliberately supersedes two normative PRD Contract rows, but the PRD still states the old ones",
+      "corpus_record": "corpus/3308.json#/verdict/issues/0",
+      "location_as_emitted": "plans/dashboard-availability-prd.md:195",
+      "disposition": null
+    },
+    {
+      "id": "3340-correctness-0",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Streak escalation is one-shot for a persistent condition",
+      "corpus_record": "corpus/3340.json#/verdict/issues/0",
+      "location_as_emitted": "scripts/legibility/nightly.py:872",
+      "disposition": null
+    },
+    {
+      "id": "3340-test-coverage-1",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "test-coverage",
+      "headline": "Progress probe ships with no caller anywhere in the repo",
+      "corpus_record": "corpus/3340.json#/verdict/issues/1",
+      "location_as_emitted": "scripts/legibility/check_trickle_progress.py:1",
+      "disposition": null
+    },
+    {
+      "id": "3340-correctness-2",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Writer and reader resolve the path from different process envs",
+      "corpus_record": "corpus/3340.json#/verdict/issues/2",
+      "location_as_emitted": "scripts/legibility/trickle_state.py:180",
+      "disposition": null
+    },
+    {
+      "id": "3363-correctness-0",
+      "task": "3363",
+      "severity_as_emitted": "major",
+      "category": "correctness",
+      "headline": "Narrowing recovered_open silently drops the 'escalation open' badge for insufficient_data / grandfathered / unjudged rows",
+      "corpus_record": "corpus/3363.json#/verdict/issues/0",
+      "location_as_emitted": "dashboard/src/dashboard/data/memory_evals.py:805",
+      "disposition": null
+    },
+    {
+      "id": "3363-design-1",
+      "task": "3363",
+      "severity_as_emitted": "medium",
+      "category": "design",
+      "headline": "internal_error in _UNCACHEABLE_ISSUE_KINDS can permanently defeat the memory-evals cache — the failure mode this change rejects elsewhere",
+      "corpus_record": "corpus/3363.json#/verdict/issues/1",
+      "location_as_emitted": "dashboard/src/dashboard/data/memory_evals.py:199",
+      "disposition": null
+    },
+    {
+      "id": "3367-correctness-0",
+      "task": "3367",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Env-recovery gate checks `attempt.test.rc != 0` but not that the TEST leg is the ENV_TRANSIENT source",
+      "corpus_record": "corpus/3367.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify.py:4460",
+      "disposition": null
+    },
+    {
+      "id": "3367-correctness-1",
+      "task": "3367",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "A TYPE-leg ENV_TRANSIENT now outranks and masks a co-occurring genuine TEST_FAILURE",
+      "corpus_record": "corpus/3367.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify_classify.py:583",
+      "disposition": null
+    },
+    {
+      "id": "3453-correctness-0",
+      "task": "3453",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "The registration-time canary is a FINDABILITY probe, not an importability probe — it cannot detect the exact failure mode the task measured",
+      "corpus_record": "corpus/3453.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/proc_supervision.py:797",
+      "disposition": null
+    },
+    {
+      "id": "3453-blast-radius-1",
+      "task": "3453",
+      "severity_as_emitted": "medium",
+      "category": "blast-radius",
+      "headline": "`--setenv=PYTHONPATH=` applies to the ENTIRE transient unit, not just the submit child — the deploy payload now runs with a PYTHONPATH it never had",
+      "corpus_record": "corpus/3453.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/proc_supervision.py:847",
+      "disposition": null
+    },
+    {
+      "id": "3454-correctness-0",
+      "task": "3454",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Documented-but-unfixed capacity marker gap makes the key probe fail misleadingly",
+      "corpus_record": "corpus/3454.json#/verdict/issues/0",
+      "location_as_emitted": "shared/tests/test_cli_invoke_integration.py:159",
+      "disposition": null
+    },
+    {
+      "id": "3679-test-coverage-0",
+      "task": "3679",
+      "severity_as_emitted": "medium",
+      "category": "test-coverage",
+      "headline": "Docstring cites a pin test that does not exist; the load-bearing ordering is entirely unpinned",
+      "corpus_record": "corpus/3679.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify_classify.py:380",
+      "disposition": null
+    },
+    {
+      "id": "3757-correctness-0",
+      "task": "3757",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "A duplicate-uuid store row is still reported as `bad_manifest` — the exact mis-attribution this change eliminates elsewhere",
+      "corpus_record": "corpus/3757.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/scripts/local_memory_models_eval/build_corpus.py:1306",
+      "disposition": null
+    }
+  ],
+  "gate": {
+    "decision": "continue",
+    "decided_at": "2026-09-14",
+    "rationale": "STOP is not available. The task authorises stopping only if all five priority findings disposition (a) or (c); three of the five are (b) — 3041-correctness-0, 3075-correctness-0 and 3142-correctness-0 are all still live on current main, one of them reproduced at runtime. Two are (a), both confirmed by hunk/commit rather than by claim. A 3-of-5 live rate among the high/major band is also the opposite of the 'low yield' premise the stop path rests on, so the 18 medium findings are triaged rather than deferred.",
+    "priority_tally": {
+      "a": 2,
+      "b": 3,
+      "c": 0
+    },
+    "stop_was_permitted": false
+  },
+  "dispositions": [
+    {
+      "id": "2896-correctness-0",
+      "disposition": "a",
+      "note": "Already fixed, and the fix is confirmed by the hunk rather than accepted from the task description. b57f8c1402 changed `task_id=''` to `task_id=entity_uuid` in maybe_escalate_suppression_storm, which is exactly the key misalignment the finding named. Notably it is an evil-merge: the line is in NEITHER parent's tree (parent1 c267573b73 still has task_id='' with the entity_uuid lookup; parent2 5b51fa970b has no such function at all), so it exists on main solely through that merge's by-hand conflict resolution — consistent with the description's 'fixed by hand'. `git log -S'task_id=entity_uuid' origin/main` finds nothing without -m, which is why the fix is easy to miss. The dedup mechanism was subsequently reworked by 201c9c018b (task 3522): the fold now keys on `dedupe_fingerprint` rather than has_open_l1, and task_id=entity_uuid survives as an unchanged context line, so the write key and the read key agree on both axes today.",
+      "followup_ticket": null,
+      "evidence": {
+        "filed_with": "flag_dedup.py::maybe_escalate_suppression_storm — task_id=entity_uuid, dedupe_fingerprint=compute_content_fingerprint(...)",
+        "queried_by": "escalation/src/escalation/dedupe.py::content_fingerprint_key returns esc.dedupe_fingerprint; per-entity reads use queue.get_by_task(entity_uuid)",
+        "fixing_hunk": "b57f8c1402: -task_id='' / +task_id=entity_uuid, with a new INVARIANT comment naming the no-op bug",
+        "pins": [
+          "fused-memory/tests/test_flag_dedup.py::TestMaybeEscalateSuppressionStorm::test_over_threshold_files_one_escalation",
+          "fused-memory/tests/test_flag_dedup.py::TestMaybeEscalateSuppressionStorm::test_recurring_storm_folds_into_one_parent",
+          "fused-memory/tests/test_stages.py::TestMemoryConsolidatorEntityStandingDecision::test_storm_escalation_filed_when_one_decision_suppresses_many"
+        ],
+        "incidental_observation": "b57f8c1402's own commit message cites a test name, test_dedup_key_round_trips_through_a_real_queue, that no longer exists on main — 201c9c018b folded it into test_recurring_storm_folds_into_one_parent, which retains the write-key-equals-read-key assertion. The coverage survived; only the name a reader would grep for is gone."
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3031-integration-gap-0",
+      "disposition": "a",
+      "note": "Fixed, and fixed along the exact path the finding itself nominated. `mcp__plan-tools__report_ready_to_merge` IS now a member of `_PLAN_CREATOR_TOOLS` in orchestrator/src/orchestrator/agents/roles.py, carrying its own explanatory comment ('work is complete on THIS BRANCH; only the merge to main is missing'). Three commits did it: 192b88bbcd 'grant report_ready_to_merge to ARCHITECT + SIMPLE_TASK', then d51f11d906 and e344f6f27d which taught the ARCHITECT and SIMPLE_TASK prompts the exit. So both halves the finding separated — the hard reachability blocker in the ALLOWLIST and the softer prompt enumeration — are closed. The rest of the chain the finding called dead code is live: artifacts.py carries write_ready_to_merge / read_ready_to_merge / clear_ready_to_merge, event_store.py documents an event emitted 'once per .task/ready_to_merge.json report by TaskWorkflow._handle_ready_to_merge_report, on BOTH dispositions', and stranded_verified_green.py names the exit as one of its recovery routes. The finding closed by asking to 'confirm leaf zeta is filed and includes the _PLAN_CREATOR_TOOLS entry, or add it here' — so it explicitly allowed for the follow-up resolution, and that is what happened. The self-check it offered also now passes: this task's own architect was told report_ready_to_merge was among its tools, and the allowlist now agrees rather than contradicting the briefing.",
+      "followup_ticket": null,
+      "evidence": {
+        "allowlist_now_contains_it": "roles.py::_PLAN_CREATOR_TOOLS includes 'mcp__plan-tools__report_ready_to_merge'",
+        "fixing_commits": [
+          "192b88bbcd (allowlist)",
+          "d51f11d906 (architect prompt)",
+          "e344f6f27d (simple_task prompt)"
+        ],
+        "handler_chain_live": "artifacts.py write/read/clear_ready_to_merge; event_store.py event per report via TaskWorkflow._handle_ready_to_merge_report; stranded_verified_green.py cites the exit",
+        "findings_own_preferred_path": "'Confirm leaf zeta is filed and includes the _PLAN_CREATOR_TOOLS entry, or add it here' — the former happened"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3031-correctness-1",
+      "disposition": "b",
+      "note": "Still live, with both sides of the contradiction quotable verbatim on current main. SIDE A, the enqueue exit in workflow.py: \"'blocked' with no escalation is instead LEAVE-shaped, and the merge callback (or the found_on_main reconciler) flips it done once main actually moves.\" The comment's whole purpose is to justify persisting blocked-with-no-escalation on the grounds that the recovery sweep will leave it alone. SIDE B, harness.py: that shape is upgraded away from LEAVE. The condition is still `action == RecoveryAction.LEAVE and status == 'blocked' and report.live_claimant is None and self._only_merge_remediable(report.open_escalations) and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN` -> `RE_FILE_ESCALATION`, and the surrounding comment confirms the vacuous case the finding relied on: 'an empty list is still True'. So a blocked task with NO escalation whose branch is off main is exactly what gets re-escalated. The two comments cannot both be right, and neither has moved: nothing since 2026-08-01 touched the LEAVE-shaped rationale except a05136c0cb (task 3537 halt-filing), which did not address it. THIS IS THE MILDEST (b) IN THE ROSTER and should be filed as such rather than inflated. The finding said so itself — 'behaviourally this is bounded ... the stranded reaper has the same exposure (pre-existing), so this may be accepted behaviour — but the enqueue-exit comment should say so rather than assert the opposite.' The defect is a load-bearing comment that states the inverse of what the code does, with a real if bounded cost behind it (a burned architect run per sweep, and a second MergeRequest on the same branch once the 30-minute grace lapses). The remedy may legitimately be a comment correction rather than a behaviour change.",
+      "followup_ticket": "tkt_0RTN091H7E8CR02RVAN13R6HBY",
+      "evidence": {
+        "side_a_still_asserted": "workflow.py enqueue exit: \"'blocked' with no escalation is instead LEAVE-shaped\"",
+        "side_b_still_upgrades": "harness.py: LEAVE + blocked + no live claimant + _only_merge_remediable + EXISTS_OFF_MAIN -> RE_FILE_ESCALATION",
+        "vacuous_case_confirmed_in_comment": "'an empty list is still True' — so no-escalation satisfies _only_merge_remediable",
+        "commits_since_august_touching_it": "a05136c0cb (task 3537 halt-filing) — did not address the rationale",
+        "remedy_may_be_docs_only": "the finding explicitly allows 'the comment should say so rather than assert the opposite'"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3041-correctness-0",
+      "disposition": "b",
+      "note": "Still live, and narrowed to precisely one of its three texts. The CODE measurement reproduces exactly: still 2 of 6 Mem0 delete paths under reconciliation/ wired to record_mem0_deletion_tombstones (wired: _sweep_stale_mem0_pool, enforce_summary_pool_cap; unwired: harness._delete_status_correction_memories, scope_freshness._pool_cap_scope_snapshots, targeted._delete_stale_completion_echoes, task_knowledge_sync._prune_task_count_snapshots). Of the three overclaiming texts, one is FIXED and two are not. TEXT 2 (recon_self_model.py) is now fully bounded — task 4421 (done) replaced the universal claim with an enumerated deleter list, names all four unwired paths explicitly, and points at task 4422 for the widening. TEXT 1 (mem0_tombstone.py module docstring) still says 'consumed by every recon path that deletes a Mem0 record'; that is tracked by task 4472 (deferred, low) which names the exact lines. TEXT 3 (server/tools.py::get_memory_by_id, the LIVE FastMCP tool description) still hedges tombstone absence with the TTL reason ONLY, and is the one piece of residue no open task appears to name: 4472's scope is mem0_tombstone.py + memory_service.py, and 4422/4861 are coverage-widening tasks. THE FINDING IS NOW WORSE THAN WHEN WRITTEN, in a way it could not have predicted: task 4421's fix to Text 2 means the Stage 2 prompt now tells an agent that 'several Mem0 delete paths write no tombstone at all' while the get_memory_by_id tool description that same agent reads says absence only means TTL expiry. The two live agent-facing texts now contradict each other. Also note the finding's own mitigation has expired: it said render_cycle_summary_section was 'not yet imported by any prompt file (task xi cutover pending)'. It IS now imported and interpolated by prompts/stage2.py, so the text is live.",
+      "followup_ticket": "tkt_0RTN0677778P5F1XT85R7DTN0F",
+      "evidence": {
+        "wired_call_sites": 2,
+        "unwired_call_sites": 4,
+        "unchanged_since_july": true,
+        "text_1_mem0_tombstone_py": "STILL OVERCLAIMS — 'consumed by every recon path that deletes a Mem0 record'; tracked by task 4472 (deferred)",
+        "text_2_recon_self_model_py": "FIXED by task 4421 (done) — now an enumerated deleter list naming all four unwired paths and task 4422",
+        "text_3_server_tools_py": "STILL OVERCLAIMS — absence hedged on TTL only; NOT named by 4472 (scope: mem0_tombstone.py + memory_service.py) and not by 4422/4861's coverage scope",
+        "new_contradiction": "prompts/stage2.py renders the bounded Text 2 while get_memory_by_id ships the unbounded Text 3 — one agent, two incompatible statements",
+        "mitigation_expired": "render_cycle_summary_section is now imported and rendered by reconciliation/prompts/stage2.py",
+        "related_open_tasks": [
+          "4472 (deferred)",
+          "4422 (deferred)",
+          "4861 (pending)"
+        ]
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3041-architectural-coherence-1",
+      "disposition": "b",
+      "note": "Still live: both sides of the incoherence are intact, and each has since been documented MORE firmly rather than reconciled. The eviction key is still `(is_ledger_stamp, has_parseable_created_at, created_at)`, and it now carries a formal 'Retention contract (task 3041)' stating that narratives are evicted BEFORE any ledger_stamp and calling the narrative 'the disposable LLM-authored duplicate that task 2468 already tried to suppress'. Meanwhile prompts/stage2.py still MANDATES exactly that record as the resolution of a `missing_stage2_summary` carry-forward finding — 'The reconstruction `add_memory` MUST carry metadata={...'record_type': 'narrative'}' — and still tells the model the write is 'deterministically findable by metadata-keyed lookup and subject to the stage2_cycle_summary pool cap'. There is no narrative carve-out, exemption or protection anywhere in summary_pool.py. So the reconstruct -> evict-on-first-trim -> re-flag loop the finding described is still reachable: one module calls the record disposable and first-out, the other directs an LLM to write it as a durable resolution, and the prompt never warns that it will be the next thing trimmed. IMPORTANT NARROWING, recorded so the follow-up is not misaimed: the eviction ORDER is not the defect. Its rationale is explicit and incident-backed — letting a narrative evict a ledger_stamp 'is what made all three of run 84eae9bd's anchors vanish together (recon gate 165 / esc-165-1)' — and the ledger_stamp is the copy an auditor correlates against get_cycle_summary_presence. The remedy therefore almost certainly belongs on the PROMPT side (warn the model, exempt a reconstruction from the cap, or stop directing the write at all), not by reverting the retention contract.",
+      "followup_ticket": "tkt_0RTN0AZENJ1T3NCPJZJ1KW8P23",
+      "evidence": {
+        "eviction_key_unchanged": "(is_ledger_stamp, has_parseable_created_at, created_at) — narratives first",
+        "retention_contract_now_formalised": "'record_type=narrative records are evicted BEFORE any record_type=ledger_stamp'; narrative called 'the disposable LLM-authored duplicate'",
+        "prompt_side_unchanged": "prompts/stage2.py still MANDATES record_type='narrative' as the carry-forward resolution and calls it 'subject to the stage2_cycle_summary pool cap'",
+        "no_carve_out": "no narrative exemption or protection anywhere in summary_pool.py",
+        "remedy_is_probably_prompt_side": "the eviction order's rationale is incident-backed (recon gate 165 / esc-165-1); reverting it would reintroduce that incident"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3064-efficiency-0",
+      "disposition": "b",
+      "note": "Still live, and MEASURABLY WORSE than when the finding was written — which is exactly why the plan required re-measuring rather than trusting the August number. The get_statuses docstring is now 9,376 characters. August measured 8,328, itself grown from an original 959. So the description was indeed edited again in the interval, and it grew by a further ~1,048 chars: the trend the finding identified continued unchecked for six weeks. FastMCP still uses `fn.__doc__` as the tool description, so the mechanism is unchanged. ONE GENUINE MITIGATION, observed first-hand in this very session rather than inferred, and recorded because it cuts against the finding: this client DEFERS MCP tool schemas — the fused-memory tools arrived as names only, with an explicit note that their schemas are not loaded until fetched via a search tool, and `get_statuses` was never fetched. So for a deferred-schema client the 9,376 chars are NOT standing context, and the finding's '~1,900 extra tokens of standing context per session' overstates the cost for that client. It does NOT dispose of the finding, for two reasons. Deferral is a CLIENT-side behaviour that varies per client and can change without notice, so it is not a property of the server the finding is about; and the non-Claude-Code consumers the finding named — the reconciliation stages and the eval harness's FakeMcpClient — are unaffected by it. The content critique also stands on its own: the bulk of the text is maintainer-facing rationale (the who-calls-this census, the why-page_size-is-not-clamped note, the rule for future maintainers) that belongs in block comments, not in a wire-shipped tool description.",
+      "followup_ticket": "tkt_0RTN0BTYZJJ4F35Q3NV59FA1NG",
+      "evidence": {
+        "measured_now_chars": 9376,
+        "august_chars": 8328,
+        "original_chars": 959,
+        "delta_since_august": "+1048 — the description was edited again and grew",
+        "mechanism_unchanged": "FastMCP uses fn.__doc__ as the tool description",
+        "client_side_mitigation_observed": "this session's client deferred fused-memory tool schemas; get_statuses' schema was never loaded, so for such a client the text is not standing context",
+        "why_that_does_not_dispose_of_it": "deferral is client-side and varies; the reconciliation stages and the eval harness FakeMcpClient are unaffected; and the maintainer-facing-content critique is independent"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3075-correctness-0",
+      "disposition": "b",
+      "note": "Still live, with the word 'permanently' now false for one of its two paths. Every mechanical fact reproduces verbatim: the Pass-1 record gate preserves unconditionally on ASSIGNED reading only LANE_STATE_RAW and LANE_STATE_TASK_ID; lib_lane_state.sh exports no age field at all, so the gate CANNOT see updated_at even though the record carries it; the gate is still positioned before the --disk-pressure rm branch, deliberately and by documented design; the arg parser still has no --force/--ignore-record/--max-record-age; and _note_released_durable still swallows OSError with 'cache updated (FREE), durable record left as-is'. WHAT CHANGED, and it matters: task 2891 landed two harness passes the July reading predates. _reclaim_terminal_lane_records DOES clear stuck records — but keyed on TERMINAL task status, not record age — so a stuck record whose task is done/cancelled now heals within a tick. _stale_lane_assignment_census is the only code applying an age bound (lane_stale_report_days, default 7) and is REPORT-ONLY by explicit design. So an age bound now exists in the tree and terminates in a digest line, never in a reclaim. TWO PATHS REMAIN LIVE. (1) A record stranded while its task is still pending/in-progress/blocked is skipped by the terminal reclaim by design and only printed by the census; reclaim_victim (the steal/preempt path) routes through the same swallowing write and its victim is typically non-terminal, so this is a real producer. (2) The claim's core ENOSPC scenario survives intact, because the healing pass releases through the SAME _note_released_durable and therefore fails identically while the disk is still full — the self-healing path is blocked by the very condition it would heal, during exactly the window the operator is running reclaim --disk-pressure. One genuine mitigation the July reading predates: the swallowed write is no longer silent, firing an L2 operator escalation at warm_lane_drift_l2_threshold (default 3). It still neither clears the record nor unblocks the gate. Test coverage is the telling gap: the analogous pin EXISTS for the sibling gate — test_warm_lane_gc.sh 'K5: --disk-pressure ALSO honours the live-reference gate' — while Block S (the record gate, S1-S23) contains zero --disk-pressure cases and Block K contains zero record-gate cases.",
+      "followup_ticket": "tkt_0RTN06S7S2FA8BX9EA4WX015GV",
+      "evidence": {
+        "gate_reads": "LANE_STATE_RAW, LANE_STATE_TASK_ID only — lib_lane_state.sh exports no age field",
+        "updated_at_exists_on_record": "orchestrator/src/orchestrator/lane_lifecycle.py — stamped on every transition",
+        "gate_still_before_disk_pressure": true,
+        "disk_pressure_override_exists": false,
+        "healed_case": "terminal-task records, by harness._reclaim_terminal_lane_records (task 2891) — so 'permanently' overstates for these",
+        "still_live_1": "non-terminal stuck records (e.g. preempt/steal victims): skipped by the terminal reclaim by design, report-only census",
+        "still_live_2": "the acute ENOSPC window: the healing release uses the same OSError-swallowing write, so it fails while the disk is full",
+        "age_bound_in_tree_but_report_only": "harness._stale_lane_assignment_census, config.lane_stale_report_days default 7.0",
+        "new_mitigation": "drift now escalates to L2 at warm_lane_drift_l2_threshold (default 3); does not clear the record",
+        "missing_pin": "test_warm_lane_gc.sh Block S has no --disk-pressure case; the analogous K5 pin exists for the live-reference gate",
+        "partially_overlapping_open_task": "5341 (pending, low) releases lanes whose task left the runnable set — addresses part of still_live_1, but not the gc gate's age bound nor a --disk-pressure override"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3142-correctness-0",
+      "disposition": "b",
+      "note": "Still live, reproduced at runtime rather than inferred. Running the shipped code: extract_completion_claims('Filed follow-up task 3200 for the remaining work') yields CompletionClaim(kind='filing_dispatch', subject='task', ref='3200'), and verify_claims with a probe returning 'pending' yields status='mismatch', observed='pending'. build_unverified_flag on that verdict returns a populated flag with tag='unverified_claim' — so the downstream consequence is confirmed end-to-end, which the original finding only inferred. verify_claims still branches solely on claim.subject; claim.kind appears nowhere in verify_claims, _verify_task, _verify_ticket or _verify_commit. The test blind spot is also unchanged: every filing_dispatch case in test_completion_claim_gate.py pairs with a TICKET subject, and the task-side fixture hardcodes kind='applied_work'. Two commits touched the file since 2026-08-10 (both task 3403 clause-boundary work) and neither changed a line of the dispatch. NO NEW FOLLOW-UP FILED, DELIBERATELY: task 4205 (deferred, medium) already tracks this as its CLASS 1 and quotes the same diagnosis, and the repo already carries an independent quantification in docs/unverified-completion-claim-sweep-2026-08-11/investigation.md — 125-128 of ~166-172 production mismatches are this exact class, with not one terminal. Filing a duplicate would be the wrong action; the accounting entry is the existing task.",
+      "followup_ticket": "task-4205",
+      "evidence": {
+        "runtime_reproduction": "kind='filing_dispatch' subject='task' ref='3200' -> status='mismatch' observed='pending'",
+        "downstream_confirmed": "build_unverified_flag returns tag='unverified_claim' with status='mismatch'",
+        "dispatch_still_subject_only": "verify_claims branches on claim.subject; claim.kind is never read there",
+        "test_blind_spot_unchanged": "all filing_dispatch cases pair with a ticket subject; _task_claim() hardcodes kind='applied_work'",
+        "commits_since_2026_08_10": "bcbaf27f36, b280f5d480 — both task 3403 clause boundaries; zero changed lines in the kind/subject dispatch",
+        "production_scale": "docs/unverified-completion-claim-sweep-2026-08-11: 125-128 of ~166-172 mismatches are this class; none terminal"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "pre_existing_task",
+      "existing_task": "4205"
+    },
+    {
+      "id": "3142-correctness-1",
+      "disposition": "b",
+      "note": "Still live, reproduced at runtime with output BYTE-IDENTICAL to the August finding. Running the shipped code in this worktree (module resolved to fused-memory/src/fused_memory/services/completion_claim_gate.py, i.e. this tree, which is unmodified from main for this file): 'Merged PR #4521 into main' -> kind='applied_work' subject='task' ref='4521'; 'The upstream issue #123 was closed as wontfix' -> kind='filing_dispatch' subject='task' ref='123'. Both match the finding's recorded results exactly. `_refs_in_clause` still applies TASK_REF_RE (plus _EXTERNAL_TASK_REF_RE) with no PR/pull/issue/GH exclusion, so the bare `#` cue still captures a PR or issue number as a task ref and the gate then consults the task authority about an id the sentence never claimed anything about. Both downstream outcomes the finding named remain live: a real non-terminal task with that id yields 'mismatch' (a false accusation about work nobody claimed), and a nonexistent id yields 'unverifiable' — still tagged, still escalated. NOT COVERED BY THE EXISTING TASK: 4205 tracks three false-positive classes from the task-3381 sweep — filing claims held to a completion standard, cross-repo commit probing, and negation-stripper misses. The bare-`#` PR/issue over-match does not appear among them, so unlike its sibling 3142[0] this one needs its own follow-up.",
+      "followup_ticket": "tkt_0RTN0CDNGBA7VN4VPHGA1CCQX6",
+      "evidence": {
+        "runtime_repro": [
+          "'Merged PR #4521 into main' -> applied_work/task/4521",
+          "'The upstream issue #123 was closed as wontfix' -> filing_dispatch/task/123"
+        ],
+        "identical_to_august": true,
+        "module_measured": "fused-memory/src/fused_memory/services/completion_claim_gate.py in this worktree (unmodified from main)",
+        "no_exclusion_added": "_refs_in_clause applies TASK_REF_RE and _EXTERNAL_TASK_REF_RE with no PR/pull/issue/GH guard",
+        "not_covered_by_4205": "4205's three classes are filing/terminality, cross-repo commit probing, negation-stripper misses"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3142-correctness-2",
+      "disposition": "b",
+      "note": "Still live, verbatim. In the coroutine, `probe = make_commit_probe(root)` is still called INLINE and only the per-ref call is threaded: `answer = await asyncio.to_thread(probe, ref)` on the very next lines. make_commit_probe still eagerly resolves the git toplevel at construction time via a blocking subprocess.run(['git','rev-parse','--show-toplevel']). The docstring a few lines above still states the rationale the construction defeats — 'asyncio.to_thread — a blocking git call on the event loop would stall every other in-flight MCP request behind one episode's verification'. That is precisely what the un-threaded rev-parse reintroduces, once per claimed project per episode, for up to the probe timeout on a slow, NFS-backed or lock-hung repository. The finding's two suggested remedies — wrap the construction in `await asyncio.to_thread(make_commit_probe, root)`, or make toplevel resolution lazy inside the threaded probe — are both still available and both cheap; neither was applied. The compounding issue it noted also stands: nothing caps commit refs per episode, so the per-sha probes remain serial.",
+      "followup_ticket": "tkt_0RTN0D8MN4NB038DEGEXS25QV0",
+      "evidence": {
+        "construction_still_inline": "probe = make_commit_probe(root) in the coroutine body",
+        "only_the_call_is_threaded": "answer = await asyncio.to_thread(probe, ref)",
+        "blocking_call_at_construction": "subprocess.run(['git','rev-parse','--show-toplevel']) inside make_commit_probe",
+        "docstring_still_states_the_defeated_rationale": "'a blocking git call on the event loop would stall every other in-flight MCP request'",
+        "neither_remedy_applied": "no to_thread around construction; toplevel resolution not made lazy"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3308-contract-drift-0",
+      "disposition": "c",
+      "note": "No longer applicable: the docs-vs-code divergence has been documented, which is what the finding asked for. Dispositioned exactly as the plan required — on whether the PRD still states the superseded rows TODAY. It does still state them, at plans/dashboard-availability-prd.md's §Contract table, but they are no longer unannotated, which was the whole complaint ('the document is unchanged'). The PRD now carries an explicit block: 'Note on the shipped dedup horizon and I4's episode-end condition (amended 2026-08-12, task 4088, from the shipped scripts/dashboard-watchdog.py)', which corrects both rows the finding named, by number, and states the reason for correcting rather than rewriting: 'the original wording is what the gamma task was dispatched against, and erasing it would erase the record that the code deliberately diverged, along with the reasoning that justifies the divergence.' Row 1 is now documented as shipping 'at most one L2 per rolling RATE_WINDOW_SECS, keyed on the persisted last_escalation_epoch', with the flapping-dashboard rationale the finding itself judged 'the right call'. Row 2 (I4) is documented as shipping 'no further restarts until the episode ends, where any successful probe ends it'. The note also bounds itself — 'Both corrections are narrow ... only the dedup HORIZON and the episode-END CONDITION are corrected' — which is the precision the finding said a steward reading the contract needed. Recorded as (c) rather than (a) deliberately: nothing was FIXED, because the code was never wrong. The finding was about a document, and the document caught up. Amended 2026-08-12 by task 4088, eleven days after this verdict was emitted and never read.",
+      "followup_ticket": null,
+      "evidence": {
+        "rows_still_present_but_annotated": "the §Contract table rows remain; an explicit correction block now covers both",
+        "annotation": "'Note on the shipped dedup horizon and I4's episode-end condition (amended 2026-08-12, task 4088, from the shipped scripts/dashboard-watchdog.py)'",
+        "row_1_documented_as": "at most one L2 per rolling RATE_WINDOW_SECS, keyed on the persisted last_escalation_epoch",
+        "row_2_documented_as": "no further restarts until the episode ends, where any successful probe ends it",
+        "why_not_rewritten_in_place": "'erasing it would erase the record that the code deliberately diverged, along with the reasoning'",
+        "fixed_by": "task 4088, 2026-08-12",
+        "why_c_not_a": "the code was never wrong; the finding was about the document, and the document caught up"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3340-correctness-0",
+      "disposition": "b",
+      "note": "Still live, unchanged. The guard is still exact-equality edge-triggered: `if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS: return` in scripts/legibility/nightly.py. A streak of 4 or more therefore returns early and posts nothing, so the sampling-cut door's only escalation is still the single one on the night the streak first equals the threshold. The finding's sharpest observation stands too: _escalate_barren_streak's own docstring names unread-journal-warnings as the failure mode it refuses to reproduce, and then reproduces it for this door. Its suggested remedy — re-fire on a bounded backoff such as streak in {3, 6, 12, 24} rather than exactly once — was not adopted. Reading this with 3340[1] as the plan directed, the two compound exactly as the finding warned: a persistent sampling-cut suppression escalates once, and the only level-triggered detector that would catch the continuing condition still has no caller.",
+      "followup_ticket": "tkt_0RTN0DPCN7ZBT5A09Z31MVRT8Y",
+      "evidence": {
+        "guard_still_edge_triggered": "if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS: return",
+        "consequence": "streak 4+ posts nothing; one escalation ever for a persistent condition",
+        "remedy_not_adopted": "no bounded-backoff re-fire (e.g. {3, 6, 12, 24})",
+        "compounds_with": "3340-test-coverage-1 — the level-triggered detector still has no caller"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3340-test-coverage-1",
+      "disposition": "b",
+      "note": "Still live. Re-ran the finding's own census across the whole repo (excluding this triage's own artifacts and the session's transcript files, both of which mention the name and would otherwise be false hits): every remaining reference is PROSE or the script itself. nightly.py's four hits are docstrings plus a log line; check_trickle_liveness.sh's two are comments; trickle_state.py's are docstrings — one of which still says 'when bound as a ...', i.e. conditional on a binding that does not exist; plans/confusion-reduction-prd.md is PRD prose; and the rest are its own tests. There is no .service or .timer unit, no task predicate binding, no yaml, and no OPERATIONS.md entry — grep for trickle_progress in OPERATIONS.md returns nothing. Dispositioned the way the plan required: on the presence of a CALLER, not on the presence of a test. scripts/tests/test_check_trickle_progress.py exists and is green, which is exactly the trap — 'has a test' is not 'has a caller', and the stdlib-only constraint the module docstrings justify at length is still written for a before_done predicate binding that was never filed. ONE PARTIAL MITIGATION since August, recorded for fairness: nightly.py now emits an operator-facing log line, 'Probe on demand with: check_trickle_progress.py ...', so a reader of the journal is at least told the probe exists. That improves discoverability and does not make the detector level-triggered, which is the property the finding was about. Neither of the finding's two remedies (file the binding, or say plainly in the PRD that the probe is hand-run-only) was taken.",
+      "followup_ticket": "tkt_0RTN0EG727M3EMNQ2ADKA7T712",
+      "evidence": {
+        "caller_census": "all remaining references are prose/docstrings/log text or the script's own tests",
+        "no_binding_of_any_kind": "no .service, no .timer, no task predicate, no yaml, nothing in OPERATIONS.md",
+        "the_trap_the_plan_warned_about": "scripts/tests/test_check_trickle_progress.py exists — 'has a test' is not 'has a caller'",
+        "still_conditional_in_its_own_docs": "trickle_state.py says 'when bound as a ...' — a binding that does not exist",
+        "partial_mitigation": "nightly.py now logs 'Probe on demand with: check_trickle_progress.py ...' — discoverability, not level-triggering",
+        "neither_remedy_taken": "binding not filed; PRD does not say hand-run-only"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3340-correctness-2",
+      "disposition": "b",
+      "note": "Still live as written, but LATENT rather than currently reachable — and the distinction matters enough to record, because it changes what the follow-up should say. `trickle_state_path` still derives the path from the calling process's environment: `${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/<project_id>/trickle-state.json`. Nothing pins the writer's and the reader's environments to agree, and the tempfile.gettempdir() degradation on an unset HOME is still in place. So the divergence mechanism is intact. WHAT MAKES IT LATENT: the finding's failure scenario requires the reader to be 'check_trickle_progress.py, ONCE BOUND as a before_done predicate' and EXEC'd by deterministic_runner with the orchestrator's environment. Per 3340[1], that binding still does not exist — there is no orchestrator-EXEC'd reader today, so the two independently-sourced environments never actually meet. The hazard is gated on the very binding whose absence is the other finding. That coupling is the useful output here: whoever files the missing binding (3340[1]) MUST fix the path derivation in the same change, or they will convert a dormant defect into a born-at-L2 milestone_check_failed escalation for a pipeline that is running perfectly — which is exactly the outcome this finding predicted. The follow-up should be worded as a precondition on the binding, not as an independent bug hunt.",
+      "followup_ticket": "tkt_0RTN0EVPSGZ31EX57G2V904HP7",
+      "evidence": {
+        "derivation_unchanged": "${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/<project_id>/trickle-state.json, from the calling process's env",
+        "degradation_still_present": "unset HOME falls back to tempfile.gettempdir(), a path the nightly never writes",
+        "why_latent": "the failure needs an orchestrator-EXEC'd reader; per 3340[1] no such binding exists yet",
+        "coupling": "must be fixed IN THE SAME CHANGE as the 3340[1] binding, or filing that binding converts a dormant defect into a born-at-L2 milestone_check_failed for a healthy pipeline"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3363-correctness-0",
+      "disposition": "a",
+      "note": "Fixed, and fixed more thoroughly than the finding suggested. Task 3442 landed the repair (commits aa5ac9c415, 5e0938c58e, 41803f5b7c, e63803cb72, dec8c9f480) and task 3481 moved verdictBadge out of the JSX into dashboard/src/dashboard/static/redux/memory_evals_fmt.js, so the finding's cited consumer path is itself stale now. The producer is UNCHANGED — recovered_open is still narrowed to no_alarm and the *_open states are still emitted — but the consumer is no longer three literals: it is a 9-entry PARITY_REFINEMENT table plus a 4-entry PARITY_PLAIN opt-out, and the producer now exports its vocabulary as a closed PARITY_STATES frozenset of 13. The decisive check is the set difference, and it is empty in BOTH directions: every producer state is handled, and there are no dead consumer branches. The exact row the finding named now renders 'insufficient_data - escalation open' with badge warn, which is precisely the behaviour it asked for. The fix went further than the suggestion in two ways: it is enumerated-exhaustive rather than endsWith('_open'), so an unlisted state fails LOUDLY as 'unrecognised parity' / badge bad instead of degrading to muted; and unknown_verdict now reads 'unreadable verdict' / badge bad, distinct from an absent verdict's 'no verdict' / muted, resolving the finding's second sub-claim. One residue is NOT a defect: _parity's docstring still says the change is 'purely additive for existing consumers'. The finding offered a disjunctive remedy — fix the consumer OR drop the claim — and the consumer was fixed, which makes the sentence true rather than misleading. No follow-up is warranted.",
+      "followup_ticket": null,
+      "evidence": {
+        "producer_unchanged": "recovered_open still narrowed to no_alarm; *_open states still emitted; PARITY_STATES now a 13-member frozenset",
+        "consumer_relocated": "verdictBadge now in dashboard/src/dashboard/static/redux/memory_evals_fmt.js (task 3481), not tab_memory_evals.jsx",
+        "set_difference_both_directions": "empty — 13 producer states = 9 refined + 4 plain, no unhandled value and no dead branch",
+        "named_row_now_renders": "insufficient_data + open escalation -> 'insufficient_data - escalation open', badge warn",
+        "stronger_than_suggested": "enumerated-exhaustive with a loud 'unrecognised parity' fallback, rather than endsWith('_open')",
+        "second_subclaim_resolved": "unknown_verdict -> 'unreadable verdict' / badge bad, distinct from absent 'no verdict' / muted",
+        "pins": [
+          "dashboard/tests/js/memory_evals_fmt.test.mjs::'verdictBadge: an escalation-open parity on a never-measured metric is NOT a recovery'",
+          "dashboard/tests/js/memory_evals_fmt.test.mjs::'verdictBadge: every _open state renders the same escalation-open affordance'",
+          "dashboard/tests/test_tab_memory_evals.py::test_parity_vocabulary_fully_covered",
+          "dashboard/tests/test_tab_memory_evals.py::test_every_open_parity_state_shows_the_escalation_affordance"
+        ],
+        "docstring_claim_now_true": "_parity still says 'purely additive for existing consumers'; the consumer fix makes that accurate"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3363-design-1",
+      "disposition": "a",
+      "note": "Fixed, and fixed along the exact line the finding drew. `internal_error` is still a member of `_UNCACHEABLE_ISSUE_KINDS`, so a glance at that frozenset would wrongly suggest nothing changed — the fix is in the predicate. `_is_uncacheable` now ends `return kind != 'internal_error' or issue.get('eval_id') is None`, so a SCOPED internal_error (one carrying an eval_id) is CACHEABLE and only an UNSCOPED one still defeats the cache. That is precisely point 1 of the finding: the per-eval internal_error drops one row and leaves the rest of the payload complete and useful — 'exactly the \"completed over a degraded tree\" case the same predicate deliberately keeps cacheable' — while the docstring's build-aborted argument only ever fitted the unscoped case. Point 2 (a content-reachable bug is deterministic and therefore a steady state) is answered by the same change: the recurring per-eval bug is now cacheable, so it can no longer defeat the cache on every build. The fix also shows its work on the part the finding did NOT ask to change: `unreadable_root` stays unconditionally uncacheable, and the docstring explains why the tempting generalisation was refused — 'A blanket \"any scoped issue is cacheable\" rule reads cleaner and is a no-op today, which is exactly what makes it a trap: unreadable_root means Path.iterdir raised and NOTHING was walked.'",
+      "followup_ticket": null,
+      "evidence": {
+        "frozenset_unchanged": "_UNCACHEABLE_ISSUE_KINDS still contains 'internal_error' — the fix is in the predicate, not the set",
+        "predicate_now": "return kind != 'internal_error' or issue.get('eval_id') is None",
+        "effect": "a scoped (per-eval) internal_error is cacheable; only an unscoped, build-aborting one is not",
+        "matches_finding_point_1": "the per-eval error drops one row and leaves a complete payload — the 'completed over a degraded tree' case",
+        "generalisation_deliberately_refused": "unreadable_root stays unconditionally uncacheable because iterdir raised and nothing was walked"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3367-correctness-0",
+      "disposition": "b",
+      "note": "Still live, verbatim. The gate in verify.py still reads `category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None and attempt.test.rc != 0`, and the comment block above it still states THE RULE as 'it therefore fires only when the TEST leg is the failing one' while explicitly resting that on 'an explicit `attempt.test.rc != 0`'. The finding's objection is untouched: rc != 0 establishes only that the test leg failed SOMEHOW, not that it is the leg which classified ENV_TRANSIENT. Re-measured ranks confirm the masking is still possible — ENV_TRANSIENT severity_rank 10 still outranks TEST_FAILURE 11 (the absolute numbers shifted by one since August, the ORDER is identical), so a phantom TYPE-leg ENV_TRANSIENT still sets the aggregate category while a genuine test regression holds rc=1. The comment has in fact acquired a defence that does not reach the finding: 'The rc check is correct on its own terms ... re-running a passing leg can never recover anything.' True, and irrelevant — it answers the rc==0 case, not the rc!=0-for-a-real-regression case the finding describes. The sharpest evidence is thirty lines below the gate: the bare-xdist reclassification guard requires `attempt.test.rc != 0 and attempt.lint.rc == 0 and attempt.type.rc == 0` — precisely the co-occurrence guard this gate lacks, in the same function, added for the same reason. The finding cited that as in-repo precedent; it is still precedent, and still unapplied here.",
+      "followup_ticket": "tkt_0RTN07JSXP72V67AS14REFW529",
+      "evidence": {
+        "gate_current": "category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None and attempt.test.rc != 0",
+        "rule_comment_still_present": "THE RULE (task 3367) ... 'fires only when the TEST leg is the failing one'",
+        "ranks_remeasured": "ENV_TRANSIENT rank=10 outranks TEST_FAILURE rank=11 (August said 9 vs 10; order unchanged)",
+        "adjacent_guard_has_the_missing_check": "the bare-xdist guard in the same function requires lint.rc == 0 and type.rc == 0",
+        "suggested_fix_still_applies": "gate on the test leg's OWN classify_failure result rather than its rc"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3367-correctness-1",
+      "disposition": "b",
+      "note": "Still live, and the remedy is now CHEAPER than when the finding was written. Confirmed by measurement rather than reading: ENV_TRANSIENT is severity_rank 10 and TEST_FAILURE 11, so ENV_TRANSIENT still wins _worst_category; ENV_TRANSIENT is still a member of INFRA_TRANSIENT_CATEGORIES; and merge_queue.py still routes on the AGGREGATE at three sites (`(verify.category or '') in INFRA_TRANSIENT_CATEGORIES`), so a run whose TYPE leg is phantom-red and whose TEST leg is genuinely red is still held as transient infra with no steward and no branch-blaming. WHAT CHANGED IS THE AVAILABILITY OF THE FIX, not the defect. The repo now carries per-leg categories (`local_verify.failing_leg_categories`, pinned by TestSummarizeChecksReportsEveryFailingLegCategory) and has already adopted the exact principle this finding asks for, in a comment headed 'GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173 review)' — whose reasoning is the same shape as this finding's: severity_rank lets a high-severity infra leg dominate a co-occurring branch-blaming TEST_FAILURE, which is correct for 'how bad was this run' and wrong for attribution. That principle was applied ONLY to the indeterminate-verdict veto cross-check. The infra-transient routing three functions away still keys on the single aggregate value. So the fix no longer needs new machinery — it needs the existing machinery extended to a site that was missed, and the inconsistency between the two adjacent policies is now itself the argument.",
+      "followup_ticket": "tkt_0RTN085P18105P4H30YNXMPH14",
+      "evidence": {
+        "ranks_remeasured": "ENV_TRANSIENT rank=10 beats TEST_FAILURE rank=11; is_infra_transient=True",
+        "aggregate_routing_sites_still_present": "merge_queue.py lines ~2997, ~3080, ~3584 test (verify.category or '') in INFRA_TRANSIENT_CATEGORIES",
+        "per_leg_machinery_now_exists": "VerifyResult.failing_leg_categories, consumed at merge_queue.py ~3323",
+        "principle_already_adopted_elsewhere": "merge_queue.py comment 'GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173 review)' — applied only to the INDETERMINATE_VERDICT_CATEGORIES veto",
+        "consequence_unchanged": "a real branch regression is held as infra_issue: blocked + transient-infra reason, no steward, no fix loop"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3453-correctness-0",
+      "disposition": "b",
+      "note": "Still live, all three elements intact. The probe is still `importlib.util.find_spec('escalation.submit')`; the comment above it still says the process 'can prove the invariant here for free (find_spec on an ...)'; and the warning text still reads 'proc_supervision: `escalation.submit` is NOT importable from %s'. find_spec locates a spec without executing the module, so neither the comment nor the warning is true, and the blind spot the finding identified is exactly the failure mode the task was built around: a missing transitive site-packages dependency (escalation.submit -> escalation.queue -> shared.timestamps -> shared/__init__ -> shared.async_sqlite_base -> aiosqlite) leaves the .py file on disk, so find_spec succeeds, the canary stays silent, and the deferred child still dies at fire time having filed no L2. Neither of the finding's two alternative remedies was taken: the probe was not upgraded to a real `importlib.import_module` in a try/except, and the wording was not corrected to say 'cannot be located'. Nothing since 2026-08-01 changed the probe. Read together with 3453[1], per the plan's instruction: these two findings are in the same module and NEITHER has been addressed, so no change resolved one without the other.",
+      "followup_ticket": "tkt_0RTN09HRZC1NSSDEKVVK07KYVW",
+      "evidence": {
+        "probe_still_findability_only": "importlib.util.find_spec('escalation.submit'); probe_detail 'find_spec returned None'",
+        "overclaiming_comment_intact": "'it can prove the invariant here for free (find_spec on an ...)'",
+        "overclaiming_warning_intact": "'proc_supervision: `escalation.submit` is NOT importable from %s'",
+        "blind_spot_unchanged": "a missing transitive dep (e.g. aiosqlite) still yields a valid spec, a silent canary, and a child that dies at fire time with 0 L2s",
+        "neither_remedy_taken": "no import_module probe; wording not narrowed to 'cannot be located'",
+        "read_with_sibling": "3453[1] is also still live — no change resolved one of the pair without the other"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3453-blast-radius-1",
+      "disposition": "b",
+      "note": "Still live, and the argv makes it unambiguous. `setenv_args = _submit_child_setenv_args()` is spliced into the systemd-run argv BEFORE the payload — `argv = ['systemd-run', '--user', f'--on-active=...', f'--unit=...', '--collect', f'--working-directory=...', *setenv_args, '/bin/sh', '-c', wrapped]` — so PYTHONPATH is set for the whole `/bin/sh -c` payload, not for the on-failure submit branch inside it. The helper's own docstring still frames it as 'the ... systemd-run args for the submit child', which is the framing the finding challenged. The narrower remedy it proposed (drop the systemd-run token and prefix the on-failure command inside the shell wrapper) was not adopted. ONE REAL BOUND worth recording, which keeps this at medium rather than higher: the token is attached only on the escalation-spec branch — the else branch sets `setenv_args = []` — so a payload with no EscalationSpec is entirely unaffected. The exposure is confined to payloads that DO carry a spec, which is precisely the set the finding named (deterministic_runner's detached restart path, routing real deploy scripts). So the contamination surface is real and narrower than 'every transient unit'. Still unpinned by any test.",
+      "followup_ticket": "tkt_0RTN0AEH2C6E6HF5BGREK4ZRJH",
+      "evidence": {
+        "argv_verbatim": "['systemd-run','--user','--on-active=...','--unit=...','--collect','--working-directory=...',*setenv_args,'/bin/sh','-c',wrapped]",
+        "scope": "unit-wide over the whole /bin/sh -c payload, not the submit child",
+        "docstring_framing_unchanged": "'The --setenv=PYTHONPATH=... systemd-run args for the submit child'",
+        "bound_that_limits_it": "setenv_args = [] on the no-EscalationSpec branch, so only spec-carrying payloads are exposed",
+        "narrower_remedy_not_adopted": "no in-wrapper `PYTHONPATH=<roots> <python> -m escalation submit` prefix"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "filed_here"
+    },
+    {
+      "id": "3454-correctness-0",
+      "disposition": "a",
+      "note": "Fixed, and fixed to the letter of the finding's own suggestion plus a structural improvement it did not ask for. The finding's remedy was: add 'weekly limit' and 'session limit' to the local `_CAPACITY_FAILURE_MARKERS`, and replace the KNOWN MISLEADING FAILURE paragraph with a note that capped runs now skip. Both happened, and the marker list was promoted out of the test module rather than merely extended. The guard is now `_capacity_skip.result_looks_like_capacity_failure`, backed by shared/src/shared/cap_markers.py and a `REAL_CLI_CAP_MESSAGES` corpus of verbatim observed cap texts, with its own tests (shared/tests/test_capacity_skip.py, test_cap_markers.py). test_capacity_skip.py pins the EXACT string the finding named — \"You've hit your weekly limit - resets Aug 5, 11am\" — as a case that must be recognised. The old local list survives only as a historical reference in _capacity_skip.py's docstring, which names the same defect: 'That copy missed \"You've hit your weekly limit ...\"'. The docstring rewrite is equally complete: 'READING A RED RUN. A capped account now SKIPS: the guard is _capacity_skip.result_looks_like_capacity_failure, pinned (task 3483) against the verbatim weekly text observed here ... which the guard previously did not match, so a capped account used to fail the assertion below with a cap message dressed up as lost context.' The KNOWN MISLEADING FAILURE paragraph is gone. Credited to task 3483.",
+      "followup_ticket": null,
+      "evidence": {
+        "guard_now": "shared/tests/_capacity_skip.py::result_looks_like_capacity_failure, backed by shared/src/shared/cap_markers.py",
+        "exact_string_now_pinned": "shared/tests/test_capacity_skip.py pins \"You've hit your weekly limit - resets Aug 5, 11am\"",
+        "local_list_retired": "_CAPACITY_FAILURE_MARKERS survives only as a historical note in _capacity_skip.py's docstring",
+        "docstring_rewritten": "'A capped account now SKIPS' replaced the KNOWN MISLEADING FAILURE paragraph",
+        "fixed_by": "task 3483",
+        "went_further_than_asked": "the marker corpus was promoted to a shared module with its own tests, rather than the suggested local two-string addition"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3679-test-coverage-0",
+      "disposition": "a",
+      "note": "Fixed, and dispositioned the way the finding demanded — by searching for a pin test, not by re-reading the docstring. TestAnchoredSlotTimeoutWithCollateralIsEnvTransient now EXISTS at orchestrator/tests/test_verify_classify.py, and it pins exactly what the docstring claims: the full slot-shape x collateral-shape x order cross-product classifying ENV_TRANSIENT rather than SEMAPHORE_TIMEOUT. In August that grep returned nothing repo-wide. TWO THINGS MAKE THIS THE MOST INTERESTING (a) IN THE ROSTER. First, the fixing work is labelled 'task 4126 (recovered from the task-3679 review)' in both the test's comment block and its class docstring — so this finding was independently RECOVERED and acted on through some route other than the review gate that dropped it. It is direct evidence that the dropped-finding population was not uniformly lost, and the only such evidence in this triage. Second, the repo has since grown a structural guard against the whole defect CLASS: orchestrator/tests/test_cited_test_class_drift.py asserts that every test class cited by name in a src docstring actually resolves to a real class, and its module docstring names this very incident as the motivation — 'orchestrator.verify_classify carried one for TEN DAYS naming a class that existed nowhere in the repo (citation landed 2026-08-05; the class was written 2026-08-15)'. The finding's own remedy was one test; what landed was that test plus a detector for every future instance. No follow-up is warranted.",
+      "followup_ticket": null,
+      "evidence": {
+        "cited_class_now_exists": "orchestrator/tests/test_verify_classify.py::TestAnchoredSlotTimeoutWithCollateralIsEnvTransient",
+        "august_grep_result": "no hits repo-wide for AnchoredSlotTimeout|WithCollateralIsEnvTransient",
+        "fixed_by": "task 4126, self-described as 'recovered from the task-3679 review'",
+        "class_level_guard_added": "orchestrator/tests/test_cited_test_class_drift.py — every src-cited test class must resolve; cites this incident as motivation",
+        "behaviour_was_never_wrong": "the finding said so too; the defect was the missing pin plus a false docstring claim, and both are closed"
+      },
+      "checked_at": "2026-09-14"
+    },
+    {
+      "id": "3757-correctness-0",
+      "disposition": "a",
+      "note": "Fixed, and fixed with the finding's own reasoning reproduced almost verbatim in the code. The uniqueness check is now `_require_unique_uuids`, and it is called from OUTSIDE verify_manifest's manifest-attributable try — the docstring says so explicitly: 'It is its own function, called from OUTSIDE verify_manifest's manifest-attributable try, because the failures that clause used to cover have two different culprits'. The justification is the finding's argument restated: 'select is handed two MANIFEST values (n and seed) over a STORE-supplied population. No manifest value can put the same node in FalkorDB twice, so reporting a duplicated node as bad_manifest sends the reader off to re-derive a corpus that is perfectly correct while the duplicated node that actually needs deleting stays put.' The distinction the finding was careful to preserve is preserved too: the carve-out is 'deliberately the uniqueness rule ALONE, and not the whole of _group_by_cell', because an unsatisfiable recorded n genuinely IS a manifest defect and allocate 'already reports — correctly — as bad_manifest'. That is exactly the line the finding drew between the two culprits sharing one clause, and it is the same case its cited test test_an_unsatisfiable_recorded_n_is_still_a_bad_manifest pins. The rule also lives in one place rather than being re-spelled ('one home for it, and no second spelling to drift').",
+      "followup_ticket": null,
+      "evidence": {
+        "check_relocated": "_require_unique_uuids is called from OUTSIDE verify_manifest's manifest-attributable try",
+        "reasoning_matches_the_finding": "'No manifest value can put the same node in FalkorDB twice ... while the duplicated node that actually needs deleting stays put'",
+        "distinction_preserved": "carve-out is the uniqueness rule ALONE; an unsatisfiable recorded n still correctly reports bad_manifest via allocate",
+        "spot_respected": "the rule is called, not re-spelled — 'one home for it, and no second spelling to drift'"
+      },
+      "checked_at": "2026-09-14"
+    }
+  ],
+  "findings": [],
+  "disposition_key": {
+    "a": "already fixed incidentally — the defect was real and is gone from current main",
+    "b": "still a live defect on current main — one follow-up task filed, ticket recorded",
+    "c": "not actually a defect, or no longer applicable — the code it described has moved or the reading was wrong",
+    "deferred_by_gate": "not adjudicated, because the recorded gate decision stopped the triage; the note carries the gate's rationale"
+  },
+  "followups": {
+    "filed_count": 14,
+    "live_defect_count": 15,
+    "not_refiled_count": 1,
+    "note": "14 follow-up tasks filed, one per group-(b) finding, with no bundling — including the two 3453 findings that share a module and the three 3340 findings whose remedies are coupled, because coupled is not the same as identical and a bundled task loses the per-finding accounting this triage exists to produce. The coupling is instead carried in each description as an explicit cross-reference. The 15th (b), 3142-correctness-0, was DELIBERATELY NOT RE-FILED: task 4205 (deferred) already tracks it as its CLASS 1, quotes the same diagnosis, and is independently corroborated by docs/unverified-completion-claim-sweep-2026-08-11 at 125-128 of ~166-172 production mismatches. Filing a duplicate would inflate the follow-up count while making the backlog worse, so its accounting entry is the existing task id rather than a new ticket.",
+    "ids_are_tickets_not_tasks": "Every tkt_ value is a CURATOR TICKET, not a task id. The curator runs asynchronously and decides create/combine/drop per ticket, so no task existed at filing time and the final task ids are not knowable from here.",
+    "idempotency_keys": "escalation_id 'agent-followup-5430' on all 14; suggestion_hash = sha256('5430:<finding id>')[:16], so a re-filed candidate dedupes per finding rather than per batch"
+  }
+}

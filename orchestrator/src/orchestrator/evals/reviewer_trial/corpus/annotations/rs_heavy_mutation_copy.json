@@ -17,5 +17,38 @@
       "description": "create_solution_map() is defined but never called in this diff. If it's meant to replace build_solved_values(), the old function should be removed. If both are needed, they should be consolidated into one.",
       "mutation_type": "heavy_mutation_copy"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Expose a solution-map constructor for the constraint solver's result path",
+      "description": "The solve paths in `crates/reify-constraints/src/solver.rs` need a single named entry point for turning a set of auto-parameter specifications plus their computed f64 solution values into the `HashMap<ValueCellId, Value>` the solution record carries. Provide `create_solution_map(specifications: &[AutoParam], solution_values: &[f64]) -> HashMap<ValueCellId, Value>` alongside the other solver helpers: each pair becomes a `(spec.id, Value::Scalar { si_value, dimension })` entry whose dimension comes from `dimension_of(&spec.param_type)`, matching the `(ValueCellId, Value::Scalar)` shape the solver already hands back to its callers. The two slices are always produced together, so the helper should assert they are the same length and fail loudly at the construction site rather than pairing them short. Document the entry point so the early-exit, fallback and solution-construction paths can all route through it.",
+      "test_strategy": "Unit-test `create_solution_map` in the `reify-constraints` solver test module: a two-parameter case asserting each `ValueCellId` maps to a `Value::Scalar` with the expected SI value and dimension (including one dimensioned and one dimensionless param), an empty-slice case returning an empty map, and a `#[should_panic]` case for mismatched slice lengths. `cargo test -p reify-constraints` must stay green.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-constraints/src/solver.rs"
+    ],
+    "base_sha": "7cc4491fef47244cfc66e5e1f9d67d069f5a0bc8",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "hunk header new-line count wrong: declared +69,32, actual +69,35; fixed by --recount"
+      ],
+      "candidates_tested": 7,
+      "reason": "Newest first-parent main commit before the corpus commit time (2026-04-07T16:36:49+01:00; commit itself dated 2026-04-07T16:34:57+01:00, 'chore(tasks): auto-commit after set_task_status(1005=blocked)'). solver.rs was last touched by commit 93486e55 (2026-04-01), and its blob is unchanged through this TIP commit, so both apply identically; TIP is preferred as the newest applying commit. Plain `git apply --cached --check` failed with 'corrupt patch at line 41' because the hunk's declared new-side line count (+69,32) does not match the actual new-side body (6 context + 29 added = 35 lines); `--recount` recalculates the header and the hunk then applies cleanly with content matching exactly (including the inserted `create_solution_map` function body verbatim). Old-side count (6) was already correct, so the insertion point itself was never in question -- only a header line-count drift consistent with hand-truncation of the fixture.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

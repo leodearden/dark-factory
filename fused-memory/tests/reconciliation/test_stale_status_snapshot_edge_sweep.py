@@ -37,12 +37,22 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import complete_paged_read, incomplete_paged_read
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_PAGE_CAP,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    IncompleteEnumerationError,
+)
 from fused_memory.reconciliation import task_filter
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
     _MAX_SUPERSEDE_WRITES_PER_CYCLE,
+    STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+    STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     _last_clause_break,
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
@@ -51,6 +61,16 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
     sweep_stale_status_snapshot_edges,
+)
+
+# The pinned shape corpora live in a plain data module so task 3949's
+# candidate-tightening suite can re-validate against the SAME lists rather than
+# a copy that silently stops covering additions. Append new shapes there.
+from reconciliation.plural_enum_shapes import (
+    ADVERBIAL_PREAMBLE_SHAPES,
+    GUARD_REJECTED_SUPPRESSION_SHAPES,
+    PRECISION_GUARD_SHAPES,
+    SUBJECT_POSITIVE_SHAPES,
 )
 
 
@@ -66,7 +86,9 @@ def _make_memory_service() -> MagicMock:
     """
     memory_service = MagicMock()
     memory_service.graphiti = MagicMock()
-    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
     memory_service.update_edge = AsyncMock()
     memory_service.add_memory = AsyncMock()
     return memory_service
@@ -710,131 +732,7 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == expected
 
-    @pytest.mark.parametrize(
-        'fact',
-        [
-            # transitive-verb reading — the mandatory copula must refuse it,
-            # exactly as INDIVIDUAL_SNAPSHOT_RE's transitive arm does. This
-            # is a permanently-true historical fact, not a status snapshot.
-            'Tasks 1020, 1030, and 1031 blocked task 5.',
-            'Tasks 1020 and 1030 block the merge queue.',
-            # terminal status — gate short-circuits
-            'Tasks 1020, 1030, and 1031 are done.',
-            # negation / past-exit, refused by the closed-class _ADVERB_ALT
-            'Tasks 1020, 1030, and 1031 are no longer pending.',
-            # marker present but NOT adjacent to the enumeration+copula: the
-            # BRANCH is active, not the tasks
-            'Tasks 1020 and 1030 were merged into the active branch.',
-            # ---------------------------------------------------------- #
-            # Prepositional-complement over-selection (amendment,
-            # reviewer_comprehensive correctness-precision finding, task
-            # 3079). In each of these the plural NP is the COMPLEMENT OF A
-            # PREPOSITION, so the copula's real subject is an outer head
-            # noun and the marker describes THAT, not the tasks. Every one
-            # is a permanently-true historical/meta fact, so the sweep
-            # would retire it the instant any referenced id went terminal —
-            # the over-selection direction the module docstring forbids,
-            # and the same class task 3042 closed for LIST_INTRODUCER_RE.
-            # ---------------------------------------------------------- #
-            # singular outer head — 'is' cannot agree with a plural subject,
-            # so plural-agreement on the copula alone already refuses these
-            'The merge of tasks 1020 and 1030 is blocked.',
-            'Review of tasks 1020 and 1030 is pending.',
-            'Documentation for tasks 1020 and 1030 is still pending.',
-            'Verification of tasks 1020, 1030, and 1031 is pending.',
-            # PLURAL outer head — the plural copula agrees with the OUTER
-            # head here, so these survive a plural-agreement-only fix and
-            # are what force the second remedy (preposition lookbehinds)
-            'Dependencies for tasks 1020 and 1030 are blocked.',
-            'The merges of tasks 1020 and 1030 are blocked.',
-            'Reviews of tasks 1020, 1030, and 1031 are pending.',
-            'Work on tasks 1020 and 1030 is blocked.',
-            'The dependency between tasks 1020 and 1030 is blocked.',
-            # DETERMINER between the preposition and the list noun. These
-            # defeated the original fixed-width-lookbehind spelling of the
-            # guard wholesale — one extremely common word re-opened every
-            # entry in the preposition list at once, and the suite's own
-            # positive case 'The tasks 1020 and 1030 are blocked.' is the
-            # head of exactly this shape. Plural agreement does not save
-            # them: 'Statuses'/'Reviews'/'Notes' are plural, which is the
-            # residue the preposition check exists to cover. (amendment,
-            # reviewer_comprehensive correctness-precision finding, task
-            # 3079)
-            'Statuses of the tasks 1020 and 1030 are blocked.',
-            'Reviews for the tasks 1020 and 1030 are pending.',
-            'Notes about the tasks 1020 and 1030 are pending.',
-            'Reviews of these tasks 1020 and 1030 are pending.',
-            'Notes regarding all tasks 1020 and 1030 are pending.',
-            # multi-space / newline gap before the list noun — the other
-            # defect the fixed-offset lookbehind could not see
-            'Reviews for  the\n  tasks 1020 and 1030 are pending.',
-            # NON-DETERMINER intervening words. The determiner cases above
-            # were first fixed with a six-word slot
-            # ('the|these|those|all|our|its'), which was a second closed
-            # vocabulary and failed the same way one word over. The gap is an
-            # OPEN class, so one case per class it admits — quantifier, bare
-            # adjective, possessive, determiner stack, participle — plus the
-            # THREE-word gaps that a merely-bounded slot (the review's
-            # suggested '{0,2} arbitrary words') would still admit, which is
-            # why the guard is clause-scoped and unbounded instead.
-            # (amendment, reviewer_comprehensive correctness-precision
-            # finding, task 3079)
-            'Statuses of some tasks 1020 and 1030 are pending.',
-            'Dependencies for both tasks 1020 and 1030 are blocked.',
-            'Notes about a few tasks 1020 and 1030 are pending.',
-            'Reviews of all the tasks 1020 and 1030 are pending.',
-            'Notes on remaining tasks 1020 and 1030 are pending.',
-            'Statuses of open tasks 1020 and 1030 are pending.',
-            'Blockers for downstream tasks 1020 and 1030 are pending.',
-            "Reviews of Leo's tasks 1020 and 1030 are pending.",
-            'Statuses of quite a few tasks 1020 and 1030 are pending.',
-            'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.',
-            # HYPHENATED negation / past-exit reaching the marker through
-            # _COMPOUND_PREFIX rather than the closed-class adverb slot
-            'Tasks 1020 and 1030 are un-blocked.',
-            'Tasks 1020 and 1030 are previously-blocked.',
-            # NON-SENTENCE-FINAL punctuation between the preposition and the
-            # list noun. Each of these over-selected while the clause-break
-            # class still contained ':', the paren/bracket family and the
-            # quote family: the break truncated the backward scan short of
-            # the governing preposition, so the guard saw a clause with no
-            # preposition in it and admitted the match. A colon typically
-            # INTRODUCES the complement its preposition governs, and a
-            # parenthetical or quoted aside is an interpolation inside the
-            # clause rather than a new one — neither ends government, so
-            # neither may be a break. (amendment, reviewer_comprehensive
-            # correctness-precision finding, task 3079)
-            'Statuses of the following: tasks 1020 and 1030 are pending.',
-            'Reviews of the following (still open): tasks 1020 and 1030 are pending.',
-            'Statuses of the "next" tasks 1020 and 1030 are pending.',
-            'Blockers for the merge lane [df] tasks 1020 and 1030 are pending.',
-            # INTRA-TOKEN '.' is not sentence-final punctuation, so it must
-            # not count as a clause break either: a '.' flanked by
-            # alphanumerics on both sides (filename extension, version
-            # string, dotted module path, dotted section number) ends no
-            # sentence, so treating it as a break truncates the backward
-            # scan short of the governing preposition — the same
-            # over-selection the punctuation-family exclusions above guard,
-            # just for a '.' occurrence rather than a different character.
-            # (amendment, reviewer_comprehensive correctness-precision
-            # finding, task 4149)
-            'Reviews for verify_cmd.py tasks 1020 and 1030 are pending.',
-            # CONTROL: identical but for the extension; already passed before
-            # this amendment and must keep passing.
-            'Reviews for verify_cmd tasks 1020 and 1030 are pending.',
-            'Blockers on scheduler.py tasks 1020 and 1030 are in progress.',
-            'Statuses of the v1.2 tasks 1020 and 1030 are pending.',
-            'Reviews for section 4.2.1 tasks 1020 and 1030 are pending.',
-            'Statuses of tasks in df.core tasks 1020 and 1030 are pending.',
-            # UNICODE flanking: _is_intra_token_dot's docstring claims
-            # str.isalnum() makes the test unicode-aware by construction,
-            # so a non-ASCII filename must be recognized as intra-token
-            # exactly like an ASCII one — pin that claim by behaviour
-            # rather than by prose. (amendment, reviewer_comprehensive
-            # test-coverage finding, task 4149)
-            'Reviews for café.py tasks 1020 and 1030 are pending.',
-        ],
-    )
+    @pytest.mark.parametrize('fact', PRECISION_GUARD_SHAPES)
     def test_plural_enumeration_precision_guards(self, fact):
         """Shapes the plural path must NOT extract. (task 3079)
 
@@ -846,15 +744,7 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
-    @pytest.mark.parametrize(
-        'fact',
-        [
-            'Reviews for tasks 1020, task 1030 and task 1031 are pending.',
-            'Statuses of the tasks 1020 and task 1030 are blocked.',
-            'Notes about tasks 1020, task 1030 and task 1031 are pairwise-stalled.',
-            "Reviews of Leo's tasks 1020 and task 1030 are pending.",
-        ],
-    )
+    @pytest.mark.parametrize('fact', GUARD_REJECTED_SUPPRESSION_SHAPES)
     def test_guard_rejected_enumeration_suppresses_ids_on_every_path(self, fact):
         """Rejecting the plural match must not leave its tail extractable.
 
@@ -966,67 +856,7 @@ class TestExtractSnapshotEdgeTaskIds:
             f'complement still over-selects'
         )
 
-    @pytest.mark.parametrize(
-        ('fact', 'expected'),
-        [
-            # These two are the load-bearing pair: both end in the letters
-            # 'on'/'ion' immediately before ' tasks', so they prove the
-            # preposition guard is \b-anchored and does not fire on a word
-            # that merely ENDS in a preposition.
-            ('Migration tasks 1020 and 1030 are pending.', {1020, 1030}),
-            ('Verification tasks 1020 and 1030 are pending.', {1020, 1030}),
-            # a marker-qualified plural head is still a subject
-            ('Blocked tasks 1020 and 1030 are pending.', {1020, 1030}),
-            # a determiner before the plural head is not a preposition
-            ('The tasks 1020 and 1030 are blocked.', {1020, 1030}),
-            # 'remain' must survive the copula narrowing to plural agreement
-            ('Tasks 1020 and 1030 remain pending.', {1020, 1030}),
-            # CLAUSE SCOPE. The preposition guard is unbounded within a
-            # clause, so these pin the other edge of it: strong punctuation
-            # ends the span a preposition governs, and an enumeration opening
-            # a new sentence/clause really is its own copula's subject even
-            # though a listed preposition appears earlier in the fact. Without
-            # a clause reset the guard would swallow the whole prefix and
-            # disable the plural path for any multi-sentence fact. (amendment,
-            # reviewer_comprehensive correctness-precision finding, task 3079)
-            ('Reviews for the branch are done. Tasks 1020 and 1030 are pending.',
-             {1020, 1030}),
-            ('Blocked on review; tasks 1020 and 1030 are pending.', {1020, 1030}),
-            # ...and the other edge of narrowing the break class to
-            # sentence-final punctuation: a colon-preambled genuine snapshot
-            # is unaffected, because the longer clause it now scans still
-            # contains no listed preposition for the guard to fire on.
-            # (amendment, reviewer_comprehensive correctness-precision
-            # finding, task 3079)
-            ('Note: tasks 1020 and 1030 are pending.', {1020, 1030}),
-            # ...and the other edge of narrowing WHICH '.' occurrences count
-            # as a break (task 4149): a real sentence-ending '.' must still
-            # break the clause even when a dotted (intra-token) token
-            # precedes it in the same fact — proving the narrowing did not
-            # disable '.' as a break wholesale, only intra-token occurrences
-            # of it. The second case also pins that '!' stayed unconditional.
-            ('Reviews for verify_cmd.py are done. Tasks 1020 and 1030 are pending.',
-             {1020, 1030}),
-            ('Blockers on scheduler.py are resolved! Tasks 1020 and 1030 are pending.',
-             {1020, 1030}),
-            # ...and specifically the WALK'S RETRY behaviour: the loop must
-            # continue past an intra-token '.' to an EARLIER genuine
-            # sentence break, not give up at the first intra-token '.' it
-            # meets. Every other intra-token case above either never enters
-            # the loop (the break is already non-intra-token) or enters it
-            # and exhausts to -1 (no real break precedes); only this one has
-            # an earlier break to retry TO. Verified this pins the retry:
-            # replacing the `while` with a single
-            # `if dot > hard and _is_intra_token_dot(...): dot = -1` (give
-            # up instead of retrying) still passes every other case here,
-            # but turns this one from {1020, 1030} into set() — the scan
-            # runs back over 'for' in the PREVIOUS sentence instead of
-            # stopping at the '.' after 'branch'. (amendment,
-            # reviewer_comprehensive test-coverage finding, task 4149)
-            ('Notes v1.2 for the branch. Statuses v3.4 tasks 1020 and 1030 are pending.',
-             {1020, 1030}),
-        ],
-    )
+    @pytest.mark.parametrize(('fact', 'expected'), SUBJECT_POSITIVE_SHAPES)
     def test_plural_enumeration_subject_positives_survive_precision_guards(
         self, fact, expected
     ):
@@ -1039,18 +869,7 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == expected
 
-    @pytest.mark.parametrize(
-        'fact',
-        [
-            # 'of' inside a date stamp — the shape the finding's own
-            # motivating fact carries ("... is pending as of 2026-07-14...")
-            'As of 2026-08-09, tasks 1020 and 1030 are pending.',
-            # 'in' inside a location-scoping preamble
-            'In the merge queue, tasks 1020 and 1030 are pending.',
-            # 'for' inside a cycle-scoping preamble
-            'For this cycle, tasks 1020 and 1030 are pending.',
-        ],
-    )
+    @pytest.mark.parametrize('fact', ADVERBIAL_PREAMBLE_SHAPES)
     def test_adverbial_preamble_is_a_documented_under_selection(self, fact):
         """Cost of the clause-scoped guard, pinned rather than left implicit.
 
@@ -1071,10 +890,26 @@ class TestExtractSnapshotEdgeTaskIds:
         here so the recall cost is VISIBLE and intentional — if the guard
         widens further, these cases are where it shows up, and if the real
         edge corpus ever makes the cost matter, this is the test that has to
-        be renegotiated first. Deliberately NOT fixed speculatively:
-        tightening the guard means measuring against the actual edge set,
-        and every candidate tightening trades back toward the unrecoverable
-        over-selection direction.
+        be renegotiated first.
+
+        The corpus has now been measured and says it does NOT (task 3949).
+        Two live facts reach this guard, and BOTH are correctly-rejected
+        prepositional complements; NEITHER triages as an adverbial preamble,
+        which is the only rejection class that costs recall. So the measured
+        recall cost of the guard is zero edges — which is a WEAKER claim
+        than 'nothing matches the regex at all', and is the one the evidence
+        actually supports. Both candidate tightenings were re-validated
+        against the full precision parametrization: (b) re-opens a pinned
+        over-selection, and (a) re-opens none but does not even recover the
+        'As of <date>, ...' case above. VERDICT: not tightened — see the
+        measurement block at ``_ENUM_PREP_WORDS``, and
+        plans/plural-enum-guard-recall-report.md for the per-graph figures.
+        Those figures are deliberately NOT restated here: an earlier draft of
+        this docstring pinned an edge count and a graph count inline and both
+        were stale within days. Re-run
+        ``scripts/measure_plural_enum_guard_recall.py`` before renegotiating
+        this test — every count in that report is a point-in-time fact about
+        a growing corpus.
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
@@ -2515,7 +2350,7 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
 
 class TestSweepStaleStatusSnapshotEdgesCore:
     """sweep_stale_status_snapshot_edges enumerates valid edges via
-    memory_service.graphiti.get_all_valid_edges, cross-references each
+    memory_service.graphiti.enumerate_all_valid_edges, cross-references each
     candidate id's CURRENT status via taskmaster.get_statuses (never
     semantic search), and invalidates only the edges
     select_stale_status_snapshot_edges identifies as stale.
@@ -2537,8 +2372,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         healthy_edge = {
             'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge, healthy_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '999': 'pending'})
 
@@ -2576,6 +2414,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 1, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
         )
@@ -2613,8 +2452,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         control_edge = {
             'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+                complete_paged_read(rows_seen=3),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2885': 'done', '3001': 'blocked'})
         now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
@@ -2629,6 +2471,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected both blocked-worded task-2885 edges invalidated and the '
             f'still-blocked control edge left alone, got stats={stats!r}'
@@ -2711,8 +2554,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         control_edge = {
             'uuid': 'edge-3100-control', 'fact': 'Task 3100 is pending.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [genitive_edge, plural_edge, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [genitive_edge, plural_edge, control_edge]},
+                complete_paged_read(rows_seen=3),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={
@@ -2731,6 +2577,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 2, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected both repro-shape edges invalidated and the still-pending '
             f'control edge left alone, got stats={stats!r}'
@@ -2799,8 +2646,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'fact': 'Dependencies for tasks 1020 and task 1030 are pending in blocked status',
             'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [true_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [true_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         # Both ids POSITIVELY KNOWN and != 'blocked', so the blocked rule
         # fires the moment the extractor hands it either of them: the census
@@ -2820,6 +2670,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 0, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the prepositional-complement enumeration scanned but never '
             f'selected — it asserts nothing about task 1020 or 1030 — got stats={stats!r}'
@@ -2875,8 +2726,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         control_edge = {
             'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [blocked_edge, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [blocked_edge, control_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending', '3001': 'blocked'})
         now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
@@ -2926,8 +2780,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value=census)
 
@@ -2974,8 +2831,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         failing = {
             'uuid': 'edge-failing', 'fact': 'Task 144 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [terminal_stale, blocked_stale, healthy, failing]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [terminal_stale, blocked_stale, healthy, failing]},
+                complete_paged_read(rows_seen=4),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={
@@ -3046,8 +2906,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
             {'uuid': f'edge-{i}', 'fact': fact, 'name': ''}
             for i, fact in enumerate(facts)
         ]
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': edges},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': edges},
+                complete_paged_read(rows_seen=len(edges)),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '142': 'done', '1020': 'blocked',
@@ -3090,10 +2953,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """One add_memory per contradicted task, with the full write envelope."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
 
@@ -3133,11 +2999,14 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
-                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                    {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
 
@@ -3171,11 +3040,14 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
-                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                    {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(
@@ -3223,15 +3095,18 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         task_ids = list(range(9000, 9000 + total))
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {
-                    'uuid': f'edge-{task_id}',
-                    'fact': f'Task {task_id} remains blocked as of 2026-07-22',
-                    'name': '',
-                }
-                for task_id in task_ids
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {
+                        'uuid': f'edge-{task_id}',
+                        'fact': f'Task {task_id} remains blocked as of 2026-07-22',
+                        'name': '',
+                    }
+                    for task_id in task_ids
+                ]},
+                complete_paged_read(rows_seen=total),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={str(task_id): 'pending' for task_id in task_ids},
@@ -3272,10 +3147,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """The common case logs nothing — the warning marks real truncation."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         log = MagicMock()
@@ -3300,10 +3178,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.update_edge = AsyncMock(side_effect=RuntimeError('lock contention'))
@@ -3330,10 +3211,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
 
@@ -3358,10 +3242,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'done'})
 
@@ -3409,7 +3296,7 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
 
     @pytest.mark.asyncio
     async def test_taskmaster_none_yields_all_zero_stats_with_no_calls(self):
-        """taskmaster=None -> all-zero stats; get_all_valid_edges never awaited."""
+        """taskmaster=None -> all-zero stats; enumerate_all_valid_edges never awaited."""
         memory_service = _make_memory_service()
 
         stats = await sweep_stale_status_snapshot_edges(
@@ -3421,8 +3308,9 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
             'invalidated': 0, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': None, 'enumeration_incomplete_kind': None,
         }
-        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_candidate_ids_skips_get_statuses(self):
@@ -3433,8 +3321,11 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
         count_only_edge = {
             'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [count_only_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [count_only_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
 
         stats = await sweep_stale_status_snapshot_edges(
@@ -3471,8 +3362,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         stale_edge_2 = {
             'uuid': 'edge-stale-2', 'fact': 'Task 144 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge_1, stale_edge_2]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge_1, stale_edge_2]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '144': 'cancelled'})
         memory_service.update_edge = AsyncMock(
@@ -3491,17 +3385,20 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 1, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
         )
 
     @pytest.mark.asyncio
-    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
-        """get_all_valid_edges raises -> sweep returns all-zero stats (errors
+    async def test_enumerate_all_valid_edges_failure_yields_all_zero_stats_without_raising(
+        self,
+    ):
+        """enumerate_all_valid_edges raises -> sweep returns all-zero stats (errors
         tallied) without raising and without calling get_statuses/update_edge."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
             side_effect=RuntimeError('transient read timeout'),
         )
 
@@ -3514,10 +3411,63 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': None, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
         taskmaster.get_statuses.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_structurally_incomplete_enumeration_is_a_best_effort_error(self):
+        """A STRUCTURAL incompleteness aborts the cycle as a best-effort error.
+
+        ``enumerate_all_valid_edges`` never raises — it reports incompleteness
+        as a value — so the fail-closed guard the ``get_all_valid_edges`` shim
+        used to provide has to be re-applied by the sweep itself.  Without it a
+        page-capped read would be taken for the whole corpus and every edge the
+        missing pages carry would be scanned as absent, which is exactly the
+        direction that silently retires nothing and reports a clean cycle.
+
+        The pin is that the truncated rows are NOT scanned (``scanned == 0``,
+        no ``update_edge``) and that the abort is tallied (``errors == 1``)
+        rather than propagated: the sweep is best-effort, and one truncated
+        read must not take the surrounding reconciliation cycle down.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task',
+                     'name': ''},
+                ]},
+                incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1, expected_rows=9999),
+            ),
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+
+        try:
+            stats = await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )
+        except IncompleteEnumerationError as exc:
+            pytest.fail(
+                'A structurally incomplete enumeration must be tallied as a best-effort '
+                f'error, not propagated out of the sweep, got: {exc!r}'
+            )
+
+        assert stats == {
+            'scanned': 0, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 1,
+            'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
+            'enumeration_complete': False,
+            'enumeration_incomplete_kind': INCOMPLETE_PAGE_CAP,
+        }, (
+            f'Expected the structural incompleteness to abort the cycle with nothing '
+            f'scanned and one error tallied, got {stats!r}'
+        )
         memory_service.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3529,8 +3479,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         candidate_edge = {
             'uuid': 'edge-candidate', 'fact': 'Task 142 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [candidate_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [candidate_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('transient read timeout'))
 
@@ -3543,6 +3496,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
         )
@@ -3557,8 +3511,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         stale_edge = {
             'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
         memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
@@ -3593,11 +3550,14 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-                {'uuid': 'edge-2849', 'fact': self.BLOCKED_FACT_2849, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                    {'uuid': 'edge-2849', 'fact': self.BLOCKED_FACT_2849, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '2849': 'in-progress'},
@@ -3624,6 +3584,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 1,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             'Expected the failed supersede tallied into supersede_errors only, '
             f'leaving both invalidations intact and errors at 0, got {stats!r}'
@@ -3641,10 +3602,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write rejected'))
@@ -3674,11 +3638,14 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-                {'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                    {'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '3001': 'blocked'},
@@ -3717,10 +3684,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(side_effect=exc_type())
@@ -3745,10 +3715,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
         memory_service.update_edge = AsyncMock(side_effect=exc_type())
@@ -3757,3 +3730,313 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             await sweep_stale_status_snapshot_edges(
                 memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
             )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — enumeration completeness signal
+# (task 4386)
+# --------------------------------------------------------------------------- #
+
+
+class TestEnumerationStatKeyValues:
+    """Pin the SHIPPED spelling of the exported report.stats key names.
+
+    The producer (memory_consolidator) and the wiring tests now reference
+    these through the symbol, which is the point — a rename is one edit
+    instead of a grep across five files. But that also means a rename of the
+    STRING would slip past every one of those call sites with all of them
+    still green, silently renaming the wire format the ledger, the journal
+    and the judge read. So the literal is pinned in exactly one place: here.
+
+    Mirrors test_task_count_snapshot_cadence.py's
+    ``test_prune_enumeration_ok_stat_key_value`` for the sibling stat family.
+    (amendment, reviewer_comprehensive pattern-consistency finding)
+    """
+
+    def test_status_snapshot_enumeration_complete_stat_key_value(self):
+        assert STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY == (
+            'stale_status_snapshot_edges_enumeration_complete'
+        )
+
+    def test_status_snapshot_enumeration_incomplete_kind_stat_key_value(self):
+        assert STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY == (
+            'stale_status_snapshot_edges_enumeration_incomplete_kind'
+        )
+
+    def test_the_two_keys_share_the_consolidator_prefix(self):
+        """Both keys carry THIS sweep's prefix, so a reader scanning
+        report.stats can attribute them to the read that produced them —
+        and cannot confuse them with the priority sweep's independent pair."""
+        for key in (
+            STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+            STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
+        ):
+            assert key.startswith('stale_status_snapshot_edges_'), key
+
+
+class TestSweepStaleStatusSnapshotEdgesEnumerationCompleteness:
+    """The sweep reports whether the corpus it swept was the WHOLE corpus.
+
+    Before this, a cycle that swept a truncated read was indistinguishable in
+    its stats from one that swept everything: both reported the same counters,
+    and the only trace of the truncation was a log line nobody correlates with
+    the cycle. That is the ambiguity the two new keys close, and it is the same
+    move the supersede counters already make against the same failure — a bare
+    ``superseded=0`` cannot distinguish "nothing needed superseding" from
+    "every superseding write failed".
+
+    ``enumeration_complete`` is deliberately TRI-STATE, because three outcomes
+    are genuinely distinct and collapsing any pair loses information a reader
+    needs:
+
+      ``True``  — the read was PROVEN complete. The only value a caller may
+                  gate on; see ``test_only_is_true_gates_a_swept_corpus``.
+      ``False`` — a corpus was observed and it was INCOMPLETE, with
+                  ``enumeration_incomplete_kind`` naming which way.
+      ``None``  — NO corpus was observed at all: either the sweep
+                  short-circuited before reading, or the read itself failed.
+                  Distinguished from each other by ``errors``.
+
+    ``enumeration_incomplete_kind`` carries the backend's stable
+    ``INCOMPLETE_*`` discriminator, never ``PagedRead.reason`` — that field is
+    diagnostic prose the backend documents as an unstable interface, so
+    asserting on it here would pin wording rather than behaviour.
+    """
+
+    STALE_FACT = 'Task 142 is an active pending task'
+
+    def _memory_reading(self, paged) -> MagicMock:
+        """A memory service whose enumeration returns one stale edge + *paged*."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': self.STALE_FACT, 'name': ''},
+                ]},
+                paged,
+            ),
+        )
+        return memory_service
+
+    @staticmethod
+    def _taskmaster_saying_done() -> MagicMock:
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_complete_read_reports_complete_true_and_no_kind(self):
+        """A proven-complete read: the sweep behaves exactly as it always did."""
+        memory_service = self._memory_reading(complete_paged_read(rows_seen=1))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is True, (
+            f'Expected a proven-complete read reported as True, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind, got {stats!r}'
+        )
+        # Unchanged behaviour on the path that was already correct.
+        assert stats['scanned'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind', [INCOMPLETE_CENSUS_UNAVAILABLE, INCOMPLETE_SHORT_READ],
+        ids=['census_unavailable', 'short_read'],
+    )
+    async def test_empirical_incompleteness_still_sweeps_but_says_so(self, kind):
+        """EMPIRICAL incompleteness -> sweep what was fetched, and report it.
+
+        This is the whole point of the task. The empirical kinds are
+        transient-capable on a graph under continuous write, so aborting would
+        take the live rebuild down for something that self-heals next cycle —
+        the sweep therefore proceeds normally and ``errors`` stays 0. What
+        changes is that the cycle now SAYS the corpus was partial instead of
+        reporting a clean sweep, so a consumer can decline to treat this
+        cycle's absences as evidence.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=40),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the partial corpus reported as False, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the stable {kind!r} discriminator surfaced, got {stats!r}'
+        )
+        # The sweep still did its job on what it did fetch.
+        assert stats['scanned'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0, (
+            f'An empirical incompleteness is NOT an error — raising on a census '
+            f'disagreement would flap on a live graph, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empirical_incompleteness_warns_through_the_injected_log(self):
+        """The one warning about a truncated corpus rides the sweep's logger.
+
+        ``apply_incompleteness_policy`` defaults to the BACKEND module logger,
+        which would surface this message detached from the cycle that produced
+        it. The sweep passes its own injected ``log`` so the truncation shows
+        up beside the rest of that cycle's diagnostics.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40),
+        )
+        log = MagicMock()
+
+        await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1', log=log,
+        )
+
+        assert log.warning.call_count == 1, (
+            f'Expected exactly one truncation warning on the sweep\'s own logger, '
+            f'got {log.warning.call_args_list!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_structural_incompleteness_reports_the_kind_beside_the_error(
+        self, kind,
+    ):
+        """A STRUCTURAL abort is a STRUCTURED fact, not just a log line.
+
+        The keys are assigned BEFORE the policy is applied, which is what lets
+        an aborted cycle still say WHY it aborted. Without that ordering the
+        operator gets ``errors=1`` and has to reconstruct the cause from logs —
+        exactly the reconstruction this task exists to remove.
+
+        Parametrised over the frozenset rather than the two named constants, so
+        a future third structural path is covered by construction (the backend
+        asks callers to branch on membership, not on a specific kind).
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=9999),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the aborted cycle to still report the corpus as partial, '
+            f'got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the abort reason carried as a structured fact, got {stats!r}'
+        )
+        assert stats['errors'] == 1, f'Expected the abort tallied, got {stats!r}'
+        assert stats['scanned'] == 0, (
+            f'A structurally truncated read must NOT be scanned as if whole, '
+            f'got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_observes_no_corpus(self):
+        """No taskmaster -> no read happened, so completeness is UNKNOWN.
+
+        ``None``, not ``True``: nothing was proven about the corpus because
+        nothing was read. Reporting ``True`` here would let a caller treat a
+        cycle that never looked as a cycle that looked and found everything.
+        """
+        memory_service = _make_memory_service()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN on the short-circuit path, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 0, (
+            f'The short-circuit is not an error — that is what distinguishes it '
+            f'from a failed read, got {stats!r}'
+        )
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_observes_no_corpus(self):
+        """The read itself raised -> also UNKNOWN, distinguished by ``errors``.
+
+        Both no-corpus paths report ``None``; ``errors`` is what tells them
+        apart, which is why the tri-state does not need a fourth value.
+        """
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, _make_taskmaster(), 'test_project', '/tmp/reify',
+            run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN when the read never returned, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 1, (
+            f'Expected the failed read tallied, which is what distinguishes it '
+            f'from the short-circuit, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_is_true_gates_a_swept_corpus(self):
+        """``is True`` is the ONLY admissible gate predicate.
+
+        A truthiness test (``if stats['enumeration_complete']``) happens to
+        agree here, but an ``is not False`` or ``!= False`` test would wrongly
+        admit the two UNKNOWN paths — so this pins identity, not truthiness,
+        and pins that the three states are mutually exclusive.
+        """
+        taskmaster = self._taskmaster_saying_done()
+        complete = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(complete_paged_read(rows_seen=1)), taskmaster,
+            'test_project', '/tmp/reify', run_id='run-1',
+        )
+        empirical = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(
+                incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40),
+            ),
+            taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+        structural = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(
+                incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1, expected_rows=9999),
+            ),
+            taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+        unread = await sweep_stale_status_snapshot_edges(
+            _make_memory_service(), None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        gated = [
+            name for name, stats in (
+                ('complete', complete), ('empirical', empirical),
+                ('structural', structural), ('unread', unread),
+            )
+            if stats['enumeration_complete'] is True
+        ]
+        assert gated == ['complete'], (
+            f'Only a PROVEN-complete read may pass the gate, got {gated!r}'
+        )
+        assert empirical['enumeration_complete'] is False
+        assert structural['enumeration_complete'] is False
+        assert unread['enumeration_complete'] is None

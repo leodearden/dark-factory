@@ -65,7 +65,7 @@ and delete the rest.
 
 Two-phase model
 ----------------
-**Phase 1 — Scan + report (default, --dry-run)**: enumerate every known
+**Phase 1 — Scan + report (default)**: enumerate every known
 project's Stage 1 and legacy Stage 2 cycle-summary pools, classify each
 member as keep/delete, and print a structured JSON report + human-readable
 summary table.  No writes.

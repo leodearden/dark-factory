@@ -1,0 +1,49 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-07-31T16:36:50.420249+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "medium",
+        "category": "integration-gap",
+        "file": "orchestrator/src/orchestrator/mcp/plan_tools.py",
+        "line": 863,
+        "title": "report_ready_to_merge is not in the architect's tool allowlist \u2014 the exit is unreachable in production",
+        "description": "The new MCP tool is registered on the plan-tools server, but `_PLAN_CREATOR_TOOLS` in orchestrator/src/orchestrator/agents/roles.py:194-215 is an explicit allowlist and enumerates only `report_blocking_dependency`, `report_task_already_done`, `report_unactionable_task`, `report_false_premise` \u2014 `mcp__plan-tools__report_ready_to_merge` is absent. The architect's system prompt (roles.py:348-353, 1460-1464) and briefing.py:363-364, 515 likewise never mention it, and roles.py:353 still instructs the architect that an escalate_blocker with no plan MUST be followed by report_unactionable_task / report_blocking_dependency / report_task_already_done. Net effect: nothing can ever write .task/ready_to_merge.json in a real dispatch, so the entire handler, event type, and merge path are dead code until the roster is updated. PRD leaf \u03b6 (plans/architect-already-complete-exits.md:106) covers the prompt enumeration, so this may be a deliberate follow-up \u2014 but the capability manifest's evidence row cites roles.py:205-210 (the ALLOWLIST, not just prose), and an allowlist omission is a hard reachability blocker, not documentation. Confirm \u03b6 is filed and includes the `_PLAN_CREATOR_TOOLS` entry, or add it here.",
+        "failure_scenario": "An architect agent hits a merge-landing desync, follows the (unchanged) prompt, and either calls report_unactionable_task (the exact ~100k-token human L1 this PRD exists to remove) or, if it somehow infers the new tool name, gets a tool-not-permitted error. The shipped code path never executes."
+      },
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/workflow.py",
+        "line": 6090,
+        "title": "The enqueue exit's 'blocked + no escalation is LEAVE-shaped' rationale is contradicted by the sweep's EXISTS_OFF_MAIN upgrade",
+        "description": "The comment at workflow.py:6084-6094 justifies persisting `status='blocked'` with no escalation on the grounds that this shape is LEAVE-shaped for the recovery sweep, so nothing re-drives the task while the MergeRequest is queued. But harness.py:4991-4998 upgrades exactly that shape \u2014 `action == LEAVE and status == 'blocked' and live_claimant is None and _only_merge_remediable([]) (vacuously True) and branch_state.kind == EXISTS_OFF_MAIN` \u2014 to RE_FILE_ESCALATION, which files a stranded_blocked L1 that the watcher auto-resolves into a re-pend. The sibling docstring at _schedule_architect_merge_done (workflow.py:6216-6230) states this same upgrade explicitly, as the self-healing mechanism for an ABANDONED merge; the two comments cannot both be right. The claimant is cleared at slot release, and the sweep runs every stranded_reconcile_interval_secs (900s default, config.py:3425), while the desync exit stamps no merge_phase_liveness marker (that gate at harness.py:10118 only guards the orphan-L0 reaper anyway). Behaviourally this is bounded \u2014 a re-dispatched architect re-reports and the fresh `architect_merge_request` marker suppresses a duplicate submit \u2014 but only inside the 30-minute grace; a merge that is queued longer than that gets a genuine second submit on the same branch, and every sweep in between costs an extra architect run. The stranded reaper has the same exposure (pre-existing), so this may be accepted behaviour \u2014 but the enqueue-exit comment should say so rather than assert the opposite.",
+        "failure_scenario": "Architect-desync merge is enqueued behind a busy merge queue and takes >15 min. The reconcile sweep classifies the task EXISTS_OFF_MAIN \u2192 RE_FILE_ESCALATION \u2192 stranded_blocked L1 \u2192 watcher auto-resolves \u2192 task re-pended and re-dispatched mid-flight; a full architect invocation is burned, and if the merge is still queued past 30 min the stale marker permits a second MergeRequest for the same branch."
+      },
+      {
+        "severity": "low",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/workflow.py",
+        "line": 5976,
+        "title": "Predicate 4 (review PASS) is evaluated against the worktree HEAD tree, not the tip resolved by predicates 1\u20133",
+        "description": "Predicates 1\u20133 are all bound to `tip`, resolved first-hand from `refs/heads/<prefix><task_id>` in project_root (git_ops.resolve_branch_sha, run with cwd=project_root). Predicate 4 instead keys the verdict cache on `git rev-parse HEAD^{tree}` run in `self.worktree` (git_ops.py:7780). Nothing asserts the worktree HEAD equals `tip`, so the review-PASS proof is not provably about the commit being merged. The docstring claims the verdict is checked on 'this exact committed tree'. The usual mismatch direction is a false REJECT (harmless), and the verify predicate (last_verified_green_tip == tip) closes most of the accept-side gap, but the guarantee would be exact and self-evident if the tree came from the tip itself (e.g. `git rev-parse <tip>^{tree}`) or if worktree HEAD were compared to `tip` as an explicit predicate.",
+        "failure_scenario": "The worktree HEAD lags the branch ref (branch advanced by another process, or a reused/detached worktree) while a verify-green event exists for the newer tip: the cached PASS verdict from the older tree satisfies predicate 4, and a tree that current reviewers never passed is enqueued for merge. The merge worker's scoped re-verify covers tests, not review."
+      },
+      {
+        "severity": "low",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/workflow.py",
+        "line": 6126,
+        "title": "The TerminalExitRejection race _persist_blocked_row handles as benign would then trip run()'s SM-2 assertion",
+        "description": "_persist_blocked_row documents the already-terminal row as the EXPECTED good outcome (the merge callback or found_on_main won) and deliberately leaves it terminal. But the handler still returns WorkflowOutcome.BLOCKED, and run()'s SM-2 check (workflow.py:3272-3206) re-reads the last persisted status and raises AssertionError when `outcome_allows_status` fails \u2014 and shared/src/shared/task_transitions.py:296-304 excludes TaskStatus.DONE from the 'blocked' allow-set. So if that race ever fires, run() raises out to the harness instead of returning cleanly. The window is milliseconds wide and mark_done only happens on a genuinely landed merge, so this is unlikely to fire in practice; but the two code paths disagree about whether the race is survivable. Either return DONE when the row is already done, or note in _persist_blocked_row that the race is theoretical-only.",
+        "failure_scenario": "Merge lands and _on_architect_merge_done calls mark_done between the enqueue and run()'s exit status read: _persist_blocked_row swallows TerminalExitRejection as benign, then run() raises AssertionError('outcome BLOCKED inconsistent with status done') and the harness sees an exception rather than a terminal report."
+      }
+    ],
+    "summary": "Strong, unusually well-documented change. The core design is sound: the report is never trusted, all four desync predicates are re-derived first-hand, the exit never advances main (the merge worker's scoped re-verify stays the sole gate), a durable per-caller marker guards re-submits, and both terminal dispositions (durable failure \u2192 born-at-L2 stranded_merge_failed; cancellation \u2192 abandonment, not failure) are handled loudly and fail-safe. The extraction of DURABLE/SUCCESS_TRANSIENT status sets, the resubmit grace, and the submit primitive into stranded_verified_green.py removes real lockstep-copy risk between the reaper and the new exit, and the module stays a leaf so workflow.py\u2192harness.py circularity is avoided. Test coverage is thorough (happy path, every reject predicate, fingerprint gate, idempotency, all callback dispositions, escalation dedupe/failure, dispatch ordering); I ran the new and touched suites plus all stranded/reaper/verified-green tests \u2014 444 and 393 passed, 0 failures. Four findings, none of them a defect in the handler's own logic. The one that matters operationally: `mcp__plan-tools__report_ready_to_merge` is missing from the architect's `_PLAN_CREATOR_TOOLS` allowlist (roles.py:209-211) and from the architect prompt/briefing, so nothing can reach this code in a real dispatch \u2014 PRD leaf \u03b6 appears to cover the prompt, but an allowlist omission is a hard reachability blocker, so confirm \u03b6 includes it. Second, the enqueue exit's comment asserts 'blocked + no escalation is LEAVE-shaped', while harness.py:4991-4998 upgrades exactly that shape (EXISTS_OFF_MAIN) to RE_FILE_ESCALATION \u2192 re-pend \u2014 the sibling _schedule_architect_merge_done docstring relies on that same upgrade, so the two comments contradict each other and a >15-min queued merge can be re-driven mid-flight. Third, the review-PASS predicate keys on the worktree HEAD tree rather than the tip resolved for predicates 1\u20133. Fourth, the TerminalExitRejection race _persist_blocked_row treats as expected would trip run()'s SM-2 assertion (DONE is not in the 'blocked' allow-set) \u2014 theoretical, but the two paths disagree."
+  }
+}

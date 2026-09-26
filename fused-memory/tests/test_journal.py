@@ -326,7 +326,7 @@ async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
 @pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
-    db = journal._require_db()
+    db = journal._require_access().connection
     async with db.execute('PRAGMA table_info(runs)') as cursor:
         rows = await cursor.fetchall()
     colnames = {row['name'] for row in rows}
@@ -928,3 +928,188 @@ class TestExtractTarget:
         from fused_memory.reconciliation.journal import _extract_target
 
         assert _extract_target({'result_summary': 'not json'}) == '?'
+
+
+class TestGetRunWithStageReportsText:
+    """The CAS read primitive: one row read yields BOTH the parsed run and the
+    exact stored ``runs.stage_reports`` text used as a compare-and-set token.
+
+    The token must be the bytes actually in the column — not a re-serialization
+    of the parsed run — so the CAS in ``compare_and_set_run_stage_reports``
+    cannot fail spuriously the day the DB-text → parsed → model_dump → json.dumps
+    round-trip stops being byte-identical.
+    """
+
+    @staticmethod
+    async def _seed(journal, *, stage_reports=None) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        if stage_reports is not None:
+            await journal.update_run_stage_reports(run_id, stage_reports)
+        return run_id
+
+    @staticmethod
+    async def _raw_stage_reports(journal, run_id: str):
+        """Read the column directly, bypassing every parsing layer."""
+        row = await journal._require_access().read_one(
+            'SELECT stage_reports FROM runs WHERE id = ?', (run_id,)
+        )
+        return None if row is None else row['stage_reports']
+
+    @pytest.mark.asyncio
+    async def test_returns_the_parsed_run_and_the_exact_stored_text(self, journal):
+        now = datetime.now(UTC)
+        report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=now,
+            completed_at=now,
+            stats={'created': 1, 'deleted': 2},
+            llm_calls=3,
+            tokens_used=500,
+        )
+        run_id = await self._seed(journal, stage_reports={'memory_consolidator': report})
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        # The parsed half matches what get_run() would have handed back.
+        via_get_run = await journal.get_run(run_id)
+        assert run.id == via_get_run.id
+        assert run.project_id == via_get_run.project_id
+        assert run.status == via_get_run.status
+        assert set(run.stage_reports) == set(via_get_run.stage_reports)
+        assert (
+            run.stage_reports['memory_consolidator'].model_dump(mode='json')
+            == via_get_run.stage_reports['memory_consolidator'].model_dump(mode='json')
+        )
+
+        # The token half is the column value byte-for-byte. Compared against a
+        # raw SELECT, NOT against a re-serialized round-trip — the whole point
+        # of the primitive is that it does not depend on round-trip stability.
+        assert text == await self._raw_stage_reports(journal, run_id)
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_returns_none(self, journal):
+        assert await journal.get_run_with_stage_reports_text('nonexistent-id') is None
+
+    @pytest.mark.asyncio
+    async def test_never_written_stage_reports_is_carried_through_as_is(self, journal):
+        """The token is passed through untouched so it can be fed straight back
+        into the CAS — no normalising, no defaulting."""
+        run_id = await self._seed(journal)
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        assert text == await self._raw_stage_reports(journal, run_id)
+        assert run.stage_reports == {}
+
+
+class TestCompareAndSetRunStageReports:
+    """The serialised half of a read-modify-write of the WHOLE stage_reports
+    blob: the write applies only if the column still holds the exact text the
+    caller read, so a competing wholesale rewrite is refused rather than
+    silently clobbered.
+    """
+
+    @staticmethod
+    async def _seed(journal) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(run_id, {'seed': {'findings': []}})
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_fresh_token_applies(self, journal):
+        run_id = await self._seed(journal)
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        run.stage_reports['seed']['findings'].append({'id': 'f-1'})
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, run.stage_reports, expected_text=token
+            )
+            is True
+        )
+
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+    @pytest.mark.asyncio
+    async def test_stale_token_refuses_and_writes_nothing(self, journal):
+        """Lost-update prevention proper: assert BOTH the refusal and that no
+        partial write landed."""
+        run_id = await self._seed(journal)
+
+        mine, token = await journal.get_run_with_stage_reports_text(run_id)
+        mine.stage_reports['seed']['findings'].append({'id': 'mine'})
+
+        # A competing writer lands, from its own separately-read copy.
+        theirs = await journal.get_run(run_id)
+        theirs.stage_reports['seed']['findings'].append({'id': 'theirs'})
+        await journal.update_run_stage_reports(run_id, theirs.stage_reports)
+        competitors_blob = await journal.get_run(run_id)
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, mine.stage_reports, expected_text=token
+            )
+            is False
+        )
+
+        after = await journal.get_run(run_id)
+        assert after.stage_reports == competitors_blob.stage_reports
+        assert after.stage_reports['seed']['findings'] == [{'id': 'theirs'}]
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                'nonexistent-id', {'seed': {}}, expected_text='{}'
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_null_token_round_trips(self, journal):
+        """A NULL stage_reports column is CASable with expected_text=None,
+        proving the comparison is NULL-safe (``IS``) rather than silently
+        never matching."""
+        run_id = await self._seed(journal)
+        async with journal._require_access().write() as db:
+            await db.execute('UPDATE runs SET stage_reports = NULL WHERE id = ?', (run_id,))
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        assert token is None
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, {'seed': {'findings': [{'id': 'f-1'}]}}, expected_text=token
+            )
+            is True
+        )
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]

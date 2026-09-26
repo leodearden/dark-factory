@@ -1,0 +1,63 @@
+[Unit]
+Description=Legibility trickle health probe for %i (task 4514)
+Documentation=file:///home/leo/src/dark-factory/plans/confusion-reduction-prd.md
+
+[Service]
+Type=oneshot
+# All generic legibility CODE lives in the dark-factory checkout (PRD §5);
+# only the target project varies, via the %i instance name. systemd expands
+# %i at instantiation, so this template is copied verbatim and never
+# per-project customised.
+WorkingDirectory=/home/leo/src/dark-factory
+# check_trickle_health.py self-bootstraps scripts/ onto sys.path when run
+# directly (mirroring its siblings' `if __name__ == "__main__"` guard), but
+# PYTHONPATH is set explicitly too so `from legibility import ...` resolves
+# even if that self-bootstrap ever changes.
+Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
+#
+# NO LEGIBILITY_CLAUDE_BIN, deliberately. This unit never launches the coder
+# -- it runs two read-only probes. legibility-trickle@.service pins that
+# variable for a load-bearing reason (the 2026-08-18 PATH gap) that does not
+# apply here, and a copied pin would be a claim about this unit that is
+# simply false, left to rot until someone trusts it.
+#
+# NO DARK_FACTORY_LEGIBILITY_STATE_ROOT, NO XDG_STATE_HOME, NO HOME --
+# deliberately, and this is the GAP-3 fix at the unit level.
+# scripts/legibility/trickle_state.py::trickle_state_path is anchored to the
+# invoking account's passwd home and reads no ambient environment, so the
+# WRITER (legibility-trickle@%i.service, under the `systemd --user` manager's
+# own environment) and this READER agree on ONE file without either unit
+# pinning anything. Pinning a state root in one of the two units is exactly
+# how the writer/reader divergence comes back -- and it would come back
+# silently, because each unit in isolation still looks reasonable. To
+# RELOCATE state, set DARK_FACTORY_LEGIBILITY_STATE_ROOT for BOTH units at
+# once. Pinned by
+# scripts/tests/test_install_trickle_health_timer.py::test_neither_unit_pins_a_legibility_state_root,
+# which asserts the absence for the PAIR.
+#
+# The absolute /home/leo/.local/bin/uv mirrors both sibling units and exists
+# because the `systemd --user` manager's PATH at boot-with-linger did not
+# contain ~/.local/bin on 2026-08-18: the graphical login that imports
+# ~/.profile came 84 minutes later, and a bare name in ExecStart is
+# execvp-resolved against whatever PATH the manager happens to hold.
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/check_trickle_health.py --project-id %i
+StandardOutput=journal
+StandardError=journal
+#
+# WHY THIS IS A SEPARATE UNIT rather than a second ExecStart appended to
+# legibility-trickle@.service. This comment is the SINGLE HOME for that
+# argument -- it lives in the file the change it forbids would be made in,
+# and check_trickle_health.py plus OPERATIONS.md cite it rather than
+# restating it. Do not copy it back out.
+#
+# A FAILING PROBE MUST NOT FLIP THE TRICKLE SERVICE TO Result=failed.
+# check_trickle_liveness.sh's whole verdict is that unit's `Result`, so a
+# probe sharing the unit would report its own non-zero exit as "the nightly
+# run failed" -- turning every genuine health finding into a permanent false
+# alarm about a night that actually succeeded. That is
+# the exact inversion scripts/legibility/nightly.py::_escalate_barren_streak
+# refuses when it declines to write back onto result.exit_code, and running in
+# a separate unit is what makes this probe's non-zero exit safe.
+
+[Install]
+WantedBy=timers.target

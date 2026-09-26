@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -236,9 +237,16 @@ def apply_budgets(candidates: list[Any], budgets: dict[str, float]) -> list[Any]
 # literally only because that constant is defined below), and it belongs in this
 # tuple for exactly the reason the others do: it is the report layer's number,
 # surfaced verbatim, never a second derivation.
+#
+# ``declined`` / ``no_plan_declined`` (task 4760) join the tuple on identical
+# terms: they are the report layer's admitted-pool counts, surfaced verbatim.
+# They say WHY the ``no_plan`` beside them is what it is — how many of those
+# cells took an explicit plan-tools decline exit, which is the architect
+# CORRECTLY refusing an unplannable fixture rather than failing to plan.
 _SUMMARY_FIELDS = (
-    'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
-    'mean_plan_quality', 'judged_without_reference',
+    'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'declined',
+    'no_plan_declined', 'plan_rate', 'mean_plan_quality',
+    'judged_without_reference',
 )
 
 # The per-cell reference-validity marker. Producer is eval-revival σ (task
@@ -254,6 +262,57 @@ UNMEASURED_CELLS_KEY = 'judged_without_reference_unmeasured_cells'
 # never the ``-`` report.py uses for an empty mean: this one has to survive
 # being skimmed.
 UNMEASURED = 'unmeasured'
+
+# The per-candidate breakout of ``declined`` by terminal kind (task 4760).
+# Carried alongside the total rather than folded into it: an ``already_done``
+# and a ``false_premise`` are opposite findings ABOUT THE FIXTURE — one says the
+# work already landed, the other says the premise is false — and only one of
+# them says anything about the fixture corpus needing a refresh.
+DECLINE_KINDS_KEY = 'declined_by_kind'
+
+# The plan-tools exit each decline kind NAMES, spelled the way an operator
+# reading this report would grep for it. DERIVED from ``DECLINE_KINDS`` rather
+# than typed out: the renderer's two decline blocks (the PRD-D6 banding NOTE and
+# the ``declined`` column legend) each carried their own hand-written copy of
+# the five names, which put the prose outside the very discipline metrics.py's
+# ``_DECLINE_READERS`` comment exists to enforce — "a sixth architect exit
+# cannot be half-added". Three kinds spell their exit mechanically as
+# ``report_<kind>``; the two that do not are listed here and ONLY here, so a new
+# kind renders by the rule instead of going silently missing from both blocks.
+_IRREGULAR_DECLINE_EXITS = {
+    'already_done': 'report_task_already_done',
+    'unactionable': 'report_unactionable_task',
+}
+
+
+def decline_exit_names() -> str:
+    """Every decline kind's ``report_*`` exit, in vocabulary order, for prose.
+
+    ONE string with two consumers inside :func:`format_campaign_report`, so the
+    two blocks cannot drift from each other or from the instrument. Deferred
+    import, like every other ``orchestrator`` import in this module.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    return ' / '.join(
+        _IRREGULAR_DECLINE_EXITS.get(kind, f'report_{kind}') for kind in DECLINE_KINDS
+    )
+
+
+def _decline_exit_prose(lead: str) -> list[str]:
+    """``lead (exit / exit / ...).`` as report lines, wrapped like its neighbours.
+
+    A DERIVED enumeration cannot be hand-wrapped the way the prose around it is,
+    so it is wrapped here instead. :func:`textwrap.wrap` is a pure function of
+    its input, which is what keeps the block byte-identical run to run — the
+    property ``test_rendering_is_deterministic`` requires of every committed
+    artifact — while still absorbing a sixth exit with no edit to either caller.
+    """
+    return textwrap.wrap(
+        f'{lead} ({decline_exit_names()}).',
+        width=88, initial_indent='  ', subsequent_indent='  ',
+        break_on_hyphens=False, break_long_words=False,
+    )
 
 
 def marker_available(results: list[Any]) -> bool:
@@ -329,6 +388,21 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     PERSISTED ``plan_steps``, so it stays valid on exactly the fixtures where no
     reference diff exists and ``plan_quality`` therefore cannot be interpreted.
 
+    The task-4760 decline split (``declined``, ``no_plan_declined``,
+    ``declined_by_kind``) is surfaced on those same terms and for that same
+    reason. What it adds is the INTERPRETATION of the no-plan band, which
+    ``plan_rate`` alone cannot carry: a decline is the architect taking an
+    explicit plan-tools exit — ``report_false_premise``,
+    ``report_task_already_done`` and their three siblings — i.e. a CORRECT
+    REFUSAL of an unplannable task, not a failure to plan one. So
+    ``no_plan == no_plan_declined`` is a POSITIVE reliability result, and
+    reading it as a planning failure inverts the finding.
+    That is not hypothetical: tranche 1 reported an 89% planning failure over 47
+    ``plan_steps = 0`` cells of which 47 were adversarially-verified-true
+    declines. ``plan_rate`` itself is DELIBERATELY unchanged — it keeps its exact
+    historical derivation so every committed campaign artifact stays comparable,
+    and the split is reported alongside it.
+
     Rows are sorted by ``config_name`` so a committed report artifact diffs
     cleanly.
     """
@@ -347,6 +421,13 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
         # VALUE is single-sourced, which is the property that matters — two
         # surfaces must not answer one question differently.
         row[UNMEASURED_CELLS_KEY] = entry['judged_without_reference_unmeasured']
+        # The per-KIND breakout of the ``declined`` count already surfaced above
+        # (task 4760), copied from the same entry for the same reason — the
+        # kinds are not interchangeable, and a single total would let a corpus of
+        # stale fixtures ('already_done') read as one of ill-posed ones
+        # ('false_premise'). Key-sorted by the report layer, so a committed
+        # artifact diffs cleanly.
+        row[DECLINE_KINDS_KEY] = entry['declined_by_kind']
         rows.append(row)
     rows.sort(key=lambda r: r['config_name'])
     return rows
@@ -355,7 +436,18 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
 # The raw per-cell dump. v1's discipline (task_id / config_name / outcome /
 # trial / plan_quality / plan_steps / cost_usd) extended with judge_cost_usd and
 # cap_tainted, so the verdict is recomputable without re-parsing a log.
-_CELL_FIELDS = ('plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted')
+#
+# ``terminal_kind`` (task 4760) is what makes a ``plan_steps = 0`` cell readable
+# AT ALL without forensics: the plan-tools decline artifacts that name the cause
+# live in the eval worktree's meta root, which ``cleanup_eval_worktree``
+# ``rmtree``s in ``run_architect_eval``'s ``finally``, so nothing downstream can
+# recover it afterwards. Reading tranche 1 required opening transcripts; with
+# the kind persisted per cell, an analyst splits the no-plan band straight off
+# this artifact.
+_CELL_FIELDS = (
+    'plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted',
+    'terminal_kind',
+)
 
 
 def find_missing_cells(
@@ -501,13 +593,18 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     # is the mixed-case "unmeasured (N of M scored cells)", and a column narrower
     # than its own longest value overflows and drags the table's right edge out
     # of alignment on exactly the rows an operator most needs to read.
+    # ``declined`` sits IMMEDIATELY AFTER ``no_plan`` (task 4760): it is the
+    # explanation OF that number — how many of those cells were an explicit
+    # refusal rather than a failure to plan — and a column placed away from the
+    # one it qualifies is the version of this fix that does not work.
     header = (
         f'{"candidate":<26} {"n":>4} {"total":>6} {"cap_excl":>9} {"no_plan":>8} '
-        f'{"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>32}'
+        f'{"declined":>9} {"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>32}'
     )
     lines.append(header)
     lines.append('-' * len(header))
     unmeasured_marker = False
+    declined_any = False
     for row in report.get('candidates', []):
         marker = _fmt(row.get(MARKER_KEY))
         if row.get(MARKER_KEY) is None:
@@ -525,9 +622,12 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             missing = row.get(UNMEASURED_CELLS_KEY)
             if missing:
                 marker = f'{UNMEASURED} ({missing} of {row["n"]} scored cells)'
+        if row.get('declined'):
+            declined_any = True
         lines.append(
             f'{row["config_name"]:<26} {_fmt(row["n"]):>4} {_fmt(row["total"]):>6} '
             f'{_fmt(row["cap_excluded"]):>9} {_fmt(row["no_plan"]):>8} '
+            f'{_fmt(row["declined"]):>9} '
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
             f'{marker:>32}'
         )
@@ -575,6 +675,38 @@ def format_campaign_report(report: dict[str, Any]) -> str:
                 '  NOTE: reference validity is UNMEASURED, so the ceiling band is '
                 'unsatisfiable and nothing can be discarded (D6: ambiguity -> retain).'
             )
+        if bands['counts'].get('declined'):
+            # Gated on a nonzero count, like the declined_any legend below: a
+            # campaign where nothing was refused must not grow a paragraph about
+            # refusals it never made, and the gate is what keeps this
+            # byte-deterministic. The COUNT line above is unconditional — the
+            # artifact's schema must not shift with its contents — so only the
+            # prose is gated.
+            lines += [
+                '  NOTE: declined counts fixtures whose every ADMITTED no-plan cell '
+                'took an EXPLICIT',
+                *_decline_exit_prose('plan-tools decline exit'),
+                '  A DECLINE IS A CORRECT REFUSAL of moot, blocked or ill-posed work '
+                '— NOT the headroom',
+                '  this pool is selected for.',
+                '  ADMITTED is the load-bearing word: a CAP-TAINTED cell bands '
+                'unmeasured one rung',
+                '  EARLIER, and a transport refusal says nothing about why that cell '
+                'produced no plan, so',
+                '  a fixture bands declined while still holding a cap-excluded '
+                'zero-step cell. Read the',
+                '  cap_excl column against this band before concluding every cell '
+                'here was a refusal.',
+                '  It is RETAINED nonetheless: D6 discards only the unambiguous '
+                'ceiling band, so this',
+                '  band changes what the partition is CALLED and never which side a '
+                'fixture lands on.',
+                '  Provenance: tranche 1 read 47 of 53 plan_steps = 0 cells as an 89% '
+                'planning failure',
+                '  when every one was a verified-true decline (ruling D9, task 3636: '
+                'the no-plan band',
+                '  is decline-shaped, not incapability-shaped).',
+            ]
 
     if unmeasured_marker:
         lines += [
@@ -604,10 +736,37 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             '  (RETAINED) on its own, never ceiling — so nothing is hidden by its '
             'keylessness here.',
         ]
+
+    if declined_any:
+        # Printed only when at least one arm declined — a campaign where every
+        # candidate planned must not grow a paragraph about refusals it never
+        # made, and the gate is what keeps this byte-deterministic.
+        lines += [
+            '',
+            'LEGEND — declined: how many of that candidate\'s SCORED cells ended on an '
+            'explicit',
+            *_decline_exit_prose('plan-tools decline exit'),
+            '  A DECLINE IS A CORRECT REFUSAL, not a planning failure: the architect '
+            'read the fixture',
+            '  and stated why it cannot be planned. Read against no_plan — when the two '
+            'match, that',
+            '  candidate emitted no plan ONLY where it explicitly refused, which is a '
+            'positive',
+            '  reliability result. Tranche 1 reported the opposite (an 89% planning '
+            'failure over 47',
+            '  cells that were 47 verified-true declines) because this column did not '
+            'exist.',
+            f'  plan_rate is UNCHANGED by any of this. The per-kind breakout '
+            f'({DECLINE_KINDS_KEY})',
+            '  and the no-plan intersection (no_plan_declined) ride in the JSON '
+            'artifact; a cell that',
+            '  planned and THEN declined counts here but not in no_plan, so the two '
+            'can differ.',
+        ]
     return '\n'.join(lines)
 
 
-BANDS = ('ceiling', 'intermittent', 'no_plan', 'unmeasured')
+BANDS = ('ceiling', 'intermittent', 'no_plan', 'declined', 'unmeasured')
 
 # ``ceiling`` is the ONLY discarded band. Everything else is retained.
 RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
@@ -619,8 +778,21 @@ RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
 # admissible cell, so a fixture that already has a genuine measurement must not
 # be labelled ``unmeasured`` and re-run pointlessly. ``no_plan`` leads because a
 # candidate that could not plan at all is the strongest evidence of headroom
-# this pool is being selected for.
-_BAND_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
+# this pool is being selected for — a rationale that is TRUE of it for the first
+# time now that ``declined`` has moved the correct refusals out of it (task
+# 4766; ruling D9, task 3636).
+#
+# ``declined`` sits IMMEDIATELY AFTER ``no_plan`` and nowhere else. That slot is
+# load-bearing, not cosmetic: it is the unique one under which the split merely
+# REFINES labels — every fixture keeps its old label or gains ``declined``
+# exactly where the old label was ``no_plan``, and none changes side between
+# retained and discarded. The plausible alternative (last before ``ceiling``,
+# making the label mean strict unanimity) relabels ``{declined, unmeasured}``
+# fixtures as ``unmeasured``, which would send γ1's re-run recipe at a fixture
+# that already holds an admissible cell — regressing against the very rationale
+# above. Do not reorder: the property is enumerated exhaustively by
+# ``test_the_split_cannot_re_select_the_pool``, not asserted here.
+_BAND_PRECEDENCE = ('no_plan', 'declined', 'intermittent', 'unmeasured', 'ceiling')
 
 
 def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
@@ -633,10 +805,31 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
        admissible cell, so the driver NAMES them rather than banding on a
        refusal — banding one would penalise whichever candidate happened to be
        scheduled inside a session-cap window, a property of the schedule.
-    2. ``not produced_a_plan`` -> ``no_plan``. THE plan-production predicate
-       (``metrics.py:191``), used directly and never re-implemented, and never
-       replaced by ``plan_quality > 0``: the two plan scorers disagreed exactly
-       on a stepless artifact, so a nonzero score is not evidence a plan exists.
+    2. ``not produced_a_plan`` -> ``declined`` when this cell's
+       :func:`~orchestrator.evals.metrics.terminal_kind_of` is one of the five
+       explicit plan-tools decline exits, else ``no_plan``. THE
+       plan-production predicate (``metrics.py:191``) still decides that a cell
+       is on this rung at all — used directly and never re-implemented, and
+       never replaced by ``plan_quality > 0``: the two plan scorers disagreed
+       exactly on a stepless artifact, so a nonzero score is not evidence a plan
+       exists. What the split adds is WHY there is no plan, because the two
+       causes are OPPOSITE verdicts on the candidate: a genuine "could not plan"
+       is the headroom this pool is selected for, whereas a decline is the
+       architect CORRECTLY refusing moot, blocked or ill-posed work. Reading
+       them as one number is what made tranche 1 report an 89% planning failure
+       over cells that were every one a verified-true decline (ruling D9, task
+       3636). An UNMEASURED kind — a missing key or an explicit ``None``, which
+       ``terminal_kind_of`` conflates on purpose — stays ``no_plan``: that band
+       already means "we cannot tell why there is no plan", and banding it
+       ``declined`` would fabricate a refusal nobody observed.
+
+       SCOPE: the split lives strictly INSIDE this branch. A cell that planned
+       and THEN declined satisfies ``produced_a_plan``, never reaches rung 2,
+       and bands on its plan's merits exactly as before — preserving the
+       contract ``docs/plan-scoring-and-judge.md`` states for that cell, that
+       both facts survive and a downstream reader can bucket it either way.
+       Both bands are RETAINED, so this changes what the partition is CALLED and
+       never which side a fixture lands on.
     3. reference validity not KNOWN-GOOD -> ``intermittent``. Either THIS CELL
        carries no :data:`MARKER_KEY` (it predates σ, so its validity was never
        measured) or it is marked as judged without a reference. The two cases
@@ -663,12 +856,20 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
     fires, so such a fixture can never be discarded — the conservative
     direction, by construction rather than by care.
     """
-    from orchestrator.evals.metrics import produced_a_plan
+    from orchestrator.evals.metrics import (
+        DECLINE_KINDS,
+        produced_a_plan,
+        terminal_kind_of,
+    )
 
     if metrics.get('cap_tainted'):
         return 'unmeasured'
     if not produced_a_plan(metrics):
-        return 'no_plan'
+        # Through the accessor, never a bare ``metrics.get('terminal_kind')``:
+        # it exists so this driver and the report layer consult ONE expression,
+        # and it already conflates missing-key with explicit-None into the
+        # ``None`` that must NOT band ``declined``.
+        return 'declined' if terminal_kind_of(metrics) in DECLINE_KINDS else 'no_plan'
     if MARKER_KEY not in metrics or metrics.get(MARKER_KEY):
         return 'intermittent'
     quality = metrics.get('plan_quality')
@@ -688,7 +889,7 @@ def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
 
     ``retained`` and ``discarded`` partition the pool EXACTLY: disjoint, and
     their union is every fixture that produced a cell. ``counts`` always carries
-    all four bands, zeros included, so the artifact's schema does not shift with
+    every band, zeros included, so the artifact's schema does not shift with
     its contents.
 
     The returned ``marker_available`` is a run-level DISPLAY flag ONLY: it

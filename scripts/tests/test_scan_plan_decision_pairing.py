@@ -388,7 +388,7 @@ class TestScanPlanFile:
 
         assert record.envelope_leak is True
 
-    def test_the_self_name_specimen_carries_no_other_signature(self, tmp_path):
+    def test_the_self_name_specimen_carries_no_other_signature(self):
         """The non-circular control: it must be INVISIBLE to the blanket set.
 
         If a future widening of the fixed literals caught this specimen anyway,
@@ -398,8 +398,17 @@ class TestScanPlanFile:
         assert detect(SELF_NAME_TAINTED_RATIONALE) is None
         assert '\x3c/invoke>' not in SELF_NAME_TAINTED_RATIONALE
 
-    def test_a_clean_entry_is_still_reported_envelope_clean(self, tmp_path):
-        """The widening must not turn ordinary prose into a false positive."""
+    def test_an_envelope_clean_but_mispaired_entry_is_reported_envelope_clean(
+        self, tmp_path
+    ):
+        """The widening must not turn ordinary prose into a false positive.
+
+        The specimen is clean on the ENVELOPE axis and deliberately DEFECTIVE
+        on the pairing one — ``MISPAIRED_ENTRY``, not ``CLEAN_ENTRY``. That is
+        the stronger control precisely because the two axes are independent:
+        it proves the widened envelope verdict does not bleed across and start
+        reporting a pairing defect as a leak.
+        """
         path = write_plan(tmp_path, '12', [MISPAIRED_ENTRY])
 
         (record,) = scan_plan_file(path)

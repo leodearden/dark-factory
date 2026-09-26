@@ -28,7 +28,19 @@ import sys
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    ScriptTagCollector,
+    assert_script_loads_before,
+    destructure_bindings,
+    extract_df_data_block,
+    extract_function_body,
+    find_function_params,
+    find_script_position,
+    strip_js_comments,
+    walk_balanced,
+)
 
 
 class TestExtractFunctionBody:
@@ -424,6 +436,679 @@ def _resolved_client_scope(request) -> str | None:
         if marker is not None:
             return getattr(marker, 'scope', None)
     return None
+
+
+class TestFindFunctionParams:
+    """The paren-depth-walk primitive shared by the two signature consumers.
+
+    `extract_function_body` and test_charts_axis_labels.py's
+    `_extract_signature` both had to locate `function NAME(` and walk to the
+    matching `)`.  They return DISJOINT, adjacent slices of that declaration —
+    the params between the parens, and the body from the brace — so neither
+    could be built on the other, but the walk itself was duplicated.  This
+    primitive is that walk, and it returns the two indices plus the masked
+    source so each caller can take the slice it actually needs.
+    """
+
+    def test_returns_the_parameter_list_slice_parens_excluded(self) -> None:
+        """`source[params_start:params_end]` is exactly the parameter text."""
+        src = 'function Foo(a, b = 2) { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'a, b = 2'
+        assert src[params_start - 1] == '(', 'params_start is just past the open paren'
+        assert src[params_end] == ')', 'params_end is the index OF the matching paren'
+
+    def test_an_empty_parameter_list_yields_an_empty_slice_not_a_miss(self) -> None:
+        """`function Foo()` degenerates to `params_start == params_end`.
+
+        This is the one shape where the two returned indices collapse onto
+        each other, so the params slice is `''` — and a caller could read that
+        as "lookup failed" rather than "this function takes no arguments".
+        The two ARE distinguishable, but only because a real miss RAISES
+        (pinned below) instead of returning an empty slice, so that
+        distinction is worth holding still.
+
+        The walk decrements on the immediately-following `)`, so `params_end`
+        still lands ON that paren and the body brace is still found past it.
+        """
+        src = 'function Foo() { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == ''
+        assert params_start == params_end
+        assert src[params_start - 1] == '(', 'params_start is still just past the open paren'
+        assert src[params_end] == ')', 'params_end is still the index OF the matching paren'
+
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_the_body_brace_is_found_past_params_end(self) -> None:
+        """`masked.find('{', params_end + 1)` is the body's opening brace."""
+        src = 'function Foo(a) { const x = 1; }'
+
+        masked, _params_start, params_end = find_function_params(src, 'Foo')
+        start = masked.find('{', params_end + 1)
+
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_a_destructured_parameter_does_not_capture_the_body(self) -> None:
+        """`function Foo({ a, b }) {` must yield the BODY, never `{ a, b }`.
+
+        The destructuring pattern carries its own `{`/`}` pair INSIDE the
+        parameter list, so taking the first `{` after the opening paren returns
+        the pattern instead of the body — a truncated slice every downstream
+        absence assertion then passes vacuously over.
+        """
+        src = 'function Foo({ a, b }) { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == '{ a, b }'
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_a_paren_inside_a_string_literal_is_not_counted(self) -> None:
+        """The walk runs over the mask, so a `)` in a string cannot close it."""
+        src = 'function Foo(a = ")") { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'a = ")"'
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_the_function_keyword_inside_a_comment_is_not_matched(self) -> None:
+        """A commented-out declaration must not shadow the real one."""
+        src = '/* function Foo(decoy) {} */\nfunction Foo(real) { const x = 1; }'
+
+        _masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'real'
+
+    def test_the_mask_is_index_aligned_with_the_source(self) -> None:
+        """`len(masked) == len(source)`, so the indices slice the REAL text."""
+        src = 'function Foo(a /* note */, b) { const s = "x"; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert len(masked) == len(src)
+        assert src[params_start:params_end] == 'a /* note */, b', (
+            'the slice is taken from the original source, comments intact'
+        )
+
+    def test_finds_a_declaration_nested_inside_another_function(self) -> None:
+        """The regex is deliberately NOT line-anchored.
+
+        The real instance is `function statusMatches(s) {` indented inside
+        `TasksTab` in tab_tasks.jsx.
+        """
+        src = (
+            'function Outer(a) {\n'
+            '    function Inner(b) { return b; }\n'
+            '    return Inner(a);\n'
+            '}'
+        )
+
+        _masked, params_start, params_end = find_function_params(src, 'Inner')
+
+        assert src[params_start:params_end] == 'b'
+
+    def test_a_prefix_sibling_does_not_shadow_the_target(self) -> None:
+        """The trailing `\\s*\\(` stops `TaskGraphEdges(` matching `TaskGraph`.
+
+        `function TaskGraphEdges(` at tab_tasks.jsx:33 precedes
+        `function TaskGraph(` at :151, so without the anchor the earlier
+        declaration wins and the wrong slice is returned.
+        """
+        src = 'function TaskGraphEdges(edges) { }\nfunction TaskGraph(nodes) { }'
+
+        _masked, params_start, params_end = find_function_params(src, 'TaskGraph')
+
+        assert src[params_start:params_end] == 'nodes'
+
+    def test_raises_when_there_is_no_such_declaration(self) -> None:
+        """A miss RAISES — never a sentinel, so no caller can go vacuously GREEN."""
+        src = 'const Foo = (a) => a;'
+
+        with pytest.raises(AssertionError):
+            find_function_params(src, 'Foo')
+
+    def test_raises_when_the_parameter_list_is_never_closed(self) -> None:
+        src = 'function Foo(a, b'
+
+        with pytest.raises(AssertionError):
+            find_function_params(src, 'Foo')
+
+    def test_the_miss_reason_is_available_to_the_caller(self) -> None:
+        """Callers can supply their own exception factory.
+
+        `extract_function_body` needs its four-way `_miss` wording preserved
+        exactly, and test_charts_axis_labels.py keeps a file-specific message;
+        neither can be served by one fixed string.
+        """
+        src = 'const Foo = (a) => a;'
+        sentinel = 'CALLER SPECIFIC MESSAGE'
+
+        with pytest.raises(AssertionError, match=sentinel):
+            find_function_params(
+                src, 'Foo', miss=lambda what: AssertionError(f'{sentinel}: {what}'),
+            )
+
+
+class TestDfChartsDestructure:
+    """The shared `window.DF_CHARTS` destructure/export parser.
+
+    The primitive returns (canonical, local) PAIRS rather than one side,
+    because the three consumers it replaces project OPPOSITE halves of the
+    same line: test_charts_consumer_bindings wants the LOCAL/alias name (what
+    the file must actually reference), test_charts_axis_labels wants the
+    CANONICAL/source name (what must exist on the namespace object), and
+    test_tab_burndown wants both at once.  On `HistBar: HB` those are `'HB'`
+    and `'HistBar'` — disjoint — so a primitive that picked a side would
+    silently invert one suite.
+    """
+
+    def test_a_bare_name_is_both_canonical_and_local(self) -> None:
+        assert destructure_bindings('{ StackedAreaChart }') == [
+            ('StackedAreaChart', 'StackedAreaChart'),
+        ]
+
+    def test_an_alias_splits_canonical_left_local_right(self) -> None:
+        """`Canonical: alias` — the source name binds to the local name."""
+        assert destructure_bindings('{ StackedAreaChart, HistBar: HB }') == [
+            ('StackedAreaChart', 'StackedAreaChart'),
+            ('HistBar', 'HB'),
+        ]
+
+    def test_it_splits_on_the_first_colon_only(self) -> None:
+        assert destructure_bindings('a: b: c') == [('a', 'b: c')]
+
+    def test_both_halves_are_whitespace_stripped(self) -> None:
+        assert destructure_bindings('\n   HistBar   :   HB   \n') == [
+            ('HistBar', 'HB'),
+        ]
+
+    def test_empty_parts_and_trailing_commas_produce_no_entry(self) -> None:
+        assert destructure_bindings('A, , B,') == [('A', 'A'), ('B', 'B')]
+
+    def test_source_order_is_preserved_and_duplicates_are_not_collapsed(self) -> None:
+        """The LIST shape is load-bearing — each caller does its own projection.
+
+        consumer_bindings' `_unused_bindings` must report a repeated binding
+        twice; burndown's dict collapses last-wins; axis_labels' set dedupes.
+        Collapsing here would take that choice away from all three.
+        """
+        assert destructure_bindings('A, B, A') == [
+            ('A', 'A'), ('B', 'B'), ('A', 'A'),
+        ]
+
+    def test_the_two_projections_are_opposite_halves(self) -> None:
+        """The `HistBar: HB` case both consumer suites hinge on."""
+        pairs = destructure_bindings('{ StackedAreaChart, HistBar: HB }')
+
+        assert [local for _canonical, local in pairs] == ['StackedAreaChart', 'HB']
+        assert {canonical for canonical, _local in pairs} == {
+            'StackedAreaChart', 'HistBar',
+        }
+
+    def test_destructure_re_matches_the_consumer_shape(self) -> None:
+        src = "const { StackedAreaChart, HistBar: HB } = window.DF_CHARTS;"
+
+        m = DF_CHARTS_DESTRUCTURE_RE.search(src)
+
+        assert m is not None
+        assert destructure_bindings(m.group(1)) == [
+            ('StackedAreaChart', 'StackedAreaChart'), ('HistBar', 'HB'),
+        ]
+
+    def test_export_re_matches_the_provider_shape(self) -> None:
+        src = "window.DF_CHARTS = { StackedAreaChart, LineChart };"
+
+        m = DF_CHARTS_EXPORT_RE.search(src)
+
+        assert m is not None
+        assert {c for c, _ in destructure_bindings(m.group(1))} == {
+            'StackedAreaChart', 'LineChart',
+        }
+
+    def test_a_nested_brace_yields_no_match(self) -> None:
+        """The `[^{}]*` class is brace-HOSTILE by design; do not widen it.
+
+        Three call sites turn this miss into a loud, self-naming failure that
+        points at the nested brace.  Widening it would instead let the parser
+        return a half-read binding list, and a sweep built on that list would
+        go quietly wrong rather than loudly red.
+        """
+        nested = "const { StackedAreaChart, opts: { a: 1 } } = window.DF_CHARTS;"
+
+        assert DF_CHARTS_DESTRUCTURE_RE.search(nested) is None
+
+    def test_export_re_is_equally_brace_hostile(self) -> None:
+        nested = "window.DF_CHARTS = { StackedAreaChart, opts: { a: 1 } };"
+
+        assert DF_CHARTS_EXPORT_RE.search(nested) is None
+
+
+class TestWalkBalanced:
+    """The balanced-delimiter walk shared by the two anchor-specific extractors.
+
+    `extract_df_data_block` (anchored on data.js's `key: {` seed form) and
+    test_tab_memory_evals.py's `_extract_const_object` (anchored on a
+    module-scope `const NAME = {`/`[`) need the identical depth loop over
+    DIFFERENT anchors — the same shape that made `find_function_params` worth
+    factoring out of `extract_function_body`.  With the loop written twice,
+    the string-literal blind spot pinned below was documented in two places
+    and would have had to be fixed in two places.
+    """
+
+    def test_returns_the_span_including_both_delimiters(self) -> None:
+        src = 'const A = { open: 3 }; const B = 1;'
+        start = src.index('{')
+
+        assert walk_balanced(src, start) == '{ open: 3 }'
+
+    def test_a_nested_pair_does_not_terminate_the_walk_early(self) -> None:
+        """The depth count is the whole point: `[^}]*` would truncate here."""
+        src = '{ summary: { open: 3 }, rows: [] } TRAILING'
+        span = walk_balanced(src, 0)
+
+        assert span == '{ summary: { open: 3 }, rows: [] }'
+        assert 'TRAILING' not in span
+        assert span.count('{') == span.count('}')
+
+    def test_the_delimiter_pair_is_selectable(self) -> None:
+        """`_extract_const_object` walks `[`/`]` for PARITY_PLAIN's array."""
+        src = "const PARITY_PLAIN = ['a', ['b'], 'c']; const AFTER = 1;"
+        start = src.index('[')
+
+        assert walk_balanced(src, start, '[', ']') == "['a', ['b'], 'c']"
+
+    def test_returns_empty_string_when_the_delimiter_is_never_closed(self) -> None:
+        """Silent `''`, not a raise and not a truncated slice.
+
+        The deliberate policy of this family: every call site already asserts
+        on the returned value, so raising would only relocate its failure.
+        """
+        assert walk_balanced('{ open: 3', 0) == ''
+
+    def test_a_delimiter_inside_a_string_literal_miscounts(self) -> None:
+        """KNOWN LIMITATION, pinned as current behaviour, not endorsed.
+
+        Unlike `extract_function_body`, this walk is NOT quote-aware.  It is
+        now the SINGLE place that limitation lives, which is the point of
+        factoring it out: making it quote-aware later is one edit against one
+        pin rather than two of each.
+        """
+        src = '{ label: "a } b", open: 3 }'
+
+        assert walk_balanced(src, 0) == '{ label: "a }', (
+            'if this now returns the full block the walk became quote-aware — '
+            'a real improvement, but update this pin deliberately'
+        )
+
+
+class TestExtractDfDataBlock:
+    """The `window.DF_DATA` seed-block extractor's contract.
+
+    Deliberately pins the CURRENT behaviour of the three private copies this
+    replaces (test_tab_escalations, test_tab_memory_evals,
+    test_tab_escalation_analytics), whose code was byte-identical.  Two of
+    those behaviours differ from its sibling `extract_function_body` and are
+    kept as-is rather than "improved" in the same change that moves them: the
+    silent `''` on a miss, and the string-literal blind spot.  Unifying and
+    changing semantics at once is exactly what makes a consolidation unsafe.
+    """
+
+    def test_returns_the_block_with_both_braces(self) -> None:
+        src = "window.DF_DATA = { ESCALATIONS: { open: 3 }, OTHER: 1 };"
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ open: 3 }'
+        assert block.startswith('{') and block.endswith('}')
+
+    def test_the_walk_is_brace_depth_aware(self) -> None:
+        """A NESTED object does not terminate the block early.
+
+        This is the whole reason a `[^}]*` regex was rejected: it would stop at
+        the first nested `}` and silently truncate.
+        """
+        src = (
+            "ESCALATIONS: { summary: { open: 3, closed: 1 }, rows: [] }, "
+            "MEMORY_EVALS: { n: 9 }"
+        )
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ summary: { open: 3, closed: 1 }, rows: [] }'
+        assert 'MEMORY_EVALS' not in block, 'a later sibling key must be excluded'
+        assert block.count('{') == block.count('}')
+
+    def test_the_key_is_regex_escaped(self) -> None:
+        """A key carrying regex metacharacters is matched literally."""
+        src = "a.b: { x: 1 }, aXb: { x: 2 }"
+
+        assert extract_df_data_block(src, 'a.b') == '{ x: 1 }'
+        assert extract_df_data_block(src, 'a[b') == ''
+
+    def test_arbitrary_whitespace_is_allowed_around_the_colon(self) -> None:
+        src = "ESCALATIONS   :\n    {\n  open: 3\n}"
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block.startswith('{') and 'open: 3' in block
+
+    def test_returns_empty_string_when_the_key_is_absent(self) -> None:
+        """A miss is SILENT — the opposite policy to `extract_function_body`.
+
+        Kept deliberately: all four call sites already assert on the returned
+        value themselves, so raising here would merely relocate their failures.
+        """
+        assert extract_df_data_block('OTHER: { x: 1 }', 'ESCALATIONS') == ''
+
+    def test_returns_empty_string_when_the_brace_is_never_closed(self) -> None:
+        assert extract_df_data_block('ESCALATIONS: { open: 3', 'ESCALATIONS') == ''
+
+    def test_is_re_entrant_over_its_own_output(self) -> None:
+        """Feeding the result back in extracts a nested key.
+
+        test_tab_escalations.py relies on exactly this: it pulls the
+        ESCALATIONS seed block, then pulls `summary` back out of it.
+        """
+        src = "ESCALATIONS: { summary: { open: 3 }, rows: [] }, OTHER: 1"
+
+        seed_block = extract_df_data_block(src, 'ESCALATIONS')
+        summary_block = extract_df_data_block(seed_block, 'summary')
+
+        assert summary_block == '{ open: 3 }'
+
+    def test_brace_inside_a_string_literal_miscounts(self) -> None:
+        """KNOWN LIMITATION, pinned as current behaviour, not endorsed.
+
+        Unlike `extract_function_body`, this walk is NOT quote-aware: a `{` or
+        `}` inside a quoted string is counted, so the block ends early.  Pinned
+        so that making it quote-aware later is a deliberate, visible contract
+        edit rather than silent drift.
+        """
+        src = 'ESCALATIONS: { label: "a } b", open: 3 }'
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ label: "a }', (
+            'if this now returns the full block the walk became quote-aware — '
+            'a real improvement, but update this pin deliberately'
+        )
+        assert 'open: 3' not in block
+
+
+class TestScriptOrderHelpers:
+    """The served-HTML script-order helper trio's contract.
+
+    These three used to be copied verbatim into five modules
+    (test_esc_flow_diagram, test_index_html, test_tab_escalation_analytics,
+    test_tab_escalations, test_tab_memory_evals), so a fix to the false-pass
+    guard had to be applied five times or not at all.  Everything pinned below
+    was measured off those copies before the move, so the consolidation cannot
+    silently change an outcome.
+
+    The three guard phrases in particular are pinned VERBATIM because
+    test_index_html.py's `_DEFERRED_CDN_CASES` / `_DEFERRED_TAB_TASKS_CASES`
+    turn them into `pytest.raises(match=...)` patterns; a reworded message
+    there would make those parametrizations match nothing.
+    """
+
+    # -- ScriptTagCollector ------------------------------------------------
+
+    def test_collector_records_one_attrs_dict_per_script_start_tag(self) -> None:
+        """One entry per <script> START tag, in document order."""
+        collector = ScriptTagCollector()
+        collector.feed(
+            '<html><head>'
+            '<script src="/a.js"></script>'
+            '<script src="/b.js" defer></script>'
+            '</head></html>'
+        )
+
+        assert [a.get('src') for a in collector.script_attrs] == ['/a.js', '/b.js']
+        assert collector.script_attrs[1].get('defer') is not None or (
+            'defer' in collector.script_attrs[1]
+        ), 'valueless attributes must still be recorded as keys'
+
+    def test_collector_counts_inline_scripts(self) -> None:
+        """An inline (src-less) <script> still consumes an index.
+
+        Load-order positions are indices into this list, so a tag that did not
+        consume one would shift every later position and could invert a
+        comparison.
+        """
+        collector = ScriptTagCollector()
+        collector.feed(
+            '<script src="/a.js"></script>'
+            '<script>window.X = 1;</script>'
+            '<script src="/b.js"></script>'
+        )
+
+        assert len(collector.script_attrs) == 3
+        assert 'src' not in collector.script_attrs[1]
+        assert [a.get('src') for a in collector.script_attrs] == [
+            '/a.js', None, '/b.js',
+        ]
+
+    def test_collector_ignores_non_script_tags(self) -> None:
+        collector = ScriptTagCollector()
+        collector.feed('<link rel="stylesheet" href="/a.css"><div><p>hi</p></div>')
+
+        assert collector.script_attrs == []
+
+    # -- find_script_position ----------------------------------------------
+
+    def test_find_returns_index_and_attrs_for_the_first_prefix_match(self) -> None:
+        """`(index, attrs)` for the FIRST tag whose src startswith the prefix."""
+        body = (
+            '<script src="/static/vendor/react.js"></script>'
+            '<script src="/static/redux/store.js"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        result = find_script_position(body, '/static/redux/')
+
+        assert result is not None
+        index, attrs = result
+        assert index == 1, 'index is the 0-based position in document order'
+        assert attrs.get('src') == '/static/redux/store.js'
+
+    def test_find_index_counts_inline_scripts(self) -> None:
+        """The index is a document-order position over ALL script tags."""
+        body = (
+            '<script>window.DF = {};</script>'
+            '<script src="/static/app.js"></script>'
+        )
+
+        result = find_script_position(body, '/static/app.js')
+
+        assert result is not None
+        assert result[0] == 1
+
+    def test_find_returns_none_when_no_tag_matches(self) -> None:
+        body = '<script src="/static/app.js"></script>'
+
+        assert find_script_position(body, '/static/missing') is None
+
+    def test_find_treats_a_srcless_tag_as_empty_string(self) -> None:
+        """No `src` coerces to `''`, so it matches only an empty prefix.
+
+        The `or ''` is what stops `None.startswith` blowing up on an inline
+        script, and the empty string only ever prefix-matches `''`.
+        """
+        body = '<script>window.X = 1;</script>'
+
+        assert find_script_position(body, '/static/') is None
+
+        result = find_script_position(body, '')
+        assert result is not None
+        assert result[0] == 0
+
+    # -- assert_script_loads_before ----------------------------------------
+
+    def test_passes_when_before_precedes_after(self) -> None:
+        body = (
+            '<script src="/static/vendor/react.js"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        assert_script_loads_before(
+            body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+        )
+
+    def test_raises_naming_the_missing_before_prefix(self) -> None:
+        body = '<script src="/static/redux/tabs.jsx"></script>'
+
+        with pytest.raises(AssertionError, match=r'No <script src="/static/vendor/'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_raises_distinctly_when_the_after_tag_is_absent(self) -> None:
+        """A missing AFTER tag gets its own message, not the missing-BEFORE one."""
+        body = '<script src="/static/vendor/react.js"></script>'
+
+        with pytest.raises(AssertionError) as exc:
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+        message = str(exc.value)
+        assert 'cannot verify load-order invariant for react' in message
+        assert not message.startswith('No <script src=')
+
+    def test_raises_on_out_of_order_pair(self) -> None:
+        body = (
+            '<script src="/static/redux/tabs.jsx"></script>'
+            '<script src="/static/vendor/react.js"></script>'
+        )
+
+        with pytest.raises(AssertionError, match=r'must load\s+BEFORE'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_out_of_order_message_interpolates_the_consumer_note(self) -> None:
+        """The ordering failure carries the caller's `consumer_note`.
+
+        This is the ONE place the five copies diverged — test_index_html.py
+        alone dropped the note for a fixed two-sentence string.  The unified
+        helper adopts the canonical 4-of-5 form, which makes the note visible
+        at index_html's 13 note-passing call sites instead of discarding the
+        notes at the other four modules' 14 sites.  No test anywhere matches
+        the ordering message, so either variant satisfies the suite; this one
+        strictly carries more information.
+        """
+        body = (
+            '<script src="/static/redux/tabs.jsx"></script>'
+            '<script src="/static/vendor/react.js"></script>'
+        )
+        note = 'tabs.jsx dereferences React at module scope.'
+
+        with pytest.raises(AssertionError) as exc:
+            assert_script_loads_before(
+                body,
+                '/static/vendor/',
+                '/static/redux/',
+                'react',
+                'tabs',
+                note,
+            )
+
+        assert note in str(exc.value)
+
+    # -- the defer/async/type=module false-pass guard ----------------------
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_defer_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        """`defer` divorces document order from execution order on EITHER tag."""
+        before_attr = ' defer' if offender == 'before' else ''
+        after_attr = ' defer' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(AssertionError, match='defer attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_async_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        before_attr = ' async' if offender == 'before' else ''
+        after_attr = ' async' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(AssertionError, match='async attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_type_module_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        before_attr = ' type="module"' if offender == 'before' else ''
+        after_attr = ' type="module"' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(
+            AssertionError, match=r'type="module".*deferred by default'
+        ):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_type_is_compared_case_insensitively(self) -> None:
+        """`type="MODULE"` is the same module semantics; the guard lowercases."""
+        body = (
+            '<script src="/static/vendor/react.js" type="MODULE"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        with pytest.raises(AssertionError, match='deferred by default'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_a_non_module_type_does_not_trip_the_guard(self) -> None:
+        """`type="text/javascript"` is a classic script — order still holds."""
+        body = (
+            '<script src="/static/vendor/react.js" type="text/javascript"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        assert_script_loads_before(
+            body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+        )
+
+    def test_the_guard_runs_before_the_order_comparison(self) -> None:
+        """A deferred pair fails with the GUARD message even when in order.
+
+        Otherwise a `defer` regression would pass silently: document order
+        would still be right while execution order was not.
+        """
+        body = (
+            '<script src="/static/vendor/react.js" defer></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        with pytest.raises(AssertionError, match='defer attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
 
 
 class TestSharedServedAssetFixtures:

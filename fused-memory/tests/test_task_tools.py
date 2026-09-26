@@ -1171,6 +1171,40 @@ async def test_submit_task_operational_warning_not_merged_when_result_is_error(
     assert result.get('error') == 'boom'
 
 
+@pytest.mark.asyncio
+async def test_submit_task_stage2_stamp_does_not_blind_operational_suggestion(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(d) A machine-injected Stage-2 doc-drift stamp appended to an
+    operational ask must not blind this guard at the WIRE boundary. The
+    stamp's bare "FIX" previously armed the code-change suppression, so the
+    finding was never produced and no warning reached the caller (task 4569,
+    ported from task 4532). Pins that the recovered finding actually flows
+    through the wiring, not just through the unit function -- and that the
+    guard stays WARN-ONLY, so the submission still reaches the
+    interceptor."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Restart fused-memory',
+            'description': (
+                'Restart the fused-memory service and confirm it is back up.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'operational_suggestion_warning' in result, (
+        f'stamp must not blind the guard at the wire boundary; got: {result!r}'
+    )
+    task_interceptor.submit_task.assert_awaited_once()
+
+
 # ------------------------------------------------------------------
 # trigger_reconciliation without taskmaster
 # ------------------------------------------------------------------

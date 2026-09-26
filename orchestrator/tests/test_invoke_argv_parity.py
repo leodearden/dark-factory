@@ -4,10 +4,14 @@ build byte-identical argv for identical inputs (task 2465 dedup).
 Drives both real code paths — shared.cli_invoke.invoke_claude_agent
 (non-sandbox) and orchestrator.agents.invoke._invoke_claude_with_sandbox
 (sandbox) — with the same inputs, capturing the argv each one hands to its
-respective ``_run_subprocess``. RED until both paths route through the
-shared ``build_claude_argv`` helper (step-4): today the sandbox fork still
-assembles argv by hand and lacks the CLI-2.1.168 StructuredOutput deny-list
-expansion, so the ``schema_with_wildcard_deny`` case diverges.
+respective ``_run_subprocess``. Both paths now route through the shared
+``shared/src/shared/cli_invoke.py::build_claude_argv`` helper (task 2465
+dedup), so this test is a standing regression guard against the two
+forks drifting apart again, not a pending RED. ``schema_with_wildcard_deny``
+is the sharpest case: it exercises the CLI-2.1.168 StructuredOutput
+deny-list expansion, which a re-forked
+``orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_with_sandbox``
+path would be most likely to miss.
 """
 
 from __future__ import annotations

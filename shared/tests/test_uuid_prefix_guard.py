@@ -1,0 +1,2347 @@
+"""C3 boundary policy contract — the declared matrix, then the behaviour.
+
+This file opens with assertions on the module's DATA, before any middleware
+runs. That is deliberate and is what INV-1 asks for: the policy is a declared,
+total matrix over outcome x tool class, so it can be checked as a table rather
+than inferred by driving every path and hoping the cases were exhaustive.
+
+## Why the behavioural half drives a Client
+
+Middleware sits at the SERVER REQUEST layer, and both in-process idioms this
+repo established elsewhere BYPASS it entirely. MEASURED, and recorded in
+``shared/src/shared/mcp_markup_middleware.py``'s own test module:
+
+* fused-memory's ``await server._tool_manager.call_tool(name, args)``
+* orchestrator/escalation's ``await server.get_tool(n)`` then ``tool.fn(...)``
+  / ``await tool.run({...})``
+
+A test written either way would pass while exercising nothing — the guard
+would never run. Only ``async with Client(mcp)`` runs registered middleware, so
+it is the only harness that can exercise this contract.
+
+## Why toy servers, and a fake resolver rather than a mock
+
+``shared`` is the base layer: its tests may not import ``fused_memory``, which
+is exactly why the resolver is an injected PORT rather than a dependency. The
+toy tools below mirror the real victim signatures (``add_memory``,
+``update_task``, ``submit_task``, ``delete_memory``) and RECORD the arguments
+they actually received. That is what makes "the tool received the expanded
+value" and "the tool never ran" DIRECTLY assertable, rather than inferred from
+what the guard says on ``meta`` — meta reports intent, the recorder reports
+what actually landed, and only the second one is the contract.
+
+No test here asserts on docstring or comment prose.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import json
+import logging
+from collections.abc import Callable, Mapping
+from typing import Any, get_args
+
+import pytest
+from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
+
+from shared import uuid_prefix_guard as guard
+from shared.uuid_prefix import UUID_PREFIX_OVERRIDE_KEY
+
+# --- the resolution vocabulary is typed and closed ----------------------
+
+
+def test_candidate_and_resolution_are_namedtuples() -> None:
+    for declared in (guard.Candidate, guard.Resolution):
+        assert issubclass(declared, tuple)
+        assert hasattr(declared, '_fields')
+        assert hasattr(declared, '_replace')
+
+
+def test_candidate_fields() -> None:
+    assert guard.Candidate._fields == ('namespace', 'id', 'preview')
+
+
+def test_resolution_fields() -> None:
+    assert guard.Resolution._fields == ('outcome', 'candidates')
+
+
+def test_namespace_constants_are_derived_from_the_literal_type() -> None:
+    """One source for the type and the constant, so they cannot drift apart."""
+    assert get_args(guard.Namespace) == guard.NAMESPACES
+    assert set(guard.NAMESPACES) == {'mem0', 'graphiti_node', 'graphiti_edge'}
+
+
+def test_resolution_outcome_constants_are_derived_from_the_literal_type() -> None:
+    assert get_args(guard.ResolutionOutcome) == guard.RESOLUTION_OUTCOMES
+    assert set(guard.RESOLUTION_OUTCOMES) == {'unique', 'ambiguous', 'none'}
+
+
+def test_resolver_unavailable_is_an_exception_carrying_the_failed_store() -> None:
+    """INV-11: an outage must name which store failed, never fail soft silently."""
+    assert issubclass(guard.ResolverUnavailable, Exception)
+    error = guard.ResolverUnavailable('mem0')
+    assert error.store == 'mem0'
+    assert 'mem0' in str(error)
+
+
+# --- the fact and tool-class vocabularies -------------------------------
+
+
+def test_fact_outcome_vocabulary_is_exactly_the_four_declared_values() -> None:
+    assert get_args(guard.FactOutcome) == guard.FACT_OUTCOMES
+    assert set(guard.FACT_OUTCOMES) == {
+        'expanded',
+        'rejected',
+        'forwarded_ambiguous',
+        'resolver_unavailable',
+    }
+
+
+def test_tool_classes_are_exactly_the_three_declared_ones() -> None:
+    assert {c.value for c in guard.ToolClass} == {'default', 'forward_on_ambiguity', 'exempt'}
+
+
+def test_prefix_actions_are_exactly_the_five_declared_ones() -> None:
+    assert {a.value for a in guard.PrefixAction} == {
+        'substitute_and_forward',
+        'reject_with_candidates',
+        'forward_with_candidates',
+        'forward_unchanged',
+        'inert',
+    }
+
+
+# --- the matrix is TOTAL ------------------------------------------------
+
+NON_EXEMPT_CLASSES = (guard.ToolClass.DEFAULT, guard.ToolClass.FORWARD_ON_AMBIGUITY)
+
+
+@pytest.mark.parametrize(
+    ('outcome', 'tool_class'),
+    list(itertools.product(guard.RESOLUTION_OUTCOMES, NON_EXEMPT_CLASSES)),
+)
+def test_every_cell_is_declared(
+    outcome: guard.ResolutionOutcome, tool_class: guard.ToolClass
+) -> None:
+    """No cell is reachable by falling off the end of a lookup (INV-1).
+
+    Parametrized over the PRODUCT of the two vocabularies rather than over a
+    hand-listed set of pairs, so adding an outcome or a tool class without
+    declaring its cells fails here instead of at a call site in production.
+    """
+    assert (outcome, tool_class) in guard.POLICY_MATRIX
+    assert isinstance(guard.POLICY_MATRIX[(outcome, tool_class)], guard.PrefixAction)
+
+
+def test_matrix_declares_no_cell_beyond_the_product() -> None:
+    expected = set(itertools.product(guard.RESOLUTION_OUTCOMES, NON_EXEMPT_CLASSES))
+    assert set(guard.POLICY_MATRIX) == expected
+
+
+def test_matrix_transcribes_the_prd_table() -> None:
+    """PRD §4-C3's table, cell by cell."""
+    m = guard.POLICY_MATRIX
+    assert m[('unique', guard.ToolClass.DEFAULT)] is guard.PrefixAction.SUBSTITUTE_AND_FORWARD
+    assert m[('unique', guard.ToolClass.FORWARD_ON_AMBIGUITY)] is guard.PrefixAction.SUBSTITUTE_AND_FORWARD
+    assert m[('ambiguous', guard.ToolClass.DEFAULT)] is guard.PrefixAction.REJECT_WITH_CANDIDATES
+    assert m[('ambiguous', guard.ToolClass.FORWARD_ON_AMBIGUITY)] is guard.PrefixAction.FORWARD_WITH_CANDIDATES
+    assert m[('none', guard.ToolClass.DEFAULT)] is guard.PrefixAction.INERT
+    assert m[('none', guard.ToolClass.FORWARD_ON_AMBIGUITY)] is guard.PrefixAction.INERT
+
+
+def test_matrix_is_immutable() -> None:
+    """The matrix IS the policy, so it must not be edited at runtime."""
+    with pytest.raises(TypeError):
+        guard.POLICY_MATRIX[('unique', guard.ToolClass.DEFAULT)] = guard.PrefixAction.INERT  # type: ignore[index]
+
+
+def test_exempt_is_not_a_key_in_the_matrix() -> None:
+    """An exemption is a declaration that this is not a repair site.
+
+    It short-circuits ahead of resolution, so it has no outcome and therefore
+    no row — a cell for it would imply the resolver had been consulted.
+    """
+    for outcome in guard.RESOLUTION_OUTCOMES:
+        assert (outcome, guard.ToolClass.EXEMPT) not in guard.POLICY_MATRIX
+
+
+# --- what is storm-counted, declared as data ----------------------------
+
+
+def test_storm_counted_outcomes_are_exactly_the_two_fail_soft_ones() -> None:
+    """INV-4, and the reason `expanded` is excluded is a measurement.
+
+    `expanded` is the DESIGNED SUCCESS PATH. At ~10% of 124 writes/day it
+    would fire the 3/3600 thresholds continuously and be ignored, which is how
+    a storm escape stops being an escape.
+    """
+    assert frozenset(
+        {'forwarded_ambiguous', 'resolver_unavailable'}
+    ) == guard.STORM_COUNTED_OUTCOMES
+
+
+def test_expanded_is_not_storm_counted() -> None:
+    assert 'expanded' not in guard.STORM_COUNTED_OUTCOMES
+
+
+def test_rejected_is_not_storm_counted() -> None:
+    """A rejection is not fail-soft: the caller is told, so it needs no escape."""
+    assert 'rejected' not in guard.STORM_COUNTED_OUTCOMES
+
+
+def test_storm_counted_outcomes_are_all_real_fact_outcomes() -> None:
+    assert set(guard.FACT_OUTCOMES) >= guard.STORM_COUNTED_OUTCOMES
+
+
+# ---------------------------------------------------------------------------
+# The harness.
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """Records the arguments each toy tool actually received.
+
+    ``calls`` being EMPTY is the direct assertion that a rejected call wrote
+    nothing. ``calls[0]`` carrying the expanded value is the direct assertion
+    that a substitution LANDED rather than merely being reported on ``meta``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def record(self, tool: str, **kwargs: Any) -> dict[str, Any]:
+        entry = {'tool': tool, **kwargs}
+        self.calls.append(entry)
+        return entry
+
+    @property
+    def args(self) -> dict[str, Any]:
+        """The single recorded call — asserts there was exactly one."""
+        assert len(self.calls) == 1, f'expected exactly one call, got {self.calls!r}'
+        return self.calls[0]
+
+
+#: What a resolver returns for a prefix no live id starts with.
+NO_MATCH = guard.Resolution('none', ())
+
+
+class _FakeResolver:
+    """The injected C2 port, answering from a DECLARED table.
+
+    A table, not a mock. Every answer it can give is one a real resolver could
+    give — ``Resolution`` is a NamedTuple with a closed outcome vocabulary — so
+    a test can never accidentally assert against a shape C2 forbids. A bare
+    ``MagicMock`` would answer anything at all, which is also why
+    ``scripts/check_bare_magicmock_config.py`` gates ``shared/tests``.
+
+    ``calls`` records ``(project, prefix)`` in order, which is what makes C1's
+    "distinct tokens are resolved once each per call" directly assertable
+    instead of inferred from the number of facts.
+    """
+
+    def __init__(
+        self,
+        answers: Mapping[str, guard.Resolution],
+        raises: Mapping[str, Exception] | None = None,
+    ) -> None:
+        self.answers = dict(answers)
+        # A resolver that can only ever ANSWER is not the port. INV-11 turns on
+        # the difference between a store that held nothing and a store that
+        # could not be reached, and only a fake that can fail can express it.
+        self.raises = dict(raises or {})
+        self.calls: list[tuple[str | None, str]] = []
+
+    async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
+        self.calls.append((project, prefix))
+        if prefix in self.raises:
+            raise self.raises[prefix]
+        return self.answers.get(prefix, NO_MATCH)
+
+    @property
+    def prefixes(self) -> list[str]:
+        return [prefix for _, prefix in self.calls]
+
+
+#: The project every toy call in this file attributes itself to. A constant
+#: rather than read off the arguments, because ``project_for`` is its own
+#: contract with its own erratum and is pinned separately.
+PROJECT = 'reify'
+
+
+class Harness:
+    """A toy FastMCP server plus the guard under test, driven by a Client."""
+
+    def __init__(
+        self,
+        mcp: FastMCP,
+        recorder: _Recorder,
+        resolver: _FakeResolver,
+        facts: list[Any],
+        escalations: list[Any],
+    ) -> None:
+        self.mcp = mcp
+        self.recorder = recorder
+        self.resolver = resolver
+        self.facts = facts
+        self.escalations = escalations
+
+    async def call(self, tool: str, arguments: dict[str, Any]):
+        async with Client(self.mcp) as client:
+            return await client.call_tool(tool, arguments)
+
+
+def build_harness(
+    *,
+    answers: Mapping[str, guard.Resolution] | None = None,
+    raises: Mapping[str, Exception] | None = None,
+    resolver: _FakeResolver | None = None,
+    project_for: Callable[[Mapping[str, Any]], str | None] | None = None,
+    **guard_kwargs: Any,
+) -> Harness:
+    """Build a server whose tools mirror the real victim signatures.
+
+    ``update_task`` and ``submit_task`` declare ``project_root`` while
+    ``add_memory`` declares ``project_id``, because that divergence is real (it
+    is what erratum 7 turns on) and a harness that smoothed it over would make
+    the ``project_for`` contract look easier than it is.
+    """
+    mcp = FastMCP('uuid-prefix-guard-harness')
+    rec = _Recorder()
+    facts: list[Any] = []
+    escalations: list[Any] = []
+
+    @mcp.tool
+    def add_memory(
+        content: str,
+        category: str | None = None,
+        project_id: str | None = None,
+        agent_id: str | None = None,
+        # dict OR JSON string, mirroring the real surface — which is what the
+        # override helper's shape tolerance exists for.
+        metadata: dict | str | None = None,
+    ) -> str:
+        rec.record(
+            'add_memory',
+            content=content,
+            category=category,
+            project_id=project_id,
+            agent_id=agent_id,
+            metadata=metadata,
+        )
+        return 'mem_1'
+
+    @mcp.tool
+    def update_task(
+        task_id: str,
+        project_root: str,
+        description: str | None = None,
+        details: str | None = None,
+        metadata: dict | str | None = None,
+    ) -> str:
+        """D3's forward-on-ambiguity tool: losing the write is worse than the defect."""
+        rec.record(
+            'update_task',
+            task_id=task_id,
+            project_root=project_root,
+            description=description,
+            details=details,
+            metadata=metadata,
+        )
+        return 'task_1'
+
+    @mcp.tool
+    def submit_task(
+        title: str,
+        description: str,
+        project_root: str,
+        priority: str = 'medium',
+        metadata: dict | str | None = None,
+    ) -> str:
+        """Carries the B8 nested path: ``metadata.cluster_memory_ids[i]``."""
+        rec.record(
+            'submit_task',
+            title=title,
+            description=description,
+            project_root=project_root,
+            priority=priority,
+            metadata=metadata,
+        )
+        return 'tkt_1'
+
+    @mcp.tool
+    def delete_memory(memory_id: str, store: str = 'mem0', project_id: str | None = None) -> str:
+        """B9's exemption: an id-addressed destructive tool stays refuse-only."""
+        rec.record('delete_memory', memory_id=memory_id, store=store, project_id=project_id)
+        return 'deleted'
+
+    # A ready-made resolver overrides the table, for the two contracts a table
+    # cannot express: WHEN an answer arrives (the cost bound below) and what a
+    # resolver that breaks C2's own contract does to the guard.
+    if resolver is None:
+        resolver = _FakeResolver(answers or {}, raises)
+    guard_kwargs.setdefault('fact_sink', facts.append)
+    guard_kwargs.setdefault('escalation_sink', escalations.append)
+    mcp.add_middleware(
+        guard.UuidPrefixGuardMiddleware(
+            resolver,
+            project_for if project_for is not None else (lambda arguments: PROJECT),
+            **guard_kwargs,
+        )
+    )
+    return Harness(mcp, rec, resolver, facts, escalations)
+
+
+def repair_of(result: Any) -> dict[str, Any] | None:
+    """The result's ``uuid_prefix_repair`` block, or ``None`` when there is none.
+
+    ONE accessor for both directions. ``meta`` is Optional on the wire type — a
+    tool result legitimately carries none — so an absent block and an absent
+    meta are the same answer here, and a test asserting inertness never has to
+    tell them apart.
+    """
+    meta = result.meta or {}
+    return meta.get('uuid_prefix_repair')
+
+
+async def resolved_prefixes(arguments: dict[str, Any]) -> list[str]:
+    """The prefixes the resolver was asked about, in order, for one add_memory call.
+
+    Document order with duplicates collapsed is the observable form of "each
+    distinct token, once" — so both halves of that invariant are one assertion.
+    """
+    h = build_harness()
+    await h.call('add_memory', dict(arguments))
+    return h.resolver.prefixes
+
+
+# ---------------------------------------------------------------------------
+# The clean path: no prefix-shaped token anywhere.
+# ---------------------------------------------------------------------------
+
+CLEAN_CALL = {
+    'content': 'the reconciler ran twice and both passes agreed',
+    'project_id': PROJECT,
+    'agent_id': 'claude-interactive',
+}
+
+
+class TestCleanCallPassesThrough:
+    async def test_the_arguments_reach_the_tool_verbatim(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', dict(CLEAN_CALL))
+        assert h.recorder.args == {
+            'tool': 'add_memory',
+            'content': CLEAN_CALL['content'],
+            'category': None,
+            'project_id': PROJECT,
+            'agent_id': 'claude-interactive',
+            'metadata': None,
+        }
+
+    async def test_no_repair_block_rides_on_meta(self) -> None:
+        h = build_harness()
+        result = await h.call('add_memory', dict(CLEAN_CALL))
+        assert repair_of(result) is None
+
+    async def test_no_fact_is_emitted(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', dict(CLEAN_CALL))
+        assert h.facts == []
+
+    async def test_the_resolver_is_never_consulted(self) -> None:
+        """The fast path costs one scan and NO awaited round trip (INV-8).
+
+        This guard sits on every tool call on the server, and the overwhelming
+        majority carry no prefix at all. A resolver round-trip on those would
+        put a store read on the loop thread for every call in the factory.
+        """
+        h = build_harness()
+        await h.call('add_memory', dict(CLEAN_CALL))
+        assert h.resolver.calls == []
+
+
+# ---------------------------------------------------------------------------
+# B5 — a token that resolves to nothing is INERT.
+# ---------------------------------------------------------------------------
+#
+# The strongest form of "inert": not merely unmodified, but UNRECORDED. 33,076
+# of the corpus's hex-8 occurrences are this case, so a fact per miss would be
+# 75% of the stream and would teach every reader to skip it (INV-2's reason for
+# emitting only unique/ambiguous/unavailable).
+
+NONE_CALL = {
+    'content': (
+        'the recon-3f2a9c1e pass over the 20260904 snapshot left a deadbeef '
+        'marker, and deadbeef is not an id'
+    ),
+    'project_id': PROJECT,
+}
+
+
+class TestB5ZeroMatchIsInert:
+    async def test_the_body_reaches_the_tool_byte_identical(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', dict(NONE_CALL))
+        assert h.recorder.args['content'] == NONE_CALL['content']
+
+    async def test_no_repair_block_rides_on_meta(self) -> None:
+        h = build_harness()
+        result = await h.call('add_memory', dict(NONE_CALL))
+        assert repair_of(result) is None
+
+    async def test_no_fact_is_emitted_not_even_one_recording_the_miss(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', dict(NONE_CALL))
+        assert h.facts == []
+
+    async def test_the_glue_rule_keeps_the_composite_handle_out_of_the_resolver(self) -> None:
+        """``recon-3f2a9c1e`` is not a token, so it is never even looked up.
+
+        Detection is ``shared.uuid_prefix``'s job and the guard does not
+        second-guess it — but the consequence is visible HERE, as a store read
+        that never happens.
+        """
+        assert '3f2a9c1e' not in await resolved_prefixes(NONE_CALL)
+
+    async def test_each_distinct_token_is_resolved_exactly_once(self) -> None:
+        """C1's stated invariant, asserted where it costs something.
+
+        ``deadbeef`` occurs twice in one string. Resolving per OCCURRENCE
+        rather than per distinct token would double the store reads on exactly
+        the calls that cite one id repeatedly, and each of those reads is a
+        full collection walk.
+        """
+        assert await resolved_prefixes(NONE_CALL) == ['20260904', 'deadbeef']
+
+
+# ---------------------------------------------------------------------------
+# Resolution builders and a hand-advanced clock.
+# ---------------------------------------------------------------------------
+
+
+def unique(
+    full_id: str, namespace: guard.Namespace = 'mem0', preview: str = ''
+) -> guard.Resolution:
+    """A `unique` resolution — exactly one candidate, as C2 requires."""
+    return guard.Resolution('unique', (guard.Candidate(namespace, full_id, preview),))
+
+
+class _Clock:
+    """A hand-advanced clock, so a storm window is a decision and not a race."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+#: Full ids, each with its own prefix as a literal prefix — the monotonicity
+#: `substitute` enforces, so a wrong expansion stays visible and reversible.
+BFF = 'bff81530'
+BFF_FULL = 'bff81530-1a2b-4c3d-8e9f-0123456789ab'
+F1C = 'f1c4a651'
+F1C_FULL = 'f1c4a651-2b3c-4d5e-8f90-1234567890ab'
+B7B = 'b7b0f63b'
+B7B_FULL = 'b7b0f63b-3c4d-4e5f-8a01-234567890abc'
+BEC = '8bec9cd6'
+BEC_FULL = '8bec9cd6-4d5e-4f60-8b12-34567890abcd'
+
+#: A dead full uuid, which corpus convention treats as provenance. It sits
+#: beside an expandable prefix in the B8 list so "the guard touched exactly one
+#: entry" is asserted rather than assumed.
+SIBLING_FULL = '48433882-ee71-480d-aff7-c91aa4640ff5'
+
+AGENT = 'claude-interactive'
+
+
+def detection_fact(**overrides: Any) -> dict[str, Any]:
+    """One complete ``uuid_prefix_detected`` record, defaulted to the B1 expansion.
+
+    Spelled as a COMPLETE record with overrides rather than as a subset check,
+    so a key the guard silently stopped emitting fails a test instead of
+    passing one — and one builder for every arm, so a key that drifted between
+    arms could not pass either.
+    """
+    fact = {
+        'fact': 'uuid_prefix_detected',
+        'tool': 'add_memory',
+        'field': 'content',
+        'token': BFF,
+        'outcome': 'expanded',
+        'candidate_ids': [BFF_FULL],
+        'namespace': 'mem0',
+        'agent_id': AGENT,
+        'project': PROJECT,
+    }
+    fact.update(overrides)
+    return fact
+
+
+# ---------------------------------------------------------------------------
+# B1 — unique expansion on a memory write.
+# ---------------------------------------------------------------------------
+
+
+class TestB1UniqueExpansion:
+    CALL = {
+        'content': f'the {BFF} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL, preview='the reconciler ran twice')})
+
+    async def test_the_tool_received_the_expanded_value(self) -> None:
+        """Read off the RECORDER, not off meta.
+
+        ``meta`` reports what the guard says it did; the recorder reports what
+        the tool was actually handed. A guard that reported a substitution it
+        never applied would pass every meta assertion in this file.
+        """
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+    async def test_the_other_arguments_are_untouched(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['project_id'] == PROJECT
+        assert h.recorder.args['agent_id'] == AGENT
+        assert h.recorder.args['metadata'] is None
+
+    async def test_the_substitution_is_reported_on_meta(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {
+            'substitutions': [
+                {
+                    'field': 'content',
+                    'path': ['content'],
+                    'from': BFF,
+                    'to': BFF_FULL,
+                    'namespace': 'mem0',
+                }
+            ]
+        }
+
+    async def test_exactly_one_fact_with_outcome_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.facts == [detection_fact()]
+
+    async def test_fastmcps_own_meta_is_preserved_not_replaced(self) -> None:
+        """``call_next``'s result already carries FastMCP's signalling.
+
+        Discarding it to deliver our own would be a poor trade, so the report
+        is FOLDED into whatever meta came back.
+        """
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert (result.meta or {}).get('fastmcp') == {'wrap_result': True}
+
+
+# ---------------------------------------------------------------------------
+# B7 — a slash-separated pair: the glue rule keeps both, and both expand.
+# ---------------------------------------------------------------------------
+
+
+class TestB7SlashSeparatedPair:
+    CALL = {
+        'content': f'both {F1C}/{B7B} are cited',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={F1C: unique(F1C_FULL), B7B: unique(B7B_FULL)})
+
+    async def test_both_tokens_reach_the_tool_expanded(self) -> None:
+        """The reverse-document-order fold, observed rather than argued.
+
+        Applying the earlier span first would shift every later offset by the
+        length of the expansion, so the second replacement would land inside
+        the first one's new text. Both landing span-exact is the direct
+        evidence that did not happen.
+        """
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'both {F1C_FULL}/{B7B_FULL} are cited'
+
+    async def test_two_substitutions_are_reported_in_document_order(self) -> None:
+        """Applied in reverse, REPORTED in reading order — the consumer's order."""
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert [(s['from'], s['to']) for s in repair['substitutions']] == [
+            (F1C, F1C_FULL),
+            (B7B, B7B_FULL),
+        ]
+
+    async def test_one_fact_per_token(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert [(f['token'], f['candidate_ids']) for f in h.facts] == [
+            (F1C, [F1C_FULL]),
+            (B7B, [B7B_FULL]),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# B8 — the nested path, which is the shape the 4643 incident actually took.
+# ---------------------------------------------------------------------------
+
+
+class TestB8NestedPath:
+    CALL = {
+        'title': 'follow up on the cluster',
+        'description': 'nothing citable here',
+        'project_root': '/home/leo/src/reify',
+        'metadata': {'cluster_memory_ids': [BEC, SIBLING_FULL]},
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BEC: unique(BEC_FULL)})
+
+    async def test_the_tool_received_the_expanded_list_entry(self) -> None:
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.recorder.args['metadata']['cluster_memory_ids'][0] == BEC_FULL
+
+    async def test_the_sibling_full_uuid_is_untouched(self) -> None:
+        """A full uuid is never a token, so nothing may happen to one."""
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.recorder.args['metadata']['cluster_memory_ids'][1] == SIBLING_FULL
+
+    async def test_the_substitution_carries_the_structured_path(self) -> None:
+        """A list, not ``'metadata.cluster_memory_ids[0]'`` (heuristic 12).
+
+        An encoded path would need an ad-hoc parser at every consumer and
+        would be ambiguous the moment a key contains a dot or a bracket.
+        """
+        h = self.harness()
+        result = await h.call('submit_task', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert repair['substitutions'] == [
+            {
+                'field': 'metadata',
+                'path': ['metadata', 'cluster_memory_ids', 0],
+                'from': BEC,
+                'to': BEC_FULL,
+                'namespace': 'mem0',
+            }
+        ]
+
+    async def test_the_fact_names_the_top_level_argument(self) -> None:
+        """``field`` stays the FLAT vocabulary the markup fact stream uses.
+
+        Both streams stay queryable the same way; ``path`` is what carries the
+        depth.
+        """
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.facts == [
+            detection_fact(
+                tool='submit_task',
+                field='metadata',
+                token=BEC,
+                candidate_ids=[BEC_FULL],
+                agent_id=None,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The `unique` row is the SAME cell for both tool classes.
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueIsIdenticalOnTheForwardOnAmbiguityClass:
+    """A tool's class changes what happens on AMBIGUITY, and nothing else.
+
+    Driven rather than inferred from the matrix, because the matrix says the
+    two cells are equal and this says the body honours that.
+    """
+
+    CALL = {
+        'task_id': '4643',
+        'project_root': '/home/leo/src/reify',
+        'description': f'supersedes {BFF}',
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={BFF: unique(BFF_FULL)},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+        )
+
+    async def test_the_tool_received_the_expanded_value(self) -> None:
+        h = self.harness()
+        await h.call('update_task', dict(self.CALL))
+        assert h.recorder.args['description'] == f'supersedes {BFF_FULL}'
+
+    async def test_the_fact_is_an_expansion(self) -> None:
+        h = self.harness()
+        await h.call('update_task', dict(self.CALL))
+        assert [(f['tool'], f['outcome']) for f in h.facts] == [('update_task', 'expanded')]
+
+
+# ---------------------------------------------------------------------------
+# One id cited twice: resolved once, edited twice, reported twice.
+# ---------------------------------------------------------------------------
+
+
+class TestARepeatedCitationIsOneResolutionAndTwoEdits:
+    """The two vocabularies are per-DIFFERENT-things, and that is deliberate.
+
+    A resolution is per distinct token — the expensive part, a store walk. A
+    substitution and its fact are per OCCURRENCE, because they describe an
+    edit at a site, which is what an operator querying by ``field`` needs.
+    """
+
+    CALL = {
+        'content': f'{BFF} is the record; see {BFF} again',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL)})
+
+    async def test_the_store_is_walked_once(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_both_occurrences_are_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'{BFF_FULL} is the record; see {BFF_FULL} again'
+
+    async def test_two_substitutions_and_two_facts(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert len(repair['substitutions']) == 2
+        assert h.facts == [detection_fact(), detection_fact()]
+
+
+# ---------------------------------------------------------------------------
+# INV-4 — `expanded` is the designed success path and is NOT storm-counted.
+# ---------------------------------------------------------------------------
+
+
+class TestExpandedIsNeverStormCounted:
+    """Ten expansions inside one window, through ONE middleware instance.
+
+    At ~10% of 124 writes/day a counted success path would fire the 3/3600
+    thresholds continuously and be ignored, which is how a storm escape stops
+    being an escape. The clock is injected and never advanced, so all ten
+    events sit inside one window by construction rather than by being fast.
+    """
+
+    async def _ten_calls(self) -> Harness:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, time_provider=_Clock())
+        for index in range(10):
+            await h.call(
+                'add_memory',
+                {'content': f'{BFF} cited in call {index}', 'project_id': PROJECT},
+            )
+        return h
+
+    async def test_all_ten_calls_landed(self) -> None:
+        h = await self._ten_calls()
+        assert len(h.recorder.calls) == 10
+
+    async def test_no_storm_summary_ever_appears(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, time_provider=_Clock())
+        for index in range(10):
+            result = await h.call(
+                'add_memory',
+                {'content': f'{BFF} cited in call {index}', 'project_id': PROJECT},
+            )
+            repair = repair_of(result)
+            assert repair is not None
+            assert 'storm' not in repair
+
+    async def test_the_escalation_sink_received_nothing(self) -> None:
+        h = await self._ten_calls()
+        assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B2 / B4 — ambiguity on a DEFAULT-class tool is a rejection.
+# ---------------------------------------------------------------------------
+#
+# B4 is the cross-namespace case, so the two candidates here sit in DIFFERENT
+# namespaces: one Mem0 id and one Graphiti node uuid sharing a prefix is
+# `ambiguous`, and it is the shape a single-namespace resolver would have
+# missed entirely.
+
+AMB = '208f1bdf'
+AMB_MEM0 = '208f1bdf-5e6f-4071-8c23-4567890abcde'
+AMB_NODE = '208f1bdf-6f70-4182-8d34-567890abcdef'
+
+AMBIGUOUS = guard.Resolution(
+    'ambiguous',
+    (
+        guard.Candidate('mem0', AMB_MEM0, 'the reconciler ran twice and both passes'),
+        guard.Candidate('graphiti_node', AMB_NODE, 'ReconciliationRun'),
+    ),
+)
+
+
+def rejection_payload(excinfo: Any) -> dict[str, Any]:
+    """The refusal's JSON payload, which must survive the boundary intact."""
+    return json.loads(str(excinfo.value))
+
+
+class TestB2AmbiguityIsRejectedOnADefaultTool:
+    CALL = {
+        'content': f'see {AMB} for the earlier pass',
+        'category': 'observations_and_summaries',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={AMB: AMBIGUOUS})
+
+    async def _reject(self, harness: Harness) -> dict[str, Any]:
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call('add_memory', dict(self.CALL))
+        return rejection_payload(excinfo)
+
+    async def test_the_tool_never_ran(self) -> None:
+        """What makes "nothing written" TRUE rather than merely intended."""
+        h = self.harness()
+        await self._reject(h)
+        assert h.recorder.calls == []
+
+    async def test_the_payload_carries_exactly_the_declared_keys(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert set(payload) == {
+            'error',
+            'error_type',
+            'outcome',
+            'tool',
+            'field',
+            'token',
+            'candidates',
+            'original_call',
+            'hint',
+        }
+
+    async def test_the_payload_names_the_outcome_and_the_site(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['error_type'] == 'ambiguous_uuid_prefix'
+        assert payload['outcome'] == 'rejected'
+        assert payload['tool'] == 'add_memory'
+        assert payload['field'] == 'content'
+        assert payload['token'] == AMB
+
+    async def test_both_candidates_arrive_with_namespace_and_preview(self) -> None:
+        """A caller told only "ambiguous" cannot choose; this is what lets it."""
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['candidates'] == [
+            {
+                'namespace': 'mem0',
+                'id': AMB_MEM0,
+                'preview': 'the reconciler ran twice and both passes',
+            },
+            {'namespace': 'graphiti_node', 'id': AMB_NODE, 'preview': 'ReconciliationRun'},
+        ]
+
+    async def test_original_call_is_the_complete_submitted_argument_map(self) -> None:
+        """The 3936 gap, answered locally: a resubmit is mechanical.
+
+        The COMPLETE map, not just the offending field — a caller reassembling
+        the rest by hand is how the other arguments get lost for good.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['original_call'] == dict(self.CALL)
+
+    async def test_there_is_no_repaired_call(self) -> None:
+        """The choice is the author's, and the guard must not appear to have made it.
+
+        This is the one place this guard's refusal deliberately DIVERGES from
+        the markup guard's, which does carry a `repaired_call`: a mis-closed
+        tag has one correct repair, and an ambiguous citation has two correct
+        answers and no way to tell them apart.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert 'repaired_call' not in payload
+
+    async def test_the_hint_tells_the_caller_to_pick_one_and_resubmit(self) -> None:
+        """The one action available to the caller, named.
+
+        A hint that offered to choose would be a promise the guard cannot
+        keep — "exactly one candidate, or nothing is changed" is the whole
+        design.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert 'resubmit' in payload['hint'].lower()
+
+    async def test_exactly_one_fact_with_outcome_rejected(self) -> None:
+        h = self.harness()
+        await self._reject(h)
+        assert h.facts == [
+            detection_fact(
+                token=AMB,
+                outcome='rejected',
+                candidate_ids=[AMB_MEM0, AMB_NODE],
+                # Two namespaces, so there is no single one — present and null
+                # rather than absent, so a consumer never has to tell "no
+                # single namespace" from "that arm forgot the key".
+                namespace=None,
+            )
+        ]
+
+
+class TestAMixedCallIsRejectedWhole:
+    """One unique token and one ambiguous token in the same call.
+
+    The two-phase shape is what makes this structural: resolution completes
+    before ANY substitution is applied, so the rejection leaves the argument
+    map untouched rather than half-expanded. Interleaved, the unique token
+    would already have been written into the arguments by the time the
+    ambiguous one was resolved — and a rejected call would have mutated the
+    caller's data on its way out.
+    """
+
+    CALL = {
+        'content': f'{BFF} supersedes {AMB}',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS})
+
+    async def _reject(self, harness: Harness) -> dict[str, Any]:
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call('add_memory', dict(self.CALL))
+        return rejection_payload(excinfo)
+
+    async def test_the_tool_never_ran(self) -> None:
+        h = self.harness()
+        await self._reject(h)
+        assert h.recorder.calls == []
+
+    async def test_no_partial_substitution_reaches_the_payload(self) -> None:
+        """`original_call` is the map the CALLER sent, not a half-repaired one."""
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['original_call']['content'] == f'{BFF} supersedes {AMB}'
+
+    async def test_the_refusal_names_the_ambiguous_token(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['token'] == AMB
+
+    async def test_the_stream_records_only_the_rejection_never_the_unmade_expansion(
+        self,
+    ) -> None:
+        """The one non-obvious decision in ``_deliver``, pinned directly.
+
+        On a rejection the facts are emitted for the REJECTIONS only, not for
+        the whole plan. The BFF token here resolved uniquely and would have
+        been expanded — but the call was refused, so nothing was written, and
+        an `expanded` fact for it would be a lie in the stream about a
+        substitution that never reached the tool. The mirror of
+        ``TestAnOutageAbandonsAnAlreadyResolvedExpansion::
+        test_no_expanded_fact_is_emitted_for_the_abandoned_token``: same
+        principle, other arm.
+
+        Without this, deleting the ``rejections`` filter and emitting the whole
+        plan leaves every other assertion in this file green.
+        """
+        h = self.harness()
+        await self._reject(h)
+        assert [(f['outcome'], f['token']) for f in h.facts] == [('rejected', AMB)]
+
+
+# ---------------------------------------------------------------------------
+# B3 / D3 — ambiguity on a declared forward-on-ambiguity tool.
+# ---------------------------------------------------------------------------
+#
+# Losing the write is worse than the defect: an `update_task` bounced for an
+# ambiguous citation costs the whole update, and the citation is a detail of
+# it. So the prefix travels UNCHANGED and the ambiguity is reported instead.
+
+
+def project_of(arguments: Mapping[str, Any]) -> str | None:
+    """A test-local ``project_for``: whichever identity argument the tool declares.
+
+    Deliberately trivial, and deliberately not the shipped one — that has its
+    own contract, its own erratum and its own step. All this has to do is make
+    two projects distinguishable so the storm counter's keying is testable.
+    """
+    for key in ('project_id', 'project_root'):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def ambiguity_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        answers={AMB: AMBIGUOUS},
+        forward_on_ambiguity_tools=frozenset({'update_task'}),
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+def update_call(index: int = 0, project_root: str = PROJECT) -> dict[str, Any]:
+    return {
+        'task_id': str(4643 + index),
+        'project_root': project_root,
+        'description': f'supersedes {AMB}',
+    }
+
+
+class TestB3AmbiguityForwardsOnTheDeclaredClass:
+    async def test_the_tool_received_the_prefix_unchanged(self) -> None:
+        h = ambiguity_harness()
+        await h.call('update_task', update_call())
+        assert h.recorder.args['description'] == f'supersedes {AMB}'
+
+    async def test_the_ambiguity_is_reported_on_meta(self) -> None:
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        assert repair_of(result) == {
+            'ambiguous': [
+                {
+                    'field': 'description',
+                    'path': ['description'],
+                    'token': AMB,
+                    'candidates': [
+                        {
+                            'namespace': 'mem0',
+                            'id': AMB_MEM0,
+                            'preview': 'the reconciler ran twice and both passes',
+                        },
+                        {
+                            'namespace': 'graphiti_node',
+                            'id': AMB_NODE,
+                            'preview': 'ReconciliationRun',
+                        },
+                    ],
+                }
+            ]
+        }
+
+    async def test_no_substitutions_key_claims_an_expansion_that_did_not_happen(self) -> None:
+        """Omitted, not empty. A key that is always present teaches a reader to
+        skip it, and this one distinguishes "changed nothing" from "changed
+        something and did not say what"."""
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'substitutions' not in repair
+
+    async def test_one_fact_with_outcome_forwarded_ambiguous(self) -> None:
+        h = ambiguity_harness()
+        await h.call('update_task', update_call())
+        assert h.facts == [
+            detection_fact(
+                tool='update_task',
+                field='description',
+                token=AMB,
+                outcome='forwarded_ambiguous',
+                candidate_ids=[AMB_MEM0, AMB_NODE],
+                namespace=None,
+                agent_id=None,
+            )
+        ]
+
+    async def test_a_single_forward_carries_no_storm_key(self) -> None:
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'storm' not in repair
+
+
+# ---------------------------------------------------------------------------
+# INV-4 — the storm escape on the fail-soft outcomes.
+# ---------------------------------------------------------------------------
+#
+# A forwarded ambiguity is INVISIBLE to its caller: the call succeeded. So a
+# burst of them is the one signal an operator has that the boundary is
+# absorbing a defect at scale, and it must not be poolable into an alarm that
+# names an outcome or a project that never burst.
+
+
+async def drive_forwards(h: Harness, count: int, project_root: str = PROJECT) -> list[Any]:
+    return [await h.call('update_task', update_call(i, project_root)) for i in range(count)]
+
+
+class TestTheStormEscape:
+    async def test_two_forwards_do_not_fire(self) -> None:
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 2)
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_the_third_fires_and_the_summary_rides_on_meta(self) -> None:
+        """The forwarding tier is the one whose callers cannot learn of the
+        burst any other way — their calls all SUCCEEDED."""
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1])
+        assert repair is not None
+        assert repair['storm'] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'forwarded_ambiguous',
+            'project': PROJECT,
+        }
+
+    async def test_the_defaults_are_a_tripwire_not_a_rate_limit(self) -> None:
+        """3 in 3600s, read off the fired summary rather than off an attribute.
+
+        Three ambiguous citations inside one agent session is not a rate to be
+        limited, it is a signal that a whole batch of writes is citing ids that
+        do not identify anything.
+        """
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1]) or {}
+        assert (repair['storm']['threshold'], repair['storm']['window_seconds']) == (3, 3600.0)
+
+    async def test_the_escalation_sink_received_exactly_one_record(self) -> None:
+        h = ambiguity_harness(time_provider=_Clock())
+        await drive_forwards(h, 3)
+        assert h.escalations == [
+            {
+                'error_type': 'uuid_prefix_boundary_storm',
+                'count': 3,
+                'threshold': 3,
+                'window_seconds': 3600.0,
+                'outcome': 'forwarded_ambiguous',
+                'project': PROJECT,
+            }
+        ]
+
+    async def test_every_call_still_landed(self) -> None:
+        """A storm changes what an operator is told, never what the caller gets."""
+        h = ambiguity_harness(time_provider=_Clock())
+        await drive_forwards(h, 3)
+        assert len(h.recorder.calls) == 3
+        assert all(call['description'] == f'supersedes {AMB}' for call in h.recorder.calls)
+
+    async def test_two_projects_do_not_pool_into_a_premature_fire(self) -> None:
+        """Keyed per (project, outcome). One counter whose window spans every
+        event regardless of label would fire on the fourth event here and name
+        a project that saw only two."""
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 2, 'alpha') + await drive_forwards(h, 2, 'beta')
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_a_rejection_never_advances_the_forwarded_counter(self) -> None:
+        """`rejected` is not in STORM_COUNTED_OUTCOMES, and not merely because
+        its threshold is high: it is never handed to a counter at all. A
+        rejection is not fail-soft — the caller is told — so it needs no
+        escape."""
+        h = ambiguity_harness(time_provider=_Clock())
+        for _ in range(2):
+            with pytest.raises(ToolError):
+                await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT})
+        results = await drive_forwards(h, 2)
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B12 / INV-11 — the resolver could not be reached.
+# ---------------------------------------------------------------------------
+#
+# The guard's ONLY degraded path, and the one ruling that is not negotiable: a
+# boundary guard that turns a store outage into lost writes is worse than the
+# defect it exists to fix. So an outage is never a rejection and never
+# silence — it is a forward, said out loud on meta.
+
+OUTAGE = 'mem0'
+
+
+def outage_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        raises={BFF: guard.ResolverUnavailable(OUTAGE), AMB: guard.ResolverUnavailable(OUTAGE)},
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+class TestB12ResolverUnavailable:
+    CALL = {
+        'content': f'the {BFF} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    async def test_the_tool_received_its_arguments_unchanged(self) -> None:
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+
+    async def test_meta_says_unavailable_and_names_the_failed_store(self) -> None:
+        """"The resolver is down" is not actionable; "mem0 is down" is."""
+        h = outage_harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+
+    async def test_one_fact_with_outcome_resolver_unavailable(self) -> None:
+        """No candidates were ever enumerated, so the record says so."""
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.facts == [
+            detection_fact(
+                outcome='resolver_unavailable',
+                candidate_ids=[],
+                namespace=None,
+            )
+        ]
+
+    async def test_the_storm_counter_records_it(self) -> None:
+        h = outage_harness(time_provider=_Clock())
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result) or {}
+        assert repair['storm'] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'resolver_unavailable',
+            'project': PROJECT,
+        }
+
+    async def test_an_outage_never_becomes_a_refusal_on_a_reject_class_tool(self) -> None:
+        """add_memory is DEFAULT class, whose ambiguity cell is a rejection.
+
+        An outage must not borrow that cell: the guard never learned whether
+        the citation was ambiguous at all.
+        """
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert len(h.recorder.calls) == 1
+
+    async def test_an_outage_never_becomes_a_refusal_on_a_forward_class_tool(self) -> None:
+        h = outage_harness(forward_on_ambiguity_tools=frozenset({'update_task'}))
+        await h.call('update_task', update_call())
+        assert len(h.recorder.calls) == 1
+
+
+class TestAnOutageAbandonsAnAlreadyResolvedExpansion:
+    """The hardest case, and the whole reason the phases are split.
+
+    The first token resolved UNIQUE; the second raised. Interleaved, the
+    expansion for the first would already be sitting in the argument map by
+    the time the outage was discovered — so a call the guard reports as
+    "forwarded unchanged" would have been silently rewritten.
+    """
+
+    CALL = {
+        'content': f'{F1C} supersedes {BFF}',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={F1C: unique(F1C_FULL)},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+            project_for=project_of,
+        )
+
+    async def test_the_arguments_are_byte_identical_to_what_was_submitted(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'{F1C} supersedes {BFF}'
+
+    async def test_meta_reports_only_the_outage(self) -> None:
+        """No `substitutions` key claiming an expansion that was abandoned."""
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+
+    async def test_no_expanded_fact_is_emitted_for_the_abandoned_token(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert [f['outcome'] for f in h.facts] == ['resolver_unavailable']
+
+
+class TestAResolverBugIsNotAnOutage:
+    """A coding bug in the resolver must be LOUD, not absorbed as degradation.
+
+    ``ResolverUnavailable`` and only that type means "the store could not be
+    reached". Catching anything wider would let a TypeError in the resolver
+    present itself for months as an intermittent store outage, and the
+    difference is exactly what an operator would be paged on.
+    """
+
+    async def test_a_bare_runtime_error_propagates(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug: prefix was never validated')},
+            project_for=project_of,
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+
+    async def test_the_tool_never_ran(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug')}, project_for=project_of
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+        assert h.recorder.calls == []
+
+    async def test_it_is_not_recorded_as_an_outage(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug')}, project_for=project_of
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+        assert h.facts == []
+        assert h.escalations == []
+
+
+class TestTheTwoFailSoftOutcomesDoNotPool:
+    """The cross-outcome half of the storm keying (the row deferred at step 17).
+
+    Two forwarded ambiguities and two outages in the same project must not
+    fire: one counter whose window spans every event regardless of label would
+    fire on the fourth and name an outcome that saw only two.
+    """
+
+    async def test_four_interleaved_fail_soft_calls_do_not_fire(self) -> None:
+        h = build_harness(
+            answers={AMB: AMBIGUOUS},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+            project_for=project_of,
+            time_provider=_Clock(),
+        )
+        results = []
+        for index in range(2):
+            results.append(await h.call('update_task', update_call(index)))
+            results.append(
+                await h.call(
+                    'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+                )
+            )
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B9 — the declared exemption.
+# ---------------------------------------------------------------------------
+#
+# An id-addressed destructive tool is not a repair site. Expanding a prefix
+# before a delete, a merge or an edge rewrite is the one place where guessing
+# right and guessing wrong look identical from the caller's side, and only one
+# of them is recoverable. So the exemption is total: no scan, no resolution, no
+# meta, no fact — an exemption is a declaration that this is NOT a repair site,
+# and recording it would pollute the fact stream with a non-event.
+
+
+def exempt_harness(*, exempt: str = 'delete_memory', **guard_kwargs: Any) -> Harness:
+    """A harness whose ``delete_memory`` resolves — so an exemption is what stops it.
+
+    ``answers`` deliberately KNOWS the prefix. An exemption asserted against a
+    resolver that had no answer anyway would pass just as well with the
+    exemption deleted.
+    """
+    return build_harness(
+        answers={BFF: unique(BFF_FULL)},
+        exempt_tools=frozenset({exempt}),
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+DELETE_CALL = {'memory_id': BFF, 'project_id': PROJECT}
+
+
+class TestB9AnExemptToolIsSkippedEntirely:
+    async def test_the_prefix_reaches_the_tool_verbatim(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF, (
+            'a prefix must never be expanded before a delete: an id the guard '
+            'chose is indistinguishable from one the author chose, and only '
+            'one of those is recoverable'
+        )
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.resolver.calls == []
+
+    async def test_no_meta_key_is_added(self) -> None:
+        h = exempt_harness()
+        result = await h.call('delete_memory', dict(DELETE_CALL))
+        assert repair_of(result) is None
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.facts == [], (
+            'an exemption is a declaration that this is not a repair site, so '
+            'recording it would make the fact stream measure declarations'
+        )
+        assert h.escalations == []
+
+    async def test_the_exemption_is_scoped_to_the_named_tool(self) -> None:
+        """One tool exempt is not the whole server exempt."""
+        h = exempt_harness()
+        await h.call('add_memory', {'content': f'see {BFF}', 'project_id': PROJECT})
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+
+class TestTheExemptionIsMatchedBare:
+    """``context.message.name`` is the IN-SERVER name, never the agent-facing one.
+
+    A declaration written ``mcp__fused-memory__delete_memory`` would silently
+    never match, and a machine-checked declaration that fails open is worse
+    than none: the register would read as exempt while the guard expanded a
+    prefix straight into a delete (INV-1).
+    """
+
+    PREFIXED = 'mcp__fused-memory__delete_memory'
+
+    async def test_the_prefixed_spelling_does_not_match(self) -> None:
+        h = exempt_harness(exempt=self.PREFIXED)
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF_FULL
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_nothing_is_exempt_by_default(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, project_for=project_of)
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF_FULL
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+    async def test_the_declared_set_is_empty_by_default(self) -> None:
+        middleware = guard.UuidPrefixGuardMiddleware(
+            _FakeResolver({}), lambda arguments: PROJECT
+        )
+        assert middleware.exempt_tools == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# B17 / D10 — the author's override.
+# ---------------------------------------------------------------------------
+#
+# ``metadata={'allow_uuid_prefix': True}`` — an author who means the bare
+# token. The whole hatch is that the token survives, so nothing about the call
+# may change and nothing about it is a detection.
+
+OVERRIDE = {UUID_PREFIX_OVERRIDE_KEY: True}
+
+
+def override_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS},
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+class TestB17TheOverrideBypassesTheGuard:
+    async def test_the_prefix_survives_intact(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.recorder.args['content'] == f'see {BFF}'
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.resolver.calls == []
+
+    async def test_no_meta_key_and_no_fact(self) -> None:
+        h = override_harness()
+        result = await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert repair_of(result) is None
+        assert h.facts == [], (
+            'a declared, deliberate bare token is not a detection — recording '
+            'it as one would make the fact stream measure author intent'
+        )
+        assert h.escalations == []
+
+    async def test_an_ambiguous_token_is_not_rejected(self) -> None:
+        """The load-bearing case: the hatch has to work on the arm that refuses."""
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {AMB}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.recorder.args['content'] == f'see {AMB}'
+
+
+class TestTheOverrideFlagTravelsByTheToolsOwnSchema:
+    """ONE override, ONE lifecycle — γ's write-time layer must still see it.
+
+    Leaf γ strips ``allow_uuid_prefix`` at the tool body, exactly as
+    ``allow_mcp_markup`` is stripped at both layers. Consuming the flag here
+    would leave a caller doing precisely what the hint told it to and bounced
+    by the NEXT guard, so on a tool that declares ``metadata`` the map travels
+    UNCHANGED. On a tool that declares none there is nothing to inform, and
+    forwarding the parameter at all is ``Unexpected keyword argument``.
+    """
+
+    async def test_a_metadata_taking_tool_receives_the_flag_intact(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {
+                'content': f'see {BFF}',
+                'project_id': PROJECT,
+                'metadata': {UUID_PREFIX_OVERRIDE_KEY: True, 'keep': 'this'},
+            },
+        )
+        assert h.recorder.args['metadata'] == {
+            UUID_PREFIX_OVERRIDE_KEY: True,
+            'keep': 'this',
+        }
+
+    async def test_the_json_string_shape_travels_intact_too(self) -> None:
+        h = override_harness()
+        sent = json.dumps({UUID_PREFIX_OVERRIDE_KEY: True, 'keep': 'this'})
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': sent},
+        )
+        assert h.recorder.args['content'] == f'see {BFF}'
+        assert json.loads(h.recorder.args['metadata']) == {
+            UUID_PREFIX_OVERRIDE_KEY: True,
+            'keep': 'this',
+        }
+
+    async def test_a_tool_with_no_metadata_parameter_has_the_key_dropped(self) -> None:
+        """``delete_memory`` declares none — forwarding ``metadata`` cannot work."""
+        h = override_harness()
+        await h.call('delete_memory', {**DELETE_CALL, 'metadata': dict(OVERRIDE)})
+        assert 'metadata' not in h.recorder.args
+        assert h.recorder.args['memory_id'] == BFF
+
+    async def test_the_json_string_shape_is_dropped_when_it_empties(self) -> None:
+        h = override_harness()
+        await h.call(
+            'delete_memory', {**DELETE_CALL, 'metadata': json.dumps(OVERRIDE)}
+        )
+        assert 'metadata' not in h.recorder.args
+        assert h.recorder.args['memory_id'] == BFF
+
+    async def test_metadata_the_caller_also_sent_is_NOT_dropped(self) -> None:
+        """Only the emptied case is dropped — the rest is the caller's payload.
+
+        On a tool with no ``metadata`` parameter, residue sent alongside the
+        flag is the caller's own bug; leaving it in place surfaces that as an
+        unknown-parameter error, where dropping it would silently discard data.
+        """
+        h = override_harness()
+        with pytest.raises(ToolError):
+            await h.call(
+                'delete_memory',
+                {**DELETE_CALL, 'metadata': {**OVERRIDE, 'keep': 'this'}},
+            )
+
+
+class TestTheOverrideIsFailClosed:
+    """Only a literal boolean ``True``. A truthy value is not a declaration."""
+
+    @pytest.mark.parametrize('flag', ['yes', 1, 'True', [True]])
+    async def test_a_truthy_non_true_value_does_not_bypass(self, flag: Any) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {
+                'content': f'see {BFF}',
+                'project_id': PROJECT,
+                'metadata': {UUID_PREFIX_OVERRIDE_KEY: flag},
+            },
+        )
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+    async def test_an_unrelated_metadata_map_does_not_bypass(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': {'keep': 'this'}},
+        )
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
+
+
+# ---------------------------------------------------------------------------
+# project_for — the erratum-7 case, and the no_project arm.
+# ---------------------------------------------------------------------------
+#
+# C3's letter says every guarded tool declares `project_id`. It does not:
+# `update_task` and `submit_task` declare `project_root`, and D3 puts
+# `update_task` in the forward-on-ambiguity class — so a project_for written to
+# the PRD's letter goes silently inert on the ONE tool that ruling most depends
+# on. The shipped factory therefore reads `project_id` first and TRANSLATES a
+# `project_root` through the registry, which is the opposite precedence to
+# MarkupGuardMiddleware._identity: that one prefers the root because an
+# escalation queue is addressed by filesystem root, while the value here feeds
+# a resolver whose universe is keyed by project_id.
+
+REIFY_ROOT = '/home/leo/src/reify'
+DF_ROOT = '/home/leo/src/dark-factory'
+REGISTRY = {PROJECT: REIFY_ROOT, 'dark_factory': DF_ROOT}
+
+
+class TestProjectFromArgumentsResolvesAProjectId:
+    def test_a_project_id_argument_resolves_directly(self) -> None:
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_id': PROJECT, 'content': 'x'}) == PROJECT
+
+    def test_a_project_root_argument_is_inverted_through_the_registry(self) -> None:
+        """The erratum-7 translation: the root is not the resolver's vocabulary."""
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_root': REIFY_ROOT, 'task_id': '4643'}) == PROJECT
+
+    def test_project_id_is_read_first(self) -> None:
+        project_for = guard.project_from_arguments(REGISTRY)
+        arguments = {'project_id': PROJECT, 'project_root': DF_ROOT}
+        assert project_for(arguments) == PROJECT
+
+    def test_a_project_id_needs_no_registry_entry(self) -> None:
+        """It IS the resolver's vocabulary already — nothing to translate."""
+        assert guard.project_from_arguments({})({'project_id': PROJECT}) == PROJECT
+
+
+class TestProjectFromArgumentsNeverGuesses:
+    """An unresolvable identity yields None, never a default.
+
+    Mirrors ``fused_memory/server/markup_guard.py::_resolve_project_root``'s
+    refusal to accept a path the registry does not vouch for. A guessed project
+    would resolve a citation against ANOTHER project's ids — the one failure
+    mode worse than leaving the prefix alone.
+    """
+
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            pytest.param({'project_root': '/tmp/not-a-known-project'}, id='unknown-root'),
+            pytest.param({'project_root': ''}, id='empty-root'),
+            pytest.param({'project_id': ''}, id='empty-id'),
+            pytest.param({'project_id': 7}, id='non-string-id'),
+            pytest.param({'project_root': [REIFY_ROOT]}, id='non-string-root'),
+            pytest.param({'project_id': None, 'project_root': None}, id='both-null'),
+            pytest.param({'content': 'no identity argument at all'}, id='absent'),
+        ],
+    )
+    def test_none(self, arguments: dict[str, Any]) -> None:
+        assert guard.project_from_arguments(REGISTRY)(arguments) is None
+
+    def test_an_empty_registry_cannot_translate_a_root(self) -> None:
+        assert guard.project_from_arguments({})({'project_root': REIFY_ROOT}) is None
+
+    def test_a_root_is_matched_exactly(self) -> None:
+        """No prefix, suffix or normalisation games — exact membership only."""
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_root': REIFY_ROOT + '/'}) is None
+        assert project_for({'project_root': REIFY_ROOT + '/.worktrees/5322'}) is None
+
+
+class TestAMalformedRegistryRaisesAtBuildTime:
+    """Two ids on one root is a WIRING bug, caught on the first construction.
+
+    Deterministic and at startup, the ``StormCounter`` fire_mode precedent:
+    silently picking one of them would make the guard resolve a whole project's
+    citations against another project's ids, and nothing downstream could tell.
+    """
+
+    def test_a_duplicate_root_raises(self) -> None:
+        with pytest.raises(ValueError):
+            guard.project_from_arguments({'reify': REIFY_ROOT, 'reify_mirror': REIFY_ROOT})
+
+    def test_the_message_names_both_ids_and_the_root(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            guard.project_from_arguments({'reify': REIFY_ROOT, 'reify_mirror': REIFY_ROOT})
+        message = str(excinfo.value)
+        assert 'reify' in message
+        assert 'reify_mirror' in message
+        assert REIFY_ROOT in message
+
+
+class TestErratum7EndToEnd:
+    """The consequence at the boundary, not just in the factory.
+
+    ``update_task`` carries only ``project_root``. With the shipped factory it
+    resolves, reaches D3's forward-on-ambiguity arm and reports the ambiguity;
+    with a project_for written to C3's letter it would have found no project
+    and gone silently inert — which is exactly Leo's ruling failing closed
+    without anyone seeing it.
+    """
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={AMB: AMBIGUOUS},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+            project_for=guard.project_from_arguments(REGISTRY),
+        )
+
+    async def test_the_resolver_is_asked_about_the_project_ID(self) -> None:
+        h = self.harness()
+        await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        assert h.resolver.calls == [(PROJECT, AMB)], (
+            'the resolver universe is one Mem0 collection and one graph '
+            'group_id, both keyed by project_id — a root would resolve nothing'
+        )
+
+    async def test_it_reaches_the_forward_on_ambiguity_arm(self) -> None:
+        h = self.harness()
+        result = await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        repair = repair_of(result)
+        assert repair is not None
+        assert [a['token'] for a in repair['ambiguous']] == [AMB]
+        assert repair.get('resolver') is None
+
+    async def test_the_fact_is_attributed_to_the_project_id(self) -> None:
+        h = self.harness()
+        await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        assert [(f['outcome'], f['project']) for f in h.facts] == [
+            ('forwarded_ambiguous', PROJECT)
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The no_project arm — visible, never inferred.
+# ---------------------------------------------------------------------------
+
+
+def no_project_harness() -> Harness:
+    """A registry that vouches for nothing the toy calls name."""
+    return build_harness(
+        answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS},
+        project_for=guard.project_from_arguments(REGISTRY),
+    )
+
+
+UNSCOPED_CALL = {'content': f'see {BFF}', 'agent_id': AGENT}
+
+
+class TestTheNoProjectArm:
+    async def test_the_tool_receives_its_arguments_unchanged(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.recorder.args['content'] == f'see {BFF}'
+
+    async def test_meta_says_so_rather_than_leaving_it_to_be_inferred(self) -> None:
+        """An absent meta block and an unscoped call are different answers."""
+        h = no_project_harness()
+        result = await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert repair_of(result) == {'resolver': 'no_project'}
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.resolver.calls == [], (
+            'a prefix is only meaningful inside a project scope: with none '
+            'there is no universe to resolve against'
+        )
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.facts == []
+        assert h.escalations == []
+
+    async def test_an_unscoped_call_is_never_rejected(self) -> None:
+        """Nothing was resolved, so there is no ambiguity to refuse over."""
+        h = no_project_harness()
+        await h.call('add_memory', {'content': f'see {AMB}', 'agent_id': AGENT})
+        assert h.recorder.args['content'] == f'see {AMB}'
+
+
+# ---------------------------------------------------------------------------
+# The injected channels — additive, never load-bearing.
+# ---------------------------------------------------------------------------
+#
+# Both sinks are wired by a registration site to machinery this layer cannot
+# import, and both run AFTER the call's outcome is already decided. So the two
+# contracts `call_sink` states are the ones that keep a sink from becoming an
+# outage of its own: an ``async def`` emitter is AWAITED, and a raising one
+# changes nothing the caller sees. The default harness wires `list.append` for
+# both, which exercises neither branch — hence these.
+
+
+def raises_sink(_record: dict[str, Any]) -> None:
+    raise RuntimeError('the sink is unavailable')
+
+
+async def async_raises_sink(_record: dict[str, Any]) -> None:
+    raise RuntimeError('the sink is unavailable')
+
+
+class TestAnAsyncSinkIsAwaited:
+    """Called-but-not-awaited records NOTHING while returning a coroutine.
+
+    The only trace would be a bare ``coroutine was never awaited``
+    RuntimeWarning — the silent fail-soft this guard exists to end, committed
+    by the guard. This repo's queue and escalation machinery is largely async,
+    so an ``async def`` emitter is a legitimate thing to be handed.
+    """
+
+    async def test_an_async_fact_sink_receives_the_record(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(fact: dict[str, Any]) -> None:
+            recorded.append(fact)
+
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=sink)
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert [fact['outcome'] for fact in recorded] == ['expanded']
+
+    async def test_an_async_escalation_sink_receives_the_fired_burst(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(record: dict[str, Any]) -> None:
+            recorded.append(record)
+
+        h = ambiguity_harness(time_provider=_Clock(), escalation_sink=sink)
+        await drive_forwards(h, 3)
+        assert [record['error_type'] for record in recorded] == [
+            'uuid_prefix_boundary_storm'
+        ]
+
+
+class TestARaisingSinkChangesNothing:
+    """A sink outage costs an operator visibility, never a caller's write."""
+
+    async def test_an_expansion_still_reaches_the_tool(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=raises_sink)
+        result = await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+        assert repair_of(result) == {
+            'substitutions': [
+                {
+                    'field': 'content',
+                    'path': ['content'],
+                    'from': BFF,
+                    'to': BFF_FULL,
+                    'namespace': 'mem0',
+                }
+            ]
+        }
+
+    async def test_a_rejection_is_still_a_rejection(self) -> None:
+        h = build_harness(answers={AMB: AMBIGUOUS}, fact_sink=raises_sink)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT})
+        assert rejection_payload(excinfo)['outcome'] == 'rejected'
+        assert h.recorder.calls == []
+
+    async def test_an_async_sink_that_raises_is_caught_too(self) -> None:
+        """The never-raises contract has to survive the AWAIT, not just the call."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=async_raises_sink)
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+    async def test_a_raising_escalation_sink_leaves_the_storm_on_meta(self) -> None:
+        """The burst still reaches the caller and the ERROR log, and every call lands."""
+        h = ambiguity_harness(time_provider=_Clock(), escalation_sink=raises_sink)
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1]) or {}
+        assert repair['storm']['count'] == 3
+        assert len(h.recorder.calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# The resolver is a PORT, and a port's answers are checked.
+# ---------------------------------------------------------------------------
+#
+# `substitute` is MONOTONE — a token must be a literal prefix of what replaces
+# it — and it enforces that by raising. The fold runs at the END of delivery,
+# after the `expanded` facts are already published, so a `unique` answer that
+# does not extend its token would take the whole call down while the fact
+# stream claimed the substitution had happened: the call LOST and the record of
+# it a lie. The shipped C2 resolver uses STARTS WITH and cannot produce one —
+# but the guard is typed against the port, not against that implementation, and
+# it is the guard that pays.
+
+#: The natural way to produce one: a resolver that normalises dashes out before
+#: matching answers a 12-char token with the canonical dashed id.
+DASHLESS = 'bff815301a2b'
+
+
+class TestAUniqueAnswerThatCannotBeAppliedIsNotApplied:
+    CALL = {
+        'content': f'the {DASHLESS} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={DASHLESS: unique(BFF_FULL)})
+
+    async def test_the_call_still_reaches_the_tool(self) -> None:
+        """Losing the call is the one outcome worse than not repairing it."""
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+
+    async def test_nothing_claims_an_expansion(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) is None
+        assert h.facts == []
+
+    async def test_a_unique_answer_with_no_candidate_takes_the_same_exit(self) -> None:
+        """The same class of violation, and no arm downstream has to index it."""
+        h = build_harness(answers={DASHLESS: guard.Resolution('unique', ())})
+        result = await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+        assert repair_of(result) is None
+
+    async def test_the_violation_is_loud(self, caplog: Any) -> None:
+        """Demoted, never quietly tolerated: it is a bug in the injected port."""
+        h = self.harness()
+        with caplog.at_level(logging.ERROR, logger='shared.uuid_prefix_guard'):
+            await h.call('add_memory', dict(self.CALL))
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+        assert 'RESOLVER CONTRACT VIOLATION' in caplog.records[0].getMessage()
+
+    async def test_an_extending_answer_is_untouched_by_the_check(self) -> None:
+        """The check is a port contract, not a second policy: valid answers pass."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+
+# ---------------------------------------------------------------------------
+# What one guarded call COSTS.
+# ---------------------------------------------------------------------------
+#
+# PRD §6 measures one resolver walk at ~0.2s, and §4-C1's corpus says 33,076 of
+# 47,209 prefix-shaped occurrences resolve to `none` — so most tokens cost a
+# full two-store walk to learn nothing. Serial and uncapped, a prose-heavy
+# write citing N distinct runs would add N x 0.2s to one tool call, with N
+# bounded only by the size of the argument map.
+
+
+def hex_tokens(count: int) -> list[str]:
+    """*count* distinct, well-separated tokens the C1 grammar accepts."""
+    return [f'{0xAAAA0000 + index:08x}' for index in range(count)]
+
+
+def prose(tokens: list[str]) -> dict[str, Any]:
+    return {'content': ' and '.join(tokens), 'project_id': PROJECT, 'agent_id': AGENT}
+
+
+class _ConcurrencyProbe(_FakeResolver):
+    """Answers only once *expected* callers have arrived AT THE SAME TIME.
+
+    A resolver that resolved serially would sit in the first call waiting for a
+    second that cannot arrive until it returns, and the wait would time out —
+    so "these overlapped" is a fact this fake can establish rather than a
+    duration a test has to eyeball. ``peak`` additionally records how many were
+    ever in flight together, which is the semaphore's bound made observable.
+    """
+
+    def __init__(self, expected: int) -> None:
+        super().__init__({})
+        self.expected = expected
+        self.in_flight = 0
+        self.peak = 0
+        self._all_arrived = asyncio.Event()
+
+    async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        if self.in_flight >= self.expected:
+            self._all_arrived.set()
+        try:
+            await asyncio.wait_for(self._all_arrived.wait(), timeout=10)
+        finally:
+            self.in_flight -= 1
+        return await super().__call__(project, prefix)
+
+
+class _DelayedResolver(_FakeResolver):
+    """A resolver whose answers arrive OUT of document order.
+
+    ``calls`` therefore records COMPLETION order here, which is what makes
+    "the outage reported is the first in DOCUMENT order" a real assertion
+    rather than one both implementations would satisfy.
+    """
+
+    def __init__(
+        self,
+        raises: Mapping[str, Exception],
+        delays: Mapping[str, float],
+    ) -> None:
+        super().__init__({}, raises)
+        self.delays = dict(delays)
+
+    async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
+        await asyncio.sleep(self.delays.get(prefix, 0.0))
+        return await super().__call__(project, prefix)
+
+
+class TestTheDistinctTokensResolveConcurrently:
+    async def test_a_full_batch_is_in_flight_together(self) -> None:
+        """Serial resolution deadlocks this probe; concurrent resolution passes."""
+        probe = _ConcurrencyProbe(guard.MAX_CONCURRENT_RESOLUTIONS)
+        h = build_harness(resolver=probe)
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_CONCURRENT_RESOLUTIONS)))
+        assert probe.peak == guard.MAX_CONCURRENT_RESOLUTIONS
+
+    async def test_the_fan_out_is_capped(self) -> None:
+        """Unlimited overlap browns out the very stores the guard depends on."""
+        probe = _ConcurrencyProbe(guard.MAX_CONCURRENT_RESOLUTIONS)
+        h = build_harness(resolver=probe)
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL)))
+        assert len(h.resolver.prefixes) == guard.MAX_DISTINCT_PREFIXES_PER_CALL
+        assert probe.peak == guard.MAX_CONCURRENT_RESOLUTIONS
+
+    async def test_the_concurrency_bound_never_exceeds_the_call_bound(self) -> None:
+        assert guard.MAX_CONCURRENT_RESOLUTIONS <= guard.MAX_DISTINCT_PREFIXES_PER_CALL
+
+    async def test_the_outage_reported_is_the_first_in_document_order(self) -> None:
+        """Not the first to ARRIVE. What a caller is told must not depend on
+        which of two overlapping store walks lost the race."""
+        first, second = BFF, F1C
+        resolver = _DelayedResolver(
+            raises={
+                first: guard.ResolverUnavailable('mem0'),
+                second: guard.ResolverUnavailable('graphiti'),
+            },
+            delays={first: 0.05},
+        )
+        h = build_harness(resolver=resolver)
+        result = await h.call('add_memory', prose([first, second]))
+        assert h.resolver.prefixes == [second, first], 'the second answered first'
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0'}
+        assert [fact['token'] for fact in h.facts] == [first]
+
+
+class TestTheCeilingOnDistinctPrefixes:
+    """Beyond the ceiling the citations go UNCHECKED — said, not inferred."""
+
+    def over(self) -> dict[str, Any]:
+        return prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1))
+
+    async def test_the_call_is_forwarded_byte_identical(self) -> None:
+        h = build_harness()
+        call = self.over()
+        await h.call('add_memory', dict(call))
+        assert h.recorder.args['content'] == call['content']
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        """The whole point: the ceiling is a bound on COST, so it has to be
+        enforced before the first walk, not after the sixteenth."""
+        h = build_harness()
+        await h.call('add_memory', self.over())
+        assert h.resolver.calls == []
+
+    async def test_meta_names_the_reason_the_count_and_the_ceiling(self) -> None:
+        h = build_harness()
+        result = await h.call('add_memory', self.over())
+        assert repair_of(result) == {
+            'resolver': 'too_many_prefixes',
+            'distinct_prefixes': guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1,
+            'ceiling': guard.MAX_DISTINCT_PREFIXES_PER_CALL,
+        }
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        """No resolution was attempted, so there is no outcome to report — the
+        ``no_project`` arm's line, and the caller was told on its own meta."""
+        h = build_harness()
+        await h.call('add_memory', self.over())
+        assert h.facts == []
+        assert h.escalations == []
+
+    async def test_the_ceiling_is_inclusive(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL)))
+        assert len(h.resolver.prefixes) == guard.MAX_DISTINCT_PREFIXES_PER_CALL
+
+    async def test_repeated_citations_of_one_id_never_approach_it(self) -> None:
+        """The ceiling counts DISTINCT tokens, so a call quoting one id fifty
+        times is one walk — the same invariant `_resolve` keeps."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        await h.call('add_memory', prose([BFF] * 50))
+        assert h.resolver.prefixes == [BFF]
+
+
+# ---------------------------------------------------------------------------
+# The apply phase is ONE call to the substitution door, whatever the
+# occurrence count.
+# ---------------------------------------------------------------------------
+#
+# The twin of ``test_repeated_citations_of_one_id_never_approach_it`` above, on
+# the other side of the call. That one pins that 50 repeats cost ONE resolver
+# walk, because MAX_DISTINCT_PREFIXES_PER_CALL bounds DISTINCT tokens. Nothing
+# bounded the APPLY side at all: a per-occurrence fold rebuilt the whole
+# containing string once per citation, which is O(occurrences x string length)
+# and stalls a shared single-threaded server for seconds on one ordinary large
+# write. The bound is pinned DETERMINISTICALLY — how many times the door is
+# called — rather than by a wall clock that cannot see a C-level memcpy.
+
+
+class _CountingDoor:
+    """A counting delegate that FORWARDS to the real substitution door.
+
+    Explicitly written rather than a ``MagicMock``: the real door still has to
+    run, because the point is that one call does all the work correctly, not
+    that one call happened. (``scripts/check_bare_magicmock_config.py`` gates
+    ``shared/tests`` for the same reason ``_FakeResolver`` is a table.)
+    """
+
+    def __init__(self, door: Callable[..., dict[str, Any]]) -> None:
+        self.door = door
+        self.calls = 0
+
+    def __call__(self, arguments: Mapping[str, Any], replacements: Any) -> dict[str, Any]:
+        self.calls += 1
+        return self.door(arguments, replacements)
+
+
+REPEATS = 50
+
+
+class TestTheApplyPhaseIsOneDoorCallPerGuardedCall:
+    """One id cited 50 times in prose and twice more in a nested list."""
+
+    def call(self) -> dict[str, Any]:
+        arguments = prose([BFF] * REPEATS)
+        arguments['metadata'] = {'cluster_memory_ids': [BFF, BFF]}
+        return arguments
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL)})
+
+    def counting(self, monkeypatch: pytest.MonkeyPatch) -> _CountingDoor:
+        door = _CountingDoor(guard.substitute_all)
+        monkeypatch.setattr(guard, 'substitute_all', door)
+        return door
+
+    async def test_the_door_is_called_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """52 occurrences across THREE paths, one call.
+
+        Grouping is the door's own concern, so the guard hands it every planned
+        expansion at once — including the ones on different paths — rather than
+        looping per path and quietly reintroducing a per-site rebuild.
+        """
+        door = self.counting(monkeypatch)
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert door.calls == 1
+
+    async def test_the_store_is_still_walked_once(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_every_occurrence_in_the_prose_is_expanded(self) -> None:
+        """Correctness, so the count above cannot be met by skipping work.
+
+        A byte-exact equality rather than a count: the separators between the
+        citations are what a grouped rebuild would drop or duplicate if it got
+        the gaps wrong.
+        """
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.recorder.args['content'] == ' and '.join([BFF_FULL] * REPEATS)
+
+    async def test_both_nested_occurrences_are_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.recorder.args['metadata'] == {'cluster_memory_ids': [BFF_FULL, BFF_FULL]}
+
+    async def test_one_substitution_record_per_occurrence_with_its_own_path(self) -> None:
+        """A substitution is still per OCCURRENCE — batching the apply changed
+        what it COSTS, not what is reported."""
+        h = self.harness()
+        result = await h.call('add_memory', self.call())
+        repair = repair_of(result)
+        assert repair is not None
+        records = repair['substitutions']
+        assert [record['path'] for record in records] == (
+            [['content']] * REPEATS
+            + [['metadata', 'cluster_memory_ids', 0], ['metadata', 'cluster_memory_ids', 1]]
+        )
+        assert {record['from'] for record in records} == {BFF}
+        assert {record['to'] for record in records} == {BFF_FULL}
+
+    async def test_a_mixed_call_still_rejects_whole_with_the_door_never_called(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The resolve-then-apply split still holds under batching.
+
+        ``door.calls == 0`` is the structural form of "nothing was written":
+        the rejection is decided before the only code that can edit the
+        arguments has run.
+        """
+        door = self.counting(monkeypatch)
+        h = build_harness(answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS})
+        submitted = f'{BFF} supersedes {AMB}'
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory',
+                {'content': submitted, 'project_id': PROJECT, 'agent_id': AGENT},
+            )
+        assert door.calls == 0
+        assert h.recorder.calls == []
+        assert rejection_payload(excinfo)['original_call']['content'] == submitted
+
+    async def test_an_outage_after_a_unique_answer_forwards_byte_identical(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first token resolved unique, the second raised: nothing applied."""
+        door = self.counting(monkeypatch)
+        h = build_harness(
+            answers={F1C: unique(F1C_FULL)},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+        )
+        submitted = f'{F1C} supersedes {BFF}'
+        result = await h.call(
+            'add_memory', {'content': submitted, 'project_id': PROJECT, 'agent_id': AGENT}
+        )
+        assert door.calls == 0
+        assert h.recorder.args['content'] == submitted
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}

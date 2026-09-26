@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -860,6 +861,346 @@ class TestBudgetMisconfigEscalation:
         )
 
 
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestRoutingOverrideEscalation:
+    """Task 3123: ``routing_override_reason`` is an AUDITED bypass.
+
+    When a caller supplies ``routing_override_reason`` to ``submit_task``, the
+    path-scope guards are skipped entirely — the task is created no matter what
+    paths it cites.  Before this task the ONLY record of that was a
+    ``logger.warning``, so a bypass was operationally indistinguishable from no
+    bypass at all.  ``report_routing_override`` files a ``scope_violation``
+    record on the BYPASS path (nothing was blocked) so the operator queue shows
+    the override, the caller's stated reason, and the paths the guard WOULD
+    have flagged.
+    """
+
+    @staticmethod
+    def _payloads(root):
+        """Return the escalation payloads written under *root* (sorted by id)."""
+        files = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+        return [json.loads(f.read_text()) for f in files]
+
+    def test_writes_override_escalation_under_project_root(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        reason = 'self-referential: this task quotes the tokens the guard matches'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='Task about the path guard itself',
+            reason=reason,
+            matched_paths=('crates/widget.rs',),
+            suggested_project='reify',
+        )
+        assert esc_id is not None
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        assert len(files) == 1, f'expected one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'scope_violation'
+        assert payload['severity'] == 'info'
+        assert payload['level'] == 1
+        assert payload['agent_role'] == 'fused-memory/path-guard'
+
+        # Distinct anchor so override records are independently greppable from
+        # the rejection/advisory records that share the scope_violation category.
+        assert payload['task_id'] != 'task-path-guard'
+        assert payload['id'].startswith('esc-task-path-guard-override'), payload['id']
+
+        # suggested_action is rendered VERBATIM into agent briefings (task 3119).
+        # Nothing was blocked here, so it must never read as a resubmit order.
+        assert payload['suggested_action'] == 'review_override_justification'
+        assert not payload['suggested_action'].startswith('resubmit_')
+
+        assert 'ROUTING OVERRIDE' in payload['summary']
+        assert 'dark_factory' in payload['summary']
+
+        detail = payload['detail']
+        assert reason in detail, 'the caller-supplied reason must be recorded verbatim'
+        assert "filing_project_id='dark_factory'" in detail
+        assert str(tmp_path) in detail
+        assert 'crates/widget.rs' in detail
+        assert 'reify' in detail
+        # Prose must state plainly that nothing was blocked...
+        assert 'did NOT block' in detail
+        assert 'AUDIT TRAIL, not a rejection' in detail
+        assert 'nothing here asks for a resubmission' in detail.lower()
+        # ...but must NOT assert the outcome of a stage it never observes.
+        # This record is filed from _path_guard_or_skip, which runs BEFORE
+        # task creation: submit_task can still fail validation, the ticket
+        # write can fail, and the curator can later merge or discard the
+        # candidate.  A briefing-rendered claim that "the task WAS created"
+        # would be flatly false in each of those cases.
+        assert 'WAS created' not in detail, (
+            f'the guard must not claim an outcome it cannot see: {detail!r}'
+        )
+
+    # --- fold behaviour ---------------------------------------------------
+    # The record fires on EVERY override, so an automated filer looping on one
+    # justification would flood the operator queue without a fold.
+
+    def _override(self, esc, tmp_path, *, reason, paths=('corpus/',), suggested='know_live'):
+        return esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            reason=reason,
+            matched_paths=paths,
+            suggested_project=suggested,
+        )
+
+    def test_identical_override_folds_into_one_parent(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first, 'an identical repeated override must fold into the first'
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected one surviving escalation, found: {payloads}'
+        assert payloads[0]['dedupe_count'] == 1
+
+    def test_distinct_reason_files_a_new_escalation(self, tmp_path):
+        """A genuinely new justification is a new auditable claim."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='self-referential: task is about the guard')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        assert len(self._payloads(tmp_path)) == 2
+
+    def test_reason_folding_is_whitespace_insensitive(self, tmp_path):
+        """The fingerprint uses the STRIPPED reason, so entry point can't change the fold."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='  incidental mention only  ')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first
+        assert len(self._payloads(tmp_path)) == 1
+
+    def test_override_never_folds_with_rejection_or_advisory(self, tmp_path):
+        """The three modes fold INDEPENDENTLY.
+
+        A pending record of one mode must never absorb another and describe it
+        with the wrong outcome — the task-3119 failure shape, now three-way.
+        """
+        esc = ScopeViolationEscalator()
+        # dict[str, Any]: a heterogeneous kwargs bundle unpacked into three
+        # differently-typed signatures — without the annotation pyright widens
+        # every value to the union and rejects each `**common` parameter.
+        common: dict[str, Any] = dict(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        rejection = esc.report_rejection(**common, advisory=False)
+        advisory = esc.report_rejection(**common, advisory=True)
+        override = esc.report_routing_override(**common, reason='incidental mention only')
+
+        ids = {rejection, advisory, override}
+        assert None not in ids
+        assert len(ids) == 3, f'the three modes must not fold together: {ids}'
+        assert len(self._payloads(tmp_path)) == 3
+
+    def test_empty_matched_paths_still_files(self, tmp_path):
+        """The census case: an override that turned out unnecessary is the
+        evidence any later tightening of the parameter has to be based on."""
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='A task citing nothing foreign',
+            reason='belt and braces',
+            matched_paths=(),
+            suggested_project=None,
+        )
+        assert esc_id is not None
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert '<nothing>' in payloads[0]['summary']
+        assert 'would_have_matched_paths=[]' in payloads[0]['detail']
+
+    def test_reason_under_the_detail_cap_survives_verbatim(self, tmp_path):
+        """``detail`` is the field the audit actually needs, so any reason of
+        a plausible human length reaches it byte-for-byte — the cap below is a
+        backstop against abuse, not a routine clip.
+        """
+        esc = ScopeViolationEscalator()
+        # .strip()ed in the fixture: the escalator strips the reason itself
+        # (see test_reason_normalisation_is_identical_across_entry_points), so
+        # a trailing-space fixture would fail for the wrong reason.
+        reason = ('self-referential: ' + 'the guard matches its own tokens. ' * 50).strip()
+        assert len(reason) < 4000, 'fixture must sit under the detail cap'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='long but honest reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert reason in payload['detail'], 'detail must keep the full reason verbatim'
+        assert 'truncated' not in payload['detail']
+
+    def test_unbounded_reason_is_capped_in_both_summary_and_detail(self, tmp_path):
+        """``reason`` is unbounded caller-supplied free text arriving over a
+        public MCP surface, and BOTH rendered fields are bounded because BOTH
+        are rendered verbatim into operator views and agent briefings
+        (``orchestrator/agents/briefing.py``).  ``summary`` is the one-line
+        field, so it clips hard; ``detail`` clips generously — and says so,
+        naming the length it dropped, so the audit never quietly
+        misrepresents the very text it exists to audit.
+        """
+        esc = ScopeViolationEscalator()
+        reason = 'x' * 50_000
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='huge reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # The summary still SHOWS the justification (an operator scanning the
+        # queue needs it) — just a bounded prefix of it.
+        assert 'x' * 100 in payload['summary']
+
+        detail = payload['detail']
+        assert reason not in detail, 'detail must not carry 50k chars of caller text'
+        assert len(detail) < 6000, (
+            f'detail must stay bounded too, got {len(detail)} chars'
+        )
+        # LOUD, not silent: the record names what it dropped.
+        assert 'truncated' in detail
+        assert '50000' in detail, 'the truncation marker must name the original length'
+        # Still enough of the claim to judge it by.
+        assert 'x' * 1000 in detail
+
+    def test_many_matched_paths_stay_bounded_in_summary_and_whole_in_detail(self, tmp_path):
+        """``matched_paths`` is caller-supplied too — on the FILES-certain side
+        it comes straight from ``metadata.files`` — so the same one-line-field
+        rationale that bounds the reason has to bound the path list.  A
+        submission declaring 500 foreign files must not render a
+        multi-kilobyte summary; ``detail`` still carries every path.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            reason='cross-cutting by design',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # Elided LOUDLY — the summary says what it dropped rather than
+        # reading as a complete list.
+        assert 'other-project/src/module_0.py' in payload['summary']
+        assert '+495 more' in payload['summary']
+        # detail is the field the audit needs: nothing is dropped there.
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_many_matched_paths_stay_bounded_in_rejection_summary(self, tmp_path):
+        """Same bound on the rejection/advisory summaries — same rationale,
+        and this is the mode whose paths come from ``metadata.files``.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        assert '+495 more' in payload['summary']
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_summary_path_cap_does_not_change_the_fold(self, tmp_path):
+        """The fingerprint hashes ``matched_paths`` directly, not the elided
+        rendering, so two over-cap path lists that differ only PAST the cap
+        must still fold apart.  Capping a rendered field must never collapse
+        two distinct events into one record.
+        """
+        esc = ScopeViolationEscalator()
+        head = tuple(
+            f'other/src/module_{i}.py'
+            for i in range(sve_mod._SUMMARY_PATHS_MAX + 2)
+        )
+        first = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=head, suggested_project='know_live',
+        )
+        second = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=(*head[:-1], 'other/src/DIFFERENT.py'),
+            suggested_project='know_live',
+        )
+        assert first is not None
+        assert second is not None
+        assert second != first, (
+            'lists differing only past the summary cap must not fold together'
+        )
+
+    def test_reason_normalisation_is_identical_across_entry_points(self, tmp_path):
+        """``submit_task`` strips the reason before the guard sees it, but
+        ``_path_guard_or_skip`` is also callable directly with an unstripped
+        one.  The escalator strips it itself, so which entry point supplied it
+        cannot change whether two otherwise-identical overrides fold — a
+        reproducibility bug that would only show up across entry points.
+        """
+        esc = ScopeViolationEscalator()
+        stripped = self._override(esc, tmp_path, reason='incidental mention only')
+        unstripped = self._override(esc, tmp_path, reason='\n  incidental mention only \t')
+
+        assert stripped is not None
+        assert unstripped == stripped
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert "routing_override_reason='incidental mention only'" in payloads[0]['detail']
+
+    def test_dedupe_disabled_escape_hatch(self, tmp_path):
+        """Reuses report_rejection's existing knob — no second flag."""
+        esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second is not None
+        assert second != first, 'dedup disabled: each call must file its own escalation'
+        assert len(self._payloads(tmp_path)) == 2
+
+
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
         """When HAS_ESCALATION is False the escalator silently no-ops."""
@@ -874,5 +1215,27 @@ class TestEscalationDisabled:
         )
         assert result is None
         # No file is written.
+        queue_dir = tmp_path / 'data' / 'escalations'
+        assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))
+
+    def test_routing_override_no_ops_when_escalation_pkg_unavailable(
+        self, tmp_path, monkeypatch,
+    ):
+        """Same contract for the override audit record, and it matters MORE
+        here: the submission it describes has ALREADY been allowed, so a
+        minimal env without the escalation package must degrade to "no audit
+        record", never to an exception out of an allowed submit_task.
+        """
+        monkeypatch.setattr(sve_mod, 'HAS_ESCALATION', False)
+        esc = ScopeViolationEscalator()
+        result = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='whatever',
+            reason='incidental mention only',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        assert result is None
         queue_dir = tmp_path / 'data' / 'escalations'
         assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))

@@ -56,6 +56,7 @@ const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
 // defined after the shared load is strictly stronger than "did not throw": it
 // proves each script ran all the way through its trailing `window.* =` line.
 const EXPECTED_WINDOW_GLOBALS = {
+  'datum.js': 'DF_DATUM',
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
   'prd_grouping.js': 'DF_PRD_GROUPING',
@@ -63,12 +64,18 @@ const EXPECTED_WINDOW_GLOBALS = {
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
   'orch_filter.js': 'DF_ORCH_FILTER',
+  'orch_summary.js': 'DF_ORCH_SUMMARY',
+  'task_done_count.js': 'DF_TASK_DONE_COUNT',
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
   'spark_path.js': 'DF_SPARK_PATH',
   'memory_evals_fmt.js': 'DF_MEMORY_EVALS_FMT',
   'task_row_cells.js': 'DF_TASK_ROW_CELLS',
   'burndown_bands.js': 'DF_BURNDOWN_BANDS',
   'pins_recovery.js': 'DF_PINS_RECOVERY',
+  'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
+  'recon_status.js': 'DF_RECON_STATUS',
+  'task_vocab.js': 'DF_TASK_VOCAB',
+  'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
 };
 
 function readIndexHtml() {

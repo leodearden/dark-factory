@@ -838,12 +838,19 @@ class TestRunDeterministicReconSweep:
         h.scheduler.get_tasks = AsyncMock(return_value=[task])
         h._escalation_queue.get_by_task = MagicMock(return_value=[esc])  # type: ignore[union-attr]
         h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
-        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        # Returns False = "I deduped, I filed nothing" — the real method's
+        # answer for this fixture.  Since task 3541 Source A always CALLS the
+        # method (its self-dedup is the only copy of that guard) and gates
+        # `recovered_this_pass` on the return value, which is what preserves
+        # this test's actual contract: a deduped task is still Source B's.
+        h._recover_stranded_deterministic_task = AsyncMock(  # type: ignore[method-assign]
+            return_value=False,
+        )
         h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
 
         await h._run_deterministic_recon_sweep()
 
-        h._recover_stranded_deterministic_task.assert_not_awaited()
+        h._recover_stranded_deterministic_task.assert_awaited_once()
         h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
             esc, task, metadata
         )
@@ -1383,7 +1390,16 @@ def _pinned_deploy_strand(tid: str = 'tid-pinned') -> dict:
 
 
 class TestDeterministicReconSweepSiteEmits:
-    """The sweep's Source-A deploy dedup skip — the SILENT half of the pair."""
+    """One sweep pass over a deduped deploy strand: the row it writes.
+
+    Was "the SILENT half of the pair" — the Source-A deploy branch's own copy
+    of the dedup read and veto.  Task 3541 deleted that copy, so a pass now
+    reaches the SAME hold through `_recover_stranded_deterministic_task` and
+    the row carries that method's site label.  Everything else about the row —
+    the reason, the ids, the ages, the shape, the RE-FILE-NEVER-FLIP
+    disposition, the bounded repeat — is unchanged, which is what makes the
+    collapse a de-duplication rather than a behaviour change.
+    """
 
     @pytest.mark.asyncio
     async def test_dedup_skip_emits_recovery_vetoed(self, tmp_path: Path) -> None:
@@ -1400,7 +1416,10 @@ class TestDeterministicReconSweepSiteEmits:
         assert rows[0]['event_type'] == EventType.recovery_vetoed.value
         assert rows[0]['task_id'] == 'tid-pinned'
         data = rows[0]['data']
-        assert data['site'] == 'deterministic_recon_sweep'
+        assert data['site'] == 'deterministic_recon_deploy', (
+            'the surviving guard is the one inside '
+            '_recover_stranded_deterministic_task, so its label is what charges'
+        )
         assert data['reason'] == 'escalation_pinned'
         assert data['store_unavailable'] is False
 
@@ -1540,16 +1559,19 @@ class TestDeterministicReconDeploySiteEmits:
         h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
-class TestDeterministicReconPairIsMeasurable:
-    """The point of the two labels: the duplication becomes a FACT."""
+class TestDeterministicReconPairIsCollapsed:
+    """The duplication measured under two labels is GONE (task 3541).
+
+    This class is the deliberate inversion of the one it replaces, which
+    asserted that both halves spoke under distinct site labels precisely so
+    task eta could measure the duplication rather than assume it.  Eta is that
+    collapse, so the assertion flips: one hold, one label.
+    """
 
     @pytest.mark.asyncio
-    async def test_the_pair_speaks_under_two_distinct_site_labels(
+    async def test_a_sweep_pass_and_a_direct_call_use_the_same_site(
         self, tmp_path: Path,
     ) -> None:
-        """Deliberately NOT asserting that only one fires — de-duplicating
-        the predicate is task eta's (3541), and a shared label would hide
-        exactly the duplication eta needs to measure."""
         h = _emitting_recon_harness(tmp_path)
         task = _pinned_deploy_strand()
         h.scheduler.get_tasks = AsyncMock(return_value=[task])
@@ -1562,9 +1584,11 @@ class TestDeterministicReconPairIsMeasurable:
         )
 
         sites = [r['data']['site'] for r in _recon_recovery_rows(h)]
-        assert sites == ['deterministic_recon_sweep', 'deterministic_recon_deploy'], (
-            'both halves of the duplicated predicate must be independently '
-            'attributable in the event store'
+        assert sites == ['deterministic_recon_deploy'], (
+            'ONE hold, ONE row.  The sweep now reaches this hold THROUGH the '
+            'method, so both observations are the same site speaking and the '
+            'emitter\'s transition guard collapses them — where the two labels '
+            'each carried their own transition state and so both spoke'
         )
 
 
@@ -1805,6 +1829,10 @@ def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
     archive handling, and a mock would assert none of it.
     """
     h = _make_recon_harness()
+    # The alarm IS the subject here, so its narrow kill switch is pinned ON
+    # rather than inherited from the live project yaml, which an operator may
+    # silence at any time (and did: recovery_emission.streak_escalation_enabled).
+    h.config.recovery_emission.streak_escalation_enabled = True
     h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
     h._escalation_queue = EscalationQueue(tmp_path / 'queue')
     clock = _FakeClock()
@@ -1901,7 +1929,7 @@ class TestDeterministicReconStreakRelease:
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
         await _recon_passes(h, clock, 3)
-        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_deploy'}
 
         h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
         clock.advance(_RECON_INTERVAL)
@@ -2028,7 +2056,7 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
         # A reconcile pass that swept nothing: its own entry is stale.
         h._release_recovery_veto_streaks(RecoverySweepTally())
 
-        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_deploy'}
         assert len(_sentinel_alarms(h)) == 1, (
             'the deterministic sweep still holds this task — its shared alarm '
             'must not be stood down by the other sweep'
@@ -2160,3 +2188,316 @@ class TestDeterministicReconQueueAbsentNoticeReArms:
 
         assert h._recovery_process_latch() is first
         assert h._recovery_process_notices == {'deterministic_recon_sweep'}
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — THE DETERMINISTIC PAIR COLLAPSES.
+#
+# The Source-A deploy branch and `_recover_stranded_deterministic_task` each
+# performed the SAME `get_by_task(tid, status='pending')` read and the SAME
+# `bool(rows)` veto, back to back, emitting under two different site labels.
+# Both halves carried a comment naming this task as the owner of collapsing
+# them, and `TestDeterministicReconPairIsMeasurable` deliberately asserted the
+# duplication so eta could measure it rather than assume it.
+#
+# The OUTER copy goes.  The inner one must stay: the method has direct callers
+# that rely on its own dedup guard, so deleting it would make the method unsafe
+# to call standalone.  Deleting only the outer copy would silently change
+# behaviour, though — today a dedup hit `continue`s WITHOUT adding the tid to
+# `recovered_this_pass`, so Source B still re-validates that task's open record
+# in the same pass.  The method therefore gains a `bool` return and the sweep
+# gates the bookkeeping on it.
+# ---------------------------------------------------------------------------
+
+
+def _info_pin(esc_id: str = 'esc-info-1', *, task_id: str = 'tid-pinned') -> Escalation:
+    """An ANNOTATION — never a handoff, at any level (pins link 1)."""
+    return Escalation(
+        id=esc_id, task_id=task_id, agent_role='harness-deterministic-recon-sweep',
+        severity='info', category='infra_issue', summary='annotation', level=0,
+        timestamp='2026-07-01T00:00:00+00:00',
+    )
+
+
+def _dead_l0_pin(esc_id: str = 'esc-l0-1', *, task_id: str = 'tid-pinned') -> Escalation:
+    """A blocking L0 with no filing identity, read where nothing holds the task.
+
+    The sweep enumerates `blocked` tasks in the stranded-deterministic shape,
+    so `live_claimant=False` is honest and link 4 reaches its
+    identity-independent branch: the filer is necessarily dead.
+    """
+    return Escalation(
+        id=esc_id, task_id=task_id, agent_role='harness-deterministic-recon-sweep',
+        severity='blocking', category='infra_issue', summary='dead handoff', level=0,
+        timestamp='2026-07-01T00:00:00+00:00',
+    )
+
+
+def _healthy_unit(h: Harness) -> None:
+    h._recon_unit_inspector = AsyncMock(  # type: ignore[method-assign]
+        return_value={'MainPID': 4321, 'ActiveState': 'active'},
+    )
+
+
+@pytest.mark.asyncio
+class TestDeterministicPairIsCollapsed:
+    """ONE read, ONE emission, under ONE site label."""
+
+    @staticmethod
+    def _arm(h: Harness, rows: list) -> MagicMock:
+        reader = MagicMock(return_value=rows)
+        h._escalation_queue.get_by_task = reader  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        return reader
+
+    @staticmethod
+    def _pending_reads(reader: MagicMock) -> list:
+        return [
+            c for c in reader.call_args_list
+            if c.kwargs.get('status') == 'pending' or 'pending' in c.args
+        ]
+
+    async def test_an_unpinned_strand_reads_the_pending_queue_exactly_once(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE duplicate read.
+
+        On the SUPPRESSED path the outer copy short-circuits, so only its own
+        read happens and the duplication is invisible.  It is the RECOVERED
+        path that pays twice: the outer copy reads, finds nothing, and calls
+        through to a method whose first act is the identical read.
+        """
+        h = _emitting_recon_harness(tmp_path)
+        reader = self._arm(h, [])
+        _healthy_unit(h)
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        assert len(self._pending_reads(reader)) == 1, (
+            f'the pair read the pending queue twice per pass: '
+            f'{reader.call_args_list}'
+        )
+
+    async def test_a_pinned_strand_also_reads_exactly_once(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        reader = self._arm(h, [_pinning_esc()])
+
+        await h._run_deterministic_recon_sweep()
+
+        assert len(self._pending_reads(reader)) == 1
+
+    async def test_one_pass_emits_exactly_one_row_under_the_deploy_site(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        self._arm(h, [_pinning_esc()])
+
+        await h._run_deterministic_recon_sweep()
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 1, f'expected exactly one row, got {rows}'
+        assert rows[0]['data']['site'] == 'deterministic_recon_deploy', (
+            'the surviving guard lives in _recover_stranded_deterministic_task, '
+            'so its own site label is the one that charges'
+        )
+        assert rows[0]['data']['reason'] == 'escalation_pinned'
+        assert rows[0]['data']['shape'] == 'blocked|unknown|unknown|true|ran'
+
+
+@pytest.mark.asyncio
+class TestRecoverStrandedDeterministicTaskReturnsWhetherItFiled:
+    """The `bool` return that keeps `recovered_this_pass` byte-identical."""
+
+    async def test_returns_false_on_the_dedup_path(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+
+        filed = await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        assert filed is False
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    async def test_returns_true_when_it_files(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        _healthy_unit(h)
+
+        filed = await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        assert filed is True
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
+    async def test_returns_false_when_the_store_is_absent(self, tmp_path: Path) -> None:
+        """The fail-safe path files nothing, so it did not recover anything."""
+        h = _emitting_recon_harness(tmp_path)
+        h._escalation_queue = None
+        task = _pinned_deploy_strand()
+
+        assert await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        ) is False
+
+
+@pytest.mark.asyncio
+class TestRecoveredThisPassBookkeepingIsPreserved:
+    """Source A/B exclusion must not change when the outer copy goes.
+
+    Today a dedup hit `continue`s WITHOUT adding the tid, so Source B still
+    re-validates that task's open record in the SAME pass.  Calling through
+    unconditionally would add it and silently skip that re-validation for a
+    whole pass — a behaviour change nobody asked for.
+    """
+
+    @staticmethod
+    def _arm(h: Harness, rows: list) -> MagicMock:
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=rows)  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=list(rows))  # type: ignore[union-attr]
+        spy = AsyncMock(return_value=None)
+        h._revalidate_open_deterministic_escalation = spy  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        return spy
+
+    async def test_a_dedup_skipped_task_is_still_revalidated_by_source_b(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        spy = self._arm(h, [_pinning_esc()])
+
+        await h._run_deterministic_recon_sweep()
+
+        assert spy.await_count == 1, (
+            'a dedup-skipped task is NOT recovered_this_pass, so Source B must '
+            'still re-validate its open record in the same pass'
+        )
+
+    async def test_a_task_that_gets_a_filing_is_skipped_by_source_b(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        spy = self._arm(h, [])
+        h._escalation_queue.get_pending = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        _healthy_unit(h)
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        assert spy.await_count == 0, (
+            'a task this pass actually filed for IS recovered_this_pass'
+        )
+
+
+@pytest.mark.asyncio
+class TestDeterministicDedupConsumesTheSharedPredicate:
+    """The surviving guard's predicate is `records_pin_recovery`, not `bool(rows)`."""
+
+    @staticmethod
+    async def _drive(h: Harness, rows: list) -> None:
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=rows)  # type: ignore[union-attr]
+        _healthy_unit(h)
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+    async def test_an_info_record_no_longer_suppresses_the_re_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """An annotation is not a handoff — spec S6, PRD boundary #8."""
+        h = _emitting_recon_harness(tmp_path)
+        await self._drive(h, [_info_pin()])
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
+    async def test_a_dead_l0_no_longer_suppresses_the_re_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """A dead L0 has no consumer left, so it cannot be the dedup target."""
+        h = _emitting_recon_harness(tmp_path)
+        await self._drive(h, [_dead_l0_pin()])
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
+    async def test_a_blocking_l1_still_suppresses_the_re_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """A queue-backed handoff still wins — re-filing would stack a second."""
+        h = _emitting_recon_harness(tmp_path)
+        await self._drive(h, [_pinning_esc()])
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        assert len(_recon_recovery_rows(h)) == 1
+
+
+@pytest.mark.asyncio
+class TestGateCheckStaysArchiveInclusiveAndSeparate:
+    """PRD D3's named carve-out: NOT one of the collapsed copies.
+
+    The gate check asks a DIFFERENT question — "did a human already act?" —
+    which is why it is archive-inclusive (a RESOLVED record counts) where every
+    pin predicate reads only OPEN records.  It stays separate, and stays
+    silent, by decision rather than by omission.
+    """
+
+    @staticmethod
+    def _gate_strand(tid: str = 'tid-gate') -> dict:
+        return {
+            'id': tid, 'status': 'blocked',
+            'description': 'gate strand',
+            'metadata': _strand_metadata(
+                phase=None, gate_escalated_at='2026-07-01T00:00:00+00:00',
+            ),
+        }
+
+    async def test_the_gate_check_reads_role_scoped_with_status_unset(
+        self, tmp_path: Path,
+    ) -> None:
+        """`status` unset means the read scans queue root AND archive.
+
+        A RESOLVED/archived record must still count, so this read can never be
+        narrowed to `status='pending'` the way every pin read is.
+        """
+        h = _emitting_recon_harness(tmp_path)
+        reader = MagicMock(return_value=[_pinning_esc(task_id='tid-gate')])
+        h._escalation_queue.get_by_task = reader  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h.scheduler.get_tasks = AsyncMock(return_value=[self._gate_strand()])
+
+        await h._run_deterministic_recon_sweep()
+
+        from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE
+
+        gate_reads = [
+            c for c in reader.call_args_list
+            if c.kwargs.get('agent_role') == DETERMINISTIC_AGENT_ROLE
+        ]
+        assert len(gate_reads) == 1, reader.call_args_list
+        assert 'status' not in gate_reads[0].kwargs, (
+            'archive-inclusive by construction: narrowing this read to pending '
+            'would make a human-resolved gate look like a fresh strand'
+        )
+
+    async def test_the_gate_check_still_emits_nothing(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        h._escalation_queue.get_by_task = MagicMock(  # type: ignore[union-attr]
+            return_value=[_pinning_esc(task_id='tid-gate')],
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h.scheduler.get_tasks = AsyncMock(return_value=[self._gate_strand()])
+
+        await h._run_deterministic_recon_sweep()
+
+        assert _recon_recovery_rows(h) == [], (
+            'the gate check is DELIBERATELY silent — emitting would blur a '
+            'boundary PRD D3 draws on purpose'
+        )

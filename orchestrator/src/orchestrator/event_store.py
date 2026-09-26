@@ -189,6 +189,20 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
+    # deliberately DIFFERENT data shapes — read the producer before the payload:
+    #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
+    #     {merge_sha, local_runner, remote_runner, passed, local_category,
+    #     remote_category}.  The two *_category keys are ALWAYS present, carrying
+    #     '' for a clean arm, so a consumer never has to tell an absent key apart
+    #     from a clean result.  A non-empty value such as 'merge_flake_suppressed'
+    #     marks an arm whose green came from a flake-suppression rerun
+    #     (verify.apply_merge_flake_suppression) rather than a clean first pass —
+    #     i.e. the two hosts agreed, but one of them only agreed on a retry.
+    #   - merge_queue's land-time remote-green cross-check emits the same first
+    #     four keys WITHOUT the categories.
+    #   - merge_shadow's warm/cold compare emits a wholly different
+    #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -235,6 +249,18 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # PRD merge-worktree-lifecycle-integrity §4 C4 (task 2930/η): the serial-lane
+    # TRIPWIRE — a second concurrent LOCAL merge verify was dispatched while the
+    # _MERGE_AHEAD_BOUND-derived per-host in-flight bound is 1.  DETECTION ONLY:
+    # the dispatch is NOT blocked (C4: "no hard block"); this is the cheap net for
+    # a request-identity leak of the task/5326 class (two journal entries for one
+    # branch, both enqueued — 2026-07-22 12:10:26).  Sole emit site:
+    # merge_liveness.alarm_serial_lane_breach, reached from
+    # SpeculativeMergeWorker._inflight_append.  data:
+    #   {local_inflight, per_host_bound, merge_ahead_bound, num_hosts,
+    #    branch, request_id, host}
+    # task_id = the dispatching item's task_id; phase = 'merge'.
+    merge_serial_lane_breached = 'merge_serial_lane_breached'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
     # Emitted by verify.run_scoped_verification when the merge gate (the
@@ -305,36 +331,56 @@ class EventType(StrEnum):
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript,
-    #                             reseeded}.
-    #   session_resume_capped   — resume_count reached max_resumes_per_task;
-    #                             by-design throttling, degrades to fresh dispatch.
+    #                             dispatch; data.reasons is a SORTED list of
+    #                             EVERY reason it was ineligible, drawn from
+    #                             {stale, capped, no_transcript, reseeded}.
+    #   session_resume_capped   — resume_count reached max_resumes_per_task and
+    #                             was the ONLY disqualifier; by-design
+    #                             throttling of an otherwise healthy session,
+    #                             degrades to fresh dispatch. A capped session
+    #                             that ALSO failed freshness or corroboration
+    #                             emits session_resume_fallback instead, with
+    #                             `capped` still present in data.reasons — it
+    #                             would not have resumed anyway, so counting it
+    #                             as throttling would overstate that population.
     # (enabled=False degrades silently — no event.)
     #
     # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
     # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
     # <lane>/.task/ and the whole claude-config transcript store with it, so a
-    # session adopted at boot routinely finds its store gone by re-dispatch. It
-    # therefore does NOT feed the fallback-storm streak (like
-    # session_resume_capped); only {stale, no_transcript} do. The event is still
-    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
-    # rate is read off these reasons post-deploy).
+    # session adopted at boot routinely finds its store gone by re-dispatch. The
+    # event is still emitted so the rate stays measurable (PRD open question 3 —
+    # lane-collision rate is read off these reasons post-deploy). Which reasons
+    # feed the fallback-storm streak is a SEPARATE question from which event is
+    # emitted; the _run_slot guard's streak branch in harness.py is the answer.
     #
     # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
     # the three outcome events (session_resume + session_resume_fallback +
     # session_resume_capped) for a window, since the guard emits exactly one per
     # dispatch that carried a recovered session. Read the fallback RATE as a
     # ratio against that denominator rather than as an absolute count, and split
-    # the numerator by json_extract(data, '$.reason') to separate expected
-    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
-    # so a zero total means either no recovered sessions or the kill switch.)
+    # the numerator by json_extract(data, '$.reasons'). Because the list is
+    # SORTED, that expression is a stable string and a plain GROUP BY 1 is a
+    # CO-OCCURRENCE census — '["no_transcript","stale"]' is its own bucket,
+    # distinct from '["stale"]' — with no json_each needed. (enabled=False emits
+    # nothing, so a zero total means either no recovered sessions or the kill
+    # switch.)
+    #
+    # TIME SPLIT — rows emitted BEFORE task 3728 carry a SCALAR '$.reason'
+    # holding only the FIRST matching reason, and no '$.reasons' at all. A naive
+    # lifetime query therefore mixes two code generations: '$.reasons' silently
+    # skips every pre-change row, and '$.reason' silently skips every one after,
+    # each returning a confident partial answer rather than an error. Bound any
+    # query by ts, or coalesce the two fields deliberately — and do not compare
+    # a pre-change reason census against a post-change one, because the older
+    # generation UNDER-counts every reason that lost a first-match race.
     #
     # session_resume_fallback additionally carries `data.archive_available: bool`
-    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # (task 3727) on EVERY fallback — reseeded and genuine alike —
     # answering "was this session actually RECOVERABLE from the durable
     # transcript archive?", i.e. did its transcript survive outside the wiped
     # worktree. Query it as json_extract(data, '$.archive_available') alongside
-    # the existing '$.reason' split, so the fallback population can be cut into
+    # the '$.reasons' split, so the fallback population can be cut into
     # recoverable vs genuinely lost.
     #
     # session_resume and session_resume_capped deliberately do NOT carry the
@@ -349,12 +395,100 @@ class EventType(StrEnum):
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
 
-    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
-    # _run_slot guard above and then still failed to happen. It closes the
-    # population that was previously journal-only and runs.db-INVISIBLE: an
-    # armed --resume whose transcript the CLI could not resolve exits before it
-    # ever contacts the API, so none of the three events above, and no cost or
-    # cap row, ever recorded that the session was lost.
+    # session_config_dir_ambiguous (task 3620) — the surviving worktree holds
+    # config-dir candidates but NOT the one this session's transcript would be
+    # in, so the recovered session cannot be corroborated at all.
+    #
+    # Emitted by orchestrator/src/orchestrator/harness.py::Harness._adopt_recovered_session,
+    # at BOOT during crash recovery — NOT by the _run_slot dispatch guard that
+    # emits the three events above. The config dir is DERIVED from the adopted
+    # task id (the sole creator, shared/src/shared/config_dir.py::TaskConfigDir,
+    # names it `claude-config-<task_id>`); when that derived dir is absent but
+    # other `claude-config-*` dirs are present, the worktree belongs to some
+    # other owner — e.g. the `claude-config-<task_id>-unblock` dir created by
+    # orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock. Nothing
+    # is stashed, so the ensuing dispatch is a GUARANTEED 'no_transcript'
+    # fallback. Before this event that outcome was silent: the resolver stashed
+    # a lexically-first candidate, the dispatch-time re-glob found no transcript
+    # there, and the session degraded with zero operator signal.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it — the same trap
+    # session_resume_failed's own comment warns about, restated because this
+    # member sits inside the family block. The three outcome events are one per
+    # DISPATCH that carried a recovered session; this one is one per ADOPTION
+    # that could not resolve. Adding it to that sum would mix populations
+    # counted on different units and inflate the attempt count.
+    #
+    # Emitted IF AND ONLY IF candidates exist and the derived dir is absent. An
+    # empty `.task/` — no `claude-config-*` at all — stays SILENT: that is
+    # ABSENCE, not ambiguity, and it is the dominant recovered-session
+    # population (warm-lane acquire always re-seeds a lane from base, wiping the
+    # transcript store, which is why `reseeded` is a by-design fallback reason
+    # above). Emitting there would fire on nearly every recovered lane and put
+    # the most-expected outcome in the same bucket as a genuine defect. That
+    # population is already instrumented at dispatch by
+    # session_resume_fallback's '$.archive_available'.
+    #
+    # data: {expected, found, session_id, task_id} — `expected` the derived
+    # path, `found` a SORTED list of every candidate path as a string so
+    # json_extract(data, '$.found') is a stable group key (same discipline as
+    # '$.reasons'), `session_id` the sidecar's session, `task_id` the adopted
+    # key (also passed as the row's task_id, so it stays joinable).
+    #
+    # SQL: which derived path was missing, and what was there instead —
+    #   SELECT json_extract(data, '$.expected'), json_extract(data, '$.found'),
+    #          COUNT(*)
+    #     FROM events WHERE event_type = 'session_config_dir_ambiguous'
+    #    GROUP BY 1, 2;
+    # A nonzero count is a definite lost resume with a definite cause, unlike a
+    # fallback census — which is why it also files a deduped L1 (one open at a
+    # time, under harness.py::Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL) rather
+    # than being counted against a storm threshold.
+    #
+    # It consequently does NOT feed the session-resume fallback-storm streak,
+    # and that exclusion is STRUCTURAL rather than a carve-out: this is
+    # detected at BOOT during adoption, while the streak is only ever touched
+    # in the _run_slot DISPATCH guard — unlike the by-design `capped` case,
+    # which sits inside that same guard block and therefore does need an
+    # explicit branch. So config.fallback_storm_threshold has no effect here
+    # and an ambiguity L1 appearing alone is not evidence of a resume storm.
+    session_config_dir_ambiguous = 'session_config_dir_ambiguous'
+
+    # session_resume_failed (task 3578) — an ARMED resume that then failed to
+    # happen. It closes the population that was previously journal-only and
+    # runs.db-INVISIBLE: an armed --resume whose transcript the CLI could not
+    # resolve exits before it ever contacts the API, so none of the three
+    # events above, and no cost or cap row, ever recorded that the session was
+    # lost.
+    #
+    # WHICH PRODUCER ARMED IT is not what this used to say. The original text
+    # read "a resume that was ADOPTED by the _run_slot guard above", and the
+    # data says otherwise: measured 2026-09-16 against runs.db, all 10 rows are
+    # stage='cli', spanning 2026-08-24..2026-09-15, and NOT ONE of their
+    # session ids (or task ids) appears among the 8 session_resume rows the
+    # guard has ever emitted — whose nearest neighbours in time, 2026-08-20 and
+    # 2026-09-16, fall outside the failure span entirely. The only other writer
+    # of TaskWorkflow._pending_resume_session_id is the IN-WORKFLOW
+    # progress-timeout re-arm (workflow.py::TaskWorkflow, the re-arm beside the
+    # progress-timeout handler), so that is what armed all ten.
+    #
+    # That is also why this population, and not the guard's, is dense enough to
+    # carry an alarm — see the streak note below.
+    #
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
+    # here is also reported to Harness.note_resume_failed, which subtracts the
+    # by-design carve-out and counts what is left as a chained run. FEEDS the
+    # streak: stage='cli' always (the restore ran a phase earlier and is not
+    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
+    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
+    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
+    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
+    # restore outcome added later is GENUINE by default and must be added to
+    # that constant to be exempted. No new EventType was introduced for the
+    # feeder and no fourth term was added to the ratio denominator below: these
+    # rows already ARE the population, and a second event would be a second
+    # source of truth for one fact.
     #
     # NOT part of the ratio recipe's denominator above, and this is the one
     # thing to get right when querying it. The three events above are emitted by
@@ -395,7 +529,8 @@ class EventType(StrEnum):
     #                which a plain fresh dispatch can reach, and counting those
     #                would inflate the ratio below past 1.
     #
-    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    # SQL split, alongside session_resume_fallback's '$.reasons' /
+    # '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
     #     FROM events WHERE event_type = 'session_resume_failed'
     #    GROUP BY stage;

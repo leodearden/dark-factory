@@ -33,7 +33,17 @@ pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
 addopts = "-n auto --dist loadgroup -m 'not integration'"
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
-# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
+# is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
+# starved of CPU on a loaded 32-core host trips it and — under thread mode
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
+# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
+# clock under real fleet load x the 8x headroom factor — and no longer
+# judgement-picked. THE TWO SLOWEST UNMARKED TESTS IN THE WHOLE CORPUS ARE IN
+# THIS SUITE: tests/test_check_bare_magicmock_config.py's whole-tree scans, at
+# 61.52s and 54.52s. They carry no @pytest.mark.timeout, so this default is what
+# governs them, and they are what the value is derived from. See
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N).
 # thread method instead of signal: signal proved unreliable under pytest-xdist
 # workers in practice ("-n auto --dist loadgroup" above). See
@@ -43,11 +53,13 @@ addopts = "-n auto --dist loadgroup -m 'not integration'"
 # pytest-timeout >= 2.x). When this fires under -n auto --dist loadgroup
 # the entire xdist worker process dies; if it dies near end-of-suite the
 # controller can deadlock waiting for a completion signal that will
-# never arrive. Tests with a real-time budget approaching 60s MUST set
+# never arrive. Tests with a real-time budget approaching 300s MUST set
 # @pytest.mark.timeout(N) to opt up — otherwise a single slow run takes
 # down the whole suite. Fix the mock (shared.testing.make_gate_mock)
 # rather than leaning on this cap to recover from hangs.
-timeout = 60
+# thread method is UNCHANGED by the 60→300 and 300→540 raises, deliberately:
+# a raise attacks the trigger, not the two safety mechanisms.
+timeout = 540
 timeout_method = "thread"
 
 [tool.pyright]

@@ -31,7 +31,7 @@ class TestLoadPriorities:
                 {
                     'severity_weights': {'critical': 99.0},
                     'category_weights': {'security': 42.0},
-                    'project_weights': {'my-project': 7.0},
+                    'project_weights': {'my-project': 7.0},  # folded on load (3812)
                     'defaults': {'severity': 1.0, 'category': 1.0, 'project': 1.0},
                     'age_curve': {'max_bonus': 3.0, 'saturation_seconds': 100.0},
                     'manual_boost': {'weight': 2.0, 'min': -10, 'max': 10},
@@ -43,7 +43,10 @@ class TestLoadPriorities:
 
         assert result.severity_weights == {'critical': 99.0}
         assert result.category_weights == {'security': 42.0}
-        assert result.project_weights == {'my-project': 7.0}
+        # load_priorities re-keys project_weights onto the canonical
+        # project token (task 3812), so 'my-project' loads as
+        # 'my_project'. severity/category keys are NOT folded.
+        assert result.project_weights == {'my_project': 7.0}
         assert result.defaults.severity == 1.0
         assert result.defaults.category == 1.0
         assert result.defaults.project == 1.0
@@ -304,7 +307,15 @@ class TestEnsurePrioritiesFile:
 class TestSavePriorities:
     def test_round_trips_custom_weights(self, tmp_path):
         """save_priorities must be the exact inverse of load_priorities/_priorities_from_dict:
-        a non-default Priorities written out and read back must compare equal."""
+        a non-default Priorities written out and read back must compare equal.
+
+        Stated over CANONICAL project keys, which is all the cockpit itself
+        ever produces (known_projects offers canonical names only, task
+        3812). A drifted key is the one deliberate exception to the identity
+        -- load folds it -- and that heals the file rather than round-trips
+        it; the second half of this test pins exactly that."""
+        from dataclasses import replace
+
         from cockpit.priority import (
             AgeCurve,
             Defaults,
@@ -317,7 +328,7 @@ class TestSavePriorities:
         custom = Priorities(
             severity_weights={'critical': 9.0, 'high': 4.0, 'medium': 2.0, 'low': 1.0},
             category_weights={'bug': 4.0},
-            project_weights={'df': 9.0},
+            project_weights={'dark_factory': 9.0},
             defaults=Defaults(severity=1.1, category=0.6, project=0.2),
             age_curve=AgeCurve(max_bonus=3.3, saturation_seconds=123.0),
             manual_boost=ManualBoostConfig(weight=2.0, min=-7, max=7),
@@ -328,6 +339,16 @@ class TestSavePriorities:
 
         assert target.exists()
         assert load_priorities(target) == custom
+
+        # The one deliberate non-identity: a DRIFTED project key does not
+        # round-trip, it HEALS. Saving it emits the raw key, but the next
+        # load folds it onto the canonical token -- so a load->save cycle
+        # rewrites the file's key in place (task 3812).
+        drifted = replace(custom, project_weights={'df': 9.0})
+        save_priorities(drifted, target)
+        healed = load_priorities(target)
+        assert healed.project_weights == {'dark_factory': 9.0}
+        assert healed == custom
 
     def test_write_failure_is_fail_soft_and_warns(self, tmp_path, caplog):
         """An unwritable target must fail soft: logged WARNING, never an exception.

@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
@@ -22,12 +23,48 @@ from fused_memory.memory_metadata import (
     normalize_supersedes,
 )
 
-#: Leaf α's committed census artifact — the oracle the registry is
-#: grandfathered from.  Resolved from ``__file__`` (repo root is two
-#: parents up from ``fused-memory/tests/<this file>``) rather than from
-#: cwd, so the test is invariant to where pytest is invoked.
+#: Leaf α's census artifact AS OF DERIVATION — the frozen oracle the
+#: registry and the >=1000 blessed-key cut are grandfathered from.
+#: Resolved from ``__file__`` rather than from cwd, so the test is
+#: invariant to where pytest is invoked.
+#:
+#: WHY A FROZEN COPY RATHER THAN ``plans/memory-metadata-census-report.json``
+#: (changed 2026-08-16, out of esc-4006-4).  This used to read the live
+#: ``plans/`` artifact.  Task 4006 turned that artifact into a NIGHTLY
+#: REGENERATED trend input (``scripts/memory-metadata-coverage-census.sh``,
+#: 05:00 timer, rewriting it in place in the main checkout), which
+#: collides head-on with the invariant leaf β states for itself in
+#: ``memory_metadata.KIND_REGISTRY``'s own docstring: *"a registry that
+#: mutates when an artifact is regenerated is not a registry"*.  That
+#: docstring already pins its derivation to a REVISION
+#: ("plans/memory-metadata-census-report.json @ b5af3e4b03"); reading the
+#: live path was only ever safe while the file was human-gated.  Pointing
+#: at the frozen projection restores the stated intent — the assertions
+#: below pin the literal against the census it was actually derived from.
+#:
+#: WHAT THIS DELIBERATELY GIVES UP, AND WHERE IT WENT.  The live-artifact
+#: read doubled as a drift tripwire ("census artifact changed — re-derive
+#: the registry").  It fired correctly on 4006's first live run: the live
+#: corpus moved 329 → 385 distinct ``kind`` values (+70 new, −14 gone), so
+#: ``KIND_REGISTRY`` IS materially stale against today's corpus.  That is
+#: not lost — it is handed to leaf β's owner as a reviewed re-derivation
+#: (with the removal policy the −14 need, and the question of whether a
+#: live-artifact drift check should exist at all), filed as ticket
+#: **tkt_0RSH6HFNT4YWRX20663ZGJ9YGZ** carrying the measured deltas and all
+#: three open decisions.  Naming the ticket is the point: without it this
+#: note records a known-stale registry with no traceable owner, and no test
+#: will ever notice further drift now that the tripwire is gone.  (A ticket,
+#: not a task id — the curator files asynchronously, so the resulting task
+#: is found by searching that ticket, not by a number predicted here.)
+#: It is not urgent:
+#: ``memory_metadata.enforce_kind_registry`` ships default **False** and is
+#: deliberately kept off (PRD §10 open question 1 — 242 of 329 measured
+#: values are singletons), so a stale registry rejects no live write.
+#: Do NOT regenerate the fixture to make these tests go green; that would
+#: ratify agent-invented free-text kinds into a normative closed registry
+#: without the review PRD D3 requires.
 _CENSUS_ARTIFACT = (
-    Path(__file__).resolve().parents[2] / 'plans' / 'memory-metadata-census-report.json'
+    Path(__file__).resolve().parent / 'fixtures' / 'census-grandfather-oracle.json'
 )
 
 
@@ -298,21 +335,15 @@ class TestKeyLayers:
         `tests/test_tag_cgl_eta_rehome_scope.py:309` needs no edit, while
         identity proves the extraction left one object rather than two.
         """
-        import importlib.util
-        import sys
-
         from fused_memory.backends import mem0_client
 
         script_path = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
-        spec = importlib.util.spec_from_file_location('tag_cgl_eta_rehome_scope', script_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules['tag_cgl_eta_rehome_scope'] = module
-        try:
-            spec.loader.exec_module(module)
-            assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
-        finally:
-            sys.modules.pop('tag_cgl_eta_rehome_scope', None)
+        # Left installed rather than popped in `finally`: the key is shared
+        # with test_tag_cgl_eta_rehome_scope.py, whose module-level `_mod`
+        # holds a live reference to it, so evicting it here is what forced a
+        # later load to exec a second copy (task 3895).
+        module = load_script_module(script_path, mod_name='tag_cgl_eta_rehome_scope')
+        assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
 
     def test_server_stamped_keys(self):
         from fused_memory.memory_metadata import SERVER_STAMPED_KEYS

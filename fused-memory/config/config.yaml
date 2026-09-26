@@ -12,6 +12,15 @@ server:
 llm:
   provider: "openai"
   model: "gpt-4o-mini"
+
+  # Output-token budget per LLM request (restart-tier — not hot-reloadable).
+  # Reaches the wire on EVERY arm: both graphiti client_class values, the
+  # graphiti anthropic arm, and mem0. Before task 3864 the default client
+  # silently sent 16384 regardless of this value. The effective value is
+  # echoed in the "Graphiti LLM: ..." startup INFO line.
+  # Raise this if the write path reports "Output length exceeded max tokens",
+  # then restart. Note it is SHARED: raising it also raises the anthropic arm
+  # and mem0, and Anthropic rejects a value above a model's output ceiling.
   max_tokens: 4096
 
   # Which graphiti LLM client to build (restart-tier — not hot-reloadable).
@@ -156,6 +165,60 @@ taskmaster:
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal — RED-TIER / restart-only. The prune runs once at startup
+# (server/main.py), so nothing re-reads these values afterwards; a changed leaf
+# is correctly reported restart_required by mcp__escalation__reload_config.
+#
+# These are the DEPLOYED values, and they are meant to be edited. The fallback
+# for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
+# place the numbers are defined — prune_write_ops itself takes all six as
+# required arguments precisely so there is no third copy to drift.
+#
+# MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
+# held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
+# lopsided, which is why the horizons are:
+#
+#   reads   35,170,444 (99.27%) — get_task 20.9M, get_tasks 7.5M,
+#                                 get_statuses 5.1M, get_external_statuses 1.2M
+#                                 = 34,669,782 task reads (97.9% of the whole
+#                                 table, ~220,800/day) with NO consumer
+#   search     481,447 (1.36%, ~3,066/day) — leaf eta's (task 3213) sole data
+#                                 source and leaf theta's (3214) retro corpus
+#   writes     258,271 (0.73%)  — the causation-joined durable audit trail
+#
+# So search rows outlive task-read rows: the long horizon is nearly free
+# (365 d of search is ~1.1M rows) while the volume problem is entirely the four
+# task-read operations. An inverted pair is REJECTED at config load.
+#
+# RECORDED COST of task 3212 item (1): journalling per-result ids/scores/sizes
+# grows a search row from a measured ~90 B of JSON to roughly ~1.3 KB, i.e.
+# ~1.4 GB across the 365-day search horizon. Stated here so the cost is a
+# decision rather than a later discovery.
+#
+# THIS BOUNDS GROWTH; IT DOES NOT SHRINK THE FILE. `PRAGMA auto_vacuum` is NONE
+# on this database, so deleted pages go to SQLite's freelist for reuse — `ls -lh`
+# still reports ~16 GB after a fully successful prune, and those freed pages are
+# what absorbs the per-result detail above. Reclaiming disk needs an offline
+# VACUUM (a full-file rewrite needing ~16 GB of scratch), never run at startup.
+#
+# A first run against a large backlog legitimately needs many restarts to drain;
+# each partial sweep logs a WARNING naming which horizon is still behind AND the
+# rows/sec it achieved. Reads accrue at ~220,800/day, so a sweep must sustain
+# ~2,500-7,400 rows/sec (at 1-3 fleet redeploys/day) to make net progress. If the
+# measured rate comes in under that, raise prune_max_seconds here for the drain
+# phase, or bulk-delete once against a STOPPED server where no startup grace
+# applies — otherwise the WARNING repeats forever while the backlog never clears.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal:
+  read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
+  search_retention_days: ${WRITE_JOURNAL_SEARCH_RETENTION_DAYS:365}
+  write_retention_days: ${WRITE_JOURNAL_WRITE_RETENTION_DAYS:730}
+  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:5000}
+  prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
+  prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
+
+
 # task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
 # (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
 # the write proceed; true rejects a schema-violating add_task/update_task with
@@ -180,6 +243,13 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
+  # 1800 -> 3600 (Leo, 2026-09-16) was ruled on a premise that later proved
+  # false: that remediation runs routinely overran the cutoff. In fact every
+  # age-reaped remediation run was the orphan of a fused-memory service stop.
+  # Live runs are protected by the lock-identity guard at any cutoff, so this
+  # value only sets how long an orphan row lingers. Whether to revert is
+  # pending; task 5545 terminalises the orphaned child on cancellation.
+  stale_run_recovery_seconds: 3600
   # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
   # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
   # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
@@ -274,6 +344,18 @@ reconciliation:
   token_budget: 65000
   context_search_limit: 5
   context_fetch_batch_size: 10
+  # Caller bar for `deterministic-*` done provenance (task 5237, PRD C5).
+  # Green-tier hot-reloadable — registered in
+  # `config/reload.py::RELOADABLE_FIELDS`, which is the authoritative list.
+  # DENY-ON-MISSING: a caller whose resolved identity matches no prefix here is
+  # refused, and an EMPTY list denies EVERY caller — that empty value is the
+  # incident knob, and it is green-tier so it lands on the next call rather than
+  # after a restart. Only 'orchestrator' by default: the orchestrator sends no
+  # agent_id, so the identity resolver falls back to the clientInfo.name its MCP
+  # session advertises, which is that literal. NOTE the identity this bar reads
+  # is SELF-REPORTED, so it deters a cooperating caller rather than enforcing a
+  # boundary. Shown at its shipped default; uncomment to change.
+  # deterministic_provenance_allowed_agent_prefixes: ['orchestrator']
   usage_cap:
     enabled: true
     wait_for_reset: true
@@ -369,10 +451,133 @@ summary_rebuild:
 #   storm_threshold: 20
 #   storm_window_seconds: 3600.0
 
+# Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
+# CREATES a Graphiti Entity node so a dangling referent has something to point
+# at. All five leaves are green-tier hot-reloadable: they are registered in
+# `config/reload.py::RELOADABLE_FIELDS`, which is the authoritative list, and
+# `mcp__escalation__reload_config` applies a change to any of them to a RUNNING
+# server with no restart. During a runaway-mint incident the knob you want is
+# `entity_mint.enabled: false` immediately below — it denies every caller on the
+# very next call. (Deliberately not cross-referenced to OPERATIONS.md §6: that
+# section's fused-memory enumeration is explicitly non-exhaustive and does not
+# yet name these leaves, so pointing an operator at it during an incident would
+# send them somewhere that answers "no such knob".)
+# Every value below is the shipped default, shown so the knobs are discoverable
+# without reading the schema. Uncomment to change one.
+# entity_mint:
+#   # Kill switch. false denies EVERY caller on the very next call, allowlisted
+#   # or not, with NO restart — this is the knob to flip during a runaway-mint
+#   # incident. It is green-tier precisely so that is true: a restart-only kill
+#   # switch is no kill switch, because the operator believes they turned it off.
+#   enabled: true
+#   # agent_id-prefix allowlist. Narrow by design: a node minted under a
+#   # non-canonical name SPLITS a referent instead of resolving it, and nothing
+#   # sweeps orphan minted nodes, so the damage is quiet and cumulative.
+#   # recon-stage- admits every reconciliation stage agent; curator- admits the
+#   # interactive memory-consolidation sitting, which is the flow that discovers
+#   # a dangling referent in the first place. agent_id is SELF-REPORTED, so this
+#   # deters misuse by cooperating callers rather than enforcing a security
+#   # boundary — a determined caller can claim any prefix.
+#   allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   # Bound on the wait for the per-group_id write-time-identity lock, which the
+#   # mint holds across its exact-name pre-read and the mint itself. Bounded
+#   # because the other holder (the episode-ingest write path) keeps that lock
+#   # across a full LLM extraction, so an unbounded wait would block an MCP
+#   # request for tens of seconds. On expiry the tool returns an
+#   # EntityMintLockBusy refusal and mints nothing. Raise it if you see that
+#   # refusal under heavy ingest; lower it to fail faster.
+#   lock_timeout_seconds: 5.0
+#   # Mint burst alarm: escalates, never blocks — the node it is complaining
+#   # about has already landed. Resolves (the idempotent re-call this primitive
+#   # is designed to make cheap) and refusals do not count toward it, or a
+#   # runaway minter would drown in ordinary traffic.
+#   storm_threshold: 10
+#   storm_window_seconds: 3600.0
+
+# Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
+# plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
+# pure predicate rules on it, and a passing cluster is consolidated WITH NO
+# HUMAN IN THE LOOP. All thirteen leaves are green-tier hot-reloadable: they
+# are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
+# authoritative list, and `mcp__escalation__reload_config` applies a change to
+# any of them to a RUNNING server with no restart.
+#
+# DURING AN INCIDENT the knob you want is `consolidation_auto.enabled: false`
+# immediately below: it stops every auto-execution on the next cycle. Ships
+# false already, unlike the mem0_update and entity_mint kill switches — those
+# gate a TOOL behind a self-reported-agent allowlist that is the real bar,
+# whereas this machinery writes on its own initiative, so the switch IS the bar.
+#
+# ROLLOUT (PRD §11): stage one project with `enabled_projects: ['dark_factory']`
+# while `enabled` stays false — the pipeline proposes, rules and records without
+# writing, and a human reads that supervised dry-run cycle — then set
+# `enabled: true` for the same project.
+#
+# `enabled_projects` and `category_weights` reload ATOMICALLY: each is replaced
+# wholesale, never merged into the previous value, so a half-applied ranking map
+# can never gate a cycle.
+#
+# Every value below is the shipped default, shown so the knobs are discoverable
+# without reading the schema. Uncomment to change one.
+# consolidation_auto:
+#   # Kill switch. false stops every auto-execution regardless of
+#   # enabled_projects. Read together with enabled_projects: BOTH must admit a
+#   # project before anything is written.
+#   enabled: false
+#   # Per-project staging lever. Empty means no project is staged in. Replaced
+#   # wholesale on reload, never merged — removing a project here removes it.
+#   enabled_projects: []
+#   # Opaque label stamped onto every verdict and onto auto-execution
+#   # provenance. Bump it when the predicate rungs change meaning, so a verdict
+#   # tagged with the old version is visibly not a claim about the current rules.
+#   predicate_version: '1'
+#   # Proposal-shape bounds. Below two members there is no duplication to
+#   # consolidate; above twenty a cluster is more likely a topic drifting than a
+#   # duplicate set, and a human sitting reads it better than an automatic write.
+#   member_min: 2
+#   member_max: 20
+#   # Cap on the LLM-supplied claim, which becomes the canonical's FIRST
+#   # PARAGRAPH verbatim. Inclusive — a claim of exactly this length is accepted.
+#   claim_max_chars: 200
+#   # Blast-radius caps, per reconciliation cycle. 0 is legal on both and is the
+#   # narrow off switch: it stops execution (or gate filing) while leaving the
+#   # rest of the pipeline proposing and recording.
+#   max_auto_per_cycle: 3
+#   max_gate_filings_per_cycle: 3
+#   # How many candidate clusters the ranking considers per cycle, as a multiple
+#   # of max_auto_per_cycle — so the cycle picks the best few of a wider field
+#   # rather than the first few it saw.
+#   backlog_multiplier: 5
+#   # Consecutive refusals of the SAME topic before it stops being re-proposed
+#   # and goes to a human. A refusal no LLM re-emission can fix would otherwise
+#   # repeat every cycle forever, which is cost with no information.
+#   refusal_streak_threshold: 5
+#   # Token-Jaccard at or ABOVE which a proposed topic slug is treated as
+#   # colliding with an existing canonical slug, refusing rather than minting a
+#   # near-twin topic that splits one referent across two canonicals. A slug
+#   # equal to the proposed topic is skipped, not scored — a re-emission always
+#   # sees its own slug already present. Calibrate during the supervised cycle.
+#   slug_collision_jaccard: 0.6
+#   # How long a ledger proposal stays executable before it must be re-derived.
+#   # The corpus moves under an aged proposal, so executing a week-old row on its
+#   # original facts would write against a world that no longer exists.
+#   proposal_ttl_hours: 168
+#   # Ranking weights over the three Mem0-primary categories.
+#   # observations_and_summaries is down-weighted because that corpus is
+#   # session-recap noise far more often than it is a reusable norm. An ABSENT
+#   # category is not a candidate at all — a different fact from a zero weight,
+#   # which is why the Graphiti-primary categories are absent rather than zeroed.
+#   # Replaced wholesale on reload, never merged.
+#   category_weights:
+#     procedural_knowledge: 1.0
+#     preferences_and_norms: 1.0
+#     observations_and_summaries: 0.7
+
 write_triage:
-  # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
-  # keys in this block a human is meant to edit; everything below the fence is
-  # derived. Both are green-tier hot-reloadable, and
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
+  # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
+  # and the six judge knobs below them; everything below the fence is
+  # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
   #

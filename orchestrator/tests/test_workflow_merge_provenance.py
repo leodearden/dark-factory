@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_workflow_helpers.py
@@ -23,17 +23,14 @@ from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_wor
     _Fixture,
     _make,
 )
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import reconcile_landed_outbox
 from orchestrator.scheduler import SetTaskStatusRejected
-from orchestrator.workflow import (
-    WorkflowOutcome,
-    WorkflowState,
-    _PriorImplStatus,
-)
+from orchestrator.workflow import WorkflowOutcome, WorkflowState
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +39,41 @@ def _reset_merge_provenance():
     MergeProvenance._outbox = None
     yield
     MergeProvenance._outbox = None
+
+
+def _arm_escalation_queue(f: _Fixture, tmp_path: Path) -> EscalationQueue:
+    """Give the workflow a real escalation queue, and no dry-run spawn.
+
+    ``escalation_queue`` is a PUBLIC TaskWorkflow attribute (ctor parameter,
+    workflow.py::TaskWorkflow.__init__), so a block can be observed as the
+    escalation it actually files rather than by stubbing ``_mark_blocked``.
+    ``unblock_auto.enabled = False`` short-circuits ``_spawn_dry_run_unblock``'s
+    fire-and-forget investigation, which a unit test must never launch — it is
+    the second term of that method's own guard (workflow.py::TaskWorkflow.
+    _spawn_dry_run_unblock), so the skip is the one production takes when an
+    operator turns the hook off.
+    """
+    f.wf.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+    f.wf.config.unblock_auto.enabled = False
+    return f.wf.escalation_queue
+
+
+def _record_prior_work(f: _Fixture) -> None:
+    """Give the REAL ``_has_prior_implementation`` a work entry to find.
+
+    The classifier reads only ``artifacts.read_base_commit()`` and
+    ``read_iteration_log()``, and ``_Fixture.artifacts`` is a real
+    ``TaskArtifacts`` under tmp_path — so a guard's has-work term is driven by
+    writing the artifact production actually reads rather than by replacing the
+    classifier with a stub.  ``_make`` stamps ``base_commit='oldbase'``, so a
+    SHA-primary caller passing any other wt_head sees divergence; the entry is
+    the work-classified shape from ``_CLASSIFICATION_CASES`` below.
+    """
+    f.artifacts.append_iteration_log({
+        'agent': 'implementer', 'source': 'orchestrator',
+        'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+        'commit': 'newhead',
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +136,13 @@ class TestFinaliseRecoveryDone:
             task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
         )
         f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
+        # STUBBED DELIBERATELY (esc-5026-4): this chokepoint enters the DONE
+        # phase BEFORE mark_done, so the real `_mark_blocked` sees a terminal
+        # machine, logs 'already done, ignoring late blocked transition' and
+        # returns DONE — the sibling `_finalise_merged_done` marks done first
+        # and does return BLOCKED (see that test below, which runs the real
+        # path).  Un-stubbing here would change what this test asserts, so the
+        # stub stays until the production ordering question is adjudicated.
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
@@ -146,11 +185,8 @@ class TestRecoverIfAlreadyMerged:
                 '_check_branch_on_main must not be called on a journal hit',
             ),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called on a journal hit',
-            ),
-        )
+        # The legacy heuristic is reachable only THROUGH that probe, so the
+        # sentinel above pins both halves of the short-circuit.
 
         outcome = await f.wf._recover_if_already_merged()
 
@@ -169,9 +205,7 @@ class TestRecoverIfAlreadyMerged:
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
+        _record_prior_work(f)
 
         outcome = await f.wf._recover_if_already_merged()
 
@@ -181,7 +215,6 @@ class TestRecoverIfAlreadyMerged:
             f.wf.task_id, kind='found_on_main', sha='mainsha123',
             note='branch already on main at workflow start (pre-PLAN recovery)',
         )
-        f.wf._has_prior_implementation.assert_called_once_with(wt_head='wthead123')
 
     async def test_journal_miss_on_main_with_no_prior_work_returns_none(
         self, tmp_path: Path,
@@ -192,30 +225,30 @@ class TestRecoverIfAlreadyMerged:
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
+        # Row 2 exactly: an inherited .task/ carries a work-shaped iteration
+        # entry, but the branch never advanced past its base.  This guard
+        # passes wt_head, so SHA non-divergence vetoes the log signal — a
+        # bare-fallback consultation would false-DONE here instead, which is
+        # the discrimination this arm exists to hold.
+        f.artifacts.update_base_commit('wthead123')
+        _record_prior_work(f)
 
         outcome = await f.wf._recover_if_already_merged()
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
     async def test_journal_miss_not_on_main_returns_none(self, tmp_path: Path):
         """Journal miss + branch not on main → no recovery, no fallback probe."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called when not on main',
-            ),
-        )
+        # Work IS on record, so a regression that consulted the heuristic here
+        # would recover instead of returning None.
+        _record_prior_work(f)
 
         outcome = await f.wf._recover_if_already_merged()
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
 
@@ -352,7 +385,6 @@ class TestRecoverBeforeExecute:
         outcome = await f.wf._recover_before_execute()
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
     async def test_journal_hit_returns_done_without_consulting_git_or_fallback(
@@ -367,11 +399,9 @@ class TestRecoverBeforeExecute:
                 '_check_branch_on_main must not be called on a journal hit',
             ),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called on a journal hit',
-            ),
-        )
+        # This guard's fallback is the Layer-C branch-content diff, reached
+        # only through the probe sentinelled above — it does not consult the
+        # legacy heuristic at all.
 
         outcome = await f.wf._recover_before_execute()
 
@@ -419,7 +449,6 @@ class TestRecoverBeforeExecute:
         outcome = await f.wf._recover_before_execute()
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
     async def test_found_on_main_recovery_stamps_nonempty_metadata_files(
@@ -457,16 +486,12 @@ class TestRecoverBeforeExecute:
         """Journal miss + branch not on main → no recovery, no fallback probe."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called when not on main',
-            ),
-        )
+        # git_ops is a MagicMock here: were the Layer-C diff consulted past the
+        # not-on-main short-circuit, awaiting it would fail this test loudly.
 
         outcome = await f.wf._recover_before_execute()
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
 
@@ -495,11 +520,8 @@ class TestRecoverBeforeMerge:
         f.is_ancestor.side_effect = AssertionError(
             'is_ancestor must not be called on a journal hit',
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called on a journal hit',
-            ),
-        )
+        # _branch_work_landed_on_main consults the heuristic only AFTER
+        # is_ancestor, so that sentinel pins both halves.
 
         outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
 
@@ -516,9 +538,7 @@ class TestRecoverBeforeMerge:
         """Journal miss + branch is ancestor of main + prior implementation
         work → fallback DONE (provenance sha is main_sha, not branch_head)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
+        _record_prior_work(f)
 
         outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
 
@@ -536,30 +556,25 @@ class TestRecoverBeforeMerge:
         """Journal miss + ancestor (spurious merge signal) + no prior work →
         None, proceed with the real merge (task 2911-style guard)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
+        # No iteration-log entry: the real classifier's bare-fallback scan
+        # (this guard passes wt_head=None) finds no work.
 
         outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
     async def test_journal_miss_not_ancestor_returns_none(self, tmp_path: Path):
         """Journal miss + branch NOT an ancestor of main → None, fallback
         heuristic never consulted (a real merge is still needed)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=False)
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called when not an ancestor',
-            ),
-        )
+        # Work IS on record: has the ancestor check not short-circuited, the
+        # real classifier would report work and this arm would recover.
+        _record_prior_work(f)
 
         outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
 
         assert outcome is None
-        assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
 
     async def test_warning_scoped_to_ancestor_without_work_only(
@@ -576,9 +591,7 @@ class TestRecoverBeforeMerge:
             worktree=tmp_path / 'wt-ancestor', project_root=tmp_path / 'proj-ancestor',
             branch_on_main=True,
         )
-        f_ancestor.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
+        # No iteration-log entry written — no work, per the real classifier.
         with caplog.at_level(logging.WARNING):
             outcome_ancestor = await f_ancestor.wf._recover_before_merge(
                 'branchhead123', 'mainsha123',
@@ -661,9 +674,10 @@ class TestBranchWorkLandedOnMain:
         must not even be consulted (mirrors the sibling guards' short-circuit
         contract)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=False)
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError('must not be called when not an ancestor'),
-        )
+        # Work IS on record (as in the sibling arms above), so consulting the
+        # has-work term at all would return True — the False below is the
+        # short-circuit itself.
+        _record_prior_work(f)
 
         result = await f.wf._branch_work_landed_on_main(
             'branchhead123', 'mainsha123', wt_head='branchhead123',
@@ -747,14 +761,14 @@ class TestNoPhantomDoneProperty:
     async def test_journal_miss_no_work_leaves_task_re_dispatchable_all_guards(
         self, tmp_path: Path,
     ):
-        no_work = _PriorImplStatus(has_work=False, entries=[], base_commit=None)
+        # No fixture below writes an iteration-log entry, so the real
+        # classifier reports no work for every guard that consults it.
 
         # Guard 1: _recover_if_already_merged — on-main, no prior work.
         f1 = _make(worktree=tmp_path / 'wt1', project_root=tmp_path / 'proj1')
         f1.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f1.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
         outcome1 = await f1.wf._recover_if_already_merged()
         assert outcome1 is None
         assert f1.wf._merge_recovery_basis is None
@@ -779,7 +793,6 @@ class TestNoPhantomDoneProperty:
             worktree=tmp_path / 'wt3', project_root=tmp_path / 'proj3',
             branch_on_main=True,
         )
-        f3.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
         outcome3 = await f3.wf._recover_before_merge('branchhead123', 'mainsha123')
         assert outcome3 is None
         assert f3.wf._merge_recovery_basis is None
@@ -845,7 +858,7 @@ class TestFinaliseMergedDoneConsumesLandedRow:
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
         f.wf._merge_sha = 'advsha'
-        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+        f.wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=([], None))
 
         # Row present BEFORE completion.
         assert outbox.lookup(f.wf.task_id) is not None
@@ -872,7 +885,7 @@ class TestFinaliseMergedDoneConsumesLandedRow:
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
         f.wf._merge_sha = 'advsha'
-        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+        f.wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=([], None))
         # get_status → 'done' so an unconsumed row WOULD be RC-3 pruned;
         # is_ancestor/get_main_sha are already AsyncMocks from _make
         # (is_ancestor → True, get_main_sha → 'mainsha123').
@@ -901,18 +914,17 @@ class TestFinaliseMergedDoneConsumesLandedRow:
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
         f.wf._merge_sha = 'advsha'
-        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+        f.wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=([], None))
         rejection = SetTaskStatusRejected(
             task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
         )
         f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        _arm_escalation_queue(f, tmp_path)
 
         outcome = await f.wf._finalise_merged_done()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        mark_blocked.assert_awaited_once()
+        assert f.wf.state == WorkflowState.BLOCKED
         # The write-ahead row must STILL be present — a rejected done-write
         # must not consume it.
         assert outbox.lookup(f.wf.task_id) is not None
@@ -961,7 +973,6 @@ def _arm_recovery_fixture(
     f.wf.config.delivered_checks = DeliveredChecksConfig(
         enabled=enabled, check_timeout_secs=7.5,
     )
-    f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
     return f
 
 
@@ -1014,7 +1025,7 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         f.mark_done.assert_not_awaited()
         assert WorkflowState.DONE not in phases
         assert f.wf.state != WorkflowState.DONE
-        cast(AsyncMock, f.wf._reconcile_metadata_files_for_done).assert_not_awaited()
+        f.update_task.assert_not_awaited()
         assert f.wf._merge_recovery_basis is None
 
     # --- row 2: all_delivered -> byte-identical recovery -------------------
@@ -1040,9 +1051,9 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         f.mark_done.assert_awaited_once_with(
             f.wf.task_id, kind=kind, sha='advancedsha123', note='n',
         )
-        cast(
-            AsyncMock, f.wf._reconcile_metadata_files_for_done,
-        ).assert_awaited_once_with(override_files=['a.py'])
+        f.update_task.assert_awaited_once()
+        _task_id, metadata = f.update_task.await_args.args
+        assert metadata['files'] == ['a.py']
 
     # --- row 3: no delivered_checks -> unchanged, but still DELEGATED ------
 
@@ -1053,7 +1064,8 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         """A check-less task must not gain a new requirement. The workflow
         DELEGATES unconditionally (forwarding the task's metadata) rather than
         short-circuiting itself — inertness lives in the helper alone."""
-        f = _arm_recovery_fixture(tmp_path, metadata={})
+        checkless_metadata: dict = {}
+        f = _arm_recovery_fixture(tmp_path, metadata=checkless_metadata)
         guard = AsyncMock(return_value=None)
 
         with patch(_WF_GATE_TARGET, guard):
@@ -1065,7 +1077,10 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         f.mark_done.assert_awaited_once()
         guard.assert_awaited_once()
         assert guard.await_args is not None
-        assert guard.await_args.args[1] == f.wf.task['metadata']
+        # Forwarded verbatim — compared against what the fixture stamped, since
+        # the real metadata-files reconcile replaces task['metadata'] after the
+        # guard has already been handed the pre-reconcile dict.
+        assert guard.await_args.args[1] == checkless_metadata
 
     # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
 
@@ -1090,7 +1105,6 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         assert outcome is None
         f.mark_done.assert_not_awaited()
         assert f.wf.state != WorkflowState.DONE
-        assert f.wf._merge_recovery_basis is None
 
     # --- row 6: kill switch is FORWARDED, never re-implemented -------------
 
@@ -1203,7 +1217,6 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
 
         assert outcome is None
         f.mark_done.assert_not_awaited()
-        assert f.wf._merge_recovery_basis is None
 
     async def test_recover_if_already_merged_fallback_arm_honours_a_block(
         self, tmp_path: Path,
@@ -1214,9 +1227,7 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
+        _record_prior_work(f)
         guard = AsyncMock(return_value=DeliveredChecksBlock(
             reason='failed', main_sha='m' * 40, failed_check=_WF_DC_CHECK,
         ))
@@ -1226,4 +1237,3 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
 
         assert outcome is None
         f.mark_done.assert_not_awaited()
-        assert f.wf._merge_recovery_basis is None

@@ -481,7 +481,7 @@ class TestBuildImplementerPromptWipNotice:
         ]
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=wip_notice,
+            minimal_plan, context='', wip_notice=wip_notice,
         )
 
         assert 'Verify Before Re-Implementing' in prompt
@@ -492,7 +492,7 @@ class TestBuildImplementerPromptWipNotice:
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=None,
+            minimal_plan, context='', wip_notice=None,
         )
 
         assert 'Verify Before Re-Implementing' not in prompt
@@ -501,7 +501,7 @@ class TestBuildImplementerPromptWipNotice:
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=[],
+            minimal_plan, context='', wip_notice=[],
         )
 
         assert 'Verify Before Re-Implementing' not in prompt
@@ -516,7 +516,7 @@ class TestBuildImplementerPromptWipNotice:
         }
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', rebase_notice=rebase_notice, wip_notice=None,
+            minimal_plan, context='', rebase_notice=rebase_notice, wip_notice=None,
         )
 
         assert 'Rebase Notice' in prompt
@@ -540,7 +540,7 @@ class TestBuildImplementerPromptMandatoryPreflight:
         it must render even when there is no WIP notice at all, which is the
         common case for most implementer invocations."""
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=None,
+            minimal_plan, context='', wip_notice=None,
         )
 
         assert 'git diff HEAD' in prompt
@@ -554,7 +554,7 @@ class TestBuildImplementerPromptMandatoryPreflight:
         ]
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=wip_notice,
+            minimal_plan, context='', wip_notice=wip_notice,
         )
 
         assert 'git diff HEAD' in prompt

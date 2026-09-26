@@ -17,5 +17,38 @@
       "description": "The --diff-filter flag excludes Type-change (T) files by default. While rare, symlink-to-file type changes would be silently dropped from the results.",
       "mutation_type": "swapped_args"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Add include_deleted to GitOps.get_changed_files and a shortstat diff-stats helper",
+      "description": "`orchestrator/src/orchestrator/git_ops.py::GitOps.get_changed_files` hands callers every path git reports between two commits, with no way to say whether deletions belong in the answer: rollback validation needs the removed paths, while today's callers want only the files that still exist after the change. Add an `include_deleted: bool = False` parameter that selects the diff filter accordingly, where the default may narrow the result to paths that still exist after the change. Add a sibling `GitOps.get_diff_stats(from_sha, to_sha)` returning `{'insertions': N, 'deletions': N}` parsed from `git diff --shortstat`, so callers can size a changeset without shelling out themselves. Both stay on the module's existing `_run` helper with `cwd=self.project_root`.",
+      "test_strategy": "Extend `orchestrator/tests/test_git_ops.py` with a temporary repo whose second commit adds, modifies and deletes files: assert `get_changed_files` returns the expected path set over that commit range with `include_deleted` both False and True, and that `get_diff_stats` matches the insertion/deletion counts git itself reports for the same range.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "orchestrator/src/orchestrator/git_ops.py"
+    ],
+    "base_sha": "84b26ea05539b436c424f49b5c5e455f8d8daffa",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "--recount"
+      ],
+      "candidates_tested": 1,
+      "reason": "Newest first-parent ancestor of edf348e39127bed3759a82d72e5414d263a6a95d^ that touches orchestrator/src/orchestrator/git_ops.py (commit '84b26ea0: Merge task/293 into main', 2026-04-06 23:01:36+0100). Also confirmed via `git merge-base --is-ancestor` that no non-first-parent commit touching this file and dated before edf348e is both an edf348e ancestor AND newer than 84b26ea0. Plain `git apply --cached --check` reports 'corrupt patch at line 45' (a hand-authoring hunk-count miscount, same class of defect as the other synthetic fixtures). `git apply --recount --cached --check` against this commit's tree succeeds (rc=0), confirming the pre-image (get_changed_files signature/body around old line 410+) matches this tree exactly.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

@@ -1,6 +1,14 @@
 /* App shell: rail nav, topbar, toolbar (filters), live feed */
 const { useState, useEffect, useMemo, useRef } = React;
 const SP_SHELL = window.DF_CHARTS.Sparkline;
+const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
+// The badge-chip pip's type size, decided here rather than at each call site:
+// the four escalation-subsection pips each carried their own `fontSize: 9`, and
+// one of four drifting is how a summary row comes to have two type sizes.
+const PIP_BADGE_STYLE = Object.freeze({ fontSize: 9 });
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name — see the CANONICAL note in datum.js's header.
+const { datumView } = window.DF_DATUM;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
 
@@ -436,6 +444,53 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
   );
 }
 
+// ── One pip of a project-group summary ──
+// The shared home the six caller-built pip fragments had none of. ProjectGroup
+// could not be it: it takes `summary` as an OPAQUE node, and the word "pip"
+// does not occur anywhere else in this file — every pip was a JSX fragment
+// hand-built at its call site, the six sharing only their CSS. So this is a NEW
+// component placed beside ProjectGroup, which is the closest honest reading of
+// the PRD's "ProjectGroup pips".
+//
+// The markup is the fragments' own, unchanged, so `.proj-head .summary .pip`
+// and `.pip-dot` keep styling it — a new shape would have needed new CSS in a
+// file no leaf of this PRD owns.
+//
+// ONLY PIPS THAT RENDER A MEASURED NUMBER COME THROUGH HERE. The status-word
+// pips (running/completed, offline, state unknown) are derived FLAGS with no
+// measurement instant, and wrapping a boolean in an envelope whose contract is
+// value + as_of + state would be a category error; gamma2/theta own those
+// surfaces.
+//
+// `label` is the TRAILING word ('p50', 'active', 'blocked'), kept a separate
+// prop rather than folded into `format` so the formatter stays about the VALUE
+// and the space between the two is decided once here instead of at each site.
+// A LEADING label ('L1 · 3') goes through `format` instead: two sites want one,
+// and a second placement prop would be a second way to say the same thing.
+//
+// The age is a dim suffix rather than a badge of its own: a pip sits in a dense
+// flex summary row, and a second bordered element per pip would double that
+// row's width. It shares DATUM_AGE_STYLE with StatTile, so the dashboard states
+// an age in one shape as well as one format.
+//
+// TWO LEADING GLYPHS, BECAUSE THE FRAGMENTS HAD TWO. A summary pip either
+// carries a coloured dot (the orchestrator/perf/merge/burndown rows) or renders
+// its reading inside a `.badge` chip (the escalation subsections' L1/L2 and
+// unreadable counts, where the chip's tone IS the level). Both are pre-existing
+// shared markup this component adopts unchanged rather than new variants it
+// invents; `color` and `badge` are each absent on the shape that does not use
+// it, so neither draws an empty 7px dot nor an untoned chip.
+function Pip({ datum, label, color, format, badge }) {
+  const view = datumView(datum, { now: Date.now(), format });
+  const reading = <>{view.text}{label && ` ${label}`}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</>;
+  return (
+    <span className="pip" title={view.title || undefined}>
+      {color && <span className="pip-dot" style={{ background: color }}></span>}
+      {badge ? <span className={`badge ${badge}`} style={PIP_BADGE_STYLE}>{reading}</span> : reading}
+    </span>
+  );
+}
+
 // ── Segmented control ──
 function Segmented({ options, value, onChange }) {
   return (
@@ -451,4 +506,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };

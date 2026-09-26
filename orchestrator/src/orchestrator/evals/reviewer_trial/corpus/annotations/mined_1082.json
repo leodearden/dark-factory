@@ -40,5 +40,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Fix reconciliation agents to verify operation success before incrementing stat counters",
+      "description": "Both Stage 1 (memory_consolidator) and Stage 2 (task_knowledge_sync) reconciliation agents prematurely increment success counters without verifying the underlying operation actually succeeded, inflating reported stats. Stage 1 inflates memories_written by counting every add_memory call attempt regardless of whether Mem0 wrote anything (empty memory_ids = deduplication/filter = no-op). Stage 2 inflates tasks_reopened and tasks_created before confirming that add_task or set_task_status actually took effect (silent failures from deduplication, network error, or timeout go undetected). Fix both stages so counters only advance on confirmed success.",
+      "test_strategy": "",
+      "details": "**Stage 1 fix \u2014 memory_consolidator (skills/memory-consolidator.md or equivalent):**\n- After each `add_memory(...)` call, inspect the returned `memory_ids` list.\n- Pattern: `if add_memory(...)['memory_ids']: memories_written += 1`\n- An empty list means Mem0 deduplicated or filtered the write \u2014 count as a no-op, not a successful addition.\n- Per CLAUDE.md guidance: 'After calling add_memory, inspect the memory_ids field in the response. An empty list means Mem0 deduplicated or filtered the write and no new memory was created \u2014 count it as a no-op, not a successful addition.'\n\n**Stage 2 fix \u2014 task_knowledge_sync agent prompt/code:**\n- After each `add_task` or `set_task_status` call, call `get_task` with the returned task_id to confirm the task exists and has the expected status.\n- Only then increment `tasks_created` or `tasks_reopened`.\n- If the returned task_id is missing or `get_task` returns an unexpected status, skip the counter increment and log the discrepancy.\n\n**Scope:** Stage 1 and Stage 2 reporting loops in the reconciliation agent prompts/skills (fused-memory reconciliation skills directory or equivalent markdown skill files).\n\n**FILES_TO_MODIFY:**\n  - skills/memory-consolidator.md",
+      "authored": false,
+      "id": "1082",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-26T12:46:32.285Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py"
+    ],
+    "base_sha": "22d5d4a7dfebecc796bfb57e710099270a59dad0",
+    "branch_sha": "a6e5f92434c4f5c669e90b9cbe91099264fb835e",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "a8dc363d9eb94ff9cb68756f239f713088f66861",
+      "merge_base_sha": "22d5d4a7dfebecc796bfb57e710099270a59dad0",
+      "diff_reproduces_from": "git diff 22d5d4a7df a8dc363d9e",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

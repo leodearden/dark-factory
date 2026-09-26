@@ -28,15 +28,12 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from config_dir_archival_allowlist import ARCHIVED, AUDITED_SITES, DISPOSITIONS
-from silent_fallthrough_scan import (
-    _build_parent_map,
-    _compute_qualname,
-    iter_first_party_files,
-)
+from silent_fallthrough_scan import ParsedFile, _build_parent_map, _compute_qualname
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -57,8 +54,13 @@ _SiteKey = tuple[str, str]
 # downgrade a disposition and lose the transcripts for real.
 _ARCHIVAL_NAMES = frozenset({'archive_task_transcripts', 'archive_before_delete'})
 
+#: Every identifier this gate can match. A record whose SOURCE contains none of
+#: them cannot produce a hit, so it is skipped before any per-node work — see
+#: :func:`_scan` for why that is exact rather than a heuristic.
+_TRACKED_NAMES = _ARCHIVAL_NAMES | {'TaskConfigDir'}
 
-def _scan(repo_root: Path) -> tuple[list[_SiteKey], list[_SiteKey]]:
+
+def _scan(records: Sequence[ParsedFile]) -> tuple[list[_SiteKey], list[_SiteKey]]:
     """Return ``(construction_sites, archival_reference_sites)``.
 
     One AST walk yields both halves of the audit:
@@ -92,22 +94,56 @@ def _scan(repo_root: Path) -> tuple[list[_SiteKey], list[_SiteKey]]:
     site's teardown path; it does not prove every path into that helper is
     covered. Tests of the call sites themselves carry that half.
 
-    ``iter_first_party_files`` already encodes the 7 scope roots, the
-    ``tests``/``mem0``/``graphiti``/``conftest.py`` exclusions, and a
-    sentinel-dir validation of *repo_root* that RAISES rather than yielding a
-    vacuously-empty scan.
+    THE SCAN DOES NO I/O AND NO PARSING OF ITS OWN (task 4520). *records* are
+    the :class:`silent_fallthrough_scan.ParsedFile` objects the session-scoped
+    ``first_party_tree`` fixture hands out — the whole first-party tree, read
+    and ``ast.parse``d exactly once per session and shared with every other
+    gate. ``silent_fallthrough_scan.parse_first_party_tree`` still enumerates
+    via ``iter_first_party_files``, so the 7 scope roots, the
+    ``tests``/``mem0``/``graphiti``/``conftest.py`` exclusions, and the
+    sentinel-dir validation that RAISES rather than yielding a vacuously-empty
+    scan all keep their meaning. The trees are walked READ-ONLY: they belong to
+    the session, not to this gate.
 
-    Read/parse errors are deliberately NOT swallowed: a first-party source file
-    that cannot be read or parsed is a real breakage, and silently skipping it
-    would let a construction site hide behind it — the exact silent-degradation
-    shape this repo's gates exist to prevent.
+    Records whose SOURCE mentions none of :data:`_TRACKED_NAMES` are skipped
+    before any per-node work. That is exact rather than a heuristic: all three
+    names are Python identifiers, and the scan only ever matches ``ast.Name.id``
+    or ``ast.Attribute.attr``, both of which are literal substrings of the
+    file's source by construction — there is no computed-attribute or
+    ``getattr`` spelling the scan would have caught and the prefilter drops.
+    ``test_tree_scan_sharing.TestArchivalGateUsesTheSharedTree`` asserts that
+    as multiset parity against an unfiltered scan rather than trusting the
+    argument. Payoff: 14 of 461 files mention a tracked name, so 97% of the
+    per-node work — and 97% of the parent maps — disappears.
+
+    Read/parse errors are still deliberately NOT swallowed: a first-party
+    source file that cannot be read or parsed is a real breakage, and silently
+    skipping it would let a construction site hide behind it — the exact
+    silent-degradation shape this repo's gates exist to prevent. Reads and
+    decodes now fail loudly inside ``parse_first_party_tree`` (strict utf-8,
+    errors propagate). A ``SyntaxError`` it RECORDS rather than raises — that
+    is the other gate's contract, which needs every bad file listed at once —
+    so this scan re-raises a recorded one for any file that passes the
+    prefilter, i.e. for exactly the files whose contents it actually depends on.
     """
     sites: list[_SiteKey] = []
     archival_refs: list[_SiteKey] = []
-    for py_file in iter_first_party_files(repo_root):
-        tree = ast.parse(py_file.read_text(encoding='utf-8'), filename=str(py_file))
+    for record in records:
+        if not any(name in record.source for name in _TRACKED_NAMES):
+            continue
+        if record.syntax_error is not None:
+            raise record.syntax_error
+        # tree XOR syntax_error is a ParsedFile invariant, but it is documented
+        # prose rather than something a type checker can see, so narrow it
+        # explicitly — and assert it, so a provider that ever broke the
+        # invariant fails here instead of raising AttributeError deeper in.
+        tree = record.tree
+        assert tree is not None, (
+            f'{record.relpath}: ParsedFile carries neither a tree nor a '
+            f'syntax_error — silent_fallthrough_scan.ParsedFile invariant broken'
+        )
         parent_map = _build_parent_map(tree)
-        rel = py_file.relative_to(repo_root).as_posix()
+        rel = record.relpath
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in _ARCHIVAL_NAMES:
                 archival_refs.append((rel, _compute_qualname(node, parent_map)))
@@ -127,17 +163,26 @@ def _scan(repo_root: Path) -> tuple[list[_SiteKey], list[_SiteKey]]:
     return sites, archival_refs
 
 
-@pytest.fixture(scope='module')
-def scan_result() -> tuple[list[_SiteKey], list[_SiteKey]]:
-    return _scan(_REPO_ROOT)
+@pytest.fixture(scope='session')
+def scan_result(
+    first_party_tree: Sequence[ParsedFile],
+) -> tuple[list[_SiteKey], list[_SiteKey]]:
+    """Scan the shared first-party tree once per SESSION, not once per module.
+
+    Session-scoped since task 4520: this gate used to re-enumerate, re-read and
+    re-parse the whole tree at module scope, duplicating work
+    ``test_silent_fallthrough_gate`` had already done. Both now walk the ASTs
+    ``first_party_tree`` (conftest.py) built once.
+    """
+    return _scan(first_party_tree)
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope='session')
 def scanned_sites(scan_result) -> list[_SiteKey]:
     return scan_result[0]
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope='session')
 def archival_ref_sites(scan_result) -> set[_SiteKey]:
     return set(scan_result[1])
 

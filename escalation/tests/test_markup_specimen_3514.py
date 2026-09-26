@@ -329,51 +329,110 @@ def test_the_landed_detector_fires_on_the_specimen(name: str) -> None:
     )
 
 
+#: The recovered lengths, per specimen. VERBATIM lengths, not the scrubbed
+#: control's — the fixture README quoted 1016/1077, which are these values
+#: inflated by a 16-character placeholder standing in for a 10-character
+#: literal. Corrected under task 4502; see that README's correction note.
+RECOVERED_EVIDENCE_CHARS = {"esc-3514-1.json": 1010, "esc-3514-3.json": 1071}
+RECOVERED_ACTION_CHARS = 261
+CLEAN_VALUE_CHARS = 1453
+
+
 @pytest.mark.parametrize("name", SPECIMEN_IDS)
 @pytest.mark.asyncio
-async def test_the_specimen_is_unrepairable_as_stored(name: str) -> None:
-    """(b) THE VERDICT PIN — recovery does NOT happen for this specimen class.
+async def test_the_specimen_is_repairable_as_stored(name: str) -> None:
+    """(b) THE VERDICT PIN — INVERTED under task 4502, at the same strength.
 
-    Task 3643's own description anticipated that under FORWARD_REPAIR "a
-    corrupted escalate_info LANDS with its suggested_action recovered instead
-    of being lost". Measured against the real records that is FALSE: `repair()`
-    returns None, which routes to `_refuse_unrepairable`, so the escalation
-    does not file under its own task id at all and the payload survives only as
-    a separate critical L2 residue record.
+    This was `test_the_specimen_is_unrepairable_as_stored`, and it FIRED
+    EXACTLY AS DESIGNED. Its own failure message prescribed this edit: "repair()
+    now SUCCEEDS where it measurably returned None. The recorded verdict in
+    docs/escalation-markup-write-boundary.md is stale and must be revisited."
+    So the pin is not deleted, and not weakened — it is replaced by the
+    opposite pin, asserting the new verdict at least as tightly as the old one
+    asserted the previous one.
 
-    IF THIS ASSERTION EVER FAILS, that is the intended signal, not a bug: a
-    future repairer has improved past this shape. Revisit — and update —
-    `docs/escalation-markup-write-boundary.md`, which records this verdict as
-    the answer to the task's question. Do not delete the test.
+    WHAT CHANGED. Task 3643 anticipated that under FORWARD_REPAIR "a corrupted
+    escalate_info LANDS with its suggested_action recovered instead of being
+    lost". Measured in 2026-08 against the real records that was FALSE, because
+    boundary row B5 refused any tail containing a closing tag anywhere in a
+    recovered value — and these escalations were REPORTING a markup leak, so
+    their evidence quotes the pattern that tripped the tripwire. Task 4502
+    narrowed B5 to an alternative-boundary test, and 3643's expectation is now
+    simply true: both records repair, recovering both swallowed siblings.
+
+    The call shape is still DERIVED from the live server, never hardcoded. Its
+    disjointness guard — `suggested_action` and `evidence` are asserted absent
+    from `supplied` — is what kept the old refusal assertion honest, and it
+    protects this one identically: were they supplied, `repair()` would refuse
+    on boundary row B9 and this test would fail for a reason with nothing to do
+    with the verdict it pins.
     """
     schema_params, supplied = await _escalate_info_call_shape()
     detail = _load(name)["detail"]
 
-    assert repair(detail, "detail", schema_params, supplied) is None, (
-        f"{name}: repair() now SUCCEEDS where it measurably returned None. "
-        f"The recorded verdict in docs/escalation-markup-write-boundary.md is "
-        f"stale and must be revisited."
+    result = repair(detail, "detail", schema_params, supplied)
+
+    assert result is not None, (
+        f"{name}: repair() returns None again, where task 4502 measured a "
+        f"successful recovery. The verdict recorded in "
+        f"docs/escalation-markup-write-boundary.md is stale and must be "
+        f"revisited — do not delete this test."
     )
+    assert set(result.recovered) == {"evidence", "suggested_action"}
+
+    # The absorbing parameter: contract C1's post-condition, unchanged by 4502.
+    assert len(result.clean_value) == CLEAN_VALUE_CHARS
+    assert detect(result.clean_value) is None
+
+    # The characters that were being dropped on the floor before this task —
+    # asserted by CONTENT and by length, so a truncating regression that still
+    # returned two names could not pass.
+    recovered_action = result.recovered["suggested_action"]
+    assert recovered_action.startswith(REAL_SUGGESTED_ACTION_PREFIX)
+    assert len(recovered_action) == RECOVERED_ACTION_CHARS
+
+    recovered_evidence = result.recovered["evidence"]
+    assert EVIDENCE_HEAD_PIN in recovered_evidence
+    assert recovered_evidence.count(OBSERVATION_KEY) == EVIDENCE_ENTRY_COUNT
+    assert len(recovered_evidence) == RECOVERED_EVIDENCE_CHARS[name]
+
+    # THE POINT OF THE CARVE-OUT. The delivered value still carries the literal,
+    # because that is the caller's OWN text: invariant D5 guarantees every
+    # recovered value is a verbatim substring of what the caller sent. It is
+    # not residue, and refusing to deliver it is what dropped it before. The
+    # middleware publishes the quoting as `quoted_markup_params` so it is
+    # countable rather than silent.
+    assert QUOTED_MATCHED_PATTERN in recovered_evidence
 
 
 @pytest.mark.parametrize("name", SPECIMEN_IDS)
 @pytest.mark.asyncio
 async def test_the_quoted_pattern_is_the_sole_blocker(name: str) -> None:
-    """(c) THE SCRUB CONTROL — what makes (b) a finding rather than a smoke test.
+    """(c) THE SCRUB CONTROL — kept, and re-framed by task 4502.
 
-    `repair()` rejects any candidate whose parsed tail contains a second
-    mis-close. The swallowed `evidence` value here QUOTES an envelope literal,
-    because the escalation was *reporting a markup leak* and faithfully
-    reproduced the `matched_pattern` that tripped the tripwire. Replacing ONLY
-    that one quoted literal with an inert placeholder — every other byte
-    untouched, asserted below — flips `repair()` from None to recovering both
-    swallowed siblings.
+    THIS WAS THE ISOLATING EXPERIMENT that identified the blocker. `repair()`
+    used to reject any candidate whose parsed tail contained a closing tag
+    anywhere in a recovered value. The swallowed `evidence` here QUOTES an
+    envelope literal, because the escalation was *reporting a markup leak* and
+    faithfully reproduced the `matched_pattern` that tripped the tripwire.
+    Replacing ONLY that one quoted literal with an inert placeholder — every
+    other byte untouched, asserted below — flipped `repair()` from None to
+    recovering both swallowed siblings. That isolated the quote as the sole
+    blocker, and is what routed the defect to task 4502.
 
-    Together (b) and (c) prove the quote is the ONLY blocker, which is the
-    generalisable finding: an escalation REPORTING a markup leak is the one
-    payload class the repairer structurally cannot recover, because a faithful
-    report quotes the pattern. This independently confirms the "doubly
-    corrupted" PRD boundary row B5 shape that
+    IT IS RETAINED AS THE REGRESSION CONTROL THAT THE BLOCKER IS GONE, and the
+    assertion is now the STRONGER post-state: scrubbing must leave the outcome
+    UNCHANGED. Both readings recover the same two names, the same
+    `clean_value`, the same `suggested_action`, and evidence differing ONLY by
+    the placeholder substitution. A future edit that re-coupled recovery to the
+    presence of a quoted literal — in either direction — fails here.
+
+    The old generalisation was that an escalation REPORTING a markup leak is
+    the one payload class the repairer structurally cannot recover. The class
+    is real; it is now RECOVERED rather than unrecoverable. PRD boundary row B5
+    still refuses the genuinely doubly-corrupted shape it was written for — an
+    inner closer that mis-closes the item itself, spans a tool-call boundary,
+    or yields an equally valid alternative parse — which is the shape
     `test_markup_middleware_registration.py` describes for `esc-3184-2`.
     """
     schema_params, supplied = await _escalate_info_call_shape()
@@ -406,6 +465,25 @@ async def test_the_quoted_pattern_is_the_sole_blocker(name: str) -> None:
 
     # repair()'s no-silent-partial-repair contract, on this payload.
     assert detect(result.clean_value) is None
+
+    # THE POST-4502 CLAIM: the scrub changes NOTHING but the placeholder.
+    # Before this task the unscrubbed reading returned None, so this comparison
+    # had no left-hand side at all; that it now exists IS the fix.
+    unscrubbed = repair(detail, "detail", schema_params, supplied)
+    assert unscrubbed is not None, (
+        f"{name}: the unscrubbed specimen no longer repairs, so the quoted "
+        f"pattern is blocking recovery again"
+    )
+    assert set(unscrubbed.recovered) == set(result.recovered)
+    assert unscrubbed.clean_value == result.clean_value
+    assert unscrubbed.recovered["suggested_action"] == recovered_action
+    assert recovered_evidence.replace(
+        INERT_PLACEHOLDER, QUOTED_MATCHED_PATTERN
+    ) == unscrubbed.recovered["evidence"], (
+        f"{name}: the scrubbed and unscrubbed recoveries differ by more than "
+        f"the placeholder substitution, so this is no longer a controlled "
+        f"experiment"
+    )
 
 
 def _empty_evidence(record: dict) -> bool:

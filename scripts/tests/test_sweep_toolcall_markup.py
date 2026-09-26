@@ -416,7 +416,7 @@ def test_symlinked_plan_fixture_is_an_absolute_symlink(sweep_root):
 
 
 # ---------------------------------------------------------------------------
-# step-1 — discovery. The two pinned path sets, and NOTHING else.
+# step-1 — discovery. The three pinned path sets, and NOTHING else.
 # ---------------------------------------------------------------------------
 
 
@@ -1095,12 +1095,24 @@ def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
     The nested double-leak shape cancelled task 3654 classified. What actually
     happens is worth pinning precisely, because it is NOT "repaired twice":
 
-    ``_parse_tail`` refuses outright when a recovered item contains a further
-    mis-close (PRD boundary row B5 — the inner value's boundary would be a
-    guess), so a STRICTLY nested leak is a refusal, not a two-round repair. The
-    shape that DOES survive round one is the unterminated inner opener below:
-    it carries no closing tag, so B5 does not fire, and the recovered value
-    lands in its hole still tripping detect().
+    ``_parse_tail`` refuses when a recovered item contains a further mis-close
+    (PRD boundary row B5 — the inner value's boundary would be a guess), so a
+    STRICTLY nested leak is a refusal, not a two-round repair. It said "refuses
+    OUTRIGHT" until task **5620**, which is the pre-**4502** rule stated
+    unconditionally (scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS). Nothing this
+    test asserts changes: its inner value is a real mis-close, and only a
+    merely-QUOTED closing tag repairs now.
+
+    THE REST OF THIS PARAGRAPH IS UNAFFECTED, and deliberately so. The shape
+    that DOES survive round one is the unterminated inner opener below: it
+    carries no closing tag, so B5 does not fire, and the recovered value lands
+    in its hole still tripping detect(). Task 5620 added a rule blocking a
+    parameter OPENER inside a recovered value and this shape STILL survives,
+    because ``_parse_body``'s cheap prefilter only fires on a closing-tag
+    sequence, so the rule never sees it. That asymmetry is declared rather than
+    overlooked — task **5639** owns it — and
+    closing it would rewrite this convergence case rather than merely correct
+    its prose.
 
     Round two then REFUSES it (there is no qualifying mis-close to scan), so
     the residue is reported rather than silently left — and a second
@@ -1133,31 +1145,41 @@ def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
     assert [o.action for o in again_outcomes].count(sweep.ACTION_REPAIRED) == 0
 
 
+def _never_converges(value, param, schema_params, supplied):
+    """A ``repair`` stub that always "repairs", so no document reaches a fixed point.
+
+    Module-level rather than nested in one test: two rows now need a
+    non-converging document and they must drive the loop bound the SAME way,
+    or "the sweep stalled" means something subtly different in each.
+
+    Stubbing ``repair`` rather than hand-building a document is deliberate and
+    STILL the only honest way to exercise the bound — but not for the reason
+    recorded here until task **5620**; see scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS for what
+    falsified it. What holds is weaker: no document in either live corpus has
+    been OBSERVED to reach the bound. Unreachable-by-construction would have
+    made a hand-built document merely hard to write; merely-unobserved makes it
+    UNRELIABLE — a document that reached the bound today would do so for
+    reasons no one has characterised. So the seam stays. Only a value the
+    per-field ``detect_for`` gate already flagged ever gets here, so a clean
+    document is unaffected by the stub.
+    """
+    return sweep.Repair(
+        clean_value=value,
+        recovered={'root_cause': 'restored by the stub'},
+        pattern=INVOKE_CLOSER,
+        misclose=INVOKE_CLOSER,
+    )
+
+
 def test_a_non_converging_document_reports_did_not_converge(monkeypatch):
     """Case (b): the bound truncates the LOOP, never a repair.
 
-    Driven through a stubbed ``repair`` rather than a hand-built document, and
-    deliberately so: with the real repairer no document can reach the bound —
-    a recovered value can never contain a further mis-close (B5 refuses the
-    parse), so one round always converges on every shape repair() accepts. That
-    is exactly why the loop is INSURANCE rather than routine machinery, and why
-    its bound has to be tested at the seam instead of through a fixture that
-    cannot exist today.
-
-    What must hold when the bound is hit: the document is still valid, every
-    repair already applied is INTACT, and the failure is reported loudly with
-    the path that was still changing — never silently truncated into a
-    plausible-looking clean result.
+    Driven through :func:`_never_converges`, which records why the bound can
+    only be reached at that seam. What must hold when it IS reached: the
+    document is still valid, every repair already applied is INTACT, and the
+    failure is reported loudly with the path that was still changing — never
+    silently truncated into a plausible-looking clean result.
     """
-    def _never_converges(value, param, schema_params, supplied):
-        # Always "repairs", never reaching a fixed point.
-        return sweep.Repair(
-            clean_value=value,
-            recovered={'root_cause': 'restored by the stub'},
-            pattern=INVOKE_CLOSER,
-            misclose=INVOKE_CLOSER,
-        )
-
     monkeypatch.setattr(sweep, 'repair', _never_converges)
     record = make_escalation('esc-8-2', 'resolved', 'detail ' + INVOKE_CLOSER)
 
@@ -1307,7 +1329,7 @@ def test_a_symlinked_plan_resolves_to_the_meta_root_and_stays_a_link(sweep_root)
 
     ``os.replace`` onto the link path would replace it with a regular file and
     re-fork the lane and meta-root copies — the esc-5205-9 stale-plan
-    divergence ``plan_tools._atomic_write_plan`` documents at line 715. The
+    divergence ``TaskArtifacts._write_json`` documents. The
     link must therefore still be a link after resolution, and forever after.
     """
     target = _plan_target(sweep_root, '9002-2026')
@@ -1446,8 +1468,9 @@ def test_unreproducible_formatting_is_refused(raw):
     """A hand-edited or unusually-formatted file fail-safes for free.
 
     Rewriting it would put changes in the diff that the corrupted strings did
-    not cause — the exact reason plan_tools._atomic_write_plan was NOT reused
-    here (it stamps _schema_version and re-indents).
+    not cause — the exact reason TaskArtifacts.write_plan, the single
+    plan.json writer, is NOT reused here (it stamps _schema_version and
+    re-indents).
     """
     assert sweep.round_trips(raw, json.loads(raw)) is False
 
@@ -1725,10 +1748,14 @@ def test_non_convergence_is_counted_at_the_cli_and_forces_a_non_zero_exit(
     this task is measured by.
 
     Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`,
-    and for the same reason: no real document can reach the bound today (B5
-    refuses a nested parse). That is what makes the wiring worth testing NOW —
-    the outcome exists to be the tripwire for a future widening of ``repair()``,
-    and a tripwire connected to nothing is not a tripwire.
+    and for the reason :func:`_never_converges` records: the bound has never
+    been OBSERVED to be reached on either live corpus, which is weaker than the
+    unreachability this docstring asserted until task **5620**.
+
+    That makes the wiring MORE worth testing now, not less. The outcome was
+    written as a tripwire for a future widening of ``repair()``; two widenings
+    have since landed (4502 and 5620), and a tripwire connected to nothing is
+    not a tripwire.
     """
     def _never_converges(value, param, schema_params, supplied):
         return sweep.Repair(
@@ -1759,11 +1786,38 @@ def test_non_convergence_is_counted_at_the_cli_and_forces_a_non_zero_exit(
 
 
 def test_the_lane_flag_narrows_the_sweep(sweep_root, capsys):
-    """--lane lets an operator run one corpus at a time."""
-    _c, plans_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'plans')
-    _c2, esc_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'escalations')
+    """--lane lets an operator run one corpus at a time — every lane, via argv.
+
+    All three lanes go through ``_run_json`` -> ``sweep.main(argv)``, which is
+    the argparse path an operator's cron actually takes. ``meta-plans`` is here
+    because it is the lane the periodic check is documented to use, and until
+    this row its ONLY argv-level coverage was
+    ``sweep.LANE_META_PLANS in sweep._LANE_CHOICES`` — an assertion against a
+    private constant, which cannot tell a selectable lane from a lane the
+    parser rejects. The exit code is asserted rather than discarded for the
+    same reason: an operator reads the status, not the JSON.
+    """
+    plans_code, plans_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'plans'
+    )
+    esc_code, esc_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'escalations'
+    )
+    meta_code, meta_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'meta-plans'
+    )
+
     assert plans_only['files_scanned'] == 2
     assert esc_only['files_scanned'] == 4
+    assert meta_only['files_scanned'] == 1, (
+        'the one `.worktrees/.task-meta/9002/plan.json` the fixture holds — '
+        'and NOT the `.worktrees-orphaned` symlink that points at it, which '
+        'belongs to the plans lane'
+    )
+
+    assert (plans_code, esc_code, meta_code) == (
+        sweep.EXIT_REPAIRABLE_REMAINS,
+    ) * 3, 'every lane of this fixture has repairable work pending'
 
 
 def test_the_script_source_spells_no_raw_envelope_literal():
@@ -2088,9 +2142,9 @@ def test_the_did_not_converge_path_does_not_duplicate_refusals(monkeypatch):
     keeping the duplicate-refusal bug on exactly the path that already means
     something has gone wrong.
 
-    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`
-    — no real document can reach the bound (B5 refuses a nested parse) — but
-    this stub also REFUSES one field, so the run has refusals to duplicate.
+    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`,
+    for the reason :func:`_never_converges` records — but this stub also
+    REFUSES one field, so the run has refusals to duplicate.
     """
     def _repairs_detail_only(value, param, schema_params, supplied):
         if param != 'detail':
@@ -2187,9 +2241,12 @@ def test_the_self_name_specimen_is_invisible_to_the_blanket_predicate():
 def test_repair_document_repairs_a_self_name_closer_in_a_dict_field():
     """The gate widening, asserted where the sweep actually writes.
 
-    Today ``_repair_dict``'s per-field gate asks the param-free ``detect``, so
-    both fields are skipped, the document round-trips UNCHANGED and the sweep
-    reports nothing at all — the corruption is not even counted as residue.
+    ``_repair_dict``'s per-field gate asks the parameter-aware ``detect_for``
+    (task **4696**), so both self-name closers are SEEN and both fields are
+    repaired here, on the path that rewrites the file. Each outcome is
+    ``ACTION_REPAIRED`` with empty ``recovered_names`` — the PRD boundary row
+    B4 last-parameter shape, where the mis-closed field was the final argument
+    so there was nothing to drop and nothing to recover.
     """
     document = _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW)
     original = json.loads(json.dumps(document))
@@ -2351,8 +2408,11 @@ def test_the_meta_plans_lane_selects_the_same_files_as_all(meta_plans_root):
     """(a, continued) ``--lane meta-plans`` and ``--lane all`` agree here.
 
     This root holds nothing but meta-root plans, so the two runs must produce
-    identical summaries. A lane constant that discovery tagged but the CLI
-    could not select would be a lane in name only.
+    identical summaries. Scoped to what it calls: ``run_sweep(lane=...)``
+    directly, so this row pins the SELECTION, not the CLI — whether the lane
+    the operator's ``--lane meta-plans`` resolves to is argparse-reachable at
+    all is pinned by ``test_the_lane_flag_narrows_the_sweep``, which goes
+    through ``sweep.main(argv)``.
     """
     scoped, _ = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
     everything, _ = sweep.run_sweep(meta_plans_root, lane='all')
@@ -2377,6 +2437,52 @@ def test_the_default_dry_run_reports_the_dead_lane_and_writes_nothing(meta_plans
     assert summary.pending == 1
     assert summary.exit_code() == sweep.EXIT_REPAIRABLE_REMAINS
     assert len(diffs) == 1 and '7001' in diffs[0]
+
+
+def test_a_skipped_file_is_still_SCANNED_and_counted(meta_plans_root):
+    """(b2) "Not looked at" must be distinguishable from "clean".
+
+    THE DEFECT. ``run_sweep`` applied the write gates BEFORE
+    ``repair_document``, so a plan under a live lane was counted in ``skipped``
+    and never scanned at all. New corruption is BY DEFINITION written by a
+    RUNNING task into a LIVE lane — so the check advertised as the silent-write
+    detector was structurally blind to exactly the population it claims to
+    detect, and reported a corrupt live plan identically to a clean one.
+
+    THE FIX IS COUNTING, NOT WRITING. ``repair_document`` is non-mutating and
+    returns a new object, so moving it ahead of the gates changes what is
+    COUNTED without changing what is WRITTEN. The rows below pin both halves:
+    the live-lane plan contributes to ``strings_detected`` and to a new
+    ``skipped_with_markup`` counter, while ``pending``, ``diffs`` and the exit
+    code are bit-for-bit what they were, and not one byte of the tree moves.
+    """
+    before = _fingerprint(meta_plans_root)
+
+    summary, diffs = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+
+    # (a) the live-lane plan is SEEN. 7001 (dead, corrupt) and 7002 (live,
+    # corrupt) both carry one repairable string; 7003 is clean.
+    assert summary.strings_detected == 2, (
+        'the skipped live-lane plan must contribute — it was 1 while the '
+        'sweep gated the scan behind the write decision'
+    )
+
+    # (b) ...and "skipped WITH corruption" is reportable on its own, which is
+    # the signal whose absence made a corrupt live plan look like a clean one.
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.skipped_with_markup == 1
+
+    # (c) THE EXIT-CODE CONTRACT IS UNCHANGED. exit_code() reads only
+    # did_not_converge / failed / pending and never `skipped`, so scanning more
+    # cannot raise the status: the status answers "is there DEAD-lane work
+    # pending", and the report answers "is it still happening".
+    assert summary.pending == 1, 'only the dead lane is actionable'
+    assert summary.repaired == 1
+    assert len(diffs) == 1 and '7001' in diffs[0]
+    assert summary.exit_code() == sweep.EXIT_REPAIRABLE_REMAINS
+
+    # (d) and scanning a skipped file writes NOTHING — bytes and mtimes both.
+    assert _fingerprint(meta_plans_root) == before
 
 
 def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
@@ -2409,7 +2515,16 @@ def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
 
 
 def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
-    """(e) The acceptance invariant delta already uses: second run reports 0."""
+    """(e) The acceptance invariant delta already uses: second run reports 0.
+
+    EXIT_CLEAN here does NOT mean the tree is clean — ``7002`` is still corrupt
+    on disk and always will be, because a live lane's plan is plan-tools' to
+    repair (PRD D4), not this sweep's. That is the exact ambiguity the
+    reviewer flagged: a green exit over a tree carrying known corruption, with
+    nothing in the report to say so. ``skipped_with_markup`` is that missing
+    signal, asserted here rather than only on the dry-run row, because this is
+    the invocation an operator's cron actually leaves green.
+    """
     sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True)
 
     summary, diffs = sweep.run_sweep(
@@ -2419,6 +2534,86 @@ def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
     assert summary.pending == 0
     assert diffs == []
     assert summary.exit_code() == sweep.EXIT_CLEAN
+    assert summary.skipped_with_markup == 1, (
+        'green exit, and the report still says corruption was seen'
+    )
+
+
+def test_a_non_converging_plan_under_a_live_lane_cannot_redden_the_status(
+    tmp_path, monkeypatch
+):
+    """(b3) The other half of (b2): the scan now sees STALLS it cannot act on.
+
+    THE DEFECT THE ROW ABOVE LEFT BEHIND. Moving the scan ahead of the write
+    gates made every counter it feeds reachable for a file the sweep then
+    REFUSES — and ``did_not_converge`` is the one residue counter
+    :meth:`Summary.exit_code` reads FIRST. A non-converging plan under a LIVE
+    lane would therefore have exited 3 on every periodic run forever, with no
+    action available: this sweep declines to write that file BY DESIGN, so no
+    re-run and no ``--apply`` could ever clear it. That directly contradicts
+    the module docstring's own promise that nothing observed about a refused
+    file can redden the status.
+
+    THE FIX IS THE SAME ONE (b2) ALREADY MADE for ``skipped_with_markup``:
+    bank the observation into a report-only counter of its own. The tree here
+    is a SINGLE live lane, so the stub cannot reach a writable file and the
+    green exit below is about the refusal rather than about an empty corpus.
+    """
+    root = tmp_path / 'repo'
+    write_plan(
+        root / '.worktrees' / '.task-meta' / '7002' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    (root / '.worktrees' / '7002').mkdir(parents=True, exist_ok=True)
+    before = _fingerprint(root)
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+
+    summary, diffs = sweep.run_sweep(root, lane=sweep.LANE_META_PLANS)
+
+    # (a) the refusal is what it always was, and the stall is REPORTED.
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.skipped_did_not_converge == 1, (
+        'the operator must still be told the document stalled'
+    )
+    assert summary.skipped_with_markup == 1
+
+    # (b) ...and it is reported through a channel the STATUS does not read.
+    assert summary.did_not_converge == 0, (
+        'a stall on a file this sweep refuses to write is not dead-lane work'
+    )
+    assert summary.exit_code() == sweep.EXIT_CLEAN, (
+        'exit 3 here would be permanent: there is no action that clears it'
+    )
+
+    # (c) and scanning it still writes nothing.
+    assert diffs == []
+    assert summary.pending == 0
+    assert _fingerprint(root) == before
+
+
+def test_a_non_converging_plan_the_sweep_MAY_write_still_reddens_the_status(
+    tmp_path, monkeypatch
+):
+    """The positive control for the row above: the tripwire still fires.
+
+    Same stub, same specimen, one difference — no ``.worktrees/<id>`` beside
+    the meta-root, so the plan belongs to a DEAD lane and this sweep owns it.
+    Without this row, ``skipped_did_not_converge`` could be implemented by
+    never counting a stall at all and (b3) would still pass.
+    """
+    root = tmp_path / 'repo'
+    write_plan(
+        root / '.worktrees' / '.task-meta' / '7001' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+
+    summary, _diffs = sweep.run_sweep(root, lane=sweep.LANE_META_PLANS)
+
+    assert summary.skipped == {}
+    assert summary.did_not_converge == 1
+    assert summary.skipped_did_not_converge == 0
+    assert summary.exit_code() == sweep.EXIT_DID_NOT_CONVERGE
 
 
 def test_never_touch_still_fires_for_a_meta_plans_shaped_target(meta_plans_root):

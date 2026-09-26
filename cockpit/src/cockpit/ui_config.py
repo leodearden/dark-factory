@@ -81,6 +81,11 @@ def save_ui_config(cfg: CockpitUIConfig, root: Path | str | None = None) -> None
     failure) so a save is never observed half-written. Fail-soft: any
     error is logged and swallowed rather than raised -- the cockpit's own
     UI-state write must never crash the view.
+
+    This mkdir + mkstemp + json.dump + os.replace is synchronous, and is
+    deliberately NOT called once per UI event:
+    ``cockpit/src/cockpit/app.py::CockpitApp._flush_ui_config`` debounces it
+    onto the poll tick. Do not reintroduce a per-keypress call site.
     """
     path = ui_config_path(root)
     try:

@@ -1040,9 +1040,8 @@ def test_default_status_fetcher_sends_absolute_project_root_for_dot(
     `{"error": "project_root must be a non-empty absolute path, got: '.'",
       "error_type": "ValidationError"}`.
 
-    In production that call ALWAYS carried a relative path: census.py's CLI
-    defaults `--project-root` to `"."`, and `nightly._default_census_launcher`
-    (nightly.py:521) launches census.py with no arguments at all. The MCP
+    census.py resolves its own, now required, `--project-root` (task 3269);
+    the `evaluate` CLI's `"."` default still reaches this resolve. The MCP
     argument is resolved by the SERVER's cwd, not the client's, so a relative
     path is meaningless over the wire."""
     monkeypatch.chdir(tmp_path)

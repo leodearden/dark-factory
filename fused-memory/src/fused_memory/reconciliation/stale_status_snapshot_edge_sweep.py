@@ -156,7 +156,8 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   residual pointed the WRONG way (an unlisted preposition over-selects)
   and one fail-safe residual (a genuine subject-position enumeration
   sharing a clause with a listed preposition is missed) — see
-  ``_ENUM_PREP_WORDS``.
+  ``_ENUM_PREP_WORDS``. The fail-safe one is MEASURED, not open: zero
+  cost on the live corpus (task 3949).
 - task 3037: the blocked family drops any aggregate list whose introducer
   follows a task reference in the same clause ('Task 5 is waiting on
   blocked tasks: 142, 148'), so a genuine aggregate of that shape is not
@@ -184,9 +185,9 @@ rate; do not re-open them:
    Those grounds covered query FILTERS only and were silent about
    server-side TRUNCATION.  Task 4340 measured a FalkorDB
    ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
-   HALF the valid-edge corpus on dark_factory (exact figures: the
-   RESULT-SET CAP AUDIT block in ``backends/graphiti_client.py``, which is
-   the one place they are recorded).  So at the time of the task-2613
+   HALF the valid-edge corpus on dark_factory (exact figures:
+   ``plans/falkordb-resultset-cap-audit.md``, which is the one place they
+   are recorded).  So at the time of the task-2613
    investigation this sweep saw about half the edges, and the miss rate was
    computed against a truncated denominator.  ``get_all_valid_edges`` is
    paginated as of task 4340 and the truncation is gone, but the RATE has
@@ -205,8 +206,8 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids_by_marker_class`` once per valid edge from
 an UNGUARDED dict comprehension with no per-edge timeout, over the whole
-group's edge set (tens of thousands of edges; current figures in the RESULT-SET CAP
-AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
+group's edge set (tens of thousands of edges; current figures in
+``plans/falkordb-resultset-cap-audit.md``).  Extractor cost is
 therefore a whole-cycle LIVENESS property — one pathological fact stalls
 the entire reconciliation cycle — not a micro-optimisation. (amendment,
 task 3079)
@@ -220,7 +221,7 @@ cycle, so the per-edge cost this test guards matters more than the
 original number implied, not less.  The read that feeds it was timed
 2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
 reify) — bounded, and roughly +2.6 s per cycle over the old truncated
-read; see the MEASURED COST section of that same audit block, so this
+read; see the MEASURED COST section of that same audit doc, so this
 claim rests on a number rather than on an estimate. (amendment, task 4340)
 
 Adding the second (blocked) pattern family did NOT add a second per-edge
@@ -243,12 +244,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
 
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     STRICT_CLAUSE_BOUNDARY_RE,
@@ -587,8 +589,64 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # speculation: every candidate tightening (requiring a plural/capitalized head
 # before the preposition, or stopping the backward scan at a comma when no
 # preposition follows it) trades back toward the unrecoverable over-selection
-# direction, so it needs measurement against the real edge corpus first.
+# direction, so it needed measurement against the real edge corpus first.
 # (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
+#
+# THAT MEASUREMENT IS NOW DONE (task 3949), against every populated FalkorDB
+# graph the store reports — discovered rather than hardcoded, because a
+# hardcoded project list is a coverage claim nothing checks. THE FIGURES LIVE
+# IN THE ARTIFACT, DELIBERATELY NOT HERE:
+#
+#     plans/plural-enum-guard-recall-report.md    (per-graph table, totals)
+#     plans/plural-enum-guard-recall-report.json  (same, machine-readable)
+#
+# An earlier draft of this block hand-copied that table inline, and every row
+# of it went stale within days as the corpus grew — the per-graph edge counts,
+# the graph count and the near-miss total all moved on the next re-run. Cite
+# the artifact and re-run the script; do not paste the numbers back in here.
+#
+# What the measurement FOUND is the durable part, and is what belongs here:
+# the recall cost of this guard on the real corpus is ZERO edges. Only two live
+# facts reach the guard at all, and both are genuine prepositional complements
+# it is right to reject — 'Task 3949 mentions that blockers for downstream,
+# still-unmerged tasks 1020 and 1030 are pending' (the BLOCKERS are pending).
+# Neither triages as an adverbial preamble, which is the only rejection class
+# that costs recall. Note the observer effect, and discount accordingly: both
+# edges were written at 07:24 on the FIRST measurement day by task 3949's own
+# session, so what the corpus actually offers is still zero organic matches.
+#
+# What the plural path loses here it loses at the REGEX, not at the guard. The
+# artifact's 'tasks <n>' column is a LEXICAL SUPERSET that already includes the
+# two full matches above; the remainder carry 'tasks <digits>' but no status
+# marker, no copula, or broken copula-marker adjacency ('Tasks 1752 and 1753
+# are related to ...', 'Both tasks 1920 and 1921 edit ...').
+#
+# Both candidates were re-validated against the full precision
+# parametrization, as the finding required before shipping either:
+#   (a) plural/capitalized head before the preposition — re-opens none of the
+#       47 pinned precision+suppression shapes, but does NOT recover
+#       'As of <date>, tasks ...', the finding's OWN motivating shape,
+#       because 'of' there follows the capitalized sentence-initial 'As'.
+#   (b) restart the backward scan after a preposition-free comma — recovers
+#       all three preamble shapes, but RE-OPENS the pinned over-selection
+#       'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are
+#       pending.', where the comma is intra-clause. It fails the required
+#       re-validation outright — and now on LIVE data too: it re-opens one of
+#       the two real corpus rejections above, which is the same shape.
+#
+# VERDICT: NOT TIGHTENED. Zero measured recall loss to buy back, against
+# nonzero unrecoverable over-selection risk, on a module whose stated
+# invariant is that under-selection self-heals and over-selection never does.
+#
+# Re-checkable as the corpus grows — the verdict is only as good as its
+# re-runnability, and a rejection census is a point-in-time fact:
+#     cd fused-memory && \
+#       uv run python scripts/measure_plural_enum_guard_recall.py
+# Artifacts: plans/plural-enum-guard-recall-report.{json,md}. The candidate
+# re-validation is mechanical — it parametrizes over the shared pinned corpora
+# in tests/reconciliation/plural_enum_shapes.py, which this suite parametrizes
+# off too, so a shape appended there re-validates both candidates — in
+# tests/test_measure_plural_enum_guard_recall.py.
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the
 # vocabulary has ONE source of truth: the regression test parametrizes
@@ -1452,6 +1510,67 @@ class _ExtractionResult(NamedTuple):
     rejected_spans: tuple[tuple[int, int], ...]
 
 
+def _plural_enum_ids(
+    fact: str,
+    pattern: re.Pattern[str] = PLURAL_ENUM_SNAPSHOT_RE,
+    *,
+    guard: Callable[[str], bool] = _enumeration_is_prepositional_complement,
+) -> tuple[set[int], list[tuple[int, int]]]:
+    """The plural-enumeration arm, in ONE place. (task 3079; task 3949; task 3037)
+
+    Returns ``(ids, rejected_spans)``: the ids the plural path yields, and the
+    spans of every enumeration *guard* rejected. Both outputs are needed by
+    the production extractor — a rejected span is, by construction, a region
+    established to be a preposition's complement, so the drop it implies is
+    applied to every other anchored path too (see ``_extract_ids``).
+
+    Ids come from the match's ``'ids'`` group only, via ``_BARE_DIGIT_RE``,
+    preserving invariant (d): a bare ``\\d+`` contributes an id only from
+    inside an already-detected, marker-anchored span.
+
+    WHY THIS IS A FUNCTION AND NOT AN INLINE LOOP. ``guard`` is injectable
+    solely so task 3949's recall probe
+    (``fused-memory/scripts/measure_plural_enum_guard_recall.py``) can run the
+    IDENTICAL arm under a candidate guard instead of re-implementing it. A
+    hand-copied arm in the probe would keep measuring the old spelling after
+    this one gained a step, and would report a reassuring zero while doing it
+    — the same staleness argument that makes the probe import
+    ``PLURAL_ENUM_SNAPSHOT_RE`` rather than re-spell it. Any future drift now
+    surfaces as a signature change rather than as a silently stale copy.
+
+    The default is the shipped guard, so production callers pass nothing and
+    the injection point costs them nothing. It is a REPORTING seam, not an
+    extension point: no production caller may pass a different guard.
+
+    *pattern* defaults to ``PLURAL_ENUM_SNAPSHOT_RE`` — i.e. the UNION
+    family's plural arm, since that constant is bound from
+    ``_UNION_PATTERNS`` — so the probe's one-positional-argument call keeps
+    measuring exactly the arm it always measured. ``_extract_ids`` passes its
+    own family's ``patterns.plural_enum`` explicitly instead, because the
+    BLOCKED family narrows this pattern and must not silently fall back to
+    the union's. (task 3037 made the patterns per-family; this parameter is
+    how the task-3949 seam survives that.)
+
+    Pure: no I/O, no side effects.
+    """
+    ids: set[int] = set()
+    rejected_spans: list[tuple[int, int]] = []
+    for enum in pattern.finditer(fact):
+        # Subjecthood guard, second half: reject an enumeration that is a
+        # PREPOSITION'S COMPLEMENT rather than the copula's subject
+        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
+        # pending). Lives here rather than as an in-pattern lookbehind
+        # because Python lookbehind is fixed-width, and a fixed offset is
+        # defeated by a single intervening determiner — while the words that
+        # may sit in that gap are an open class no bound can cover. See
+        # _ENUM_PREP_WORDS.
+        if guard(fact[: enum.start()]):
+            rejected_spans.append(enum.span())
+            continue
+        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    return ids, rejected_spans
+
+
 def _extract_ids(
     fact: str,
     patterns: _SnapshotPatterns,
@@ -1481,22 +1600,22 @@ def _extract_ids(
 
     Pure: no I/O, no side effects.
     """
-    ids: set[int] = set()
-    rejected_spans: list[tuple[int, int]] = [*inherited_rejected_spans]
-
-    for enum in patterns.plural_enum.finditer(fact):
-        # Subjecthood guard, second half: reject an enumeration that is a
-        # PREPOSITION'S COMPLEMENT rather than the copula's subject
-        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
-        # pending). Lives here rather than as an in-pattern lookbehind
-        # because Python lookbehind is fixed-width, and a fixed offset is
-        # defeated by a single intervening determiner — while the words that
-        # may sit in that gap are an open class no bound can cover. See
-        # _ENUM_PREP_WORDS.
-        if _enumeration_is_prepositional_complement(fact[: enum.start()]):
-            rejected_spans.append(enum.span())
-            continue
-        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    # The plural arm lives in _plural_enum_ids so task 3949's recall probe can
+    # measure THIS code rather than a copy of it (see that function). THIS
+    # family's plural pattern is passed explicitly — the blocked family
+    # narrows it, and must not fall back to the union default.
+    #
+    # This family's OWN rejections are concatenated AFTER the inherited ones,
+    # which reproduces exactly the order the in-place loop built before the arm
+    # was extracted (inherited seeded first, own appended in match order). The
+    # loop only ever APPENDED to rejected_spans and never read it, so hoisting
+    # it out is order- and value-preserving; the spans are consumed as an
+    # unordered membership test below in any case.
+    ids, own_rejected_spans = _plural_enum_ids(fact, patterns.plural_enum)
+    rejected_spans: list[tuple[int, int]] = [
+        *inherited_rejected_spans,
+        *own_rejected_spans,
+    ]
 
     # Suppressing only the PLURAL match left the rejected enumeration's tail
     # extractable by the other anchored paths, because an enumeration may
@@ -1792,6 +1911,53 @@ def select_stale_status_snapshot_edges(
 # convention of stamping a stable, identifiable actor.
 _SWEEP_AGENT_ID = 'recon-stage-memory_consolidator'
 
+# The names this sweep's completeness pair carries once MemoryConsolidator has
+# prefixed it onto ``report.stats``.  Exported as symbols rather than left as
+# inline literals at each of producer / consumer / test, matching the
+# :data:`~fused_memory.reconciliation.task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
+# precedent for exactly this stat family — otherwise a rename has to be found
+# by grep across five files, which is how a stat key ends up half-renamed and
+# a consumer starts silently reading `None`.  (amendment,
+# reviewer_comprehensive pattern-consistency finding, task 4386)
+#
+# NOTE the two layers: the sweep's own returned dict uses the SHORT keys
+# ``enumeration_complete`` / ``enumeration_incomplete_kind`` (documented on
+# ``sweep_stale_status_snapshot_edges`` below), and the consolidator projects
+# them onto ``report.stats`` under this module's prefix.  These constants name
+# the ``report.stats`` layer — the one that crosses module boundaries and is
+# read by the ledger, the journal and the judge.  Spelled out as whole
+# literals rather than built by concatenating a prefix, so the shipped key
+# name stays greppable from a log line back to here.
+
+STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_complete'
+)
+"""Key under Stage 1's ``report.stats``: this sweep's TRI-STATE read verdict.
+
+``True`` = the edge enumeration was proven whole, ``False`` = a corpus was
+observed and found incomplete, ``None`` = no corpus was observed. The only
+safe predicate is ``is True``; ``is not False`` would admit the UNKNOWN case,
+letting a cycle that never looked pass as one that looked and found
+everything.
+
+Conditional presence: ABSENT when the sweep itself raised (the stage swallows
+that best-effort and sets NONE of its stats), which is honest in a way
+``False`` would not be — ``False`` claims a corpus was observed. Read via
+``report.stats.get(...)``, never direct indexing.
+"""
+
+STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_incomplete_kind'
+)
+"""Key under Stage 1's ``report.stats``: WHICH WAY the corpus was partial.
+
+Carries the backend's stable ``INCOMPLETE_*`` discriminator (never
+``PagedRead.reason``, whose wording the backend documents as deliberately
+unstable), or ``None`` when there is nothing to discriminate. Conditional
+presence exactly as for
+:data:`STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY` above.
+"""
+
 
 async def sweep_stale_status_snapshot_edges(
     memory_service,
@@ -1806,7 +1972,7 @@ async def sweep_stale_status_snapshot_edges(
     """Enumerate valid status-snapshot edges and invalidate the stale ones.
 
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
-    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    ``memory_service.graphiti.enumerate_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
     each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
@@ -1821,7 +1987,8 @@ async def sweep_stale_status_snapshot_edges(
     retired assertion instead of merely losing it.
 
     Args:
-        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
+        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``
+            and
             ``.update_edge``.
         taskmaster: Object exposing ``.get_statuses``. A falsy value (e.g.
             unavailable backend) short-circuits to all-zero stats.
@@ -1835,7 +2002,7 @@ async def sweep_stale_status_snapshot_edges(
 
     Best-effort (mirrors
     ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
-    backend error enumerating (``get_all_valid_edges``), cross-referencing
+    backend error enumerating (``enumerate_all_valid_edges``), cross-referencing
     (``get_statuses``), or invalidating (``update_edge``) is caught, logged,
     and tallied into ``stats['errors']``. An enumeration or cross-reference
     failure aborts the rest of this cycle's sweep (there is nothing left to
@@ -1877,6 +2044,36 @@ async def sweep_stale_status_snapshot_edges(
         contradicted tasks left without a superseding fact because
         ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` was reached).
 
+        Plus two keys describing the READ that produced ``scanned`` rather
+        than counting anything (task 4386):
+
+        ``enumeration_complete`` (``bool | None``) — TRI-STATE, because three
+        outcomes are genuinely distinct and collapsing any pair loses
+        information the reader needs. ``True`` = the read was PROVEN
+        complete; ``False`` = a corpus was observed and it was INCOMPLETE;
+        ``None`` = NO corpus was observed at all, either because this call
+        short-circuited on a falsy *taskmaster*/*project_root* or because the
+        enumeration itself failed (``errors`` tells those two apart). The
+        ONLY predicate a caller may gate on is ``is True``: an ``is not
+        False`` test would admit both UNKNOWN cases, which would let a cycle
+        that never looked pass as one that looked and found everything.
+
+        ``enumeration_incomplete_kind`` (``str | None``) — the backend's
+        ``INCOMPLETE_*`` constant (``graphiti_client.py::INCOMPLETE_PAGE_CAP``
+        and siblings), which is the documented STABLE discriminator. Callers
+        should branch on membership in
+        ``graphiti_client.py::INCOMPLETE_STRUCTURAL_KINDS`` rather than on a
+        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced: the
+        backend documents its wording as diagnostic prose and an unstable
+        interface, so projecting it into stats would invite consumers to
+        parse it.
+
+        Both keys describe the read, NOT the counted funnel, so they leave
+        the ``invalidated == candidate_edges - errors`` identity below
+        exactly true. An EMPIRICAL incompleteness in particular does not
+        touch ``errors``: the sweep proceeds on what it fetched, and the
+        cycle merely says the corpus was partial.
+
         ``errors`` stays scoped to the enumerate / cross-reference /
         INVALIDATE paths, which is what keeps the identity
         ``invalidated == candidate_edges - errors`` exactly true: every
@@ -1894,18 +2091,56 @@ async def sweep_stale_status_snapshot_edges(
     stats = {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
         'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. Every early return below therefore reports the honest
+        # 'no corpus observed' rather than a fabricated clean read. (task 4386)
+        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
     }
 
     if not taskmaster or not project_root:
         return stats
 
     try:
-        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
+            group_id=project_id,
+        )
+        # Recorded BEFORE the policy is applied, and the ordering is
+        # load-bearing: apply_incompleteness_policy RAISES on a structural
+        # incompleteness, so assigning after it would leave the aborted cycle
+        # reporting errors=1 with no stated reason and the operator
+        # reconstructing the cause from logs — the exact reconstruction this
+        # signal exists to remove. (task 4386)
+        stats['enumeration_complete'] = paged.complete
+        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
+        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
+        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
+        # applied on this sweep's behalf has to be re-applied here, or a
+        # page-capped read is taken for the whole corpus and every edge the
+        # missing pages carry is scanned as absent: a silently clean cycle that
+        # retires nothing. Deliberately INSIDE the same try, so a structural
+        # incompleteness lands in the existing handler below exactly as the
+        # shim's raise did (``IncompleteEnumerationError`` subclasses
+        # ``Exception``, never ``BaseException``, precisely so it is caught
+        # here). An EMPIRICAL incompleteness only warns — through this sweep's
+        # injected ``log``, so the one message about a truncated corpus
+        # surfaces with the rest of the cycle's diagnostics — and the sweep
+        # proceeds on what it did get. (task 4386)
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_all_valid_edges',
+            group_id=project_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not drive a staleness verdict',
+            log=log,
+        )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         log.exception(
-            'stale_status_snapshot_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            'stale_status_snapshot_edge_sweep: enumerate_all_valid_edges failed for '
+            'group_id=%s',
             project_id,
         )
         stats['errors'] += 1

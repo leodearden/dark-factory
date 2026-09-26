@@ -42,7 +42,7 @@ Read `docs/legibility/design-invariants.md` — the single normative list; do no
 
 Resolve any hit by redesigning the task, or by waiving it: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task at Step 3. An unresolved, unwaived hit **blocks** the batch until Step 3.
 
-Calibration fixtures will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped and one code-snippet-shaped per invariant — plus the rehearsal verdict table, for calibrating this walk against dark-factory's family.
 
 ### Step 2.5 — Capability manifest (mechanize G3 + G6; commit beside the PRD)
 

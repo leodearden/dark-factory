@@ -90,7 +90,12 @@ from collections.abc import Sequence
 # differently, so one shared compare_unit would change a report text both
 # suites assert on) with a filed follow-up. Do not read the import above as
 # evidence the lift is finished.
-from systemd_unit_parity import find_dropins, parse_unit_directives
+from systemd_unit_parity import (
+    _ABSENT,
+    Drift,
+    find_dropins,
+    parse_unit_directives,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,12 +110,6 @@ LOG_TAG = "lms_unit_parity"
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
-
-# Rendered in place of a value on whichever side does not declare the
-# directive at all. Deliberately not '' or None: it appears verbatim in the
-# operator's report, where "<absent>" reads unambiguously and an empty string
-# would look like a directive set to nothing.
-_ABSENT = "<absent>"
 
 # The instance suffix probed in place of the bare template. `systemctl show`
 # on `lms-arm@.service` does not resolve %i-dependent state the way an
@@ -162,16 +161,9 @@ def _same_file_key(path: str | pathlib.Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
-class Drift:
-    """One disagreement between the repo copy and the installed copy."""
-
-    unit: str
-    section: str
-    key: str
-    repo_value: str
-    installed_value: str
-    reason: str
+# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
+# (see the import above). They were code-identical in all three checkers; the
+# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)

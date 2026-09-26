@@ -766,3 +766,75 @@ class TestFetchEventsByTypeAllRuns:
         assert store.fetch_events_by_type_all_runs(
             EventType.workflow_verify, task_id='does-not-exist'
         ) == []
+
+
+class TestMergeSerialLaneBreachedEventType:
+    """EventType.merge_serial_lane_breached must exist and round-trip (task 2930/η).
+
+    The C4 serial-lane TRIPWIRE (PRD merge-worktree-lifecycle-integrity §4 C4,
+    §9 row 10): a second concurrent LOCAL merge verify was dispatched while the
+    _MERGE_AHEAD_BOUND-derived per-host in-flight bound is 1.  DETECTION ONLY —
+    the dispatch is not blocked.  Resolves PRD §11 Open Q4 (the tentative
+    `merge_serial_lane_violation` is rejected: no enum member contains
+    `violation`, `tripwire` or `guard`; the house shape is
+    <subject>_<past-participle-outcome>).
+    """
+
+    def test_merge_serial_lane_breached_member_exists_and_name_equals_value(self) -> None:
+        """merge_serial_lane_breached must exist with value == name (project convention)."""
+        assert EventType.merge_serial_lane_breached == 'merge_serial_lane_breached'
+        assert (
+            EventType.merge_serial_lane_breached.value
+            == EventType.merge_serial_lane_breached.name
+        )
+
+    def test_merge_serial_lane_breached_round_trip(self, tmp_path: Path) -> None:
+        """Emitting the tripwire event writes exactly one row whose data round-trips.
+
+        The round-trip half is what proves the payload is JSON-serialisable:
+        EventStore.emit is documented "Never raises" and wraps its whole body in
+        a blanket `except Exception: logger.warning(...)`, so an unserialisable
+        value would SILENTLY DROP the row — a mock-only test would never notice.
+        """
+        db_path = tmp_path / 'sl_test.db'
+        store = EventStore(db_path, 'run-sl')
+        store.emit(
+            EventType.merge_serial_lane_breached,
+            task_id='5326',
+            phase='merge',
+            data={
+                'local_inflight': 2,
+                'per_host_bound': 1,
+                'merge_ahead_bound': 1,
+                'num_hosts': 1,
+                'branch': 'task/5326',
+                'request_id': 'mr-29dfdbc2',
+                'host': 'local',
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, "
+            "json_extract(data, '$.local_inflight') AS local_inflight, "
+            "json_extract(data, '$.per_host_bound') AS per_host_bound, "
+            "json_extract(data, '$.merge_ahead_bound') AS merge_ahead_bound, "
+            "json_extract(data, '$.num_hosts') AS num_hosts, "
+            "json_extract(data, '$.branch') AS branch, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.host') AS host "
+            "FROM events WHERE event_type = 'merge_serial_lane_breached'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_serial_lane_breached'
+        assert rows[0][1] == '5326'
+        assert rows[0][2] == 'merge'
+        assert rows[0][3] == 2
+        assert rows[0][4] == 1
+        assert rows[0][5] == 1
+        assert rows[0][6] == 1
+        assert rows[0][7] == 'task/5326'
+        assert rows[0][8] == 'mr-29dfdbc2'
+        assert rows[0][9] == 'local'

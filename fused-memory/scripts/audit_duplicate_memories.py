@@ -940,7 +940,7 @@ def find_liveness_snapshot_recurrences(
     which is what makes the rescope monotone: a bucket membership that existed
     before clause scoping cannot be vacated by it, so the rescope can only ADD
     recall and grows no new disclosure counter
-    (``TestLivenessSubjectFactsIsAdditive``, ``TestLivenessSubjectFactsFallback``).
+    (``TestLivenessSubjectFactsIsAdditive``).
 
     Clause scoping was INERT when the detector was first written:
     ``_CLAUSE_SPLIT_RE`` split on EVERY ``.``, shattering

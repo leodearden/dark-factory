@@ -248,6 +248,12 @@ _BASELINE_SERVICE_KWARGS = frozenset(
         'causation_id',
         'temporal_context',
         'reference_time',
+        # task 3669 (PRD leaf delta): the caller's `entities` declaration, always
+        # forwarded — None when omitted. It belongs in the BASELINE rather than
+        # among the gate's `extra` keys precisely because it is unconditional:
+        # this gate must neither add it nor drop it, and folding it in here
+        # keeps that assertion exact instead of loosening it to a subset check.
+        'declared_referents',
         '_source',
     }
 )

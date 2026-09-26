@@ -2076,3 +2076,43 @@ class TestStdinStarvationRaceLocal:
         assert captured_kwargs['stdin'] is None, (
             f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
         )
+
+
+class TestWriteCodexMcpConfig:
+    """codex loads ``.codex/config.toml`` as ``[mcp_servers.<name>]`` tables
+    with ``command`` + ``args``; the former ``[[mcp_servers]]`` array-of-tables
+    shape was rejected by codex 0.143 and 0.154 alike ("invalid type:
+    sequence, expected a map"), so no codex invocation with an MCP server had
+    ever started. Parse what we write with tomllib and check the shape."""
+
+    def test_writes_one_table_per_server_with_command_args_and_env(self, tmp_path) -> None:
+        import tomllib
+
+        from orchestrator.agents.invoke import _write_codex_mcp_config
+
+        path = tmp_path / 'config.toml'
+        _write_codex_mcp_config(path, {'mcpServers': {
+            'verdict-tools': {
+                'command': '/venv/bin/python',
+                'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
+                'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+            },
+            'plain': {'command': 'srv'},
+        }})
+        parsed = tomllib.loads(path.read_text())
+        servers = parsed['mcp_servers']
+        assert set(servers) == {'verdict-tools', 'plain'}
+        assert servers['verdict-tools']['command'] == '/venv/bin/python'
+        assert servers['verdict-tools']['args'] == ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"']
+        assert servers['verdict-tools']['env'] == {'FASTMCP_SHOW_SERVER_BANNER': 'false'}
+        assert servers['plain'] == {'command': 'srv', 'args': []}
+        assert 'mcp_servers' not in parsed.get('mcp_servers', {}).get('plain', {})
+
+    def test_no_servers_writes_an_empty_valid_file(self, tmp_path) -> None:
+        import tomllib
+
+        from orchestrator.agents.invoke import _write_codex_mcp_config
+
+        path = tmp_path / 'config.toml'
+        _write_codex_mcp_config(path, {'mcpServers': {}})
+        assert tomllib.loads(path.read_text()) == {}

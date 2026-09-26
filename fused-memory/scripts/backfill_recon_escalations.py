@@ -52,6 +52,43 @@ Safety properties:
 - Only ever calls EscalationQueue methods (get_pending, get, submit, resolve);
   never enumerates, moves, or deletes raw files directly.
 - Blocking escalations (infra_issue, recon_failure, etc.) are never touched.
+- The queue directory must ALREADY EXIST; ``run()`` refuses otherwise.  See the
+  section below.
+
+WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
+-------------------------------------------------------------
+:func:`run` refuses, before the scan, unless ``--queue-dir`` names a directory
+that ALREADY exists.  The default is the RELATIVE
+``./data/reconciliation/escalations``, so a run from anywhere but the project
+root -- a task worktree in particular -- manufactures an empty queue and reports
+``"pending_before": 0``, a false all-clear that ``main()`` below would hand back
+as exit 0.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
+
+A RESIDUAL THIS TASK RECORDED AND DELIBERATELY DID NOT GUARD (task 4319)
+-------------------------------------------------------------------------
+:func:`apply_plan` is not transactional.  Per group it stamps the canonical via
+``queue.submit()`` and THEN dismisses N children in a loop, with no rollback
+between the two.  Its own idempotency guard skips any canonical that already
+carries dedupe state, so a failure landing between the submit and the last
+``queue.resolve`` would strand the remaining children PERMANENTLY: the re-run
+sees the stamped canonical and skips the whole group.
+
+That is recorded rather than fixed here because under a uniform write-deny it
+is unreachable.  The first write-requiring syscall in every mutating queue path
+is the lockfile ``os.open(..., O_CREAT | O_RDWR)`` in
+``escalation/queue.py::escalation_id_lock``, taken outside any handler, so a
+denial aborts on record #1 before anything is written.  The premise that would
+make it reachable, and that a later reader should re-check: a PARTIAL policy
+that grants the queue root but denies a subtree — e.g. ``archive/``, where
+``escalation/queue.py::EscalationQueue._archive_resolved`` swallows ``OSError``
+into a ``logger.warning`` by deliberate no-data-loss choice.  Landlock does not
+produce that shape (its rules are path-prefix based), which is why it is a
+premise and not an observation.
 """
 
 from __future__ import annotations
@@ -68,6 +105,8 @@ from pathlib import Path
 from escalation.dedupe import DedupeConfig, compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+from fused_memory.utils.target_store_preflight import assert_queue_dir_exists
 
 logger = logging.getLogger(__name__)
 
@@ -227,15 +266,23 @@ def apply_plan(
       on the canonical and persists it via ``queue.submit()``.
     - Dismisses each child via ``queue.resolve(dismiss=True)``.
 
-    Returns a dict with ``dismissed`` and ``updated`` counts.
+    Returns a dict with ``dismissed`` and ``updated`` counts plus two
+    state-drift error counters: ``canonical_not_found`` (a canonical gone
+    before it could be stamped) and ``children_vanished`` (a child gone before
+    it could be dismissed, so its stamped canonical overstates the group).  A
+    canonical that already carries dedupe state is skipped uncounted: that is
+    A7b's idempotency guard, not a failure.
     """
     dismissed = 0
     updated = 0
+    canonical_not_found = 0
+    children_vanished = 0
 
     for collapse in plan.collapses:
         canonical = queue.get(collapse.canonical_id)
         if canonical is None:
             logger.warning('Canonical %s not found; skipping group', collapse.canonical_id)
+            canonical_not_found += 1
             continue
 
         # Guard: if the canonical already carries dedupe state, A7b may already
@@ -265,10 +312,16 @@ def apply_plan(
                     'get_pending and apply); skipping',
                     child_id,
                 )
+                children_vanished += 1
             else:
                 dismissed += 1
 
-    return {'dismissed': dismissed, 'updated': updated}
+    return {
+        'dismissed': dismissed,
+        'updated': updated,
+        'canonical_not_found': canonical_not_found,
+        'children_vanished': children_vanished,
+    }
 
 
 def run(
@@ -282,7 +335,13 @@ def run(
 
     Returns a report dict.  When ``apply`` is False (dry-run, the default),
     no writes are performed.
+
+    Refuses with ``TargetStoreMissing`` when *queue_dir* does not exist — see
+    the module docstring.  The check lives here rather than in ``main()`` so
+    programmatic callers inherit it too.
     """
+    assert_queue_dir_exists(queue_dir, operation='backfill_recon_escalations')
+
     queue = EscalationQueue(Path(queue_dir))
     pending = queue.get_pending()
     plan = build_plan(pending)
@@ -309,9 +368,21 @@ def run(
         pending_after = len(queue.get_pending())
         report['dismissed'] = result['dismissed']
         report['updated'] = result['updated']
+        report['canonical_not_found'] = result['canonical_not_found']
+        report['children_vanished'] = result['children_vanished']
         report['pending_after'] = pending_after
 
     return report
+
+
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when ``canonical_not_found`` or ``children_vanished``
+    is non-zero.
+
+    A missing key counts as 0; a dry-run report carries neither.
+    """
+    errors = report.get('canonical_not_found', 0) + report.get('children_vanished', 0)
+    return 1 if errors > 0 else 0
 
 
 def main() -> int:
@@ -351,7 +422,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return 0
+    return resolve_exit_code(report)
 
 
 if __name__ == '__main__':

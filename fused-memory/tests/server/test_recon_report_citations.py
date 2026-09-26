@@ -504,6 +504,104 @@ class TestCiteTask:
         assert result.get('error_type') == 'ReconReportFindingUnknown'
 
 
+    # ---- task 4864 step-5: the title-less record the producer writes -------
+    #
+    # ``title = result.get('title') or data.get('title', '')`` has NO rejection
+    # path, so a ``get_task`` record carrying no title at either level is
+    # stored as ``title=''``.  That is the ONE citation shape this validating
+    # producer mints itself, and it used to be permanently un-corroborable
+    # downstream — silently, since nothing logged it.  Titles are cosmetic
+    # (task 4864), so the citation must still be recorded; what must change is
+    # that it stops happening in silence.
+
+    TITLELESS_RECORDS = {
+        'no-title-key': {'id': '5'},
+        'title-none': {'id': '5', 'title': None},
+        'title-empty': {'id': '5', 'title': ''},
+        # Exercises the SECOND branch of the `or`: a falsy top-level title
+        # falling through to an equally title-less `data` sub-dict.
+        'data-without-title': {'id': '5', 'title': '', 'data': {'id': '5'}},
+        'data-none': {'id': '5', 'title': '', 'data': None},
+    }
+    LOGGER = 'fused_memory.server.recon_report'
+
+    def _titleless_state(self, record):
+        """A state whose interceptor returns *record* for dark_factory task 5."""
+        fake_ti = _FakeTaskInterceptor(
+            results={('5', '/home/leo/src/dark-factory'): record}
+        )
+        return self._state_and_finding(fake_ti=fake_ti)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(TITLELESS_RECORDS), ids=sorted(TITLELESS_RECORDS))
+    async def test_titleless_record_still_cites_but_warns(self, shape, caplog):
+        """A cosmetic field must not veto a citation whose existence check
+        passed — but the degraded write must be audible."""
+        state, run_id, finding_id, _ = self._titleless_state(self.TITLELESS_RECORDS[shape])
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('error') is None, (
+            f'a title-less record still EXISTS, so the citation must stand '
+            f'({shape}); got {result!r}'
+        )
+        assert result.get('project_id') == 'dark_factory' and result.get('task_id') == '5'
+        assert result.get('title') == '', (
+            f'the empty title is returned verbatim ({shape}); got {result!r}'
+        )
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        cited = report['flagged_items'][0]['cited_tasks']
+        assert len(cited) == 1 and cited[0]['task_id'] == '5', (
+            f'the citation must be appended ({shape}); got {cited!r}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, (
+            f'a title-less citation must be logged at WARNING ({shape}); got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        message = warnings[0].getMessage()
+        assert 'dark_factory' in message and '5' in message, (
+            f'the warning must identify the project/task ({shape}); got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_with_a_title_logs_no_such_warning(self, caplog):
+        """Companion: the signal stays meaningful only if the ordinary path is
+        silent."""
+        state, run_id, finding_id, _ = self._state_and_finding()
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('title') == 'T-5'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'a resolvable title must not warn; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_title_resolved_from_the_data_fallback_logs_no_warning(self, caplog):
+        """The `or data.get('title')` fallback is a SUCCESS, not a degradation."""
+        state, run_id, finding_id, _ = self._titleless_state(
+            {'id': '5', 'data': {'id': '5', 'title': 'T-5-from-data'}}
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('title') == 'T-5-from-data', (
+            f'the data fallback must still resolve a title; got {result!r}'
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'a title resolved via the data fallback must not warn; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task-2425 step-1: TestCiteTaskInRunCitedTaskDedup — RED until step-2 adds
 # the in-run cited-task fold to ReconReportState.cite_task

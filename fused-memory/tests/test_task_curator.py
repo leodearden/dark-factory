@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
+import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -38,6 +41,8 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
+    PoolWithheld,
+    PreparedCandidate,
     TaskCurator,
     _parse_batch_decisions,
     _parse_decision,
@@ -47,6 +52,7 @@ from fused_memory.middleware.task_curator import (
     _task_files,
     _to_pool_entry,
     _trim_pool,
+    clip_for_prompt,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -203,6 +209,48 @@ class TestFlattenTaskTree:
     def test_empty(self):
         assert flatten_task_tree({}) == []
 
+class TestClipForPrompt:
+    """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
+
+    Both the pool side (`_PoolEntry.render`) and the candidate side
+    (`_build_user_prompt` / `_build_batch_section`) route through it, so the
+    marker cannot drift between them.
+    """
+
+    def test_under_cap_returned_unchanged(self):
+        assert clip_for_prompt('abc', 10) == 'abc'
+
+    def test_empty_returned_unchanged(self):
+        assert clip_for_prompt('', 10) == ''
+
+    def test_exactly_at_cap_is_not_marked(self):
+        text = 'x' * 10
+        assert clip_for_prompt(text, 10) == text
+
+    def test_one_over_cap_is_marked(self):
+        text = 'x' * 11
+        clipped = clip_for_prompt(text, 10)
+        assert clipped.startswith('x' * 10)
+        assert clipped != text
+        # The count is reconstructed, never hard-coded.
+        assert str(len(text) - 10) in clipped
+
+    def test_marker_carries_the_exact_elided_count(self):
+        text = 'y' * 3000
+        cap = 2000
+        clipped = clip_for_prompt(text, cap)
+        assert clipped[:cap] == text[:cap]
+        marker = clipped[cap:]
+        elided = len(text) - cap
+        assert str(elided) in marker
+        # No other integer is smuggled into the marker.
+        assert [int(n) for n in re.findall(r'\d+', marker)] == [elided]
+
+    def test_marker_keeps_the_ellipsis_prefix(self):
+        clipped = clip_for_prompt('z' * 50, 10)
+        assert clipped[10] == '\u2026'
+
+
 class TestTrimPool:
     def _entry(self, task_id: str, source: str) -> _PoolEntry:
         return _PoolEntry(
@@ -220,7 +268,15 @@ class TestTrimPool:
 
     def test_no_trim_when_under_cap(self):
         pool = [self._entry(str(i), 'module') for i in range(5)]
-        assert len(_trim_pool(pool, 10)) == 5
+        kept, dropped_n = _trim_pool(pool, 10)
+        assert len(kept) == 5
+        assert dropped_n == 0
+
+    def test_exactly_at_cap_drops_nothing(self):
+        pool = [self._entry(str(i), 'module') for i in range(10)]
+        kept, dropped_n = _trim_pool(pool, 10)
+        assert kept == pool
+        assert dropped_n == 0
 
     def test_trims_dependency_first(self):
         pool = (
@@ -229,18 +285,122 @@ class TestTrimPool:
             + [self._entry(f'e{i}', 'embedding') for i in range(3)]
             + [self._entry(f'd{i}', 'dependency') for i in range(3)]
         )
-        result = _trim_pool(pool, 7)
-        sources = [e.source for e in result]
+        kept, dropped_n = _trim_pool(pool, 7)
+        sources = [e.source for e in kept]
         # dependency dropped first, so no dependency entries remain
         assert 'dependency' not in sources
-        assert len(result) == 7
+        assert len(kept) == 7
+        assert dropped_n == len(pool) - 7
 
     def test_anchor_preserved(self):
         pool = [self._entry('a', 'anchor')] + [
             self._entry(f'm{i}', 'module') for i in range(20)
         ]
-        result = _trim_pool(pool, 5)
-        assert any(e.source == 'anchor' for e in result)
+        kept, dropped_n = _trim_pool(pool, 5)
+        assert any(e.source == 'anchor' for e in kept)
+        assert len(kept) == 5
+        assert dropped_n == len(pool) - 5
+
+    def test_dropped_count_is_what_the_pool_lost(self):
+        """`dropped_n` is the census input — it must equal the real shortfall."""
+        pool = [self._entry(f'm{i}', 'module') for i in range(41)]
+        kept, dropped_n = _trim_pool(pool, 30)
+        assert len(kept) + dropped_n == len(pool)
+        assert dropped_n == 11
+
+
+class TestPoolWithheld:
+    """The census that tells the LLM its pool is incomplete.
+
+    Absence of a duplicate in a TRUNCATED pool is not evidence that no
+    duplicate exists, so the prompt has to say when the pool was cut — and
+    say nothing when it was not.
+    """
+
+    def test_empty_census_is_quiet(self):
+        assert PoolWithheld().total == 0
+        assert PoolWithheld().render() is None
+
+    def test_all_zero_counts_are_also_quiet(self):
+        census = PoolWithheld(
+            by_source={'module': 0, 'embedding': 0, 'dependency': 0, 'total_cap': 0},
+            caps={'module': 15},
+        )
+        assert census.total == 0
+        assert census.render() is None
+
+    def test_total_sums_every_source(self):
+        census = PoolWithheld(
+            by_source={'module': 4, 'embedding': 2, 'dependency': 1, 'total_cap': 3},
+        )
+        assert census.total == 10
+
+    def _payload(self, rendered: str) -> dict:
+        """Parse the JSON fact out of the rendered block (no substring matching)."""
+        line = next(
+            line for line in rendered.splitlines() if line.strip().startswith('pool_truncated:')
+        )
+        return json.loads(line.split('pool_truncated:', 1)[1])
+
+    def test_render_emits_a_parseable_pool_truncated_fact(self):
+        census = PoolWithheld(
+            by_source={'module': 7, 'embedding': 3, 'dependency': 0, 'total_cap': 0},
+            caps={
+                'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30,
+            },
+        )
+        rendered = census.render()
+        assert rendered is not None
+        payload = self._payload(rendered)
+        assert payload['withheld'] == {
+            'module': 7, 'embedding': 3, 'dependency': 0, 'total_cap': 0,
+        }
+        assert payload['caps'] == {
+            'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30,
+        }
+
+    def test_render_emits_exactly_one_fact_line(self):
+        census = PoolWithheld(by_source={'module': 1}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        assert rendered.count('pool_truncated:') == 1
+
+    def test_render_carries_the_decision_safety_guidance(self):
+        census = PoolWithheld(by_source={'module': 7}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        lowered = rendered.lower()
+        # The ONE place the guidance's wording is pinned — every other test
+        # asks `_carries_guidance`, which reads it from render() itself.
+        # Absence in a truncated pool is not proof of absence...
+        assert 'not proof' in lowered
+        # ...so prefer create over a speculative combine.
+        assert 'create' in lowered
+        assert 'combine' in lowered
+
+    def test_lower_bound_streams_are_named_in_the_fact(self):
+        """A count the retrieval window ceilinged must not read as exact."""
+        census = PoolWithheld(
+            by_source={'module': 7, 'embedding': 20},
+            caps={'module': 15, 'embedding': 10},
+            lower_bounds=('embedding',),
+        )
+        rendered = census.render()
+        assert rendered is not None
+        assert self._payload(rendered)['lower_bounds'] == ['embedding']
+        assert 'at least' in rendered.lower()
+
+    def test_an_exact_census_names_no_lower_bounds(self):
+        census = PoolWithheld(by_source={'module': 7}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        assert 'lower_bounds' not in self._payload(rendered)
+        assert 'at least' not in rendered.lower()
+
+    def test_is_frozen(self):
+        census = PoolWithheld(by_source={'module': 1})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            census.by_source = {'module': 2}  # type: ignore[misc]
 
 
 class TestCandidateHash:
@@ -414,6 +574,20 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
         )
         for tid, status in pairs
     ]
+
+
+def _carries_guidance(text: str) -> bool:
+    """Does *text* carry the pool-truncation decision-safety guidance?
+
+    Read from the guidance's ONE source — ``PoolWithheld.render`` itself —
+    so a test that only cares WHETHER a prompt carries it does not pin a
+    second copy of the prose. The wording is pinned in exactly one place,
+    ``TestPoolWithheld.test_render_carries_the_decision_safety_guidance``;
+    a reword touches that test and nothing else.
+    """
+    rendered = PoolWithheld(by_source={'module': 1}, caps={'module': 15}).render()
+    assert rendered is not None
+    return rendered.split('\n', 1)[1] in text
 
 
 class TestParseDecision:
@@ -626,7 +800,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         async def boom(*a, **k):
             raise RuntimeError('llm down')
@@ -653,7 +827,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='auth error', structured_output=None,
@@ -680,7 +854,7 @@ class TestCurateFallbacks:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='auth error', structured_output=None,
@@ -710,7 +884,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='StructuredOutput denied',
@@ -748,7 +922,7 @@ class TestCurateFallbacks:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='err', structured_output=None,
@@ -902,7 +1076,7 @@ class TestCurateFallbacks:
         }
 
         async def corpus_with_known_sizes(*a, **k):
-            return [], known_pool_sizes
+            return [], known_pool_sizes, PoolWithheld()
 
         # CuratorFailureError with subtype and cost_usd set.
         budget_error = CuratorFailureError(
@@ -1111,7 +1285,7 @@ class TestCuratorCapHandling:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1138,7 +1312,7 @@ class TestCuratorCapHandling:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1182,7 +1356,7 @@ class TestZeroOutputTimeoutAcceptance:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1234,7 +1408,7 @@ class TestZeroOutputTimeoutAcceptance:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         mock_llm = AsyncMock(side_effect=[zot_result, healthy_result])
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
@@ -1274,7 +1448,7 @@ class TestZeroOutputBreakerCurate:
 
     async def _curate(self, curator, title: str) -> CuratorDecision:
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             return await curator.curate(
@@ -1303,7 +1477,7 @@ class TestZeroOutputBreakerCurate:
 
         # 3rd call with breaker open — LLM must NOT be invoked.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1374,7 +1548,7 @@ class TestZeroOutputBreakerCurate:
 
         # Probe (half-open): should be allowed through and succeed.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1394,7 +1568,7 @@ class TestZeroOutputBreakerCurate:
             await curator.curate(CandidateTask(title='E'), project_id='p', project_root='/x')
 
         async def empty_corpus2(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus2), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1406,6 +1580,233 @@ class TestZeroOutputBreakerCurate:
         assert 'zero-output-breaker' not in r_next.justification
 
 
+class TestZeroOutputBreakerBatchReset:
+    """RED (task 4143): a successful MULTI-ITEM batch LLM call must reset the
+    consecutive-ZOT breaker too, not just the single-item curate() path.
+
+    On main, _call_llm_batch has no success-path reset, so in a
+    batch-dominant deployment size-1 bisect ZOTs accumulate across an
+    unbounded number of healthy batch round-trips until they trip the
+    breaker on a demonstrably healthy service.
+    """
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    def _healthy_batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': 'ok'}
+                for i in range(n)
+            ]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_resets_zot_counter(self):
+        """(1) A successful _call_llm_batch call resets the counter directly."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Seed one recorded ZOT directly.
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_between_zots_does_not_open_breaker(self):
+        """(2) Production symptom, end to end: ZOT, healthy batch, ZOT must NOT open
+        the breaker — the healthy batch has to clear what the first ZOT left behind."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        healthy = self._healthy_batch_result(2)
+        mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            # ZOT via curate() (counter → 1).
+            await curator.curate(
+                CandidateTask(title='Alpha'), project_id='p', project_root='/x',
+            )
+            # Healthy batch call — must reset counter to 0.
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='Batch1'), CandidateTask(title='Batch2')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+            # ZOT via curate() again (counter → 1, still under threshold=2).
+            await curator.curate(
+                CandidateTask(title='Bravo'), project_id='p', project_root='/x',
+            )
+
+        assert curator._zero_output_breaker_open_until is None
+        assert curator._consecutive_zero_output_timeouts == 1
+        # All three LLM-bound calls actually reached the LLM — nothing was
+        # short-circuited by a wrongly-opened breaker.
+        assert mock_llm.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_through_curate_batch_prepared_resets_counter(self):
+        """(3) Same reset, proven through the real production entry point
+        (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
+        rather than the private method directly."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
+        c2 = CandidateTask(title='Prepared candidate Delta', description='delta task details')
+        prepared = [
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+        ]
+
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_does_not_reset_counter(self):
+        """(4) Placement guard — GREEN before and after the fix. A failed batch
+        must NOT reset the counter, pinning the reset behind the success check
+        (if it were placed above the `if not agent_result.success` guard, the
+        breaker would become unreachable from the batch path)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        zot = self._zot_result()
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot)), \
+             pytest.raises(CuratorFailureError):
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert curator._consecutive_zero_output_timeouts == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_closes_already_open_breaker(self):
+        """(5) Deliberate semantic widening, pinned per this task's plan design
+        decision 3: a successful `_call_llm_batch` call closes an ALREADY-OPEN
+        breaker/cooldown too, not just the consecutive counter.
+
+        During a real bisect, `_call_llm_batch_with_fallback`'s two halves run
+        concurrently under asyncio.gather. A left half that bisected down to
+        size-1 curate() calls can open the breaker (two ZOTs, threshold=2)
+        while a sibling right-half batch call is still in flight; when that
+        sibling batch succeeds, this reset now cancels the cooldown the left
+        half just opened. Pre-task-4143 the batch path had no reset at all,
+        so it could never close an open breaker either — this is new
+        behaviour introduced by the fix, not a narrowing of pre-existing
+        behaviour. It is accepted rather than restricted to counter-only
+        because a completed LLM round-trip is still proof the backend isn't
+        wedged (see the plan's design-decision rationale)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Simulate a sibling bisect half having already tripped the breaker.
+        now = time.monotonic()
+        curator._record_zero_output_timeout(now)
+        curator._record_zero_output_timeout(now)
+        assert curator._consecutive_zero_output_timeouts == 2
+        assert curator._zero_output_breaker_open_until is not None
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='E'), CandidateTask(title='F')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        assert curator._consecutive_zero_output_timeouts == 0
+        assert curator._zero_output_breaker_open_until is None
+
+
 class TestCurateHappyPath:
     @pytest.mark.asyncio
     async def test_create_flows_through_llm(self):
@@ -1413,7 +1814,7 @@ class TestCurateHappyPath:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         llm_result = AgentResult(
             success=True,
@@ -1443,6 +1844,7 @@ class TestCurateHappyPath:
             return (
                 _pool_with_ids(('99', 'done')),
                 {'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0},
+                PoolWithheld(),
             )
 
         llm_result = AgentResult(
@@ -1472,6 +1874,7 @@ class TestCurateHappyPath:
             return (
                 _pool_with_ids(('50', 'pending')),
                 {'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0},
+                PoolWithheld(),
             )
 
         llm_result = AgentResult(
@@ -1597,7 +2000,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='Follow-up', spawned_from='100'),
                 project_id='p', project_root='/x',
             )
@@ -1635,7 +2038,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='New bug', files_to_modify=['src/parser.py']),
                 project_id='p', project_root='/x',
             )
@@ -1666,7 +2069,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='T', files_to_modify=['src/parser.py']),
                 project_id='p', project_root='/x',
             )
@@ -1709,7 +2112,7 @@ class TestBuildCorpus:
         with patch.object(curator, '_ensure_collection', return_value='task_curator_p'), \
              patch.object(curator, '_get_embedder', return_value=mock_embedder), \
              patch.object(curator, '_get_qdrant', return_value=mock_client):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='Near-identical re-file'),
                 project_id='p', project_root='/x',
             )
@@ -1718,6 +2121,435 @@ class TestBuildCorpus:
         assert not any(e.task_id == orphan_id for e in pool), (
             'RED: orphan neighbor for a removed task must be excluded from the pool'
         )
+
+
+# ----------------------------------------------------------------------
+# Build-corpus withheld census
+# ----------------------------------------------------------------------
+
+
+class _CorpusHarness:
+    """Stubs for driving `_build_corpus` end to end against fake streams.
+
+    Shared by every `_build_corpus` census test so the four streams are
+    wired one way only — a second copy would be free to drift from the
+    stream ordering the census depends on.
+    """
+
+    MODULE_FILE = 'src/parser.py'
+
+    def _module_task(self, tid: str) -> dict:
+        return {
+            'id': tid,
+            'title': f'Module task {tid}',
+            'description': '',
+            'details': '',
+            'status': 'pending',
+            'priority': 'medium',
+            'files_to_modify': [self.MODULE_FILE],
+        }
+
+    def _dependent_task(self, tid: str, anchor_id: str) -> dict:
+        return {
+            'id': tid,
+            'title': f'Dependent task {tid}',
+            'description': '',
+            'details': '',
+            'status': 'pending',
+            'priority': 'medium',
+            'files_to_modify': ['src/elsewhere.py'],
+            'dependencies': [anchor_id],
+        }
+
+    def _anchor_task(self, tid: str) -> dict:
+        return {
+            'id': tid,
+            'title': 'Anchor',
+            'description': '',
+            'details': '',
+            'status': 'in-progress',
+            'priority': 'high',
+            'files_to_modify': [self.MODULE_FILE],
+        }
+
+    def _taskmaster(self, tasks: list[dict]) -> AsyncMock:
+        by_id = {t['id']: t for t in tasks}
+
+        async def get_task(tid, project_root=None, **kw):
+            return by_id.get(str(tid))
+
+        tm = AsyncMock()
+        tm.get_task = AsyncMock(side_effect=get_task)
+        tm.get_tasks = AsyncMock(return_value={'tasks': tasks})
+        return tm
+
+    def _neighbor_ids(self, n: int) -> list[str]:
+        return [str(9000 + i) for i in range(n)]
+
+    def _qdrant_results(self, ids: list[str]) -> MagicMock:
+        points = []
+        for tid in ids:
+            point = MagicMock()
+            point.payload = {
+                'task_id': tid,
+                'title': f'Neighbor {tid}',
+                'description': '',
+                'files_to_modify': [],
+            }
+            points.append(point)
+        results = MagicMock()
+        results.points = points
+        return results
+
+    async def _corpus(
+        self,
+        curator: TaskCurator,
+        candidate: CandidateTask,
+        *,
+        neighbor_ids: list[str] | None = None,
+    ):
+        if neighbor_ids is None:
+            async def fail_collection(*a, **k):
+                raise RuntimeError('no qdrant')
+
+            with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
+                return await curator._build_corpus(
+                    candidate, project_id='p', project_root='/x',
+                )
+        client = AsyncMock()
+        client.query_points = AsyncMock(return_value=self._qdrant_results(neighbor_ids))
+        embedder = AsyncMock()
+        embedder.create = AsyncMock(return_value=[0.1] * 10)
+        with patch.object(curator, '_ensure_collection', return_value='task_curator_p'), \
+             patch.object(curator, '_get_embedder', return_value=embedder), \
+             patch.object(curator, '_get_qdrant', return_value=client):
+            return await curator._build_corpus(
+                candidate, project_id='p', project_root='/x',
+            )
+
+
+class TestBuildCorpusWithheldCensus(_CorpusHarness):
+    """`_build_corpus` reports what each cap kept OUT of the pool.
+
+    The census must count at every cap, not only at the final `_trim_pool`
+    pass: under stock config a maximal pool is 29 entries against a total cap
+    of 30, so a census keyed on the final trim alone never fires.
+    """
+
+    @pytest.mark.asyncio
+    async def test_module_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert sizes['module'] == cap
+        assert withheld.by_source['module'] == 5
+        assert withheld.by_source['embedding'] == 0
+        assert withheld.by_source['dependency'] == 0
+        assert withheld.by_source['total_cap'] == 0
+
+    @pytest.mark.asyncio
+    async def test_embedding_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 20)
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert sizes['embedding'] == cap
+        # The cap broke out of the neighbour loop; the neighbours it never
+        # visited are exactly what the pool lost. 20 here is the RETRIEVAL
+        # WINDOW's ceiling (overfetch = cap + 20), not a corpus count — see
+        # test_embedding_count_is_a_floor_when_the_window_filled.
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.by_source['module'] == 0
+
+    @pytest.mark.asyncio
+    async def test_embedding_count_is_a_floor_when_the_window_filled(self):
+        """The embedding arm is bounded by the retrieval window, not the corpus.
+
+        ``overfetch = pool_embedding_cap + 20`` bounds how many neighbours are
+        ever fetched, so its unvisited tail is at most 20 however many
+        near-duplicates the corpus actually holds. Unlike ``module`` and
+        ``dependency`` — both corpus-exhaustive — this count is a FLOOR when
+        the window filled, and the prompt has to say so: it is the one stream
+        ordered by actual similarity, so its withheld entries are the likeliest
+        duplicates of all.
+        """
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 20)  # exactly overfetch
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.lower_bounds == ('embedding',)
+
+    @pytest.mark.asyncio
+    async def test_embedding_count_is_exact_when_the_window_had_room(self):
+        """qdrant returned fewer neighbours than asked for, so nothing is hidden."""
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 3)  # well under overfetch
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert withheld.by_source['embedding'] == 3
+        assert withheld.lower_bounds == ()
+
+    @pytest.mark.asyncio
+    async def test_dependency_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_dependency_cap
+        anchor = self._anchor_task('100')
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(cap + 4)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster([anchor, *deps]))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', spawned_from='100'),
+        )
+
+        assert sizes['dependency'] == cap
+        assert withheld.by_source['dependency'] == 4
+
+    @pytest.mark.asyncio
+    async def test_caps_are_reported_alongside_the_counts(self):
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert withheld.caps == {
+            'module': config.curator.pool_module_cap,
+            'embedding': config.curator.pool_embedding_cap,
+            'dependency': config.curator.pool_dependency_cap,
+            'total_cap': config.curator.pool_total_cap,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_full_pool_never_reaches_the_total_cap(self):
+        """FINDING 1: a census keyed only on `_trim_pool` would report nothing.
+
+        anchor(1) + module(15) + embedding(10) + dependency(3) = 29 <= 30, so
+        the final trim short-circuits even when every stream overflowed.
+        """
+        config = _make_config()
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(20)]
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
+        neighbor_ids = self._neighbor_ids(30)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+
+        pool, sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
+            neighbor_ids=neighbor_ids,
+        )
+
+        assert len(pool) == 29
+        assert len(pool) <= config.curator.pool_total_cap
+        assert withheld.by_source['total_cap'] == 0
+        # ...and yet 28 eligible entries were withheld.
+        assert withheld.by_source['module'] == 5
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.by_source['dependency'] == 3
+        assert withheld.total == 28
+        assert withheld.render() is not None
+
+    @pytest.mark.asyncio
+    async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
+        config = _make_config()
+        config.curator.pool_total_cap = 20
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(20)]
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
+        neighbor_ids = self._neighbor_ids(30)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
+            neighbor_ids=neighbor_ids,
+        )
+
+        assert len(pool) == 20
+        assert withheld.by_source['total_cap'] == 29 - 20
+        assert withheld.caps['total_cap'] == 20
+
+    @pytest.mark.asyncio
+    async def test_an_untruncated_pool_yields_a_quiet_census(self):
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(3)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert withheld.total == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_pool_sizes_shape_is_untouched(self):
+        """The census must not leak into `pool_sizes` (owned by task 4718)."""
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, sizes, _withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert set(sizes) == {'anchor', 'module', 'embedding', 'dependency'}
+        assert sizes == {
+            'anchor': 0,
+            'module': config.curator.pool_module_cap,
+            'embedding': 0,
+            'dependency': 0,
+        }
+
+
+class TestWithheldCountsOnlyAbsentEntries(_CorpusHarness):
+    """`by_source` counts entries a cap kept OUT, never one that is present.
+
+    The census exists to tell the LLM the pool it is reading is incomplete.
+    An entry one stream skipped and another admitted is IN the pool, so
+    counting it makes the prompt assert a truncation that did not happen —
+    and `render()` then tells the LLM to prefer `create` over a `combine`
+    the complete pool actually supports. Counting has to happen against the
+    ids the streams finally admitted, not at the moment each cap fires.
+    """
+
+    def _pooled_ids(self, pool) -> set[str]:
+        return {e.task_id for e in pool}
+
+    async def _module_overflow_ids(self, config, tasks) -> list[str]:
+        """The module ids this config's cap actually leaves out of the pool.
+
+        Derived from a real run rather than from `_module_sort_key`'s
+        tiebreak, so the test states the contract instead of restating the
+        production sort.
+        """
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, _withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+        pooled = self._pooled_ids(pool)
+        return [t['id'] for t in tasks if t['id'] not in pooled]
+
+    @pytest.mark.asyncio
+    async def test_module_overflow_readmitted_by_embedding_is_not_withheld(self):
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        overflow = await self._module_overflow_ids(config, tasks)
+        assert len(overflow) == 5
+
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=overflow,
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(tid in pooled for tid in overflow), (
+            'the embedding stream re-admitted every module overflow entry'
+        )
+        assert withheld.by_source['module'] == 0
+        assert withheld.total == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_unvisited_neighbors_already_pooled_are_not_withheld(self):
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        modules = [self._module_task(str(200 + i)) for i in range(10)]
+        assert len(modules) <= config.curator.pool_module_cap
+        fresh_ids = self._neighbor_ids(cap)
+        fresh = []
+        for tid in fresh_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            fresh.append(t)
+        curator = TaskCurator(
+            config=config, taskmaster=self._taskmaster([*modules, *fresh]),
+        )
+
+        # The fresh neighbours fill the cap; the already-pooled module ids are
+        # the tail the break never visits.
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=[*fresh_ids, *[t['id'] for t in modules]],
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(t['id'] in pooled for t in modules), (
+            'the module stream pooled every one of the unvisited tail ids'
+        )
+        assert withheld.by_source['embedding'] == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_absent_module_entry_is_still_withheld(self):
+        """The fix must stop the census lying, not silence it."""
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        overflow = await self._module_overflow_ids(config, tasks)
+
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(tid not in pooled for tid in overflow)
+        assert withheld.by_source['module'] == len(overflow)
+        assert withheld.render() is not None
 
 
 # ----------------------------------------------------------------------
@@ -2252,6 +3084,212 @@ class TestBuildBatchUserPrompt:
 
 
 # ----------------------------------------------------------------------
+# The pool-truncation fact reaches the prompt
+# ----------------------------------------------------------------------
+
+
+class TestPromptCarriesPoolTruncation:
+    """A truncated pool must SAY it is truncated, in the prompt itself."""
+
+    def _census(self) -> PoolWithheld:
+        return PoolWithheld(
+            by_source={'module': 5, 'embedding': 20, 'dependency': 3, 'total_cap': 0},
+            caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
+        )
+
+    def test_single_prompt_carries_the_fact_and_the_guidance(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_user_prompt(
+            CandidateTask(title='T'), pool, withheld=self._census(),
+        )
+        assert 'pool_truncated:' in rendered
+        assert _carries_guidance(rendered)
+
+    def test_batch_section_carries_the_fact_and_the_guidance(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_batch_section(
+            CandidateTask(title='T'), pool, 0, withheld=self._census(),
+        )
+        assert 'pool_truncated:' in rendered
+        assert _carries_guidance(rendered)
+
+    def test_fact_follows_the_pool_block(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_user_prompt(
+            CandidateTask(title='T'), pool, withheld=self._census(),
+        )
+        assert rendered.index('# Pool (') < rendered.index('pool_truncated:')
+
+    def test_omitted_when_the_census_is_empty(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        for rendered in (
+            curator._build_user_prompt(
+                CandidateTask(title='T'), pool, withheld=PoolWithheld(),
+            ),
+            curator._build_batch_section(
+                CandidateTask(title='T'), pool, 0, withheld=PoolWithheld(),
+            ),
+        ):
+            assert 'pool_truncated' not in rendered
+
+    def test_omitted_when_the_census_is_not_passed_at_all(self):
+        """The parameter is keyword-only with a default — positional callers
+        are unaffected and quiet calls stay quiet."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        for rendered in (
+            curator._build_user_prompt(CandidateTask(title='T'), pool),
+            curator._build_batch_section(CandidateTask(title='T'), pool, 0),
+        ):
+            assert 'pool_truncated' not in rendered
+
+    def test_batch_prompt_places_each_fact_in_its_own_section(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        only_second = PoolWithheld(
+            by_source={'module': 7}, caps={'module': 15},
+        )
+        rendered = curator._build_batch_user_prompt(
+            candidates, pools, withheld_list=[PoolWithheld(), only_second],
+        )
+
+        # Exactly one fact, and it sits inside candidate 1's section — not
+        # emitted once for the whole batch.
+        assert rendered.count('pool_truncated:') == 1
+        assert rendered.index('# Candidate batch_index=1') < rendered.index('pool_truncated:')
+
+    def test_batch_prompt_tolerates_an_absent_withheld_list(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        assert 'pool_truncated' not in curator._build_batch_user_prompt(candidates, pools)
+
+    def test_batch_prompt_tolerates_a_short_withheld_list(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        rendered = curator._build_batch_user_prompt(
+            candidates, pools, withheld_list=[self._census()],
+        )
+        assert rendered.count('pool_truncated:') == 1
+        assert rendered.index('# Candidate batch_index=0') < rendered.index('pool_truncated:')
+        assert rendered.index('pool_truncated:') < rendered.index('# Candidate batch_index=1')
+
+
+# ----------------------------------------------------------------------
+# Truncation symmetry between the pool side and the candidate side
+# ----------------------------------------------------------------------
+
+
+class TestPromptClipSymmetry:
+    """The same over-cap text renders identically wherever it appears.
+
+    The pool side marked its truncation with a bare ellipsis; the candidate
+    side clipped SILENTLY. A reader of the prompt (the curator LLM) therefore
+    could not tell a candidate that genuinely had a two-line description from
+    one whose description had been cut off mid-sentence.
+    """
+
+    def _caps(self, config) -> tuple[int, int]:
+        return (
+            config.curator.entry_description_chars,
+            config.curator.entry_details_chars,
+        )
+
+    def _over_cap_texts(self, config) -> tuple[str, str]:
+        desc_cap, details_cap = self._caps(config)
+        return ('D' * (desc_cap + 777), 'X' * (details_cap + 313))
+
+    def _entry_with(self, description: str, details: str) -> _PoolEntry:
+        return _PoolEntry(
+            task_id='pool-1',
+            title='pool entry',
+            description=description,
+            details=details,
+            files_to_modify=[],
+            module_keys=[],
+            status='pending',
+            priority='medium',
+            source='module',
+            combine_eligible=True,
+        )
+
+    def test_same_text_renders_identically_on_both_sides(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+
+        expected_desc = clip_for_prompt(desc, desc_cap)
+        expected_details = clip_for_prompt(details, details_cap)
+
+        pool_rendered = self._entry_with(desc, details).render(desc_cap, details_cap)
+        single = curator._build_user_prompt(candidate, [])
+        section = curator._build_batch_section(candidate, [], 0)
+
+        for rendered in (pool_rendered, single, section):
+            assert expected_desc in rendered
+            assert expected_details in rendered
+
+    def test_candidate_block_is_no_longer_silent(self):
+        """Direct regression: the candidate side emitted a bare `[:cap]` slice."""
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+
+        for rendered in (
+            curator._build_user_prompt(candidate, []),
+            curator._build_batch_section(candidate, [], 0),
+        ):
+            # The clipped text is present but is NOT the whole story, and the
+            # prompt says so — with the exact number of characters withheld.
+            assert f'  description: {desc[:desc_cap]}\n' not in rendered
+            assert f'  details: {details[:details_cap]}\n' not in rendered
+            assert str(len(desc) - desc_cap) in rendered
+            assert str(len(details) - details_cap) in rendered
+
+    def test_elided_counts_agree_across_all_three_renderings(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+        pool = [self._entry_with(desc, details)]
+
+        marker_desc = clip_for_prompt(desc, desc_cap)[desc_cap:]
+        marker_details = clip_for_prompt(details, details_cap)[details_cap:]
+
+        single = curator._build_user_prompt(candidate, pool)
+        section = curator._build_batch_section(candidate, pool, 0)
+        for rendered in (single, section):
+            # Once for the candidate block, once for the single pool entry.
+            assert rendered.count(marker_desc) == 2
+            assert rendered.count(marker_details) == 2
+
+    def test_under_cap_text_is_never_marked(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description='short', details='also short')
+        pool = [self._entry_with('short', 'also short')]
+
+        for rendered in (
+            curator._build_user_prompt(candidate, pool),
+            curator._build_batch_section(candidate, pool, 0),
+            pool[0].render(desc_cap, details_cap),
+        ):
+            assert 'elided' not in rendered
+
+
+# ----------------------------------------------------------------------
 # TaskCurator._call_llm_batch — timeout / turns scaling
 # ----------------------------------------------------------------------
 
@@ -2741,7 +3779,7 @@ class TestCallLlmBatchWithFallback:
             },
         )
 
-        async def fake_call_llm_batch(cs, ps, pss, st, pid, pr):
+        async def fake_call_llm_batch(cs, ps, pss, st, pid, pr, **kwargs):
             n = len(cs)
             call_log.append(n)
             if n == len(candidates):
@@ -2823,7 +3861,7 @@ class TestCallLlmBatchWithFallback:
         # Right half emits: T2 = create, T3 = drop with batch_target_index=0
         # (right-local 0 == T2).  After shift by mid=2, batch_target_index=2
         # in input-local space (which IS T2's input-local index).
-        async def fake(cs, ps, pss, st, pid, pr):
+        async def fake(cs, ps, pss, st, pid, pr, **kwargs):
             n = len(cs)
             if n == 4:
                 raise CuratorFailureError('top fail', subtype='error_empty_output')
@@ -2900,7 +3938,7 @@ class TestPrepareCandidate:
         )
         # Empty corpus keeps the section deterministic.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             prepared = await curator.prepare_candidate(candidate, 'p', '/x')
         assert isinstance(prepared, PreparedCandidate)
@@ -2964,7 +4002,7 @@ class TestCurateBatchHappyPath:
 
         async def fake_corpus(candidate, project_id, project_root):
             nonlocal call_idx
-            result = (pools[call_idx], sizes[call_idx])
+            result = (pools[call_idx], sizes[call_idx], PoolWithheld())
             call_idx += 1
             return result
 
@@ -2989,6 +4027,325 @@ class TestCurateBatchHappyPath:
         assert [d.action for d in result] == ['create', 'drop', 'create']
         assert result[1].target_id == '50'
         assert mock.await_count == 1
+
+
+# ----------------------------------------------------------------------
+# The census survives the trip from corpus to LLM prompt
+# ----------------------------------------------------------------------
+
+
+class TestWithheldReachesTheLlmPrompt:
+    """End-to-end: a truncated corpus produces a prompt that says so.
+
+    Counting the withheld entries is worthless if the count stops before the
+    prompt — the LLM is the consumer that makes the combine-vs-create call.
+    """
+
+    POOL_SIZES = {'anchor': 0, 'module': 15, 'embedding': 0, 'dependency': 0}
+
+    def _census(self, module: int = 5) -> PoolWithheld:
+        return PoolWithheld(
+            by_source={
+                'module': module, 'embedding': 0, 'dependency': 0, 'total_cap': 0,
+            },
+            caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
+        )
+
+    def _create_result(self) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'action': 'create', 'justification': 'new'},
+            cost_usd=0.01,
+        )
+
+    def _batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': f'c{i}'}
+                for i in range(n)
+            ]},
+            cost_usd=0.02 * n,
+        )
+
+    async def _curate_capturing_prompt(self, curator, candidate, corpus):
+        mock = AsyncMock(return_value=self._create_result())
+        with patch.object(curator, '_build_corpus', side_effect=corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            decision = await curator.curate(candidate, 'p', '/x')
+        assert mock.await_args is not None
+        return decision, mock.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_single_path_prompt_carries_the_fact(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), census
+
+        _decision, prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert 'pool_truncated:' in prompt
+        assert _carries_guidance(prompt)
+
+    @pytest.mark.asyncio
+    async def test_single_path_stays_quiet_for_an_untruncated_corpus(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), PoolWithheld()
+
+        _decision, prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert 'pool_truncated' not in prompt
+
+    @pytest.mark.asyncio
+    async def test_single_path_leaves_pool_sizes_alone(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), census
+
+        decision, _prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert decision.pool_sizes == self.POOL_SIZES
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_stores_the_census(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, census
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(CandidateTask(title='T'), 'p', '/x')
+        assert prepared.withheld == census
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_token_estimate_includes_the_fact(self):
+        """The estimate must match the section actually emitted, or the
+        batch-sizing accumulator under-counts every truncated candidate."""
+        from fused_memory.middleware.task_curator import estimate_tokens
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+        candidate = CandidateTask(title='T', description='body')
+
+        async def corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, census
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(candidate, 'p', '/x')
+        section = curator._build_batch_section(candidate, [], 0, withheld=census)
+        assert prepared.prompt_tokens == estimate_tokens(section)
+
+    @pytest.mark.asyncio
+    async def test_corpus_failure_yields_a_quiet_census(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+        assert prepared.withheld is None or prepared.withheld.total == 0
+
+    def _prepared(self, title: str, withheld: PoolWithheld | None) -> Any:
+        from fused_memory.middleware.task_curator import PreparedCandidate
+        return PreparedCandidate(
+            candidate=CandidateTask(title=title, description=f'body of {title}'),
+            pool=_pool_with_ids((f'pool-{title}', 'pending')),
+            pool_sizes=dict(self.POOL_SIZES),
+            prompt_tokens=30,
+            withheld=withheld,
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_path_forwards_each_candidates_own_fact(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', None),
+            self._prepared('Beta', self._census(module=7)),
+        ]
+        mock = AsyncMock(return_value=self._batch_result(2))
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+
+        assert len(decisions) == 2
+        assert mock.await_args is not None
+        prompt = mock.await_args.kwargs['prompt']
+        # Exactly one fact, in Beta's own section.
+        assert prompt.count('pool_truncated:') == 1
+        assert prompt.index('# Candidate batch_index=1') < prompt.index('pool_truncated:')
+        assert '"module": 7' in prompt
+
+    @pytest.mark.asyncio
+    async def test_batch_path_stays_quiet_when_no_pool_was_truncated(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [self._prepared('Alpha', None), self._prepared('Beta', PoolWithheld())]
+        mock = AsyncMock(return_value=self._batch_result(2))
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            await curator.curate_batch_prepared(prepared, 'p', '/x')
+        assert mock.await_args is not None
+        assert 'pool_truncated' not in mock.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_batch_path_leaves_pool_sizes_alone(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', self._census()),
+            self._prepared('Beta', self._census(module=7)),
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=self._batch_result(2))):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+        for decision in decisions:
+            assert decision.pool_sizes == self.POOL_SIZES
+
+    @pytest.mark.asyncio
+    async def test_bisect_halves_keep_their_own_census(self):
+        """The bisect splits candidates, pools and sizes — the census must
+        travel with them or the right half silently loses its fact."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', None),
+            self._prepared('Beta', None),
+            self._prepared('Gamma', self._census(module=9)),
+            self._prepared('Delta', None),
+        ]
+        prompts: list[str] = []
+        calls = 0
+
+        async def flaky(*a, **kwargs):
+            nonlocal calls
+            calls += 1
+            prompts.append(kwargs['prompt'])
+            if calls == 1:
+                raise CuratorFailureError('too big', subtype='error_max_turns')
+            return self._batch_result(2)
+
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=flaky)):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+
+        assert len(decisions) == 4
+        # The right half (Gamma, Delta) re-ran and still carried Gamma's fact.
+        right_half = [pr for pr in prompts[1:] if 'Gamma' in pr]
+        assert right_half
+        assert all('"module": 9' in pr for pr in right_half)
+
+
+# ----------------------------------------------------------------------
+# A size-1 batch must not rebuild the corpus it was handed
+# ----------------------------------------------------------------------
+
+
+class TestSizeOneBatchReusesThePreparedCorpus:
+    """`curate_batch_prepared` short-circuits N=1 to `curate` — with the bundle.
+
+    Bigger per-candidate sections (the raised `entry_description_chars`) mean
+    the worker's token accumulator admits fewer tickets per batch, so batches
+    land at size 1 MORE often. Rebuilding there re-pays a full `get_tasks`
+    over the task tree, an embedder call and a qdrant query for work already
+    done — the cost moving with exactly the setting that shrinks the batch.
+    """
+
+    POOL_SIZES = {'anchor': 1, 'module': 2, 'embedding': 0, 'dependency': 0}
+
+    def _prepared(self, **overrides: Any) -> PreparedCandidate:
+        kwargs: dict[str, Any] = {
+            'candidate': CandidateTask(title='Alpha', description='body of Alpha'),
+            'pool': _pool_with_ids(('pool-alpha', 'pending')),
+            'pool_sizes': dict(self.POOL_SIZES),
+            'prompt_tokens': 30,
+            'withheld': PoolWithheld(by_source={'module': 6}, caps={'module': 15}),
+        }
+        kwargs.update(overrides)
+        return PreparedCandidate(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_size_one_batch_does_not_rebuild_the_corpus(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        build = AsyncMock()
+        llm = AsyncMock(
+            return_value=_agent_result({'action': 'create', 'justification': 'novel'}),
+        )
+        with patch.object(curator, '_build_corpus', new=build), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
+            decisions = await curator.curate_batch_prepared(
+                [self._prepared()], 'p', '/x',
+            )
+
+        assert build.await_count == 0
+        assert len(decisions) == 1
+        assert decisions[0].pool_sizes == self.POOL_SIZES
+        assert llm.await_args is not None
+        prompt = llm.await_args.kwargs['prompt']
+        # The prepared pool AND its census reached the LLM, not a fresh build.
+        assert 'pool-alpha' in prompt
+        assert '"module": 6' in prompt
+
+    @pytest.mark.asyncio
+    async def test_a_failed_bundle_is_rebuilt_rather_than_reused(self):
+        """A corpus failure degrades the bundle to an empty pool — reusing THAT
+        would trade a loud `corpus-failed` create for an LLM call over nothing,
+        and would drop the retry the rebuild gave the size-1 path."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        build = AsyncMock(return_value=(
+            _pool_with_ids(('rebuilt-1', 'pending')),
+            dict(self.POOL_SIZES),
+            PoolWithheld(),
+        ))
+        llm = AsyncMock(
+            return_value=_agent_result({'action': 'create', 'justification': 'novel'}),
+        )
+        prepared = self._prepared(
+            pool=[], withheld=PoolWithheld(), corpus_error='qdrant down',
+        )
+        with patch.object(curator, '_build_corpus', new=build), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
+            decisions = await curator.curate_batch_prepared([prepared], 'p', '/x')
+
+        assert build.await_count == 1
+        assert len(decisions) == 1
+        assert llm.await_args is not None
+        assert 'rebuilt-1' in llm.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_records_the_corpus_failure(self):
+        """The degradation is on the bundle, not only in a log line."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+
+        assert prepared.corpus_error is not None
+        assert 'qdrant down' in prepared.corpus_error
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_prepare_records_no_failure(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), PoolWithheld()
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+
+        assert prepared.corpus_error is None
 
 
 # ----------------------------------------------------------------------
@@ -3026,7 +4383,7 @@ class TestCurateBatchPreDedupCachePollution:
         payload_hash = c1.payload_hash()
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         # The LLM only sees the unique candidate (the first one); emit a 'create'.
         batch_result = AgentResult(
@@ -3077,7 +4434,7 @@ class TestCurateBatchWholeBatchFailure:
         ]
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch.object(
@@ -3120,7 +4477,7 @@ class TestCurateBatchAllAccountsCapped:
         c2 = CandidateTask(title='Cap Two')
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch.object(
@@ -3240,7 +4597,7 @@ class TestCurateBatchBatchTargetIndexRemap:
         # unique_indices[2] = 3.
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         batch_result = AgentResult(
             success=True,
@@ -3349,7 +4706,7 @@ class TestCurateBatchCacheCheck:
         d_new = CuratorDecision(action='create', justification='new-from-llm')
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         single_calls: list = []
 
@@ -3562,7 +4919,7 @@ class TestCuratorCapWaitSanityBound:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -4056,7 +5413,7 @@ class TestCuratorBlocklistShortCircuit:
             return None
 
         async def fake_corpus(*a, **k):
-            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}, PoolWithheld()
 
         create_result = AgentResult(
             success=True,
@@ -4118,7 +5475,7 @@ class TestCuratorBatchBlocklistShortCircuit:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -4161,7 +5518,7 @@ def _make_create_mocks():
         return None
 
     async def fake_corpus(*a, **k):
-        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}, PoolWithheld()
 
     create_result = AgentResult(
         success=True,
@@ -4306,31 +5663,149 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestBlocklistLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestBlocklistLazyLoadRunsOffEventLoop:
+    """Site-specific coverage for _maybe_blocklist_drop's lazy registry load:
+    fail-open behaviour on a loader raise, and the relative-path-without-cwd
+    warning. Both pin the "blocklist" label / cancelled_premise_blocklist_path
+    config-key wiring that is unique to this call site.
+
+    The off-loop thread-identity and concurrent-first-call properties are
+    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
+    by TestPremiseGuardRunsOffEventLoop (task 4201) — duplicating them here
+    would assert the same ~40 lines of _LazyRegistry.entries a third time
+    over (docs/code-quality.md heuristic 11, SPOT).
+    """
+
+    async def test_blocklist_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a blocklist load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
+        including one originating in asyncio.to_thread itself, not just one
+        load_blocklist's own except clauses catch — must be swallowed into a
+        fail-open None, must log exactly one WARNING naming this guard's
+        "blocklist" label, and must still latch the one-shot contract so no
+        retry storm follows a failed load.
+
+        Injects the raise directly via side_effect (a counting wrapper that
+        raises) rather than a non-UTF-8 file — this targets
+        asyncio.to_thread's own raise path, which no loader-internal except
+        can ever cover, and stays valid regardless of what exception types
+        load_blocklist itself later learns to catch (see the task-4483
+        collision-risk note in plan.json).
+        """
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "blocklist" + "failing open" is the exact text the shared load
+        # helper's except block emits — narrower than "failing" appearing
+        # somewhere, which would stay green even if this WARNING were
+        # deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "blocklist" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative
+        cancelled_premise_blocklist_path with no cwd resolves against the
+        process CWD and logs a WARNING naming the config key so an operator
+        can identify which field to make absolute. Green today
+        (task_curator.py _maybe_blocklist_drop's lazy-load block); must stay
+        green once this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path="relative/blocklist.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "cancelled_premise_blocklist_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+
 # step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# The SHIPPED blocklist, resolved relative to this test file — the one thing
+# every regression-pin below consults. Declared once so a move of the YAML is
+# a single edit, not one per pin class.
+_SHIPPED_BLOCKLIST_PATH = (
+    Path(__file__).parent.parent / "config" / "cancelled_premise_blocklist.yaml"
+)
+
+
+def _load_shipped_blocklist():
+    """Load the shipped blocklist, asserting it parsed to something non-empty
+    (a YAML the loader cannot read degrades to [], which would otherwise make
+    every pin below pass vacuously)."""
+    from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+    entries = load_blocklist(_SHIPPED_BLOCKLIST_PATH)
+    assert entries, f"Shipped blocklist is empty — path: {_SHIPPED_BLOCKLIST_PATH}"
+    return entries
 
 
 class TestCancelledPremiseBlocklistPinsFixCRegression:
     """Regression-pin: the SHIPPED blocklist catches the 1376/1432 hallucination."""
 
-    # Path to the shipped YAML, resolved relative to this test file.
-    BLOCKLIST_PATH = (
-        __import__("pathlib").Path(__file__).parent.parent
-        / "config"
-        / "cancelled_premise_blocklist.yaml"
-    )
     ENTRY_NAME = "fixc_flag_marker_search_then_delete"
-
-    def _load(self):
-        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
-        entries = load_blocklist(self.BLOCKLIST_PATH)
-        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
-        return entries
 
     def test_fixture_1_task1376_style_matches(self):
         """Task-1376-style title + fixc_flags_deleted_not_found in description → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="Convert FIX C relay-flag deletion in task_knowledge_sync.py: search-then-delete",
@@ -4349,7 +5824,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_fixture_2_task1432_style_with_stage1_marker_matches(self):
         """Task-1432-style title + stage1_flag_marker in description → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="FIX C: convert flag-marker search-then-delete in knowledge sync",
@@ -4368,7 +5843,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_fixture_3_paraphrased_title_matches(self):
         """Paraphrased title variant + any description substring → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="Refactor FIX C stale-flag deletion from delete-by-id to search-then-delete",
@@ -4387,7 +5862,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_control_unrelated_fixc_task_does_not_match(self):
         """Control: a legitimate FIX C task without the fictional premise → no match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         # This touches FIX C but doesn't mention search-then-delete or fictional metrics
         candidate = CandidateTask(
@@ -4400,6 +5875,216 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
         hit = match_candidate(candidate, entries)
         assert hit is None, (
             f"Control fixture should NOT match blocklist, but hit: {hit}"
+        )
+
+
+# task 5198 (esc-5120-2) RED: TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise
+# ─────────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
+    """Regression-pin: the SHIPPED blocklist catches the refuted task-5120 premise.
+
+    Task 5120 claimed an agent guessed a wrong artifact name/location under
+    ``.task/verify/``, cascading a glob miss into an opaque JSONDecodeError.
+    Reading the raw transcript refuted both halves: the file existed under
+    exactly the guessed name, and the glob resolved against the wrong directory
+    only because the shell's cwd had drifted. The nightly census keeps
+    re-observing the symptom, so the anchor must catch the census generator's
+    own phrasings — while leaving real, separately-filed defects in the same
+    subject area fileable, which the three control fixtures below pin.
+    """
+
+    ENTRY_NAME = "verify_summary_glob_jsondecodeerror_refuted"
+
+    # The refuted framing, spelled as the codebook entry and the census
+    # generator spell it. `build_task_payloads` prepends the census marker;
+    # a hand-filed twin would carry the bare title.
+    REFUTED_TITLE = (
+        "Verify-summary glob miss cascades into a generic JSONDecodeError "
+        "instead of a clear not-found"
+    )
+    CENSUS_TITLE = f"[legibility census] {REFUTED_TITLE}"
+
+    # Task 5120's own stored description — the shape `_cluster_description`
+    # emits: cluster summary, an "Evidence:" block of quoted lines, a tail.
+    CENSUS_DESCRIPTION = (
+        "Agent chained `ls -t .task/verify/*scripts.summary.json | head -1` into "
+        "`cat ... | python3 -c 'json.load(sys.stdin)'` to inspect its own verify "
+        "run's command list, assuming a specific summary-file naming/location "
+        "convention under `.task/verify/`. No file matched the glob, so `ls` "
+        "failed with 'No such file or directory' and the downstream "
+        "`cat`/`python3` received empty stdin, surfacing an opaque "
+        "`json.decoder.JSONDecodeError: Expecting value` rather than a direct "
+        "signal that the assumed artifact path/naming was wrong.\n"
+        "\n"
+        "Evidence:\n"
+        "- ls: cannot access '.task/verify/*scripts.summary.json': No such file "
+        "or directory ... json.decoder.JSONDecodeError: Expecting value: line 1 "
+        "column 1 (char 0)\n"
+        "\n"
+        "Observed in 1 sighting(s) (project: dark_factory)."
+    )
+
+    # Every phrasing the entry's `description_substrings` must cover, so a
+    # fixture claiming to isolate one can prove the other two are absent.
+    # Each is an ANCHORED spelling: the gate needs only one of them, so a
+    # generic member would make the entry a title-only forever-drop (pinned by
+    # test_control_generic_description_does_not_match_on_the_title_alone).
+    DESCRIPTION_PHRASINGS = (
+        "scripts.summary.json",
+        "JSONDecodeError: Expecting value",
+        "cannot access '.task/verify/",
+    )
+
+    def _match(self, title, description):
+        """Run the SHIPPED blocklist over one candidate.
+
+        Returns ``(hit, names)`` — the matching entry or None, plus the names of
+        every loaded entry, so a failure message can say what was actually
+        consulted rather than only what was expected.
+        """
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = _load_shipped_blocklist()
+        candidate = CandidateTask(title=title, description=description)
+        return match_candidate(candidate, entries), [e.name for e in entries]
+
+    def test_census_shaped_refile_of_task_5120_matches(self):
+        """Task 5120's own title + description — what a re-file actually looks like."""
+        hit, names = self._match(self.CENSUS_TITLE, self.CENSUS_DESCRIPTION)
+        assert hit is not None, (
+            "Expected a blocklist hit for a census-shaped re-file of task 5120, "
+            f"got None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_bare_codebook_entry_title_without_census_marker_matches(self):
+        """A hand-filed twin carries no "[legibility census] " prefix."""
+        hit, names = self._match(self.REFUTED_TITLE, self.CENSUS_DESCRIPTION)
+        assert hit is not None, (
+            "Expected a blocklist hit for the bare codebook-entry title (no "
+            f"census marker), got None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    @pytest.mark.parametrize(
+        ("phrasing", "description"),
+        [
+            (
+                "scripts.summary.json",
+                "The `.task/verify/*scripts.summary.json` glob matched nothing, so "
+                "the downstream parse read empty stdin instead of the run's "
+                "command list.",
+            ),
+            (
+                "JSONDecodeError: Expecting value",
+                "Artifact discovery under the verify directory surfaced "
+                "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 "
+                "(char 0) rather than a direct not-found signal.",
+            ),
+            (
+                "cannot access '.task/verify/",
+                "ls: cannot access '.task/verify/*.summary.json': No such file or "
+                "directory — the chained parse then read empty stdin.",
+            ),
+        ],
+    )
+    def test_each_description_phrasing_independently_matches(self, phrasing, description):
+        """One fixture per `description_substrings` phrasing, each carrying only
+        its own — so a phrasing is genuinely pinned, not incidentally covered
+        by a sibling that happens to mention all three."""
+        bleed = [
+            other
+            for other in self.DESCRIPTION_PHRASINGS
+            if other != phrasing and other.lower() in description.lower()
+        ]
+        assert bleed == [], (
+            f"fixture for {phrasing!r} also carries {bleed} — it can no longer "
+            "show that phrasing matches on its own"
+        )
+
+        hit, names = self._match(self.CENSUS_TITLE, description)
+        assert hit is not None, (
+            f"Expected a blocklist hit for the {phrasing!r} phrasing alone, got "
+            f"None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_control_this_remediation_task_does_not_match(self):
+        """ANCHOR SAFETY: task 5198 itself must stay fileable.
+
+        Its description quotes all three `description_substrings` verbatim, so a
+        pass here proves the TITLE gate carries the safety rather than a lucky
+        description miss.
+        """
+        hit, names = self._match(
+            "Suppress the refuted task-5120 premise: blocklist entry + codebook "
+            "amendment FIRST, cancel 5120 LAST (esc-5120-2, Leo ruled b)",
+            "description_substrings: AT LEAST ONE must appear. Include the "
+            "scripts.summary.json path substring, plus the anchored "
+            "\"JSONDecodeError: Expecting value\" exception text and the "
+            "\"cannot access '.task/verify/\" glob-miss text, so the census "
+            "generator's own phrasings are all covered.",
+        )
+        assert hit is None, (
+            "This remediation task must stay fileable, but the blocklist matched "
+            f"it via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_generic_description_does_not_match_on_the_title_alone(self):
+        """ANCHOR SAFETY: the description gate must add real discrimination.
+
+        A genuine future defect in verify-artifact globbing would clear the
+        title triple, so if the description members were generic — bare
+        "cannot access" is the text of any failed ``ls`` — this entry would be
+        a permanent title-only forever-drop, refusing that defect without an
+        LLM call. This fixture carries the generic forms of all three phrasings
+        and none of the anchored ones.
+        """
+        hit, names = self._match(
+            self.CENSUS_TITLE,
+            "ls: cannot access 'data/verify-logs/*.json': No such file or "
+            "directory, so the glob found nothing and the downstream parse "
+            "raised JSONDecodeError instead of a not-found signal.",
+        )
+        assert hit is None, (
+            "A generic description must not clear the gate on the title alone, "
+            f"but the blocklist matched via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_archive_gap_task_5199_does_not_match(self):
+        """ANCHOR SAFETY: the real, measured verify-summary ARCHIVE GAP defect
+        (task 5199) is in the same subject area and must stay fileable. Its
+        title carries "verify" but neither "glob" nor "jsondecodeerror"."""
+        hit, names = self._match(
+            "Task-path verify summary JSON is never archived — "
+            "_persist_attempt_logs excludes it from its return value, so it dies "
+            "with the worktree",
+            "orchestrator/src/orchestrator/verify.py::_persist_attempt_logs "
+            "writes the task-path summary to "
+            "<worktree>/.task/verify/attempt-{N}[.{prefix}].summary.json and then "
+            "deliberately omits it from what it returns, so the summary path is "
+            "never among the files copied to data/verify-logs/<task_id>/.",
+        )
+        assert hit is None, (
+            "The archive-gap task 5199 must stay fileable, but the blocklist "
+            f"matched it via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_true_cause_entry_framing_does_not_match(self):
+        """ANCHOR SAFETY: the TRUE cause's framing — the live codebook entry
+        `entry-cand-20260729-4`, which owns the phenomenon 5120 mis-attributed
+        — must remain fileable."""
+        hit, names = self._match(
+            "Bash cwd persists across turns, causing relative-path git commit "
+            "--only pathspec failures on PRD doc commits",
+            "The shell's working directory carries over between turns, so a "
+            "worktree-relative path resolves against whatever directory a prior "
+            "turn left it in.",
+        )
+        assert hit is None, (
+            "The true-cause framing must stay fileable, but the blocklist "
+            f"matched it via entry {hit.name!r}. Entries: {names}"
         )
 
 
@@ -4441,7 +6126,7 @@ class TestZeroOutputBreakerBatchPath:
         mock_llm = AsyncMock(return_value=zot)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -4926,6 +6611,451 @@ class TestCuratorPremiseRefutedDrop:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-4201 RED: TestPremiseGuardRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestPremiseGuardRunsOffEventLoop:
+    """Tests that _maybe_premise_refuted_drop's blocking filesystem/YAML work
+    (per-candidate live-source re-verification, and the lazy registry load)
+    runs OFF the event-loop thread, so it cannot stall the fused-memory event
+    loop or any other coroutine sharing it — e.g. a concurrent project's
+    curate() call, since TaskInterceptor._get_curator memoises a single
+    TaskCurator while TaskInterceptor._curator_lock is keyed per-project.
+    """
+
+    async def test_premise_verification_runs_off_event_loop(self, tmp_path):
+        """RED: per-candidate live-source re-verification must be offloaded.
+
+        Asserts thread IDENTITY rather than a wall-clock timing threshold:
+        identity is exact and cannot flake under CI contention, whereas a
+        timing threshold would need a numeric bound with no achievability
+        basis (same rationale as test_recon_claim_verification_wiring.py's
+        test_probe_construction_runs_off_event_loop, and the wall-clock-proxy
+        anti-pattern documented at
+        orchestrator/tests/test_liveness_boundary_gate.py:345-358).
+
+        Patches verify_premise_refuted — the symbol that actually performs
+        the blocking read_text — rather than premise_refuted_entry, so this
+        pins behaviour (the work runs off-loop) rather than call shape; it
+        holds whether the implementation wraps the composite call or
+        decomposes it into match-then-verify.
+        """
+        import threading
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        verify_threads: list[int] = []
+
+        def recording_verify(entry, source_root):
+            verify_threads.append(threading.get_ident())
+            return True
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=recording_verify,
+        ):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert verify_threads and all(tid != loop_thread_id for tid in verify_threads)
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
+
+    async def test_verification_failure_fails_open(self, tmp_path, caplog):
+        """RED: an exception from the offloaded verification must fail OPEN.
+
+        _maybe_premise_refuted_drop's own docstring promises "Never raises",
+        and both its callers — curate() and curate_batch_prepared() — invoke
+        it unguarded, so an escaping exception would take down the whole
+        task submission. That contract held for free while the callees were
+        the guard module's own never-raising functions; offloading
+        verify_premise_refuted via asyncio.to_thread (this task) is a NEW
+        raise path (thread-pool failure, or anything the real/patched callee
+        raises) that does not route through the guard module's internal
+        except. Failing open (returning None) is the direction every other
+        failure mode this method already enumerates takes, and it means "let
+        the candidate through to the architect" — never "silently file a
+        dead-premise task". Mirrors task 4091's
+        TestClaimVerificationGuardFailsOpen, which needed a review amendment
+        to close this exact gap on the sibling claim-verification guard.
+        """
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=RuntimeError("boom"),
+        ), caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        fail_open_records = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "recon-premise" in r.getMessage()
+        ]
+        # Exactly one — not "the word 'premise' appears somewhere in the log",
+        # which would stay green even if a retry loop double-logged or if
+        # this WARNING were deleted and some unrelated premise-related
+        # warning (e.g. the guard module's own "assertion fails open", or
+        # the pre-existing "guard disabled for this call" cwd warning) fired
+        # instead. "recon-premise" + "failing open" together are the exact
+        # text this method's own except block emits and nothing else in the
+        # module does (verified by grep).
+        assert len(fail_open_records) == 1
+
+    async def test_registry_load_runs_off_event_loop(self, tmp_path):
+        """RED: the one-shot lazy registry load must also be offloaded.
+
+        This site is NOT the one task 4201 was filed against, but
+        measurement is what promotes it: load_premise_registry on the
+        shipped 11 KB config/recon_code_fix_premise_registry.yaml measures
+        9,917 us, of which only 21 us is read_text and 8,152 us is
+        pure-Python yaml.safe_load — ~8x the worst per-candidate
+        verification read, and by far the largest single event-loop stall
+        in this method. It runs on the first task submission each
+        fused-memory process sees, while the per-project curator write lock
+        is held. INV-8 (loop-thread-occupancy-bounded,
+        docs/legibility/design-invariants.md) names filesystem work
+        explicitly and gives asyncio.to_thread as the house pattern.
+
+        Delegates to the REAL load_premise_registry (captured before
+        patching) rather than stubbing a return value: a stub returning []
+        would make the thread-identity assertion vacuous by short-circuiting
+        at ``if not entries: return None`` before ever reaching the match/
+        verify path, and would not exercise a genuine refusal.
+        """
+        import threading
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        load_threads: list[int] = []
+
+        def recording_load(path):
+            load_threads.append(threading.get_ident())
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=recording_load,
+        ):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
+        assert len(load_threads) == 1  # lazy load, at most once per instance
+        assert decision1 is not None and decision1.action == "refuse"
+        assert decision2 is not None and decision2.action == "refuse"
+
+    async def test_concurrent_first_calls_both_see_loaded_registry(self, tmp_path):
+        """RED: concurrent first calls must not observe a half-loaded registry.
+
+        self._premise_registry_load_attempted is set BEFORE the registry
+        assignment. That ordering was safe only while the load was
+        synchronous — there was no await point between the two. Offloading
+        the load (previous step) inserted one, so a second caller can now
+        see load_attempted=True while self._premise_registry is still None,
+        fall into ``if not entries: return None``, and SILENTLY FAIL OPEN:
+        the guard is skipped and the dead-premise task it exists to refuse
+        gets filed.
+
+        This is reachable, not theoretical:
+        task_interceptor.py::TaskInterceptor._get_curator memoises a SINGLE
+        TaskCurator on self._curator with no project key, while
+        task_interceptor.py::TaskInterceptor._curator_lock is keyed
+        PER-PROJECT — so two projects can be inside curate() concurrently on
+        the same TaskCurator instance.
+
+        Uses a slow load_premise_registry wrapper (sleeps inside the worker
+        thread, off the event loop) to guarantee the second concurrent call
+        enters while the first load is still in flight.
+        """
+        import time
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_call_count = 0
+
+        def slow_load(path):
+            nonlocal load_call_count
+            load_call_count += 1
+            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=slow_load,
+        ):
+            d1, d2 = await asyncio.gather(
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+            )
+
+        assert d1 is not None and d1.action == "refuse"
+        assert d2 is not None and d2.action == "refuse"
+        assert load_call_count == 1
+
+    async def test_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """A registry load that RAISES must fail OPEN, and must not latch
+        into a permanent failure.
+
+        This pins THIS METHOD's own except-Exception wrapper around the
+        offloaded load — the last line of defence for
+        _maybe_premise_refuted_drop's "Never raises" contract, whose callers
+        curate() / curate_batch_prepared() invoke it unguarded. Two distinct
+        properties: (a) the exception does not escape, and (b)
+        _premise_registry_load_attempted still latches, so a one-shot
+        failure does not become a permanent one for the life of the process
+        (the flag is set only AFTER a successful assignment, so an unwrapped
+        raise would skip it and re-enter the load on every later call).
+
+        FAULT INJECTION, and why it is a direct raise rather than a real
+        malformed file (changed by task 4483): this test originally wrote
+        the registry as genuinely non-UTF-8 bytes, because
+        load_premise_registry then caught only FileNotFoundError/OSError on
+        read_text and yaml.YAMLError on parse — so UnicodeDecodeError (a
+        ValueError, NOT an OSError) escaped it despite its docstring
+        claiming "The function never raises". Task 4483 closed that gap: the
+        guard module now catches UnicodeDecodeError itself and degrades to
+        [], so a bad-encoding registry no longer reaches this wrapper at all
+        (that path is now covered one layer down, by
+        test_recon_code_fix_premise_guard.py). The wrapper it guards is NOT
+        dead, though: asyncio.to_thread is itself a raise path (thread-pool
+        failure/shutdown), and the guard module's internal excepts cannot
+        cover it. With no naturally-reachable in-process fault left to
+        trigger it, the raise is injected directly — same shape as the
+        sibling test_verification_failure_fails_open above.
+        """
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_calls = 0
+
+        def raising_load(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("registry load exploded")
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=raising_load,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "recon-premise" + "failing open" is the exact text this method's
+        # registry-load except block emits (see the sibling assertion in
+        # test_verification_failure_fails_open) — narrower than "premise"
+        # appears somewhere, which would stay green even if this WARNING
+        # were deleted and some other premise-related warning fired instead.
+        assert any(
+            "failing open" in r.getMessage() and "recon-premise" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    async def test_registry_load_cancellation_does_not_disable_guard(
+        self, tmp_path,
+    ):
+        """GUARD (expected GREEN already): a cancelled load must NOT latch the
+        guard permanently off.
+
+        This locks a property that already holds on the current branch (the
+        attempted flag sits after the assignment, inside the lock, so a
+        CancelledError from the first caller leaves it clear and a later call
+        retries) against the obvious "just settle the flag in a finally"
+        fix for the sibling RED test above. asyncio.CancelledError is a
+        BaseException in Python 3.13, so a `finally` would also latch the
+        flag on cancellation — permanently disabling the premise guard for
+        this TaskCurator instance because one unrelated caller was
+        cancelled mid-load, which is the same transient-becomes-permanent
+        defect class the sibling test exists to close, just with a rarer
+        trigger. The follow-up impl step must keep this test GREEN.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        call_count = 0
+
+        def first_call_cancelled(path):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise asyncio.CancelledError()
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=first_call_cancelled,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await curator._maybe_premise_refuted_drop(
+                    candidate, candidate.payload_hash(),
+                )
+
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -4978,7 +7108,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -5045,7 +7175,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -5106,7 +7236,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return [
                 CuratorDecision(action="create", justification=f"genuinely new {i}",
@@ -5298,7 +7428,7 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             return [
                 CuratorDecision(action="create", justification="new-1",
                                 pool_sizes=empty_sizes, latency_ms=0),
@@ -5552,6 +7682,127 @@ class TestCuratorMaybeRouteDeterministic:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestOperationalRegistryLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestOperationalRegistryLazyLoadRunsOffEventLoop:
+    """Site-specific coverage for _maybe_route_deterministic's lazy registry
+    load: fail-open behaviour on a loader raise, and the
+    relative-path-without-cwd warning. Both pin the "operational-ask" label /
+    operational_ask_registry_path config-key wiring that is unique to this
+    call site.
+
+    The off-loop thread-identity and concurrent-first-call properties are
+    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
+    by TestPremiseGuardRunsOffEventLoop (task 4201) — see
+    TestBlocklistLazyLoadRunsOffEventLoop's docstring for the same
+    reasoning; duplicating them here a third time would be a SPOT violation
+    (docs/code-quality.md heuristic 11).
+
+    Candidates here are deliberately UNTAGGED (no execution_class) so they
+    match via the title/description substring fallback — a tagged
+    'operational'/'decision' candidate is skipped by match_candidate
+    entirely (task delta demotion; see TestCuratorMaybeRouteDeterministic
+    above) and would make these tests vacuous.
+    """
+
+    async def test_operational_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a registry load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
+        including one originating in asyncio.to_thread itself, not just one
+        load_operational_registry's own except clauses catch — must be
+        swallowed into a fail-open None, must log exactly one WARNING naming
+        this guard's "operational-ask" label, and must still latch the
+        one-shot contract so no retry storm follows a failed load.
+
+        Injects the raise directly via side_effect rather than a non-UTF-8
+        file — see the equivalent blocklist test's rationale (task-4483
+        collision-risk note in plan.json): this targets asyncio.to_thread's
+        own raise path, which no loader-internal except can ever cover.
+        """
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "operational-ask" + "failing open" is the exact text the shared
+        # load helper's except block emits — narrower than "failing"
+        # appearing somewhere, which would stay green even if this WARNING
+        # were deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "operational-ask" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative operational_ask_registry_path
+        with no cwd resolves against the process CWD and logs a WARNING
+        naming the config key so an operator can identify which field to
+        make absolute. Green today (task_curator.py
+        _maybe_route_deterministic's lazy-load block); must stay green once
+        this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(operational_ask_registry_path="relative/registry.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "operational_ask_registry_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # task-2085 step-9 RED: TestCuratorCurateRouteDeterministicIntegration
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -5734,7 +7985,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. Its output schema has no 'route_deterministic'
             # action, so anything reaching it can only ever come back 'create'.
@@ -5811,7 +8062,7 @@ class TestCuratorBatchRouteDeterministic:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -5860,7 +8111,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. If c0 reaches it, it can only come back
             # 'create' — its output schema has no 'route_deterministic'.
@@ -6564,7 +8815,7 @@ class TestPerProjectLockDepth:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, _sizes = await curator._build_corpus(
+            pool, _sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='New bug', files_to_modify=files),
                 project_id='p', project_root=project_root,
             )

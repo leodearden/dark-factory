@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from _merge_queue_harness import drive_verify_and_advance
@@ -144,12 +144,7 @@ async def test_real_merge_item_lands_via_harness(
         speculative=False,
     )
 
-    passing = MagicMock(passed=True, summary='', timed_out=False)
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        AsyncMock(return_value=passing),
-    ):
-        advanced = await drive_verify_and_advance(worker, item)
+    advanced = await drive_verify_and_advance(worker, item)
 
     assert advanced is True, 'RealMergeItem must take the real-verify path and advance main'
     outcome = req.result.result()
@@ -263,7 +258,7 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
     )
 
     main_before = await git_ops.get_main_sha()
-    slot_locked_before = worker._speculation_slot.locked()
+    slots_available_before = worker.snapshot()['speculation']['slot_available']
 
     entry = await worker._dispatch_item(item)
     assert entry is not None
@@ -280,7 +275,7 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
         'the passthrough delivery itself must not advance main — the train '
         'landing already happened inside _do_train_merge before this handoff'
     )
-    assert worker._speculation_slot.locked() == slot_locked_before, (
+    assert worker.snapshot()['speculation']['slot_available'] == slots_available_before, (
         'train item has speculative=False; no speculation slot may be acquired '
         'or released by its passthrough delivery'
     )

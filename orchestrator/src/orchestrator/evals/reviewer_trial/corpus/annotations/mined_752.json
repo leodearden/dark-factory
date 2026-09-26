@@ -24,5 +24,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "test_merge_queue_panel: marker-based script extraction in _extract_inline_script",
+      "description": "Replace the position-based first-script regex in _extract_inline_script with marker-based sentinel selection to make the helper immune to future layout-wrapper changes that prepend other script blocks.",
+      "test_strategy": "",
+      "details": "In dashboard/tests/test_merge_queue_panel.py around lines 62-72, _extract_inline_script currently uses a regex that grabs the FIRST <script> block in the document. The docstring already acknowledges this is fragile \u2014 any future layout wrapper whose <script> appears earlier (e.g. base.html/burndown.html/costs.html alpine:init listeners) would break it.\n\nSwitch to marker-based selection: iterate `re.finditer(r'<script[^>]*>(.*?)</script>', content, re.DOTALL)` and return the first match whose body contains a partial-specific sentinel such as 'mergeQueueDepthChart' or 'function renderAll()'. Only fail if no matching script body contains the sentinel.\n\nThis also sidesteps a secondary concern: the existing regex would match <script> tags embedded inside HTML comments or string literals if they ever appeared in the partial.\n\nFollow-up from review of task 718 (escalation esc-718-23, triaged after steward timeout).",
+      "authored": false,
+      "id": "752",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-12T19:17:44.942Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/tests/test_merge_queue_panel.py"
+    ],
+    "base_sha": "981abdf48d47b02c4fe91c40b8ad75cea1e4cc20",
+    "branch_sha": "cd16375f79e904f3aff6c185a91cbf853171f256",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "e59a648cf3c44765838c29265959a9bd5b43fac2",
+      "merge_base_sha": "981abdf48d47b02c4fe91c40b8ad75cea1e4cc20",
+      "diff_reproduces_from": "git diff 981abdf48d e59a648cf3",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -154,25 +154,38 @@ tasks:
     delivered_check:
       kind: manual
       reason: absence-grep is brittle against comments/changelog mentions; pinned by iota's guard-path test
+# RULING 2026-08-30 (Leo, docket D18: "A and B, both") via gate esc-3136-3.
+# Both leaf-kappa capabilities below were wrongly stamped PASS; corrected to FAIL
+# because neither is delivered in the tree (no systemd timer unit for the detector,
+# and no caller of consolidation_gate.build_consolidation_gate_task). The descope
+# itself is deliberate and evidence-based, not an oversight: task 3136's 2026-08-11
+# amendment (C) conditioned the gate-filing wiring on an ANN replay over task 3130's
+# curator-labelled fixture; the replay ran and recorded paraphrase-band recall
+# 25/301 = 8.3% (lexical 0/301), AUC(true pairs vs hard negatives) = 0.2534 (inverted
+# — hard negatives score higher than true duplicates), so the amendment's own
+# consequence clause forbids wiring gate filing on cosine-of-full-content signals,
+# lexical or ANN. Follow-up for the wiring is task 4916 (pending), gated on a
+# detector that clears gate-grade recall on the 3130 fixture — do not re-attempt
+# the wiring on the already-refuted lexical/ANN signals above.
 - label: kappa
   task_id: 3136
   title: 'Scheduled deterministic dedup report feeding gate filing'
   capabilities:
   - name: timer-unit-committed
     binding: capability→producer — systemd user timer per flag-marker-sweep precedent
-    verdict: PASS
+    verdict: FAIL
     delivered_check:
       kind: grep
       pattern: OnCalendar
       paths:
-      - fused-memory/
+      - scripts/
       expect: present
   - name: gate-filing-consumes-report
     binding: capability→consumer (wired) — gates cite deterministically enumerated clusters (6/19 reify gates had wrong narrative enumerations)
-    verdict: PASS
+    verdict: FAIL
     delivered_check:
       kind: manual
-      reason: integration-fixture property (gate detail cites report clusters)
+      reason: integration-fixture property (gate detail cites report clusters); NOT delivered — see 2026-08-30 D18 ruling comment above; follow-up task 4916
 - label: lambda
   task_id: 3137
   title: 'Full provenance in search results'

@@ -1,0 +1,636 @@
+"""Behavioural coverage for the `producer | grep -q PAT` probes in three scripts.
+
+Covers scripts/export-data.sh, scripts/import-data.sh and
+scripts/deploy-w5-recon-reliability.sh. The sibling suite
+test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh,
+and the two share one slicer, one probe scaffold (`SIGPIPE_BULK_BYTES` and
+`dispatch_stub_body`) and one detector — all in tests/scripts/shell_sections.py.
+
+WHY THESE EXIST. `producer | grep -q PAT` reports the PRODUCER's exit status
+under `set -o pipefail`, not grep's verdict, so an `if` guarding on it can take
+the else branch on output that plainly CONTAINS the pattern. Two ways that
+happens, both covered below per site:
+
+  (a) the producer emits the match and then exits non-zero for its own reasons
+      (a probe whose status reflects the whole run, not the one line asked
+      about) — `pipefail` hands the `if` that non-zero and the match is lost;
+  (b) SIGPIPE — `grep -q` exits the instant it matches and closes the read end,
+      so a producer still writing dies of signal 13, the pipeline returns 141,
+      and the `if` again reads "no match" from a matching reply.
+
+EVERY ONE OF THESE SITES SITS INSIDE AN `if`, so the failure mode is a WRONG
+ANSWER, not an abort: export-data.sh decides a running FalkorDB is not running
+and skips the BGSAVE, import-data.sh decides live containers need no stopping
+and then reports a healthy FalkorDB as not responding. Nothing crashes and
+nothing is logged as a failure — the scripts just quietly do the wrong thing,
+which is why these need behavioural tests rather than a lint.
+
+Read through the REAL shipped text: each test slices its section out of the
+script by CODE anchors and runs it against PATH stubs, so a test asserts on
+what the script DOES, never on how the fix is spelled. The anchors were all
+verified to survive the fix, which matters because the same anchors must slice
+the unfixed text and the fixed text.
+
+The companion source-level sweep at the bottom forbids the construct itself.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+from shell_sections import (
+    REPO_ROOT,
+    SIGPIPE_BULK_BYTES,
+    dispatch_stub_body,
+    grep_q_offenders,
+    run_with_preamble,
+    slice_section,
+    slice_shell_function,
+    stub_bin_dir,
+    write_stub,
+)
+
+EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
+IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"
+DEPLOY_W5_PATH = REPO_ROOT / "scripts" / "deploy-w5-recon-reliability.sh"
+
+
+# --- the shared scaffold ----------------------------------------------------
+# export-data.sh and import-data.sh share `set -euo pipefail`, the same four
+# logging shims (their lines 11-14) and the same $REPO_ROOT / $COMPOSE_FILE
+# bindings, so one preamble serves every site in both.
+
+# The four logging shims, reduced to PLAIN TEXT so assertions can match on
+# prefixes without ANSI escapes. `fail` must still `exit 1` — the shipped one
+# does, and a slice that reaches it must die the way the script would.
+#
+# Deliberately NOT a str.format() template: these bodies are bash brace groups,
+# and every `{ printf ... }` in them would be read as a replacement field.
+_PREAMBLE = (
+    "set -euo pipefail\n"
+    "info()  { printf '==> %s\\n' \"$*\"; }\n"
+    "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
+    "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
+    "fail()  { printf 'FAIL %s\\n' \"$*\"; exit 1; }\n"
+)
+
+
+def _preamble(tmp_path: pathlib.Path) -> str:
+    """`_PREAMBLE` plus the two variables the slices read, pointed into tmp_path.
+
+    Under `set -u` an unset $COMPOSE_FILE aborts a slice before it probes
+    anything — a green-looking run that never reached the `if` under test.
+    Bound here rather than passed through `env_extra` because both are
+    script-owned variables, not environment knobs.
+    """
+    return _PREAMBLE + (
+        f'REPO_ROOT="{tmp_path}"\n'
+        f'COMPOSE_FILE="{tmp_path / "docker-compose.yml"}"\n'
+    )
+
+
+def _run_probe(tmp_path, section_text, *, docker_body):
+    """Run *section_text* in a tmp tree against a scripted `docker`.
+
+    One scaffold for every probe site in both scripts: three PATH stubs plus
+    the shared preamble. Sites differ only in the slice they pass and the
+    docker branch they script — so a new site is a wrapper, not another copy
+    of this.
+
+      `sleep`     — a no-op, which is what keeps the 30-iteration timeout
+                    cases instant.
+      `systemctl` — exits 0, so import-data.sh's section-1 slice can run its
+                    `is-active` / `stop` calls without touching the host.
+      `docker`    — the scripted producer, the thing actually under test.
+    """
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(stub_bin, "sleep", "exit 0\n")
+    write_stub(stub_bin, "systemctl", "exit 0\n")
+    write_stub(stub_bin, "docker", docker_body)
+    return run_with_preamble(tmp_path, _preamble(tmp_path), section_text)
+
+
+# Scenario bodies for a scripted docker branch, indented to sit inside `case`.
+#
+# Parameterized by the reply token rather than frozen as constants: the two
+# `ps --status running` sites look for `falkordb` and the two `redis-cli ping`
+# sites look for `PONG`, and eight near-identical constants is how the four
+# sites drift apart.
+def _match_then_nonzero(reply):
+    """Producer emits the match, then exits non-zero for its own reasons — case (a)."""
+    return f"    printf '{reply}\\n'\n    exit 1\n"
+
+
+def _match_then_bulk(reply):
+    """Producer emits the match, then keeps writing until grep closes the pipe — case (b)."""
+    return f"    printf '{reply}\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
+
+
+def _clean_match(reply):
+    """Characterization: the ordinary path — the match, then exit 0."""
+    return f"    printf '{reply}\\n'\n    exit 0\n"
+
+
+def _nonmatching_output(reply):
+    """Producer SUCCEEDS, saying something that does not contain the token.
+
+    The second negative direction, and the one that actually happens in
+    production: `docker compose ps --status running` exits 0 listing only
+    qdrant because falkordb is genuinely down, or redis-cli answers an error
+    string instead of PONG. Distinct from `_SILENT_FAILURE` below in the path
+    it takes through the fixed code, not merely in its wording — the producer
+    exits 0, so the capture's `|| true` never fires and the `[[ ]]` decides on
+    real content rather than on the empty string left behind by a failure.
+    Nothing pinned that direction before, so every site's negative branch was
+    reachable only via a producer that had failed.
+
+    Body-identical to `_clean_match` by construction (print, exit 0) and
+    deliberately kept as its own name: what distinguishes the two scenarios is
+    the argument, and a call site reading `_clean_match("qdrant")` would say
+    the opposite of what it means.
+    """
+    return _clean_match(reply)
+
+
+# What each pair of sites sees when the thing it asks about is honestly absent.
+# The listings sites are told about qdrant — a real sibling service in the same
+# compose file, up while falkordb is not — and the ping sites get redis-cli's
+# error shape. Neither string contains the token its site looks for, which is
+# the whole content of the scenario.
+_LISTING_WITHOUT_FALKORDB = "qdrant"
+_REPLY_WITHOUT_PONG = "ERR unknown command"
+
+
+# A producer that says NOTHING and fails. The honest verdict for every site is
+# the negative branch, reached WITHOUT aborting — see each site's guard test.
+_SILENT_FAILURE = "    exit 1\n"
+
+
+# --- export-data.sh section 3: the FalkorDB BGSAVE flush --------------------
+# Both anchors are CODE (not comment prose), are unique in the file, and
+# survive the fix.
+#
+# NO LINE COUNT IS CLAIMED FOR ANY SLICE IN THIS FILE, and that is the same
+# objection the slicer's own docstring raises against pinned line numbers. The
+# three counts that used to sit in these three comments were all WRONG as
+# landed — the export block was called 18 lines when the commit that wrote the
+# claim had itself grown the block to 45 — because a count is invalidated by
+# any reflow of the region it describes and nothing checks it. The anchors
+# below plus `slice_section`'s self-naming AssertionError already carry the
+# claim that matters: the slice covers the site under test, or the test dies
+# loudly.
+_EXPORT_BGSAVE_START = 'info "Flushing FalkorDB to disk"'
+_EXPORT_BGSAVE_END = "\nfi\n"
+
+
+def _lastsave_counter(tmp_path):
+    """A `redis-cli LASTSAVE` branch returning a CHANGING value on every call.
+
+    The section reads LASTSAVE once as $BEFORE, fires BGSAVE, then polls
+    LASTSAVE until it differs. A stub answering a constant would poll thirty
+    times and warn — so the success path would never reach
+    `ok "FalkorDB BGSAVE completed"` and test 1 below would assert on an
+    absence rather than on a positive message.
+
+    Exits 0: the LASTSAVE call is NOT the producer under test here (the
+    `ps --status running` branch is), and its own `|| echo "0"` guard already
+    covers a failing one.
+    """
+    counter = tmp_path / "lastsave-counter"
+    return (
+        f'    _n="$(cat {counter} 2>/dev/null || echo 0)"\n'
+        f"    _n=$((_n + 1))\n"
+        f'    printf \'%s\\n\' "$_n" > {counter}\n'
+        f'    printf \'%s\\n\' "$_n"\n'
+        f"    exit 0\n"
+    )
+
+
+def _run_export_bgsave(tmp_path, ps_body):
+    """Slice export-data.sh's section-3 block and run it against a scripted docker.
+
+    The `ps --status running` branch carries the scenario; the `exec` branch
+    answers LASTSAVE. Order matters only in that neither glob matches the
+    other's argv — `"$*"` for the listing contains `" ps "` and never `" exec "`.
+    """
+    return _run_probe(
+        tmp_path,
+        slice_section(EXPORT_DATA_PATH, _EXPORT_BGSAVE_START, _EXPORT_BGSAVE_END),
+        docker_body=dispatch_stub_body(
+            (
+                ('*" ps "*', ps_body),
+                ('*" exec "*', _lastsave_counter(tmp_path)),
+            )
+        ),
+    )
+
+
+def test_export_flushes_falkordb_when_the_listing_exits_nonzero(tmp_path):
+    """A listing that NAMED falkordb means the container is running, whatever its status.
+
+    `docker compose ps` reports on the whole compose invocation; the container
+    appearing in the listing is a fact about the OUTPUT. Conflating the two
+    skips the BGSAVE on a live database and exports a stale dump.rdb — silent
+    data loss, logged as a routine warning.
+    """
+    result = _run_export_bgsave(tmp_path, _match_then_nonzero("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert "OK FalkorDB BGSAVE completed" in combined, combined
+    assert "WARN FalkorDB container not running" not in combined, combined
+
+
+def test_export_flushes_falkordb_when_the_listing_is_sigpiped(tmp_path):
+    """A producer still writing when grep matches dies of SIGPIPE; falkordb was still listed.
+
+    `grep -q` closes the read end on its first match, so the producer takes
+    signal 13, `pipefail` turns that into 141, and the `if` reads "not running"
+    off a listing that began with the container's own name.
+    """
+    result = _run_export_bgsave(tmp_path, _match_then_bulk("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert "OK FalkorDB BGSAVE completed" in combined, combined
+    assert "WARN FalkorDB container not running" not in combined, combined
+
+
+def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
+    """A silent listing is still "not running" — and the section must NOT abort getting there.
+
+    The guard on the fix. A capture written as a bare `_running="$(producer)"`
+    makes the assignment a SIMPLE COMMAND, so `set -e` kills the whole export
+    the moment docker is unavailable, where the old pipeline merely took the
+    else branch. `returncode == 0` is the only assertion in this file that
+    distinguishes the correct fix from that plausible-looking regression.
+    """
+    result = _run_export_bgsave(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "WARN FalkorDB container not running" in combined, combined
+    assert "OK FalkorDB BGSAVE completed" not in combined, combined
+
+
+def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing that simply does not name falkordb is a real "not running".
+
+    The production negative: `docker compose ps --status running` exits 0
+    having listed only qdrant. The section must take the else branch on it, and
+    must reach that verdict without aborting — the same `returncode == 0` claim
+    the silent-producer guard makes, on the path where `|| true` is NOT what
+    supplies the empty capture.
+    """
+    result = _run_export_bgsave(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "WARN FalkorDB container not running" in combined, combined
+    assert "OK FalkorDB BGSAVE completed" not in combined, combined
+
+
+def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
+    """Characterization: the ordinary path lists falkordb and exits 0."""
+    result = _run_export_bgsave(tmp_path, _clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert "OK FalkorDB BGSAVE completed" in combined, combined
+    assert "WARN FalkorDB container not running" not in combined, combined
+
+
+# --- import-data.sh section 1: stopping the backing stores ------------------
+# The byte-identical `ps --status running | grep -q falkordb` construct fixed
+# above, in a different executable.
+#
+# `end_after` IS REQUIRED HERE, and this was MEASURED rather than assumed:
+# without it the slice ends at the `fi` closing the PRECEDING
+# `systemctl --user is-active fused-memory` block and never reaches the docker
+# site at all — a slice of the wrong region that runs cleanly and produces a
+# vacuously green test. That is precisely the hazard slice_section's third
+# anchor exists for. All three anchors occur exactly once, on non-comment
+# lines, and survive the fix.
+_IMPORT_STOP_START = 'info "Stopping services"'
+_IMPORT_STOP_END = "\nfi\n"
+_IMPORT_STOP_END_AFTER = 'ok "FalkorDB + Qdrant containers stopped"'
+
+_STOPPED = "OK FalkorDB + Qdrant containers stopped"
+
+
+def _run_import_stop(tmp_path, ps_body):
+    """Slice import-data.sh's section-1 block and run it against a scripted docker.
+
+    The slice also runs `systemctl --user is-active` and `systemctl --user stop`;
+    the harness's PATH `systemctl` stub exits 0, so that branch is taken and is
+    harmless. The `compose ... stop falkordb qdrant` call falls to the docker
+    stub's catch-all — only the listing is under test.
+    """
+    return _run_probe(
+        tmp_path,
+        slice_section(
+            IMPORT_DATA_PATH,
+            _IMPORT_STOP_START,
+            _IMPORT_STOP_END,
+            end_after=_IMPORT_STOP_END_AFTER,
+        ),
+        docker_body=dispatch_stub_body((('*" ps "*', ps_body),)),
+    )
+
+
+def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
+    """A listing that NAMED falkordb means there are containers to stop.
+
+    Misreading it leaves FalkorDB and Qdrant RUNNING while the next sections
+    replace the data trees underneath them — the import's whole reason for
+    stopping them first.
+    """
+    result = _run_import_stop(tmp_path, _match_then_nonzero("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
+
+
+def test_import_stops_the_containers_when_the_listing_is_sigpiped(tmp_path):
+    """Same misread via SIGPIPE: `grep -q` closes the pipe, the producer dies, 141."""
+    result = _run_import_stop(tmp_path, _match_then_bulk("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
+
+
+def test_import_stops_nothing_when_the_listing_says_nothing(tmp_path):
+    """A silent listing means nothing to stop — reached WITHOUT aborting.
+
+    The honest verdict for a producer that said nothing, and the guard against
+    the bare-assignment spelling: `returncode == 0` pins that the fix must not
+    turn an unavailable docker into a `set -e` abort of the whole import.
+    """
+    result = _run_import_stop(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _STOPPED not in combined, combined
+
+
+def test_import_stops_nothing_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing naming only qdrant means there is nothing of ours to stop."""
+    result = _run_import_stop(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _STOPPED not in combined, combined
+
+
+def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
+    """Characterization: the ordinary path lists falkordb and exits 0."""
+    result = _run_import_stop(tmp_path, _clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
+
+
+# --- import-data.sh section 7: the FalkorDB "wait for healthy" loop ---------
+# Anchor occurs exactly once on a non-comment line and survives the fix. The
+# same anchor shape task 4204 used for setup-host.sh's section-2 wait loop,
+# which this block is a literal copy of.
+_IMPORT_WAIT_START = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
+_IMPORT_WAIT_END = "\ndone\n"
+
+_HEALTHY = "OK FalkorDB healthy"
+_NOT_HEALTHY = "WARN FalkorDB did not become healthy in 30s"
+
+
+def _falkordb_probe(start, end, *, end_after=None):
+    """An import-data.sh section, with the real `falkordb_pings` prepended.
+
+    Both `redis-cli ping` sites call that helper, and it is defined up beside
+    the logging shims — OUTSIDE either slice, so a bare slice would die at exit
+    127. `slice_shell_function` lifts the SHIPPED definition, so these tests
+    still assert on the script's own probe rather than on a copy the harness
+    wrote for itself; and it fails LOUDLY if the helper is ever renamed, rather
+    than leaving the suite green against a probe the script no longer has.
+    """
+    return slice_shell_function(IMPORT_DATA_PATH, "falkordb_pings") + slice_section(
+        IMPORT_DATA_PATH, start, end, end_after=end_after
+    )
+
+
+def _run_import_wait(tmp_path, exec_body):
+    """Slice import-data.sh's section-7 wait loop and run it against a scripted docker.
+
+    The `up -d` invocation falls to the stub's catch-all and exits 0 silently;
+    only the `redis-cli ping` exec branch is under test. The no-op `sleep` stub
+    is what makes the 30-iteration timeout case instant.
+    """
+    return _run_probe(
+        tmp_path,
+        _falkordb_probe(_IMPORT_WAIT_START, _IMPORT_WAIT_END),
+        docker_body=dispatch_stub_body((('*" exec "*', exec_body),)),
+    )
+
+
+def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
+    """A ping that ANSWERED PONG is healthy, whatever else the producer's status says.
+
+    `docker compose exec` reports on the exec run as a whole; redis-cli having
+    answered is a fact about the OUTPUT. Reading the verdict from the
+    pipeline's status conflates the two and polls a live FalkorDB for thirty
+    seconds before declaring it never came up.
+    """
+    result = _run_import_wait(tmp_path, _match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
+
+
+def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
+    """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
+    result = _run_import_wait(tmp_path, _match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
+
+
+def test_import_wait_times_out_when_the_ping_says_nothing(tmp_path):
+    """No reply is still not-healthy — and the loop must reach that verdict without aborting."""
+    result = _run_import_wait(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_HEALTHY in combined, combined
+    assert _HEALTHY not in combined, combined
+
+
+def test_import_wait_times_out_when_the_ping_answers_something_else(tmp_path):
+    """A redis-cli that ANSWERED, but not PONG, is not healthy either.
+
+    `docker compose exec` succeeds and the reply is an error string — the shape
+    a container that is up but not yet serving actually produces. The loop must
+    keep waiting and time out, not read "it replied" as "it is healthy".
+    """
+    result = _run_import_wait(tmp_path, _nonmatching_output(_REPLY_WITHOUT_PONG))
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_HEALTHY in combined, combined
+    assert _HEALTHY not in combined, combined
+
+
+def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_import_wait(tmp_path, _clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
+
+
+# --- import-data.sh section 8: the FalkorDB health check --------------------
+# `end_after` is required so the slice runs THROUGH the `else` arm to the
+# block's own closing `fi` rather than stopping short at the `if`'s. Both
+# anchors occur exactly once, on non-comment lines, and survive the fix.
+_IMPORT_HEALTH_START = 'info "Health checks"'
+_IMPORT_HEALTH_END = "\nfi\n"
+_IMPORT_HEALTH_END_AFTER = 'warn "FalkorDB: not responding"'
+
+# Matched on the PREFIX: the same stub answers the DBSIZE call inside the
+# success arm, so the parenthesised count is whatever the scenario happened to
+# print and is irrelevant to the verdict under test.
+_PONG_OK = "OK FalkorDB: PONG"
+_NOT_RESPONDING = "WARN FalkorDB: not responding"
+
+
+def _run_import_health(tmp_path, exec_body):
+    """Slice import-data.sh's section-8 health check and run it against a scripted docker."""
+    return _run_probe(
+        tmp_path,
+        _falkordb_probe(
+            _IMPORT_HEALTH_START,
+            _IMPORT_HEALTH_END,
+            end_after=_IMPORT_HEALTH_END_AFTER,
+        ),
+        docker_body=dispatch_stub_body((('*" exec "*', exec_body),)),
+    )
+
+
+def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
+    """A FalkorDB that answered PONG is responding, whatever the exec's own status was.
+
+    This is the LAST thing the import prints about FalkorDB, so a misread here
+    is the operator's closing signal: a successful import reported as a
+    database that never came back.
+    """
+    result = _run_import_health(tmp_path, _match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
+
+
+def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
+    """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
+    result = _run_import_health(tmp_path, _match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
+
+
+def test_import_health_reports_not_responding_when_the_ping_says_nothing(tmp_path):
+    """No reply is genuinely not responding — reached WITHOUT aborting the import."""
+    result = _run_import_health(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_RESPONDING in combined, combined
+    assert _PONG_OK not in combined, combined
+
+
+def test_import_health_reports_not_responding_when_the_ping_answers_something_else(
+    tmp_path,
+):
+    """An error string is not a PONG — the import's closing signal must say so."""
+    result = _run_import_health(tmp_path, _nonmatching_output(_REPLY_WITHOUT_PONG))
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_RESPONDING in combined, combined
+    assert _PONG_OK not in combined, combined
+
+
+def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_import_health(tmp_path, _clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
+
+
+# --- the file-scoped contract ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [EXPORT_DATA_PATH, IMPORT_DATA_PATH, DEPLOY_W5_PATH],
+    ids=lambda p: p.name,
+)
+def test_never_pipes_a_producer_into_grep_q(script):
+    """No code line in these three scripts may decide anything through `producer | grep --quiet PAT`.
+
+    The behavioural tests above pin what each site DOES; this pins that the
+    defective CONSTRUCT does not come back. Task 4204 added its equivalent
+    sweep AFTER its fixes for the same reason this one lands last: a sweep
+    added first would sit RED across every intervening commit and break
+    per-step greenness.
+
+    GUARD-THE-GUARD lives elsewhere, deliberately. The detector is the shared
+    `grep_q_offenders` in tests/scripts/shell_sections.py, and
+    test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline
+    pins it against every planted spelling that must match and every shape that
+    must not — on behalf of BOTH sweeps. One detector deserves one guard; a
+    second copy of that case set here would be the drift this arrangement
+    removes.
+
+    SCOPE IS FILE-SCOPED AND THAT IS A DECISION, not an oversight. Running
+    this same detector over every *.sh in the repo finds 295 lines. The
+    overwhelming majority are warm-lane SHELL TEST assertions of the
+    `printf "%s\n" "$1" | grep -q ...` shape — a different risk profile and a
+    different owner. But the scan also finds genuine same-class PRODUCTION
+    sites in other scripts (notably a `docker ps --format ... | grep -q
+    falkordb`, the identical construct fixed here) which are outside this
+    task's file locks and are filed as follow-up work. Widening this sweep
+    would turn it into that much larger task and leave it red until every one
+    of them is fixed; narrowing the claim keeps it honest. Task 4204 set the
+    same precedent by scoping its sweep to setup-host.sh alone.
+
+    WHAT THE RULE DOES NOT FORBID. It is scoped to greps that EXIT ON FIRST
+    MATCH — every spelling of that, short cluster or long `--quiet`/`--silent`,
+    since they share one defect. A `| grep -F ... || true` inside a command
+    substitution is a different, safe shape: a non-quiet grep drains its input
+    rather than SIGPIPE-ing the producer. Neither is a `grep -q` reading a
+    FILE swept in: with no producer upstream there is nothing for `pipefail`
+    to conflate.
+
+    And it mandates NO replacement spelling. These scripts happen to use
+    `[[ ]]`, but `case` or a `<<<` here-string remain open to a future author
+    — this forbids one known-defective construct, nothing more.
+    """
+    source = script.read_text(encoding="utf-8")
+
+    # FIRST, because it is what makes the rule load-bearing: without pipefail
+    # there is no defect here and the sweep below would be guarding nothing.
+    assert "set -euo pipefail" in source, (
+        f"{script.name} no longer sets `-o pipefail`, so this sweep would pass "
+        f"vacuously. Either restore it or retire this test deliberately."
+    )
+
+    offenders = grep_q_offenders(source)
+    assert not offenders, f"producer piped into `grep -q` in {script.name}:\n" + "\n".join(
+        f"  line {n}: {line.strip()}" for n, line in offenders
+    )

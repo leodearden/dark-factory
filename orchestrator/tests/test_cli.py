@@ -2180,15 +2180,92 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
+def _communicate_or_empty(
+    child: 'subprocess.Popen', *, timeout: float = 10.0
+) -> tuple[bytes, bytes]:
+    """child.communicate(), tolerating a still-open pipe held by an orphaned
+    descendant instead of propagating subprocess.TimeoutExpired.
+
+    verify-merge's spec spawns descendants (a `sleep`-based test command,
+    build subprocesses) that inherit the Popen stdout/stderr pipe write
+    ends. If verify-merge itself dies nonzero while an orphaned descendant
+    still holds those pipes open, a plain communicate() can time out even
+    though *child* has already been reaped -- which would replace the
+    intended crash/timeout pytest.fail below with an unrelated
+    TimeoutExpired, losing the exit-code and output diagnostics.
+    """
+    try:
+        return child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return (b'', b'')
+
+
+def _wait_for_pgid_file_or_report_crash(
+    pgf: 'Path',
+    child: 'subprocess.Popen',
+    *,
+    timeout: float = 30.0,
+    interval: float = 0.1,
+) -> None:
+    """Poll for *pgf* to appear; fail promptly and distinctly if *child* has
+    already exited instead of burning the full *timeout* budget.
+
+    verify-merge writes its pgid file before doing any work and removes it
+    in a `finally` (orchestrator/src/orchestrator/cli.py::verify_merge) --
+    so a subprocess that crashes fast writes-and-removes the file well
+    inside a single poll interval, and a naive poll-then-timeout mislabels
+    that crash as a timeout. Checking child.poll() on every iteration lets
+    a crash (nonzero exit) fail immediately with an honest headline; a
+    subprocess still running after the budget remains a genuine timeout
+    (tasks 2350 and 2770 widened this budget repeatedly for load flakiness,
+    not for crash attribution -- do not fold that budget into this change).
+    A fast *successful* exit could also legitimately race the pgid-file
+    window, so the crash/timeout split is on exit code, not merely on
+    exit -- and is reported through its own message below rather than the
+    deadline headline, since the elapsed time in that case is not the
+    timeout.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    fast_clean_exit = False
+    while True:
+        if pgf.exists():
+            return
+        exit_code = child.poll()
+        if exit_code is not None:
+            # Re-check once more: a fast SUCCESSFUL exit can legitimately
+            # race the write-then-remove window.
+            if pgf.exists():
+                return
+            if exit_code != 0:
+                stdout, stderr = _communicate_or_empty(child)
+                pytest.fail(
+                    f'verify-merge exited with code {exit_code} before/without '
+                    f'writing a stable pgid file (crash, not a timeout)\n'
+                    f'STDOUT: {stdout.decode()[:2000]!r}\n'
+                    f'STDERR: {stderr.decode()[:2000]!r}'
+                )
+            fast_clean_exit = True
+            break  # exit_code == 0 -- fast successful race; fall through below
+        if time.monotonic() >= deadline:
+            break
         time.sleep(interval)
-    return False
+
+    stdout, stderr = _communicate_or_empty(child) if child.poll() is not None else (b'', b'')
+    if fast_clean_exit:
+        pytest.fail(
+            f'verify-merge exited cleanly (code 0) after '
+            f'{time.monotonic() - start:.1f}s without a visible pgid file -- '
+            f'fast successful race or a no-op invocation\n'
+            f'STDOUT: {stdout.decode()[:2000]!r}\n'
+            f'STDERR: {stderr.decode()[:2000]!r}'
+        )
+    pytest.fail(
+        f'verify-merge did not write pgid file within {timeout:.0f}s '
+        f'(subprocess poll={child.poll()!r})\n'
+        f'STDOUT: {stdout.decode()[:2000]!r}\n'
+        f'STDERR: {stderr.decode()[:2000]!r}'
+    )
 
 
 def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) -> None:
@@ -2311,14 +2388,11 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     pgid_val = None
     try:
         # --- Poll for the pgid file (written before asyncio.run) ---
-        if not _wait_for_file_cli(pgf, timeout=30):
-            _debug_stdout, _debug_stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
-            pytest.fail(
-                f'verify-merge did not write pgid file within 30s '
-                f'(subprocess poll={child.poll()!r})\n'
-                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
-                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
-            )
+        # Distinguishes a crashed verify-merge subprocess (reported
+        # immediately, exit code != 0) from a genuine timeout (subprocess
+        # still running after the budget) -- see
+        # _wait_for_pgid_file_or_report_crash's docstring.
+        _wait_for_pgid_file_or_report_crash(pgf, child, timeout=30)
 
         # Save pgid BEFORE cancel-verify removes the file
         pgid_val = int(pgf.read_text().strip())
@@ -2391,6 +2465,56 @@ def test_wait_pgid_gone_raises_for_live_group():
     try:
         with pytest.raises(AssertionError, match='still alive'):
             _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 4279 — _wait_for_pgid_file_or_report_crash: crash vs. timeout unit tests
+# ---------------------------------------------------------------------------
+#
+# test_verify_merge_cancel_end_to_end only ever exercises this helper's happy
+# path (the pgid file appears on the first poll), leaving the exit_code != 0
+# crash branch and the still-running deadline branch dead in CI. These mirror
+# the _wait_pgid_gone pair above, using cheap synthetic children instead of a
+# real verify-merge subprocess.
+
+
+def test_wait_for_pgid_file_or_report_crash_reports_crash_not_timeout(tmp_path):
+    """A child that exits nonzero before writing the pgid file fails
+    immediately with a crash-shaped message, not the generic timeout one.
+    """
+    import sys
+
+    never_created = tmp_path / 'does-not-exist.pgid'
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.exit(3)'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(pytest.fail.Exception, match='crash, not a timeout'):
+            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=5, interval=0.05)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_wait_for_pgid_file_or_report_crash_reports_timeout_for_live_child(tmp_path):
+    """A child still running at the deadline is reported as a genuine
+    timeout, not a crash -- even though it has not written the pgid file.
+    """
+    never_created = tmp_path / 'does-not-exist.pgid'
+    child = subprocess.Popen(
+        ['sleep', '30'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(pytest.fail.Exception, match='did not write pgid file'):
+            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=0.5, interval=0.05)
     finally:
         child.kill()
         child.wait(timeout=5)
@@ -2522,3 +2646,97 @@ def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
     assert watchdog_calls == [], (
         f'start_stdin_watchdog must NOT be called without --request-id; got {watchdog_calls!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-1 — the fire callback forwards the WatchdogTrigger
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypatch):
+    """The fire callback forwards the trigger, and still sets watchdog_fired FIRST.
+
+    The callback the CLI hands start_stdin_watchdog is the last hop before
+    fire_watchdog_kill reports the branch identity on stderr, so it has to
+    carry that identity through. It must also keep setting watchdog_fired
+    strictly before anything else: that happens-before is load-bearing (see
+    the comment above the callback in cli.py) and threading a new argument
+    through must not reorder it. Both are asserted from one ordered log.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import WatchdogTrigger
+
+    FAKE_PGID = 55556
+    known_json = '{"passed": true, "results": []}'
+
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = tmp_path / '.worktrees'
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
+
+    # One ordered log shared by both seams, so the happens-before is read off
+    # the log rather than inferred from two independent recorders.
+    ordered = []
+
+    class _LoggingEvent(threading.Event):
+        def set(self):
+            ordered.append('watchdog_fired.set')
+            super().set()
+
+    monkeypatch.setattr(threading, 'Event', _LoggingEvent)
+
+    kill_calls = []
+
+    def fake_fire_watchdog_kill(pgid, **kwargs):
+        ordered.append('fire_watchdog_kill')
+        kill_calls.append((pgid, kwargs))
+
+    monkeypatch.setattr(cli_module, 'fire_watchdog_kill', fake_fire_watchdog_kill)
+
+    captured_fire = []
+
+    def fake_start_stdin_watchdog(pgid, *args, fire=None, **kwargs):
+        captured_fire.append(fire)
+        return MagicMock()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', 'test-req-4194',
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert len(captured_fire) == 1, f'expected one fire= callback; got {captured_fire!r}'
+    assert captured_fire[0] is not None
+
+    ordered.clear()  # scope the log to the callback's own actions
+    captured_fire[0](WatchdogTrigger.HEARTBEAT_STARVATION)
+
+    assert ordered == ['watchdog_fired.set', 'fire_watchdog_kill']
+    assert len(kill_calls) == 1
+    pgid, kwargs = kill_calls[0]
+    assert pgid == FAKE_PGID
+    assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION

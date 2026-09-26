@@ -32,6 +32,7 @@ import aiosqlite
 import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     reap_leaked_aiosqlite_connections,
     require_orchestrator_inifile,
     sanitized_probe_env,
@@ -367,7 +368,21 @@ def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
     )
 
 
-@pytest.mark.timeout(120)
+# task 5147.  MEASURED 15.27s unloaded for this test's two full pytest
+# subprocesses (the module: `8 passed in 17.72s`); at this suite's recorded
+# ~4.8x load inflation that is ~73s, so the previous `timeout(120)` left only
+# 61% headroom with the loadavg step at which xdist workers actually DIE still
+# ahead of it.  VERIFY_CLI_PER_TEST_TIMEOUT leaves ~19.6x.
+#
+# NOT deleted, deliberately: the ini default is 60, so removing the marker
+# would leave this 15.27s two-subprocess test on a 60s budget under a bare
+# local `pytest` -- strictly worse than the bug being fixed.  The marker is
+# raised to the verify budget instead, which is a no-op under verify and a
+# genuine loosening locally.  Why a marker between those two budgets inverts
+# rather than loosens: see the VERIFY_CLI_PER_TEST_TIMEOUT comment block in
+# _orch_helpers.py, the single home of that rationale.  Enforced by
+# test_timeout_marker_inversion_guard.py.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     tmp_path, pytestconfig
 ):

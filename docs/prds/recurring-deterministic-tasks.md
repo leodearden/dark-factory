@@ -21,8 +21,10 @@ disabled unnoticed; 2 of 5 documented nightly jobs are uninstalled unnoticed; th
 A user observes: `get_task` on a completed link's successor shows an advanced fire time and
 mint provenance; a failed link is a `blocked` task with a pending born-at-L2 in the deny-listed
 `milestone_check_failed` category; the dashboard's invariants endpoint lists every chain with
-its state (`scheduled | overdue | paused | broken | ended`); and the two currently-dead nightly
-jobs (transcript-check, reify closure-staleness) run again, as the first chains.
+its state (`scheduled | overdue | paused | broken | ended`); and two real nightly jobs become
+legible as the first chains — transcript-check, whose unit was never installed, runs again, and
+the orphaned-worktree reclaim, which runs nightly but always reports success, gains a real
+pass/fail gate.
 
 ## Background — what exists (verified) and what is missing
 
@@ -58,12 +60,26 @@ jobs (transcript-check, reify closure-staleness) run again, as the first chains.
   per-row (`data/tasks.py::_shape_task`). The ε-detection PRD
   (`docs/prds/claimant-invariant-detection.md`, task d1) lands the per-root direct-sqlite pool
   path + `/api/v2/dashboard/invariants` endpoint this PRD's chain panel extends.
-- **Seed jobs are real.** `scripts/reify-closure-staleness-sweep.sh` exists, executable,
-  stdlib-only — but **always exits 0** by design (wrapper-era rationale) and needs a
-  predicate-shaped variant (its `$sweep_rc`/`$consumer_rc` are already captured).
+- **Seed jobs are real.** `scripts/reclaim-orphaned-worktrees.sh` exists, executable
+  (mode 100755), stdlib-only (it `exec`s `python3 scripts/reclaim_orphaned_worktrees.py`
+  directly — no `uv run`, no `.env`, no service-env exports; the decoupling is that
+  design's stated point) and is a live installed timer at 04:00 — but its `main()` has a
+  single `return 0` path, so it reports success unconditionally and needs a
+  predicate-shaped variant. That variant is well-founded rather than speculative: the
+  script already prints a structured JSON report carrying a `failed` counter, which is
+  the predicate input, and already has a read-only `--check` mode.
   `scripts/legibility-transcript-check@.service` names a runnable command
   (`uv run --frozen --project shared python scripts/legibility/check_transcript_persistence.py
-  --project-id %i`) whose unit was never installed. Both are currently delivering zero value.
+  --project-id %i`) whose unit was never installed. Neither currently delivers a usable
+  gate signal: one never runs, the other always reports success.
+- **Why this seed, and not the original one.** This PRD was written naming a predicate
+  variant of the nightly reify closure-staleness sweep as the first seed. That sweep, its
+  units, its wrapper, its `consume_redispatch_requests` drain and its installer were
+  retired wholesale by task 5247 (Leo's 2026-09-09 ruling): its `gate_closure` predicate
+  was a second, opposite-policy owner of the stranded-blocked population, and over the 15
+  retained journal runs it cancelled 7 reify tasks as collateral. The seed is re-pointed
+  at the orphaned-worktree reclaim above, whose substrate properties are re-verified
+  first-hand rather than inherited from the retired job's claim.
 
 ## Resolved design decisions
 
@@ -210,7 +226,7 @@ to one late run.
 | **r3** | Carrier timeout-leg category → `milestone_check_failed` | `orchestrator` | **leaf** | A seeded carrier whose predicate sleeps past a small `timeout_secs`: `get_task_escalations` shows the pending L2 with `category='milestone_check_failed'`, where today's identical setup yields `infra_issue` (B7) | r1 |
 | **r4** | Dashboard chain panel on the invariants endpoint (R-D5 state function) | `dashboard` | **leaf** | The endpoint's `chains` section lists a seeded chain and walks the states: future-dated `scheduled`, past-dated `overdue`, done-without-successor `broken` — each rendered distinctly, never absent (B8, B5's read side) | r1, **d1** (detection PRD) |
 | **r5** | Watcher checklist chain-triage extension | `skills` | **leaf** (non-code) | `git grep -n 'overdue\|broken' -- skills/escalation-watcher/SKILL.md skills/recon-escalation-watcher/SKILL.md` shows the chain-triage rule added to the invariants step in both files | r4, **d2** (detection PRD) |
-| **r6** | Seed the first two chains: predicate variant of the reify closure-staleness sweep + transcript-check; demonstrate link→successor end-to-end | `scripts`, task filing | **leaf** (integration gate) | B10 through the product read path: `get_task` shows link-1 `done` with `done_provenance.kind='deterministic-milestone'` and link-2 minted with advanced `at` + `minted_from`; the chain panel lists both chains | r2, r3 |
+| **r6** | Seed the first two chains: predicate variant of the orphaned-worktree reclaim + transcript-check; demonstrate link→successor end-to-end | `scripts`, task filing | **leaf** (integration gate) | B10 through the product read path: `get_task` shows link-1 `done` with `done_provenance.kind='deterministic-milestone'` and link-2 minted with advanced `at` + `minted_from`; the chain panel lists both chains | r2, r3 |
 
 **Routing notes.** All tasks are `task_kind='normal'`; r5 (a docs-only edit) additionally
 carries `metadata.complexity='simple'` for the single-agent fast path — deliberately NOT
@@ -219,8 +235,9 @@ routing the work to a human (Leo's 2026-08-24 ruling: reserve human attention fo
 needs it). r6 writes the predicate-variant script and files carriers; the carriers it files
 are themselves `task_kind='deterministic'`.
 
-**G1.** The mechanism's consumers are real and in-batch: r6 converts two currently-dead
-documented jobs into the first chains (the integration gate), and the ε-detection PRD's ε.2
+**G1.** The mechanism's consumers are real and in-batch: r6 converts two real documented jobs —
+one never installed, one running nightly but ungated — into the first chains (the integration
+gate), and the ε-detection PRD's ε.2
 census is a named future consumer (explicitly not built until its trigger fires). A third
 migration candidate (the 6-hourly `cleanup_test_collections` cron) is a follow-up, not queued.
 
@@ -260,8 +277,9 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
   until separately ruled.
 - **Retention policy for accumulated done links** (~365 rows/year per daily chain) — accepted
   for now; revisit if tree size bites.
-- **Migrating the remaining timer jobs** (flag-marker sweep, reclaim-orphaned-worktrees, the
-  cron cleanup) — follow-ups once r6's chains have soaked.
+- **Migrating the remaining timer jobs** (flag-marker sweep, the canonical/topic coverage
+  census, the cron cleanup) — follow-ups once r6's chains have soaked. The orphaned-worktree
+  reclaim left this list when it became r6's seed.
 
 ## Open questions (tactical)
 
@@ -269,5 +287,5 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
    `interval_secs`, capped at 24h. Decide during r4.
 2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance). Suggested:
    yes, verbatim — same job, same locks. Decide during r2.
-3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their former timer
+3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their documented timer
    slots. Decide during r6.

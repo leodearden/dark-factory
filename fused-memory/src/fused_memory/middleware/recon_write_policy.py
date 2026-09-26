@@ -56,6 +56,7 @@ function that always runs its gates when called.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
@@ -281,7 +282,7 @@ def _reject(
 # ---------------------------------------------------------------------------
 
 
-def check(
+async def check(
     op: str,
     *,
     task_id: str,
@@ -299,6 +300,18 @@ def check(
     Pure function — always runs its gates; the recon-stage scoping
     (``agent_id.startswith('recon-stage-')``) lives at the call site in
     ``task_interceptor.py``, not here.
+
+    ASYNC, and intrinsically non-blocking (task 3778). Gate 2's
+    :func:`~fused_memory.services.live_workflow_detector.is_workflow_live_for_task`
+    is a coroutine function — its three git probes await
+    :func:`shared.git_async.run_git` instead of shelling out with a blocking
+    ``subprocess.run`` — and Gate 2's remaining blocking work (the two on-disk
+    reads inside :func:`_corroboration_verdict`) is offloaded here via
+    ``asyncio.to_thread``. Callers therefore ``await check(...)`` directly:
+    both ``task_interceptor`` call sites previously differed (``set_task_status``
+    wrapped the whole call in ``asyncio.to_thread``, ``update_task`` called it
+    inline), and that asymmetry is gone. Gates 1 and 3 remain pure, allocation-
+    free comparisons and never yield.
 
     Gate 1 (terminal): ``op == 'update_task'`` AND ``live_status`` is
     terminal (done/cancelled) AND NOT ``is_annotation_clear`` ->
@@ -453,15 +466,19 @@ def check(
         parsed_metadata = _coerce_metadata_dict(task_metadata)
         # Per-task corroboration (task 2964). Computed inside this branch only,
         # and only for an in-progress task — see _corroboration_verdict and this
-        # function's Gate 2 docstring paragraph. The two blocking on-disk reads
-        # it performs are why this whole check() call is dispatched via
-        # asyncio.to_thread by task_interceptor.py: Gate 2 already did blocking
-        # git I/O, and corroboration rides that same existing thread hop rather
-        # than adding a second one or re-blocking the event loop.
-        corroborated = _corroboration_verdict(
+        # function's Gate 2 docstring paragraph. It performs two blocking on-disk
+        # reads (scheduler_state.json, orchestrator.lock). Until task 3778 those
+        # rode the asyncio.to_thread hop task_interceptor wrapped the whole
+        # check() call in, for the sake of Gate 2's then-blocking git I/O. That
+        # hop is gone — the git probes are natively async now — so the offload
+        # moves HERE, to the one call that still blocks. Without it, removing
+        # the hop would have quietly relocated two synchronous file reads per
+        # recon status write onto the event loop.
+        corroborated = await asyncio.to_thread(
+            _corroboration_verdict,
             task_id, project_root, live_status, task_snapshot,
         )
-        if is_workflow_live_for_task(
+        if await is_workflow_live_for_task(
             task_id,
             project_root,
             status=live_status,
@@ -579,8 +596,11 @@ def _corroboration_verdict(
     fail-safe to ``None``: ``read_scheduler_state`` (which already returns an
     empty skeleton for an absent/invalid file) and ``orchestrator_started_at``
     (the restart boundary parsed from the lock's ``started <ISO>`` token). Both
-    are blocking, which is why this runs inside the ``asyncio.to_thread`` hop
-    ``task_interceptor`` already uses for :func:`check` — see that call site.
+    are blocking, which is why :func:`check` dispatches this function through
+    ``asyncio.to_thread`` (task 3778). It deliberately stays SYNCHRONOUS: an
+    ``async def`` here would advertise a non-blocking contract that two
+    ``open()`` calls cannot honour, and would put the burden of remembering the
+    offload on every future caller instead of on the one that exists.
 
     Fail-safe direction is TOWARD live at every exit: ``None`` on a non-Mapping
     or absent snapshot, on any non-in-progress status, and on any exception, so

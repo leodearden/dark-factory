@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -40,6 +40,26 @@ __all__ = [
     "premise_refuted_entry",
     "verify_premise_refuted",
 ]
+
+
+def _resolve_yaml_loader(yaml_module: Any = yaml) -> type:
+    """Return the fastest available SAFE YAML loader from *yaml_module*.
+
+    Prefers ``CSafeLoader`` (the libyaml-backed C implementation, measured
+    ~8x faster than the pure-Python ``SafeLoader`` on a single parse of the
+    shipped registry) and falls back to ``SafeLoader`` when PyYAML was built
+    without libyaml. Both are *safe* loaders: same restricted tag set, no
+    arbitrary object construction.
+    """
+    return getattr(yaml_module, "CSafeLoader", None) or yaml_module.SafeLoader
+
+
+#: Resolved once at import for tidiness — NOT because this is a hot loop.
+#: load_premise_registry runs at most once per TaskCurator instance
+#: (task_curator.py caches the parsed entries for the instance's lifetime
+#: behind its `_premise_registry_load_attempted` guard), so this buys a
+#: one-time ~8ms saving on the registry parse, not a per-call one.
+_YAML_LOADER: type = _resolve_yaml_loader()
 
 
 @dataclass(frozen=True)
@@ -97,7 +117,7 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
 
     Returns an empty list (without warning) when *path* is ``None``.
     Returns an empty list and emits one WARNING when the file is missing,
-    unreadable, or not valid YAML.
+    unreadable, not decodable as UTF-8, or not valid YAML.
     Skips malformed individual entries with one WARNING each while returning
     the well-formed entries from the same file.
 
@@ -120,10 +140,22 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
             path, exc,
         )
         return []
+    except UnicodeDecodeError as exc:
+        logger.warning(
+            "recon_code_fix_premise_guard: cannot decode %s as UTF-8: %s — guard disabled",
+            path, exc,
+        )
+        return []
 
-    # Parse
+    # Parse. The `except yaml.YAMLError` below is exhaustive only because
+    # `text` was already decoded as strict UTF-8 above — that rejects lone
+    # surrogates before the parser ever sees them. On a scalar containing a
+    # lone surrogate, CSafeLoader raises UnicodeEncodeError (a ValueError,
+    # NOT a yaml.YAMLError) where SafeLoader raises yaml.reader.ReaderError
+    # (which IS a YAMLError) — so a future change to a bytes/errors="replace"
+    # read path must re-check this handler.
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_YAML_LOADER)
     except yaml.YAMLError as exc:
         logger.warning(
             "recon_code_fix_premise_guard: YAML parse error in %s: %s — guard disabled",

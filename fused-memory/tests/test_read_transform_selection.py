@@ -7,9 +7,10 @@ over an already-fetched hit list, so every test here injects hand-built
 ranked lists with exactly-known answers — which is what permits exact
 assertions with no tolerances.
 
-Both scripts are loaded via importlib so they can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily.
+Both scripts are loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so they can be tested without sys.path pollution:
+that helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  Both are invoked lazily.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
 -------------------------------------------
@@ -33,9 +34,10 @@ in-progress and claims that module.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
+
+from _fm_helpers import load_script_module
 
 SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS_DIR / 'read_transform_selection.py'
@@ -49,21 +51,15 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
+    call sys.modules.get(cls.__module__)).  Both keys are SHARED — with
+    ``test_bake_off_storage_shape.py``, with ``test_bake_off_fetch_cache.py``
+    and with the script-side ``read_transform_selection._load_script`` — which
+    is what makes reuse, rather than an unconditional re-exec, correct here.
 
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(path, mod_name=mod_name)
 
 
 @functools.cache
@@ -74,6 +70,42 @@ def _mod() -> types.ModuleType:
 @functools.cache
 def _bake_off() -> types.ModuleType:
     return _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+
+
+class TestTheScriptsAreLoadedOnceNotReExecuted:
+    """The loader seam must REUSE each script, not re-execute it.
+
+    An unconditional re-exec mints a SECOND module object under the same
+    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
+    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
+    serves whichever object a test module last registered under
+    ``'bake_off_storage_shape'``.  Three test modules register that key, and
+    ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
+    loadgroup"``, so collection order is not stable.
+
+    The UNCACHED two-argument seam is what these call: ``_mod()`` and
+    ``_bake_off()`` are ``functools.cache``d and would pass vacuously.
+    """
+
+    def test_the_bake_off_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        second = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        assert first is second
+        # The invariant `_assert_reexported_from_bake_off` leans on: it
+        # deliberately bypasses `_bake_off()` and compares against the LIVE
+        # `sys.modules` entry, so this is what keeps its premise honest.
+        assert sys.modules['bake_off_storage_shape'] is first
+
+    def test_the_selection_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        second = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        assert first is second
+        assert sys.modules['read_transform_selection'] is first
 
 
 def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
@@ -117,6 +149,13 @@ def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
 import copy  # noqa: E402
 
 import pytest  # noqa: E402
+
+# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
+#
+# Defined once in the sibling module so five importers cannot drift apart;
+# its docstring says why redirecting the directory is a hard boundary rather
+# than a convenience.  Autouse applies to every test in THIS module.
+from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: E402,F401
 
 
 def _rec(record_id, *, topic: str | None = 't', canonical=False, kind=None,
@@ -458,8 +497,9 @@ class TestPromotingAnchorNeedsNoContestedKey:
     """Arm (1) is landable today: it reads `topic` and nothing else.
 
     `contested` is a hand-labelled bake-off FIXTURE field — it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601)
-    and has no writer — so an arm that needed it would be unimplementable.
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`) and has no
+    writer — so an arm that needed it would be unimplementable.
     """
 
     @pytest.mark.parametrize('extra_key', ['contested', 'supersedes'])
@@ -756,7 +796,8 @@ class TestTheContestedTermIsStructurallyZeroToday:
     """Arm (2) suppresses, and cannot implement V2's protection.
 
     `contested` is a hand-labelled bake-off FIXTURE field: it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`
     — `{topic, canonical, kind, parent_id, supersedes}`), has no writer and
     no adjudication surface.  So the `+ contested` term above is arithmetic
     that production cannot currently make non-zero, and the report says so
@@ -3529,3 +3570,185 @@ class TestTheLiveExtendNeverWritesBelowProductionK:
         )
 
         assert replayed
+
+
+# ---------------------------------------------------------------------------
+# The live driver's in-use lease (task 4775)
+# ---------------------------------------------------------------------------
+#
+# `fetch_production_rankings` seeds under exactly the prefix the 6-hourly
+# reaper deletes — `config.mem0.collection_prefix = bake.ephemeral_collection_prefix()`
+# — and has its own `__main__` CLI, so it carries the identical exposure to
+# `run_bake_off` and needs its own lease.  The doubles below are the minimum
+# that lets the live driver reach its teardown; they are deliberately local
+# and are not a general harness for this file.
+
+
+def _fake_config():
+    """A config shaped like the two attributes paths the driver walks."""
+    config = types.SimpleNamespace(
+        mem0=types.SimpleNamespace(
+            collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
+            qdrant_url='http://localhost:6333',
+        ),
+        embedder=types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=types.SimpleNamespace(
+                openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+        queue=types.SimpleNamespace(data_dir='./data/queue'),
+    )
+    config.model_copy = lambda deep=False: _fake_config()
+    return config
+
+
+class _FakeMemoryService:
+    """Enough service for the driver to initialise, seed and tear down."""
+
+    initialize_raises = False
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = object()
+        self.closed = False
+
+    async def initialize(self):
+        if type(self).initialize_raises:
+            raise RuntimeError('qdrant unreachable')
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+class TestFetchProductionRankingsHoldsALease:
+    """The second live-seeding driver, and it needs its own lease.
+
+    `run_bake_off` is not the only site that seeds under a reaped prefix:
+    this one repoints `collection_prefix` at
+    `bake.ephemeral_collection_prefix()` and runs the same
+    drop -> seed -> measure -> finally-drop shape, with its own `__main__`
+    CLI where no pytest conftest exists to cover it.
+    """
+
+    @staticmethod
+    def _install_doubles(monkeypatch, *, initialize_raises=False):
+        """Patch the driver's seams at their source; return the observations.
+
+        `drop_collections` is the first statement in the driver's `try`, so
+        it fires before any collection exists — the instant the lease has to
+        already be live.
+        """
+        import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+        bake = _bake_off()
+        reaper = bake.load_cleanup_script()
+        at_drop: list[list[dict]] = []
+
+        def _drop_and_look(*args, **kwargs):
+            at_drop.append(reaper.live_leases())
+
+        async def _seed(*args, **kwargs):
+            return None
+
+        async def _fetch(*args, **kwargs):
+            return {'queries': {}}
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize_raises', initialize_raises)
+        monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _fake_config)
+        monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+        monkeypatch.setattr(bake, 'drop_collections', _drop_and_look)
+        monkeypatch.setattr(bake, 'seed_arm', _seed)
+        monkeypatch.setattr(bake, 'fetch_arm', _fetch)
+        return reaper, at_drop
+
+    async def test_a_lease_is_live_when_the_pre_run_sweep_fires(self, monkeypatch):
+        mod = _mod()
+        reaper, at_drop = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert at_drop, 'the observation seam never fired'
+        assert len(at_drop[0]) == 1, at_drop[0]
+        assert mod.__name__ in at_drop[0][0]['owner'], at_drop[0][0]['owner']
+
+    async def test_the_lease_is_released_once_the_call_returns(self, monkeypatch):
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []
+
+    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, monkeypatch,
+    ):
+        """The same acquisition-window property `run_bake_off` carries.
+
+        The temp queue directory is this pass's FIRST acquisition and the
+        service is built right after it, both before the `with`.  A
+        `bake.load_cleanup_script()` evaluated in the `with` header would sit
+        after both and before the `try` — the one window where a raise
+        (`_load_sibling_script` raises `FixtureError` when the spec cannot be
+        built) leaks the directory and skips `close()`.
+
+        Asserted as "NO resolution happens once a resource exists": the
+        `ephemeral_collection_prefix()` call above resolves the reaper either
+        way, so an index comparison would pass on the unfixed driver.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        bake = _bake_off()
+        self._install_doubles(monkeypatch)
+        order: list[str] = []
+        resolve = bake.load_cleanup_script
+        mkdtemp = tempfile.mkdtemp
+
+        def _record_resolve():
+            order.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            order.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        monkeypatch.setattr(bake, 'load_cleanup_script', _record_resolve)
+        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert 'queue_dir' in order, order
+        assert 'reaper' in order, order
+        assert 'reaper' not in order[order.index('queue_dir'):], order
+
+    async def test_the_raising_flag_is_restored_rather_than_left_set(self):
+        """`initialize_raises` is a CLASS attribute, so setting it directly
+        would leave the double raising for the rest of the pytest process.
+
+        Nothing breaks today only because every test that touches
+        `_FakeMemoryService` goes through `_install_doubles` first, which
+        resets it — an invariant a future test that constructs the double
+        directly has no way to know about, and whose breakage would surface
+        as an order-dependent failure under `pytest-randomly`.  Asserted
+        inside one test through a nested monkeypatch context, so it does not
+        itself depend on collection order.
+        """
+        with pytest.MonkeyPatch.context() as patcher:
+            self._install_doubles(patcher, initialize_raises=True)
+            assert _FakeMemoryService.initialize_raises is True
+
+        assert _FakeMemoryService.initialize_raises is False
+
+    async def test_the_lease_is_released_when_the_service_raises(self, monkeypatch):
+        """A failed pass must not hold the cron off any more than a failed
+        bake-off does."""
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch, initialize_raises=True)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []

@@ -31,7 +31,7 @@ WorkingDirectory=/home/leo/src/dark-factory
 # test_keep_alive_timeout_is_pinned_above_poll_interval, which derives this floor from
 # every poller registered in CLIENT_POLLERS -- so adding a slower poller, or slowing an
 # existing one, requires raising this value in BOTH unit files.
-ExecStart=/home/leo/.local/bin/uv run --project dashboard \
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080 \
   --timeout-graceful-shutdown 8 \

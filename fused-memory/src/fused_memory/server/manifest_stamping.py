@@ -7,7 +7,8 @@ each batch task whose metadata carries both ``prd_path`` and
 (``<prd-stem>.capability-manifest.yaml``), stamp the real ``task_id`` onto
 the matching label entry (written back to disk — the decompose session
 commits it, this module never does), and copy that label's MECHANICAL
-``delivered_checks`` (``grep``/``script`` kinds only — never ``manual``)
+``delivered_checks`` (every ``DeliveredCheckMeta`` kind — ``manual`` alone
+is dropped; see :data:`shared.capability_manifest.MECHANICAL_CHECK_KINDS`)
 into the producer task's ``metadata.delivered_checks`` via the interceptor's
 per-project write lock.
 
@@ -29,7 +30,11 @@ from typing import Any
 
 import yaml
 from pydantic import ValidationError
-from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
+from shared.capability_manifest import (
+    MECHANICAL_CHECK_KINDS,
+    DeliveredCheckMeta,
+    parse_capability_manifest,
+)
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 
@@ -289,10 +294,16 @@ async def _stamp_capability_manifests_impl(
             missing_labels.append(label)
     report['missing_labels'] = missing_labels
 
-    # 5. For each stamped label, copy only MECHANICAL (grep/script)
-    #    delivered_checks into that producer's metadata.delivered_checks —
-    #    a manual-only (or checkless) label collects an empty list and is
-    #    skipped, leaving the δ gate a status-only no-op for it.
+    # 5. For each stamped label, copy its MECHANICAL delivered_checks into
+    #    that producer's metadata.delivered_checks. Mechanical is not an
+    #    enumeration kept here — it is every DeliveredCheckMeta kind, since
+    #    a metadata entry IS a copied check; only 'manual' is dropped. The
+    #    rule is imported as MECHANICAL_CHECK_KINDS rather than restated, so
+    #    a new kind cannot be added to the schema and silently missed here
+    #    (a dropped check is one the δ gate never sees, which reads as
+    #    ungated rather than as failing). A manual-only (or checkless) label
+    #    collects an empty list and is skipped, leaving the δ gate a
+    #    status-only no-op for it.
     for task in doc.tasks:
         if task.label not in stamped_label_set:
             continue
@@ -308,7 +319,7 @@ async def _stamp_capability_manifests_impl(
             mechanical: list[dict[str, Any]] = []
             for cap in task.capabilities:
                 check = cap.delivered_check
-                if check is None or check.kind not in ('grep', 'script'):
+                if check is None or check.kind not in MECHANICAL_CHECK_KINDS:
                     continue
                 mechanical.append(
                     DeliveredCheckMeta(

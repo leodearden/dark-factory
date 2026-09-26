@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ import pytest
 from legibility import (
     census_trigger,
     codebook,
+    coder,
     digest,
     nightly,
     trickle_state,
@@ -41,7 +43,7 @@ from legibility.config import load_config
 
 @pytest.fixture(autouse=True)
 def _isolate_trickle_state(tmp_path, monkeypatch):
-    """Point XDG_STATE_HOME at tmp_path for EVERY test in this module.
+    """Point the legibility state root at tmp_path for EVERY test here.
 
     ``run_nightly`` records run state through ``trickle_state.record_run``
     on every exit path (task 3340), so without this an ordinary test run
@@ -52,8 +54,12 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
     reaches the recorder — including the ones that assert on this module's
     WARNING records, which a failed real-home write would otherwise
     pollute.
+
+    The lever was ``XDG_STATE_HOME`` until task 4514 made
+    ``trickle_state.trickle_state_path`` environment-independent; this is
+    now the only variable it reads.
     """
-    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg-state'))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / 'legibility-state'))
 
 
 def _write_config(
@@ -1004,7 +1010,8 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     launcher_calls = []
     line, fire = nightly.evaluate_census_step(
         cfg, now=None, status_fetcher=None, decide=fake_decide,
-        entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
+        entrypoint_exists=lambda: True,
+        launcher=lambda project_root, **kwargs: launcher_calls.append(1),
     )
 
     assert fire is True
@@ -1035,7 +1042,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     # the way a timed-out/killed census does.
     logged_at_launch = []
 
-    def _dying_launcher():
+    def _dying_launcher(project_root, **kwargs):
         logged_at_launch.extend(r.getMessage() for r in caplog.records)
         raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
 
@@ -1179,7 +1186,7 @@ def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None, "the launcher never raises and returns None (never-crash-the-nightly)"
     assert any(
@@ -1197,13 +1204,353 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake0)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None
     assert not any(
         "census" in r.getMessage()
         for r in caplog.records if r.levelno >= logging.WARNING
     ), "a zero-exit census must not emit a census-failure warning"
+
+
+# ---------------------------------------------------------------------------
+# task 5488: the census subprocess must be handed a POOL-CHOSEN account
+#
+# census.py runs as a GRANDCHILD -- run_nightly -> _default_census_launcher ->
+# subprocess.run(census.py) -- and that call carries no `env` of its own, so
+# the grandchild is authenticated today only because the 2026-09-14 stopgap
+# drop-in exported one account's token into the systemd unit. Retiring that
+# drop-in (steps 21-24) without this would leave the census riding whatever
+# ~/.claude holds: strictly WORSE than today, and invisible, because
+# census.preflight_headroom fails SAFE -- a token-less census silently defers
+# the whole run rather than erroring.
+#
+# A non-regression gate, not a new feature. The env is an OVERLAY on the
+# parent's, and "no account available" degrades to inheriting exactly as
+# before: a census launch must never crash or fail the nightly run, and must
+# never be blocked by a pool problem either.
+# ---------------------------------------------------------------------------
+
+def _spy_subprocess_run(monkeypatch):
+    """Capture the kwargs of the launcher's subprocess.run, return the dict."""
+    seen = {}
+
+    def _fake_run(args, **kwargs):
+        seen['args'] = args
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', _fake_run)
+    return seen
+
+
+def test_default_census_launcher_passes_an_explicit_env_through(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-from-the-pool'}
+
+    nightly._default_census_launcher('/some/project', env=env)
+
+    assert seen['env'] is env, (
+        'the census subprocess must be spawned with the env it was given, or '
+        'the account the pool chose never reaches census.py'
+    )
+    assert seen['check'] is False, (
+        "check=False is the launcher's never-crash-the-nightly contract and "
+        'must survive the new parameter'
+    )
+
+
+def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch):
+    """No env means the pre-5488 behaviour, byte for byte.
+
+    ``env=None`` and an omitted ``env`` are the SAME thing to subprocess --
+    inherit the parent's -- which is what keeps this parameter strictly
+    additive for every other caller of the launcher.
+    """
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/project')
+
+    assert seen.get('env') is None
+
+
+# ---------------------------------------------------------------------------
+# task 3269 (re-landed by task 5782): the census launch names its target
+#
+# The launcher used to run a bare `python census.py`, so census.py fell back
+# to its `--project-root "."` default and resolved against the launcher's cwd
+# -- which legibility-trickle@.service pins to /home/leo/src/dark-factory for
+# EVERY %i instance. Every fired census therefore censused dark_factory,
+# whichever project the trickle instance was for. No test inspected the argv.
+# ---------------------------------------------------------------------------
+
+def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
+    """Return ``[flag, value]`` for the first occurrence of *flag* in *argv*.
+
+    Asserting on the ADJACENT pair (rather than mere membership of both
+    strings) is what makes "flag present but paired with the wrong value"
+    fail -- the exact failure mode under test.
+    """
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index:index + 2]
+    return None
+
+
+def _fire_decide(project_root, *, now=None, status_fetcher=None):
+    return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+
+
+def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/other/project')
+
+    argv = seen['args']
+    assert argv[0] == sys.executable
+    assert argv[1].endswith('census.py'), f'argv[1] must be the census entrypoint, got {argv[1]!r}'
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+    assert '--config' not in argv, (
+        'a caller holding only a project root must not synthesize a config path'
+    )
+
+
+def test_default_census_launcher_argv_carries_config_path_when_given(monkeypatch):
+    """``--config`` pins the EXACT legibility.yaml the trickle itself loaded,
+    so the census cannot independently re-resolve to a different one."""
+    seen = _spy_subprocess_run(monkeypatch)
+    config_path = '/some/other/project/docs/legibility/legibility.yaml'
+
+    nightly._default_census_launcher('/some/other/project', config_path=config_path)
+
+    argv = seen['args']
+    assert _adjacent_pair(argv, '--config') == ['--config', config_path]
+    # ...riding the SAME argv as the project root, not replacing it.
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+
+
+def test_default_census_launcher_refuses_a_relative_config_path(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher(
+            '/some/project', config_path='docs/legibility/legibility.yaml',
+        )
+
+    assert 'docs/legibility/legibility.yaml' in str(excinfo.value)
+    assert seen == {}, 'a refused config path must never reach subprocess.run'
+
+
+def test_default_census_launcher_composes_project_root_with_the_pool_env(monkeypatch):
+    """Task 3269's argv fix and task 5488's env overlay ride the SAME launch."""
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
+
+    nightly._default_census_launcher('/p', env=env)
+
+    assert seen['env'] is env
+    assert seen['check'] is False
+    assert _adjacent_pair(seen['args'], '--project-root') == ['--project-root', '/p']
+
+
+def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
+    """A relative target would resolve against the trickle's cwd -- the unit
+    file's WorkingDirectory -- which is task 3269's defect all over again."""
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher('relative-proj')
+
+    assert 'relative-proj' in str(excinfo.value)
+    assert seen == {}, 'a refused target must never reach subprocess.run'
+
+
+def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path):
+    cfg = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    _line, fire = nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec,
+    )
+
+    assert fire is True
+    # The config's own root -- a tmp dir, definitively NOT the pytest cwd.
+    assert calls == [(str(tmp_path / 'proj_a'), None)]
+
+
+def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(tmp_path):
+    """The production defect's own shape: a legibility-trickle@reify run and a
+    legibility-trickle@dark_factory run launched an IDENTICAL census."""
+    cfg_a = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    cfg_b = load_config(_write_config(tmp_path / 'proj_b', project_id='proj_b'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append(project_root)
+
+    for cfg in (cfg_a, cfg_b):
+        nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=_fire_decide,
+            entrypoint_exists=lambda: True, launcher=rec,
+        )
+
+    assert calls == [str(tmp_path / 'proj_a'), str(tmp_path / 'proj_b')]
+
+
+def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
+    config_path = _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    cfg = load_config(config_path)
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec, config_path=config_path,
+    )
+
+    assert calls == [(cfg.project_root, config_path)]
+
+
+def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
+    tmp_path, monkeypatch,
+):
+    """The census is pinned to the legibility.yaml THIS run loaded -- made
+    absolute, so an operator's relative ``--config`` is never re-resolved
+    against the census subprocess's cwd."""
+    monkeypatch.chdir(tmp_path)
+    _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    calls = []
+
+    def _spy_evaluate(cfg, **kwargs):
+        calls.append((cfg, kwargs))
+        return 'census trigger: NO-FIRE -- stub', False
+
+    monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+
+    nightly.run_nightly(
+        config_path='proj_a/docs/legibility/legibility.yaml',
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: None,
+    )
+
+    assert len(calls) == 1
+    cfg, kwargs = calls[0]
+    expected = (tmp_path / 'proj_a' / 'docs' / 'legibility' / 'legibility.yaml').resolve()
+    assert kwargs['config_path'] == expected
+    assert Path(kwargs['config_path']).is_absolute()
+    # The cfg and the config path name the SAME project.
+    assert cfg.project_root == str(tmp_path / 'proj_a')
+
+
+class TestRunNightlyBindsTheCensusLauncherToThePool:
+    """The wiring half: the launcher run_nightly hands the census step is
+    bound to THIS run's pool, so the account census.py authenticates as is one
+    the gate believes is live -- rather than the hardcoded max-h of the
+    stopgap drop-in this task retires."""
+
+    class _Lease:
+        def __init__(self, name, token):
+            self.name = name
+            self.token = token
+
+    class _OneAccountGate:
+        """A pool with exactly one leasable account, leased by token."""
+
+        account_count = 1
+
+        def __init__(self, token='tok-census-account'):
+            self.token = token
+            self.released = []
+
+        def try_lease(self, **_kwargs):
+            return TestRunNightlyBindsTheCensusLauncherToThePool._Lease(
+                'max-h', self.token,
+            )
+
+        def release_probe_slot(self, oauth_token):
+            self.released.append(oauth_token)
+
+    @staticmethod
+    def _capture_launcher(monkeypatch):
+        seen = {}
+
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
+            seen['launcher'] = launcher
+            return 'census trigger: NO-FIRE -- stub', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+        return seen
+
+    @staticmethod
+    def _env_the_census_would_get(launcher, monkeypatch):
+        """Resolve *launcher* the way evaluate_census_step does, run it with
+        subprocess.run spied, and return the env the census subprocess got."""
+        seen = _spy_subprocess_run(monkeypatch)
+        (launcher if launcher is not None else nightly._default_census_launcher)('/some/project')
+        return seen.get('env')
+
+    def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
+        gate = self._OneAccountGate()
+        monkeypatch.setattr(nightly.account_pool, 'build_pool', lambda **kw: gate)
+        # The invoke half is stubbed out: this class is about the census env,
+        # and a pool-backed invoker over a FAKE token would spawn the REAL
+        # `claude` on PATH (a 401 here, genuine billable spend the day a test
+        # stub holds a live token). The invoke wiring itself is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool.
+        monkeypatch.setattr(
+            nightly.account_pool, 'pool_invoke',
+            lambda pool, **kw: (
+                lambda prompt, model: '{"matches": [], "candidates": []}'
+            ),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        # No invoke= : the production path, where a pool IS built.
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=None,
+        )
+
+        env = self._env_the_census_would_get(seen['launcher'], monkeypatch)
+        assert env is not None, (
+            'the census inherited the parent env -- after the account-pin '
+            'drop-in is retired that means ~/.claude, and preflight_headroom '
+            'would defer the whole census with no error anyone can see'
+        )
+        assert env['CLAUDE_CODE_OAUTH_TOKEN'] == gate.token
+        assert 'ANTHROPIC_API_KEY' not in env
+
+    def test_a_run_with_no_pool_leaves_the_census_env_inherited(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """An injected invoke= builds no gate, and that must not be allowed to
+        cost the census its env: unchanged inheritance is the fail-safe."""
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setattr(
+            nightly.account_pool, 'build_pool',
+            lambda **kw: pytest.fail('no pool may be built on the injected path'),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
+        )
+
+        assert self._env_the_census_would_get(seen['launcher'], monkeypatch) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1251,7 +1598,9 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             factory_calls.append(project_root)
             return sentinel
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None):
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
             seen['status_fetcher'] = status_fetcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -1321,6 +1670,207 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
         assert factory_calls == [], (
             'an injected status_fetcher must short-circuit the default factory'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5488: run_nightly must DEFAULT the coder's `invoke` seam to the shared
+# multi-account pool
+#
+# The SAME asymmetry as the status_fetcher one above, one seam over, and from
+# the same cause: main() holds nothing to build a gate from, so `invoke=None`
+# reached `coder.code_digest`, hit its `invoke or _invoke_cli` fallback, and
+# every one of the night's 33 one-shots authenticated as whatever login
+# ~/.claude happened to hold. ONE capped login therefore deferred an entire
+# night while six live accounts in config/usage-accounts.yaml sat idle, and a
+# 2026-09-14 stopgap drop-in pinned the unit to a single account (max-h) to
+# paper over it. `invoke` was the LAST seam here still resolving None to
+# nothing -- which is precisely the shape task 4148's comment block warns
+# about, three seams and three repairs later.
+# ---------------------------------------------------------------------------
+
+class TestRunNightlyDefaultsTheInvokeSeamToThePool:
+    """Pin run_nightly's invoke seam: None means "build the real pool-backed
+    invoker", an explicit value is honoured.
+
+    The spy replaces ``coder.code_digests`` ITSELF, so what is asserted is
+    the callable that reached the coder -- not merely that a pool was built
+    somewhere. Identity assertions throughout: "some invoker got through"
+    must never pass for "the pool's invoker got through".
+    """
+
+    class _StubGate:
+        """Stands in for the ``UsageGate`` ``build_pool`` returns.
+
+        Deliberately inert: ``run_nightly`` is only ever allowed to THREAD
+        this object (to ``pool_invoke``, and to the census launcher's env),
+        never to interrogate it, so an empty roster is the safest shape a
+        stub can have.
+        """
+
+        account_count = 0
+
+        def try_lease(self, **_kwargs):
+            return None
+
+    @staticmethod
+    def _install_spies(monkeypatch):
+        """Stub the pool factory pair and record what reached the coder.
+
+        Returns ``(gate, invoker, build_calls, pool_calls, seen)``.
+        """
+        gate = TestRunNightlyDefaultsTheInvokeSeamToThePool._StubGate()
+        build_calls = []
+        pool_calls = []
+        seen = {}
+
+        def _invoker(prompt, model):
+            raise AssertionError('the spied coder must never call the invoker')
+
+        def _fake_build_pool(**kwargs):
+            build_calls.append(kwargs)
+            return gate
+
+        def _fake_pool_invoke(pool, **kwargs):
+            pool_calls.append((pool, kwargs))
+            return _invoker
+
+        def _spy_code_digests(digests, cb, *, project=None, model=None, invoke=None):
+            seen['invoke'] = invoke
+            return coder.RunResult(
+                status='ok', records=[], failures=[], total=0, succeeded=0, failed=0,
+            )
+
+        monkeypatch.setattr(nightly.account_pool, 'build_pool', _fake_build_pool)
+        monkeypatch.setattr(nightly.account_pool, 'pool_invoke', _fake_pool_invoke)
+        monkeypatch.setattr(nightly.coder, 'code_digests', _spy_code_digests)
+        # The file's own hazard note (task 4148 block above): a run reaching
+        # the census step must not be able to POST anywhere or subprocess-
+        # launch census.py, which spends real tokens and writes real git.
+        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
+        return gate, _invoker, build_calls, pool_calls, seen
+
+    @staticmethod
+    def _run_one_digest_night(tmp_path, **kwargs):
+        """Drive a night carrying ONE real digest, so ``code_digests`` is
+        genuinely reached.
+
+        The quiet-night helper the status_fetcher class above uses cannot
+        serve here: an empty sample returns before the coder stage, and this
+        seam exists nowhere else.
+        """
+        work_cwd = str(tmp_path / 'work')
+        _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+        projects_root = tmp_path / 'projects'
+        _write_transcript(
+            projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+        )
+        kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
+        return nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            poster=lambda url, envelope: None,
+            **kwargs,
+        )
+
+    def test_defaults_to_the_pool_backed_invoker(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        install_fake_httpx(_no_outbound_post)
+        gate, invoker, _build_calls, pool_calls, seen = self._install_spies(monkeypatch)
+
+        # No invoke argument at all -- exactly what main() passes.
+        self._run_one_digest_night(tmp_path)
+
+        assert seen['invoke'] is invoker, (
+            f'run_nightly handed coder.code_digests {seen["invoke"]!r} instead '
+            'of the pool-backed invoker -- with None, code_digest falls back '
+            'to a bare _invoke_cli and the night rides the ambient ~/.claude '
+            'login again'
+        )
+        assert [pool for pool, _kwargs in pool_calls] == [gate], (
+            'pool_invoke must be handed the gate build_pool returned'
+        )
+
+    def test_the_pool_is_built_exactly_once_per_run(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """Cap state lives in the gate's memory and only there, so ONE gate
+        must serve the whole night: a per-digest pool would forget every cap
+        it had just learned and re-try capped accounts for all 33 digests."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, build_calls, pool_calls, _seen = self._install_spies(monkeypatch)
+
+        self._run_one_digest_night(tmp_path)
+
+        assert len(build_calls) == 1, (
+            f'build_pool must be called exactly once per run, got {len(build_calls)}'
+        )
+        assert len(pool_calls) == 1
+
+    def test_the_trickle_drains_the_roster_from_the_end(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """reverse=True: the trickle's one-shots take accounts h->b so they do
+        not contend with the orchestrator's b->h first-available order."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, _build_calls, pool_calls, _seen = self._install_spies(monkeypatch)
+
+        self._run_one_digest_night(tmp_path)
+
+        assert pool_calls[0][1].get('reverse') is True, (
+            f'run_nightly built the invoker with {pool_calls[0][1]!r} -- the '
+            'trickle must drain the roster in reverse'
+        )
+
+    def test_an_injected_invoke_is_not_overridden(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """DI-seam regression guard: every other run_nightly test in this file
+        injects an invoke stub and depends on the default never clobbering
+        it. No gate may be constructed on that path either -- a test suite
+        that builds a real pool reads the operator's own .env."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, build_calls, pool_calls, seen = self._install_spies(monkeypatch)
+
+        def my_fake(prompt, model):
+            return '{"matches": [], "candidates": []}'
+
+        self._run_one_digest_night(tmp_path, invoke=my_fake)
+
+        assert seen['invoke'] is my_fake
+        assert build_calls == [] and pool_calls == [], (
+            'an injected invoke must short-circuit the pool entirely'
+        )
+
+    def test_the_pool_and_the_coder_share_one_module_object(self):
+        """account_pool's `coder` must BE nightly's `coder`, not a second
+        import of the same file.
+
+        scripts/legibility/ is on sys.path as well as scripts/, so a bare
+        `import coder` and `from legibility import coder` build two distinct
+        module objects carrying two distinct `CoderCapExhausted` classes. The
+        pool raises that exception and `coder.code_digest` catches it by name
+        -- and there is no generic `except Exception` beneath those two arms,
+        so a mismatch would not mislabel the deferral, it would let the
+        exception escape run_nightly entirely and crash the night that task
+        4736 exists to make exit 0.
+        """
+        assert nightly.account_pool.coder is nightly.coder
+        assert (
+            nightly.account_pool.coder.CoderCapExhausted
+            is nightly.coder.CoderCapExhausted
+        )
+
+
+def _no_outbound_post(url, **kwargs):
+    """An httpx.post stub that fails LOUDLY rather than returning a plausible
+    reply. Every seam in these runs is injected, so a POST reaching the wire
+    means a seam silently resolved to its live implementation -- exactly the
+    fault this class exists to pin, and it must not pass quietly."""
+    pytest.fail(f'unexpected outbound POST to {url!r} -- every seam is injected')
 
 
 # ---------------------------------------------------------------------------
@@ -1750,8 +2300,157 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
 # step-15/16: run_nightly -- fail-loud on coder storm (decision 8, §8.6)
 # ---------------------------------------------------------------------------
 
+_CAP_BANNER_4736 = "You've hit your weekly limit - resets 2pm (Europe/London)"
+"""The verbatim line observed on 2026-08-24, from the shared corpus entry.
+
+Spelled here rather than imported so the unit tests read as the incident
+replay they are; the CORPUS is the authority, and the end-to-end replay below
+asserts this exact text survives the whole chain."""
+
+
+def _fake_invoke_capped(prompt: str, model: str):
+    """Every digest hits a usage cap -- the 2026-08-24 shape."""
+    raise coder.CoderCapExhausted(
+        "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
+        f'stdout="{_CAP_BANNER_4736}" stderr=\'\'',
+        marker="you've hit your",
+    )
+
+
 def _fake_invoke_unparseable(prompt: str, model: str) -> str:
     return 'not valid json at all'
+
+
+# ---------------------------------------------------------------------------
+# task 4736: run_nightly's capped night -- a DEFERRAL, not a fail-loud branch
+# ---------------------------------------------------------------------------
+
+def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
+    """An all-accounts-capped night exits 0 and leaves the codebook alone.
+
+    The 2026-08-24 shape.  Before this, the same night exited 1 with an
+    ERROR-level escalation -- an operator paged for a condition ruled normal
+    (Leo's directive; sibling task 4503).
+    """
+    codebook_path_holder = {}
+
+    def _poster(url, envelope):
+        escalation_calls.append((url, envelope))
+
+    escalation_calls = []
+    with caplog.at_level(logging.DEBUG):
+        result, repo = _run_e2e_nightly(
+            tmp_path, branch='capped', poster=_poster,
+        )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    codebook_path_holder['p'] = codebook_path
+
+    # (a) A capped night is not a failed night.
+    assert result.exit_code == 0, (
+        "a capped night must not fail the systemd unit -- that is what turned "
+        "2026-08-24 into an infra incident"
+    )
+    # (b) The new structured fact.
+    assert result.capped is True
+    # (c) The batch really did storm; only the DISPOSITION differs.  status's
+    # vocabulary is deliberately unchanged, because census reads it.
+    assert result.coder_status == 'failure'
+    # (f) Nothing merged, nothing dumped, nothing committed, nothing made up.
+    assert result.commit_made is False
+    assert result.applied == 0
+
+    # (d) Exactly ONE escalation, naming the deferral rather than a storm, and
+    # carrying the cap text so the journal names the cause on first read.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    summary = arguments['summary'].lower()
+    assert 'storm' not in summary, (
+        f"a deferral must not be announced as a storm; got {summary!r}"
+    )
+    assert 'cap' in summary or 'defer' in summary, summary
+    assert 'weekly limit' in arguments['detail'].lower(), (
+        f"the cap banner must reach the escalation detail, or the operator "
+        f"reads a deferral with no stated cause; got {arguments['detail']!r}"
+    )
+
+    # (e) WARNING, not ERROR: post_escalation's own level rule is ERROR iff
+    # this escalation is itself the fail-loud trigger returning exit_code=1.
+    errors = [r for r in caplog.records
+              if r.name == 'legibility.nightly' and r.levelno >= logging.ERROR]
+    assert not errors, (
+        f"a deferred night must not journal at ERROR -- exit_code is 0, so "
+        f"this escalation is not a fail-loud trigger; got "
+        f"{[r.getMessage() for r in errors]!r}"
+    )
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == 'legibility.nightly' and r.levelno == logging.WARNING]
+    assert any('weekly limit' in w.lower() for w in warnings), (
+        f"the aggregate journal line must carry the cap text; got {warnings!r}"
+    )
+
+
+def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
+    """No dump, no commit, no fabricated records -- the file on disk is
+    unchanged."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_capped,
+        status_fetcher=None,
+        poster=lambda url, envelope: None,
+    )
+
+    assert result.exit_code == 0
+    assert result.capped is True
+    assert codebook_path.read_bytes() == before_bytes, (
+        "a deferred night must leave the codebook byte-identical -- nothing "
+        "was ever coded"
+    )
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log, "a deferred night makes no commit"
+
+
+def test_run_nightly_capped_is_false_on_the_other_branches(tmp_path):
+    """`capped` is never ambiguous: it is False on a healthy night and False
+    on a GENUINE storm.
+
+    The storm half is the regression guard -- if capped ever leaked onto a
+    real storm, every coder regression would defer silently.
+    """
+    happy_dir = tmp_path / 'happy'
+    storm_dir = tmp_path / 'storm'
+    happy_dir.mkdir()
+    storm_dir.mkdir()
+
+    happy, _repo = _run_e2e_nightly(happy_dir)
+    assert happy.capped is False
+    assert happy.exit_code == 0
+
+    storm, _repo2 = _run_e2e_nightly(storm_dir, branch='storm')
+    assert storm.capped is False
+    assert storm.exit_code == 1, "a genuine storm must still fail loudly"
+    assert storm.coder_status == 'failure'
 
 
 def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
@@ -2698,6 +3397,10 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
 
     * ``'extractor'``  — ``build_digests`` raises (needs *monkeypatch*)
     * ``'storm'``      — every digest's coding output is unparseable
+    * ``'capped'``     — every digest hits a usage cap (task 4736).  Not a
+      fail-loud branch: it returns ``exit_code=0``.  Wired here anyway so
+      the recorder and journaling parametrizations can reach it, since this
+      is the one place branch knowledge lives.
     * ``'validation'`` — the merged codebook fails ``codebook.validate``
       (needs *monkeypatch*)
     * ``'commit'``     — the committer fails
@@ -2748,6 +3451,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
     elif branch == 'storm':
         kwargs['invoke'] = _fake_invoke_unparseable
+    elif branch == 'capped':
+        kwargs['invoke'] = _fake_invoke_capped
     elif branch == 'validation':
         assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
         monkeypatch.setattr(
@@ -2824,6 +3529,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -2836,6 +3542,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -2847,6 +3554,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -2858,6 +3566,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -2875,6 +3584,7 @@ class TestRunNightlyRecordsTrickleState:
             _run_e2e_nightly(tmp_path, recorder=recorder)
 
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] != 0, (
             'a crashed night must record its crash honestly'
         )
@@ -2882,6 +3592,54 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_a_crash_after_selecting_digests_records_failed_not_productive(
+        self, tmp_path
+    ):
+        """The 2026-08-18 reify shape: signal DID reach the digest stage,
+        and the pipeline broke downstream of it. Before task 4514 this
+        recorded ``productive``, streak 0, and a FRESH
+        ``last_productive_at`` — every night, for as long as the coder
+        stayed broken."""
+        recorder, calls = _recorder_spy()
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='storm', recorder=recorder,
+        )
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] >= 1, (
+            'signal reached the digest stage; the counters must still say so'
+        )
+        assert doc['consecutive_failed_runs'] == 1
+        assert doc['consecutive_barren_runs'] == 0
+        assert doc['last_productive_at'] is None
+
+    def test_result_exit_code_is_not_mutated_by_recording(self, tmp_path):
+        """Nothing in the recorder may write back onto
+        ``NightlyResult.exit_code`` — the refusal
+        ``scripts/legibility/nightly.py::_escalate_barren_streak``
+        records, because doing so would flip the unit to ``Result=failed``
+        and invert ``check_trickle_liveness.sh`` into a permanent false
+        alarm."""
+        recorder, calls = _recorder_spy()
+        clean, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
+        assert clean.exit_code == 0
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+
+        storm_dir = tmp_path / 'storm'
+        storm_dir.mkdir()
+        recorder, calls = _recorder_spy()
+        stormed, _repo2 = _run_e2e_nightly(
+            storm_dir, branch='storm', recorder=recorder,
+        )
+        assert stormed.exit_code == 1, (
+            'the fail-loud branch owns the exit code; recording must not '
+            'move it in either direction'
+        )
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
 
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
@@ -2945,15 +3703,16 @@ class _NightRunner:
 
     def night(self, day, kind):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
-        'productive' (real signal, stock budget) or 'quiet' (no sessions at
-        all for this date)."""
+        'productive' (real signal, stock budget), 'quiet' (no sessions at
+        all for this date) or 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``)."""
         target = date(2026, 7, day)
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive'):
+        if kind in ('barren', 'productive', 'storm'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -2966,10 +3725,22 @@ class _NightRunner:
             projects_root=self.projects_root,
             target_date=target,
             now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=_fake_invoke_known_cause,
+            invoke=(
+                _fake_invoke_unparseable if kind == 'storm'
+                else _fake_invoke_known_cause
+            ),
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
         )
+
+    def recorded(self):
+        """The state document the REAL recorder just wrote for this run."""
+        status, doc = trickle_state.load_state(
+            trickle_state.trickle_state_path('testproj')
+        )
+        assert (status, doc) != ('missing', None), 'no run recorded yet'
+        assert doc is not None
+        return doc
 
 
 class TestBarrenStreakEscalation:
@@ -2982,6 +3753,74 @@ class TestBarrenStreakEscalation:
     than re-opening it, and avoids the one-shot latch's worse failure mode
     that 3270 explicitly rejected.
     """
+
+    def test_repeated_crashes_never_restamp_last_productive_at(self, tmp_path):
+        """THE "forever green" scenario, end to end through the real
+        pipeline: one productive night, then three storming ones. An
+        operator reading ``last_productive_at`` must see night one, not a
+        stamp refreshed by every crash."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'productive')
+        first = runner.recorded()
+        assert first['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        stamp = first['last_productive_at']
+        assert stamp is not None
+
+        for night, expected_streak in ((14, 1), (15, 2), (16, 3)):
+            result = runner.night(night, 'storm')
+            assert result.exit_code == 1
+            doc = runner.recorded()
+            assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+            assert doc['consecutive_failed_runs'] == expected_streak
+            assert doc['last_productive_at'] == stamp, (
+                'a night that crashed did nothing productive; restamping '
+                'here is the lie that makes a broken pipeline read healthy'
+            )
+
+    def test_a_failed_night_does_not_fire_the_barren_streak_escalation(
+        self, tmp_path
+    ):
+        """``_escalate_barren_streak`` returns early unless the outcome is
+        ``barren``, so a crashed night cannot fire it — the crash is
+        already owned by that run's own fail-loud escalation."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+
+        stormed = runner.night(15, 'storm')
+
+        assert stormed.exit_code == 1
+        assert stormed.barren_escalated is False
+        assert _streak_escalations(runner.escalations) == []
+
+    def test_a_failed_night_carries_the_barren_streak_forward(self, tmp_path):
+        """barren, barren, FAILED, barren — the FOURTH night is the one
+        that reaches the threshold. Asserting exactly one streak
+        escalation across all four proves the carry-forward cannot
+        double-fire the exact-equality edge trigger."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+        assert runner.recorded()['consecutive_barren_runs'] == 2
+
+        runner.night(15, 'storm')
+        carried = runner.recorded()
+        assert carried['outcome'] == trickle_state.OUTCOME_FAILED
+        assert carried['consecutive_barren_runs'] == 2, (
+            'a crashed run is evidence about the RUN, not about whether '
+            'signal is flowing'
+        )
+
+        fourth = runner.night(16, 'barren')
+
+        assert runner.recorded()['consecutive_barren_runs'] == 3
+        assert fourth.barren_escalated is True
+        assert len(_streak_escalations(runner.escalations)) == 1, (
+            'the streak passes through the threshold value at most once, so '
+            'the carry-forward cannot produce a second edge trigger'
+        )
 
     def test_threshold_default_is_three(self):
         """One barren night can be an ordinary bad day; three consecutive
@@ -3385,6 +4224,37 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # `nightly._default_census_launcher`. The two tests below are the pattern.
 # ---------------------------------------------------------------------------
 
+def _stub_census_launcher_and_pool(monkeypatch):
+    """Stub both of a ``main()``-driven run's reaches into the real world, and
+    return the launcher's call list, one ``(args, kwargs)`` pair per call.
+
+    MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
+    subprocess-runs scripts/legibility/census.py (real LLM spend + real git
+    writes) and ``_default_entrypoint_exists`` is true in a real checkout --
+    and reaching FIRE is the entire point of the tests that call this. Since
+    task 5488, main() -- which injects no ``invoke`` -- also makes run_nightly
+    build a REAL multi-account pool out of the operator's own
+    CLAUDE_OAUTH_TOKEN_* vars and hand one of those tokens to that launcher.
+    A test about the census trigger has no business touching either.
+    """
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher',
+        lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
+    )
+
+    class _EmptyPool:
+        account_count = 0
+
+        def try_lease(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        nightly.account_pool, 'build_pool', lambda **_kwargs: _EmptyPool(),
+    )
+    return launcher_calls
+
+
 def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     tmp_path, monkeypatch, caplog, install_fake_httpx,
 ):
@@ -3441,14 +4311,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     install_fake_httpx(_fake_post)
 
-    # MANDATORY, not cosmetic: on FIRE the real launcher subprocess-runs
-    # scripts/legibility/census.py (real LLM spend + git writes), and
-    # _default_entrypoint_exists is true in a real checkout -- and reaching
-    # FIRE is the entire point of this test.
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     # Empty -> empty sample -> no digests -> `invoke` is never called and
     # nothing is committed, so no LLM and no git.
@@ -3472,7 +4335,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     # (i) condition (b) fired all the way through the production entrypoint.
     assert exit_code == 0
-    assert launcher_calls == [1], (
+    assert len(launcher_calls) == 1, (
         'the census launcher never fired end-to-end. Read the captured log '
         'BEFORE suspecting the wiring: task 4085 turns any exception out of '
         '`decide` into a quiet synthetic NO-FIRE line rather than a '
@@ -3499,6 +4362,12 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
         'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
         for m in messages
     ), messages
+
+    # (iv) task 3269: the census launched from the systemd entry point is aimed
+    # at THIS project and THIS legibility.yaml, never at the process cwd.
+    launch_args, launch_kwargs = launcher_calls[0]
+    assert launch_args == (str(tmp_path),)
+    assert launch_kwargs['config_path'] == Path(config_path).resolve()
 
 
 def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
@@ -3549,10 +4418,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 
     install_fake_httpx(_refusing_post)
 
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
@@ -3852,12 +4718,20 @@ def test_missing_claude_binary_journals_both_halves_end_to_end(
 
     escalations = []
     with caplog.at_level(logging.DEBUG):
-        # NO invoke= override: the real coder._invoke_cli seam runs.
+        # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than
+        # left to default. Since task 5488 `invoke=None` resolves to the
+        # pool-backed invoker, which builds a real UsageGate over
+        # config/usage-accounts.yaml and draws real CLAUDE_OAUTH_TOKEN_* out of
+        # the ambient environment. This test is about _invoke_cli's own
+        # missing-binary path, so it pins the bare seam and stays hermetic;
+        # the pool wiring is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool above.
         result = nightly.run_nightly(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            invoke=coder._invoke_cli,
             status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
         )
@@ -3892,3 +4766,211 @@ def test_missing_claude_binary_journals_both_halves_end_to_end(
         f'"1/1 digests failed" is what the incident already had. got '
         f'{aggregate!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4736 step-15/16: THE 2026-08-24 INCIDENT REPLAY, end to end.
+#
+# On 2026-08-24 every account was capped. The claude CLI wrote
+# `You've hit your weekly limit - resets 2pm (Europe/London)` to STDOUT and
+# exited 1 for 17 of 20 digests; `_invoke_cli` embedded only the (empty)
+# stderr tail, so the reason that reached the journal, the escalation and
+# `run.failures` was the bare `claude CLI exited 1 (model='haiku', ...,
+# cwd=None): ` with nothing after the colon. The batch tripped the storm
+# threshold, `run_nightly` exited 1, and an operator was paged at
+# ERROR for a condition Leo has ruled NORMAL (sibling task 4503).
+#
+# This is that failure turned into an automated test, and it is the second
+# test in this module that runs `run_nightly` with NO `invoke=` override --
+# so it, like the 2026-08-18 ENOENT replay above, exercises the production
+# wiring `run_nightly -> coder.code_digests -> coder._invoke_cli` end to end.
+# It stays hermetic and free: LEGIBILITY_CLAUDE_BIN points at a fake shell
+# script, so there is no LLM call, no network and no spend.
+# ---------------------------------------------------------------------------
+
+_GITKRAKEN_HOOK_NOISE = (
+    'SessionEnd hook [/home/leo/.gk/gk_3_1_68 ai hook run --host claude-code] '
+    'failed: Hook cancelled'
+)
+"""A benign teardown race that also appears on SUCCESSFUL exit-0 runs.
+
+Present in this replay only as a DECOY: it shares the incident's transcripts
+and would be the first thing an operator's eye lands on, but it is not the
+cause of anything and must never be mistaken for one. Do not file or fix
+anything against it.
+"""
+
+
+def _write_fake_claude_streams(
+    bin_dir, *, stdout_text='', stderr_text='', exit_code=1,
+):
+    """Fake `claude`: emit *stdout_text* on STDOUT, *stderr_text* on STDERR,
+    exit *exit_code*.
+
+    Payloads travel through sidecar FILES the script ``cat``s, never
+    interpolated into the shell source -- the same discipline as
+    test_legibility_coder.py::_write_fake_claude_failing_on_both_streams, and
+    for the same reason: the verbatim 2026-08-24 banner carries an apostrophe
+    (``You've``), and the bytes the fake CLI emits have to be the incident's
+    bytes or a green test proves something other than what the CLI said.
+    """
+    out_file = bin_dir / 'fake_stdout.txt'
+    err_file = bin_dir / 'fake_stderr.txt'
+    out_file.write_text(stdout_text, encoding='utf-8')
+    err_file.write_text(stderr_text, encoding='utf-8')
+    script = bin_dir / 'claude'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        # Drain the prompt so a large stdin can never EPIPE the fake before
+        # it has emitted its payloads.
+        'cat > /dev/null\n'
+        f'cat "{out_file}"\n'
+        f'cat "{err_file}" >&2\n'
+        f'exit {exit_code}\n'
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _replay_capped_night(tmp_path, monkeypatch, *, stdout_text, stderr_text):
+    """Run the real `run_nightly -> code_digests -> _invoke_cli` chain against
+    a fake `claude` that answers with a cap banner and exits 1."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    bin_dir = tmp_path / 'fake-bin'
+    bin_dir.mkdir()
+    fake = _write_fake_claude_streams(
+        bin_dir, stdout_text=stdout_text, stderr_text=stderr_text, exit_code=1,
+    )
+    # MANDATORY, not tidiness: with a real `claude` still on PATH, a
+    # regression in _invoke_cli's env-var branch would fall through to the
+    # bare name and spawn GENUINE billable Haiku calls. See the helper.
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv('LEGIBILITY_CLAUDE_BIN', str(fake))
+
+    escalations = []
+    # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than left
+    # to default, for the reason spelled out in
+    # test_missing_claude_binary_journals_both_halves_end_to_end: since task
+    # 5488 `invoke=None` builds a real multi-account pool. What these two cases
+    # pin is the per-digest DEFER a banner from ONE login produces, which is
+    # still exactly what the pool hands its failover loop; the pool's own
+    # all-accounts-capped deferral is pinned end-to-end in
+    # test_legibility_coder.py.
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=coder._invoke_cli,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalations.append((url, envelope)),
+    )
+    return result, repo, escalations
+
+
+def test_capped_cli_defers_and_journals_both_halves_end_to_end(
+    tmp_path, monkeypatch, caplog,
+):
+    """The 2026-08-24 shape exactly: banner on STDOUT, stderr EMPTY, exit 1.
+
+    Both journal halves must name the cause -- where the incident's per-digest
+    line ended in a bare `...cwd=None): ` with nothing after the colon -- and
+    the run must DEFER (exit 0) rather than page an operator.
+    """
+    with caplog.at_level(logging.DEBUG):
+        result, repo, escalations = _replay_capped_night(
+            tmp_path, monkeypatch,
+            stdout_text=_CAP_BANNER_4736,
+            stderr_text='',
+        )
+
+    # (c) A capped night is a deferred night.
+    assert result.exit_code == 0, (
+        'an all-accounts-capped night must not fail the systemd unit -- that '
+        'is what turned 2026-08-24 into an infra incident'
+    )
+    assert result.capped is True
+    assert result.commit_made is False
+
+    # (a) Half one: the coder announced the cap for that specific digest,
+    # VERBATIM. This is the assertion the incident would have failed.
+    coder_warnings = [
+        r for r in caplog.records
+        if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
+    ]
+    assert len(coder_warnings) == 1, (
+        f'expected one per-digest WARNING; got '
+        f'{[r.getMessage() for r in coder_warnings]}'
+    )
+    coder_message = coder_warnings[0].getMessage()
+    assert _CAP_BANNER_4736 in coder_message, (
+        'the CLI SAID what was wrong on stdout; a per-digest reason that '
+        f'drops it is the 17-of-20 empty-tail shape. got {coder_message!r}'
+    )
+
+    # (b) Half two: the aggregate carries it too, at WARNING, with no ERROR.
+    loud = _nightly_warnings(caplog)
+    assert [r for r in loud if r.levelno >= logging.ERROR] == [], (
+        'exit_code is 0, so this escalation is not a fail-loud trigger and '
+        'nothing here belongs in `journalctl -p err`; got '
+        f'{[r.getMessage() for r in loud if r.levelno >= logging.ERROR]}'
+    )
+    aggregates = [r for r in loud if _CAP_BANNER_4736 in r.getMessage()]
+    assert aggregates, (
+        'the aggregate must carry the REASON, not just the count -- a bare '
+        f'"1/1 digests failed" is what the incident already had. got '
+        f'{[r.getMessage() for r in loud]}'
+    )
+    assert all(r.levelno == logging.WARNING for r in aggregates)
+
+    # (d) One escalation, and its detail names the cause on first read.
+    assert len(escalations) == 1
+    _url, envelope = escalations[0]
+    detail = envelope['params']['arguments']['detail']
+    assert _CAP_BANNER_4736 in detail, (
+        f'the cap banner must survive into the escalation detail; got '
+        f'{detail!r}'
+    )
+
+
+def test_capped_cli_on_stderr_under_hook_noise_still_defers_end_to_end(
+    tmp_path, monkeypatch, caplog,
+):
+    """Same night, the other stream split -- and a decoy on the one left over.
+
+    The cap banner lands on STDERR while STDOUT carries only the benign
+    GitKraken SessionEnd hook line, which also appears on SUCCESSFUL exit-0
+    runs. The run must still defer, and the journal must still name the CAP:
+    a classifier that keyed on whichever stream happened to be non-empty
+    would report the hook race as the cause of a capped night.
+    """
+    with caplog.at_level(logging.DEBUG):
+        result, repo, escalations = _replay_capped_night(
+            tmp_path, monkeypatch,
+            stdout_text=_GITKRAKEN_HOOK_NOISE,
+            stderr_text=_CAP_BANNER_4736,
+        )
+
+    assert result.exit_code == 0
+    assert result.capped is True
+    assert result.commit_made is False
+
+    coder_warnings = [
+        r for r in caplog.records
+        if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
+    ]
+    assert len(coder_warnings) == 1
+    coder_message = coder_warnings[0].getMessage()
+    assert _CAP_BANNER_4736 in coder_message, coder_message
+
+    assert [r for r in _nightly_warnings(caplog) if r.levelno >= logging.ERROR] == []
+    assert len(escalations) == 1
+    detail = escalations[0][1]['params']['arguments']['detail']
+    assert _CAP_BANNER_4736 in detail, detail

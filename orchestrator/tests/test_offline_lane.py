@@ -1043,8 +1043,16 @@ async def test_handle_red_run_threads_priority_into_filed_task(tmp_path: Path):
     escalation_queue2 = MagicMock()
     escalation_queue2.get_by_task.return_value = []
     escalation_queue2.make_id.return_value = 'esc-T2-1'
+    # Its own project_root, because the red-path state is restart-durable and
+    # therefore SHARED by every worker rooted at one project (task 5352): left
+    # on tmp_path, worker2 would see worker1's open fix task for this same
+    # failing-test set and take the append-suspect-range branch instead of
+    # filing.  The subject here is the priority default, not the dedup.
     worker2 = _make_worker(
-        tmp_path, task_client=task_client2, escalation_queue=escalation_queue2,
+        tmp_path,
+        config=_make_config(tmp_path / 'project-2'),
+        task_client=task_client2,
+        escalation_queue=escalation_queue2,
     )
     await worker2._handle_red_run(wt, 'HEAD1', confirmation_runner=confirmation_runner2)
     task_client2.submit_fix_task.assert_awaited_once()

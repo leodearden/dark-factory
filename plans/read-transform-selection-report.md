@@ -53,7 +53,7 @@ PRD V2 requires that **contested children are never suppressed** — the esc-571
 
 `contested` is a hand-labelled **fixture** field of the bake-off (`ArmClaim.contested`:196, `contested_record_ids`:2567, `SeededArm.contested_ids`:2593). It never appears in any `ArmRecord.metadata`, it has **no writer**, and it has no adjudication surface anywhere in the running system.
 
-The live reserved vocabulary is `RESERVED_VOCABULARY_KEYS` (`fused-memory/src/fused_memory/memory_metadata.py`:601), and it is exactly {`canonical`, `kind`, `parent_id`, `supersedes`, `topic`} — verified against the imported frozenset, not transcribed. `contested` is not among them. Any arm that suppresses records therefore ships without the esc-5712 protection until a `contested` key is designed, reserved, written and adjudicated.
+The live reserved vocabulary is `RESERVED_VOCABULARY_KEYS` (`fused-memory/src/fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`), and it is exactly {`canonical`, `kind`, `parent_id`, `supersedes`, `topic`} — verified against the imported frozenset, not transcribed. `contested` is not among them. Any arm that suppresses records therefore ships without the esc-5712 protection until a `contested` key is designed, reserved, written and adjudicated.
 
 ## Recommendation
 

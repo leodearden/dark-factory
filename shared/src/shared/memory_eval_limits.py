@@ -332,11 +332,11 @@ class LimitsConfig:
     """The declared inputs an operator actually reasons about.
 
     Deliberately NOT a home for a significance threshold. ``false_alarm_budget``
-    is a BUDGET DECLARATION in units a human can hold — *expected false alarms
-    per quarter* — and alpha is derived from it by :func:`derive_alpha` (PRD M2,
-    D3, G6). Nothing here is a p-value, and alpha is not stored: it depends on
-    how many metrics are alarm-eligible in a given run, which this config
-    cannot know.
+    is a BUDGET DECLARATION in units a human can hold — *an upper bound on
+    false alarms per quarter*, not a forecast of them — and alpha is derived
+    from it by :func:`derive_alpha` (PRD M2, D3, G6). Nothing here is a
+    p-value, and alpha is not stored: it depends on how many metrics are
+    alarm-eligible in a given run, which this config cannot know.
 
     ``min_samples`` and ``baseline_window`` are SUFFICIENCY guards on the canary
     precedent (``canary.py`` ``min_samples``), not thresholds on the statistic:
@@ -357,7 +357,8 @@ class LimitsConfig:
     """
 
     false_alarm_budget: float = 1.0
-    """Expected false alarms per quarter across the whole eval. PRD-sanctioned default."""
+    """Upper bound on expected false alarms per quarter across the whole eval; the realized
+    rate lands below it — see :func:`derive_alpha`. PRD-sanctioned default."""
 
     runs_per_quarter: int
     """How often this eval runs — 90 for the D10 daily cadence."""
@@ -401,9 +402,33 @@ def derive_alpha(
 
     ``alpha = budget / (runs_per_quarter * alarmed_metric_count)`` — a
     Bonferroni split of one quarterly budget across every opportunity to spend
-    it. Each run of each alarm-eligible metric is one such opportunity, so at
-    this alpha the expected number of false alarms per quarter is exactly the
-    declared budget.
+    it. Each run of each alarm-eligible metric is one such opportunity.
+
+    The budget is a CEILING on that count, not a prediction of it. Alpha only
+    bounds how often a run is SURPRISING; an alarm additionally requires that
+    surprise to be HARMFUL, and :func:`_verdict_from_p` combines the two via
+    ``alarmed = surprising and harmful``. The p-values judged against alpha
+    are two-sided (:func:`binomial_two_sided_p`, :func:`poisson_two_sided_p`),
+    while every metric that reaches the gate is directional — a missing
+    ``direction`` raises ``AssertionError`` — so part of each metric's alpha
+    is spent on outcomes that are surprising on the safe side, which report
+    as ``improved`` and never alarm. The exact discrete tests are already
+    conservative on their own, before the harm gate takes its cut: enumerated
+    against this module's own p-value engines, the total surprising mass
+    never exceeds alpha. A third share is never spendable at all:
+    :func:`evaluate_series` counts tripwires in ``alarmed_metric_count``,
+    even though a structural rule has no false-alarm probability under the
+    null and strictly does not consume budget. So the expected false alarms
+    per quarter are AT MOST the declared budget, never exactly it — and the
+    shortfall is not a constant fraction: at the exemplar's alpha of 1/360,
+    the harmful side carries ~0.50 of the surprising mass for a symmetric
+    binomial (n=30, p0=0.5), 0.24 for the upper tail of a n=200/p0=0.9
+    proportion, and 1.00 for a Poisson rate of 5, where the lower tail
+    cannot reach alpha at all, since ``poisson_two_sided_p(0, 5) = 0.0122``.
+    Treat ``false_alarm_budget`` as an upper bound on wake-ups, not a
+    forecast of them: loosening alpha to spend the unspent share is
+    deliberately NOT done here, since that is a policy change an operator
+    must decide, not a documentation fix.
 
     The consequence worth stating: alpha SHRINKS as metrics are added. That is
     intended, and it is why the evaluator recomputes alpha per run from the

@@ -1,0 +1,69 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-08-01T22:08:16.922193+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/proc_supervision.py",
+        "line": 797,
+        "title": "The registration-time canary is a FINDABILITY probe, not an importability probe \u2014 it cannot detect the exact failure mode the task measured",
+        "detail": "`importlib.util.find_spec('escalation.submit')` locates the module's spec; it does NOT execute the module. The comment above it claims the process 'can prove the invariant here' and the warning text says '`escalation.submit` is NOT importable from %s'. Both overclaim.\n\nConcretely: the MEASURED failure this whole task is built around is the third-party dependency floor \u2014 `escalation.submit` -> `escalation.queue` -> `shared.timestamps` -> `shared/__init__.py` -> `shared.async_sqlite_base` -> `import aiosqlite`. If `aiosqlite` (or any other transitive site-packages dep) is missing from sys.executable's environment, `find_spec('escalation.submit')` still returns a valid spec (the .py file is right there on disk), the canary stays silent, and the deferred child still dies on ImportError at fire time and files no L2 \u2014 precisely the 3404-class 'exactly one L2 must be filed on failure, got 0' outcome the canary exists to pre-empt.\n\nThe canary only catches the narrow case where the `escalation` package itself is absent from the interpreter \u2014 which is also the case least likely to occur, since this same process already imports `escalation.models`/`escalation.queue` at runtime in `_file_inprocess_escalation`.\n\nEither actually import (`importlib.import_module('escalation.submit')` in a try/except ImportError \u2014 it is a one-time cost on a path that runs at most once per scheduled restart, and it is the same interpreter, so nothing is being simulated), or keep find_spec and correct the comment + warning wording to say what it actually proves ('cannot be located' rather than 'is NOT importable') and note the transitive-dep blind spot explicitly. The current wording will read to a future maintainer as a guarantee that does not exist."
+      },
+      {
+        "severity": "medium",
+        "category": "blast-radius",
+        "file": "orchestrator/src/orchestrator/proc_supervision.py",
+        "line": 847,
+        "title": "`--setenv=PYTHONPATH=` applies to the ENTIRE transient unit, not just the submit child \u2014 the deploy payload now runs with a PYTHONPATH it never had",
+        "detail": "The token is placed on the systemd-run argv, so it is set for the whole `/bin/sh -c` payload \u2014 which is the deploy script, not just the on-failure `python -m escalation submit` branch. The docstring frames it as existing 'solely so the RP-4 `python -m escalation submit` child can import', but the scope is wider than that framing.\n\nThis is not hypothetical: the deterministic-runner detached path (deterministic_runner.py:_default_schedule_detached_restart) routes real deploy scripts through here with an EscalationSpec attached, and `scripts/restart-all-orchestrators.sh:215` invokes a bare PATH `python3 \"$SCRIPT_DIR/drain_check.py\"`. That interpreter (the system python3, not the workspace venv) will now start with `<repo>/escalation/src:<repo>/shared/src` \u2014 plus any ambient PYTHONPATH the orchestrator happened to carry \u2014 prepended to its sys.path. Today that is probably benign, but it is a cross-interpreter contamination surface that the change's own rationale does not intend and no test pins.\n\nA strictly narrower form gets the same guarantee with no payload exposure: drop the systemd-run token and prefix the on-failure command inside the shell wrapper instead \u2014 `PYTHONPATH=<quoted roots> <python> -m escalation submit ...`. That keeps the env var scoped to the one process that needs it, keeps the non-escalation argv byte-identical exactly as today, and removes the need to reason about what else the transient unit runs."
+      },
+      {
+        "severity": "low",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/proc_supervision.py",
+        "line": 148,
+        "title": "Under a real wheel install the resolved root is site-packages itself, which PYTHONPATH places AHEAD of the stdlib",
+        "detail": "`Path(loc).resolve().parent` for a wheel-installed `escalation` resolves to `<venv>/lib/pythonX.Y/site-packages`. The docstring explicitly claims this 'keeps this correct under both the editable install used in the deployed venv and a real wheel install'.\n\nIt is not equivalent in the wheel case. PYTHONPATH entries are inserted into sys.path BEFORE the stdlib directories, whereas site-packages normally sits after them. Putting site-packages on PYTHONPATH therefore inverts stdlib-vs-site-packages precedence for the child, so any site-packages distribution shipping a top-level module that shadows a stdlib name would win where it previously lost.\n\nThe deployed environment is editable, so this is latent rather than live \u2014 but the docstring asserts the wheel case is covered, and it is the docstring a future maintainer will trust when the deployment changes. Either skip roots that are already on the child's default sys.path (a `site.getsitepackages()`/`sysconfig.get_paths()['purelib']` filter), or narrow the claim."
+      },
+      {
+        "severity": "low",
+        "category": "test-fragility",
+        "file": "orchestrator/tests/test_proc_supervision.py",
+        "line": 1601,
+        "title": "`test_partial_resolution_still_emits_what_resolved` silently assumes `escalation` and `shared` resolve to DIFFERENT roots",
+        "detail": "The negative assertion `not any((Path(r) / 'shared' / '__init__.py').exists() for r in roots)` \u2014 described in-test as 'guards the stub itself' \u2014 only holds because the editable install gives `<repo>/escalation/src` and `<repo>/shared/src` as distinct roots. Under a wheel install both packages resolve to the same site-packages root, so the `escalation` root would also contain `shared/__init__.py` and this assertion fails even though the code under test behaved correctly.\n\nSame environment coupling applies (less sharply) to the positive filesystem assertions in `test_setenv_pythonpath_present_and_carries_resolvable_roots`. Consider asserting against `importlib.util.find_spec(...)`-derived expected roots rather than probing the filesystem for sibling package layout, so the cells pin the FUNCTION's contract rather than the current install mode."
+      },
+      {
+        "severity": "low",
+        "category": "consistency",
+        "file": "orchestrator/tests/test_service_restart.py",
+        "line": 1318,
+        "title": "A sibling test in the same file still pins fixed argv offsets 7/8 and was left unconverted",
+        "detail": "`test_schedule_detached_systemd_restart_without_escalation_builds_unbranched_wrapper` still does `assert argv[7] == '-c'` / `wrapped = argv[8]`. It passes today only because it exercises the `on_failure_escalation=None` path where no `--setenv` token is spliced in \u2014 i.e. it is correct by accident of which branch it happens to test, not by construction.\n\nThe diff converted the two offset-based assertions it had to touch to the index-derived `sh_at = argv.index('/bin/sh')` form and documented why. Leaving this third one behind means the next person adding a systemd-run option gated differently gets a confusing partial-failure. Convert it for the same reason the other two were converted."
+      },
+      {
+        "severity": "low",
+        "category": "robustness",
+        "file": "orchestrator/src/orchestrator/proc_supervision.py",
+        "line": 122,
+        "title": "Ambient PYTHONPATH entries are forwarded verbatim, so a relative entry silently re-anchors to the child's cwd",
+        "detail": "Entries from the parent's `PYTHONPATH` are `_add`ed as-is, while the resolved roots go through `Path(loc).resolve()`. A relative ambient entry (`.`, `src`, `../shared/src`) would therefore be re-interpreted by the child against `--working-directory=<self.cwd>` rather than against the orchestrator's own cwd \u2014 a different directory in general, and exactly the class of implicit-cwd bug RP-3 exists to close.\n\nThe new test explicitly `monkeypatch.delenv('PYTHONPATH')` before asserting every root is absolute, so the absoluteness invariant it pins does not actually cover the ambient-entry path (the sentinel used in the propagation test is itself absolute). Resolving ambient entries too \u2014 or at minimum dropping/warning on relative ones \u2014 would make the emitted value uniformly cwd-independent, which is what the docstring's 'the deferred unit runs under the systemd user manager, not this process' reasoning implies."
+      },
+      {
+        "severity": "low",
+        "category": "cleanup",
+        "file": "orchestrator/tests/test_proc_supervision.py",
+        "line": 1279,
+        "title": "`_detached_plan_with_spec` takes an unused `tmp_queue_dir` parameter",
+        "detail": "The helper's first parameter is never referenced in its body \u2014 the queue dir only reaches the plan via the already-built `spec`. Every call site therefore threads a value that does nothing, which reads as if plan construction depends on the queue dir when it does not. Drop the parameter."
+      }
+    ],
+    "summary": "The change is well-motivated and the core mechanism is sound: `systemd-run --user` genuinely propagates none of the caller's environment, so a deferred RP-4 `python -m escalation submit` child needs its import roots supplied explicitly on the argv, and building them from this process's own `find_spec` resolution (rather than a hardcoded repo layout) is the right call. Gating the token on `on_failure_escalation` correctly keeps the no-escalation argv byte-identical, the loud-over-silent degradation path never blocks the restart (verified by the new dispositions asserts), and the two fixed-offset argv assertions that the new token would have broken were converted to index-derived form rather than re-hardcoded. I ran orchestrator/tests/test_proc_supervision.py + test_service_restart.py (111 passed) and test_deterministic_runner.py + test_supervision_composition_integration_gate.py (293 passed) \u2014 all green, and I confirmed deterministic_runner already delegates to RestartPlan so there is no second copy of the argv builder left unpatched.\n\nTwo findings are worth acting on before this lands. First, the registration-time canary does not prove what its comment and warning text say it proves: `find_spec('escalation.submit')` locates a module without executing it, so the specific MEASURED failure mode driving this task \u2014 a missing site-packages dep such as `aiosqlite` reached transitively via `shared/__init__.py` \u2014 passes the canary silently and still files no L2 at fire time. Either import for real or narrow the claim. Second, `--setenv=PYTHONPATH=` is scoped to the whole transient unit, not the submit child the docstring says it exists 'solely' for; the deploy payload shares it, and `scripts/restart-all-orchestrators.sh` invokes a bare PATH `python3 drain_check.py` that will now start with repo src roots prepended. Prefixing the on-failure command inside the shell wrapper instead gets the identical guarantee with no payload exposure. The remaining five findings are lower-stakes: a wheel-install stdlib-precedence hazard the docstring claims is covered, two tests coupled to the current editable-install layout, one sibling test left on fixed offsets, unresolved relative ambient PYTHONPATH entries, and an unused helper parameter."
+  }
+}

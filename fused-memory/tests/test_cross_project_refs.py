@@ -32,6 +32,11 @@ from fused_memory.utils.cross_project_refs import (
 # local task number.
 INCIDENT_CONTENT = 'Reify task 5181 was cancelled; its work was rerouted to dark_factory:2500.'
 
+# A Unicode decimal digit that ``str.isdigit()`` accepts but ``str.isascii()``
+# does not — spelled by ESCAPE so the fixture survives transport and a reader
+# sees the codepoint rather than a glyph that renders like an ASCII '3'.
+ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
+
 
 class TestFindCrossProjectTaskRefsMatches:
     """A qualified 'proj:N' reference to a project other than the current group
@@ -184,6 +189,36 @@ class TestNoFalsePositives:
     )
     def test_noise_yields_no_refs(self, content):
         scan = find_cross_project_task_refs(content, group_id='reify')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            # A Unicode digit is not a task number. cross_project_refs owns no
+            # pattern of its own, so this asserts the canonical_labels narrowing
+            # (task 4174) propagates through this adapter. Measured RED before
+            # that fix: CrossProjectRef(project_id='reify', task_number='\u0663').
+            'see reify:' + ARABIC_INDIC_THREE + ' now',
+            # The mixed run is the sharper case: it must yield NOTHING, never
+            # the truncated prefix CrossProjectRef('reify', '12') — not mangled
+            # junk but a fully well-formed foreign ref pointing at the WRONG
+            # task, which is the misattribution the split hook this scanner
+            # feeds exists to prevent and would instead perform.
+            'see reify:12' + ARABIC_INDIC_THREE + ' now',
+        ],
+    )
+    def test_unicode_digits_are_not_task_numbers(self, content):
+        """Scanned from dark_factory, NOT from the 'reify' group the shared
+        no-false-positives list above uses.
+
+        Measured, and the reason this is a separate method rather than two more
+        entries in that list: with group_id='reify' a 'reify:'-qualified fixture
+        is SELF-qualified and dropped as local before the digit class is ever
+        consulted, so it would pass vacuously — green whether or not the
+        narrowing exists. A FOREIGN qualifier is what makes this assert anything.
+        """
+        scan = find_cross_project_task_refs(content, group_id='dark_factory')
         assert scan.refs == ()
         assert scan.ambiguous == ()
 

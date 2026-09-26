@@ -11,9 +11,11 @@ wedging on an endpoint it cannot read.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from recon_busy_check import classify
 
 SCRIPT = Path(__file__).parent.parent / "recon_busy_check.py"
@@ -60,15 +62,59 @@ def test_classify_non_dict_is_unreachable():
 
 # ---------------------------------------------------------------------------
 # CLI (reads /health body from stdin) — driven via subprocess.run
+#
+# Mirrors the defensive-timeout pattern in test_scan_task_toolcall_leaks.py
+# (task 4217/4515). A third sibling, scripts/tests/test_drain_check.py, runs
+# the identical ["python3", str(SCRIPT), *args] harness shape and still
+# hardcodes timeout=10; bringing it in line is outside this task's locked
+# scope (scripts/tests/test_recon_busy_check.py only) and a follow-up is
+# filed to cover it alongside the shared-helper extraction question.
 # ---------------------------------------------------------------------------
 
-def _run_cli(stdin_text: str) -> subprocess.CompletedProcess:
+def _cli_timeout_from_env(default: float = 60.0) -> float:
+    """Resolve the default wall-clock budget (seconds) for a CLI subprocess.
+
+    10s was tight enough to flake under machine load: concurrent
+    orchestrator agents can push interpreter startup + imports past 10s even
+    though the CLI under test behaves correctly (returncode/stderr already
+    correct at the moment the old budget expired). 60s gives real headroom
+    without materially slowing an idle-machine run (measured baseline for
+    the whole file is ~1.1s).
+
+    RECON_BUSY_CHECK_TEST_TIMEOUT overrides the default for further tuning
+    without a code change. An unset or blank value (e.g. a CI template that
+    always exports the var) is treated as "not overridden" rather than an
+    error — otherwise this escape hatch would itself fail the *entire*
+    module's collection, including the pure-unit tests here that never spawn
+    a subprocess. A present-but-malformed value (non-numeric or non-positive)
+    still fails loudly, naming the offending value, rather than silently
+    falling back and masking a typo'd override.
+    """
+    raw = os.environ.get("RECON_BUSY_CHECK_TEST_TIMEOUT", "").strip()
+    if not raw:
+        return default
+    error = ValueError(
+        f"RECON_BUSY_CHECK_TEST_TIMEOUT must be a positive number of seconds; got {raw!r}"
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        raise error from None
+    if value <= 0:
+        raise error
+    return value
+
+
+_CLI_TIMEOUT = _cli_timeout_from_env()
+
+
+def _run_cli(stdin_text: str, timeout: float = _CLI_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["python3", str(SCRIPT)],
         input=stdin_text,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
@@ -126,3 +172,82 @@ def test_cli_non_object_json_is_unreachable():
     result = _run_cli("[1, 2, 3]")
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert result.stdout.splitlines()[0] == "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# _cli_timeout_from_env(): default-resolution branches (unset/blank -> 60.0;
+# a valid override parses through). Loud-rejection branches are in the next
+# section, once the helper exists.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", [None, "", "   \n\t"])
+def test_cli_timeout_from_env_unset_or_blank_returns_default(raw, monkeypatch):
+    # None stands for "unset" and needs delenv rather than setenv; folded
+    # into one parametrization with blank/whitespace-only since all three
+    # exercise the same `if not raw` branch and assert the same outcome.
+    if raw is None:
+        monkeypatch.delenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raw)
+    assert _cli_timeout_from_env() == 60.0
+
+
+def test_cli_timeout_from_env_integral_override_parses(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "5")
+    assert _cli_timeout_from_env() == 5.0
+
+
+def test_cli_timeout_from_env_fractional_override_parses(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "2.5")
+    assert _cli_timeout_from_env() == 2.5
+
+
+# ---------------------------------------------------------------------------
+# _cli_timeout_from_env(): loud-rejection branches — a present-but-malformed
+# override must fail loudly, naming both the env var and the offending raw
+# value, rather than silently falling back or misbehaving far from the cause.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-1"])
+def test_cli_timeout_from_env_malformed_or_non_positive_raises(raw, monkeypatch):
+    # "abc" hits the except-ValueError branch; "0"/"-1" hit the `value <= 0`
+    # branch. Folded into one parametrization since both branches produce
+    # the same externally-observable contract this test actually pins: a
+    # ValueError naming the env var and the offending raw value.
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raw)
+    with pytest.raises(ValueError) as excinfo:
+        _cli_timeout_from_env()
+    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
+    # repr(), not a bare substring: "0" or "-1" as plain substrings could be
+    # satisfied incidentally by unrelated text (e.g. a mention of the 60.0
+    # default), so this pins the actual interpolated value unambiguously.
+    assert repr(raw) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# _run_cli() wiring: the resolved budget must actually reach subprocess.run
+# — this is the regression this task exists to fix. Behavioural (spy on
+# subprocess.run) rather than inspect.signature-based, so it survives a
+# refactor that moves resolution out of the default argument, and it spawns
+# no interpreter.
+# ---------------------------------------------------------------------------
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="idle\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("{}")
+    # The 60.0 default is independently pinned by
+    # test_cli_timeout_from_env_unset_or_blank_returns_default; a bound here
+    # would break the documented RECON_BUSY_CHECK_TEST_TIMEOUT override
+    # (tune-down case).
+    assert captured["timeout"] == _CLI_TIMEOUT
+
+    # An explicit override must also reach subprocess.run — otherwise
+    # _run_cli's timeout parameter is dead surface no caller ever exercises.
+    _run_cli("{}", timeout=3)
+    assert captured["timeout"] == 3

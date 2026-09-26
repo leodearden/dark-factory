@@ -470,6 +470,7 @@ def test_load_ticket_expectations_absent_db_returns_empty(tmp_path):
 
 _GREP_CHECK = {"kind": "grep", "pattern": "def foo", "paths": ["a.py"], "expect": "present"}
 _SCRIPT_CHECK = {"kind": "script", "script": "scripts/x.sh", "timeout_secs": 30}
+_PATH_CHECK = {"kind": "path", "expect": "present", "paths": ["orchestrator/tests/t.py"]}
 _MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
 
 
@@ -514,15 +515,16 @@ def test_build_manifest_index_maps_task_id_to_expectation(tmp_path):
     assert expectation.delivered_check_names == ("cap-one",)
 
 
-def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
-    """THE MECHANICAL-KINDS RULE, corrected against the real stamping site.
+def test_build_manifest_index_keeps_every_mechanical_kind_drops_only_manual(tmp_path):
+    """THE MECHANICAL-KINDS RULE, read off the schema rather than restated.
 
-    fused-memory/src/fused_memory/server/manifest_stamping.py:311 reads
-    `if check is None or check.kind not in ('grep', 'script'): continue` — so
-    BOTH grep and script are copied into metadata.delivered_checks and only
-    'manual' is dropped. A grep-only filter would silently under-count the
-    expected entries and yield FALSE NEGATIVES on exactly the highest-severity
-    class, so the rule is pinned here with all three kinds on one task.
+    ``manifest_stamping``'s copy filter admits every
+    ``DeliveredCheckMeta`` kind and drops only ``'manual'``, so this sweep
+    must count grep, script AND path capabilities as expected entries. A
+    narrower filter here would silently UNDER-COUNT and yield FALSE
+    NEGATIVES on exactly the severity class this script exists to detect —
+    a lost mark-done gate — which is why the rule is pinned with every kind
+    on one task.
     """
     _write_manifest(tmp_path, "plans/b-prd.capability-manifest.yaml", {
         "prd": "plans/b-prd.md",
@@ -530,6 +532,7 @@ def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
         "tasks": [{"label": "ε", "task_id": 3319, "capabilities": [
             _capability("cap-grep", _GREP_CHECK),
             _capability("cap-script", _SCRIPT_CHECK),
+            _capability("cap-path", _PATH_CHECK),
             _capability("cap-manual", _MANUAL_CHECK),
             _capability("cap-no-check", None),
         ]}],
@@ -537,7 +540,28 @@ def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
 
     names = build_manifest_index(str(tmp_path))["3319"].delivered_check_names
 
-    assert names == ("cap-grep", "cap-script")
+    assert names == ("cap-grep", "cap-script", "cap-path")
+
+
+def test_build_manifest_index_counts_a_path_only_capability(tmp_path):
+    """A capability gated SOLELY by a path check still contributes its name.
+
+    Isolating it from the mixed-kind case above: if the sweep only ever saw
+    'path' next to a grep it recognised, an off-by-one in the filter could
+    still leave a path-only task counted as having NO expected entries —
+    i.e. no gate to lose, the false negative in its purest form.
+    """
+    _write_manifest(tmp_path, "plans/p-prd.capability-manifest.yaml", {
+        "prd": "plans/p-prd.md",
+        "schema_version": 1,
+        "tasks": [{"label": "ζ", "task_id": 4743, "capabilities": [
+            _capability("cap-path-only", _PATH_CHECK),
+        ]}],
+    })
+
+    expectation = build_manifest_index(str(tmp_path))["4743"]
+
+    assert expectation.delivered_check_names == ("cap-path-only",)
 
 
 def test_build_manifest_index_globs_both_plans_and_docs_prds(tmp_path):

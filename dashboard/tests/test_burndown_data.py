@@ -11,11 +11,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import httpx
 import pytest
 
+import dashboard.data.burndown as burndown_module
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     _INSERT_SNAPSHOT_SQL,
+    _SNAPSHOT_PAGE_SIZE,
     BURNDOWN_SCHEMA,
     _count_statuses,
     _count_zones,
@@ -151,7 +154,10 @@ def _fake_load(by_root_map):
     """
     canonical = {_root_key(k): v for k, v in by_root_map.items()}
 
-    async def _fake(client, config, project_root):
+    # **_kwargs absorbs the collector's opt-in `chunk_size=` (task 5018); these
+    # fakes stand in for the whole fetch_tasks seam, so paging is already done
+    # by the time they answer.
+    async def _fake(client, config, project_root, **_kwargs):
         key = _root_key(project_root)
         if key not in canonical:
             raise KeyError(f'Unmapped project_root: {key}')
@@ -908,7 +914,7 @@ class TestCollectSnapshot:
             }
             _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            async def fake_load(client, config, project_root):
+            async def fake_load(client, config, project_root, **_kwargs):
                 key = _root_key(project_root)
                 if key == bad_root_str:
                     raise PermissionError('Permission denied')
@@ -942,7 +948,7 @@ class TestCollectSnapshot:
             _tasks_map: dict = {config.project_root: []}
             _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            async def fake_load(client, config, project_root):
+            async def fake_load(client, config, project_root, **_kwargs):
                 key = _root_key(project_root)
                 if key == bad_root_str:
                     raise PermissionError('Permission denied')
@@ -981,7 +987,7 @@ class TestCollectSnapshot:
             }
             _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            async def fake_load(client, config, project_root):
+            async def fake_load(client, config, project_root, **_kwargs):
                 key = _root_key(project_root)
                 if key == bad_root_str:
                     raise PermissionError('denied')
@@ -1067,7 +1073,7 @@ class TestCollectSnapshot:
         n_roots = 3
         barrier = threading.Barrier(n_roots, timeout=10.0)
 
-        async def fake_load(client, config, project_root):
+        async def fake_load(client, config, project_root, **_kwargs):
             await asyncio.to_thread(_wait_or_fail, barrier)
             return []
 
@@ -1118,7 +1124,7 @@ class TestCollectSnapshot:
             }
             _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            async def fake_load(client, config, project_root):
+            async def fake_load(client, config, project_root, **_kwargs):
                 key = _root_key(project_root)
                 if key == bad_root_str:
                     raise OSError('mock disk error')
@@ -1167,7 +1173,7 @@ class TestCollectSnapshot:
             }
             _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            async def fake_load(client, config, project_root):
+            async def fake_load(client, config, project_root, **_kwargs):
                 key = _root_key(project_root)
                 if key == bad_root_str:
                     raise OSError('mock disk error')
@@ -1238,7 +1244,7 @@ class TestCollectSnapshot:
 
         unexpected_calls: list = []
 
-        async def fake_load(client, config, project_root):
+        async def fake_load(client, config, project_root, **_kwargs):
             key = _root_key(project_root)
             if key == bad_root_str:
                 raise PermissionError('Permission denied')
@@ -1397,7 +1403,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         db_path, config, conn = burndown_env
         seen_roots: list[str] = []
 
-        async def fake_tasks(client, cfg, project_root):
+        async def fake_tasks(client, cfg, project_root, **_kwargs):
             seen_roots.append(str(project_root))
             return []
 
@@ -1587,6 +1593,78 @@ class TestCollectSnapshotTaskSourceAndCap:
             }
 
     @pytest.mark.asyncio
+    async def test_snapshot_read_probes_unpaginated_before_paginating(
+        self, burndown_env, dummy_client,
+    ):
+        """A tree that fits the envelope costs ONE request, not ceil(N/P).
+
+        Pagination is gated behind a size probe (_fetch_snapshot_tasks): the
+        paginated walk is ~496 sequential requests on this repo and must be the
+        exception, not the steady state.  Discriminates: it fails if the
+        collector goes back to passing page_size unconditionally.
+        """
+        db_path, config, conn = burndown_env
+        calls: list[dict] = []
+
+        async def fake_tasks(client, cfg, project_root, **kwargs):
+            calls.append(kwargs)
+            return [_ztask(status='pending', id=1)]
+
+        with (
+            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        assert len(calls) == 1, f'a fitting tree must cost one read, got {calls}'
+        assert 'chunk_size' not in calls[0], (
+            'the probe must be an ordinary unchunked read'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejected_probe_falls_back_to_the_paginated_walk(
+        self, burndown_env, dummy_client,
+    ):
+        """An oversize tree still gets its row — via the paginated fallback.
+
+        The probe must not reintroduce the permanent-hole failure it was added
+        on top of: when the unpaginated read is rejected wholesale, the
+        paginated path still runs and the snapshot row is still written.
+        """
+        db_path, config, conn = burndown_env
+        calls: list[dict] = []
+
+        async def fake_tasks(client, cfg, project_root, **kwargs):
+            calls.append(kwargs)
+            # `chunk_size`, not `page_size`: the collector's fallback now asks
+            # for a CHUNKED complete read. Keying this fake off the old spelling
+            # would make the probe and the fallback indistinguishable and the
+            # fallback would never appear to succeed.
+            if 'chunk_size' not in kwargs:
+                return {'offline': True, 'error': 'response too large'}
+            return [_ztask(status='pending', id=1)]
+
+        with (
+            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        assert [('chunk_size' in c) for c in calls] == [False, True], (
+            f'expected probe-then-chunked-walk, got {calls}'
+        )
+        # The PYTHON kwarg is `chunk_size`; the MCP WIRE argument is still
+        # `page_size` (fused-memory's tool parameter, out of scope here). Two
+        # names at two layers, both asserted — see the wire assertions over
+        # stubbed `mcp_tool_call` calls further down this file.
+        assert calls[1]['chunk_size'] == _SNAPSHOT_PAGE_SIZE
+        async with conn.execute('SELECT pending FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1, (
+            'the paginated fallback must still write the row'
+        )
+
+    @pytest.mark.asyncio
     async def test_offline_marker_still_skips_the_project(
         self, burndown_env, caplog, dummy_client,
     ):
@@ -1625,7 +1703,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         ):
             bad_key = _root_key(config.project_root)
 
-            async def fake_tasks(client, cfg, project_root):
+            async def fake_tasks(client, cfg, project_root, **_kwargs):
                 if _root_key(project_root) == bad_key:
                     return 'not a task list'
                 return [_ztask(status='pending', id=1)]
@@ -2461,6 +2539,221 @@ class TestCollectSnapshotExplicitRollback:
 
 
 # ---------------------------------------------------------------------------
+# Per-root whole-operation budget (task 4884 / #4424)
+# ---------------------------------------------------------------------------
+
+
+# The ~209 s paginated worst case measured for ONE root of this repo's size —
+# ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` sequential round trips at ~0.33-0.35 s each.
+# The measurement and its derivation live on ``burndown._SNAPSHOT_PAGE_SIZE``;
+# this is the test's own copy of the FLOOR it enforces, deliberately spelled
+# as a number rather than derived from ``_SNAPSHOT_PER_ROOT_BUDGET`` (deriving
+# the bound from the value under test would assert nothing).
+_MEASURED_PAGINATED_WORST_CASE = 209.0
+
+
+class TestCollectSnapshotPerRootBudget:
+    """``collect_snapshot``'s Phase-2 fan-out is whole-operation bounded per root.
+
+    Before task 4884 this was the LAST unbounded ``fetch_tasks`` caller in the
+    tree: task 4788 gave every route caller a named
+    ``DEFAULT_WHOLE_OPERATION_BUDGET`` wrap and deliberately left the
+    background collector out of scope, so a single hung MCP fan-out could park
+    the collector task forever and silently stop every project's burndown row
+    — the 2026-08-27 19.8h wedge shape, one layer down from the routes.
+
+    The hang stub is ``await asyncio.Event().wait()`` — the 4788 idiom — with
+    NO duration at all, so no choice of budget value can make an unbounded
+    implementation pass these tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hung_root_is_skipped_and_healthy_root_still_snapshots(
+        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """(a) One root hanging forever costs that root's row, not the cycle."""
+        healthy_root = tmp_path / 'healthy'
+        healthy_root.mkdir()
+
+        async with burndown_conn_with_config(known_project_roots=[healthy_root]) as (
+            _db_path, config, conn,
+        ):
+            hung_key = _root_key(config.project_root)
+            healthy_key = _root_key(healthy_root)
+
+            async def fake_load(client, cfg, project_root, **_kwargs):
+                key = _root_key(project_root)
+                if key == hung_key:
+                    # No duration: nothing ever sets this Event, so the only
+                    # thing that can end this await is the caller's bound.
+                    await asyncio.Event().wait()
+                assert key == healthy_key, f'Unmapped project_root: {key}'
+                return _task_rows([{'status': 'pending'}, {'status': 'done'}])
+
+            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+
+            with (
+                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Hard external cap, mirroring test_healthz_deadline._call_healthz:
+                # a regression to the unbounded gather must fail fast here rather
+                # than wedge the whole suite behind pytest-timeout.
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail(
+                        'collect_snapshot did not return within 10s against a root '
+                        'whose fetch hangs forever — the Phase-2 fan-out is still '
+                        'unbounded (expected a per-root _SNAPSHOT_PER_ROOT_BUDGET '
+                        'wrap around _fetch_snapshot_tasks).'
+                    )
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+            project_ids = {row['project_id'] for row in rows}
+            assert str(healthy_root.resolve()) in project_ids, (
+                'the healthy root must still get its snapshot row: one hung root '
+                'may not sink the cycle'
+            )
+            assert str(config.project_root) not in project_ids, (
+                'the hung root must be SKIPPED, not written with fabricated zero '
+                'counts — snapshots is an append-only historical record'
+            )
+            assert len(rows) == 1
+
+            warnings = [
+                r for r in caplog.records
+                if r.levelno >= logging.WARNING and str(config.project_root) in r.getMessage()
+            ]
+            assert warnings, (
+                'expected a WARNING naming the hung root; a root that silently '
+                'vanishes from an append-only chart is exactly the invisible '
+                'failure this bound exists to make visible. Saw: '
+                f'{[r.getMessage() for r in caplog.records]}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_expiry_surfaces_through_the_existing_exception_triage(
+        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """(b) Task 519's partial-success semantics are preserved verbatim.
+
+        Expiry must arrive at Phase 3 as a per-root ``BaseException`` in the
+        gather's result list — i.e. ``return_exceptions=True`` is still in
+        force — so the EXISTING ``isinstance(result, BaseException)`` branch
+        logs-and-continues.  A bound that instead let the ``TimeoutError``
+        escape the gather would abort the cycle and roll nothing back but
+        write nothing more either.
+        """
+        healthy_root = tmp_path / 'healthy'
+        healthy_root.mkdir()
+        late_root = tmp_path / 'late'
+        late_root.mkdir()
+
+        async with burndown_conn_with_config(
+            known_project_roots=[healthy_root, late_root],
+        ) as (_db_path, config, conn):
+            hung_key = _root_key(healthy_root)
+
+            async def fake_load(client, cfg, project_root, **_kwargs):
+                if _root_key(project_root) == hung_key:
+                    await asyncio.Event().wait()
+                return _task_rows([{'status': 'pending'}])
+
+            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+
+            with (
+                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail('collect_snapshot did not return within 10s (see (a))')
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                project_ids = {row['project_id'] for row in await cur.fetchall()}
+
+            # The main project commits FIRST (it is roots_to_snapshot[0]) and a
+            # later root's expiry may not roll it back.  The root AFTER the hung
+            # one is still reached, which is what "isolated, not aborted" means.
+            assert str(config.project_root) in project_ids
+            assert str(late_root.resolve()) in project_ids
+            assert str(healthy_root.resolve()) not in project_ids
+
+            triage = [
+                r for r in caplog.records
+                if r.getMessage().startswith('Failed to fetch tasks for')
+                and str(healthy_root.resolve()) in r.getMessage()
+            ]
+            assert triage, (
+                'the timed-out root must reach the EXISTING '
+                "isinstance(result, BaseException) triage branch ('Failed to "
+                "fetch tasks for %s'), proving return_exceptions=True still "
+                'converts its expiry into a handled per-root result. Saw: '
+                f'{[r.getMessage() for r in caplog.records]}'
+            )
+            assert triage[0].exc_info is not None
+            assert issubclass(triage[0].exc_info[0], TimeoutError), (
+                'the exception carried into triage must be the budget expiry '
+                f'itself, not a substitute; got {triage[0].exc_info[0]!r}'
+            )
+
+    def test_budget_is_sized_between_the_route_default_and_one_collector_cycle(self):
+        """(c) The VALUE is derived from the collector's own cycle, not the routes.
+
+        Wrapping at the route convention's 7.0 would be a REGRESSION, not a
+        fix: ``_fetch_snapshot_tasks`` probes unpaginated and, on transport
+        rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call
+        that internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round
+        trips, MEASURED at ~209 s for one root of this repo's size (the
+        measurement and its derivation live on ``_SNAPSHOT_PAGE_SIZE``).  A
+        7.0 s bound would time out every big root on every cycle, and because
+        ``snapshots`` is APPEND-ONLY and no later cycle backfills, that is a
+        permanent unexplained hole in the chart.
+        """
+        import dashboard.loops as loops_module
+        from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
+
+        budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
+        one_cycle_half = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+
+        # BOTH bounds are the ones the derivation actually names. An earlier
+        # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
+        # and `< _SAMPLE_INTERVAL_SECONDS` (600) — two orders of magnitude
+        # apart from the stated floor at one end and double the stated ceiling
+        # at the other — so a value of 10.0 passed while doing exactly the
+        # permanent-hole damage the docstring describes.
+        assert budget >= _MEASURED_PAGINATED_WORST_CASE, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the MEASURED '
+            f'~{_MEASURED_PAGINATED_WORST_CASE} s paginated worst case for one '
+            "root of this repo's size (see _SNAPSHOT_PAGE_SIZE). Anything below "
+            'it times out every big root on EVERY cycle, and because snapshots '
+            'is APPEND-ONLY and no later cycle backfills, that is a permanent '
+            'unexplained hole in the chart — not a degraded read. The shared '
+            f'route default ({DEFAULT_WHOLE_OPERATION_BUDGET}) is the value '
+            'this must NOT be confused with: a BACKGROUND root that walks '
+            'ceil(N/P) sequential pages is not a request-path one.'
+        )
+        assert budget <= one_cycle_half, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
+            f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
+            'finish inside one cycle can never finish at all, and the halving '
+            'is what guarantees cycle N is done before cycle N+1 starts even '
+            'when a root spends its whole budget.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Docstring contract (#13 — partial-failure semantics)
 # ---------------------------------------------------------------------------
 
@@ -2916,3 +3209,528 @@ class TestComputeWindowCompletion:
         })
         assert result['completed'] == 0
         assert result['velocity'] == 0.0
+
+
+class TestCollectSnapshotPaginatesTheTaskRead:
+    """The whole-tree read must not be able to open a permanent history hole.
+
+    ``snapshots`` is APPEND-ONLY: one row per cycle, never backfilled.  So a
+    cycle whose ``get_tasks`` response is rejected wholesale for exceeding the
+    MCP transport limit does not merely arrive late — that point in the burndown
+    history is gone for good, and the chart reads as a gap with no explanation
+    on it.
+
+    Neither obvious alternative is available.  There is no field-limited read
+    anywhere in the chain (MCP ``get_tasks`` accepts only ``project_root``/
+    ``tag``/``page_size``/``offset``/``statuses``, and the backend query is
+    ``SELECT *``) even though the collector reads just four keys per task.  And
+    falling back to ``fetch_statuses`` is worse than the disease: BURNDOWN_SCHEMA
+    declares ``in_progress_live``/``in_progress_stranded`` ``INTEGER NOT NULL
+    DEFAULT 0``, so a statuses-only row physically cannot say "split unknown"
+    and would have to write ``stranded=0`` — a confident zero manufactured out
+    of a degraded read.  A visible hole beats an invisible lie.
+
+    That leaves bounding the per-response size.  These tests pin both halves:
+    pagination closes the hole, and a genuinely unreadable tree still writes
+    nothing at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_fetch_tasks_cache(self):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _raw(tid: int, status: str = 'pending', **extra) -> dict:
+        """A RAW MCP get_tasks row (pre-``_shape_task``)."""
+        row = {
+            'id': str(tid), 'title': f'task {tid}', 'status': status,
+            'description': '', 'details': '', 'dependencies': [], 'metadata': {},
+        }
+        row.update(extra)
+        return row
+
+    def _tree(self) -> list[dict]:
+        """A tree with a known live/stranded split: 2 live, 2 stranded, 3 other."""
+        return [
+            self._raw(1, 'in-progress',
+                      claimant_run_id='run-1/sess-1/pid=42',
+                      heartbeat_at=datetime.now(UTC).isoformat()),
+            self._raw(2, 'in-progress',
+                      claimant_run_id='run-2/sess-2/pid=43',
+                      heartbeat_at=datetime.now(UTC).isoformat()),
+            self._raw(3, 'in-progress'),   # no claimant at all => stranded
+            self._raw(4, 'in-progress'),   # no claimant at all => stranded
+            self._raw(5, 'pending'),
+            self._raw(6, 'done'),
+            self._raw(7, 'blocked'),
+        ]
+
+    @staticmethod
+    def _stub(tasks: list[dict], calls: list[dict], *, oversize_unpaginated: bool):
+        """An ``mcp_tool_call`` stub for the REAL ``fetch_tasks`` to drive.
+
+        Patching at this layer rather than at ``burndown.fetch_tasks`` is the
+        point: what is under test is whether the collector asks for a BOUNDED
+        response, which a stubbed-out fetch_tasks would hide entirely.
+
+        With ``oversize_unpaginated`` the single whole-tree request answers with
+        the tool-level rejection envelope an over-limit response produces.
+        ``fetch_tasks`` turns that into its offline marker and the collector
+        skips the cycle — the permanent hole.
+        """
+
+        async def _call(_client, _url, tool, args, **_kwargs):
+            assert tool == 'get_tasks', tool
+            calls.append(dict(args))
+            page_size = args.get('page_size')
+            if page_size is None:
+                if oversize_unpaginated:
+                    return {'error': 'response exceeds maximum allowed tokens'}
+                return {'tasks': list(tasks)}
+            offset = args.get('offset', 0)
+            page = tasks[offset:offset + page_size]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset,
+                    'page_size': page_size, 'returned': len(page),
+                    'has_more': offset + len(page) < len(tasks),
+                },
+            }
+
+        return _call
+
+    @pytest.mark.asyncio
+    async def test_the_probe_marker_does_not_suppress_the_chunked_fallback(
+        self, burndown_env, dummy_client,
+    ):
+        """NAMED regression pin: `chunk_size` must stay IN the cache key.
+
+        THE HAZARD, stated once at `dashboard/src/dashboard/data/tasks.py::_CompleteRead`:
+        "chunk size selects transport, never the contract" is true of the
+        ANSWER and false of the KEY, and acting on the first half alone
+        suppresses the burndown fallback with the probe's own failure marker.
+        This test is the executable half of that statement.
+
+        NO CACHE CLEAR between the two reads — that is the whole test. The
+        autouse fixture clears around the test, not inside it, so the fallback
+        runs against a cache still holding the probe's fresh marker.
+
+        WHY THIS EXISTS SEPARATELY. `test_a_tree_that_only_fits_in_pages_still
+        _yields_a_row` covers this path INCIDENTALLY. Incidental coverage is
+        what a later edit removes silently: adding a mid-test cache clear, or
+        splitting the probe into its own test, would drop the guard with every
+        test still green. The probe/fallback tests in
+        `TestCollectSnapshotTaskSourceAndCap` cannot catch it at all — they
+        patch `burndown.fetch_tasks` wholesale and never reach the cache.
+        """
+        db_path, config, conn = burndown_env
+        tasks = self._tree()
+        calls: list[dict] = []
+
+        with (
+            patch(
+                'dashboard.data.tasks.mcp_tool_call',
+                new=AsyncMock(side_effect=self._stub(
+                    tasks, calls, oversize_unpaginated=True,
+                )),
+            ),
+            patch(
+                'dashboard.data.burndown.find_running_orchestrators',
+                return_value=[],
+            ),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        assert calls, 'the probe must actually reach the wire'
+        assert calls[0].get('page_size') is None, (
+            f'the probe is the UNPAGINATED read, got {calls[0]}'
+        )
+        assert any(c.get('page_size') == _SNAPSHOT_PAGE_SIZE for c in calls), (
+            'the chunked fallback never reached the server — the probe\'s own '
+            'offline marker suppressed it, which means chunk_size has been '
+            f'dropped from the cache key. Calls: {calls}'
+        )
+
+        async with conn.execute(
+            'SELECT pending, in_progress_live, in_progress_stranded FROM snapshots'
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None, (
+            'an oversize tree must still write its snapshot row — a missing '
+            'row here is a PERMANENT hole in an append-only table'
+        )
+        assert row[0] == 1 and row[1] == 2 and row[2] == 2, (
+            f'the fallback must record the whole tree, got {tuple(row)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_tree_that_only_fits_in_pages_still_yields_a_row(
+        self, burndown_env, dummy_client,
+    ):
+        """A row is written, and its counts equal the single-page delivery's.
+
+        Pagination changes DELIVERY, never the recorded values — so the two
+        rows this collects (paged, then whole) must agree column for column.
+        """
+        import dashboard.data.tasks as tasks_mod
+
+        db_path, config, conn = burndown_env
+        tasks = self._tree()
+        paged_calls: list[dict] = []
+        whole_calls: list[dict] = []
+
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=self._stub(
+                      tasks, paged_calls, oversize_unpaginated=True))),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        # Baseline: the same tasks delivered whole, for a value-for-value compare.
+        tasks_mod._fetch_tasks_cache_clear()
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=self._stub(
+                      tasks, whole_calls, oversize_unpaginated=False))),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        async with conn.execute('SELECT * FROM snapshots ORDER BY rowid') as cur:
+            rows = list(await cur.fetchall())
+
+        assert len(rows) == 2, (
+            'the paginated cycle must write its row, not silently skip; '
+            f'requests issued were {paged_calls!r}'
+        )
+        assert any(c.get('page_size') for c in paged_calls), (
+            f'the collector must ask for a bounded response; got {paged_calls!r}'
+        )
+        paged, whole = rows[0], rows[1]
+        for col in (
+            'pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done',
+            'in_progress_live', 'in_progress_stranded',
+        ):
+            assert paged[col] == whole[col], (
+                f'{col}: pagination changed a recorded value '
+                f'({paged[col]} paged vs {whole[col]} whole)'
+            )
+        assert paged['in_progress'] == 4
+        assert paged['in_progress_stranded'] == 2
+        assert paged['in_progress_live'] == 2
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_tree_writes_no_row_rather_than_a_zero_split(
+        self, burndown_env, dummy_client,
+    ):
+        """THE anti-fabrication invariant: no row beats a fabricated one.
+
+        When the tree cannot be read at ALL — paginated or not — the existing
+        skip-and-log behaviour is retained.  Emphatically NOT a fallback row
+        carrying ``in_progress_stranded=0``: the NOT NULL split columns cannot
+        represent "split unknown", so any such row asserts, in the permanent
+        record, that nothing was stranded at a moment nobody could see.
+        """
+        db_path, config, conn = burndown_env
+
+        async def _always_fails(_client, _url, _tool, _args, **_kwargs):
+            raise httpx.ConnectError('fused-memory unreachable')
+
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=_always_fails)),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 0, 'an unreadable tree must leave a visible hole, not a zero row'
+
+    @pytest.mark.asyncio
+    async def test_a_non_advancing_server_writes_no_row_rather_than_a_zero_split(
+        self, burndown_env, dummy_client,
+    ):
+        """A server that never advances must leave a hole, not a fabricated zero.
+
+        Every paginated request answers ``returned=0`` while claiming 400 rows
+        remain.  Before ``fetch_tasks`` learned to raise on truncation this
+        wrote ONE row of ``(pending=0, in_progress=0, done=0, ...)`` for a tree
+        the server itself reported as holding 400 tasks.
+
+        ``snapshots`` is APPEND-ONLY, so the dropped row is a permanent, visible
+        hole that no later cycle backfills — which is the INTENDED outcome.  A
+        gap in the chart is visible and prompts a question; a fabricated dip is
+        unfalsifiable after the fact.
+        """
+        db_path, config, conn = burndown_env
+        calls: list[dict] = []
+
+        async def _never_advances(_client, _url, tool, args, **_kwargs):
+            assert tool == 'get_tasks', tool
+            calls.append(dict(args))
+            # The size probe (_fetch_snapshot_tasks) issues an ordinary
+            # unpaginated read first; reject it the way an oversize tree is
+            # rejected, because that rejection is the ONLY reason the paginated
+            # path this test is about ever runs.
+            if 'page_size' not in args:
+                return {'error': 'response too large'}
+            return {
+                'tasks': [],
+                'pagination': {
+                    'total': 400, 'offset': args.get('offset', 0),
+                    'page_size': args.get('page_size'), 'returned': 0,
+                    'has_more': True,
+                },
+            }
+
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=_never_advances)),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        async with conn.execute(
+            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
+            'in_progress_live, in_progress_stranded FROM snapshots',
+        ) as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+
+        assert rows == [], (
+            'a non-advancing server must leave a hole, not a row asserting the '
+            f'400-task tree it reported was empty; fabricated {rows!r} from '
+            f'requests {calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_partially_readable_tree_writes_no_row(
+        self, burndown_env, dummy_client,
+    ):
+        """Pages 0-1 arrive, then the server stalls → no row at all.
+
+        A PARTIAL count is the more dangerous artefact than an all-zero one: it
+        looks entirely plausible in the chart, so nobody ever goes looking.  The
+        partial rows must not reach ``_count_zones``.
+
+        ``snapshots`` is APPEND-ONLY: the dropped row is a permanent, visible
+        hole no later cycle backfills, which is strictly better than an
+        undercount recorded as fact.
+        """
+        db_path, config, conn = burndown_env
+        tasks = self._tree()
+        calls: list[dict] = []
+
+        async def _stalls_after_two_pages(_client, _url, tool, args, **_kwargs):
+            assert tool == 'get_tasks', tool
+            calls.append(dict(args))
+            # The size probe (_fetch_snapshot_tasks) issues an ordinary
+            # unpaginated read first; reject it the way an oversize tree is
+            # rejected, because that rejection is the ONLY reason the paginated
+            # path this test is about ever runs.
+            if 'page_size' not in args:
+                return {'error': 'response too large'}
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size') or 0
+            page = tasks[offset:offset + page_size] if offset < 4 else []
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset,
+                    'page_size': page_size, 'returned': len(page),
+                    'has_more': True,
+                },
+            }
+
+        with (
+            patch('dashboard.data.burndown._SNAPSHOT_PAGE_SIZE', 2),
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=_stalls_after_two_pages)),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        assert 'page_size' not in calls[0], (
+            f'the size probe must come first and be unpaginated; got {calls!r}'
+        )
+        assert [c.get('offset') for c in calls[1:]] == [0, 2, 4], (
+            f'the stub must have served two pages then stalled; got {calls!r}'
+        )
+        async with conn.execute(
+            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
+            'in_progress_live, in_progress_stranded FROM snapshots',
+        ) as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+
+        assert rows == [], (
+            'a partial read must leave a hole, not a plausible-looking '
+            f'undercount; fabricated {rows!r} from the 7-task tree'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_tree_still_writes_a_zero_row(
+        self, burndown_env, dummy_client,
+    ):
+        """POSITIVE CONTROL: a truly empty project still gets its all-zero row.
+
+        ``total=0, returned=0`` is a COMPLETE read of an empty project, not a
+        truncation — a true zero, not a manufactured one.  This is the property
+        the empty-tree carve-out in ``fetch_tasks`` exists to protect, and
+        without this control "writes no row" above could pass by having broken
+        pagination outright.
+
+        The probe rejection below is what makes that control real rather than
+        vacuous.  A stub that answers EVERY request — including the unpaginated
+        size probe ``_fetch_snapshot_tasks`` issues first — with a successful
+        empty envelope never enters the paginated path at all, so the carve-out
+        it claims to exercise is never executed.  (Measured: with the probe
+        answered successfully, mutating the carve-out to ``if False:`` left this
+        test green.)  Its three siblings in this class reject the probe for the
+        same reason.
+        """
+        db_path, config, conn = burndown_env
+        calls: list[dict] = []
+
+        async def _empty(_client, _url, tool, args, **_kwargs):
+            assert tool == 'get_tasks', tool
+            calls.append(dict(args))
+            # Reject the unpaginated size probe exactly as an oversize tree is
+            # rejected — that rejection is the ONLY reason the paginated path
+            # this control is about ever runs.
+            if 'page_size' not in args:
+                return {'error': 'response too large'}
+            return {
+                'tasks': [],
+                'pagination': {
+                    'total': 0, 'offset': args.get('offset', 0),
+                    'page_size': args.get('page_size'), 'returned': 0,
+                    'has_more': False,
+                },
+            }
+
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call',
+                  new=AsyncMock(side_effect=_empty)),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        async with conn.execute(
+            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
+            'in_progress_live, in_progress_stranded FROM snapshots',
+        ) as cur:
+            rows = list(await cur.fetchall())
+
+        # Load-bearing: proves the control actually reached the paginated path
+        # rather than being satisfied by the probe.  Without this the class can
+        # silently go vacuous again the next time the read shape changes.
+        assert any('page_size' in c for c in calls), (
+            f'the carve-out under test lives in the PAGINATED path; this control '
+            f'never reached it, so it proves nothing. Requests were {calls!r}'
+        )
+        assert len(rows) == 1, (
+            f'an empty project is a complete read and must still get its row; '
+            f'requests were {calls!r}'
+        )
+        assert list(rows[0]) == [0] * 8, (
+            f'every zone count must be a true zero; got {tuple(rows[0])!r}'
+        )
+
+
+class TestSnapshotPageSizeIsSizedFromMeasuredDensity:
+    """``_SNAPSHOT_PAGE_SIZE`` must be derived from full-row density.
+
+    The first cut of this constant was 500, a number borrowed by analogy with
+    ``_STATUSES_AUTO_PAGE_LIMIT = 2000`` — but that cap was derived at ~14-23
+    chars per *status* entry, and a full task row is ~200-350x denser.  A page
+    of 500 full rows measured 2.4 MB (random) / 7.6 MB (worst) against a
+    ~62,000-char documented-safe envelope: 40-120x over, i.e. the exact failure
+    pagination was added to prevent still happened on every cycle.
+
+    So the number needs its own derivation and its own guard.  The derivation
+    — measured read-only against this repo's backend, with the full percentile
+    distribution and the cost model — lives in ONE place, the
+    ``_SNAPSHOT_PAGE_SIZE`` comment block in ``burndown.py``; re-measuring
+    updates it there.  Restated here only because the assertion consumes them:
+    the mean row density and the documented-safe envelope, below.
+
+    This asserts on the REAL constant so a future bump cannot silently re-cross
+    the wall.
+    """
+
+    # Measured mean chars per serialised full task row (see class docstring).
+    MEASURED_MEAN_ROW_CHARS = 5_234
+    # Conservative side of the wall: get_statuses failed closed at 80,795 and
+    # 84,638 chars; ~62 KB is the documented-safe envelope from that same
+    # incident record (fused-memory/tests/test_get_statuses_pagination.py).
+    SAFE_ENVELOPE_CHARS = 62_000
+
+    @staticmethod
+    def _row(task_id: int, *, chars: int) -> dict:
+        """A full task row padded to *chars* serialised characters."""
+        row = {
+            'id': task_id,
+            'status': 'in-progress',
+            'title': '',
+            'description': '',
+            'details': '',
+            'claimant_run_id': 'run-0123456789abcdef',
+            'heartbeat_at': '2026-09-01T00:00:00+00:00',
+            'metadata': {'infra_hold': False},
+        }
+        import json
+        pad = chars - len(json.dumps(row))
+        if pad > 0:
+            row['details'] = 'x' * pad
+        return row
+
+    def test_a_typical_page_fits_the_documented_safe_envelope(self):
+        """PAGE_SIZE rows at MEASURED MEAN density must serialise under 62 KB.
+
+        THE guard on this constant, and it is one assertion rather than several
+        because the alternatives all collapse into it.  "Is it
+        status-granularity sized?" (``_STATUSES_AUTO_PAGE_LIMIT`` is 2000 at
+        ~14-23 chars per *status* entry, ~200-350x less dense than a full task
+        row) reduces to exactly the same ``_SNAPSHOT_PAGE_SIZE <= 62,000/5,234
+        ~= 11`` bound this serialisation already enforces, so it cannot fail
+        unless this has: 500 x 5,234 ~= 2.6 MB is what the original cut failed
+        on, and it fails here too.
+
+        What this DELIBERATELY does not assert: that the mitigation is a
+        guarantee.  The row-size tail is not bounded by any page size — the
+        largest real row measured 95,838 chars, over the envelope ALONE — so
+        even a page of one can be rejected.  That fact is a property of the
+        measurement, not of any production symbol, so pinning it here would be
+        a comment written in ``assert`` syntax that can never fail; it lives in
+        the ``_SNAPSHOT_PAGE_SIZE`` comment block instead, and the behaviour it
+        motivates (fail LOUD and all-or-nothing rather than write a partial read
+        as fact) is pinned by the truncation tests in
+        ``TestCollectSnapshotPaginatesTheTaskRead`` and ``test_tasks.py``.
+        """
+        import json
+
+        from dashboard.data.burndown import _SNAPSHOT_PAGE_SIZE
+
+        assert _SNAPSHOT_PAGE_SIZE > 0, (
+            f'_SNAPSHOT_PAGE_SIZE={_SNAPSHOT_PAGE_SIZE} would make the walk '
+            f'request no rows at all.'
+        )
+        page = [
+            self._row(i, chars=self.MEASURED_MEAN_ROW_CHARS)
+            for i in range(_SNAPSHOT_PAGE_SIZE)
+        ]
+        serialised = json.dumps({'tasks': page})
+        assert len(serialised) < self.SAFE_ENVELOPE_CHARS, (
+            f'A typical page of {_SNAPSHOT_PAGE_SIZE} rows at the measured mean '
+            f'density ({self.MEASURED_MEAN_ROW_CHARS} chars/row) serialises to '
+            f'{len(serialised)} chars, at or over the '
+            f'{self.SAFE_ENVELOPE_CHARS}-char documented-safe envelope. Lower '
+            f'_SNAPSHOT_PAGE_SIZE — do NOT relax this bound, and do NOT size it '
+            f'by analogy with any status-granularity cap.'
+        )

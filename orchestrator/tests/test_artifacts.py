@@ -1,14 +1,25 @@
 """Tests for task artifacts management."""
 
+import copy
+import errno
 import json
 import os
+import stat
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared import safe_io
 
-from orchestrator.artifacts import TaskArtifacts, _normalize_plan
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    ArtifactWriteError,
+    TaskArtifacts,
+    _normalize_plan,
+)
 
 
 @pytest.fixture
@@ -1689,13 +1700,23 @@ class TestWorktreeMissingTolerance:
         worktree.mkdir()
         ta = TaskArtifacts(worktree)
         ta.init('task-z', 'present', 'desc')
-        # Root exists; make write_text raise PermissionError
+        # Root exists, so the FileNotFoundError tolerance in ``_write_json``
+        # must NOT engage and a genuine I/O failure must surface.
+        #
+        # The patch deliberately targets ``Path.mkdir`` — a seam BOTH write
+        # strategies traverse: the historical ``path.parent.mkdir(...)`` +
+        # ``path.write_text(...)`` pair, and the atomic
+        # ``safe_io.atomic_write_text(..., mkdir=True)`` delegation that
+        # replaced it (which calls ``p.parent.mkdir(parents=True,
+        # exist_ok=True)`` itself).  Do NOT re-narrow this to ``write_text``:
+        # the atomic writer writes through an ``os.fdopen`` handle and never
+        # calls it, so such a patch would stop exercising anything.
         import pathlib
 
         def _raise_permission(self, *args, **kwargs):
             raise PermissionError('denied')
 
-        monkeypatch.setattr(pathlib.Path, 'write_text', _raise_permission)
+        monkeypatch.setattr(pathlib.Path, 'mkdir', _raise_permission)
         with pytest.raises(PermissionError):
             ta.write_review('rev', {'verdict': 'PASS', 'issues': []})
 
@@ -2339,3 +2360,557 @@ class TestWriteMarkupResidue:
         assert json.loads(
             (first.root / first_id).read_text()
         )['raw_value'] == 'FIRST payload'
+
+
+# ---------------------------------------------------------------------------
+# task 3957 step-1 — the atomicity contract of ``TaskArtifacts._write_json``,
+# stated as an executable property rather than as an assertion about code.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteJsonIsAtomic:
+    """A concurrent reader never observes a partial `.task-meta` artifact.
+
+    ``_write_json`` is the single write seam behind ~13 whole-file JSON
+    artifacts (metadata, plan, review_state, reviews, verdicts,
+    agent_session, reconcile_state, the report artifacts).  The contract it
+    owns: a reader racing a write sees either the complete OLD document or
+    the complete NEW one — never a truncated file, and never a missing one.
+
+    The only convincing evidence for that is to race it, so these tests do.
+    The harness is ported from the plan-tools suite that proved the same
+    property for `_atomic_write_plan`; it is asserted here at the layer that
+    now owns the guarantee, and for a NON-plan artifact too, so the contract
+    is visibly `_write_json`'s rather than plan.json's alone.
+    """
+
+    READERS = 4
+    READS_PER_READER = 300
+    WRITES = 50
+
+    @staticmethod
+    def _race(readers, reads_per_reader, read_once, write_all):
+        """Run *readers* threads calling *read_once* while *write_all* writes.
+
+        Returns the list of values *read_once* produced.  Readers are barrier
+        -synchronised with the writer so the reads genuinely overlap the
+        writes rather than all landing before the first one.
+        """
+        observations: list = []
+        errors: list = []
+        start = threading.Barrier(readers + 1)
+        done = threading.Event()
+
+        def reader():
+            start.wait(timeout=30)
+            for _ in range(reads_per_reader):
+                try:
+                    observations.append(read_once())
+                except Exception as exc:  # noqa: BLE001 — recorded, then asserted on
+                    errors.append(repr(exc))
+                if done.is_set():
+                    break
+
+        threads = [
+            threading.Thread(target=reader, name=f'reader-{i}', daemon=True)
+            for i in range(readers)
+        ]
+        for thread in threads:
+            thread.start()
+
+        start.wait(timeout=30)
+        try:
+            write_all()
+        finally:
+            done.set()
+
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive(), f'{thread.name} did not finish'
+
+        return observations, errors
+
+    def test_readers_only_ever_observe_a_complete_document(
+        self, artifacts: TaskArtifacts
+    ):
+        plan_path = artifacts.root / 'plan.json'
+
+        # Two documents of DELIBERATELY different sizes: a torn read of the
+        # larger one cannot be mistaken for a clean read of the smaller.
+        doc_a = {'task_id': 'task-1', 'title': 'A' * 4000, 'steps': []}
+        doc_b = {'task_id': 'task-1', 'title': 'B', 'analysis': 'B' * 40000,
+                 'steps': []}
+        # What ``write_plan`` actually lands: the input plus its schema stamp.
+        expected = []
+        for doc in (doc_a, doc_b):
+            stamped = copy.deepcopy(doc)
+            stamped['_schema_version'] = PLAN_SCHEMA_VERSION
+            expected.append(stamped)
+
+        artifacts.write_plan(copy.deepcopy(doc_a))
+
+        def write_all():
+            for i in range(self.WRITES):
+                artifacts.write_plan(copy.deepcopy(doc_b if i % 2 else doc_a))
+
+        observations, errors = self._race(
+            self.READERS,
+            self.READS_PER_READER,
+            lambda: json.loads(plan_path.read_text()),
+            write_all,
+        )
+
+        assert errors == [], (
+            f'a reader observed an unparseable plan.json: {errors[:3]}'
+        )
+        unexpected = [o for o in observations if o not in expected]
+        assert unexpected == [], (
+            'a reader observed a document that is neither the pre-write nor '
+            f'the post-write plan: {[sorted(u) for u in unexpected[:2]]}'
+        )
+        assert observations, 'the readers observed nothing at all'
+
+    # A watcher thread can only sample the unlink→create window of a
+    # hypothetical unlink-then-create writer while it actually holds the GIL,
+    # and that window is a microsecond of bytecode.  Every one of these three
+    # constants was set by MUTATION, not by taste: with
+    # ``path.unlink(missing_ok=True)`` inserted before the write, one watcher
+    # at the stock 5 ms switch interval never caught it, and three watchers at
+    # 1 µs over 50 writes caught it only intermittently (1 of 3 runs).  At 500
+    # writes the same mutant dies on every run with four orders of magnitude
+    # of margin (~20k misses).  Do not lower ABSENCE_WRITES, raise the switch
+    # interval, or drop to one watcher: each silently returns this test to
+    # proving nothing at all.
+    WATCHERS = 3
+    ABSENCE_WRITES = 500
+    SWITCH_INTERVAL = 1e-6
+
+    def test_the_artifact_path_is_never_absent_mid_write(
+        self, artifacts: TaskArtifacts
+    ):
+        """The swap is a replace-in-place — never unlink-then-create.
+
+        Green against the superseded ``path.write_text`` too, which truncates
+        in place and so also never removes the name; this is a forward-looking
+        guard on the tmp+rename implementation, where ``os.replace`` is what
+        keeps the promise and a naive ``unlink`` + create would break it.
+        """
+        plan_path = artifacts.root / 'plan.json'
+        artifacts.write_plan({'task_id': 'task-1', 'steps': []})
+
+        misses: list = []
+        stop = threading.Event()
+
+        def watcher():
+            while not stop.is_set():
+                if not plan_path.exists():
+                    misses.append(1)
+
+        threads = [
+            threading.Thread(target=watcher, name=f'watcher-{i}', daemon=True)
+            for i in range(self.WATCHERS)
+        ]
+        previous_interval = sys.getswitchinterval()
+        sys.setswitchinterval(self.SWITCH_INTERVAL)
+        for thread in threads:
+            thread.start()
+        try:
+            for i in range(self.ABSENCE_WRITES):
+                artifacts.write_plan({'task_id': 'task-1', 'title': f't{i}',
+                                      'steps': []})
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=30)
+            sys.setswitchinterval(previous_interval)
+
+        for thread in threads:
+            assert not thread.is_alive(), f'{thread.name} did not finish'
+        assert misses == [], 'plan.json vanished during an atomic write'
+
+    def test_a_non_plan_artifact_is_equally_atomic(
+        self, artifacts: TaskArtifacts
+    ):
+        """The contract belongs to `_write_json`, not to plan.json.
+
+        Driven through ``write_verdict`` so nothing about it is
+        plan-specific: if only ``write_plan`` were made atomic, this fails.
+        """
+        verdict_path = artifacts.root / 'verdicts' / 'judge.json'
+
+        def envelope(payload: str) -> dict:
+            return {
+                'role': 'judge',
+                'schema_version': 1,
+                'session_id': 's',
+                'emitted_at': 't',
+                'verdict': {'complete': True, 'notes': payload},
+            }
+
+        small = envelope('n' * 4000)
+        large = envelope('N' * 40000)
+        expected = [small, large]
+
+        artifacts.write_verdict('judge', copy.deepcopy(small))
+
+        def write_all():
+            for i in range(self.WRITES):
+                artifacts.write_verdict(
+                    'judge', copy.deepcopy(large if i % 2 else small)
+                )
+
+        observations, errors = self._race(
+            self.READERS,
+            self.READS_PER_READER,
+            lambda: json.loads(verdict_path.read_text()),
+            write_all,
+        )
+
+        assert errors == [], (
+            f'a reader observed an unparseable verdicts/judge.json: {errors[:3]}'
+        )
+        unexpected = [o for o in observations if o not in expected]
+        assert unexpected == [], (
+            'a reader observed a verdict envelope that is neither the '
+            f'pre-write nor the post-write one: {[sorted(u) for u in unexpected[:2]]}'
+        )
+        assert observations, 'the readers observed nothing at all'
+
+
+class TestWriteJsonPreservesMode:
+    """An artifact's permission bits survive the atomic replace.
+
+    The superseded ``Path.write_text`` TRUNCATED an existing file, so its
+    mode was never touched.  tmp+rename does not inherit that for free — the
+    destination takes the TEMP's bits — so without explicit preservation the
+    first write after the migration would silently re-mode every
+    `.task-meta` artifact: an invisible, permanent mutation performed as a
+    side effect of a routine write.  This is the semantic
+    ``plan_tools._target_file_mode`` existed for, asserted at the layer that
+    now owns it.
+    """
+
+    @pytest.mark.parametrize('mode', [0o600, 0o640, 0o664])
+    def test_an_existing_targets_mode_survives_the_write(
+        self, artifacts: TaskArtifacts, mode: int
+    ):
+        target = artifacts.root / 'plan.json'
+        target.write_text('{}')
+        os.chmod(target, mode)
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'kept', 'steps': []})
+
+        assert stat.S_IMODE(target.stat().st_mode) == mode, (
+            f'expected {mode:#o}, got '
+            f'{stat.S_IMODE(target.stat().st_mode):#o} — the replace re-moded '
+            'a pre-existing artifact'
+        )
+        # A no-op write would satisfy the mode assertion vacuously.
+        assert json.loads(target.read_text())['title'] == 'kept'
+
+    def test_a_new_targets_mode_matches_what_write_text_would_produce(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """A not-yet-existing artifact gets the umask-derived mode.
+
+        The expectation is derived from a LIVE reference file created in this
+        same test rather than hard-coded to 0o644, so the assertion holds
+        under any umask the suite happens to run with.
+        """
+        reference = tmp_path / 'reference.json'
+        reference.write_text('{}')
+
+        target = artifacts.root / 'plan.json'
+        assert not target.exists()
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'fresh', 'steps': []})
+
+        assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(
+            reference.stat().st_mode
+        ), (
+            'a newly created artifact must land with the same bits '
+            'Path.write_text would have given it'
+        )
+        assert json.loads(target.read_text())['title'] == 'fresh'
+
+    def test_a_non_missing_stat_failure_propagates(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """Only the missing-file case is benign.
+
+        The mode lookup must swallow FileNotFoundError ONLY — an EACCES /
+        ELOOP / ENAMETOOLONG on the target's ``stat()`` is a genuine failure
+        and must surface, not be misread as "this file is new, use the
+        umask".  Ports ``test_target_file_mode_propagates_a_non_missing_file_os_error``
+        from the plan-tools suite, whose whole point this is.
+        """
+        target = artifacts.root / 'plan.json'
+        real_stat = Path.stat
+
+        # Scoped to *target*, falling back to the real stat() for every other
+        # path: a blanket raise would break unrelated machinery (pytest's own
+        # bookkeeping calls Path.stat via Path.exists).
+        def boom(self, *args, **kwargs):
+            if self == target:
+                raise OSError(errno.EACCES, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', boom)
+
+        with pytest.raises(OSError) as excinfo:
+            artifacts.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert excinfo.value.errno == errno.EACCES
+
+
+class TestWriteJsonFollowsSymlinks:
+    """A write through the lane symlink reaches the REAL file, never eats it.
+
+    `ensure_lane_plan_symlink` makes `<worktree>/.task/plan.json` an absolute
+    symlink onto the meta-root plan, and `_artifacts_from_args` still supports
+    the legacy `meta_root=None` shape where `self.root` IS `<worktree>/.task`
+    (mcp_lifecycle's `meta_root` parameter defaults to None) — so
+    `self.root / 'plan.json'` can BE that symlink.
+
+    `Path.write_text` followed the link.  A bare `os.replace` onto the link
+    path would swap the LINK for a regular file, silently re-forking the lane
+    and meta-root copies: the esc-5205-9 stale-plan divergence the symlink
+    exists to make impossible.  So `_write_json` must resolve first — which
+    also puts the temp on the same filesystem as the real file, making the
+    replace an intra-filesystem rename rather than an EXDEV error.
+    """
+
+    @pytest.fixture
+    def lane_and_meta(self, worktree: Path) -> tuple[TaskArtifacts, Path, Path]:
+        """A legacy-mode `TaskArtifacts` whose plan path IS the lane symlink.
+
+        Returns ``(legacy_artifacts, lane_plan, real_plan)``.
+        """
+        worktree.mkdir()
+        meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        meta = TaskArtifacts(worktree, meta_root)
+        meta.init('task-1', 'Test Task', 'Desc')
+        meta.ensure_lane_plan_symlink()
+
+        lane_plan = worktree / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+
+        # The legacy view: self.root == <worktree>/.task, so write_plan's
+        # target is the symlink itself.
+        legacy = TaskArtifacts(worktree)
+        assert legacy.root == worktree / '.task'
+        return legacy, lane_plan, meta_root / 'plan.json'
+
+    def test_symlink_survives_and_the_real_file_receives_the_write(
+        self, lane_and_meta
+    ):
+        legacy, lane_plan, real_plan = lane_and_meta
+        link_target_before = os.readlink(lane_plan)
+
+        legacy.write_plan({'task_id': 'task-1', 'title': 'written', 'steps': []})
+
+        assert lane_plan.is_symlink(), 'the lane symlink was replaced by a file'
+        assert os.readlink(lane_plan) == link_target_before
+        assert json.loads(real_plan.read_text())['title'] == 'written'
+        # And the lane path still resolves to the same single source of truth.
+        assert json.loads(lane_plan.read_text())['title'] == 'written'
+
+    def test_the_replace_targets_the_real_file_not_the_link(
+        self, lane_and_meta, monkeypatch
+    ):
+        """The mechanism, not a side effect.
+
+        Resolving first is what keeps the rename intra-filesystem (the lane
+        and the meta root need not share a filesystem) AND what stops the
+        replace from eating the link.  Spying on `os.replace` proves the temp
+        was created beside the RESOLVED file rather than beside the symlink.
+        """
+        legacy, lane_plan, real_plan = lane_and_meta
+        seen: list[tuple[Path, Path]] = []
+        real_replace = safe_io.os.replace
+
+        def spy(src, dst, *args, **kwargs):
+            seen.append((Path(src), Path(dst)))
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(safe_io.os, 'replace', spy)
+
+        legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert seen, 'no atomic replace was performed at all'
+        src, dst = seen[-1]
+        assert dst == real_plan, (
+            f'the replace targeted {dst} — it must target the resolved file, '
+            'not the lane symlink'
+        )
+        assert src.parent == real_plan.parent, (
+            f'the temp was created in {src.parent}, not beside the real file'
+        )
+
+    @staticmethod
+    def _residue(directory: Path) -> list[str]:
+        """Whatever in *directory* looks like an unswept atomic-write temp.
+
+        ``safe_io._create_temp`` names its temp ``.<dest>.<uuid4hex>.tmp``, so
+        a ``.tmp`` suffix is the shape to look for; the same arm also catches
+        the fixed ``<dest>.tmp`` name a hand-rolled writer would leave behind.
+
+        A residue PREDICATE rather than an exact directory listing on
+        purpose.  An exact listing couples this test to the complete set of
+        artifacts ``init()`` happens to create today, so adding any new
+        init-time artifact (a base_commit sidecar, a lock file, …) would fail
+        a test whose message points at temp residue when nothing about
+        residue changed.
+        """
+        return sorted(
+            entry.name for entry in directory.iterdir()
+            if entry.name.endswith('.tmp')
+        )
+
+    def test_no_temp_residue_in_either_directory(self, lane_and_meta):
+        legacy, lane_plan, real_plan = lane_and_meta
+
+        legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert self._residue(lane_plan.parent) == []
+        assert self._residue(real_plan.parent) == []
+        # Not vacuous: the swept-clean directories are the ones the write
+        # actually went through and landed in.
+        assert {'plan.json'} <= {p.name for p in lane_plan.parent.iterdir()}
+        assert {'plan.json'} <= {p.name for p in real_plan.parent.iterdir()}
+        assert json.loads(real_plan.read_text())['task_id'] == 'task-1'
+
+    def test_dangling_symlink_fails_loudly_without_materialising_a_file(
+        self, worktree: Path
+    ):
+        """A broken link must NOT quietly become a stray regular file.
+
+        Materialising one at the link path IS the divergence, not a recovery
+        from it: the lane would hold a plan the meta root has never seen.
+        """
+        lane_task = worktree / '.task'
+        lane_task.mkdir(parents=True)
+        lane_plan = lane_task / 'plan.json'
+        missing = worktree.parent / 'gone' / 'plan.json'
+        os.symlink(missing, lane_plan)
+        assert lane_plan.is_symlink() and not lane_plan.exists()
+
+        legacy = TaskArtifacts(worktree)
+        with pytest.raises(ArtifactWriteError) as excinfo:
+            legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        message = str(excinfo.value)
+        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
+        assert str(missing) in message, 'the RESOLVED path must be named too'
+        assert lane_plan.is_symlink()
+        assert not lane_plan.exists(), 'a stray regular file was materialised'
+        assert {p.name for p in lane_task.iterdir()} == {'plan.json'}
+
+    def test_an_ordinary_path_with_a_missing_parent_is_still_created(
+        self, artifacts: TaskArtifacts
+    ):
+        """The dangling check must be gated on `is_symlink()`.
+
+        For an ordinary path a missing parent is NOT an error — `mkdir=True`
+        creates it, which is how `reviews/` and `verdicts/` come into being.
+        An unconditional parent check would break artifact creation outright.
+        """
+        import shutil
+        shutil.rmtree(artifacts.root / 'verdicts')
+
+        artifacts.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+
+        assert artifacts.read_verdict('judge') is not None
+
+
+# ---------------------------------------------------------------------------
+# task 3957 amendment — the DELEGATION contract of ``_write_json``.
+#
+# Everything else in this group asserts an observable property (torn reads,
+# mode, symlink write-through).  The two kwargs below have no observable
+# property to assert against on a live filesystem: dropping ``fsync=True``
+# leaves the whole orchestrator suite green while silently retiring the
+# durability half of the docstring's contract, and dropping ``mkdir=True``
+# only shows up as a FileNotFoundError on the first write into a directory
+# nothing has created yet.  So they are pinned directly.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteJsonDelegatesToSharedSafeIo:
+    """`_write_json` calls the blessed writer, with the kwargs it promises.
+
+    ``fsync=True`` is a deliberate override of ``shared.safe_io``'s own
+    ``fsync=False`` default (see ``_write_json``'s docstring for the measured
+    ~5 ms/write it costs and the three reasons the artifacts pay it).  A
+    deliberate override needs a pin, or the next reader who measures the cost
+    silently deletes the kwarg and nothing anywhere goes red.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[dict]:
+        """Record every ``atomic_write_text`` call, then perform it for real.
+
+        Recording without performing would make the surrounding write a no-op
+        and let a `_write_json` that never wrote at all pass.
+        """
+        calls: list[dict] = []
+        real = safe_io.atomic_write_text
+
+        def spy(path, text, **kwargs):
+            # ``kwargs`` verbatim under a nested key, so a DROPPED kwarg reads
+            # back as None and trips the assertion below rather than dying
+            # with a bare KeyError at the exact seam this test explains.
+            calls.append({'path': Path(path), 'text': text, 'kwargs': kwargs})
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(safe_io, 'atomic_write_text', spy)
+        return calls
+
+    def test_the_plan_write_is_fsynced_and_creates_its_parent(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        calls = self._spy(monkeypatch)
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'p', 'steps': []})
+
+        assert len(calls) == 1, (
+            f'expected exactly one delegated write, saw {len(calls)} — '
+            '_write_json must not re-implement or double-write'
+        )
+        call = calls[0]
+        assert call['path'] == artifacts.root / 'plan.json'
+        assert call['kwargs'].get('fsync') is True, (
+            "fsync=True is _write_json's stated durability contract, and "
+            'safe_io defaults it to False — so dropping or flipping the '
+            f'kwarg silently retires the guarantee.  Saw: {call["kwargs"]}'
+        )
+        assert call['kwargs'].get('mkdir') is True, (
+            f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
+        )
+        # The write really happened — the spy is not standing in for it.
+        assert json.loads((artifacts.root / 'plan.json').read_text())['title'] == 'p'
+
+    def test_a_nested_artifact_delegates_on_the_same_terms(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """The contract belongs to the seam, not to ``write_plan``.
+
+        ``verdicts/<role>.json`` also exercises ``mkdir=True`` for real: the
+        parent directory is what ``mkdir`` has to conjure.
+        """
+        import shutil
+        shutil.rmtree(artifacts.root / 'verdicts')
+        calls = self._spy(monkeypatch)
+
+        artifacts.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+
+        assert [c['kwargs'].get('fsync') for c in calls] == [True]
+        assert [c['kwargs'].get('mkdir') for c in calls] == [True]
+        assert calls[0]['path'] == artifacts.root / 'verdicts' / 'judge.json'
+        assert artifacts.read_verdict('judge') is not None

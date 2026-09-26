@@ -19,7 +19,7 @@ from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once_state
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -96,7 +96,7 @@ def _keep_gates_off_the_real_tmp(request):
     developer's actual /tmp and delete real dead-PID probe dirs — a
     multi-second stall inside a unit test, and a mutation no test asked for.
     Defaulting it off also removes the ordering coupling that the process-wide
-    ``_probe_dir_sweep_done`` guard would otherwise create between test
+    one-shot mark in ``shared.config_dir`` would otherwise create between test
     classes. Tests that want the real thing request ``real_probe_dir_sweep``.
     """
     if 'real_probe_dir_sweep' in request.fixturenames:
@@ -845,9 +845,69 @@ class TestProbeConfigDirLeakSweep:
     """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_sweep_guard(self, monkeypatch):
-        """Start every case as if this were a fresh process."""
-        monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
+    def _reset_sweep_guard(self):
+        """Start — and END — every case as if this were a fresh process.
+
+        The one-shot state moved into ``shared.config_dir`` with the sweep
+        wrapper itself, so this clears it through the hoisted test hook. Cleared
+        on the way out too, keeping the promise symmetric: the state is
+        module-global, so a case that marked the prefix and did not clear it
+        would leak into whichever test ran next.
+
+        SCOPED to the gate's own prefix, never the bare
+        ``reset_sweep_once_state()``. The bare form would also drop
+        ``claude-config-startup-probe-``, which this class neither owns nor
+        protects, and it is a widening even for THIS prefix: what it replaced
+        was a monkeypatch that RESTORED the prior value on teardown rather than
+        clearing unconditionally. Only ``test_config_dir.py``, which tests the
+        helper itself, legitimately wants the whole state cleared.
+        """
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
+        yield
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
+
+    def test_gate_construction_delegates_to_the_shared_once_helper(self):
+        """The once-per-process bookkeeping lives in shared.config_dir now.
+
+        Its twin used to live here in ~45 near-verbatim lines — same one-shot
+        flag, same set-before-call ordering, same broad except, same
+        silent-on-zero rule — and the two could drift apart with nothing to
+        notice.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs_once', return_value=0) as once:
+            make_gate(['work'])
+
+        once.assert_called_once()
+        assert once.call_args.args[0] == PROBE_DIR_PREFIX
+
+    def test_the_module_level_sweep_name_is_still_the_interception_point(self):
+        """`shared.usage_gate.sweep_stale_pid_dirs` must stay what actually runs.
+
+        The ANTI-REGRESSION guard for the whole hoist, written BEFORE the rewire
+        so the guarantee is pinned rather than asserted after the fact. If the
+        helper ever resolves the sweep out of `shared.config_dir`'s own globals
+        instead — whether by a def-time default parameter, which cannot be
+        intercepted at all, or by calling that module's global by name, which
+        merely moves the single interception point there — then
+        `_keep_gates_off_the_real_tmp` and the ~dozen sibling
+        `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
+        class silently stop intercepting, and this suite starts scandir-ing and
+        deleting the developer's real /tmp.
+        """
+        calls: list[str] = []
+
+        def _recording_sweep(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            return 0
+
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', _recording_sweep):
+            make_gate(['work'])
+
+        assert calls == [PROBE_DIR_PREFIX], (
+            'the sweep patched onto shared.usage_gate was not what ran — every '
+            'patch site in this module has stopped intercepting, and the suite '
+            'is now deleting real /tmp dirs'
+        )
 
     def test_gate_construction_sweeps_stale_probe_dirs(self):
         with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:

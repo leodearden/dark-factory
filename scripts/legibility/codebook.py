@@ -14,12 +14,15 @@ import argparse
 import contextlib
 import copy
 import json
+import logging
 import os
 import re
 import sys
 import tempfile
 
 import yaml
+
+logger = logging.getLogger("legibility.codebook")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -153,6 +156,29 @@ _MATCH_SCHEMA = {
     "required": ["entry_id"],
 }
 
+_CORRECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entry_id": {"type": "string"},
+        # Required AND non-empty: an entry's framing may never change without
+        # an audit trail saying why it was withdrawn, and `_build_sighting`
+        # emits `note` only when truthy — so `""` would land the rewrite with
+        # a bare, unexplained sighting, defeating the op's one safety
+        # property. Required-key-only enforcement let exactly that through.
+        # The asymmetry with title/cause below is deliberate: for those, empty
+        # means "not supplied" and the correction loop skips the field (a
+        # correction can never CLEAR one); for `note` there is no such
+        # fallback, so emptiness invalidates the whole record.
+        "note": {"type": "string", "minLength": 1},
+        "title": {"type": "string"},
+        "cause": {"type": "string"},
+        "status": {"enum": STATUSES},
+        "origin_phase": {"enum": PHASES},
+        "manifested_phase": {"enum": PHASES},
+    },
+    "required": ["entry_id", "note"],
+}
+
 _CANDIDATE_RECORD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -176,6 +202,9 @@ CODING_RECORD_SCHEMA = {
         "agent_class": {"type": "string"},
         "matches": {"type": "array", "items": _MATCH_SCHEMA},
         "candidates": {"type": "array", "items": _CANDIDATE_RECORD_SCHEMA},
+        # Optional, like its two siblings — every record the coder already
+        # emits stays valid without it.
+        "corrections": {"type": "array", "items": _CORRECTION_SCHEMA},
     },
     "required": ["session", "date", "project", "agent_class"],
 }
@@ -197,7 +226,8 @@ def _type_matches(value, type_spec) -> bool:
 
 def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
     """Minimal recursive validator for the small JSON-Schema subset this
-    module's schemas use (type/properties/required/items/enum/const).
+    module's schemas use (type/properties/required/items/enum/const/
+    minLength).
 
     Not a general-purpose JSON-Schema implementation: the `jsonschema` PyPI
     package is NOT available in this module's actual verify environment
@@ -225,6 +255,13 @@ def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
     schema_type = schema.get("type")
     if schema_type is not None and not _type_matches(instance, schema_type):
         errors.append(f"{loc}: {instance!r} is not of type {schema_type!r}")
+        return errors
+
+    min_length = schema.get("minLength")
+    if min_length is not None and isinstance(instance, str) and len(instance) < min_length:
+        errors.append(
+            f"{loc}: {instance!r} is shorter than the required minLength {min_length}"
+        )
         return errors
 
     if "properties" in schema and isinstance(instance, dict):
@@ -317,8 +354,8 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
 
 def _reject_deletion_directive(record: dict) -> None:
     """Raise NeverDeleteError if `record` is deletion-shaped: a top-level
-    delete/remove/retract/drop key, or a match carrying a delete/remove
-    action. Called before apply_coding_record touches anything."""
+    delete/remove/retract/drop key, or a match/correction carrying a
+    delete/remove action. Called before apply_coding_record touches anything."""
     if not isinstance(record, dict):
         return
     for key in _REMOVAL_KEYS:
@@ -330,6 +367,12 @@ def _reject_deletion_directive(record: dict) -> None:
         if isinstance(match, dict) and match.get("action") in _REMOVAL_ACTIONS:
             raise NeverDeleteError(
                 f"coding record match carries a removal action: {match.get('action')!r}"
+            )
+    for correction in record.get("corrections", []) or []:
+        if isinstance(correction, dict) and correction.get("action") in _REMOVAL_ACTIONS:
+            raise NeverDeleteError(
+                "coding record correction carries a removal action: "
+                f"{correction.get('action')!r}"
             )
 
 
@@ -409,10 +452,17 @@ def assert_no_deletion(before: dict, after: dict) -> None:
 def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
 
+    Three ops: `matches` (append a sighting to an existing entry),
+    `candidates` (file a novel cause for the census to adjudicate), and
+    `corrections` (withdraw an entry's refuted framing). They are applied in
+    the order corrections → matches → candidates (see the correction-handling
+    paragraph for why corrections go first).
+
     Operates on a deep copy — never mutates `codebook` in place. Returns
     `(new_codebook, stats)` where stats has keys `matched`,
     `skipped_unknown_entry`, `candidates_applied`,
-    `candidate_disposition_conflicts`, `record_invalid`.
+    `candidate_disposition_conflicts`, `corrections_applied`,
+    `correction_skipped`, `record_invalid`.
 
     A record that fails `validate_coding_record()` is skipped WHOLE (never
     partially applied): the input codebook comes back unchanged (deep
@@ -446,6 +496,40 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
       fabricates an entry (only the census promotes), so the candidate is
       the only place left to keep it.
 
+    Correction handling: a `corrections` op writes an entry's `title`,
+    `cause` and/or `status` in place, and appends one note-bearing sighting
+    as the audit trail. This is the one op that is NOT a pure append, and the
+    boundary is deliberate: a sighting is an immutable dated observation and
+    stays append-only, while an entry's `title`/`cause` is the CURRENT best
+    explanation of a cause — and is the only part of an entry that
+    `scripts/legibility/coder.py::build_codebook_index` renders to the coder,
+    so a refuted framing can only be withdrawn there. A field is written only
+    when the correction supplies it AND the value is truthy, so a correction
+    can never clear one; `note`, by contrast, is schema-enforced non-empty,
+    so the rewrite can never land without its audit trail. An unresolvable
+    `entry_id` is counted in `skipped_unknown_entry` exactly as in the match
+    path — the merger never fabricates an entry. The whole op (field writes
+    and sighting alike) is gated by the same per-entry `session` dedup the
+    match path uses, so re-running `apply` over an already-merged record is
+    exactly a no-op.
+
+    That dedup admits one sighting per (session, entry), so a record carrying
+    two ops for the SAME entry can land only one of them. Corrections are
+    therefore applied FIRST: a correction is the only op that can withdraw a
+    refuted framing, and it carries its own note-bearing sighting, so letting
+    a sibling `matches` op win would trade the whole withdrawal for one
+    interchangeable sighting. A sibling match for an entry a correction just
+    corrected is absorbed (no second sighting, not counted in `matched`).
+    Two corrections for one entry in one record still collide, and the loser
+    is reported rather than dropped: `correction_skipped` counts it and a
+    WARNING names the entry and session — distinguishing it from the silent,
+    correct no-op of re-applying an already-merged record.
+
+    `status` remains census-owned for lifecycle transitions
+    (`scripts/legibility/census.py::retire_entry`); a correction writing it
+    is an operator adjudication CARRIED BY the record, not a
+    merger-initiated transition.
+
     Never-resurrect: the merger must never re-open a census verdict. Only
     the census writes `disposition` (census.py promote_candidate/
     reject_candidate), so an adjudicated-title collision leaves that field
@@ -478,6 +562,8 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
         "candidate_disposition_conflicts": 0,
+        "corrections_applied": 0,
+        "correction_skipped": 0,
         "record_invalid": False,
     }
 
@@ -494,6 +580,55 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     project = record["project"]
 
     entries_by_id = {e["id"]: e for e in result.get("entries", [])}
+
+    # Entries that ALREADY carried this session before this record was applied.
+    # Everything below deduplicates on (session, entry), so this set is what
+    # separates "already merged on an earlier run" — the idempotent re-apply
+    # the dedup exists for, correctly silent — from "a sibling op in THIS
+    # record got there first", which is a collision and must not be silent.
+    premerged = {
+        entry_id
+        for entry_id, entry in entries_by_id.items()
+        if session in {s.get("session") for s in entry.get("sightings", []) or []}
+    }
+
+    # `corrections` runs BEFORE `matches`, deliberately: both ops write at most
+    # one sighting per (session, entry), so when one record carries both for the
+    # same entry exactly one can land. The correction is the one that must —
+    # it is the only op that can withdraw a refuted framing, while a match adds
+    # a sighting whose own note the correction's sighting stands in for.
+    for correction in record.get("corrections", []) or []:
+        entry_id = correction.get("entry_id")
+        entry = entries_by_id.get(entry_id)
+        if entry is None:
+            stats["skipped_unknown_entry"] += 1
+            continue
+        sightings = entry.setdefault("sightings", [])
+        if session in {s.get("session") for s in sightings}:
+            if entry_id not in premerged:
+                # Another correction for this same entry_id already consumed
+                # this record's one sighting slot, so this one's field writes
+                # cannot land. Silently dropping a framing withdrawal is the
+                # one outcome this op must never have.
+                stats["correction_skipped"] += 1
+                logger.warning(
+                    "codebook: correction for entry %r dropped — session %r was "
+                    "already recorded on that entry by an earlier op in the SAME "
+                    "record, so its title/cause/status writes did not land; split "
+                    "the record or merge the corrections",
+                    entry_id, session,
+                )
+            continue
+        for field in ("title", "cause", "status"):
+            value = correction.get(field)
+            # Supplied AND truthy: a correction can never CLEAR a field, since
+            # an emptied title/cause is a deletion in disguise.
+            if value:
+                entry[field] = value
+        sightings.append(
+            _build_sighting(correction, session=session, date=date, project=project)
+        )
+        stats["corrections_applied"] += 1
 
     for match in record.get("matches", []) or []:
         entry = entries_by_id.get(match.get("entry_id"))
@@ -759,6 +894,13 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     promoted-with-no-resolvable-`promoted_to` case only — a promoted title's
     recurrence is routed onto the entry it was promoted to and counted in
     `matched` instead (see `apply_coding_record`).
+
+    `correction_skipped` is a fifth thing again: a well-formed correction
+    whose field writes could not land because a sibling correction in the
+    same record already claimed that entry's one sighting slot for this
+    session. It is reported here and as a WARNING (never silently dropped),
+    but the batch keeps going and the return value stays 0 — the record is
+    valid, it just says the same thing twice.
     """
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
@@ -773,6 +915,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
         "candidate_disposition_conflicts": 0,
+        "corrections_applied": 0,
+        "correction_skipped": 0,
         "record_invalid": 0,
         "malformed_json": 0,
         "deletion_directive": 0,
@@ -819,6 +963,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             totals["candidate_disposition_conflicts"] += stats[
                 "candidate_disposition_conflicts"
             ]
+            totals["corrections_applied"] += stats["corrections_applied"]
+            totals["correction_skipped"] += stats["correction_skipped"]
             totals["record_invalid"] += int(stats["record_invalid"])
 
     errors = validate(codebook)
@@ -831,6 +977,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     print(
         "applied: matched={matched} candidates_applied={candidates_applied} "
         "candidate_disposition_conflicts={candidate_disposition_conflicts} "
+        "corrections_applied={corrections_applied} "
+        "correction_skipped={correction_skipped} "
         "skipped_unknown_entry={skipped_unknown_entry} "
         "record_invalid={record_invalid} malformed_json={malformed_json} "
         "deletion_directive={deletion_directive}".format(**totals)

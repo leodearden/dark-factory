@@ -17,5 +17,40 @@
       "description": "The updated docstring claims 'The caller's base dict is never mutated \u2014 we work on a copy' but the implementation now assigns merged = base directly (no copy), contradicting the documented behavior.",
       "mutation_type": "deep_shallow_copy"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Add _merge_env_overrides helper for env-var layering in config.py",
+      "description": "`orchestrator/src/orchestrator/config.py` layers project config over defaults through `_deep_merge`, but env-override dicts are combined ad hoc at the call sites, and empty-string values reach tools that choke on `FOO=\"\"`. Add `_merge_env_overrides(base_env, extra)` next to `_deep_merge`: it merges *extra* over *base_env* with extra winning on conflict, then returns the result with empty values stripped. While you are in that docstring, spell out `_deep_merge`'s merge semantics \u2014 override wins at leaf level, nested dicts are merged recursively rather than replaced wholesale.",
+      "test_strategy": "Add cases to `orchestrator/tests/test_config_merge_deep.py`: extra wins on a conflicting key, keys present only in base survive, and empty-string values are dropped from the result. Re-run the existing config-loading tests in `orchestrator/tests/test_config.py` to confirm defaults-plus-project-override resolution is unchanged.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "orchestrator/src/orchestrator/config.py"
+    ],
+    "base_sha": "597594951a1e51274259cd1c8b2cd06b3b07c630",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index; base commit corroborated by extracting the tree's blob via git cat-file and constructing an equivalent, independently-verified patch outside the repo",
+      "applies_cleanly": false,
+      "tolerance_flags": [
+        "--recount",
+        "--ignore-whitespace",
+        "--whitespace=fix"
+      ],
+      "candidates_tested": 1,
+      "reason": "Newest first-parent ancestor of edf348e39127bed3759a82d72e5414d263a6a95d^ that touches orchestrator/src/orchestrator/config.py (commit '597594951a: feat(eval): wire env_overrides through invoke chain for local vLLM model evaluation', 2026-04-05 14:17:32+0100). git apply never succeeds against this diff, on this or any tree, under any flag combination tried (plain, --recount, --ignore-whitespace, --whitespace=fix, and by hand-correcting the hunk header's start line and old/new counts) -- it always fails with 'while searching for: <the exact 11-line old-side block>' / 'patch does not apply'. Isolated the cause by binary search: a truncated copy of the same hunk ending at '    return merged' (pure context, no trailing '+' lines) DOES apply cleanly (rc=0) to this same tree; the moment a second, separate '+'-block (the _merge_env_overrides insertion) is appended after that trailing context, application fails again. Independently reconstructed the two edits as a real `diff -u`-generated 2-hunk patch (default 3-line context, so the two edits land in separate hunks) against the exact same blob (extracted via `git cat-file` from this commit's tree) -- that reconstruction applies cleanly (rc=0) to 597594951a's tree, byte-confirming the pre-image content is present verbatim. Manually merging that same verified-correct 2-hunk content into ONE hunk (matching the corpus fixture's shape: context, removed, added, context, added) reproduces the failure even with no typos and correct recounted headers. Conclusion: this is a git-apply limitation/defect specific to this hunk's multi-region shape (a trailing context block immediately followed by a second, disjoint addition block within one hunk), independent of base commit -- so applies_cleanly is honestly false -- but the base commit is established with high confidence by the two independent content-match reconstructions above, both anchored to 597594951a1e51274259cd1c8b2cd06b3b07c630.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

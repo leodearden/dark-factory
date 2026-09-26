@@ -1,11 +1,13 @@
 """Tests for git operations — worktree lifecycle."""
 
+import ast
 import asyncio
 import contextlib
 import fcntl
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from collections.abc import Mapping
@@ -19,7 +21,9 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 
+from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -418,6 +422,68 @@ class TestWorktreeLifecycle:
         assert worktree_info.path.exists()
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
+
+    async def test_create_worktree_self_heals_duplicate_hooks_path(
+        self, git_ops: GitOps,
+    ):
+        """create_worktree must converge core.hooksPath even when it is already
+        duplicated in the shared config (task 4570).
+
+        A plain single-value `git config core.hooksPath hooks` is REFUSED by
+        git (exit 5, "cannot overwrite multiple values with a single value")
+        once the key already holds two values — which is exactly the jammed
+        state this self-heal exists to repair. Seed that jam directly (as an
+        external/manual mutation would) and confirm create_worktree both
+        succeeds and collapses the key back to a single "hooks" value.
+        """
+        await _run(['git', 'config', 'core.hooksPath', 'hooks'], cwd=git_ops.project_root)
+        await _run(['git', 'config', '--add', 'core.hooksPath', 'echo'], cwd=git_ops.project_root)
+        rc, dup_values, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert dup_values.strip().splitlines() == ['hooks', 'echo']
+
+        worktree_info = await git_ops.create_worktree('hooks-path-jam')
+        assert worktree_info.path.exists()
+
+        rc, resolved, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert resolved.strip().splitlines() == ['hooks']
+
+    async def test_create_worktree_logs_hooks_path_set_failure(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A failed core.hooksPath write is logged, not silently discarded (4570).
+
+        --replace-all converges from the duplicated-key jam covered above, but
+        not from every failure mode — e.g. `.git/config.lock` contention with a
+        concurrent orchestrator/merge worker, or a read-only shared .git under
+        the OS-sandbox write-set. Silently discarding that rc is precisely what
+        let the exit-5 duplicate-value jam run unnoticed on every
+        worktree-create, so the write must stay best-effort (never raises) while
+        no longer being silent.
+        """
+        async def fake_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'config'] and 'core.hooksPath' in cmd:
+                return (
+                    255, '',
+                    "error: could not lock config file .git/config: File exists\n",
+                )
+            return await _run(cmd, cwd=cwd, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            worktree_info = await git_ops.create_worktree('hooks-path-set-failed')
+
+        # Best-effort: a wrong hooksPath must not block worktree create/dispatch.
+        assert worktree_info.path.exists()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('failed to set core.hooksPath' in r.getMessage() for r in warnings), (
+            f'All warnings: {[r.getMessage() for r in warnings]}'
+        )
 
     async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
         """create_worktree returns WorktreeInfo with path and base_commit."""
@@ -6664,7 +6730,7 @@ class TestRunWorktreeMissing:
 
 
 async def _wait_for_child_pid(
-    pid_file: Path, *, timeout: float = 5.0, interval: float = 0.1,
+    pid_file: Path, *, timeout: float = 30.0, interval: float = 0.1,
 ) -> int:
     """Poll for *pid_file* to appear and return its pid.
 
@@ -6677,6 +6743,18 @@ async def _wait_for_child_pid(
     (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
     convention used by ``wait_for_pgid_file`` in
     test_laptop_warm_verify_boundary.py.
+
+    After task 4109, this poll is the sole remaining startup-timing bound in
+    ``TestRunCancellationReapsChild``. ``timeout`` here is a diagnostic
+    CEILING, not a deadline that must be beaten: the loop returns the
+    instant ``pid_file`` exists, so the value is paid only when the child
+    genuinely never starts. It is kept well under the 60s
+    ``timeout``/``timeout_method = "thread"`` cap configured in
+    ``orchestrator/pyproject.toml``, so a genuine never-started child surfaces
+    as this function's own ``pytest.fail`` message below, not a generic
+    thread-method kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
+    deliberately left unwidened — that is an ASSERTION window (prompt
+    reaping is the property under test), not an arrange wait.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -6705,6 +6783,117 @@ async def _assert_child_reaped(
     pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
 
 
+# Cancellation timeout for the wait_for-shaped caller in
+# TestRunCancellationReapsChild. NOT a tuned threshold: the child sleeps 60s
+# AFTER publishing its pid, and _start_hung_child does not return until that
+# pid is on disk, so this value only has to be SHORTER than 60s (a ~1200x
+# margin). It fails safe — a slower box makes the timeout MORE likely to
+# fire, never less. Contrast the single 5.0s deadline this replaced, which
+# had to do both jobs at once and was tuned down to 0/40 misses on one box
+# rather than eliminated (task 4109).
+#
+# One narrow parent-side window is covered probabilistically rather than by
+# construction: the child's pid can land on disk while _run's own coroutine
+# is still inside create_subprocess_exec's pipe/transport setup rather than
+# the try block that owns kill+reap. That window is covered by
+# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
+# the owning await point before cancellation lands, not eliminated
+# structurally.
+_CANCEL_TIMEOUT = 0.05
+
+
+async def _start_hung_child(
+    pid_file: Path, *, startup_delay: float = 0.0,
+) -> tuple[asyncio.Task[tuple[int, str, str]], int]:
+    """Spawn a child that publishes its pid then sleeps, and confirm it started.
+
+    The single spawn-and-confirm arrange path shared by both tests in
+    ``TestRunCancellationReapsChild``. Returns only once the child has
+    PUBLISHED its pid, so the caller's cancellation is guaranteed to hit a
+    live child and no caller-side timeout has to cover interpreter startup
+    (task 4109). ``startup_delay`` exists so the contract guard can inject a
+    startup slower than any caller timeout.
+    """
+    script = (
+        'import os, time\n'
+        f'time.sleep({startup_delay!r})\n'
+        f"tmp = {str(pid_file)!r} + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
+        f"os.replace(tmp, {str(pid_file)!r})\n"
+        'time.sleep(60)\n'
+    )
+    task = asyncio.ensure_future(_run(['python3', '-c', script]))
+    try:
+        child_pid = await _wait_for_child_pid(pid_file)
+    except BaseException:
+        # Drive the cancellation to completion rather than just scheduling
+        # it: _wait_for_child_pid's pytest.fail() raises a BaseException, and
+        # if we returned immediately after task.cancel() the event loop would
+        # never get a turn to run _run's own except BaseException: proc.kill()
+        # + await proc.wait() cleanup. Without this await, a genuine
+        # never-started-child diagnostic would itself leak the orphan
+        # sleeping child this test class exists to catch (task 4109).
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise
+    return task, child_pid
+
+
+@pytest.mark.asyncio
+class TestHungChildHelperContract:
+    """Contract for the ``_start_hung_child`` arrange helper.
+
+    Pins that the helper's arrange phase is deadline-independent: it waits
+    for the observable fact of the child's pid landing on disk, however long
+    interpreter startup takes, rather than racing a fixed clock (task 4109).
+    """
+
+    async def test_returns_only_after_pid_published_and_alive(
+        self, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / 'child.pid'
+        # 4x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
+        # folded the spawn into any sub-second fixed deadline, or that
+        # returned before the pid was published, fails the assertions below
+        # here. This is the slow-interpreter-startup condition the old fixed
+        # 5.0s deadline could only cover probabilistically, applied
+        # deterministically instead of hoped for.
+        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.2)
+
+        try:
+            assert pid_file.read_text().strip() == str(child_pid), (
+                f'pid_file contents {pid_file.read_text().strip()!r} do not '
+                f'match the pid the helper returned ({child_pid!r}) — the '
+                'returned pid must be the one the child actually published, '
+                'not a guess'
+            )
+
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(
+                    f'child pid {child_pid} is not alive immediately after '
+                    '_start_hung_child returned — any cancellation the '
+                    'caller drives next would race a child that may already '
+                    'be gone'
+                )
+
+            assert not task.done(), (
+                'task is already done right after _start_hung_child '
+                'returned — the _run future must still be pending inside '
+                'await proc.communicate() so cancelling it exercises the '
+                'kill+reap path under test rather than an already-completed '
+                'no-op'
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _assert_child_reaped(child_pid)
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -6716,52 +6905,32 @@ class TestRunCancellationReapsChild:
     ``_run`` on timeout. Before the fix, the spawned child kept running as
     an orphan with its stdout/stderr pipes open, leaking a process + FDs on
     every scheduler sweep for a persistently-hung script.
+
+    Both tests below arrange through ``_start_hung_child``, which returns
+    only once the child has published its pid, so neither cancellation path
+    depends on interpreter-startup timing (task 4109).
     """
 
     async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # A child that records its own pid then sleeps far longer than the
-        # wait_for timeout below — simulates a persistently-hung script.
-        # The pid is written to a sibling .tmp file and atomically renamed
-        # into place so `pid_file` only ever appears fully written (task
-        # 3851) — see _wait_for_child_pid.
-        script = (
-            'import os, time, sys\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        # The deadline must outlast the child's interpreter startup, or the
-        # child is cancelled before it ever publishes its pid and the poll
-        # below fails as 'child never started'. Measured on a loaded box:
-        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
-        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
-        # child very much alive — which is what this test is about.
+        task, child_pid = await _start_hung_child(pid_file)
+
+        # The wait_for-shaped caller this test exists to model
+        # (delivered_checks._run_script_check) — but driven against an
+        # ALREADY-STARTED future. The child is confirmed alive before the clock
+        # starts, so _CANCEL_TIMEOUT does not have to cover interpreter startup;
+        # it only has to be shorter than the child's 60s sleep. That removed a
+        # fixed 5.0s from every run and the load-sensitive miss with it (task 4109).
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=5.0
-            )
+            await asyncio.wait_for(task, timeout=_CANCEL_TIMEOUT)
 
-        # Wait for the child to have written its pid (should be near-instant).
-        child_pid = await _wait_for_child_pid(pid_file)
-
-        # The cancelled _run must have killed + reaped the child by now — no
-        # zombie, no orphan still sleeping.
+        # The cancelled _run must have killed + reaped the child — no zombie,
+        # no orphan still sleeping.
         await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
-        script = (
-            'import os, time\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        child_pid = await _wait_for_child_pid(pid_file)
+        task, child_pid = await _start_hung_child(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -13856,6 +14025,197 @@ class TestDisableSharedRepoAutoMaintenance:
 
 
 # ---------------------------------------------------------------------------
+# task 3778 step-3: _run delegates its spawn to shared.git_async (INV-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunDelegatesToSharedGitAsync:
+    """``_run`` owns the WorktreeMissing taxonomy; ``shared.git_async`` owns the spawn.
+
+    The primitive (``create_subprocess_exec`` + LC_ALL=C child env + optional
+    stdin + the task-2608 kill+reap) grew here and is now needed verbatim by
+    fused-memory's live-workflow probes.  Rather than clone it (INV-5,
+    no-lockstep-duplication) it moved to ``shared/`` and ``_run`` became a thin
+    adapter.  What must NOT change is ``_run``'s own surface: the
+    ``WorktreeMissing`` pre-flight and re-classification, and the
+    ``(returncode, stdout, stderr)`` 3-tuple that git_ops' ~12k lines of call
+    sites destructure.
+    """
+
+    async def test_shared_helper_is_the_single_spawn_seam(self, tmp_path: Path) -> None:
+        """Patching the shared entry point AS BOUND IN git_ops intercepts _run.
+
+        Bare-name binding (``from shared.git_async import run_git``) is what
+        makes ``git_ops.run_git`` the patchable seam; a qualified
+        ``shared.git_async.run_git(...)`` call would leave this patch applying
+        cleanly but no longer intercepting.
+        """
+        sentinel = GitResult(returncode=7, stdout='intercepted', stderr='se')
+        with patch('orchestrator.git_ops.run_git', return_value=sentinel) as spawn:
+            rc, out, err = await _run(['git', 'status'], cwd=tmp_path)
+
+        assert spawn.await_count == 1, 'the spawn did not route through shared.git_async'
+        assert (rc, out, err) == (7, 'intercepted', 'se')
+
+    async def test_returns_the_same_three_tuple_shape(self, tmp_path: Path) -> None:
+        """Not the new GitResult dataclass — no call site changes."""
+        result = await _run(['git', 'init', '-q'], cwd=tmp_path)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        rc, out, err = result
+        assert isinstance(rc, int)
+        assert isinstance(out, str)
+        assert isinstance(err, str)
+        assert rc == 0
+
+    async def test_cwd_vanishing_between_preflight_and_spawn_is_reclassified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The race the pre-flight alone cannot catch.
+
+        cwd exists when ``_run`` checks it and is gone by the time the child is
+        spawned.  The helper surfaces a plain ``FileNotFoundError``; ``_run``
+        must re-classify it as :class:`WorktreeMissing` so callers still see a
+        deleted worktree as the recoverable race it is.
+        """
+        doomed = tmp_path / 'doomed'
+        doomed.mkdir()
+
+        async def _vanish_then_fail(*args, **kwargs):
+            shutil.rmtree(doomed)
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_vanish_then_fail),
+            pytest.raises(WorktreeMissing) as exc,
+        ):
+            await _run(['git', 'status'], cwd=doomed)
+
+        assert exc.value.path == doomed
+
+    async def test_filenotfound_with_live_cwd_propagates_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing BINARY is a real bug, not a vanished worktree."""
+
+        async def _boom(*args, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_boom),
+            pytest.raises(FileNotFoundError) as exc,
+        ):
+            await _run(['git', 'status'], cwd=tmp_path)
+
+        assert not isinstance(exc.value, WorktreeMissing)
+
+    async def test_a_long_running_script_cannot_delay_a_concurrent_git_call(
+        self,
+    ) -> None:
+        """``_run`` opts OUT of the shared per-loop spawn bound.
+
+        ``run_git``'s ``MAX_CONCURRENT_SPAWNS`` bound is sized for
+        fused-memory's live-workflow fan-out (hundreds of short-lived git
+        probes).  ``_run`` is the orchestrator's GENERAL subprocess runner:
+        ``delivered_checks`` puts operator-supplied script checks through it
+        and gathers them concurrently, ``merge_skew_tripwire`` runs its oracle
+        through it, and it also runs every merge-lane and scheduler git call.
+        If those shared one 8-slot queue, a handful of slow or abandoned
+        scripts would head-of-line block the merge lane.
+
+        Causal, not wall-clock: the fake children stay alive until an Event
+        this test controls, so the git call can only have spawned by NOT
+        having queued behind them.
+        """
+        released = asyncio.Event()
+        spawned: list[str] = []
+
+        class _Blocking:
+            returncode = 0
+
+            def __init__(self, tag: str) -> None:
+                self._tag = tag
+
+            async def communicate(self, input: bytes | None = None):  # noqa: A002
+                spawned.append(self._tag)
+                await released.wait()
+                return b'', b''
+
+            def kill(self) -> None:
+                return None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def _fake_spawn(*args: object, **kwargs: object) -> object:
+            return _Blocking('git' if args and args[0] == 'git' else 'script')
+
+        # Comfortably more scripts than the shared bound, so a bound that
+        # applied here would certainly be saturated.
+        script_count = MAX_CONCURRENT_SPAWNS * 2
+
+        with patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+            scripts = [
+                asyncio.create_task(_run(['sh', '-c', 'sleep forever']))
+                for _ in range(script_count)
+            ]
+            git_call = asyncio.create_task(_run(['git', 'rev-parse', 'HEAD']))
+            try:
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while (
+                    'git' not in spawned
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+
+                assert spawned.count('script') == script_count, (
+                    'script checks queued on a spawn bound _run must not have'
+                )
+                assert 'git' in spawned, (
+                    'the git call never spawned: _run is queueing behind '
+                    'long-running script children (it must pass bounded=False)'
+                )
+            finally:
+                released.set()
+                await asyncio.wait_for(
+                    asyncio.gather(git_call, *scripts, return_exceptions=True),
+                    timeout=5,
+                )
+
+class TestGitOpsHoldsNoSecondSpawnPrimitive:
+    """Source-level guard against a REGROWN duplicate of the spawn primitive.
+
+    A source scan rather than a behavioural assertion because the failure mode
+    is additive: a future edit that reintroduces a second
+    ``create_subprocess_exec`` into git_ops would leave every behavioural test
+    in the sibling class green while the two copies silently drift apart.
+
+    AST-based, not a substring scan: ``WorktreeMissing``'s docstring
+    legitimately NAMES ``asyncio.create_subprocess_exec`` when explaining where
+    the generic ``FileNotFoundError`` comes from, and prose should not be
+    collateral damage of a guard aimed at calls.
+    """
+
+    def test_git_ops_makes_no_direct_create_subprocess_exec_call(self) -> None:
+        source = Path(git_ops_module.__file__).read_text()
+        tree = ast.parse(source)
+
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'create_subprocess_exec'
+        ]
+
+        assert offenders == [], (
+            f'git_ops calls create_subprocess_exec directly at line(s) {offenders}; '
+            'it must delegate its spawn to shared.git_async instead of keeping a '
+            'second copy of the primitive (INV-5 no-lockstep-duplication)'
+        )
+
 # task 3060: advance_main stands off from a FOREIGN project_root index.lock
 # ---------------------------------------------------------------------------
 

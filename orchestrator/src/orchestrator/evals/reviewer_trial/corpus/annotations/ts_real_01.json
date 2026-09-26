@@ -17,5 +17,41 @@
       "description": "The test mocks add dom: { isConnected: true } to satisfy the new guard, but there is no test case verifying the guard actually prevents dispatch when isConnected is false. A negative test case would validate the fix works.",
       "mutation_type": "real_world"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Stop Ctrl+click goto-definition from acting on an editor view the user has left",
+      "description": "`reifyGotoDefinition` in `gui/src/editor/gotoDefinition.ts` fires `requestDefinition()` from its `mousedown` handler and applies the answer in a `.then()` callback that closed over the `EditorView`. The LSP round-trip can outlive that view \u2014 the user switches files, closes the pane, or the editor is re-created while the request is in flight \u2014 and the late callback still drives `view.dispatch()` (same-file) or `onNavigate` (cross-file) off an editor that is no longer mounted, which shows up as a console error and a cursor jump the user never asked for. Make the completion path bail out when the view it captured is no longer the live one, leaving both the same-file cursor dispatch and the cross-file `onNavigate` delegation unchanged for a view that is still mounted.",
+      "test_strategy": "Extend `gui/src/__tests__/gotoDefinition.test.ts` around the mousedown handler: the existing same-file case must still call `view.dispatch` with the resolved anchor and the cross-file case must still call `onNavigate` with (uri, line, character). Run `npm run test` and `npm run typecheck` in `gui/`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "gui/src/__tests__/gotoDefinition.test.ts",
+      "gui/src/editor/gotoDefinition.ts"
+    ],
+    "base_sha": "7f1a45b908a3b8a5ccd2c4cd3fea67cef1b972d9",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git log --all --format='%H %cI %s' -S'isConnected' -- <each path> to locate the commit(s) touching 'isConnected' in both files; git show <sha> -- <paths> to inspect each candidate's diff and compare against the fixture's exact '+' lines and context; git log --format='%H' with parent inspection (git show -s --format='%P') to establish linear ancestry (7f1a45b908 -> 89449c3197 -> 1b27325bac); reconstructed each file's implied pre-image by stripping the fixture's '+' lines, then diffed that reconstruction against `git show <candidate>:<path>` for each of the three candidates (trimming the fixture's excerpted-from-mid-file offset) to find the exact byte match at 7f1a45b908; git merge-base --is-ancestor to confirm all three commits are on main.",
+      "applies_cleanly": null,
+      "tolerance_flags": [
+        "not_a_unified_diff_content_reconstruction_only",
+        "fixture_excerpts_mid_file_omits_top_of_file_preamble_in_both_files",
+        "one_blank_line_dropped_in_fixture_transcription_of_test_file"
+      ],
+      "candidates_tested": 3,
+      "reason": "This fixture is not a unified diff -- it is a hand-written listing of two files' contents with only '+' (added) lines and no '-' (removed) lines, so it shows post-change content only: 3x `dom: { isConnected: true },` added to mock views in gui/src/__tests__/gotoDefinition.test.ts, and 1x `if (!view.dom.isConnected) return;` added to gui/src/editor/gotoDefinition.ts. Searching all branches for when 'isConnected' first entered these two files (git log --all -S'isConnected') found the real commit that adds exactly these four lines, in the same files/positions/surrounding context as the fixture: 1b27325bac679984a0eb642f7152ffb0fd9002cb ('fix(gotoDefinition): guard view.dispatch against destroyed EditorView', 2026-04-04T14:34:22+01:00) -- its diff is a byte-for-byte match to the fixture's four additions and their context. However, 1b27325bac's own tree is NOT a valid base: its immediate parent, 89449c3197 ('test(gotoDefinition): add failing test for isConnected guard (same-file)', same timestamp, same author/session), had already appended a fourth 'isConnected guard' describe block to the end of the test file -- content the fixture's listing does not include at all (the fixture's test-file section ends right after the third existing describe block, with no fourth block). So neither 1b27325bac's nor 89449c3197's tree reproduces the fixture verbatim once the 4 additions are accounted for. Going one step further back, 89449c3197's parent -- 7f1a45b908a3b8a5ccd2c4cd3fea67cef1b972d9 ('chore(tasks): auto-commit after add_task', 2026-04-04T14:33:07+01:00) -- lacks all four additions AND lacks the fourth describe block. Reconstructing the fixture's pre-image (stripping '+' lines) and diffing against this commit's actual file content confirms an exact match: gui/src/editor/gotoDefinition.ts matches 100% byte-for-byte (46/46 overlapping lines, after accounting for the fixture omitting the file's top-of-file preamble/imports/docstring that precede the excerpted function); gui/src/__tests__/gotoDefinition.test.ts matches on 140 of 141 overlapping lines, with the single discrepancy being one blank line present between the second and third describe blocks in the real file but dropped in the fixture's hand-transcription -- consistent with a transcription slip rather than a different base. All three commits (7f1a45b908, 89449c3197, 1b27325bac) are confirmed ancestors of main and form a strict linear parent chain, well before the 2026-04-08 cutoff.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

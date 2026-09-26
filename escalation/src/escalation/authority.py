@@ -36,7 +36,8 @@ merge-base, probe live infra, or call ``get_task``, so it can only require
 that the watcher QUOTED the proof, trusting the read-only watcher to have
 done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
-the born-at-L2 human gates (design_concern / milestone_gate categories, the
+the born-at-L2 human gates (the design_concern / milestone_gate /
+milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
 when a class predicate would otherwise match.
 """
@@ -81,9 +82,32 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # latter is also covered by L2_AUTO_CLOSE_DENY_ROLES below (both file under
 # agent_role='orchestrator-deterministic'), but is listed here too for
 # defense-in-depth so a future filing under a different role stays blocked.
+# 'curator_adjudication_missing' (filed by ``orchestrator.deterministic_runner``)
+# is the re-ask raised when a 'human_curator_gate' task resumes with no
+# 'human_curator_adjudicated_at' stamp; auto-closing it re-opens the task-3181
+# incident verbatim (esc-3181-1 was auto-resolved by the watcher whose own
+# resolution text said the curator work was "deliberately NOT executed"). Like
+# 'milestone_check_failed' it is ALSO covered today by L2_AUTO_CLOSE_DENY_ROLES
+# (it files under agent_role='orchestrator-deterministic'), and is listed here
+# for that same defense-in-depth reason.
+#
+# CROSS-LAYER PIN (reviewer amendment). The three RUNNER-FILED members below —
+# 'milestone_gate', 'milestone_check_failed', 'curator_adjudication_missing' —
+# are each duplicated from a named constant in
+# ``orchestrator.deterministic_runner`` (MILESTONE_GATE_CATEGORY /
+# MILESTONE_CHECK_FAILED_CATEGORY / CURATOR_ADJUDICATION_MISSING_CATEGORY) and
+# held in lockstep by the function-local orchestrator imports in
+# ``tests/test_authority.py``, per the layer-direction rule in this module's
+# docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
+# single owning constant to import. It is filed as a bare literal from several
+# orchestrator call sites (twice in ``orchestrator.workflow``, once in
+# ``orchestrator.harness``) AND is a member of ``escalation.server``'s
+# operator-facing CATEGORIES vocabulary — a SHARED term, not one module's
+# duplicate, so there is no upstream definition a lockstep test could bind to.
 # Checked BEFORE the allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
-    {'design_concern', 'milestone_gate', 'milestone_check_failed'}
+    {'design_concern', 'milestone_gate', 'milestone_check_failed',
+     'curator_adjudication_missing'}
 )
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —

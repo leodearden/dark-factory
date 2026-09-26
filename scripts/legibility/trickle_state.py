@@ -43,8 +43,9 @@ import contextlib
 import json
 import logging
 import os
+import pwd
 import tempfile
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,19 @@ STATE_SCHEMA_VERSION = 1
 """Version of the recorded document's shape. :func:`load_state` treats any
 OTHER value as ``malformed`` rather than guessing at unknown fields — a
 reader that silently accepts a shape it does not understand is exactly the
-silent-degradation mode this module exists to close."""
+silent-degradation mode this module exists to close.
+
+DELIBERATELY NOT BUMPED for ``consecutive_failed_runs`` (task 4514). That
+field is ADDITIVE and every reader fetches it via ``.get()`` with a 0
+fallback, so no reader can MIS-READ a document that lacks it. Bumping
+would make every live state file on every project read ``malformed`` on
+the first post-deploy probe — one guaranteed false alarm per project,
+plus a reset streak — which is precisely the degradation this module
+exists to close.
+
+THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
+OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
+is not that; changing the meaning or type of an existing field is."""
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +88,22 @@ OUTCOME_BARREN = 'barren'
 DID reach the sampling/budget stage. This is the absence mode that looks
 identical to a quiet night from outside the pipeline."""
 
+OUTCOME_FAILED = 'failed'
+"""The run did not COMPLETE (``exit_code != 0``), whatever the sampler
+counters say.
+
+Signal may well have flowed IN — the 2026-08-18 reify run selected six
+digests — but the pipeline broke downstream, so those counters describe a
+night whose work was never finished. The counters are still recorded, so
+the "was signal flowing" question stays answerable.
+
+THE VOCABULARY HOLE THIS CLOSES. Without a fourth outcome, a permanently
+broken coder samples > 0, storms, exits 1, and records ``productive`` /
+streak 0 / a fresh ``last_productive_at`` EVERY NIGHT FOREVER, while
+``check_trickle_progress.py`` prints "OK: last run was productive 0h ago"
+indefinitely. That is the 2026-07-16..29 silent-degradation shape (task
+3270) entering through a different door."""
+
 
 # ---------------------------------------------------------------------------
 # classify_run — the three-valued absence classifier
@@ -82,6 +111,7 @@ identical to a quiet night from outside the pipeline."""
 
 def classify_run(
     *,
+    exit_code: int,
     total_records: int,
     zero_signal_dropped: int,
     dedupe_collapsed: int,
@@ -89,7 +119,8 @@ def classify_run(
     budget_skipped: int,
     selected_count: int,
 ) -> str:
-    """Classify one nightly trickle run as productive / barren / quiet.
+    """Classify one nightly trickle run as failed / productive / barren /
+    quiet.
 
     DERIVED FROM, not tuned against, :class:`sampling.SampleResult`'s
     conservation identity::
@@ -98,13 +129,15 @@ def classify_run(
                          + below_sampling_cut + budget_skipped
                          + len(selected)
 
-    Three branches:
+    Four branches:
 
-    1. ``selected_count > 0``                                -> productive.
+    1. ``exit_code != 0``                                    -> failed.
+       The run did not finish. See below for why this is read FIRST.
+    2. ``selected_count > 0``                                -> productive.
        Digests were built. This deliberately INCLUDES a night that also
        skipped records on budget: a partially-truncated night is the byte
        budget working as designed, never an absence.
-    2. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
+    3. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
        Both are doors that only records with real, distinct,
        non-duplicate signal can leave by, so reaching this branch proves
        genuine signal existed and NOTHING was digested. The two doors are
@@ -113,18 +146,36 @@ def classify_run(
        ``sampling.top_fraction``/``per_stratum_min`` — SampleResult's own
        docstring is explicit that conflating them is wrong), but for the
        PRESENCE question they are one signal: real signal in, nothing out.
-    3. otherwise                                             -> quiet.
+    4. otherwise                                             -> quiet.
 
-    WHY BRANCH 3 IS PROVABLY SAFE — the no-false-alarm guarantee. Reaching
-    the ``else`` means ``selected_count == 0`` and both cut counters are
-    0, so by the identity ``total_records == zero_signal_dropped +
-    dedupe_collapsed``: every enumerated record left by the zero-signal or
-    dedupe door, or nothing was enumerated at all. That is EXACTLY the
-    "genuinely quiet night" PRD decision 7 protects, so a quiet or dormant
-    project can never be classified barren. This is a proof from the
-    invariant, not a threshold someone picked — which is what lets a
-    progress probe exist without re-opening decision 7's false-alarm
-    objection.
+    WHY ``failed`` TAKES PRIORITY. ``selected_count > 0`` proves signal
+    reached the digest stage; it does NOT prove the night FINISHED. When
+    both are true the operator needs to know the run BROKE — the counters
+    still answer "was signal flowing", and they are recorded either way,
+    so nothing is hidden by reading the exit code first.
+
+    ``exit_code`` IS A REQUIRED KEYWORD-ONLY PARAMETER WITH NO DEFAULT,
+    deliberately. A defaulted ``0`` is exactly how a future caller would
+    silently reintroduce the hole this branch closes, so the parameter is
+    impossible to forget.
+
+    ``exit_code`` is READ here and NEVER WRITTEN. Writing
+    ``result.exit_code`` from an observability path is the
+    permanent-false-alarm inversion ``scripts/legibility/nightly.py::
+    _escalate_barren_streak`` refuses in writing.
+
+    WHY BRANCH 4 IS PROVABLY SAFE — the no-false-alarm guarantee, and it
+    is UNWEAKENED BY CONSTRUCTION by the new first branch, which is gated
+    purely on ``exit_code != 0``: a night that exited 0 reaches the
+    remaining three branches untouched. Reaching the ``else`` means
+    ``selected_count == 0`` and both cut counters are 0, so by the
+    identity ``total_records == zero_signal_dropped + dedupe_collapsed``:
+    every enumerated record left by the zero-signal or dedupe door, or
+    nothing was enumerated at all. That is EXACTLY the "genuinely quiet
+    night" PRD decision 7 protects, so a quiet or dormant project can
+    never be classified barren. This is a proof from the invariant, not a
+    threshold someone picked — which is what lets a progress probe exist
+    without re-opening decision 7's false-alarm objection.
 
     ``total_records`` and ``zero_signal_dropped`` are accepted (and
     RECORDED by :func:`record_run`) but deliberately NOT consulted by the
@@ -133,6 +184,8 @@ def classify_run(
     auditable after the fact. Do not "simplify" them out of the signature
     or out of the recorded state.
     """
+    if exit_code != 0:
+        return OUTCOME_FAILED
     if selected_count > 0:
         return OUTCOME_PRODUCTIVE
     if (budget_skipped + below_sampling_cut) > 0:
@@ -144,11 +197,63 @@ def classify_run(
 # trickle_state_path — where the record lives, and why not in the repo
 # ---------------------------------------------------------------------------
 
-def trickle_state_path(project_id: str) -> Path:
-    """Return the per-project run-state file path.
+STATE_ROOT_ENV = 'DARK_FACTORY_LEGIBILITY_STATE_ROOT'
+"""The ONE supported lever for relocating the legibility state root.
 
-    ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
-    <project_id>/trickle-state.json``.
+Deliberately a dedicated name rather than a general-purpose one. See
+:func:`trickle_state_path` for why that distinction is the whole fix."""
+
+
+def trickle_state_path(project_id: str) -> Path:
+    """Return the per-project run-state file path, resolved from the
+    ACCOUNT rather than from the calling process's environment.
+
+    ``<passwd home>/.local/state/dark-factory/legibility/<project_id>/
+    trickle-state.json``, overridable only via :data:`STATE_ROOT_ENV`.
+
+    WHAT THIS FILE IS. Its identity is "this host's legibility state for
+    this USER and this project" — not "this PROCESS's state dir". Two
+    processes that must agree on ONE file cannot each resolve it from
+    their own environment. The writer is
+    ``legibility-trickle@<project>.service`` under the ``systemd --user``
+    manager (user-record HOME, no shell rc). The reader is
+    ``legibility-trickle-health@<project>.service``, or an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Nothing pinned them
+    to agree, so before task 4514 they silently read and wrote different
+    files — and a probe that cannot find the file reports ``missing`` and
+    fails PERMANENTLY, which for a milestone binding is a born-at-L2
+    ``milestone_check_failed`` for a pipeline running perfectly.
+
+    WHY THE PASSWD ANCHOR. The home in the passwd database is a property
+    of the account that owns the pipeline, read from NSS, and is identical
+    for the same uid in every process environment. Measured 2026-09-19 on
+    this host: under ``env -i`` and under ``HOME=/tmp/otherhome``,
+    ``pwd.getpwuid(os.getuid()).pw_dir`` is unmoved while ``Path.home()``
+    follows ``HOME``. ``pwd`` is stdlib, so the module docstring's hard
+    stdlib-only constraint for the bare-``python3`` predicate path
+    survives.
+
+    WHY THE DEDICATED OVERRIDE IS NOT THE SAME BUG. ``XDG_STATE_HOME`` and
+    ``HOME`` are AMBIENT, GENERAL-PURPOSE variables that a login shell, a
+    ``systemd --user`` manager, a container and CI each set differently
+    for reasons having nothing to do with legibility — so writer and
+    reader diverged with nobody having intended to redirect anything.
+    ``DARK_FACTORY_LEGIBILITY_STATE_ROOT`` is never set incidentally; it
+    is set only by someone who means THIS file. The shipped systemd units
+    deliberately do not set it (pinned by
+    ``scripts/tests/test_install_trickle_health_timer.py``), so production
+    always takes the anchored branch.
+
+    WHAT THE DEGRADATION NOW MEANS. The old code fell through to
+    ``tempfile.gettempdir()`` whenever ``Path.home()`` raised — which a
+    stripped systemd environment with no ``HOME`` did reach. That wrote to
+    a path the nightly never reads, while logging to a logger the
+    bare-``python3`` predicate never configures, so the divergence was
+    invisible. That case now resolves correctly. The tempdir fallback
+    survives only for a genuinely absent passwd entry (an arbitrary-uid
+    container), preserving the never-raise property this helper needs on
+    the nightly run's unconditional path.
 
     NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
     there and looking like the local precedent. That file is git-TRACKED
@@ -159,43 +264,44 @@ def trickle_state_path(project_id: str) -> Path:
     warm-lane GC, the exact pollution class task 2439 fixed — or force a
     nightly commit, which would make "the repo has a commit today" a valid
     liveness signal and thereby CONTRADICT PRD decision 7 outright.
-    XDG-rooted host state is what this actually is: a record of what the
-    local timer did. It also needs no ``.gitignore`` entry, because the
-    path is outside every checkout.
+    Host-local state outside every checkout is what this actually is: a
+    record of what the local timer did. It also needs no ``.gitignore``
+    entry.
 
-    RE-DERIVED, NOT REUSED. The rooting scheme and the ``Path.home()`` ->
-    ``RuntimeError`` -> ``tempfile.gettempdir()`` degradation mirror
-    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``
-    (mcp_lifecycle.py, task 2439) verbatim in shape, but that function is
-    deliberately NOT imported: the ``orchestrator`` package is not
+    RE-DERIVED, NOT REUSED — AND NO LONGER THE SAME SHAPE. This used to
+    mirror ``orchestrator/src/orchestrator/mcp_lifecycle.py::
+    managed_runtime_data_dirs`` (task 2439) verbatim, and that claim is now
+    false: that function still resolves ``${XDG_STATE_HOME:-~/.local/state}``
+    from its own environment. That is CORRECT there, because a single
+    orchestrator process both creates and consumes those dirs, and WRONG
+    here, because two independently-launched processes must agree. The
+    rooting convention (``dark-factory/`` under a state root) is still
+    shared; the resolution of the root is deliberately not. That function
+    stays un-imported regardless: the ``orchestrator`` package is not
     importable under the bare-``python3`` predicate path this module must
-    survive (see the module docstring). Cited here so the two stay
-    recognizably ONE convention rather than drifting into two.
+    survive.
 
-    ONE DELIBERATE DIVERGENCE from that scheme: an extra ``legibility/``
-    segment between ``dark-factory/`` and ``<project_id>/`` (mcp_lifecycle
-    uses ``dark-factory/<project_id>/queue|reconciliation``). This keeps
-    legibility state from colliding with the managed fused-memory runtime
-    dirs for the same project id.
+    ONE DELIBERATE DIVERGENCE from that convention: an extra
+    ``legibility/`` segment between ``dark-factory/`` and ``<project_id>/``
+    (mcp_lifecycle uses ``dark-factory/<project_id>/queue|reconciliation``).
+    This keeps legibility state from colliding with the managed
+    fused-memory runtime dirs for the same project id.
     """
-    xdg_state_home = os.environ.get('XDG_STATE_HOME')
-    if xdg_state_home:
-        base = Path(xdg_state_home)
+    override = os.environ.get(STATE_ROOT_ENV)
+    if override:
+        base = Path(override)
     else:
         try:
-            base = Path.home() / '.local' / 'state'
-        except RuntimeError:
-            # Stripped daemon/CI environment: no HOME and no pwd entry.
-            # This helper is on the nightly run's unconditional path and on
-            # the predicate's, so an unguarded raise would turn an
-            # observability write into a new failure mode. Degrade loudly
-            # instead (task 2439 amendment's identical choice).
+            base = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
+        except (KeyError, OSError):
             logger.warning(
-                'trickle_state_path: could not resolve a home directory '
-                '(HOME unset?); falling back to the OS temp dir for '
-                'project_id=%s — the recorded streak will not survive a '
-                'reboot',
+                'trickle_state_path: no passwd entry for uid %s; falling '
+                'back to the OS temp dir for project_id=%s — the recorded '
+                'streak will not survive a reboot. Set %s to a durable '
+                'path.',
+                os.getuid(),
                 project_id,
+                STATE_ROOT_ENV,
             )
             base = Path(tempfile.gettempdir())
 
@@ -261,6 +367,44 @@ def load_state(path: str | Path) -> tuple[str, dict | None]:
 
 
 # ---------------------------------------------------------------------------
+# recorded_age_hours — the freshness reading BOTH probes share
+# ---------------------------------------------------------------------------
+
+def recorded_age_hours(doc) -> float | None:
+    """Hours elapsed since *doc*'s ``recorded_at``, or ``None``.
+
+    ``None`` means FRESHNESS CANNOT BE ASSESSED — deliberately not "old"
+    and deliberately not "fresh". Each caller decides what that means,
+    which is precisely what lets the two callers below disagree about it
+    without either re-deriving the arithmetic:
+
+    - ``check_trickle_progress.py`` reports its own distinct
+      unparseable-``recorded_at`` verdict, separate from its stale one,
+      because that file's contract is that every failure verdict names its
+      OWN remedy;
+    - ``check_trickle_health.py::_should_escalate`` treats it as
+      post-worthy, matching the posture it already takes toward
+      ``missing``/``malformed`` — a record whose freshness cannot be
+      established must never be trusted to prove someone else already
+      alarmed.
+
+    A NAIVE ``recorded_at`` is read as UTC, which is what the progress
+    probe's staleness branch did before this helper existed.
+
+    Stdlib-only, like the rest of this module: it is on the
+    bare-``python3`` predicate path (see the module docstring)."""
+    if not isinstance(doc, dict):
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(doc.get('recorded_at')))
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - stamp).total_seconds() / 3600.0
+
+
+# ---------------------------------------------------------------------------
 # record_run — the writer
 # ---------------------------------------------------------------------------
 
@@ -295,6 +439,28 @@ def record_run(
     breakage, which is PRD decision 7's no-false-alarm guarantee expressed
     in the streak rather than only in the classifier.
 
+    ``failed`` is the exception: it neither increments nor resets
+    ``consecutive_barren_runs``, it CARRIES IT FORWARD. A crashed run is
+    evidence about the RUN, not about whether signal is flowing.
+    Resetting would let a permanently broken pipeline erase a real barren
+    streak — the same silent-degradation shape one layer up; incrementing
+    would attribute an absence the sampler never observed, since the run
+    did not finish and its counters describe an unfinished night.
+
+    ``failed`` gets its OWN counter rather than being folded into the
+    barren one because the two have genuinely DIFFERENT remedies — the
+    same reason ``SampleResult`` keeps ``budget_skipped`` and
+    ``below_sampling_cut`` separate. Barren means "fix the budget or
+    sampling config"; failed means "read ``journalctl --user -u
+    legibility-trickle@<project>``".
+
+    ``scripts/legibility/nightly.py::_escalate_barren_streak`` is
+    UNAFFECTED by either. It returns early unless ``outcome ==
+    OUTCOME_BARREN``, so a failed run cannot fire it; and it gates on
+    EXACT equality with the threshold, which a carried-forward streak
+    still passes through at most once, so the carry-forward cannot
+    double-fire it either.
+
     ``last_productive_at`` is stamped with ``recorded_at`` on a productive
     run and carried forward UNCHANGED across barren and quiet runs. It is
     the field an operator reads to answer "when did this pipeline last
@@ -315,16 +481,21 @@ def record_run(
 
     prev_status, prev = load_state(path)
     prev_streak = 0
+    prev_failed = 0
     last_productive_at = None
     if prev_status == 'ok' and prev is not None:
         raw_streak = prev.get('consecutive_barren_runs')
         if isinstance(raw_streak, int) and raw_streak >= 0:
             prev_streak = raw_streak
+        raw_failed = prev.get('consecutive_failed_runs')
+        if isinstance(raw_failed, int) and raw_failed >= 0:
+            prev_failed = raw_failed
         raw_last = prev.get('last_productive_at')
         if isinstance(raw_last, str):
             last_productive_at = raw_last
 
     outcome = classify_run(
+        exit_code=exit_code,
         total_records=total_records,
         zero_signal_dropped=zero_signal_dropped,
         dedupe_collapsed=dedupe_collapsed,
@@ -348,7 +519,12 @@ def record_run(
         'commit_made': bool(commit_made),
         'budget_suppressed': bool(budget_suppressed),
         'consecutive_barren_runs': (
-            prev_streak + 1 if outcome == OUTCOME_BARREN else 0
+            prev_streak + 1 if outcome == OUTCOME_BARREN
+            else prev_streak if outcome == OUTCOME_FAILED
+            else 0
+        ),
+        'consecutive_failed_runs': (
+            prev_failed + 1 if outcome == OUTCOME_FAILED else 0
         ),
         'last_productive_at': last_productive_at,
         'counters': {
@@ -394,4 +570,22 @@ that config would drag pydantic + PyYAML onto the bare-``python3``
 predicate path this module must survive (see the module docstring). The
 progress probe also takes the threshold as an argument, so a binding that
 wants a different window passes one rather than editing config.
+"""
+
+DEFAULT_MAX_FAILED_RUNS = 2
+"""Consecutive FAILED runs before ``check_trickle_progress.py`` fails.
+
+WHY 2, AND WHY TIGHTER THAN ``DEFAULT_MAX_BARREN_RUNS = 3``. One failed
+night is already owned TWICE OVER — by ``nightly.py``'s own fail-loud
+escalation for that run, and by ``check_trickle_liveness.sh``'s ``Result
+!= success`` gate — so firing at 1 would only duplicate them. TWO
+consecutive is the PERSISTENT shape neither per-run signal can express,
+and it is what the permanently-broken-coder scenario produces on night
+two. The barren threshold is looser because one barren night can be an
+ordinary bad day, whereas a night that did not finish is already an
+anomaly on its own.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its sibling above: reading that config would drag pydantic + PyYAML
+onto the bare-``python3`` predicate path this module must survive.
 """

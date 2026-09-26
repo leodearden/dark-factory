@@ -328,11 +328,11 @@ VARIANT_SONNET5_SOLO = VariantConfig(
 
 VARIANT_CROSS_FAMILY = VariantConfig(
     name='variant_cross_family',
-    description='1x codex generalist (gpt-5.4) — cross-family model swap vs the 1x opus incumbent',
+    description='1x codex generalist (GPT-6 Astra) — cross-family model swap vs the 1x opus incumbent',
     reviewers=[
         ReviewerSpec(
             name='comprehensive_reviewer',
-            model='gpt-5.4',
+            model='gpt-6-astra',
             specialization=_SPEC_COMPREHENSIVE,
             budget=5.0,
             effort='high',
@@ -343,3 +343,49 @@ VARIANT_CROSS_FAMILY = VariantConfig(
 
 # Refresh leaderboard order: 1×Opus incumbent first, then the two candidates.
 REVIEWER_REFRESH_VARIANTS = [VARIANT_A, VARIANT_SONNET5_SOLO, VARIANT_CROSS_FAMILY]
+
+
+# ---------------------------------------------------------------------------
+# Fable admission evidence package (ruling D5, 2026-09-10): the refresh set
+# plus a Fable 5.1 generalist and the incumbent at effort xhigh. Same
+# single-generalist shape as VARIANT_A so only the model (or, for the xhigh
+# arm, only the effort) varies.
+# ---------------------------------------------------------------------------
+
+VARIANT_FABLE51_SOLO = VariantConfig(
+    name='variant_fable51_solo',
+    description='1x Fable 5.1 generalist — model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='claude-fable-5-1',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=10.0,
+            effort='high',
+        ),
+    ],
+)
+
+VARIANT_A_XHIGH = VariantConfig(
+    name='variant_a_xhigh',
+    description='1x opus generalist @ xhigh effort',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='opus',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='xhigh',
+        ),
+    ],
+)
+
+# Campaign order: incumbent first (the paired baseline every other arm is
+# scored against), then the candidates.
+FABLE_EVIDENCE_VARIANTS = [
+    VARIANT_A,
+    VARIANT_SONNET5_SOLO,
+    VARIANT_FABLE51_SOLO,
+    VARIANT_CROSS_FAMILY,
+    VARIANT_A_XHIGH,
+]

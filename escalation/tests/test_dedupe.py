@@ -117,7 +117,8 @@ class TestSummaryDedupeKey:
 
 
 class TestEscalationDedupeFields:
-    """Escalation dataclass gains dedupe_count and dedupe_children fields."""
+    """Escalation dataclass gains dedupe_count, dedupe_children and
+    dedupe_children_truncated fields."""
 
     def _make_min_escalation(self):
         from escalation.models import Escalation
@@ -169,6 +170,45 @@ class TestEscalationDedupeFields:
         assert esc_b.dedupe_children == [], (
             'dedupe_children must use default_factory, not a shared class-level list'
         )
+
+    # --- dedupe_children_truncated: the growth bound's durable loss counter ---
+
+    def test_dedupe_children_truncated_defaults_to_zero(self):
+        """A new Escalation has shed nothing, so the counter starts at 0."""
+        esc = self._make_min_escalation()
+        assert esc.dedupe_children_truncated == 0
+
+    def test_dedupe_children_truncated_round_trips_via_json(self):
+        """The counter survives to_json / from_json.
+
+        Without this the loss would be log-only: the TRUE provenance total is
+        ``len(dedupe_children) + dedupe_children_truncated``, so a counter that
+        did not persist would make the shed unassertable from the record
+        (INV-8 / no-silent-fail-soft).
+        """
+        from escalation.models import Escalation
+        esc = self._make_min_escalation()
+        esc.dedupe_children_truncated = 7
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.dedupe_children_truncated == 7
+
+    def test_from_dict_without_truncated_key_uses_default(self):
+        """Legacy on-disk JSON without the key loads with 0 — zero migration.
+
+        Same contract as every field added since: ``from_dict`` filters on
+        ``__dataclass_fields__``, so an absent key simply takes its default.
+        """
+        from escalation.models import Escalation
+        old_dict = {
+            'id': 'esc-1-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': 'connection lost',
+        }
+        esc = Escalation.from_dict(old_dict)
+        assert esc.dedupe_children_truncated == 0
 
 
 class TestFindDedupeParent:
@@ -1497,6 +1537,208 @@ class TestSubmitOrDedupe:
         files = self._queue_files(queue)
         assert len(files) == 1  # only the new esc (parent was archived)
         assert result2['id'] == files[0].stem
+
+
+class TestDedupeHalves:
+    """``submit_or_dedupe``'s two halves, named and independently callable.
+
+    ``resolve_dedupe_parent`` is the pure READ — the two gates plus the
+    ``find_dedupe_parent`` scan — and ``attach_or_submit`` is the WRITE — the
+    TOCTOU guard, the fold, and the submit fall-through.  They are separately
+    named because only the READ half moves to a worker thread (task 5648), so
+    each has to be reachable on its own, and the read half has to be provably
+    free of writes.  That second property is not asserted once in a test of its
+    own: ``_resolve`` below re-checks it on EVERY call this class makes, so a
+    write that creeps into the read half fails whichever test introduced it.
+    """
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '42', summary: str = 'fused-memory connection timeout on port 8002'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    def _resolve(self, queue, esc, config, now=None):
+        """``resolve_dedupe_parent``, with its read-only contract enforced.
+
+        The queue root is snapshotted across the call, so the property step 4
+        relies on when it moves this function to a worker thread — it writes
+        nothing — is checked at every use rather than in one test a later
+        change could route around.
+        """
+        from escalation.dedupe import resolve_dedupe_parent
+
+        before = self._queue_files(queue)
+        result = resolve_dedupe_parent(queue, esc, config, now=now)
+        assert self._queue_files(queue) == before, (
+            'resolve_dedupe_parent is the READ half and must write nothing'
+        )
+        return result
+
+    # --- resolve_dedupe_parent: the one outcome that finds a parent ---
+
+    def test_resolve_returns_the_oldest_matching_parent(self, tmp_path):
+        """Both gates open and two same-key parents pending => the OLDER id."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_infra_esc('esc-1-1')
+        older.timestamp = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        queue.submit(older)
+        newer = self._make_infra_esc('esc-1-2')
+        newer.timestamp = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        queue.submit(newer)
+
+        candidate = self._make_infra_esc('esc-1-3', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) == older.id
+
+    # --- resolve_dedupe_parent: the three outcomes that return None ---
+
+    def test_resolve_returns_none_when_the_enabled_gate_is_shut(self, tmp_path):
+        """Gate 1 — a same-key pending parent exists and is still not returned."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+        candidate = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig(infra_dedupe_enabled=False)) is None
+
+    def test_resolve_returns_none_for_a_category_outside_the_gate(self, tmp_path):
+        """Gate 2 — same summary tokens, category the stock config does not fold."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.category = 'design_concern'
+        queue.submit(parent)
+        candidate = self._make_infra_esc('esc-1-2')
+        candidate.category = 'design_concern'
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    def test_resolve_returns_none_when_both_gates_open_but_nothing_matches(self, tmp_path):
+        """The scan itself found no parent — the outcome the two gates cannot produce."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', summary='falkordb refused the connection'))
+        candidate = self._make_infra_esc('esc-1-2')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    # --- attach_or_submit: the three branches of the WRITE half ---
+
+    def test_attach_or_submit_folds_into_a_real_pending_parent(self, tmp_path):
+        """A live parent id yields the dedup_skipped shape and no second file."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result == {
+            'id': parent.id,
+            'status': 'dedup_skipped',
+            'parent_id': parent.id,
+            'child_id': child.id,
+            'level': child.level,
+        }
+        assert len(self._queue_files(queue)) == 1
+
+    def test_attach_or_submit_with_no_parent_submits(self, tmp_path):
+        """parent_id=None is the submit fall-through, reported from observed state."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_infra_esc('esc-1-1')
+
+        result = attach_or_submit(queue, esc, None)
+
+        assert result['id'] == esc.id
+        assert result['status'] == 'queued'
+        # 'level' is on every branch — the documented "the echo confirms the
+        # level landed" contract, which the halves must not drop.
+        assert result['level'] == esc.level
+        assert [p.stem for p in self._queue_files(queue)] == [esc.id]
+
+    def test_attach_or_submit_falls_through_when_the_parent_was_resolved(self, tmp_path):
+        """The TOCTOU guard, now exercised through the named half.
+
+        A parent resolved between the resolve and the attach must produce a
+        real submit, never a dropped record — which is why step 4 can put an
+        ``await`` between the two halves without adding race handling.
+        """
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        queue.resolve(parent.id, resolution='raced')
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result['status'] == 'queued', (
+            f'a stale parent id must fall through to submit; got: {result}'
+        )
+        assert [p.stem for p in self._queue_files(queue)] == [child.id]
+
+    # --- the composition ---
+
+    def test_submit_or_dedupe_is_exactly_the_two_halves_composed(self, tmp_path):
+        """Same inputs, same response — on the fold branch and the queued one.
+
+        Stated as an equality against the composition rather than by re-pinning
+        response shapes: ``TestSubmitOrDedupe`` above already owns those four
+        branches, and 15+ sync callers outside this package depend on them, so
+        a second copy of the expectations here would be the thing that drifts.
+        """
+        from escalation.dedupe import DedupeConfig, attach_or_submit, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        def _seeded(root):
+            queue = EscalationQueue(root)
+            queue.submit(self._make_infra_esc('esc-1-1'))
+            return queue
+
+        cfg = DedupeConfig()
+        for child_id, summary in (
+            ('esc-1-2', 'Fused-memory  CONNECTION timeout!'),   # folds
+            ('esc-1-3', 'falkordb refused the connection'),      # queues
+        ):
+            whole = _seeded(tmp_path / f'whole-{child_id}')
+            halves = _seeded(tmp_path / f'halves-{child_id}')
+
+            via_whole = submit_or_dedupe(whole, self._make_infra_esc(child_id, summary=summary), cfg)
+            esc = self._make_infra_esc(child_id, summary=summary)
+            via_halves = attach_or_submit(halves, esc, self._resolve(halves, esc, cfg))
+
+            assert via_whole == via_halves, (
+                f'submit_or_dedupe diverged from its halves on {summary!r}: '
+                f'{via_whole} != {via_halves}'
+            )
 
 
 class TestEscalationDedupeFingerprint:

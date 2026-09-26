@@ -36,11 +36,35 @@ on its MEASURED branch, where it is what stops a real 0 — ``height: 0%``, whic
 paints nothing — from rendering exactly like a hole.  What was wrong was
 flooring the slot rather than the measurement.)
 
+THE LAST ONE IN THE FILE (task 3681) — ``HBarChart`` is the row-shaped
+primitive: its input is rows of OBJECTS behind a ``valueKey``/``labelKey``
+indirection rather than a bare values array, and its PRIMARY value was never
+guarded at all even though its segments were scrubbed with the same
+``(r[s.key] || 0)`` hole-as-zero conflation banned for StackedAreaChart above.
+It carried one failure the other five did not: the raw value went straight into
+the CALLER's formatter (``formatVal(r[valueKey])``), and both live call sites
+pass ``v => `$${v.toFixed(2)}``` (tabs.jsx), so a row missing the key would
+throw a TypeError DURING RENDER and take the whole Costs tab down rather than
+one bar.  That is what the component's CONTRACT permits — it reads rows through
+a caller-supplied ``valueKey`` — and NOT an observed outage: today's
+``shape_costs`` (redux_api.py:536, :566) emits an explicit ``total`` on every
+by_project and by_role row, so no live payload reaches it.  The probes below
+ban the arithmetic anyway, for the reason the rest of this file exists: a
+primitive that cannot say "not measured" is one payload change away from
+saying something false, and here it would say it by throwing.  It now projects
+its rows to a values array at the
+call site and reuses ``plottableMax`` + ``barFractions`` unchanged, and the SAME
+fraction-is-null decision drives both the absent bar and the em-dash in the
+value cell, so a row's text and its bar can never disagree about whether it was
+measured.
+
 WHY THE PROBES ARE PER COMPONENT — the components' folds differ textually
 (LineChart's poisoning fold is ``Math.max(...all``, BarChart's is
-``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``), so a
-single module-level probe tuple could not express what each component must no
-longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
+``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``, and
+HBarChart's is ``Math.max(...rows.map`` — it folded over the ROWS, projecting
+each one's value inside the fold, so it does not share a single character of
+its spread with the other four), so a single module-level probe tuple could not
+express what each component must no longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
 set, its own required builders, and — via ``_PRE_FIX_BODIES`` — its own
 verbatim pre-fix body for the negative control at the bottom.
 
@@ -189,6 +213,43 @@ _HIST_BAR_BANNED = (
     # the pre-fix body by its own control.
 )
 
+_HBAR_CHART_BANNED = (
+    (
+        'Math.max(...rows.map',
+        'folds the axis maximum over the RAW row values, so ONE row missing '
+        'the key poisons max to NaN and EVERY row width becomes "NaN%" — an '
+        'invalid CSS length, so all the bars vanish silently, not just the '
+        'missing one',
+    ),
+    (
+        '(r[valueKey] / max) * 100',
+        'scales the raw primary value directly, so a null/missing row becomes '
+        'a zero-width bar indistinguishable from a measured zero',
+    ),
+    (
+        'r[s.key] || 0',
+        'scrubs a MISSING segment to a measured zero — the same scrub banned '
+        'for StackedAreaChart, in the last primitive still carrying it',
+    ),
+    # The worse half of this component's defect, and the one no other primitive
+    # had: the raw value went into the CALLER's formatter, so a hole would not
+    # merely render wrong, it would throw.
+    (
+        'formatVal(r[valueKey])',
+        "hands the RAW primary value to the caller's formatter — BOTH live "
+        'call sites pass ``v => `$${v.toFixed(2)}``` (both <HBC> tags in '
+        'tabs.jsx::CostsTab), so a row lacking the key throws a TypeError DURING '
+        'RENDER and takes out the whole Costs tab, not just one row. Rows '
+        'lacking the key are what this component\'s contract permits (it '
+        'reads them through a caller-supplied valueKey), not what the API '
+        'emits today — redux_api.py always supplies `total`',
+    ),
+    (
+        'formatVal(r[s.key]',
+        'same, for a segment',
+    ),
+)
+
 _CONTRACTS: dict[str, _Contract] = {
     'Sparkline': _Contract(builders=('sparkSmoothPaths',), banned=_SPARKLINE_BANNED),
     'StepSpark': _Contract(builders=('sparkStepPaths',), banned=_SPARKLINE_BANNED),
@@ -217,6 +278,15 @@ _CONTRACTS: dict[str, _Contract] = {
     'HistBar': _Contract(
         builders=('plottableMax', 'barFractions'),
         banned=_HIST_BAR_BANNED,
+    ),
+    # HBarChart takes rows of OBJECTS, so it projects them to a values array at
+    # the call site (`rows.map(r => r[valueKey])`) and then uses the SAME pair
+    # the other two bar primitives do — no key-projecting export of its own.
+    # It calls barFractions TWICE by design: once for the primary values and
+    # once per row for that row's segments, both scaled against the same max.
+    'HBarChart': _Contract(
+        builders=('plottableMax', 'barFractions'),
+        banned=_HBAR_CHART_BANNED,
     ),
 }
 
@@ -516,6 +586,142 @@ def test_hist_bar_branch_contract_fails_on_pre_fix_source() -> None:
     assert 'minHeight: 1' in body, 'the pre-fix floor is still in the frozen control body'
 
 
+_WIDTH_TEMPLATE_RE = re.compile(r'width:\s*`([^`]*)`')
+_IDENTIFIER_RE = re.compile(r'[A-Za-z_$][\w$]*')
+
+
+def _width_expression_sources(body: str) -> list[tuple[str, str]]:
+    """Each ``width: `...`` template paired with the code its value traces back to.
+
+    A width template rarely inlines its own arithmetic — it interpolates a
+    binding — so the template alone cannot answer "where did this number come
+    from".  Every bare identifier in it is therefore resolved ONE level, to its
+    ``const <name> = ...;`` declaration in the same body, and the template plus
+    those right-hand sides is what gets probed.
+
+    Deliberately one level and NOT transitive.  HBarChart's segment fractions
+    legitimately come from ``barFractions(segments.map(s => r[s.key]), max)``,
+    which mentions ``r[`` because PROJECTING the rows into the helper is the
+    sanctioned shape — chasing that second hop would flag the fix itself.  What
+    must not happen is a width computed by arithmetic ON a row lookup
+    (``const w = (r[valueKey] / max) * 100``), and one hop is exactly the
+    distance that separates the two.
+    """
+    sources: list[tuple[str, str]] = []
+    for m in _WIDTH_TEMPLATE_RE.finditer(body):
+        template = m.group(1)
+        traced = [template]
+        for ident in sorted(set(_IDENTIFIER_RE.findall(template))):
+            decl = re.search(rf'\bconst\s+{re.escape(ident)}\s*=\s*([^;]*);', body)
+            if decl is not None:
+                traced.append(decl.group(1))
+        sources.append((template, ' '.join(traced)))
+    return sources
+
+
+def _hbar_hole_contract_violations(body: str) -> list[str]:
+    """What HBarChart still gets wrong about a row that holds no measurement.
+
+    Each violation is tagged with its KIND (``em-dash``/``width``/``branch``) so
+    the negative control below can assert that all three checks fire on the real
+    pre-fix defect, independently of how many widths happen to violate one.
+
+    Applied identically to the live source and to the frozen pre-fix body — the
+    two-function shape ``_hole_and_measured_style_branches`` /
+    ``test_hist_bar_branch_contract_fails_on_pre_fix_source`` already sets.
+    ``body`` must already be comment-stripped.
+    """
+    violations: list[str] = []
+
+    # 1. A hole needs SOMETHING to render, because what it must not do is reach
+    #    the caller's formatter.  Either spelling of the dashboard's
+    #    no-synthetic-data placeholder counts: the repo genuinely writes both
+    #    (memory_evals_fmt.js escapes it, shell.jsx and the scheduler tabs use
+    #    the raw character), and normalising that split is a separate,
+    #    repo-wide decision this contract must not take by accident.
+    if '—' not in body and '\\u2014' not in body:
+        violations.append(
+            'em-dash: HBarChart renders no em-dash placeholder anywhere, so a '
+            'row with no measurement has nothing to show but the result of '
+            'calling formatVal on a hole. Both live call sites pass '
+            '`v => `$${v.toFixed(2)}``, which throws a TypeError on undefined '
+            '— during render, so the whole Costs tab goes down rather than '
+            'one row.'
+        )
+
+    # 2. A width must come from a fraction, never from arithmetic on a raw row
+    #    lookup — that arithmetic is what has no way to say "not measured".
+    for template, traced in _width_expression_sources(body):
+        if 'r[' in traced:
+            violations.append(
+                f'width: the width `{template}` traces back to a raw row '
+                f'lookup ({traced.strip()}). Every width must come from a '
+                f'barFractions fraction, which is `null` at a hole; raw '
+                f'`r[...]` arithmetic can only ever produce a number, and '
+                f'there is no number that means "no measurement here".'
+            )
+
+    # 3. The hole decision must be a visible BRANCH rather than falling out of
+    #    coercion, so the bar and the value cell demonstrably make the same one.
+    if re.search(r'[!=]==\s*null', body) is None:
+        violations.append(
+            'branch: HBarChart never compares anything to `null`, so nothing '
+            'in it decides explicitly whether a row was measured. The absent '
+            'bar and the em-dash must both be branches off the same '
+            'barFractions null, or the row\'s text and its bar can disagree '
+            'about whether a measurement exists.'
+        )
+
+    return violations
+
+
+def test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_throwing(
+    charts_jsx_body: str,
+) -> None:
+    """A row with no measurement must degrade, not throw.
+
+    The load-bearing part is NOT the placeholder — it is that ``formatVal`` is
+    never INVOKED on a hole.  Both live call sites pass
+    ``v => `$${v.toFixed(2)}```, so calling it on ``undefined`` throws a
+    TypeError during render and takes the entire tab down.  A blank bar
+    degrades; a throw does not.  (A hole is what this component's contract
+    permits rather than what the API emits: ``shape_costs`` supplies ``total``
+    on every row today.  The guard is for the contract, which is the only
+    thing this component can actually see.)  So it needs a placeholder to
+    render instead,
+    every width has to come from a fraction rather than from raw row
+    arithmetic, and the hole has to be an explicit branch off the SAME
+    ``barFractions`` null the bar already uses — one hole decision per row means
+    the row's text and its bar can never disagree about whether it was measured.
+    """
+    body = _component_body(charts_jsx_body, 'HBarChart')
+    violations = _hbar_hole_contract_violations(body)
+
+    assert not violations, 'HBarChart still mishandles a row with no measurement:\n' + '\n'.join(
+        f'  - {v}' for v in violations
+    )
+
+
+def test_hbar_chart_hole_contract_fails_on_pre_fix_source() -> None:
+    """The negative control for the assertion above.
+
+    All three checks must fire on a verbatim copy of the pre-fix body.  If any
+    one of them did not, the contract above would be satisfied by the defect
+    itself and would be a permanent false GREEN — the same failure mode
+    test_hist_bar_branch_contract_fails_on_pre_fix_source guards for HistBar.
+    """
+    violations = _hbar_hole_contract_violations(strip_js_comments(_PRE_FIX_HBAR_CHART))
+    kinds = {v.split(':', 1)[0] for v in violations}
+
+    assert kinds == {'em-dash', 'width', 'branch'}, (
+        f'the HBarChart hole contract did NOT fire every check on a verbatim '
+        f'copy of its pre-fix body — only {sorted(kinds)} fired, out of '
+        f'em-dash/width/branch. A check that cannot detect the real defect '
+        f'makes test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_'
+        f'throwing a permanent false GREEN.'
+    )
+
+
 @pytest.mark.parametrize('name', _DELEGATING_COMPONENTS)
 def test_component_still_exists_and_is_still_exported(charts_jsx_body: str, name: str) -> None:
     """Every pinned primitive survives the rewrite and stays on window.DF_CHARTS.
@@ -736,12 +942,54 @@ _PRE_FIX_HIST_BAR = """{
   );
 }"""
 
+_PRE_FIX_HBAR_CHART = """{
+  // rows: [{ label, total, ...segments? }]; segments: [{ key, color, label }]
+  const max = Math.max(...rows.map(r => r[valueKey]), 1);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {rows.map((r, i) => {
+        const w = (r[valueKey] / max) * 100;
+        if (segments) {
+          let cum = 0;
+          return (
+            <div key={i}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+                <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+              </div>
+              <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+                {segments.map(s => {
+                  const segW = ((r[s.key] || 0) / max) * 100;
+                  cum += segW;
+                  return <div key={s.key} title={`${s.label}: ${formatVal(r[s.key] || 0)}`} style={{ width: `${segW}%`, background: s.color }} />;
+                })}
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div key={i}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+              <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+              <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ width: `${w}%`, height: '100%', background: PALETTE.accent }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}"""
+
 _PRE_FIX_BODIES: dict[str, str] = {
     'Sparkline': _PRE_FIX_SPARKLINE,
     'LineChart': _PRE_FIX_LINE_CHART,
     'StackedAreaChart': _PRE_FIX_STACKED_AREA,
     'BarChart': _PRE_FIX_BAR_CHART,
     'HistBar': _PRE_FIX_HIST_BAR,
+    'HBarChart': _PRE_FIX_HBAR_CHART,
 }
 
 

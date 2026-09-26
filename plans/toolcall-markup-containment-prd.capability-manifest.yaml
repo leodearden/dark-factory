@@ -123,7 +123,11 @@ tasks:
   note: 'SPLIT 2026-08-19. The original γ declared all four servers and was never dispatched
     once (zero runs.db events, ever) in the seven days after β landed: it required simultaneous
     module locks on the two hottest files in the repo. γ2 (4457) carries plan-tools, γ3
-    (4458) carries fused-memory.'
+    (4458) carries fused-memory. CURRENCY, re-measured 2026-09-22: 3690 is done —
+    registration landed in 07a967fab0. The OPEN verdict on list-typed-evidence-recovery-pinned
+    below is the 2026-08-19 authoring-time record and is left as written, not overwritten;
+    its grep delivered_check (evidence present in
+    escalation/tests/test_markup_middleware_registration.py) is satisfied today, 44 occurrences.'
   capabilities:
   - name: middleware-registered-on-forward-repair-pair
     binding: capability→producer (measured 2026-08-19, live hasattr probe) — both sites
@@ -159,6 +163,15 @@ tasks:
   task_id: 4457
   title: Register the middleware on plan-tools, and rule on its overlap with 3692's
     in-line repair path
+  note: 'CURRENCY, re-measured 2026-09-22: 4457 is done — registration landed in 37eed69c97.
+    The OPEN verdict on d1-ruling-recorded-against-3692s-read-time-path below is the
+    2026-08-19 authoring-time record and is left as written, not overwritten; the ruling
+    it awaited was made, and it is COMPOSE rather than supersede — the middleware guards
+    INBOUND ARGUMENTS at the request layer while 3692''s read-time path repairs STORED
+    STATE inside the tool body, so their populations are disjoint and registering the
+    guard does not retire 3692. Recorded in prose at
+    orchestrator/src/orchestrator/mcp/plan_tools.py::_create_plan and pinned by
+    orchestrator/tests/test_plan_tools_markup_guard.py::TestComposesWithTheReadTimeRepair.'
   capabilities:
   - name: middleware-registered-on-plan-tools
     binding: capability→producer (measured 2026-08-19) — plan_tools.py imports the STANDALONE
@@ -192,6 +205,20 @@ tasks:
   task_id: 4458
   title: Adapt the guard to fused-memory's BUNDLED FastMCP, cover the two ungated write
     tools, and only then retire the four in-line gates
+  note: 'CURRENCY, re-measured 2026-09-22: 4458 is done. All three OPEN verdicts below are
+    the 2026-08-19 authoring-time record, left as written rather than overwritten, and all
+    three are discharged. fused-memory-boundary-adapted — the fork it poses was decided for
+    ADAPT, not migrate: the guard attaches through the existing _safe_call_tool chokepoint as
+    fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard, called from
+    fused-memory/src/fused_memory/server/main.py::_install_tool_dispatch_guards, landed
+    60293e0d8c on 2026-08-20. That row''s manual delivered_check reason still holds under the
+    option taken: an add_middleware grep remains unsatisfiable at this site by design, so do
+    not re-add one. ungated-write-tools-now-covered — its grep check (add_system_record present
+    in fused-memory/tests/test_markup_guard_fused_memory.py) is satisfied today, 57 occurrences.
+    inline-markup-gate-call-sites-retired-inv5 — the MUST NOT no longer binds, because the
+    replacement it guarded against is live: the four gates were retired in 5d066281c1 and that
+    row''s expect-absent grep passes with zero definitions or call sites left under
+    fused-memory/src/, every surviving mention there being past-tense prose.'
   capabilities:
   - name: fused-memory-boundary-adapted
     binding: 'capability→producer — ⚠️ THE ORIGINAL γ ROW FOR THIS SITE WAS A FALSE PASS.
@@ -280,7 +307,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: </invoke>
+      pattern: parameter name=
       paths:
       - docs/task-recovery-2026-05-13/worktree-inventory.json
       expect: present

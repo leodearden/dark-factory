@@ -213,3 +213,46 @@ class TestRefreshVariants:
         """Keeps `full`/`sweep` (which run ALL_VARIANTS) byte-identical."""
         assert VARIANT_SONNET5_SOLO not in ALL_VARIANTS
         assert VARIANT_CROSS_FAMILY not in ALL_VARIANTS
+
+
+class TestFableEvidenceVariants:
+    """The D5 evidence campaign set: refresh arms + a Fable 5.1 generalist +
+    the incumbent at xhigh, every arm the same single-generalist shape."""
+
+    def test_fable51_solo_is_a_model_only_swap_of_the_incumbent(self) -> None:
+        from orchestrator.evals.reviewer_trial.variants import VARIANT_FABLE51_SOLO
+
+        assert len(VARIANT_FABLE51_SOLO.reviewers) == 1
+        reviewer = VARIANT_FABLE51_SOLO.reviewers[0]
+        incumbent = VARIANT_A.reviewers[0]
+        assert reviewer.model == 'claude-fable-5-1'
+        assert reviewer.backend == 'claude'
+        assert reviewer.specialization == incumbent.specialization
+        assert reviewer.effort == incumbent.effort
+        assert reviewer.name == incumbent.name
+
+    def test_xhigh_arm_varies_only_effort(self) -> None:
+        from orchestrator.evals.reviewer_trial.variants import VARIANT_A_XHIGH
+
+        reviewer = VARIANT_A_XHIGH.reviewers[0]
+        incumbent = VARIANT_A.reviewers[0]
+        assert reviewer.effort == 'xhigh'
+        assert (reviewer.model, reviewer.specialization, reviewer.budget) == (
+            incumbent.model, incumbent.specialization, incumbent.budget,
+        )
+
+    def test_cross_family_targets_gpt6_astra(self) -> None:
+        assert VARIANT_CROSS_FAMILY.reviewers[0].model == 'gpt-6-astra'
+
+    def test_evidence_set_leads_with_the_incumbent(self) -> None:
+        from orchestrator.evals.reviewer_trial.variants import (
+            FABLE_EVIDENCE_VARIANTS,
+            VARIANT_A_XHIGH,
+            VARIANT_FABLE51_SOLO,
+        )
+
+        assert FABLE_EVIDENCE_VARIANTS[0] is VARIANT_A
+        names = [v.name for v in FABLE_EVIDENCE_VARIANTS]
+        for candidate in (VARIANT_SONNET5_SOLO, VARIANT_FABLE51_SOLO, VARIANT_CROSS_FAMILY, VARIANT_A_XHIGH):
+            assert candidate.name in names
+        assert len({v.name for v in FABLE_EVIDENCE_VARIANTS}) == len(FABLE_EVIDENCE_VARIANTS)

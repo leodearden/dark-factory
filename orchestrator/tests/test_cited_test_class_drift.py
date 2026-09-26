@@ -1,0 +1,855 @@
+"""Static guard: a test class CITED BY NAME in a src docstring or comment must exist.
+
+A src docstring saying "pinned by ``TestFooBarBaz``" is a load-bearing claim
+of coverage, and nothing checks it. ``orchestrator.verify_classify`` carried
+one for TEN DAYS naming a class that existed nowhere in the repo (citation
+landed 2026-08-05; the class was written 2026-08-15). A reader who trusts such
+a claim does not go and write the test.
+
+WHAT THIS ASSERTS, and nothing else: every cited IDENTIFIER RESOLVES to a real
+``class Test...`` under one of the workspace's test trees.
+
+WHAT IT DELIBERATELY DOES NOT DO:
+
+* It is NOT a wording pin. It asserts nothing whatever about the prose around
+  a citation — rewording a citing sentence is a no-op by construction, which
+  ``TestRewordInvariance`` below demonstrates executably rather than by
+  assertion. Do not extend this into a wording pin; same scope discipline as
+  ``tests/scripts/test_setup_host_unit_installation.py::test_setup_md_disable_block_covers_every_foreign_orchestrator_unit``.
+* There is NO allowlist and no carve-out table of any kind, so there is
+  nothing here that can go stale.
+* There is NO staleness assertion in EITHER direction: no "this name must
+  still be cited" arm, and no assertion that any src file mentions any
+  particular string. That direction makes another package's PROSE a
+  merge-blocking gate on this module. It is the detector task 3554 removed on
+  review, and the standing prohibition on reintroducing it — explicitly
+  including "as a word-boundary or regex variant" — lives in
+  ``tests/scripts/test_skills_module_config_decision.py``'s module docstring,
+  on the removed ``test_no_unlisted_skills_mentioning_test_escapes_triage``.
+  Here no carve-out entries exist at all, so that failure mode is
+  structurally unreachable rather than merely unimplemented.
+
+COVERAGE RULE — a rule, deliberately not a measured fraction: every ``Test`` +
+>=2-CamelCase-segment name appearing in a COMMENT or STRING token of any
+``<member>/src`` file is checked, in the backticked, bare, ``file.py::Name``
+and line-wrapped forms alike. Out of scope by shape: single-segment
+``Test<Word>`` names; citations in non-Python files; and names appearing in
+CODE rather than prose, which are uses, not coverage claims.
+
+Built in two halves, in that order — the layout of the precedent
+``orchestrator/tests/test_marker_registration_drift.py``: unit tests of the
+pure helpers against synthetic strings and ``tmp_path`` trees FIRST, then the
+wired guard against the REAL tree. The real tree is green on arrival, so the
+synthetic half carries the whole burden of proving the mechanism can FAIL.
+"""
+from __future__ import annotations
+
+import ast
+import re
+import tokenize
+import tomllib
+from collections.abc import Collection, Iterable, Sequence
+from pathlib import Path
+from typing import NamedTuple, cast
+
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This file rglob('*.py')s both corpora, so it belongs to the whole-tree-scan
+# family. The ceiling's derivation lives at its single canonical home,
+# _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT; the module-level mark is
+# REQUIRED by test_whole_tree_scan_timeout_guard.py, which recomputes its
+# scanner census from source on every run and checks this mark's VALUE.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# Resolved from THIS FILE, never from the process CWD: merge-verify runs pytest
+# from orchestrator/ while a plain run starts at the repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: A citation is ``Test`` followed by AT LEAST TWO CamelCase segments.  That
+#: one shape predicate covers the backticked, bare and ``file.py::Name`` forms
+#: alike, and is why no allowlist, carve-out dict or import-resolution table
+#: exists anywhere in this module.
+_CITATION_RE = re.compile(r'\bTest(?:[A-Z][a-z0-9_]*){2,}')
+
+
+def _cited_names(source: str) -> dict[str, int]:
+    """``{cited class name: 1-indexed line of its first occurrence}`` in *source*.
+
+    Reads COMMENT and STRING tokens ONLY, never code. A name written in code —
+    an import, a call, a base class — is a use, not a claim that a test class
+    of that name covers something; only prose makes that claim, so only prose
+    is swept. (This is also what keeps the guard from tripping over its own
+    unit tests' synthetic sources.)
+
+    The shape rule is ``Test`` + >=2 CamelCase segments, and it has two
+    deliberate consequences. It needs no backticks, so the bare and
+    ``file.py::Name`` forms are covered on equal footing. And it deliberately
+    does NOT see single-segment ``Test<Word>`` names — which is precisely how
+    the third-party ``TestClient`` cited in ``dashboard.app.lifespan``'s
+    docstring, and the ``TestBase``/``TestA`` placeholders in
+    ``orchestrator.pytest_markers``' prose, stay out of the corpus with no
+    carve-out table in existence to maintain or go stale. A genuine
+    single-segment citation would be invisible to this guard: that residual
+    gap is a RULE, stated here, not a measured count.
+
+    The line reported is the line the NAME sits on, not the token's first
+    line: a multi-line docstring token starts many lines above its citation.
+
+    Raises on an unreadable/untokenizable *source* (``TokenError``,
+    ``SyntaxError``, ``IndentationError`` all propagate) — a silent empty dict
+    would make the guard vacuous for exactly the file it could not read.
+    """
+    cited: dict[str, int] = {}
+    tokens = tokenize.generate_tokens(iter(source.splitlines(keepends=True)).__next__)
+    for tok in tokens:
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        for match in _CITATION_RE.finditer(tok.string):
+            line = tok.start[0] + tok.string[: match.start()].count('\n')
+            cited.setdefault(match.group(), line)
+    return cited
+
+
+class TestCitedNames:
+    """Unit tests for the pure extractor ``_cited_names``.
+
+    Each positive case mirrors a citation form that occurs for real under the
+    workspace members' ``src/`` trees; each negative case is a string that
+    LOOKS like a citation and must not be treated as one.
+    """
+
+    def test_backticked_docstring_citation_is_extracted(self):
+        """The double-backtick form, e.g. as used around
+        ``orchestrator.verify_classify``'s pins."""
+        source = '"""Ordering is pinned by ``TestOrderingIsPreserved``."""\n'
+        assert _cited_names(source) == {'TestOrderingIsPreserved': 1}
+
+    def test_bare_comment_citation_in_path_colon_colon_form_is_extracted(self):
+        """The bare ``file.py::Name`` idiom — the majority form 4240's
+        backtick-only extractor could not see; used by e.g.
+        ``fused_memory.services.completion_claim_gate``."""
+        source = '# see tests/test_x.py::TestClauseBoundaryIsolation for the pin\n'
+        assert _cited_names(source) == {'TestClauseBoundaryIsolation': 1}
+
+    def test_line_is_the_name_s_line_not_the_token_s_first_line(self):
+        """A multi-line STRING token starts many lines above its citation, so
+        the reported line must be recovered from the offset WITHIN the token.
+        The repeat on the last line also pins first-occurrence-wins."""
+        source = '"""Summary.\n\nPinned by ``TestOrderingIsPreserved``.\n\nAnd again: ``TestOrderingIsPreserved``.\n"""\n'
+        assert _cited_names(source) == {'TestOrderingIsPreserved': 3}
+
+    def test_two_distinct_names_in_one_token_are_both_extracted(self):
+        source = '"""Both ``TestOrderingIsPreserved`` and TestClauseBoundaryIsolation."""\n'
+        assert _cited_names(source) == {
+            'TestOrderingIsPreserved': 1,
+            'TestClauseBoundaryIsolation': 1,
+        }
+
+    def test_english_prose_words_are_not_citations(self):
+        """``Test``/``Tests``/``Tested`` carry zero uppercase segments."""
+        assert _cited_names('"""Test the thing. Tests run. Tested already."""\n') == {}
+
+    def test_single_segment_names_are_excluded_by_shape(self):
+        """``TestClient`` (starlette, cited in ``dashboard.app.lifespan``'s
+        docstring) and the ``TestBase``/``TestA`` placeholders in
+        ``orchestrator.pytest_markers``' prose stay out of the corpus with NO
+        carve-out table in existence — the shape rule alone excludes them."""
+        source = '"""Uses ``TestClient``; cf. TestBase, TestCase, TestA."""\n'
+        assert _cited_names(source) == {}
+
+    def test_code_identifiers_are_not_prose_citations(self):
+        """Only COMMENT and STRING tokens are read: writing a name in CODE is
+        not a claim of coverage, so an import or a call yields nothing."""
+        source = 'from helpers import TestFooBarBaz\n\nTestFooBarBaz()\n'
+        assert _cited_names(source) == {}
+
+    def test_untokenizable_source_raises_instead_of_reporting_no_citations(self):
+        """Loud, not fail-soft: a silent empty dict makes the guard vacuous for
+        exactly the file it could not read."""
+        with pytest.raises((tokenize.TokenError, SyntaxError)):
+            _cited_names('"""unterminated ``TestOrderingIsPreserved``\n')
+
+
+class TestRewordInvariance:
+    """The executable policy discriminator: this guard pins IDENTIFIERS, never prose.
+
+    The module docstring's reword-invariance claim points HERE. A wording pin
+    — the shape ``roles.py``'s ARCHITECT rule 5 forbids, and that task 3554
+    removed on review under the standing prohibition in
+    ``tests/scripts/test_skills_module_config_decision.py`` — goes red on the
+    first case below by definition. This guard cannot: rewording a citing
+    sentence is a no-op by construction.
+
+    If this module is ever blocked as a docstring meta-test, escalate citing
+    the task description's policy paragraph and the two landed precedents
+    (``orchestrator/tests/test_marker_registration_drift.py``,
+    ``tests/scripts/test_setup_host_unit_installation.py``) — do NOT harden
+    the regex.
+    """
+
+    _TERSE = '"""Pinned by ``TestOrderingIsPreserved``."""\n'
+    _REWRITTEN = (
+        '"""Summary line, rewritten from scratch.\n'
+        '\n'
+        '    Ordering across the whole batch is what this function actually\n'
+        '        guarantees; the property is exercised end to end by\n'
+        '        ``TestOrderingIsPreserved``, which is the only reason a\n'
+        '        caller may rely on it.\n'
+        '    """\n'
+    )
+
+    def test_rewording_the_sentence_around_a_citation_changes_nothing(self):
+        """Different words, different clauses, different indentation and line
+        breaks — same identifier, so the same extracted set."""
+        assert set(_cited_names(self._TERSE)) == {'TestOrderingIsPreserved'}
+        assert set(_cited_names(self._REWRITTEN)) == {'TestOrderingIsPreserved'}
+
+    def test_moving_a_citation_from_a_docstring_into_a_comment_changes_nothing(self):
+        comment = '# Ordering is pinned by TestOrderingIsPreserved.\n'
+        assert set(_cited_names(comment)) == set(_cited_names(self._TERSE))
+
+    def test_renaming_the_identifier_does_change_the_extracted_set(self):
+        """The converse. Without it the invariance above would be vacuous."""
+        renamed = self._REWRITTEN.replace('TestOrderingIsPreserved', 'TestOrderingIsStable')
+        assert set(_cited_names(renamed)) == {'TestOrderingIsStable'}
+
+    def test_prose_citing_no_test_class_extracts_nothing_however_long(self):
+        assert _cited_names('"""' + 'Prose naming no identifier at all. ' * 40 + '"""\n') == {}
+
+
+def _defined_test_classes(test_dirs: Iterable[Path], wanted: Collection[str]) -> set[str]:
+    """The subset of *wanted* that is actually DEFINED as a class under *test_dirs*.
+
+    Two stages, and only the second one decides. A bytes-level line-anchored
+    prefilter (``^[ \\t]*class[ \\t]+<name>\\b``, MULTILINE, one alternation over
+    the whole wanted set) is a CHEAP NARROWING that reads each test file once
+    without decoding it; ``ast.parse`` then confirms — or refuses — every file
+    that survives. Accepting a prefilter hit on its own would let a ``class
+    TestX`` sitting inside a triple-quoted synthetic source string resolve a
+    genuinely dangling citation, i.e. fail PERMISSIVE and hollow the guard out
+    silently (``test_a_class_inside_a_string_literal_is_not_resolved`` pins
+    this; ``test_marker_registration_drift.py::_applied_marker_names`` made the
+    same AST-not-grep choice). The narrowing is what keeps that soundness
+    affordable: parsing only the candidates costs a small fraction of parsing
+    the whole test corpus, which was measured to dominate the sweep.
+
+    Files are visited in sorted order so failure messages are deterministic
+    under xdist. A file that cannot be read or parsed is re-raised as an
+    ``AssertionError`` naming it — never swallowed, never skipped, because a
+    skipped file is a file this guard is silently vacuous for.
+    """
+    if not wanted:
+        return set()
+    prefilter = re.compile(
+        (r'^[ \t]*class[ \t]+(?:' + '|'.join(map(re.escape, sorted(wanted))) + r')\b').encode(),
+        re.MULTILINE,
+    )
+    found: set[str] = set()
+    for test_dir in test_dirs:
+        for path in sorted(test_dir.rglob('*.py')):
+            try:
+                raw = path.read_bytes()
+                if not prefilter.search(raw):
+                    continue
+                tree = ast.parse(raw)
+            except (SyntaxError, ValueError, OSError) as exc:
+                raise AssertionError(
+                    f'{path} could not be read/parsed while resolving cited test '
+                    f'class names: {exc!r}. Fix the file — a silently skipped '
+                    f'file would make this guard vacuous for it.'
+                ) from exc
+            found.update(
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name in wanted
+            )
+    return found
+
+
+class TestDefinedTestClasses:
+    """Unit tests for the resolver ``_defined_test_classes``, on synthetic trees."""
+
+    @staticmethod
+    def _tree(root: Path, files: dict[str, str]) -> Path:
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return root
+
+    def test_a_class_in_a_nested_subdirectory_resolves_and_a_txt_sibling_does_not(self, tmp_path):
+        self._tree(tmp_path, {
+            'deep/nested/test_a.py': 'class TestFooBarBaz:\n    pass\n',
+            'deep/nested/notes.txt': 'class TestQuuxCorgeGrault:\n',
+        })
+        wanted = {'TestFooBarBaz', 'TestQuuxCorgeGrault'}
+        assert _defined_test_classes([tmp_path], wanted) == {'TestFooBarBaz'}
+
+    def test_a_name_defined_nowhere_is_absent_from_the_result(self, tmp_path):
+        self._tree(tmp_path, {'test_a.py': 'class TestFooBarBaz:\n    pass\n'})
+        assert _defined_test_classes([tmp_path], {'TestNotDefinedAnywhere'}) == set()
+
+    def test_a_class_inside_a_string_literal_is_not_resolved(self, tmp_path):
+        """THE soundness case. A ``class Test...`` at column 0 inside a
+        triple-quoted synthetic source matches the line-anchored prefilter, so
+        a regex-only resolver would let a genuinely dangling citation resolve —
+        the permissive direction, which hollows the guard out silently. This
+        module's own unit tests embed exactly such sources, so the trap is
+        self-inflicted, not hypothetical; it is the one
+        ``test_marker_registration_drift.py::test_marker_name_inside_a_string_literal_is_ignored``
+        guards for markers.
+        """
+        self._tree(tmp_path, {'test_a.py': 'SOURCE = """\nclass TestFooBarBaz:\n    pass\n"""\n'})
+        assert _defined_test_classes([tmp_path], {'TestFooBarBaz'}) == set()
+
+    def test_a_class_nested_inside_another_class_still_resolves(self, tmp_path):
+        """``ast.walk``, not ``tree.body`` — nesting depth is not a reason to
+        call a real class absent."""
+        self._tree(tmp_path, {'test_a.py': 'class Outer:\n    class TestFooBarBaz:\n        pass\n'})
+        assert _defined_test_classes([tmp_path], {'TestFooBarBaz'}) == {'TestFooBarBaz'}
+
+    def test_empty_wanted_short_circuits_without_scanning(self):
+        """Nothing is read at all — asserted directly, by handing the resolver a
+        root that raises if it is ever swept."""
+
+        class _ExplodingRoot:
+            def rglob(self, pattern: str):
+                raise AssertionError(f'swept for {pattern} despite an empty wanted set')
+
+        assert _defined_test_classes([cast(Path, _ExplodingRoot())], set()) == set()
+
+    def test_an_unparseable_file_matching_the_prefilter_raises_naming_it(self, tmp_path):
+        self._tree(tmp_path, {'test_broken.py': 'class TestFooBarBaz:\n    def f(:\n        pass\n'})
+        with pytest.raises(AssertionError, match='test_broken.py'):
+            _defined_test_classes([tmp_path], {'TestFooBarBaz'})
+
+    def test_an_unreadable_file_raises_naming_it(self, tmp_path):
+        """A dangling symlink is yielded by ``rglob`` and raises ``OSError`` on
+        read. Never swallowed, never silently skipped: a skipped file is a file
+        this guard is vacuous for."""
+        (tmp_path / 'test_dangling.py').symlink_to(tmp_path / 'missing.py')
+        with pytest.raises(AssertionError, match='test_dangling.py'):
+            _defined_test_classes([tmp_path], {'TestFooBarBaz'})
+
+
+def _wrapped_candidates(source: str, name: str) -> set[str]:
+    """Names *name* might be, if its citation was WRAPPED across a line break.
+
+    A CANDIDATE GENERATOR ONLY, and deliberately unsound. Joining line-wraps
+    during EXTRACTION was measured to invent names that exist nowhere: in
+    ``shared.locking`` a comment line ends with ``...::TestFileExtensionsDriftGuard``
+    and the next begins ``# Drift guard (...)``, which this join turns into
+    ``TestFileExtensionsDriftGuardDrift``
+    (``test_the_false_positive_that_decided_the_design`` pins exactly that).
+    Applied as an extraction rule it would red-wall the guard on arrival with
+    pure fabrications.
+
+    What makes an unsound generator safe is the CALLER, not the generator:
+    ``_dangling_citations`` invokes this only for a name that has ALREADY
+    failed to resolve, and honours a candidate only when the joined string is
+    itself an AST-confirmed test class. The fabricated name above can never be
+    produced there, because its bare first half resolves on its own and the
+    join is therefore never attempted. Do not "simplify" this back into an
+    extraction rule, and never call it during extraction.
+    """
+    joiner = re.compile(re.escape(name) + r'-?[ \t]*\n[ \t]*#?[ \t]*([A-Z][A-Za-z0-9_]*)')
+    return {name + match.group(1) for match in joiner.finditer(source)}
+
+
+class TestWrappedCandidates:
+    """Unit tests for the line-wrap JOIN generator ``_wrapped_candidates``.
+
+    Both wrap shapes below are drawn from citations that exist for real in the
+    tree, so the fallback is fitted to the population it must recover, not to
+    an invented one.
+    """
+
+    def test_hyphen_wrap_joins(self):
+        """The shape in ``orchestrator.verify``."""
+        source = (
+            '                # double-add. Pinned by TestRunScopedVerificationReverse-\n'
+            '                # DependencyGuards (test_verify_reverse_dep.py, task 2607\n'
+        )
+        assert _wrapped_candidates(source, 'TestRunScopedVerificationReverse') == {
+            'TestRunScopedVerificationReverseDependencyGuards'
+        }
+
+    def test_no_hyphen_wrap_joins(self):
+        """The shape in ``orchestrator.workflow`` — wrapped with no hyphen at
+        all, which is why the join cannot simply key on a trailing dash."""
+        source = (
+            '                    # the REAL _mark_blocked (TestAlreadyLandedLadderWith\n'
+            '                    # RealMarkBlocked) rather than a stub:\n'
+        )
+        assert _wrapped_candidates(source, 'TestAlreadyLandedLadderWith') == {
+            'TestAlreadyLandedLadderWithRealMarkBlocked'
+        }
+
+    def test_wrap_inside_a_docstring_without_a_comment_prefix_joins(self):
+        source = '"""Pinned by TestAlreadyLandedLadderWith\n    RealMarkBlocked.\n    """\n'
+        assert _wrapped_candidates(source, 'TestAlreadyLandedLadderWith') == {
+            'TestAlreadyLandedLadderWithRealMarkBlocked'
+        }
+
+    def test_a_name_not_at_end_of_line_yields_nothing(self):
+        assert _wrapped_candidates('# Pinned by TestFooBarBaz today.\n', 'TestFooBarBaz') == set()
+
+    def test_a_lowercase_continuation_yields_nothing(self):
+        source = '# Pinned by TestFooBarBaz\n# and by nothing else.\n'
+        assert _wrapped_candidates(source, 'TestFooBarBaz') == set()
+
+    def test_the_false_positive_that_decided_the_design(self):
+        """THE reason this helper is a candidate GENERATOR and not an
+        extraction rule. In ``shared.locking`` a comment line ends with
+        ``...::TestFileExtensionsDriftGuard`` and the NEXT line begins ``# Drift
+        guard (...)``, so this pure helper invents a name that exists nowhere.
+        Asserted plainly rather than papered over: the helper alone is UNSOUND,
+        and its safety comes entirely from the caller in ``_dangling_citations``
+        invoking it ONLY for names that already failed to resolve, and honouring
+        a candidate ONLY when the joined name is itself an AST-confirmed class.
+        """
+        source = (
+            '# Drift guard (this shared copy): shared/tests/test_locking.py::TestFileExtensionsDriftGuard\n'
+            '# Drift guard (the other copy): fused-memory/tests/test_lock_charter_guard.py\n'
+        )
+        assert _wrapped_candidates(source, 'TestFileExtensionsDriftGuard') == {
+            'TestFileExtensionsDriftGuardDrift'
+        }
+
+
+class _Citations(NamedTuple):
+    """One src-corpus extraction pass: the citations, and the census proving it swept."""
+
+    locations: dict[str, str]
+    sources: list[str]
+    files: int
+    members: set[str]
+
+
+def _extract_citations(src_dirs: Sequence[Path]) -> _Citations:
+    """THE src sweep: read and tokenize every ``*.py`` under *src_dirs* exactly ONCE.
+
+    Everything downstream is derived from this single pass — both the dangling
+    map and the anti-vacuity census. A second pass would re-read and re-tokenize
+    the whole src corpus to recompute numbers this one already has mid-flight,
+    and, worse, whichever copy ran first would raise a bare
+    ``UnicodeDecodeError``/``TokenError`` naming no file, leaving the
+    remediation message below unreachable for the exact failure it is for.
+
+    A file that cannot be read or tokenized RAISES, naming itself; it is never
+    skipped, because a silently skipped file is a file this guard is vacuous
+    for. Locations are repo-relative when the file is inside the repo (a
+    synthetic tree is not).
+
+    FIRST citing site wins, in ``sorted`` walk order. That is a stated rule
+    rather than an accident of ``setdefault`` — pinned by
+    ``TestDanglingCitations`` — and its honest consequence is that one
+    dangling name cited from several modules is reported one site at a time.
+    """
+    locations: dict[str, str] = {}
+    sources: list[str] = []
+    members: set[str] = set()
+    files = 0
+    for src_dir in src_dirs:
+        for path in sorted(src_dir.rglob('*.py')):
+            files += 1
+            try:
+                source = path.read_text()
+                names = _cited_names(source)
+            except (OSError, ValueError, SyntaxError, tokenize.TokenError) as exc:
+                raise AssertionError(
+                    f'{path} could not be read/tokenized while sweeping for cited '
+                    f'test class names: {exc!r}. Fix the file — a silently skipped '
+                    f'file would make this guard vacuous for it.'
+                ) from exc
+            sources.append(source)
+            if names:
+                members.add(src_dir.parent.name)
+            shown = path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
+            for name, line in names.items():
+                locations.setdefault(name, f'{shown}:{line}')
+    return _Citations(locations=locations, sources=sources, files=files, members=members)
+
+
+def _resolve_dangling(cited: _Citations, test_dirs: Sequence[Path]) -> dict[str, str]:
+    """``{cited name: '<file>:<line>'}`` for every citation in *cited* that does NOT resolve.
+
+    Three passes over the already-extracted corpus. (1) LIVENESS: a sweep that
+    found no citations at all is broken, not clean, and says so — returning
+    ``{}`` here would let this guard pass forever while checking nothing.
+    (2) Resolve the whole cited set in ONE pass. (3) For the remainder only,
+    generate line-wrap join candidates and resolve ALL of them in ONE further
+    pass; a name with a candidate that resolves is not dangling.
+
+    Batching pass (3) is what keeps the fallback a fixed one-pass cost instead
+    of one full re-sweep per unresolved name. A surviving name carries the
+    joined candidates that were tried, so a failure message can show why a
+    wrapped citation was still rejected.
+    """
+    citations, sources = cited.locations, cited.sources
+    if not citations:
+        raise AssertionError(
+            f'the src sweep read {cited.files} file(s) and found no cited test '
+            f'class names at all. The sweep is broken, not the tree clean.'
+        )
+    unresolved = set(citations) - _defined_test_classes(test_dirs, set(citations))
+    tried: dict[str, set[str]] = {name: set() for name in unresolved}
+    for name, candidates in tried.items():
+        for source in sources:
+            candidates.update(_wrapped_candidates(source, name))
+    joined = _defined_test_classes(test_dirs, {c for cs in tried.values() for c in cs})
+    return {
+        name: citations[name]
+        + (f' (also tried joined: {", ".join(sorted(tried[name]))})' if tried[name] else '')
+        for name in sorted(unresolved)
+        if not tried[name] & joined
+    }
+
+
+def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> dict[str, str]:
+    """Extract, then resolve — the whole guard, for callers that do not also
+    need the census. ``_real_tree_sweep`` calls the two halves separately so
+    that the real tree is swept exactly once."""
+    return _resolve_dangling(_extract_citations(src_dirs), test_dirs)
+
+
+class TestDanglingCitations:
+    """THE efficacy proof: evidence that the mechanism can actually FAIL.
+
+    The real tree is green on arrival, so the wired guard below can only ever
+    demonstrate that it passes. Everything that shows this guard is not vacuous
+    lives here, on synthetic trees — the same division of labour as
+    ``test_marker_registration_drift.py::TestUnregisteredMarkers``.
+    """
+
+    @staticmethod
+    def _corpus(root: Path, src: dict[str, str], tests: dict[str, str]):
+        src_dir, test_dir = root / 'pkg' / 'src', root / 'pkg' / 'tests'
+        for target, files in ((src_dir, src), (test_dir, tests)):
+            for name, text in files.items():
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+        return [src_dir], [test_dir]
+
+    _UNRELATED = {'test_a.py': 'class TestSomethingElseEntirely:\n    pass\n'}
+
+    def test_a_planted_dangling_citation_is_reported_with_its_file_and_line(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '"""Summary.\n\nPinned by ``TestNoSuchClassAnywhere``.\n"""\n'},
+            self._UNRELATED,
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {
+            'TestNoSuchClassAnywhere': f'{src_dirs[0] / "mod.py"}:3'
+        }
+
+    def test_a_citation_naming_a_real_class_is_not_reported(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '"""Pinned by ``TestSomethingElseEntirely``."""\n'},
+            self._UNRELATED,
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_the_historical_defect_reproduced_in_miniature(self, tmp_path):
+        """The exact shape ``orchestrator.verify_classify`` carried for ten
+        days: a backticked pin naming a class nobody had written yet."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'verify_classify.py': (
+                '"""Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``,\n'
+                'which exercises the classifier end to end."""\n'
+            )},
+            self._UNRELATED,
+        )
+        assert set(_dangling_citations(src_dirs, test_dirs)) == {
+            'TestAnchoredSlotTimeoutWithCollateralIsEnvTransient'
+        }
+
+    def test_both_wrap_shapes_resolve_when_the_joined_name_exists(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': (
+                '# double-add. Pinned by TestRunScopedVerificationReverse-\n'
+                '# DependencyGuards (the sibling suite).\n'
+                '# the REAL _mark_blocked (TestAlreadyLandedLadderWith\n'
+                '# RealMarkBlocked) rather than a stub:\n'
+            )},
+            {'test_a.py': (
+                'class TestRunScopedVerificationReverseDependencyGuards:\n    pass\n\n'
+                'class TestAlreadyLandedLadderWithRealMarkBlocked:\n    pass\n'
+            )},
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_a_wrap_looking_pair_whose_bare_name_resolves_is_not_mangled(self, tmp_path):
+        """The ``shared.locking`` false positive stays absent end to end: the
+        bare name resolves, so the join is never even attempted."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'locking.py': (
+                '# Drift guard (this copy): tests/test_locking.py::TestFileExtensionsDriftGuard\n'
+                '# Drift guard (other copy): tests/test_charter.py::TestExtensionlessNamesDriftGuard\n'
+            )},
+            {'test_a.py': (
+                'class TestFileExtensionsDriftGuard:\n    pass\n\n'
+                'class TestExtensionlessNamesDriftGuard:\n    pass\n'
+            )},
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_a_wrapped_citation_whose_joined_name_is_absent_is_still_reported(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '# Pinned by TestNoSuchClassAnywhere-\n# ButWrapped (see below).\n'},
+            self._UNRELATED,
+        )
+        dangling = _dangling_citations(src_dirs, test_dirs)
+        assert set(dangling) == {'TestNoSuchClassAnywhere'}
+        reported = dangling['TestNoSuchClassAnywhere']
+        assert f'{src_dirs[0] / "mod.py"}:1' in reported
+        assert 'TestNoSuchClassAnywhereButWrapped' in reported
+
+    def test_the_same_resolving_citation_reworded_is_empty_both_ways(self, tmp_path):
+        """The reword discriminator at GUARD level, not just extractor level."""
+        tests = {'test_a.py': 'class TestOrderingIsPreserved:\n    pass\n'}
+        terse = self._corpus(
+            tmp_path / 'terse', {'mod.py': '"""Pinned by ``TestOrderingIsPreserved``."""\n'}, tests
+        )
+        verbose = self._corpus(
+            tmp_path / 'verbose',
+            {'mod.py': (
+                '"""A completely different summary sentence.\n\n'
+                '    What this function guarantees is ordering across the whole\n'
+                '        batch, and that property is exercised end to end by\n'
+                '        ``TestOrderingIsPreserved``.\n'
+                '    """\n'
+            )},
+            tests,
+        )
+        assert _dangling_citations(*terse) == {}
+        assert _dangling_citations(*verbose) == {}
+
+    def test_a_name_cited_from_several_files_reports_the_first_in_walk_order(self, tmp_path):
+        """FIRST citing site wins, in ``sorted`` walk order — pinned here so it
+        is a stated rule rather than an accident of ``setdefault``. The honest
+        consequence, which this test exists to make visible: one dangling name
+        cited from several modules is reported one site at a time, so clearing
+        it costs one red run per citing site."""
+        cited = '"""Pinned by ``TestNoSuchClassAnywhere``."""\n'
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'a_mod.py': cited, 'z_mod.py': cited}, self._UNRELATED
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {
+            'TestNoSuchClassAnywhere': f'{src_dirs[0] / "a_mod.py"}:1'
+        }
+
+    def test_an_untokenizable_src_file_raises_naming_it(self, tmp_path):
+        """The src-sweep half of the loud-failure pair whose resolution-side
+        half is ``TestDefinedTestClasses.test_an_unparseable_file_matching_the_prefilter_raises_naming_it``.
+
+        ``TestCitedNames`` already pins that the pure extractor RAISES; what is
+        pinned here is the wrapper's message, which must name the file — that
+        remediation text is only reachable through this arm.
+        """
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'broken.py': '"""Unterminated docstring\n'}, self._UNRELATED
+        )
+        with pytest.raises(AssertionError, match='broken.py'):
+            _dangling_citations(src_dirs, test_dirs)
+
+    def test_an_unreadable_src_file_raises_naming_it(self, tmp_path):
+        """A dangling symlink under a src root raises ``OSError`` on read and is
+        translated, naming the file — the src-sweep counterpart of
+        ``TestDefinedTestClasses.test_an_unreadable_file_raises_naming_it``.
+        Never swallowed, never silently skipped."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'mod.py': '"""Pinned by ``TestSomethingElseEntirely``."""\n'}, self._UNRELATED
+        )
+        (src_dirs[0] / 'dangling.py').symlink_to(src_dirs[0] / 'missing.py')
+        with pytest.raises(AssertionError, match='dangling.py'):
+            _dangling_citations(src_dirs, test_dirs)
+
+    def test_a_src_tree_with_no_citations_at_all_raises(self, tmp_path):
+        """LIVENESS. A sweep that finds nothing is broken, not clean — the one
+        outcome that would let this guard pass forever while checking nothing.
+        """
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'mod.py': '"""Prose citing no test class at all."""\n'}, self._UNRELATED
+        )
+        with pytest.raises(AssertionError, match='no cited test class names'):
+            _dangling_citations(src_dirs, test_dirs)
+
+
+def _workspace_members() -> list[str]:
+    """The workspace member roster, read from the root ``pyproject.toml``'s
+    ``[tool.uv.workspace].members`` at runtime rather than hard-coded, so adding
+    or renaming a member cannot silently shrink either corpus."""
+    config = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+    return config['tool']['uv']['workspace']['members']
+
+
+def _src_dirs() -> list[Path]:
+    """Every ``<member>/src`` the workspace actually has, derived at runtime.
+
+    A member without a ``src`` directory is skipped rather than assumed.
+    """
+    return sorted(d for d in (REPO_ROOT / m / 'src' for m in _workspace_members()) if d.is_dir())
+
+
+#: The first-party test roots that belong to no workspace member, and so cannot
+#: be derived from the roster: ``scripts/`` is not a member, and the repo-root
+#: ``tests/`` sits under no ``<member>/`` at all. Each is skipped when absent.
+_EXTRA_TEST_ROOTS = ('scripts/tests', 'tests')
+
+
+def _test_dirs() -> list[Path]:
+    """Every test root a cited class may legitimately be defined under.
+
+    Derived from the SAME member roster as ``_src_dirs`` — one
+    ``<member>/tests`` each — plus ``_EXTRA_TEST_ROOTS``.
+
+    Deliberately NOT ``REPO_ROOT.glob('*/tests')``, which was the shape this
+    module shipped with. That shallow glob also matches top-level trees
+    belonging to no member: in the main checkout it picks up the vendored
+    upstream SUBMODULES' own test suites, which a task worktree never checks
+    out. Two consequences, both removed by deriving the roster instead. An
+    unrelated upstream ``class TestFooBar`` could RESOLVE a genuine dangle —
+    the permissive direction this module refuses everywhere else — and, because
+    the extra trees exist in only one of the two places, the guard would reach
+    a different verdict for an operator in the main checkout than verify
+    reaches in a worktree. Vendored code can also red-wall the guard through
+    ``_defined_test_classes``, which raises on any prefilter-matching file it
+    cannot parse: a vendor bump is not something this repo controls.
+
+    A recursive ``rglob`` is wrong for the same family of reasons plus one of
+    its own: it would descend into ``.worktrees/<id>/...`` and multiply the
+    corpus by every live task lane.
+    """
+    roots = {REPO_ROOT / m / 'tests' for m in _workspace_members()}
+    roots |= {REPO_ROOT / extra for extra in _EXTRA_TEST_ROOTS}
+    return sorted(d for d in roots if d.is_dir())
+
+
+#: FLOORS, deliberately set well below the live values so ordinary tree growth
+#: can never break them, and never equalities or "measured at authorship"
+#: figures — the house pattern
+#: (``test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES``,
+#: ``test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_SCANNERS``). They are
+#: the only numeric constants in this module.
+_MIN_SRC_FILES = 300
+_MIN_TEST_FILES = 900
+_MIN_CITATIONS = 100
+_MIN_CITING_MEMBERS = 3
+
+
+class _Sweep(NamedTuple):
+    """One real-tree sweep plus the census that proves it was not vacuous."""
+
+    dangling: dict[str, str]
+    src_files: int
+    test_files: int
+    citations: set[str]
+    citing_members: set[str]
+
+
+@pytest.fixture(scope='module')
+def _real_tree_sweep() -> _Sweep:
+    """The single real-tree sweep, shared by both tests that need it.
+
+    The census cannot be read off the guard's RESULT: on a green tree that is
+    ``{}`` and says nothing about how much was actually swept, which is exactly
+    the vacuity the census exists to rule out. It is read off the SWEEP
+    instead — ``_extract_citations`` already holds every number mid-flight — so
+    the src corpus is still read and tokenized exactly once, and an unreadable
+    src file fails with that helper's path-naming ``AssertionError`` no matter
+    which consumer trips over it first.
+    """
+    src_dirs, test_dirs = _src_dirs(), _test_dirs()
+    cited = _extract_citations(src_dirs)
+    return _Sweep(
+        dangling=_resolve_dangling(cited, test_dirs),
+        src_files=cited.files,
+        test_files=sum(1 for d in test_dirs for _ in d.rglob('*.py')),
+        citations=set(cited.locations),
+        citing_members=cited.members,
+    )
+
+
+# Co-located on ONE xdist worker (addopts runs `--dist loadgroup`): the two
+# tests below share the module-scoped `_real_tree_sweep`, and without a group
+# tag xdist splits them across workers, each rebuilding that whole-workspace
+# sweep from scratch. MEASURED on this base: 103s split, 67s co-located.
+@pytest.mark.xdist_group('cited_test_class_drift_sweep')
+class TestCitedTestClassDrift:
+    """The deliverable guard, wired to the REAL workspace.
+
+    Green on arrival — every test class cited in src prose today exists — so
+    nothing here can currently fail, and its whole value is in failing on the
+    NEXT false coverage claim. ``TestDanglingCitations`` above carries the
+    burden of proving the mechanism can fail at all.
+    """
+
+    def test_every_cited_test_class_resolves(self, _real_tree_sweep: _Sweep):
+        """THE guard."""
+        dangling = _real_tree_sweep.dangling
+        assert not dangling, (
+            'src prose cites test classes that do not exist:\n'
+            + '\n'.join(f'  {name}  cited at {where}' for name, where in sorted(dangling.items()))
+            + '\n\nA docstring or comment saying a named test class covers '
+            'something is a load-bearing claim of coverage; when that class does '
+            'not exist the claim is FALSE, not a typo, and a reader who trusts '
+            'it skips writing the test. Two remedies, both legitimate: the class '
+            'was renamed or removed, so repoint the citation at whatever '
+            'replaced it; or it was never written, so write it (which is how '
+            'the ten-day verify_classify case in this module\'s docstring was '
+            'eventually closed). Deleting the citation is right ONLY when the '
+            'coverage claim itself was wrong.'
+        )
+
+    def test_the_sweep_is_not_vacuous(self, _real_tree_sweep: _Sweep):
+        """Floors and a structural spread check — no class name and no measured
+        count is asserted anywhere, so nothing here can rot."""
+        assert _real_tree_sweep.src_files >= _MIN_SRC_FILES, (
+            f'swept only {_real_tree_sweep.src_files} src files (floor '
+            f'{_MIN_SRC_FILES}) — the src corpus roots are probably wrong.'
+        )
+        assert _real_tree_sweep.test_files >= _MIN_TEST_FILES, (
+            f'only {_real_tree_sweep.test_files} test files are reachable (floor '
+            f'{_MIN_TEST_FILES}) — citations would resolve against almost nothing.'
+        )
+        assert len(_real_tree_sweep.citations) >= _MIN_CITATIONS, (
+            f'extracted only {len(_real_tree_sweep.citations)} distinct citations '
+            f'(floor {_MIN_CITATIONS}) — the extractor is probably broken.'
+        )
+        assert len(_real_tree_sweep.citing_members) >= _MIN_CITING_MEMBERS, (
+            f'citations came from only {sorted(_real_tree_sweep.citing_members)} '
+            f'(floor {_MIN_CITING_MEMBERS} distinct members) — the sweep is not '
+            f'reaching across the workspace.'
+        )
+
+    def test_corpus_roots_are_derived_not_hardcoded(self):
+        """Both corpora track the workspace at runtime, so adding or renaming a
+        member cannot silently shrink this guard's reach."""
+        members = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+        members = members['tool']['uv']['workspace']['members']
+        expected_src = {REPO_ROOT / m / 'src' for m in members if (REPO_ROOT / m / 'src').is_dir()}
+        assert expected_src, 'the workspace member list yielded no src roots at all'
+        assert set(_src_dirs()) == expected_src
+        test_dirs = set(_test_dirs())
+        assert REPO_ROOT / 'tests' in test_dirs
+        member_tests = {REPO_ROOT / m / 'tests' for m in members if (REPO_ROOT / m / 'tests').is_dir()}
+        assert member_tests <= test_dirs
+        # And nothing else: no top-level tree belonging to no workspace member
+        # may enter the resolution corpus. A bare `*/tests` glob also matches
+        # the vendored upstream submodules, which are checked out in the main
+        # checkout and not in a task worktree — so citations would resolve
+        # against third-party code, and the verdict would depend on where the
+        # suite was run. Derived from the roster here, so this cannot rot.
+        allowed = member_tests | {REPO_ROOT / extra for extra in _EXTRA_TEST_ROOTS}
+        assert test_dirs <= allowed, (
+            f'test roots outside the workspace roster reached the corpus: '
+            f'{sorted(str(d) for d in test_dirs - allowed)}'
+        )

@@ -9,15 +9,17 @@ the copies actually installed in ``~/.config/systemd/user/``:
     orchestrator-solar-challenge-platform.service
     orchestrator-know-live.service         orchestrator-pump-web-ui.service
 
-REBASE NOTE (2026-08-06): the two know-live / pump-web-ui entries were added
-when this branch was rebased onto a main that had, in the interim, wired both
-units into ``setup-host.sh`` (task 3641). They are registered here to keep
-the staleness guard below satisfied — a unit the installer copies but this
+The two know-live / pump-web-ui entries were added 2026-08-06, when this
+branch was rebased onto a main that had, in the interim, wired both units
+into ``setup-host.sh`` (task 3641). They are registered here to keep the
+staleness guard below satisfied — a unit the installer copies but this
 registry omits is installed-but-unchecked, the exact silent-drift failure
-this checker exists to catch — but neither has had a parity MEASUREMENT taken
-against this host as part of that rebase. Treat their drift status as
-unknown, not green, until this checker is actually run against
-``~/.config/systemd/user``.
+this checker exists to catch. The REBASE NOTE that stood here, saying
+neither had had a parity MEASUREMENT taken against this host, is DISCHARGED:
+task 4882 ran this checker against ``~/.config/systemd/user`` on 2026-09-05
+and both are ``clean``. See the KNOWN RED section below for the full
+measurement and for why the figures here are dated rather than asserted as
+current.
 
 The purpose is narrow and concrete: make it OBSERVABLE when a repo-side unit
 change never reaches the running system.  A unit edit that stays repo-side is
@@ -133,81 +135,113 @@ flag exits 2 with no tag, produces no verdicts, and installs nothing.
 
 KNOWN RED on this host
 ----------------------
-As measured 2026-08-02, the five ``orchestrator-*.service`` entries all
-diverge from their committed copies and this checker reports drift for them:
+CURRENT STATE, measured 2026-09-05 with ``--print-verdicts`` (task 4882).
+Seven of the nine units are ``clean``.  The family is NO LONGER red on
+arrival, and the two findings that remain are both DELIBERATE and OWNED:
 
-- ALL FIVE installed copies lack ``RestartSteps=4`` while declaring
-  ``RestartMaxDelaySec=60``.  systemd requires the former for the latter to
-  take effect — without it it logs "has RestartMaxDelaySec= but no
-  RestartSteps= setting. Ignoring." and DISCARDS the cap — so the restart
-  backoff ceiling those units appear to have is silently inert today.  Here
-  the REPO copy is the correct one.
-- FOUR disagree on the ExecStart ``--config`` path, and in the direction
-  opposite to the one above: the INSTALLED copies name the canonical
-  ``dark-factory-orchestrator.yaml`` that CLAUDE.md requires, while the
-  COMMITTED copies still name legacy ``orchestrator.yaml`` /
-  ``orchestrator-config.yaml``.  Here the INSTALLED copy is the correct one.
-- ``orchestrator-reify.service``'s installed copy lacks
-  ``RequiresMountsFor=/home/leo/src/warm-lanes`` — but carries a drop-in
-  (``orchestrator-reify.service.d/warm-lane.conf``) instead, which is why
-  this unit also reports ``[override]``.
+- ``orchestrator-watchdog.service`` — ``drift``.  The sole differing
+  directive is an INSTALLED-ONLY ``Environment=ORCH_RESTART_MIN_INTERVAL_SECS=259200``
+  (72h) that the committed copy does not carry.  It is a documented,
+  self-expiring deploy pause added host-side 2026-09-03 (the installed
+  unit's own header comment carries the rationale and the measurements),
+  throttling the watchdog's STALENESS redeploy tier from its 8h default.
+  OWNED by task 5020, whose escalation is the trigger to remove it.
+- ``orchestrator-reify.service`` — ``override``.  The
+  ``orchestrator-reify.service.d/warm-lane.conf`` drop-in is deliberate
+  (task 2100's ``RequiresMountsFor=/home/leo/src/warm-lanes``, carried as a
+  drop-in rather than in the unit).  Task 4198 made the installer's skip
+  PER UNIT precisely so this permanent, intentional divergence stops
+  withholding the install from the other eight.
 
-DO NOT "fix" that second bullet by forcing an install.  Measured
-2026-08-02: ``/home/leo/src/reify/orchestrator.yaml`` and
+Note the DIRECTION of the live drift, because it is the mirror image of the
+2026-08-02 first bullet below: there the INSTALLED copies were the ones
+missing a directive, so the repo side was right; here the installed copy is
+the SUPERSET and the repo side is the one that must not be propagated.
+Installing the committed watchdog unit today would silently delete a
+deliberate throttle and resume 8h fleet redeploys — which is the
+``[drift] BUT CHECK DIRECTION FIRST`` line's live, present-tense
+justification, no longer merely a historical one.
+
+HISTORICAL (2026-08-02), RESOLVED by commit 4fcd43eec0 (task 3512, landed
+2026-08-04).  Both bullets below were live when this checker was written and
+are retained because they are the recorded EVIDENCE for policies that are
+still in force — not because they still describe this host:
+
+- HISTORICAL: all five installed ``orchestrator-*.service`` copies lacked
+  ``RestartSteps=4`` while declaring ``RestartMaxDelaySec=60``.  systemd
+  requires the former for the latter to take effect — without it it logs
+  "has RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." and
+  DISCARDS the cap — so the restart backoff ceiling those units appeared to
+  have was silently inert.  Here the REPO copy was the correct one.
+- HISTORICAL: four disagreed on the ExecStart ``--config`` path, and in the
+  direction OPPOSITE to the one above: the INSTALLED copies named the
+  canonical ``dark-factory-orchestrator.yaml`` that CLAUDE.md requires,
+  while the COMMITTED copies still named legacy ``orchestrator.yaml`` /
+  ``orchestrator-config.yaml``.  Here the INSTALLED copy was the correct
+  one.  Re-measured 2026-09-05: every committed ``--config`` path now names
+  the canonical spelling and every one EXISTS; the two legacy paths named
+  below do not exist and are named by no committed unit.
+
+DO NOT "fix" a ``--config`` disagreement by forcing an install.  This is a
+POLICY, and the instance that motivated it is the second bullet above:
+measured 2026-08-02, ``/home/leo/src/reify/orchestrator.yaml`` and
 ``/home/leo/src/autopilot-video/orchestrator-config.yaml`` — the paths the
-COMMITTED units name — DO NOT EXIST.  Only the canonical
-``dark-factory-orchestrator.yaml`` does.  So the ``cp`` block in
-``setup-host.sh`` would overwrite two working installed units with committed
-ones pointing at absent config files, breaking both orchestrators on their
-next restart.  This is the exact hazard the "no ``--fix``" note below
-describes, and it is live TODAY: for these four units the committed file is
-the thing that is wrong, and it must be corrected in the repo BEFORE any
-install propagates it.  That hazard is why ``setup-host.sh`` runs this check
-PRE-install and, on drift, SKIPS the orchestrator unit install rather than
-merely warning — a warning in a non-interactive ``set -e`` script scrolls
-past and the next line does the overwrite anyway.  An operator who has read
-the report and decided the committed side is right proceeds with
-``DF_INSTALL_ORCH_UNITS=1``.  The gate never aborts the installer itself.
+COMMITTED units then named — DID NOT EXIST.  Only the canonical
+``dark-factory-orchestrator.yaml`` did.  So the ``cp`` block in
+``setup-host.sh`` would have overwritten two working installed units with
+committed ones pointing at absent config files, breaking both orchestrators
+on their next restart.  THAT PARTICULAR HAZARD IS DISCHARGED (4fcd43eec0);
+the policy it justifies is not, and the 2026-09-05 watchdog drift above is a
+current instance of the same shape in a different directive.  The policy is
+why ``setup-host.sh`` runs this check PRE-install and, on a finding, SKIPS
+that unit's install rather than merely warning — a warning in a
+non-interactive ``set -e`` script scrolls past and the next line does the
+overwrite anyway.  An operator who has read the report and decided the
+committed side is right proceeds with ``DF_INSTALL_ORCH_UNITS=1``.  The gate
+never aborts the installer itself.
 
 Since task 4198 that skip is PER UNIT — the installer reads the verdict
 channel above and declines only the units that did not clear, installing the
 rest on the same run.  The policy is unchanged: a unit with a finding is
-still never overwritten without ``DF_INSTALL_ORCH_UNITS=1``.  So the four
-units in the second bullet are still protected from exactly the overwrite
-this section warns about, while a permanent, deliberate divergence on one
-unit no longer withholds the install from every other.
-
-Fixing all five is OWNED by the follow-up filed from task 3424 as ticket
-``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``.  Task 3424 deliberately converged only
-the two watchdog units on the live host, and the measurement above is why
-that scoping was right: the five need a per-unit judgement about WHICH side
-is correct (repo for RestartSteps, installed for ExecStart) plus a restart of
-the running fleet — not a blanket copy in either direction.
+still never overwritten without ``DF_INSTALL_ORCH_UNITS=1``.  So the two
+units named at the top of this section are protected from exactly the
+overwrite this section warns about, while a permanent, deliberate divergence
+on one unit no longer withholds the install from every other.
 
 Naming the owner here is not bookkeeping.  ``check_dashboard_unit_parity.py``
 records that a permanently-red gate gets switched off within a week — taking
 the accidental drift it exists to catch with it — and accepted its own
-red-on-arrival unit only because a named task owned the fix.  That is the
-condition being met here, so the red is OWNED rather than ambient.  The
-repeatable ``--unit`` filter lets an operator scope a run meanwhile.
+red-on-arrival unit only because a named task owned the fix.  That condition
+is still met: task 5020 owns the watchdog throttle (and it self-expires
+anyway), and the reify drop-in is a standing intentional divergence that
+task 4198 already accommodated per-unit.  The red is OWNED, not ambient.
+The repeatable ``--unit`` filter lets an operator scope a run meanwhile.
+The five-unit convergence that ticket ``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``
+(filed from task 3424) was raised for is DONE — task 3512 landed it, per the
+HISTORICAL bullets above.
 
-REBASE NOTE (2026-08-06): the "FOUR disagree on the ExecStart --config path"
-finding above and its "DO NOT fix by forcing an install" warning are dated
-2026-08-02.  Commit 4fcd43eec0 (task 3512, landed 2026-08-04 — after this
-branch's fork point) repointed the reify / autopilot-video / my-solar-challenge
-/ solar-challenge-platform TEMPLATES at the canonical
-``dark-factory-orchestrator.yaml`` and reports reconciling the installed
-copies' RestartSteps=4 and reify's RequiresMountsFor by hand at the same time.
-That means the specific two-direction hazard this section describes may
-already be resolved on this host — but that was not independently
-re-measured as part of this rebase (this checker was not run against the live
-``~/.config/systemd/user`` here, deliberately, per this task's constraints).
-Do not treat the 2026-08-02 numbers above as current; re-run this checker
-against the live host before relying on either bullet.
+REBASE NOTES (2026-08-06) — DISCHARGED 2026-09-05, both by measurement.
+Two notes stood here and at the head of this docstring, and the whole content
+of each was "these numbers were not re-measured against the live host".  Task
+4882 ran this checker against ``~/.config/systemd/user`` and recorded the
+result above, which is what they asked for, so they are retired rather than
+left standing — an un-actioned "this may be stale" note is what makes a
+section stale BY CONSTRUCTION, since it never expires on its own.  For the
+record: ``orchestrator-know-live.service`` and ``orchestrator-pump-web-ui.service``
+(the two units the head-of-docstring note added without a measurement) are
+both ``clean``, and the ExecStart ``--config`` hazard the second note
+suspected 4fcd43eec0 had already fixed had indeed been fixed.
+
+READING THIS SECTION LATER: it is dated on purpose.  The host has moved under
+it three times (2026-08-02, 2026-08-16, 2026-09-05), disagreeing each time.
+Re-run ``python3 scripts/check_orchestrator_unit_parity.py --print-verdicts``
+— it is read-only and cannot mutate the host — before relying on any figure
+here.
 
 Design notes
 ------------
-- Stdlib-only (argparse, dataclasses, pathlib, sys) plus the shared parser —
+- Stdlib-only (argparse, pathlib, sys) plus the shared
+  ``scripts/systemd_unit_parity.py``, which is itself stdlib-only —
   runs under a plain python3, exactly like the two sibling checkers whose
   idioms this script follows deliberately rather than inventing a pattern.
 - The parser is imported from ``scripts/systemd_unit_parity.py``, which was
@@ -245,7 +279,6 @@ encodes host state rather than checker behaviour.
 """
 
 import argparse
-import dataclasses
 import pathlib
 import sys
 from collections.abc import Sequence
@@ -255,7 +288,12 @@ from collections.abc import Sequence
 # check_dashboard_unit_parity.py until check_lms_unit_parity.py would have made
 # it three copies; this suite's existing find_dropins tests still call
 # mod.find_dropins, so they are what proves the lift was behaviour-preserving.
-from systemd_unit_parity import find_dropins, parse_unit_directives
+from systemd_unit_parity import (
+    _ABSENT,
+    Drift,
+    find_dropins,
+    parse_unit_directives,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -301,23 +339,9 @@ def _log(message: str, *, stream=None) -> None:
 # Drift records and comparison
 # ---------------------------------------------------------------------------
 
-# Rendered in place of a value on whichever side does not declare the
-# directive at all.  Deliberately not '' or None: it appears verbatim in the
-# operator's report, where "<absent>" reads unambiguously and an empty string
-# would look like a directive set to nothing.
-_ABSENT = "<absent>"
-
-
-@dataclasses.dataclass(frozen=True)
-class Drift:
-    """One disagreement between the repo copy and the installed copy."""
-
-    unit: str
-    section: str
-    key: str
-    repo_value: str
-    installed_value: str
-    reason: str
+# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
+# (see the import above). They were code-identical in all three checkers; the
+# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 def _render(values: list[str] | None) -> str:
@@ -465,8 +489,9 @@ UNITS: dict[str, str] = {
         "scripts/orchestrator-solar-challenge-platform.service"
     ),
     # Added by this branch's 2026-08-06 rebase onto main: task 3641 wired both
-    # of these into setup-host.sh's cp block after this branch forked. See the
-    # module docstring's REBASE NOTE — neither has a measured parity status.
+    # of these into setup-host.sh's cp block after this branch forked. Both
+    # measured `clean` 2026-09-05 (task 4882) — see the module docstring's
+    # KNOWN RED section, which retired the REBASE NOTE that stood here.
     "orchestrator-know-live.service": "scripts/orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service": "scripts/orchestrator-pump-web-ui.service",
 }
@@ -724,11 +749,17 @@ def main(argv: Sequence[str]) -> int:
             "says why there is no --fix.)"
         )
         # Deliberately NOT phrased as "the installed copy is stale". The
-        # report above shows drift, not direction: measured 2026-08-02, some
-        # of these units have the correct value on the REPO side
-        # (RestartSteps) and others on the INSTALLED side (the ExecStart
-        # --config path, where two committed units name config files that do
-        # not exist). Propagating blindly would break a running orchestrator.
+        # report above shows drift, not direction, and which side is right
+        # has varied per unit on every measurement taken. Measured 2026-08-02
+        # the REPO side was correct for some (RestartSteps) and the INSTALLED
+        # side for others (the ExecStart --config path, where two committed
+        # units named config files that did not exist); both are resolved
+        # (4fcd43eec0, task 3512). Measured 2026-09-05 the one live drift runs
+        # the other way again — orchestrator-watchdog.service carries an
+        # installed-only Environment=ORCH_RESTART_MIN_INTERVAL_SECS the repo
+        # lacks, a deliberate deploy pause owned by task 5020 — so installing
+        # the committed copy would silently delete it. Propagating blindly
+        # would break, or quietly un-throttle, a running orchestrator.
         _log(
             "[drift] BUT CHECK DIRECTION FIRST: drift does not mean the "
             "installed copy is the stale one. Confirm the committed value is "

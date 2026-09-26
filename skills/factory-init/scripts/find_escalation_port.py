@@ -131,7 +131,7 @@ def main() -> int:
     df_root = Path(args.df_root).resolve()
     exclude = Path(args.exclude_root).resolve() if args.exclude_root else None
 
-    used: dict[int, str] = {}
+    used: dict[int, list[str]] = {}
     for root in known_project_roots(df_root):
         if exclude and root.resolve() == exclude:
             continue
@@ -140,7 +140,7 @@ def main() -> int:
             continue
         port = escalation_port(cfg)
         if port is not None:
-            used[port] = f"{root.name} ({cfg.relative_to(root)})"
+            used.setdefault(port, []).append(f"{root.name} ({cfg.relative_to(root)})")
 
     print("Escalation port survey", file=sys.stderr)
     print("-" * 60, file=sys.stderr)
@@ -149,7 +149,7 @@ def main() -> int:
         print(f"  {p}  {why}", file=sys.stderr)
     print("Claimed by existing project configs:", file=sys.stderr)
     for p in sorted(used):
-        print(f"  {p}  {used[p]}", file=sys.stderr)
+        print(f"  {p}  {', '.join(used[p])}", file=sys.stderr)
     if not used:
         print("  (none found)", file=sys.stderr)
 

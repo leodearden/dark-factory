@@ -78,6 +78,7 @@ def _reset_landlock_probe():
 
 
 _VAR_TMP_SKIP_REASON = '/var/tmp not writable in this sandbox'
+_LANDLOCK_SKIP_REASON = 'landlock not supported on this kernel'
 
 
 @functools.cache
@@ -107,11 +108,12 @@ def _var_tmp_writable() -> bool:
 def _skip_var_tmp() -> bool:
     """Whether /var/tmp-dependent tests should be skipped in this environment.
 
-    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — set by CI jobs known to have a
-    writable /var/tmp and a landlock-capable kernel — an unwritable /var/tmp is
-    an environment regression, not a reason to skip: quietly dropping all 12
-    enforcement-matrix rows would leave the suite green while every denial
-    assertion stopped running. Fail loudly there instead (mirrors
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — armed via ``verify_env`` in the
+    top-level ``dark-factory-orchestrator.yaml`` (task 4635) on hosts known to
+    have a writable /var/tmp and a landlock-capable kernel — an unwritable
+    /var/tmp is an environment regression, not a reason to skip: quietly
+    dropping all 12 enforcement-matrix rows would leave the suite green while
+    every denial assertion stopped running. Fail loudly there instead (mirrors
     test_landlock.py's copy).
     """
     if _var_tmp_writable():
@@ -119,6 +121,32 @@ def _skip_var_tmp() -> bool:
     if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
         pytest.fail(
             f'DF_REQUIRE_SANDBOX_TESTS=1 but {_VAR_TMP_SKIP_REASON}: refusing to '
+            'silently skip the real-kernel sandbox enforcement matrix.',
+            pytrace=False,
+        )
+    return True
+
+
+def _skip_landlock() -> bool:
+    """Whether landlock-dependent tests should be skipped in this environment.
+
+    The mirror of ``_skip_var_tmp`` above, for the OTHER arm of this suite's
+    two-part guard: all 12 rows need BOTH a writable /var/tmp (checked in the
+    scaffold fixture) AND a landlock-capable kernel (checked by the class
+    decorator), so arming only the /var/tmp arm would still let every row
+    vanish silently whenever the availability probe went False — the same
+    green-suite / empty-surface failure, relocated to the other guard (task
+    4635 amendment). Fail loudly under ``DF_REQUIRE_SANDBOX_TESTS=1`` instead.
+
+    Mirrors test_landlock.py's copy — see that one for the full rationale,
+    including why ``TestLandlockRefer``'s ``ABI < 2`` arm is deliberately left
+    quiet even when armed.
+    """
+    if is_landlock_available():
+        return False
+    if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
+        pytest.fail(
+            f'DF_REQUIRE_SANDBOX_TESTS=1 but {_LANDLOCK_SKIP_REASON}: refusing to '
             'silently skip the real-kernel sandbox enforcement matrix.',
             pytrace=False,
         )
@@ -340,10 +368,7 @@ def landlock_matrix_scaffold():
         shutil.rmtree(base, ignore_errors=True)
 
 
-@pytest.mark.skipif(
-    not is_landlock_available(),
-    reason='landlock not supported on this kernel',
-)
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 class TestSandboxEnforcementMatrix:
     """The 12 §Enforcement-matrix rows, each driven against the real
     ``compute_write_set()`` -> ``build_landlock_command()`` ->

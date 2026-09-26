@@ -107,6 +107,49 @@ class TestGetDeadLettersDurableQueue:
         )
 
     @pytest.mark.asyncio
+    async def test_durable_queue_items_forward_the_executed_fact(self):
+        """The replay decision's one fact must survive the MCP boundary.
+
+        ``get_dead_letters`` re-projects each ``get_dead_items`` row into a
+        fixed dict, so any key it does not list never leaves the process.
+        Dropping ``executed`` there reduces an operator back to string-matching
+        ``error`` prose — which for a durable_queue row never carries
+        POST_EXECUTE_DEAD_PREFIX at all, since the prefix is applied only to
+        the terminal-hook error that lands in ``write_ops.terminal_error``.
+
+        All three values must forward UNCHANGED, the unknown one especially:
+        ``None`` has to arrive as a present key whose value is None, not
+        absent and not False, or the operator reads "unknown" as "safe to
+        replay".
+        """
+        rows = [
+            {**_FAKE_DEAD_ITEMS[0], 'id': 21, 'executed': True},
+            {**_FAKE_DEAD_ITEMS[0], 'id': 22, 'executed': False},
+            {**_FAKE_DEAD_ITEMS[0], 'id': 23, 'executed': None},
+        ]
+        svc = _make_mock_service(get_dead_items_return=rows)
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'get_dead_letters',
+            {'project_id': 'proj1', 'limit': 50},
+        )
+
+        forwarded = {
+            item['id']: item
+            for item in result['items']
+            if item['source'] == 'durable_queue'
+        }
+        assert set(forwarded) == {21, 22, 23}
+        assert forwarded[21]['executed'] is True
+        assert forwarded[22]['executed'] is False
+        assert 'executed' in forwarded[23], (
+            'the unknown row must still carry the key — an absent key reads '
+            'the same as False to every caller that uses .get()'
+        )
+        assert forwarded[23]['executed'] is None
+
+    @pytest.mark.asyncio
     async def test_no_durable_queue_returns_empty(self):
         """When durable_queue is None, tool returns empty items without raising."""
         svc = AsyncMock()

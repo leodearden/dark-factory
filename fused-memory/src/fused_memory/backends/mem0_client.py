@@ -47,7 +47,7 @@ class ScrollPageBudgetExhausted(RuntimeError):
 
     The stream is TRUNCATED, so the pager raises rather than ending short —
     a caller that folded a short stream into counters would under-report with
-    no error surface (INV-2 no-silent-fail-soft).
+    no error surface (INV-11 no-silent-fail-soft).
 
     ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
     ALIAS of this class (not a subclass): the census's ``except
@@ -59,7 +59,7 @@ class ScrollPointBudgetExhausted(RuntimeError):
     """A paged scroll consumed a caller-supplied *max_points* cap.
 
     Raised, not returned short, for the same reason as its sibling: the
-    primitive never truncates silently (INV-2 no-silent-fail-soft).  A caller
+    primitive never truncates silently (INV-11 no-silent-fail-soft).  A caller
     that wants a quiet capped read converts this into its own flag; a caller
     that does not pass ``max_points`` can never see it.
 
@@ -976,11 +976,21 @@ class Mem0Backend:
                 into an empty list.
 
         Returns:
-            ``{'matches': [...], 'scanned': int, 'truncated': bool}`` where
-            each match is ``{'id', 'created_at', 'matched_fragments',
-            'excerpt', 'metadata'}``. ``scanned`` counts every point walked,
-            including non-matching ones, so it is a correct denominator for an
-            incidence rate.
+            ``{'matches': [...], 'scanned': int, 'truncated': bool,
+            'collection': str}`` where each match is ``{'id', 'created_at',
+            'matched_fragments', 'excerpt', 'metadata'}``. ``scanned`` counts
+            every point walked, including non-matching ones, so it is a correct
+            denominator for an incidence rate.
+
+            ``collection`` is the Qdrant collection this call actually
+            scrolled — the same name passed to every ``client.scroll`` below,
+            not a re-derivation. It is reported because a scan result is a
+            MEASUREMENT of a collection, and a measurement that does not
+            identify what it measured cannot be audited later: the
+            authoritative 21,089-point 2026-08-05 incidence sweep committed
+            two reports whose ``collection`` field was blank precisely because
+            this key was absent and its caller's ``.get(..., '')`` default
+            filled the hole silently (task 3243).
 
         Raises:
             TimeoutError: If any scroll page exceeds the read timeout —
@@ -1109,7 +1119,14 @@ class Mem0Backend:
                 exhaustive,
             )
 
-        return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
+        return {
+            'matches': matches,
+            'scanned': scanned,
+            'truncated': truncated,
+            # The name actually scrolled above, reported rather than re-derived
+            # by the caller — see the Returns: note.
+            'collection': collection_name,
+        }
 
     async def scroll_collection_pages(
         self,

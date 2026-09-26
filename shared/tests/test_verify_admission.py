@@ -66,7 +66,7 @@ class TestModuleExports:
     def test_all_is_exactly_the_public_seam(self):
         import shared.verify_admission as va
 
-        assert set(va.__all__) == {'acquire_task_slot', 'nice_prefix'}
+        assert set(va.__all__) == {'acquire_task_slot', 'is_gated_role', 'nice_prefix'}
 
 
 class TestAcquireInProcess:

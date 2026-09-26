@@ -205,11 +205,11 @@
       "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl"
     },
     {
-      "commit": "2b826410ffc6593a44b69bdbd287df9180e58b88",
+      "commit": "234bf88e1f0ba9cc920cba39a799b1864aa834f4",
       "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
     },
     {
-      "commit": "239bcf0f810c60b76216e6a675020fc7cf13beb8",
+      "commit": "9cff4de183361dfa86d9141b280b48efe149cb2d",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],
@@ -234,7 +234,7 @@
       },
       "family_share": 0.645536,
       "harvested_at": "2026-08-15T22:49:03.292761+00:00",
-      "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+      "journal_path": "data/reconciliation/write_journal.db",
       "literal_share": 0.520202,
       "scored_limit": 5,
       "scored_limit_basis": "briefing.py:1376 fires the four briefing-assembler queries at limit=5. It governs nothing else. The residual tail is arbitrary other callers running at 3-50, so scoring the tail at 5 is a CHOICE made for comparability with the briefing half, not a limit observed on those queries. Per-row observed_limits carry what was actually recorded.",

@@ -31,6 +31,19 @@ Usage
   # Restrict scan to a specific Taskmaster tag.
   python scripts/audit_duplicate_tasks.py --project-root /path/to/project \\
       --tag master
+
+WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
+-------------------------------------------------------------
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
+worktree has none, and merely reaching ``get_tasks`` would create one empty and
+yield an empty audit plan -- indistinguishable from a project with no
+duplicates.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
 """
 
 from __future__ import annotations
@@ -43,6 +56,8 @@ import logging
 import sys
 from dataclasses import dataclass
 from typing import Any
+
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('audit_duplicate_tasks')
 
@@ -490,6 +505,8 @@ async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
+
+    assert_task_store_exists(args.project_root, operation='audit_duplicate_tasks')
 
     import os  # noqa: PLC0415
 

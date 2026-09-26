@@ -5,6 +5,9 @@
 // DF-specific and pinned to that date. Adapt via references/orchestration.md, which
 // also folds in fixes for the failure modes this run exposed (degenerate miner
 // output, mining_summaries noise, verdict-count conflation).
+// STALE SOURCE: the tracker has since moved to `.taskmaster/tasks/tasks.db` (SQLite). The
+// tasks.json this script mines below was retired at the 2026-05-06 cutover and DELETED
+// 2026-08-25 — retarget it via references/orchestration.md rather than copying these lines.
 export const meta = {
   name: 'bug-hotspot-survey',
   description: 'Mine git/task history for bug hotspots, deep-review each, verify findings, synthesize cross-system improvements',

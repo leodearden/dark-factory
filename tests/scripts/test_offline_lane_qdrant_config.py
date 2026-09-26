@@ -21,52 +21,48 @@ rather than a raw yaml.safe_load: OrchestratorConfig is declared with
 would otherwise silently drop the value and revert to the field's default
 with no error anywhere. Mirrors
 tests/scripts/test_orchestrator_restart_config_drift.py::test_orchestrator_restart_config_round_trips_through_config_model.
+
+Anchors ``ORCH_CONFIG_PATH`` via the directory-wide ``root_config`` fixture
+(tests/scripts/conftest.py, task 4320/4598) rather than open-coding its own
+``monkeypatch.setenv`` + ``OrchestratorConfig()`` construction — see that
+fixture's docstring for why the anchor is load-bearing rather than hygiene.
 """
 
-import pathlib
-
-import pytest
 from orchestrator.config import LaneCommand, OrchestratorConfig
-
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 
 def test_offline_lane_qdrant_config_round_trips_through_config_model(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
 ) -> None:
     """dark-factory-orchestrator.yaml must instantiate the qdrant-integration
     offline-lane sub-run with the three gate flags plus its own LaneCommand.
 
     Other lane entries may coexist; this asserts only the qdrant one.
     """
-    monkeypatch.setenv("ORCH_CONFIG_PATH", str(DF_CONFIG_PATH))
-    config = OrchestratorConfig()
-
-    assert config.git.offline_lane_enabled is True, (
-        "config.git.offline_lane_enabled did not bind to True from the "
+    assert root_config.git.offline_lane_enabled is True, (
+        "root_config.git.offline_lane_enabled did not bind to True from the "
         "committed YAML — check for a field rename/typo in config.py "
         "(OrchestratorConfig uses extra='ignore', so a mismatch silently "
         "reverts to the disabled-by-default default instead of raising)"
     )
-    assert config.git.persistent_offline_deep_worktree is True, (
-        "config.git.persistent_offline_deep_worktree did not bind to True "
+    assert root_config.git.persistent_offline_deep_worktree is True, (
+        "root_config.git.persistent_offline_deep_worktree did not bind to True "
         "from the committed YAML — the offline-deep lane worker cannot run "
         "without its dedicated worktree even if offline_lane_enabled is True "
         "(check for a field rename/typo in config.py)"
     )
-    assert config.git.offline_lane_legacy_numeric_enabled is False, (
-        "config.git.offline_lane_legacy_numeric_enabled did not bind to "
+    assert root_config.git.offline_lane_legacy_numeric_enabled is False, (
+        "root_config.git.offline_lane_legacy_numeric_enabled did not bind to "
         "False from the committed YAML — dark-factory has no "
         "scripts/run-offline-deep.sh, so leaving this at its True default "
         "would make the offline-deep worker attempt a nonexistent script "
         "(check for a field rename/typo in config.py)"
     )
 
-    commands = config.git.offline_lane_commands
+    commands = root_config.git.offline_lane_commands
     matches = [c for c in commands if getattr(c, "name", None) == "qdrant-integration"]
     assert len(matches) == 1, (
-        "config.git.offline_lane_commands did not round-trip exactly one "
+        "root_config.git.offline_lane_commands did not round-trip exactly one "
         f"'qdrant-integration' entry from the committed YAML (got "
         f"{len(matches)}; all entries: "
         f"{[getattr(c, 'name', None) for c in commands]!r}) — check for a "

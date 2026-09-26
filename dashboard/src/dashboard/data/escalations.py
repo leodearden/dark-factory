@@ -252,7 +252,7 @@ def _merge_summaries(summaries: list[dict]) -> dict:
     malformed, and defaulting it would turn "this summary was built by a path
     that forgot to count skips" into a confident "0 unreadable" — precisely the
     silent-zero the key exists to eliminate.  Fail loud on a ``KeyError``
-    instead (INV-2, ``no-silent-fail-soft``).
+    instead (INV-11, ``no-silent-fail-soft``).
     """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
@@ -415,6 +415,7 @@ async def _fetch_pins_one(
         result = await asyncio.wait_for(
             mcp_tool_call(
                 client, base_url, 'get_pending_escalations', {'compact': True},
+                timeout=timeout,
             ),
             timeout=timeout,
         )
