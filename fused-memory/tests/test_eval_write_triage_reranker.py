@@ -346,7 +346,7 @@ class TestMeasureArm:
         spec = _spec(unavailable=arms.ArmUnavailable(
             arms.SkipReason.no_credential, 'JINA_API_KEY unset',
         ))
-        row = _measure(spec, self._cases(), []).to_json()
+        row = _measure(spec, self._cases(), [0.0]).to_json()
         assert (row['status'], row['skip_reason'], row['skip_detail']) == (
             'skipped', 'no_credential', 'JINA_API_KEY unset',
         )

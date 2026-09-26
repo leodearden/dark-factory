@@ -40,8 +40,8 @@ import importlib.util
 import logging
 import sys
 import types
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +70,9 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 
 _calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+_arms = _load_script(
+    _SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
+)
 
 
 def load_retrieval() -> types.ModuleType:
@@ -84,6 +87,10 @@ LABEL_PSEUDO_CONTRADICTION = _calibrate.LABEL_PSEUDO_CONTRADICTION
 load_fixture = _calibrate.load_fixture
 load_canonical_aliases = _calibrate.load_canonical_aliases
 package_relative = _calibrate.package_relative
+
+ArmStatus = _arms.ArmStatus
+SkipReason = _arms.SkipReason
+ArmUnavailable = _arms.ArmUnavailable
 
 RANK_KS = (1, 5)
 
@@ -265,3 +272,201 @@ def ranking_metrics(
         for (_, scores), order, hit in zip(scored, orders, first_hits, strict=True)
     ]
     return RankingMetrics(rank1=rank1, rank5=rank5, auc=_auc_block(cases, pair_scores))
+
+
+@dataclass(frozen=True)
+class LatencyStats:
+    slates_timed: int
+    pairs_per_slate_min: int | None
+    pairs_per_slate_max: int | None
+    load_seconds: float
+    warmup_slates: int
+
+
+@dataclass(frozen=True)
+class ArmRow:
+    """One arm's report row. A skipped row carries every metric as None, never 0."""
+
+    arm: str
+    arm_class: str
+    model: str
+    status: str
+    skip_reason: str | None = None
+    skip_detail: str | None = None
+    ranking: RankingMetrics | None = None
+    p50_seconds: float | None = None
+    p95_seconds: float | None = None
+    latency: LatencyStats | None = None
+    cost_per_write_usd: float | None = None
+    device: str | None = None
+    vram_peak_mib: float | None = None
+    max_length: int | None = None
+    pairs_over_max_length: int | None = None
+
+    @classmethod
+    def skipped(cls, spec: _arms.ArmSpec, reason: str, detail: str) -> ArmRow:
+        return cls(
+            arm=spec.name, arm_class=str(spec.arm_class), model=spec.model,
+            status=ArmStatus.skipped, skip_reason=reason, skip_detail=detail,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        ranking = self.ranking
+        return {
+            'arm': self.arm,
+            'arm_class': self.arm_class,
+            'model': self.model,
+            'status': str(self.status),
+            'skip_reason': None if self.skip_reason is None else str(self.skip_reason),
+            'skip_detail': self.skip_detail,
+            'rank1_rate': ranking.rank1.rate if ranking else None,
+            'rank5_rate': ranking.rank5.rate if ranking else None,
+            'rank1': _hits_and_total(ranking.rank1) if ranking else None,
+            'rank5': _hits_and_total(ranking.rank5) if ranking else None,
+            'auc': asdict(ranking.auc) if ranking else None,
+            'p50_seconds': self.p50_seconds,
+            'p95_seconds': self.p95_seconds,
+            'latency': asdict(self.latency) if self.latency else None,
+            'cost_per_write_usd': self.cost_per_write_usd,
+            'device': self.device,
+            'vram_peak_mib': self.vram_peak_mib,
+            'max_length': self.max_length,
+            'pairs_over_max_length': self.pairs_over_max_length,
+        }
+
+
+def _hits_and_total(count: RateCount) -> dict[str, int]:
+    return {'hits': count.hits, 'total': count.total}
+
+
+class _OverBudget(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _TimedSlate:
+    index: int
+    slate: _arms.SlateScores
+    seconds: float
+    pairs: int
+
+
+def _score_case(scorer: _arms.Scorer, case: RerankCase) -> _arms.SlateScores:
+    slate = scorer.score(case.entry, case.candidate_texts)
+    if len(slate.scores) != len(case.candidate_ids):
+        raise ValueError(
+            f'{case.memory_id}: {len(slate.scores)} scores for '
+            f'{len(case.candidate_ids)} candidates',
+        )
+    return slate
+
+
+def _sum_or_none(values: Sequence[float | int | None]) -> float | int | None:
+    """The sum, or None when there is nothing to sum or any term was unmeasured."""
+    measured = [value for value in values if value is not None]
+    if not values or len(measured) != len(values):
+        return None
+    return sum(measured)
+
+
+def measure_arm(
+    spec: _arms.ArmSpec,
+    cases: Sequence[RerankCase],
+    *,
+    aliases: Mapping[str, str] | None,
+    context: _arms.ArmContext,
+    clock: Callable[[], float],
+    max_spend_usd: float,
+) -> ArmRow:
+    """Score every non-empty slate once with *spec*'s arm and summarise it as a row.
+
+    One untimed warm-up slate precedes the timed pass, so the first call's
+    lazy initialisation is not billed as latency. An empty slate is never
+    sent and ranks as a miss.
+
+    Failure policy: an unavailable arm, crossing *max_spend_usd* (warm-up
+    included) or any other exception yields a skipped row with the reason,
+    and whatever was measured before it is discarded — a partial rate would
+    describe a different population than the one the row claims.
+    """
+    try:
+        return _measure(
+            spec, cases, aliases=aliases, context=context, clock=clock,
+            max_spend_usd=max_spend_usd,
+        )
+    except ArmUnavailable as exc:
+        logger.warning('arm %s skipped (%s): %s', spec.name, exc.reason, exc.detail)
+        return ArmRow.skipped(spec, exc.reason, exc.detail)
+    except _OverBudget as exc:
+        logger.warning('arm %s skipped: %s', spec.name, exc)
+        return ArmRow.skipped(spec, SkipReason.over_budget, str(exc))
+    except Exception as exc:
+        logger.exception('arm %s failed; recorded as skipped/error', spec.name)
+        return ArmRow.skipped(spec, SkipReason.error, f'{type(exc).__name__}: {exc}')
+
+
+def _measure(
+    spec: _arms.ArmSpec,
+    cases: Sequence[RerankCase],
+    *,
+    aliases: Mapping[str, str] | None,
+    context: _arms.ArmContext,
+    clock: Callable[[], float],
+    max_spend_usd: float,
+) -> ArmRow:
+    live = [index for index, case in enumerate(cases) if case.candidate_ids]
+    spent = 0.0
+
+    def charge(slate: _arms.SlateScores) -> None:
+        nonlocal spent
+        spent += slate.cost_usd or 0.0
+        if spent > max_spend_usd:
+            raise _OverBudget(
+                f'spent {spent:.4f} USD, over the {max_spend_usd:.4f} USD ceiling',
+            )
+
+    started = clock()
+    with spec.open(context) as scorer:
+        load_seconds = clock() - started
+        for index in live[:1]:
+            charge(_score_case(scorer, cases[index]))
+        timed: list[_TimedSlate] = []
+        for index in live:
+            start = clock()
+            slate = _score_case(scorer, cases[index])
+            timed.append(_TimedSlate(
+                index=index, slate=slate, seconds=clock() - start,
+                pairs=len(cases[index].candidate_ids),
+            ))
+            charge(slate)
+        facts = scorer.facts()
+
+    scores_by_index = {t.index: t.slate.scores for t in timed}
+    ranking = ranking_metrics(
+        cases, [scores_by_index.get(i, ()) for i in range(len(cases))], aliases=aliases,
+    )
+    seconds = _calibrate.summarize_distribution([t.seconds for t in timed])
+    costs = [t.slate.cost_usd for t in timed]
+    total_cost = _sum_or_none(costs)
+    pairs = [t.pairs for t in timed]
+    return ArmRow(
+        arm=spec.name,
+        arm_class=str(spec.arm_class),
+        model=spec.model,
+        status=ArmStatus.measured,
+        ranking=ranking,
+        p50_seconds=seconds['median'],
+        p95_seconds=seconds['p95'],
+        latency=LatencyStats(
+            slates_timed=len(timed),
+            pairs_per_slate_min=min(pairs, default=None),
+            pairs_per_slate_max=max(pairs, default=None),
+            load_seconds=load_seconds,
+            warmup_slates=len(live[:1]),
+        ),
+        cost_per_write_usd=None if total_cost is None else total_cost / len(costs),
+        device=facts.device,
+        vram_peak_mib=facts.vram_peak_mib,
+        max_length=facts.max_length,
+        pairs_over_max_length=_sum_or_none([t.slate.pairs_over_max_length for t in timed]),
+    )
