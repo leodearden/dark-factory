@@ -130,11 +130,25 @@ class TestRankingMetrics:
         )
         assert _rank1([case], [[0.1, 0.9]], aliases={'old': 'new'}).hits == 1
 
-    def test_an_absent_unreached_canonical_is_a_miss_in_the_denominator(self) -> None:
-        hit = _case(_record('d1', 'c1'), [_row('c1', 0.9)])
-        absent = _case(_record('d2', 'gone'), [_row('x', 0.9)], canonical_present=False)
-        rank1 = _rank1([hit, absent], [[0.9], [0.9]], aliases={'other': 'z'})
+    @staticmethod
+    def _hit_and_absent() -> list:
+        return [
+            _case(_record('d1', 'c1'), [_row('c1', 0.9)]),
+            _case(_record('d2', 'gone'), [_row('x', 0.9)], canonical_present=False),
+        ]
+
+    @pytest.mark.parametrize('aliases', [None, {}, {'gone': 'elsewhere'}])
+    def test_by_default_an_absent_unreached_canonical_is_a_miss_whatever_the_aliases(
+        self, aliases: dict | None,
+    ) -> None:
+        rank1 = _rank1(self._hit_and_absent(), [[0.9], [0.9]], aliases=aliases)
         assert (rank1.hits, rank1.total, rank1.rate) == (1, 2, 0.5)
+
+    def test_an_absent_canonical_can_be_left_out_of_the_denominator(self) -> None:
+        metrics = _mod().ranking_metrics(
+            self._hit_and_absent(), [[0.9], [0.9]], aliases=None, count_absent_as_miss=False,
+        )
+        assert (metrics.rank1.hits, metrics.rank1.total, metrics.rank1.rate) == (1, 1, 1.0)
 
     def test_rank_five_counts_a_hit_anywhere_in_the_top_five(self) -> None:
         ids = ['a', 'b', 'c', 'd', 'e', 'f', 'c1']
@@ -239,7 +253,14 @@ class _FakeScorer:
         return self._facts
 
 
-def _spec(scorer: _FakeScorer | _ConstantScorer | None = None, *, name: str = 'fake', unavailable=None, log=None):
+def _spec(
+    scorer: _FakeScorer | _ConstantScorer | None = None,
+    *,
+    name: str = 'fake',
+    unavailable=None,
+    log=None,
+    arm_class=None,
+):
     arms = _arms()
 
     @contextlib.contextmanager
@@ -253,7 +274,8 @@ def _spec(scorer: _FakeScorer | _ConstantScorer | None = None, *, name: str = 'f
                 log.append('closed')
 
     return arms.ArmSpec(
-        name=name, arm_class=arms.ArmClass.local_cross_encoder, model='fake-model', open=open_,
+        name=name, arm_class=arm_class or arms.ArmClass.local_cross_encoder,
+        model='fake-model', open=open_,
     )
 
 
@@ -269,7 +291,7 @@ def _slate(scores: tuple, cost: float | None = 0.0, over: int | None = 0):
 
 def _measure(spec, cases: list, clock: list, *, max_spend_usd: float = 10.0, aliases=None):
     return _mod().measure_arm(
-        spec, cases, aliases=aliases, context=_context(),
+        spec, cases, aliases=aliases, count_absent_as_miss=True, context=_context(),
         clock=iter(clock).__next__, max_spend_usd=max_spend_usd,
     )
 
@@ -456,10 +478,12 @@ class TestRunRerankerEval:
             _spec(_FakeScorer(answers, fail_on_call=2), name='flaky', log=log),
         ]
 
-    def _run(self, report_path: Path, *, specs: list | None = None) -> dict:
+    def _run(
+        self, report_path: Path, *, specs: list | None = None, count_absent_as_miss: bool = True,
+    ) -> dict:
         return _mod().run_reranker_eval(
             cases=self._cases(), arms=specs if specs is not None else self._specs(),
-            aliases=None, context=_context(),
+            aliases=None, count_absent_as_miss=count_absent_as_miss, context=_context(),
             provenance={'project_id': 'reify', 'record_count': 5},
             report_path=report_path, clock=itertools.count(0.0, 0.5).__next__,
             max_spend_usd=1.0, p95_ceiling_seconds=2.5,
@@ -481,8 +505,8 @@ class TestRunRerankerEval:
         report = self._run(tmp_path / 'r.json')
         baseline = report['baseline']
         assert (baseline['arm'], baseline['status']) == ('cosine', 'measured')
-        assert baseline['rank1'] == {'hits': 2, 'total': 2}
-        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 2}
+        assert baseline['rank1'] == {'hits': 2, 'total': 3}
+        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 3}
         assert (baseline['p50_seconds'], baseline['p95_seconds'], baseline['latency']) == (
             None, None, None,
         )
@@ -509,10 +533,42 @@ class TestRunRerankerEval:
             provenance['pairwise_concurrency'],
         ) == (4, 8.0, 20)
 
+    @pytest.mark.parametrize(('absent_in_denominator', 'total'), [(True, 3), (False, 2)])
+    def test_the_rank_population_is_the_one_asked_for_and_recorded(
+        self, tmp_path: Path, absent_in_denominator: bool, total: int,
+    ) -> None:
+        report = self._run(tmp_path / 'r.json', count_absent_as_miss=absent_in_denominator)
+        assert report['provenance']['absent_in_denominator'] is absent_in_denominator
+        assert report['baseline']['rank1']['total'] == total
+        assert report['arms'][0]['rank1']['total'] == total
+
     def test_caveats_are_strings(self, tmp_path: Path) -> None:
         caveats = self._run(tmp_path / 'r.json')['caveats']
         assert caveats
         assert all(isinstance(caveat, str) and caveat for caveat in caveats)
+
+    _SLATE_NORMALISED = 'slate-normalised'
+
+    def test_a_measured_jev_choice_arm_is_caveated_as_slate_normalised(
+        self, tmp_path: Path,
+    ) -> None:
+        arms = _arms()
+        answers = {'the entry d1': _slate((0.9, 0.1)), 'the entry n1': _slate((0.9, 0.1))}
+        jev = _spec(_FakeScorer(answers), name='jev', arm_class=arms.ArmClass.jev_choice)
+        caveats = self._run(tmp_path / 'r.json', specs=[jev])['caveats']
+        [caveat] = [caveat for caveat in caveats if self._SLATE_NORMALISED in caveat]
+        assert caveat.startswith('jev ')
+
+    def test_no_slate_normalised_caveat_without_a_measured_jev_choice_arm(
+        self, tmp_path: Path,
+    ) -> None:
+        arms = _arms()
+        skipped_jev = _spec(
+            name='jev', arm_class=arms.ArmClass.jev_choice,
+            unavailable=arms.ArmUnavailable(arms.SkipReason.no_credential, 'TYPESAFE_API_KEY unset'),
+        )
+        caveats = self._run(tmp_path / 'r.json', specs=[*self._specs(), skipped_jev])['caveats']
+        assert not [caveat for caveat in caveats if self._SLATE_NORMALISED in caveat]
 
     def test_the_json_and_its_markdown_sibling_are_written(self, tmp_path: Path) -> None:
         path = tmp_path / 'r.json'
@@ -541,24 +597,29 @@ class TestRunRerankerEval:
         assert list(tmp_path.iterdir()) == []
 
 
-class TestGuardCommittedReport:
+class TestGuardReportPath:
     def test_a_limited_run_at_the_committed_path_is_refused(self) -> None:
         with pytest.raises(ValueError):
-            _mod().guard_committed_report(_COMMITTED_REPORT, limit=3)
+            _mod().guard_report_path(_COMMITTED_REPORT, limit=3)
 
     def test_the_relative_spelling_is_refused_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(_COMMITTED_REPORT.parent.parent)
         with pytest.raises(ValueError):
-            _mod().guard_committed_report(
+            _mod().guard_report_path(
                 Path('calibration/write_triage_reranker_report.json'), limit=3,
             )
 
     def test_a_limited_run_elsewhere_is_allowed(self, tmp_path: Path) -> None:
         path = tmp_path / 'smoke.json'
-        assert _mod().guard_committed_report(path, limit=3) == path
+        assert _mod().guard_report_path(path, limit=3) == path
 
     def test_a_full_run_at_the_committed_path_is_allowed(self) -> None:
-        assert _mod().guard_committed_report(_COMMITTED_REPORT, limit=None) == _COMMITTED_REPORT
+        assert _mod().guard_report_path(_COMMITTED_REPORT, limit=None) == _COMMITTED_REPORT
+
+    @pytest.mark.parametrize('limit', [None, 3])
+    def test_a_path_not_ending_in_json_is_refused(self, tmp_path: Path, limit: int | None) -> None:
+        with pytest.raises(ValueError, match='.json'):
+            _mod().guard_report_path(tmp_path / 'out.md', limit=limit)
 
 
 _PACKAGE = Path(__file__).parent.parent
@@ -602,6 +663,14 @@ class TestCli:
         with pytest.raises(ValueError):
             _mod().run_cli(args, memory_service_factory=_refusing_factory)
 
+    def test_a_report_path_not_ending_in_json_is_refused_before_the_store_opens(
+        self, tmp_path: Path,
+    ) -> None:
+        args = _mod().build_parser().parse_args(['--report-path', str(tmp_path / 'out.md')])
+        with pytest.raises(ValueError, match='.json'):
+            _mod().run_cli(args, memory_service_factory=_refusing_factory)
+        assert list(tmp_path.iterdir()) == []
+
     def test_a_limited_run_records_what_it_measured(self, tmp_path: Path) -> None:
         from _write_triage_store_fake import FakeMemoryService
 
@@ -624,6 +693,7 @@ class TestCli:
             'tests/fixtures/write_triage_calibration.canonical_aliases.json'
         )
         assert provenance['canonical_aliases_count'] == 3
+        assert provenance['absent_in_denominator'] is True
         assert (provenance['project_id'], provenance['limit']) == ('reify', 2)
         assert (provenance['record_count'], provenance['case_count']) == (104, 2)
         assert provenance['candidate_k'] == resolve_candidate_k(

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -350,6 +351,30 @@ class TestOpenCrossEncoder:
         assert missing in caught.value.detail
         assert '--group reranker' in caught.value.detail
 
+    def test_the_model_is_released_on_exit_though_the_scorer_is_still_held(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        loaded: list[weakref.ref] = []
+
+        class _LoadedCrossEncoder:
+            def __init__(self, model_id: str, **kwargs) -> None:
+                self.tokenizer = _word_tokenizer
+                loaded.append(weakref.ref(self))
+
+        monkeypatch.setitem(sys.modules, 'torch', _fake_torch(available=False))
+        monkeypatch.setitem(
+            sys.modules, 'sentence_transformers', SimpleNamespace(CrossEncoder=_LoadedCrossEncoder),
+        )
+        with _arms().open_cross_encoder('some/model', 512)(_context()) as scorer:
+            [model] = loaded
+            assert model() is not None
+        assert scorer is not None
+        assert model() is None
+
+
+def _word_tokenizer(text: str, *, add_special_tokens: bool) -> dict:
+    return {'input_ids': text.split()}
+
 
 class _FakeCrossEncoder:
     def __init__(self, scores: list[float]) -> None:
@@ -390,6 +415,12 @@ class TestCrossEncoderScorer:
             'a b c', ['d', 'e f g h', 'i j'],
         )
         assert slate.pairs_over_max_length == 1
+
+    def test_a_closed_scorer_refuses_to_score(self) -> None:
+        scorer = self._scorer(_FakeCrossEncoder([0.2]))
+        scorer.close()
+        with pytest.raises(RuntimeError, match='closed'):
+            scorer.score('a', ['b'])
 
     def test_facts_carry_the_device_and_the_configured_max_length(self) -> None:
         facts = self._scorer(_FakeCrossEncoder([])).facts()
@@ -495,7 +526,8 @@ class TestD1Registry:
         ]
         path = tmp_path / 'bare.json'
         report = core.run_reranker_eval(
-            cases=cases, arms=arms.D1_ARMS, aliases=None, context=_context(),
+            cases=cases, arms=arms.D1_ARMS, aliases=None,
+            count_absent_as_miss=core.ABSENT_IN_DENOMINATOR, context=_context(),
             provenance={}, report_path=path, clock=itertools.count(0.0, 0.5).__next__,
             max_spend_usd=1.0, p95_ceiling_seconds=3.0,
         )

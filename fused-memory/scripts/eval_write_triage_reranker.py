@@ -96,11 +96,17 @@ load_fixture = _calibrate.load_fixture
 load_canonical_aliases = _calibrate.load_canonical_aliases
 package_relative = _calibrate.package_relative
 
+ArmClass = _arms.ArmClass
 ArmStatus = _arms.ArmStatus
 SkipReason = _arms.SkipReason
 ArmUnavailable = _arms.ArmUnavailable
 
 RANK_KS = (1, 5)
+
+#: Γ2's population, and κ1's 0.19 basis: every labelled record is in the
+#: rank denominator, and an absent canonical no alias reaches is a miss.
+#: Independent of which aliases are passed, as in ``compute_recall_at_k``.
+ABSENT_IN_DENOMINATOR = True
 
 #: Same cluster, curator-ruled not the same claim. The rule's home is
 #: ``calibrate_write_triage.py::build_pair_sets``, whose own set is private.
@@ -256,19 +262,21 @@ def ranking_metrics(
     scores_per_case: Sequence[Sequence[float | None]],
     *,
     aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool = ABSENT_IN_DENOMINATOR,
 ) -> RankingMetrics:
     """Rank-1/rank-5 of the canonical-or-alias once each slate is reordered by its scores.
 
     Scored by ``calibrate_write_triage.py::compute_recall_at_k``, the rule κ1's
-    recall@1 used. Given aliases, every case is in the denominator and an
-    unreached absent canonical is a miss — the population of Γ2's basis. The
-    AUC's pair score is found by the same rule, via ``compute_first_hit_ranks``.
+    recall@1 used, with its two independent choices: *aliases* widens what
+    reaches the canonical, *count_absent_as_miss* keeps a case whose canonical
+    left the corpus in the denominator. The AUC's pair score is found by the
+    same reach rule, via ``compute_first_hit_ranks``.
     """
     scored = list(zip(cases, scores_per_case, strict=True))
     orders = [_arm_order(case, scores) for case, scores in scored]
     ranked = [_ranked_retrieval(case, order) for (case, _), order in zip(scored, orders, strict=True)]
     recall = _calibrate.compute_recall_at_k(
-        ranked, RANK_KS, aliases=aliases, count_absent_as_miss=bool(aliases),
+        ranked, RANK_KS, aliases=aliases, count_absent_as_miss=count_absent_as_miss,
     )
     rank1, rank5 = (
         RateCount(hits=row['hits'], total=row['total'], rate=row['recall'])
@@ -382,6 +390,7 @@ def measure_arm(
     cases: Sequence[RerankCase],
     *,
     aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool,
     context: _arms.ArmContext,
     clock: Callable[[], float],
     max_spend_usd: float,
@@ -399,8 +408,8 @@ def measure_arm(
     """
     try:
         return _measure(
-            spec, cases, aliases=aliases, context=context, clock=clock,
-            max_spend_usd=max_spend_usd,
+            spec, cases, aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+            context=context, clock=clock, max_spend_usd=max_spend_usd,
         )
     except ArmUnavailable as exc:
         logger.warning('arm %s skipped (%s): %s', spec.name, exc.reason, exc.detail)
@@ -418,6 +427,7 @@ def _measure(
     cases: Sequence[RerankCase],
     *,
     aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool,
     context: _arms.ArmContext,
     clock: Callable[[], float],
     max_spend_usd: float,
@@ -451,7 +461,8 @@ def _measure(
 
     scores_by_index = {t.index: t.slate.scores for t in timed}
     ranking = ranking_metrics(
-        cases, [scores_by_index.get(i, ()) for i in range(len(cases))], aliases=aliases,
+        cases, [scores_by_index.get(i, ()) for i in range(len(cases))],
+        aliases=aliases, count_absent_as_miss=count_absent_as_miss,
     )
     seconds = _calibrate.summarize_distribution([t.seconds for t in timed])
     costs = [t.slate.cost_usd for t in timed]
@@ -525,14 +536,26 @@ _DEFAULT_REPORT_PATH = _PACKAGE_ROOT / 'calibration' / 'write_triage_reranker_re
 BASELINE_ARM = 'cosine'
 
 
-def guard_committed_report(report_path: str | Path, *, limit: int | None) -> Path:
-    """Refuse a ``--limit`` run aimed at the committed report, however its path is spelled.
-
-    ``resolve()`` on both sides, as ``eval_write_triage_judge.py::_is_committed_report``
-    does: a relative spelling must not slip past as a different file. A partial
-    run published there would be a different population under the same name.
-    """
+def require_json_report_path(report_path: str | Path) -> Path:
+    """Refuse a report path not ending in ``.json``: the ``.md`` sibling is written beside it."""
     path = Path(report_path)
+    if path.suffix != '.json':
+        raise ValueError(
+            f'the report path must end in .json (a .md sibling is written beside it): {path}',
+        )
+    return path
+
+
+def guard_report_path(report_path: str | Path, *, limit: int | None) -> Path:
+    """Every refusal of ``--report-path``, made before the store is opened.
+
+    Beyond :func:`require_json_report_path`, a ``--limit`` run aimed at the
+    committed report is refused however its path is spelled. ``resolve()`` on
+    both sides, as ``eval_write_triage_judge.py::_is_committed_report`` does: a
+    relative spelling must not slip past as a different file. A partial run
+    published there would be a different population under the same name.
+    """
+    path = require_json_report_path(report_path)
     if limit is not None and path.resolve() == _DEFAULT_REPORT_PATH.resolve():
         raise ValueError(
             f'--limit {limit} would overwrite the committed report {package_relative(path)} '
@@ -541,12 +564,17 @@ def guard_committed_report(report_path: str | Path, *, limit: int | None) -> Pat
     return path
 
 
-def measure_baseline(cases: Sequence[RerankCase], *, aliases: Mapping[str, str] | None) -> ArmRow:
+def measure_baseline(
+    cases: Sequence[RerankCase], *, aliases: Mapping[str, str] | None, count_absent_as_miss: bool,
+) -> ArmRow:
     """Production's current attach order on the same slates. Costs nothing and adds no latency."""
     return ArmRow(
         arm=BASELINE_ARM, arm_class='baseline', model='store_score',
         status=ArmStatus.measured,
-        ranking=ranking_metrics(cases, [baseline_scores(case) for case in cases], aliases=aliases),
+        ranking=ranking_metrics(
+            cases, [baseline_scores(case) for case in cases],
+            aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+        ),
     )
 
 
@@ -577,6 +605,13 @@ def caveats_for(report: Mapping[str, Any]) -> list[str]:
         + (f' {"; ".join(truncation)}.' if truncation else ''),
     )
     caveats.extend(
+        f'{row["arm"]} scores are a probability distribution over the candidates of one slate, '
+        'so they depend on the slate\'s size and its competing candidates: its AUC pools '
+        'slate-normalised values and is not comparable with the other arms\' AUC.'
+        for row in arms
+        if row['arm_class'] == ArmClass.jev_choice and row['status'] == ArmStatus.measured
+    )
+    caveats.extend(
         f'{row["arm"]} was skipped ({row["skip_reason"]}): {row["skip_detail"]}'
         for row in arms if row['status'] == ArmStatus.skipped
     )
@@ -589,6 +624,7 @@ def build_report(
     baseline: ArmRow,
     cases: Sequence[RerankCase],
     provenance: Mapping[str, Any],
+    count_absent_as_miss: bool,
     context: _arms.ArmContext,
     max_spend_usd: float,
     p95_ceiling_seconds: float,
@@ -606,6 +642,7 @@ def build_report(
             **provenance,
             'case_count': len(cases),
             'canonical_absent': sum(not case.canonical_present for case in cases),
+            'absent_in_denominator': count_absent_as_miss,
             'degraded_retrievals': sum(case.degraded for case in cases),
             'self_retrieved': sum(case.self_retrieved for case in cases),
             'p95_ceiling_seconds': p95_ceiling_seconds,
@@ -683,6 +720,7 @@ def run_reranker_eval(
     cases: Sequence[RerankCase],
     arms: Sequence[_arms.ArmSpec],
     aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool,
     context: _arms.ArmContext,
     provenance: Mapping[str, Any],
     report_path: str | Path,
@@ -691,23 +729,19 @@ def run_reranker_eval(
     p95_ceiling_seconds: float,
 ) -> dict[str, Any]:
     """Measure the baseline and every arm in order, then write and return the report."""
-    report_path = Path(report_path)
-    if report_path.suffix != '.json':
-        raise ValueError(
-            f'the report path must end in .json (a .md sibling is written beside it): '
-            f'{report_path}',
-        )
-    baseline = measure_baseline(cases, aliases=aliases)
+    report_path = require_json_report_path(report_path)
+    baseline = measure_baseline(cases, aliases=aliases, count_absent_as_miss=count_absent_as_miss)
     rows = []
     for spec in arms:
         logger.info('measuring arm %s (%s)', spec.name, spec.model)
         rows.append(measure_arm(
-            spec, cases, aliases=aliases, context=context, clock=clock,
-            max_spend_usd=max_spend_usd,
+            spec, cases, aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+            context=context, clock=clock, max_spend_usd=max_spend_usd,
         ))
     report = build_report(
         arm_rows=rows, baseline=baseline, cases=cases, provenance=provenance,
-        context=context, max_spend_usd=max_spend_usd, p95_ceiling_seconds=p95_ceiling_seconds,
+        count_absent_as_miss=count_absent_as_miss, context=context,
+        max_spend_usd=max_spend_usd, p95_ceiling_seconds=p95_ceiling_seconds,
     )
     write_report(report, report_path)
     return report
@@ -771,7 +805,7 @@ def run_cli(
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage import resolve_candidate_k  # noqa: PLC0415
 
-    report_path = guard_committed_report(args.report_path, limit=args.limit)
+    report_path = guard_report_path(args.report_path, limit=args.limit)
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
     fixture = load_fixture(args.fixture)
@@ -794,6 +828,7 @@ def run_cli(
         cases=cases,
         arms=arms if arms is not None else _arms.D1_ARMS,
         aliases=aliases,
+        count_absent_as_miss=ABSENT_IN_DENOMINATOR,
         context=_arms.ArmContext(
             device=args.device, local_batch_size=args.local_batch_size,
             vram_cap_gib=args.vram_cap_gib, pairwise_concurrency=args.pairwise_concurrency,

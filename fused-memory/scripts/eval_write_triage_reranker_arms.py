@@ -487,6 +487,8 @@ class CrossEncoderScorer:
         self._device_facts = device_facts
 
     def score(self, entry: str, candidate_texts: Sequence[str]) -> SlateScores:
+        if self._model is None:
+            raise RuntimeError('the cross-encoder scorer is closed; its model was released')
         pairs = [(entry, candidate) for candidate in candidate_texts]
         scores = self._model.predict(pairs, batch_size=self._batch_size, show_progress_bar=False)
         entry_tokens = self._token_count(entry)
@@ -501,6 +503,10 @@ class CrossEncoderScorer:
 
     def facts(self) -> ScorerFacts:
         return replace(self._device_facts(), max_length=self._max_length)
+
+    def close(self) -> None:
+        """Drop the model, so a caller still holding the scorer does not keep its weights alive."""
+        self._model = None
 
 
 def _token_counter(tokenizer: Any) -> Callable[[str], int]:
@@ -536,16 +542,18 @@ def open_cross_encoder(
             model_id, device=device, max_length=max_length,
             model_kwargs={'dtype': torch.bfloat16} if on_cuda else None,
         )
+        scorer = CrossEncoderScorer(
+            model,
+            _token_counter(model.tokenizer),
+            batch_size=context.local_batch_size,
+            max_length=max_length,
+            device_facts=(lambda: cuda_facts(torch)) if on_cuda else _cpu_facts,
+        )
+        del model
         try:
-            yield CrossEncoderScorer(
-                model,
-                _token_counter(model.tokenizer),
-                batch_size=context.local_batch_size,
-                max_length=max_length,
-                device_facts=(lambda: cuda_facts(torch)) if on_cuda else _cpu_facts,
-            )
+            yield scorer
         finally:
-            del model
+            scorer.close()
             gc.collect()
             if on_cuda:
                 torch.cuda.empty_cache()
