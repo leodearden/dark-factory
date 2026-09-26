@@ -8,9 +8,10 @@
 // the two halves findable from each other.
 //
 // THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM — datum.py's dataclass
-// is frozen for the same reason. Three client-built envelopes are sanctioned
-// and no more: unknownDatum, plainDatum and derivedDatum, each below with the
-// gap it covers.
+// is frozen for the same reason. Four client-built envelopes are sanctioned
+// and no more: unknownDatum, plainDatum, derivedDatum and combinedDatum, each
+// below with the gap it covers. combinedDatum is the only one built FROM served
+// Datums: a cross-project total the server serves per project only.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so the render decision is
 // EXECUTABLE: the .jsx files are `type="text/babel"` behind CDN Babel with no
@@ -353,6 +354,52 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
   return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
 }
 
+// ── A total over several SERVED Datums ──
+// The census is served per project; the topbar, the rail and any tile scoped to
+// more than one project need the sum. `partsByLabel` is an ordered array of
+// `[label, datum]` pairs, `combine` folds the parts' values (in part order), and
+// `emptyReason` — required — says why an empty scope has no total.
+//
+// A HOLE ANYWHERE IS A HOLE IN THE TOTAL. A partial sum is an under-count passed
+// off as a total — the rule orch_summary.js::orchSummaryTotal held before this
+// replaced it — so `combine` never runs over a scope with a gap in it, and the
+// reason names every missing part so the operator reads which one and why.
+//
+// OTHERWISE THE WORST PART DECIDES: lower_bound > stale > fresh, lower_bound
+// first so both the '≥' and the age badge survive. The total is only as recent
+// as its OLDEST part, so it takes that part's as_of and receipt, and it is only
+// as patient as its TIGHTEST bound.
+const COMBINED_STATE_PRECEDENCE = ['lower_bound', 'stale', 'fresh'];
+
+function combinedDatum(partsByLabel, combine, emptyReason) {
+  const parts = partsByLabel.map(([label, part]) => [label, assertDatum(part, 'combinedDatum')]);
+  if (parts.length === 0) return unknownDatum(emptyReason);
+
+  const holes = parts.filter(([, part]) => part.state === 'unknown');
+  if (holes.length > 0) return unknownDatum(labelledReasons(holes));
+
+  const oldest = parts
+    .map(([, part]) => part)
+    .reduce((a, b) => (Date.parse(b.as_of) < Date.parse(a.as_of) ? b : a));
+  const unfresh = parts.filter(([, part]) => part.state !== 'fresh');
+  const state = COMBINED_STATE_PRECEDENCE.find(s => parts.some(([, part]) => part.state === s));
+
+  return withReceipt(
+    {
+      value: combine(parts.map(([, part]) => part.value)),
+      as_of: oldest.as_of,
+      state,
+      reason: unfresh.length > 0 ? labelledReasons(unfresh) : null,
+      freshness_bound_seconds: Math.min(...parts.map(([, part]) => part.freshness_bound_seconds)),
+    },
+    { servedAt: oldest._served_at, receivedAt: oldest._received_at },
+  );
+}
+
+function labelledReasons(parts) {
+  return parts.map(([label, part]) => label + ': ' + part.reason).join('; ');
+}
+
 // The browser default for plainDatum's third parameter, read LAZILY: a node
 // caller passing its own map never touches a browser global, and a render
 // before data.js has published degrades to "no receipt" rather than throwing.
@@ -374,6 +421,7 @@ const DATUM_API = {
   LOWER_BOUND_PREFIX,
   plainDatum,
   derivedDatum,
+  combinedDatum,
   PLAIN_DATUM_BOUND_SECONDS,
 };
 
