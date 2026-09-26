@@ -470,3 +470,42 @@ def _measure(
         max_length=facts.max_length,
         pairs_over_max_length=_sum_or_none([t.slate.pairs_over_max_length for t in timed]),
     )
+
+
+#: PRD §9 ρ1's selection-rule ceiling. Γ2's own 3.0 s threshold lives in task
+#: 5804's before_done.args; the two may be re-based independently.
+DEFAULT_P95_CEILING_SECONDS = 3.0
+
+
+def choose_best(
+    rows: Sequence[Mapping[str, Any]], *, p95_ceiling_seconds: float,
+) -> dict[str, Any]:
+    """PRD §9's rule over report rows: arg-max rank-1 among measured arms within the ceiling.
+
+    A rank-1 tie goes to the lower p95, then to the earlier row. With no arm
+    within the ceiling, the fastest measured arm is carried with ``qualified``
+    False; with none measured, every value is None rather than a zero.
+    """
+    measured = [
+        (index, row) for index, row in enumerate(rows)
+        if row['status'] == ArmStatus.measured
+        and row['rank1_rate'] is not None and row['p95_seconds'] is not None
+    ]
+    qualified = [
+        (index, row) for index, row in measured if row['p95_seconds'] <= p95_ceiling_seconds
+    ]
+    best: Mapping[str, Any] | None = None
+    if qualified:
+        _, best = min(
+            qualified,
+            key=lambda item: (-item[1]['rank1_rate'], item[1]['p95_seconds'], item[0]),
+        )
+    elif measured:
+        _, best = min(measured, key=lambda item: (item[1]['p95_seconds'], item[0]))
+    return {
+        'arm': best['arm'] if best else None,
+        'rank1_rate': best['rank1_rate'] if best else None,
+        'p95_seconds': best['p95_seconds'] if best else None,
+        'qualified': bool(qualified),
+        'p95_ceiling_seconds': p95_ceiling_seconds,
+    }
