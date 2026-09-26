@@ -236,8 +236,8 @@ _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
 
 
-# Bounded attempt budget for `git worktree add --detach`, shared by the two
-# sites that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
+# Bounded attempt budget for `git worktree add`, shared by the three sites
+# that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
 _WORKTREE_ADD_MAX_ATTEMPTS = 3
 
 # `_ENOSPC_MARKERS` is imported from verify_classify (see the import block
@@ -247,15 +247,16 @@ _WORKTREE_ADD_MAX_ATTEMPTS = 3
 
 
 def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
-    """Is a failed ``git worktree add --detach`` worth retrying?
+    """Is a failed ``git worktree add`` worth retrying?
 
     The shape is deliberately NEGATIVE — retry by default, fail fast only on
     a known non-transient cause — rather than a positive "is this
     contention?" allow-list. The archived transient samples share no token
-    (one a ``fatal: Invalid path`` on git's ADMINISTRATIVE registration dir,
-    the other a bare ``Preparing worktree`` progress line with no cause at
-    all), so an allow-list built from either would silently stop retrying
-    the other, and stop retrying whatever shape appears next.
+    (a ``fatal: Invalid path`` on an ADMINISTRATIVE registration dir — the
+    add's own, or in 4777 a concurrently-removed sibling's — and a bare
+    ``Preparing worktree`` progress line with no cause at all), so an
+    allow-list built from either would silently stop retrying the other,
+    and stop retrying whatever shape appears next.
 
     ENOSPC is the counter-case: a full disk does not heal in 1.5s of
     backoff, so retrying there only delays the operator signal.
@@ -3094,22 +3095,22 @@ class GitOps:
         return self._refuse_foreign_band(path, owned, context)
 
     async def _worktree_add_with_retry(
-        self, path: Path, ref: str, *, label: str,
+        self, path: Path, ref: str, *, label: str, detach: bool = True,
     ) -> tuple[int, str, str, int]:
-        """Run ``git worktree add --detach <path> <ref>`` with bounded retry.
+        """Run ``git worktree add [--detach] <path> <ref>`` with bounded retry.
 
-        The only retrying add in this module: the two sites that retry a
-        ``git worktree add`` — git_ops.py::GitOps._create_merge_worktree and
-        git_ops.py::GitOps.ephemeral_worktree — both mint through here, so
+        The only retrying add in this module: the three sites that retry a
+        ``git worktree add`` — git_ops.py::GitOps._create_merge_worktree,
+        git_ops.py::GitOps.ephemeral_worktree and
+        git_ops.py::GitOps.create_worktree — all mint through here, so
         exactly one retry loop and one retryability predicate
         (git_ops.py::_worktree_add_failure_is_retryable) exist. Every
-        attempt targets the SAME *path*; the caller mints one uuid per call,
-        not per attempt.
+        attempt targets the SAME *path*.
 
         Returns ``(rc, stdout, stderr, attempts)`` from the LAST attempt
-        made, and NEVER raises on a failed add. The two callers raise
-        different exception types (``RuntimeError`` for the merge worktree,
-        whose callers catch broadly on it, vs the typed
+        made, and NEVER raises on a failed add. The callers raise
+        different exception types (``RuntimeError`` for the merge and task
+        worktrees, whose callers catch broadly on it, vs the typed
         :class:`EphemeralWorktreeError` that verify.py's two probes
         pattern-match on and that has a :class:`BlockDisposition` row), so a
         driver that raised would force one of them to catch-and-retranslate,
@@ -3121,10 +3122,16 @@ class GitOps:
 
         Args:
             path: The worktree path to mint. Reused across every attempt.
-            ref: Commit-ish to pin the detached worktree at.
+                A directory already there before the first attempt is never
+                removed; only what a failed attempt left behind is.
+            ref: With *detach*, the commit-ish to pin the worktree at;
+                without it, an EXISTING branch to check out. A new branch
+                cannot be minted here: a failed ``add -b`` has already
+                created it, so a retry would fail on its own leftover.
             label: Diagnostic prefix naming the calling site in the WARNING
                 emitted for each absorbed retry, so an operator can grep
                 which one flaked.
+            detach: Whether the worktree gets a detached HEAD.
 
         Note:
             Issues NO other git subprocess between attempts — in particular
@@ -3134,12 +3141,11 @@ class GitOps:
             --force``, since nothing was successfully registered from this
             call's perspective.
         """
+        argv = ['git', 'worktree', 'add', *(['--detach'] if detach else []), str(path), ref]
+        path_predates_call = path.exists()
         rc, out, err, attempt = 1, '', 'not attempted', 0
         for attempt in range(1, _WORKTREE_ADD_MAX_ATTEMPTS + 1):
-            rc, out, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(path), ref],
-                cwd=self.project_root,
-            )
+            rc, out, err = await _run(argv, cwd=self.project_root)
             if rc == 0:
                 return rc, out, err, attempt
             if not _worktree_add_failure_is_retryable(rc, out, err):
@@ -3158,7 +3164,8 @@ class GitOps:
                 # Leaving that residue would make the next attempt fail
                 # deterministically with "'<path>' already exists", naming a
                 # self-inflicted cause instead of the real one.
-                shutil.rmtree(path, ignore_errors=True)
+                if not path_predates_call:
+                    shutil.rmtree(path, ignore_errors=True)
                 await asyncio.sleep(0.5 * attempt)
         return rc, out, err, attempt
 
@@ -4879,13 +4886,27 @@ class GitOps:
             else:
                 await self._cleanup_leftover_branch(full_branch, branch_name)
 
-        # Create worktree with new branch from the freshened ref
+        # Branch first, then a retried add of it: `git worktree add -b` creates
+        # its branch BEFORE the step that races concurrent `.git/worktrees/`
+        # churn, so retrying `-b` itself would fail on its own leftover branch.
+        # The `Failed to create worktree: ` prefix is what operators grep for.
         rc, out, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), start_ref],
-            cwd=self.project_root,
+            ['git', 'branch', full_branch, start_ref], cwd=self.project_root,
         )
         if rc != 0:
-            raise RuntimeError(f'Failed to create worktree: {err}')
+            raise RuntimeError(
+                f'Failed to create worktree: git branch {full_branch} '
+                f'{start_ref} failed (rc={rc}); stderr={err!r}; stdout={out!r}'
+            )
+        rc, out, err, attempts = await self._worktree_add_with_retry(
+            worktree_path, full_branch, label='create_worktree', detach=False,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'Failed to create worktree: git worktree add {worktree_path} '
+                f'{full_branch} failed after {attempts} attempt(s) (rc={rc}); '
+                f'stderr={err!r}; stdout={out!r}'
+            )
 
         logger.info(
             'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
