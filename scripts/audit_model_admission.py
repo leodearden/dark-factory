@@ -13,7 +13,7 @@ arguments, rather than a fresh set of hand-written SQL that quietly disagrees
 with the last one.
 
 STRICTLY READ-ONLY.  Every connection is a `mode=ro` SQLite URI
-(:func:`_connect_ro`); this script writes nothing, files nothing, and emits no
+(:func:`connect_ro`); this script writes nothing, files nothing, and emits no
 events.  It is safe to run against a live store while the orchestrator is
 merging.
 
@@ -68,7 +68,7 @@ MODEL_REJECTION_REASONS = frozenset({
 })
 
 
-def _connect_ro(path: str | Path) -> sqlite3.Connection:
+def connect_ro(path: str | Path) -> sqlite3.Connection:
     """Open *path* strictly read-only, via a `mode=ro` SQLite URI.
 
     `mode=ro` (rather than a bare `sqlite3.connect`) is the house convention for
@@ -83,7 +83,7 @@ def _connect_ro(path: str | Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
-def _iso(moment: datetime) -> str:
+def iso(moment: datetime) -> str:
     """Format *moment* in the exact ISO-8601 spelling the store writes.
 
     `event_store.py::EventStore.emit` and the cost store both write
@@ -179,7 +179,7 @@ def scan_routing_decisions(
     cursor = conn.execute(
         'SELECT timestamp, task_id, data FROM events '
         'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
-        ('routing_decision', _iso(since)),
+        ('routing_decision', iso(since)),
     )
     selections: list[RoutingSelection] = []
     rejections: list[RoutingRejection] = []
@@ -299,7 +299,7 @@ class EventRow:
     payload: dict[str, Any]
 
 
-def _load_events(
+def load_events(
     conn: sqlite3.Connection, event_type: str, since: datetime
 ) -> list[EventRow]:
     """Load *event_type* rows at or after *since*, in (timestamp, id) order.
@@ -311,7 +311,7 @@ def _load_events(
     cursor = conn.execute(
         'SELECT timestamp, task_id, role, data FROM events '
         'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
-        (event_type, _iso(since)),
+        (event_type, iso(since)),
     )
     rows = []
     for timestamp, task_id, role, raw in cursor:
@@ -356,7 +356,7 @@ def _merger_starts_by_task(
         '(SELECT MIN(started_at) FROM invocations '
         'WHERE model = ? AND role = ? AND completed_at >= ?) '
         'ORDER BY started_at, id',
-        (MERGER_ROLE, model, MERGER_ROLE, _iso(since)),
+        (MERGER_ROLE, model, MERGER_ROLE, iso(since)),
     )
     for task_id, started_at in cursor:
         grouped.setdefault(task_id, []).append(started_at)
@@ -417,14 +417,14 @@ def scan_invocations(
     empty — which is exactly why the window has to do the attributing.
     """
     ceilings = DEFAULT_ROLE_CEILINGS_SECS if role_ceilings_secs is None else role_ceilings_secs
-    ends = _by_task(_load_events(conn, 'invocation_end', since))
-    merges = _by_task(_load_events(conn, 'merge_finalized', since))
+    ends = _by_task(load_events(conn, 'invocation_end', since))
+    merges = _by_task(load_events(conn, 'merge_finalized', since))
     merger_starts = _merger_starts_by_task(conn, model=model, since=since)
     cursor = conn.execute(
         'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
         'capped, started_at, completed_at FROM invocations '
         'WHERE model = ? AND completed_at >= ? ORDER BY completed_at, id',
-        (model, _iso(since)),
+        (model, iso(since)),
     )
     records = []
     for (task_id, project_id, role, account_name, cost_usd, duration_ms,
@@ -517,7 +517,7 @@ def scan_scoped_cap(
     cursor = conn.execute(
         'SELECT created_at, account_name, details FROM account_events '
         'WHERE event_type = ? AND created_at >= ? ORDER BY created_at, id',
-        ('cap_hit', _iso(since)),
+        ('cap_hit', iso(since)),
     )
     scoped: list[ScopedCapHit] = []
     unscoped = 0
@@ -541,7 +541,7 @@ def scan_scoped_cap(
             service=row.payload.get('service') or '',
             reason=row.payload.get('reason'),
         )
-        for row in _load_events(conn, 'service_restart', since)
+        for row in load_events(conn, 'service_restart', since)
     ]
     return ScopedCapScan(
         scoped_hits=tuple(scoped),
@@ -602,11 +602,11 @@ def spend_in_window(
     total, count = conn.execute(
         'SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM invocations '
         'WHERE model = ? AND completed_at >= ? AND completed_at < ?',
-        (model, _iso(window_start), _iso(window_end)),
+        (model, iso(window_start), iso(window_end)),
     ).fetchone()
     return SpendInWindow(
-        window_start=_iso(window_start),
-        window_end=_iso(window_end),
+        window_start=iso(window_start),
+        window_end=iso(window_end),
         total_usd=total,
         invocation_count=count,
         ceiling_usd=ceiling_usd,
@@ -654,7 +654,7 @@ def roles_on_model(
         for role, count, total in conn.execute(
             'SELECT role, COUNT(*), COALESCE(SUM(cost_usd), 0.0) FROM invocations '
             'WHERE model = ? AND completed_at >= ? GROUP BY role ORDER BY role',
-            (model, _iso(since)),
+            (model, iso(since)),
         )
     }
     ordered = list(expected_roles) + [r for r in observed if r not in expected_roles]
@@ -717,9 +717,9 @@ def audit(
     """
     return AuditResult(
         model=model,
-        since=_iso(since),
-        window_start=_iso(window[0]),
-        window_end=_iso(window[1]),
+        since=iso(since),
+        window_start=iso(window[0]),
+        window_end=iso(window[1]),
         expected_roles=tuple(expected_roles),
         routing=scan_routing_decisions(conn, model=model, since=since),
         invocations=scan_invocations(
@@ -763,7 +763,7 @@ def render_json(result: AuditResult) -> str:
     }, indent=2)
 
 
-def _table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
+def markdown_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     """A markdown table, or a single italic line when there are no rows.
 
     The empty case is spelled out rather than emitted as a headed table with no
@@ -791,13 +791,13 @@ def render_markdown(result: AuditResult) -> str:
     out: list[str] = []
 
     out += [f'### 1. Routing decisions for `{model}` since {since}', '']
-    out += _table(
+    out += markdown_table(
         ['timestamp', 'task', 'role', 'source_layer', 'rule_id', 'tier'],
         [(s.timestamp, s.task_id or '-', s.role, s.source_layer, s.rule_id or '-',
           s.routing_tier) for s in result.routing.selections],
     )
     out += ['', f'Rejections naming a model, any role, since {since}:', '']
-    out += _table(
+    out += markdown_table(
         ['timestamp', 'task', 'role', 'resolved to', 'reasons'],
         [(r.timestamp, r.task_id or '-', r.role, r.resolved_model, ', '.join(r.reasons))
          for r in result.routing.rejections],
@@ -805,7 +805,7 @@ def render_markdown(result: AuditResult) -> str:
     out += ['', f'Unparseable payloads skipped: {result.routing.skipped_rows}', '']
 
     out += [f'### 2. Invocations on `{model}` and how they ended, since {since}', '']
-    out += _table(
+    out += markdown_table(
         ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok', 'timed out',
          'model @end', 'duration ms', 'over flat ceiling', 'merge'],
         [(r.task_id or '-', r.project_id, r.role, r.account_name, f'{r.cost_usd:.2f}',
@@ -817,7 +817,7 @@ def render_markdown(result: AuditResult) -> str:
 
     out += [f'### 3. Dispatches at retry tier >= 1 since {since}', '']
     if result.tier_escalations:
-        out += _table(
+        out += markdown_table(
             ['timestamp', 'task', 'role', 'tier', 'rule_id'],
             [(s.timestamp, s.task_id or '-', s.role, s.routing_tier, s.rule_id or '-')
              for s in result.tier_escalations],
@@ -829,7 +829,7 @@ def render_markdown(result: AuditResult) -> str:
     out += ['']
 
     out += [f'### 4. Scoped cap posture for `{model}` since {since}', '']
-    out += _table(
+    out += markdown_table(
         ['created_at', 'account', 'reason'],
         [(h.created_at, h.account_name, h.reason) for h in result.scoped_cap.scoped_hits],
     )
@@ -837,7 +837,7 @@ def render_markdown(result: AuditResult) -> str:
                 f'{result.scoped_cap.unscoped_cap_hit_count}', '',
             'Service restarts since then (only an orchestrator restart reloads a '
             'restart-tier leaf):', '']
-    out += _table(
+    out += markdown_table(
         ['timestamp', 'service', 'reason'],
         [(r.timestamp, r.service, r.reason or '-') for r in result.scoped_cap.restarts],
     )
@@ -852,7 +852,7 @@ def render_markdown(result: AuditResult) -> str:
     headroom = '-' if spend.headroom_usd is None else f'{spend.headroom_usd:.2f}'
     over_ceiling = '-' if spend.at_or_over_ceiling is None else spend.at_or_over_ceiling
     out += [f'### 5. Spend on `{model}` over [{spend.window_start}, {spend.window_end})', '']
-    out += _table(
+    out += markdown_table(
         ['invocations', 'total $', 'ceiling $', 'headroom $', 'at/over ceiling'],
         [(spend.invocation_count, f'{spend.total_usd:.2f}', ceiling, headroom,
           over_ceiling)],
@@ -862,7 +862,7 @@ def render_markdown(result: AuditResult) -> str:
     containment = result.containment
     out += [f'### 6. Roles observed on `{model}` since {since}', '',
             f'Admitted roles: {", ".join(containment.expected_roles)}', '']
-    out += _table(
+    out += markdown_table(
         ['role', 'invocations', 'total $', 'admitted'],
         [(u.role, u.count, f'{u.total_usd:.2f}', u.role in containment.expected_roles)
          for u in containment.by_role],
@@ -897,7 +897,7 @@ def _parse_window(spec: str) -> timedelta:
     return timedelta(hours=size) if match.group(2) == 'h' else timedelta(days=size)
 
 
-def _parse_moment(spec: str) -> datetime:
+def parse_moment(spec: str) -> datetime:
     """Parse an ISO-8601 instant, reading a naive one as UTC.
 
     Naive-means-UTC rather than naive-means-local: the store is UTC throughout,
@@ -940,7 +940,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help='comma-separated roles the model was admitted for, e.g. merger,steward',
     )
     parser.add_argument(
-        '--since', required=True, type=_parse_moment,
+        '--since', required=True, type=parse_moment,
         help='ISO-8601 instant the admission was applied; anchors sections 1-4 and 6',
     )
     parser.add_argument(
@@ -966,7 +966,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     window_end = datetime.now(UTC)
-    conn = _connect_ro(args.runs_db)
+    conn = connect_ro(args.runs_db)
     try:
         result = audit(
             conn,

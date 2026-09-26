@@ -863,7 +863,7 @@ def test_a_naive_since_is_read_as_utc_not_as_host_local_time(host_tz_is_not_utc)
     """The store is UTC throughout and these values are used directly as SQL
     comparands, so shifting a hand-typed bound by the host's offset would move
     the whole window silently."""
-    parsed = audit_model_admission._parse_moment('2026-09-12T06:43:16')
+    parsed = audit_model_admission.parse_moment('2026-09-12T06:43:16')
 
     assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
     assert parsed == APPLY
@@ -872,7 +872,7 @@ def test_a_naive_since_is_read_as_utc_not_as_host_local_time(host_tz_is_not_utc)
 def test_an_offset_bearing_since_is_converted_to_the_same_utc_instant():
     """The apply commit is stamped +01:00; the report's --since is its UTC
     equivalent, and both spellings must resolve to one instant."""
-    parsed = audit_model_admission._parse_moment('2026-09-12T07:43:16+01:00')
+    parsed = audit_model_admission.parse_moment('2026-09-12T07:43:16+01:00')
 
     assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
     assert parsed.utcoffset() == timedelta(0)
@@ -881,7 +881,7 @@ def test_an_offset_bearing_since_is_converted_to_the_same_utc_instant():
 @pytest.mark.parametrize('spec', ['yesterday', '2026-13-01T00:00:00', ''])
 def test_a_junk_since_is_rejected_by_the_argument_parser(spec):
     with pytest.raises(argparse.ArgumentTypeError):
-        audit_model_admission._parse_moment(spec)
+        audit_model_admission.parse_moment(spec)
 
 
 @pytest.mark.parametrize(
@@ -932,7 +932,7 @@ def test_main_leaves_the_store_byte_for_byte_unchanged(runs_db_path, live_shaped
 
 
 def test_the_connection_factory_refuses_a_write(runs_db_path):
-    conn = audit_model_admission._connect_ro(runs_db_path)
+    conn = audit_model_admission.connect_ro(runs_db_path)
     try:
         with pytest.raises(sqlite3.OperationalError):
             conn.execute(
