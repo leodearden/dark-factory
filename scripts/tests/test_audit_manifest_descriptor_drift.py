@@ -1118,10 +1118,13 @@ _MEASURED_DRIFT_ROWS = (
     (
         "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml", 2906, "α4",
         "enforcement-matrix-suite-exists",
-        # BENIGN — both spellings deliver. Resynced anyway so the sweep can
-        # assert zero drift rather than carrying an allowlist.
+        # RE-REPAIRED ON BOTH SIDES (task 4783): the docstring-prose anchor
+        # broke silently if anyone reworded the docstring, so this row now
+        # anchors on the suite's own class identifier instead — same rule as
+        # the γ1/3536 row below. See
+        # test_alpha4_anchor_is_an_identifier_inside_the_certified_suite.
         _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
-        _grep("Landlock enforcement-matrix suite", ["orchestrator/tests/"]),
+        _grep("TestSandboxEnforcementMatrix", ["orchestrator/tests/"]),
     ),
     (
         "plans/task-escalation-state-graph-prd.capability-manifest.yaml", 3534, "η0",
@@ -1378,4 +1381,59 @@ def test_live_sidecars_carry_the_resynced_descriptors(
         f"would re-stamp the stale spelling over the repair), OR this check was "
         f"legitimately re-repaired on BOTH sides since — in which case update "
         f"this row's `resynced` element and see this test's maintenance contract."
+    )
+
+
+def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
+    """The α4 (task 2906) anchor must name a class/def inside the certified
+    suite, not prose it merely contains — grepped with the argv of
+    orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
+    the working tree instead of a ref."""
+    root = _repo_root()
+    if root is None:
+        pytest.skip("not a git checkout")
+
+    relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == "α4"
+        for cap in task.capabilities if cap.name == "enforcement-matrix-suite-exists"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one enforcement-matrix-suite-exists capability "
+        f"under label α4 in {relpath}, found {len(matches)}"
+    )
+    check = matches[0].delivered_check
+    assert check is not None
+    pattern = check.pattern
+    assert pattern is not None, (
+        f"expected a grep check with a pattern, got kind={check.kind!r}"
+    )
+
+    completed = subprocess.run(
+        ["git", "-C", root, "grep", "-E", "-n", "-e", pattern, "--",
+         *check.paths],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode in (0, 1), (
+        f"git grep errored (rc={completed.returncode}, stderr: "
+        f"{completed.stderr!r}) on pattern {pattern!r} under {check.paths!r} — "
+        f"_run_grep_check would report ERRORED"
+    )
+    assert completed.returncode == 0, (
+        f"pattern {pattern!r} matched nothing under {check.paths!r} — "
+        f"_run_grep_check would report FAILED on main"
+    )
+    parsed = [line.split(":", 2) for line in completed.stdout.splitlines() if line]
+    assert parsed, "grep reported rc=0 but produced no output lines"
+
+    paths_matched = {fields[0] for fields in parsed}
+    assert paths_matched == {"orchestrator/tests/test_sandbox_enforcement_matrix.py"}, (
+        f"anchor {pattern!r} leaked outside the certified suite: "
+        f"{sorted(paths_matched)}"
+    )
+
+    assert any(fields[2].lstrip().startswith(("class ", "def ")) for fields in parsed), (
+        f"anchor {pattern!r} does not name a definition the suite "
+        f"owns — no matched line starts with 'class '/'def ' after lstrip()"
     )
