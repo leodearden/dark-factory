@@ -170,7 +170,24 @@ CREATE TABLE IF NOT EXISTS snapshots (
     -- only (red-tier), but a burndown window spans restarts and the cap also
     -- varies BETWEEN projects, so the only honest denominator for a historical
     -- row is the cap that was in force at that instant.
-    concurrency_cap      INTEGER
+    concurrency_cap      INTEGER,
+    -- Task 5591 (δ1). NULL in any of these six = not recorded when the row
+    -- was written (a row from before this migration); never a measured zero.
+    -- review/merge_deferred/infra_hold complete the nine TaskStatus members.
+    -- in_progress_rows is the ROWS' in-progress count, which
+    -- in_progress_live + in_progress_stranded partitions; the census's
+    -- in_progress may differ from it by intra-unit skew.
+    -- state is 'value' or 'gap'; NULL on a pre-migration row means a measured
+    -- row, because before this change only a successful read wrote a row.
+    -- A gap row carries no measurement: its count columns are NULL, or hold
+    -- their DEFAULT physically where legacy NOT NULL forbids NULL, so every
+    -- reader selects measured rows only. reason says why a gap is a gap.
+    review               INTEGER,
+    merge_deferred       INTEGER,
+    infra_hold           INTEGER,
+    in_progress_rows     INTEGER,
+    state                TEXT,
+    reason               TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
 """
@@ -183,6 +200,12 @@ _ADDED_SNAPSHOT_COLUMNS: tuple[tuple[str, str], ...] = (
     ('in_progress_live', 'INTEGER NOT NULL DEFAULT 0'),
     ('in_progress_stranded', 'INTEGER NOT NULL DEFAULT 0'),
     ('concurrency_cap', 'INTEGER'),
+    ('review', 'INTEGER'),
+    ('merge_deferred', 'INTEGER'),
+    ('infra_hold', 'INTEGER'),
+    ('in_progress_rows', 'INTEGER'),
+    ('state', 'TEXT'),
+    ('reason', 'TEXT'),
 )
 
 # Maps raw task statuses to the 6 display zones.
@@ -217,8 +240,9 @@ async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     Additive only: probes ``PRAGMA table_info`` and issues one
     ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, never drops
     or rewrites anything, so pre-existing rows keep their data and take the
-    column defaults (``0`` for the split, ``NULL`` for the cap — an honest
-    "unknown", since no cap was recorded at the time).
+    column defaults: ``0`` for the split (task 3543), and ``NULL`` for the cap
+    and for every column task 5591 added — an honest "not recorded", since
+    none of them was measured when the row was written.
 
     Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
     ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
