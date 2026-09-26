@@ -36,12 +36,19 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
+import importlib.metadata
 import importlib.util
 import json
 import logging
+import os
 import sys
+import time
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -704,3 +711,119 @@ def run_reranker_eval(
     )
     write_report(report, report_path)
     return report
+
+
+_FIXTURES = _PACKAGE_ROOT / 'tests' / 'fixtures'
+_LIBRARIES = ('torch', 'sentence-transformers', 'transformers')
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--fixture', default=str(_FIXTURES / 'write_triage_calibration.jsonl'))
+    parser.add_argument(
+        '--canonical-aliases', dest='canonical_aliases',
+        default=str(_FIXTURES / 'write_triage_calibration.canonical_aliases.json'),
+        help='the {old_canonical_id: current_id} sidecar; the population the PRD thresholds cite',
+    )
+    parser.add_argument('--project-id', dest='project_id', default='reify')
+    parser.add_argument('--report-path', dest='report_path', default=str(_DEFAULT_REPORT_PATH))
+    parser.add_argument('--config', default=None, help='fused-memory config file (sets CONFIG_PATH)')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='measure only the first N labelled records (a smoke; refused at the committed path)')
+    parser.add_argument('--p95-ceiling-seconds', dest='p95_ceiling_seconds', type=float,
+                        default=DEFAULT_P95_CEILING_SECONDS)
+    parser.add_argument('--max-arm-spend-usd', dest='max_arm_spend_usd', type=float, default=2.0)
+    parser.add_argument('--pairwise-concurrency', dest='pairwise_concurrency', type=int, default=20)
+    parser.add_argument('--local-batch-size', dest='local_batch_size', type=int, default=4)
+    parser.add_argument('--device', default='auto', help="local arms' torch device: auto, cpu or cuda")
+    parser.add_argument('--vram-cap-gib', dest='vram_cap_gib', type=float, default=8.0)
+    return parser
+
+
+def _library_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in _LIBRARIES:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+@contextlib.asynccontextmanager
+async def _live_memory_service(config: Any) -> AsyncIterator[Any]:
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        yield memory
+    finally:
+        await memory.close()
+
+
+def run_cli(
+    args: argparse.Namespace,
+    *,
+    memory_service_factory: Callable[[Any], AbstractAsyncContextManager[Any]] | None = None,
+    arms: Sequence[_arms.ArmSpec] | None = None,
+) -> int:
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.server.write_triage import resolve_candidate_k  # noqa: PLC0415
+
+    report_path = guard_committed_report(args.report_path, limit=args.limit)
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+    fixture = load_fixture(args.fixture)
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
+    labelled = [record for record in fixture if str(record['label']) != LABEL_CANONICAL]
+    labelled = labelled if args.limit is None else labelled[:args.limit]
+    config = FusedMemoryConfig()
+    k = resolve_candidate_k(types.SimpleNamespace(config=config))
+    open_memory = memory_service_factory or _live_memory_service
+    logger.info('retrieving %d slate(s) from project_id=%s at k=%d', len(labelled), args.project_id, k)
+
+    async def prefetch() -> dict[str, dict[str, Any]]:
+        async with open_memory(config) as memory:
+            return await load_retrieval().prefetch_retrievals(
+                memory, labelled, project_id=args.project_id, k=k,
+            )
+
+    cases = build_cases(labelled, asyncio.run(prefetch()))
+    report = run_reranker_eval(
+        cases=cases,
+        arms=arms if arms is not None else _arms.D1_ARMS,
+        aliases=aliases,
+        context=_arms.ArmContext(
+            device=args.device, local_batch_size=args.local_batch_size,
+            vram_cap_gib=args.vram_cap_gib, pairwise_concurrency=args.pairwise_concurrency,
+        ),
+        provenance={
+            'fixture_path': package_relative(args.fixture),
+            'record_count': len(fixture),
+            'canonical_aliases_path': (
+                package_relative(args.canonical_aliases) if args.canonical_aliases else None
+            ),
+            'canonical_aliases_count': len(aliases),
+            'project_id': args.project_id,
+            'candidate_k': k,
+            'retrieval_call': _calibrate.RETRIEVAL_CALLS[_calibrate.RETRIEVAL_PRODUCTION],
+            'limit': args.limit,
+            'libraries': _library_versions(),
+        },
+        report_path=report_path,
+        clock=time.perf_counter,
+        max_spend_usd=args.max_arm_spend_usd,
+        p95_ceiling_seconds=args.p95_ceiling_seconds,
+    )
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    return run_cli(build_parser().parse_args())
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
