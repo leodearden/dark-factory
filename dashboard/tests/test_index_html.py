@@ -1230,6 +1230,104 @@ def test_task_vocab_js_loads_before_app(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: task_snapshot.js is served, versioned, and sits between the
+# modules it reads and the census surfaces that read it (task 5589, PRD leaf
+# gamma2)
+#
+# task_snapshot.js is the ONE client reader of the /tasks snapshot unit. It
+# destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope, and
+# shell.jsx, tab_overview.jsx, tabs.jsx and app.jsx destructure
+# window.DF_TASK_SNAPSHOT at module scope — none with a fallback. Every edge is
+# its own case, as in _DATUM_ORDER_CASES, because each one blanks a different
+# surface.
+# ---------------------------------------------------------------------------
+
+_TASK_SNAPSHOT_PREFIX = '/static/redux/task_snapshot.js'
+_TAB_OVERVIEW_PREFIX = '/static/redux/tab_overview.jsx'
+
+
+def test_task_snapshot_js_is_served(client) -> None:
+    """GET /static/redux/task_snapshot.js returns 200.
+
+    The load-order guards below only read tag positions, which a file present
+    in git but not served would still pass — while every census surface throws
+    on its top-level destructure.
+    """
+    resp = client.get(_TASK_SNAPSHOT_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_TASK_SNAPSHOT_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_task_snapshot_js_has_cache_buster(index_html_body: str) -> None:
+    """task_snapshot.js is present among the VERSIONED redux assets.
+
+    Its own test for the task_vocab.js reason next door. A browser holding a
+    stale copy would read this week's census payload with last week's readings.
+    """
+    assert re.search(r'/static/redux/task_snapshot\.js\?v=\d+', index_html_body), (
+        'task_snapshot.js is not present among the versioned /static/redux/* '
+        'assets in index.html — every census surface destructures '
+        'window.DF_TASK_SNAPSHOT at top level with no fallback. Bump all '
+        '/static/redux/* ?v= uniformly.'
+    )
+
+
+_READS_AT_MODULE_SCOPE = (
+    'destructures the global {before} defines at module scope with no '
+    'fallback; the definition must run first.'
+)
+_TASK_SNAPSHOT_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _READS_AT_MODULE_SCOPE),
+    (_TASK_VOCAB_PREFIX, 'task_vocab.js', _TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _READS_AT_MODULE_SCOPE),
+    (
+        _TASK_SNAPSHOT_PREFIX,
+        'task_snapshot.js',
+        _SHELL_PREFIX,
+        'shell.jsx',
+        'holds the shared readings (Pip, DatumReading) every census surface '
+        'renders through; the census reader stays among the classic scripts '
+        'that all run before it.',
+    ),
+    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _TAB_OVERVIEW_PREFIX, 'tab_overview.jsx', _READS_AT_MODULE_SCOPE),
+    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _TABS_PREFIX, 'tabs.jsx', _READS_AT_MODULE_SCOPE),
+    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _APP_JSX_PREFIX, 'app.jsx', _READS_AT_MODULE_SCOPE),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label, why',
+    _TASK_SNAPSHOT_ORDER_CASES,
+    ids=[
+        'datum-before-snapshot',
+        'vocab-before-snapshot',
+        'snapshot-before-shell',
+        'snapshot-before-tab-overview',
+        'snapshot-before-tabs',
+        'snapshot-before-app',
+    ],
+)
+def test_task_snapshot_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+    why: str,
+) -> None:
+    """The census reader loads after what it reads and before what reads it."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + why.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: datum.js is served and sits between endpoint_staleness.js
 # and its consumers (task 5588, PRD leaf gamma1)
 #
