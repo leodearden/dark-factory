@@ -22,6 +22,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STREAK_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     SUPPRESSION_STREAK_THRESHOLD_CYCLES,
@@ -14272,3 +14273,144 @@ class TestUpdateSuppressionStreaks:
             _ESD_U1: 3,
             _ESD_U2: 2,
         }
+
+
+async def _seed_streak(ledger: ReconLedgerStore, entity_uuid: str, streak: int) -> None:
+    await ledger.upsert_suppression_streak(
+        project_id=_STREAK_PID,
+        entity_uuid=entity_uuid,
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        streak=streak,
+        last_run_id='run-seed',
+        updated_at=_STREAK_NOW,
+        expires_at='2099-01-01T00:00:00+00:00',
+    )
+
+
+class TestUpdateSuppressionStreaksFailSafe:
+    """An unread ledger is never read as a quiet cycle (task 2943 step-9)."""
+
+    @pytest.mark.asyncio
+    async def test_unevaluated_cycle_neither_increments_nor_resets(
+        self, ledger_memory_service
+    ):
+        ledger = ledger_memory_service.recon_ledger
+        await _seed_streak(ledger, _ESD_U1, 2)
+        unevaluated = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
+        )
+
+        assert await _run_cycle(ledger_memory_service, 'run-1', unevaluated) == []
+        assert await _stored_streaks(ledger) == {_ESD_U1: 2}
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_returns_empty_with_debug_log(self, caplog):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+
+        with caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
+            updates = await _run_cycle(memory_service, 'run-1', _suppressing(_ESD_U1))
+
+        assert updates == []
+        assert any(
+            rec.levelno == logging.DEBUG and 'update_suppression_streaks' in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_read_failure_writes_nothing(self, ledger_memory_service, monkeypatch, caplog):
+        """A transient read error leaves an established streak intact."""
+        ledger = ledger_memory_service.recon_ledger
+        await _seed_streak(ledger, _ESD_U1, 2)
+        monkeypatch.setattr(
+            ledger, 'list_suppression_streaks', AsyncMock(side_effect=RuntimeError('boom'))
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            updates = await _run_cycle(
+                ledger_memory_service, 'run-1', _suppressing(_ESD_U1, _ESD_U2)
+            )
+
+        assert updates == []
+        seeded = await ledger.get_by_identity(
+            _STREAK_PID,
+            RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+            task_id='',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id=_ESD_U1,
+        )
+        assert seeded is not None
+        assert json.loads(seeded.payload_json)[STREAK_PAYLOAD_KEY] == 2
+        assert (
+            await ledger.get_by_identity(
+                _STREAK_PID,
+                RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+                task_id='',
+                flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                run_id=_ESD_U2,
+            )
+            is None
+        ), 'no row may be written when the prior state could not be read'
+        assert any(rec.levelno == logging.WARNING for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'payload_json',
+        [
+            '[2, 3]',
+            '"two"',
+            'not json',
+            json.dumps({STREAK_PAYLOAD_KEY: True}),
+            json.dumps({STREAK_PAYLOAD_KEY: '2'}),
+            json.dumps({STREAK_PAYLOAD_KEY: -3}),
+        ],
+    )
+    async def test_malformed_stored_streak_reads_as_zero(
+        self, ledger_memory_service, payload_json
+    ):
+        await ledger_memory_service.recon_ledger.upsert(
+            ReconLedgerRecord(
+                project_id=_STREAK_PID,
+                record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+                payload_json=payload_json,
+                state='active',
+                created_at=_STREAK_NOW,
+                flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                run_id=_ESD_U1,
+                entity_uuid=_ESD_U1,
+                expires_at='2099-01-01T00:00:00+00:00',
+            )
+        )
+
+        (update,) = await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
+
+        assert update.streak == 1
+
+    @pytest.mark.asyncio
+    async def test_one_entitys_write_failure_does_not_abort_the_others(
+        self, ledger_memory_service, monkeypatch, caplog
+    ):
+        ledger = ledger_memory_service.recon_ledger
+        real_upsert = ledger.upsert_suppression_streak
+
+        async def _fail_for_u1(**kwargs):
+            if kwargs['entity_uuid'] == _ESD_U1:
+                raise RuntimeError('disk full')
+            await real_upsert(**kwargs)
+
+        monkeypatch.setattr(ledger, 'upsert_suppression_streak', _fail_for_u1)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            updates = await _run_cycle(
+                ledger_memory_service, 'run-1', _suppressing(_ESD_U1, _ESD_U2)
+            )
+
+        assert [u.entity_uuid for u in updates] == [_ESD_U2]
+        assert await _stored_streaks(ledger) == {_ESD_U2: 1}
+        assert any(
+            rec.levelno == logging.WARNING and _ESD_U1 in rec.getMessage()
+            for rec in caplog.records
+        ), 'a WARNING naming the failed entity must be logged'
