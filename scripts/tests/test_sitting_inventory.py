@@ -54,6 +54,7 @@ def df_root(tmp_path):
     root = tmp_path / 'src' / 'dark-factory'
     (root / 'data' / 'escalations').mkdir(parents=True)
     (root / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+    (root / '.taskmaster' / 'tasks').mkdir(parents=True)
     return root
 
 
