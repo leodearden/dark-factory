@@ -1469,38 +1469,61 @@ async def main_baseline_failing_ids(
     module_configs: 'list[ModuleConfig]',
     git_ops: object,
     main_sha: str,
+    *,
+    red_module_prefixes: frozenset[str] | None = None,
 ) -> 'frozenset[str] | None':
     """Return the set of test ids already failing on *main_sha*, cache-first.
 
-    Cache hit (seeded by a prior gate pass, or a prior probe of this same
-    sha while it is still cached): returned immediately — no probe, no
-    worktree.
+    *red_module_prefixes* names the modules holding the caller's red ids.
+    ``None`` asks about the whole tree. A set asks only about those modules:
+    each one the cache does not know yet is probed with its registered
+    merge-role command, the identical per-module run a whole-tree probe
+    makes, so its selection context is unchanged. It is never narrowed to
+    single test ids, because module granularity keeps the identical command
+    and selection context (task 4585 measured selection-dependent failures).
+    An empty set needs no probe. A prefix outside
+    ``verify_plan.effective_merge_module_configs`` falls back to the whole
+    tree.
 
-    Cache miss: runs exactly ONE full-suite, merge-role probe of bare main,
-    reusing the same ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ...,
-    warm_seed=True)`` + ``run_scoped_verification`` lifecycle
-    :func:`verify_failure_is_preexisting_on_main` uses for its own probe —
+    Cache hit: a whole-tree entry (a gate-pass seed or a whole-tree probe of
+    this sha) answers any request; per-module entries answer the modules
+    they cover. No probe, no worktree.
+
+    Cache miss: probes bare main inside ONE
+    ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ..., warm_seed=True)`` —
     a leaseless, local-only probe that NEVER routes through
     :class:`~orchestrator.verify_runner.HostAllocator` or
-    :class:`~orchestrator.verify_runner.RemoteRunner` (see that function's
-    docstring for the full LEASE-SAFETY & HOST-AFFINITY rationale, which
-    applies identically here). The probe passes no ``task_files`` — full
-    suite, no scoping — so its id-set is apples-to-apples with a merge+full
-    branch verify's id-set.
+    :class:`~orchestrator.verify_runner.RemoteRunner` (see
+    :func:`verify_failure_is_preexisting_on_main`'s docstring for the full
+    LEASE-SAFETY & HOST-AFFINITY rationale, which applies identically here).
+    The whole-tree probe is one ``run_scoped_verification`` with no
+    ``task_files``; the narrowed probe is one ``run_verification`` per
+    missing red module.
 
-    A probe that doesn't yield a junit-derived id set
-    (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the probe
-    itself errored) returns ``None`` (B3 degrade) and is deliberately **not**
-    cached, so the next caller retries rather than being stuck with a
-    falsely-empty baseline for the life of the SHA.
+    B3: when the whole tree, or any requested module, yields no junit-derived
+    id set (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the
+    probe itself errored), the answer is ``None`` and that part is
+    deliberately **not** cached, so the next caller retries rather than
+    being stuck with a falsely-empty baseline for the life of the SHA.
 
-    Does not alter deferred-probe scheduling/transport (G4, task 2564) — the
-    probe body reused here is exactly the one that function already owns.
+    Does not alter deferred-probe scheduling/transport (G4, task 2564).
     """
-    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
-
     if not main_sha:
         return None
+    if red_module_prefixes is None:
+        return await _whole_tree_main_baseline(config, module_configs, git_ops, main_sha)
+    return await _red_module_main_baseline(
+        config, module_configs, git_ops, main_sha, red_module_prefixes,
+    )
+
+
+async def _whole_tree_main_baseline(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+) -> 'frozenset[str] | None':
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
     _cached = _recall_main_baseline(main_sha, touch=True)
     if _cached is not None and _cached.every_module is not None:
@@ -1557,19 +1580,117 @@ async def main_baseline_failing_ids(
         return None
 
 
+async def _red_module_main_baseline(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+    prefixes: frozenset[str],
+) -> 'frozenset[str] | None':
+    if not prefixes:
+        return frozenset()
+    registered = {
+        mc.prefix: mc
+        for mc in verify_plan.effective_merge_module_configs(config, module_configs)
+    }
+    unresolved = prefixes - registered.keys()
+    if unresolved:
+        logger.info(
+            'main_baseline_failing_ids: red module(s) %s are not merge modules '
+            '(main_sha=%.8s) — probing the whole tree', sorted(unresolved), main_sha,
+        )
+        return await _whole_tree_main_baseline(config, module_configs, git_ops, main_sha)
+
+    known = _recall_main_baseline(main_sha, touch=True) or _MainShaBaseline()
+    if known.every_module is not None:
+        return known.every_module
+    by_module = dict(known.by_module)
+    missing = prefixes - by_module.keys()
+    if missing:
+        probed = await _probe_modules_on_main(
+            config, git_ops, main_sha, [registered[p] for p in sorted(missing)],
+        )
+        if probed:
+            current = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
+            _remember_main_baseline(
+                main_sha, replace(current, by_module={**current.by_module, **probed}),
+            )
+            by_module.update(probed)
+        if probed is None or not missing <= probed.keys():
+            return None
+    return frozenset().union(*(by_module[p] for p in prefixes))
+
+
+async def _probe_modules_on_main(
+    config: 'OrchestratorConfig',
+    git_ops: object,
+    main_sha: str,
+    module_configs: 'list[ModuleConfig]',
+) -> dict[str, frozenset[str]] | None:
+    """Each module's failing ids on bare *main_sha*, keyed by prefix.
+
+    A module whose run collected no junit is absent from the result; the
+    whole answer is ``None`` when the worktree or any run raised.
+    """
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
+
+    sem = asyncio.Semaphore(max(1, config.merge_verify_max_concurrent_modules))
+
+    async def _probe(worktree: Path, mc: 'ModuleConfig') -> VerifyResult:
+        async with sem:
+            return await run_verification(worktree, config, mc, max_retries=0, role='merge')
+
+    try:
+        # warm_seed=True for the reason given in _whole_tree_main_baseline.
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
+        ) as tmp_path:
+            # return_exceptions: no sibling may outlive the worktree it runs in.
+            results = await asyncio.gather(
+                *(_probe(tmp_path, mc) for mc in module_configs), return_exceptions=True,
+            )
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+        )
+        return None
+    except Exception:
+        logger.warning('main_baseline_failing_ids: unexpected error', exc_info=True)
+        return None
+
+    collected: dict[str, frozenset[str]] = {}
+    for mc, result in zip(module_configs, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'main_baseline_failing_ids: probe of module %s raised', mc.prefix,
+                exc_info=result,
+            )
+            return None
+        if result.failing_test_ids is not None:
+            collected[mc.prefix] = frozenset(result.failing_test_ids)
+    return collected
+
+
 def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
     """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
 
     Pure, synchronous, side-effect-free (it never reorders the recency
-    bound): returns the cached whole-tree id set for *main_sha* when
-    present, else ``None``.  Used by the synchronous branch-block reason
-    enrichment in ``merge_queue._run_post_merge_verify`` (task μ,
+    bound). Returns the whole-tree id set for *main_sha* when known;
+    otherwise the ids KNOWN to fail across the modules probed so far (a
+    lower bound on main's red); otherwise ``None``. Used by the synchronous
+    branch-block reason enrichment and the task-2823 trivial-pass main-red
+    gate in ``merge_queue._run_post_merge_verify`` (task μ,
     verify-scope-inversion-prd.md), which must NEVER trigger a probe on the
-    critical path (G4, task 2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
-    probes on a miss), this helper only ever reads.
+    critical path (G4, task 2564).
     """
     _cached = _recall_main_baseline(main_sha, touch=False)
-    return _cached.every_module if _cached is not None else None
+    if _cached is None:
+        return None
+    if _cached.every_module is not None:
+        return _cached.every_module
+    if _cached.by_module:
+        return frozenset().union(*_cached.by_module.values())
+    return None
 
 
 def _worst_category(categories: list[str]) -> str:
