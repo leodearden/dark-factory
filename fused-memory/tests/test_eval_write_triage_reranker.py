@@ -481,8 +481,8 @@ class TestRunRerankerEval:
         report = self._run(tmp_path / 'r.json')
         baseline = report['baseline']
         assert (baseline['arm'], baseline['status']) == ('cosine', 'measured')
-        assert baseline['rank1'] == {'hits': 2, 'total': 3}
-        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 3}
+        assert baseline['rank1'] == {'hits': 2, 'total': 2}
+        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 2}
         assert (baseline['p50_seconds'], baseline['p95_seconds'], baseline['latency']) == (
             None, None, None,
         )

@@ -37,6 +37,7 @@ Usage
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -509,3 +510,197 @@ def choose_best(
         'qualified': bool(qualified),
         'p95_ceiling_seconds': p95_ceiling_seconds,
     }
+
+
+#: The COMMITTED artifact: the 84-case measurement gate Γ2 reads.
+_DEFAULT_REPORT_PATH = _PACKAGE_ROOT / 'calibration' / 'write_triage_reranker_report.json'
+
+BASELINE_ARM = 'cosine'
+
+
+def guard_committed_report(report_path: str | Path, *, limit: int | None) -> Path:
+    """Refuse a ``--limit`` run aimed at the committed report, however its path is spelled.
+
+    ``resolve()`` on both sides, as ``eval_write_triage_judge.py::_is_committed_report``
+    does: a relative spelling must not slip past as a different file. A partial
+    run published there would be a different population under the same name.
+    """
+    path = Path(report_path)
+    if limit is not None and path.resolve() == _DEFAULT_REPORT_PATH.resolve():
+        raise ValueError(
+            f'--limit {limit} would overwrite the committed report {package_relative(path)} '
+            'with a partial measurement; pass --report-path somewhere else',
+        )
+    return path
+
+
+def measure_baseline(cases: Sequence[RerankCase], *, aliases: Mapping[str, str] | None) -> ArmRow:
+    """Production's current attach order on the same slates. Costs nothing and adds no latency."""
+    return ArmRow(
+        arm=BASELINE_ARM, arm_class='baseline', model='store_score',
+        status=ArmStatus.measured,
+        ranking=ranking_metrics(cases, [baseline_scores(case) for case in cases], aliases=aliases),
+    )
+
+
+def caveats_for(report: Mapping[str, Any]) -> list[str]:
+    """What a reader must know to read the numbers, stated from the report's own data."""
+    arms = report['arms']
+    caveats = [
+        'Local cross-encoder arms score with each model\'s published template and default '
+        'instruction; the LLM pairwise arm uses this script\'s own same-claim prompt, so the '
+        'two classes are not prompted alike.',
+        f'The {BASELINE_ARM} baseline orders each slate by store_score, production\'s attach '
+        'signal. It is reported for comparison and is never eligible for best.',
+        'AUC is rank-based (Mann-Whitney, ties count half) over each case\'s canonical-or-alias '
+        'pair score as the arm scored it on the retrieved slate. '
+        f'{report["baseline"]["auc"]["n_hard_negative"]} hard negative(s) reached their slate; '
+        'read the value beside that sample size.',
+        'Latency is per-slate wall time on the recorded device after one untimed warm-up '
+        'slate; remote arms include the network round trip.',
+        'A local arm\'s cost is the per-call charge (zero), not amortised hardware or power.',
+    ]
+    truncation = [
+        f'{row["arm"]} at {row["max_length"]} tokens: {row["pairs_over_max_length"]} pair(s) over'
+        for row in arms if row['max_length'] is not None
+    ]
+    caveats.append(
+        'pairs_over_max_length is a lower bound on truncation: it counts entry plus candidate '
+        'tokens without the template or special tokens.'
+        + (f' {"; ".join(truncation)}.' if truncation else ''),
+    )
+    caveats.extend(
+        f'{row["arm"]} was skipped ({row["skip_reason"]}): {row["skip_detail"]}'
+        for row in arms if row['status'] == ArmStatus.skipped
+    )
+    return caveats
+
+
+def build_report(
+    *,
+    arm_rows: Sequence[ArmRow],
+    baseline: ArmRow,
+    cases: Sequence[RerankCase],
+    provenance: Mapping[str, Any],
+    context: _arms.ArmContext,
+    max_spend_usd: float,
+    p95_ceiling_seconds: float,
+) -> dict[str, Any]:
+    rows = [row.to_json() for row in arm_rows]
+    measured = {
+        'arms': rows,
+        'baseline': baseline.to_json(),
+        'best': choose_best(rows, p95_ceiling_seconds=p95_ceiling_seconds),
+    }
+    return {
+        **measured,
+        'caveats': caveats_for(measured),
+        'provenance': {
+            **provenance,
+            'case_count': len(cases),
+            'canonical_absent': sum(not case.canonical_present for case in cases),
+            'degraded_retrievals': sum(case.degraded for case in cases),
+            'self_retrieved': sum(case.self_retrieved for case in cases),
+            'p95_ceiling_seconds': p95_ceiling_seconds,
+            'max_arm_spend_usd': max_spend_usd,
+            'local_batch_size': context.local_batch_size,
+            'vram_cap_gib': context.vram_cap_gib,
+            'pairwise_concurrency': context.pairwise_concurrency,
+        },
+    }
+
+
+def _fmt(value: Any, spec: str = '') -> str:
+    return 'n/a' if value is None else format(value, spec)
+
+
+def _rate_cell(rate: float | None, count: Mapping[str, int] | None) -> str:
+    if count is None:
+        return _fmt(rate)
+    return f'{_fmt(rate, ".3f")} ({count["hits"]}/{count["total"]})'
+
+
+def _table_row(row: Mapping[str, Any]) -> str:
+    cells = [
+        row['arm'], row['arm_class'], row['status'], _fmt(row['skip_reason']),
+        _rate_cell(row['rank1_rate'], row['rank1']),
+        _rate_cell(row['rank5_rate'], row['rank5']),
+        _fmt(row['auc']['value'] if row['auc'] else None, '.3f'),
+        _fmt(row['p50_seconds'], '.3f'), _fmt(row['p95_seconds'], '.3f'),
+        _fmt(row['cost_per_write_usd'], '.5f'),
+        _fmt(row['device']), _fmt(row['vram_peak_mib'], '.0f'),
+    ]
+    return '| ' + ' | '.join(cells) + ' |'
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """The human-readable sibling of the JSON report, rendered from it alone."""
+    best = report['best']
+    lines = [
+        '# Write-triage reranker arms (rho1)',
+        '',
+        'Rendered from the JSON report beside this file by '
+        '`scripts/eval_write_triage_reranker.py`.',
+        '',
+        f'**Best:** {best["arm"] or "none measured"} — '
+        f'rank-1 {_fmt(best["rank1_rate"], ".3f")}, p95 {_fmt(best["p95_seconds"], ".3f")} s, '
+        f'qualified: {"yes" if best["qualified"] else "no"} '
+        f'(p95 ceiling {best["p95_ceiling_seconds"]} s)',
+        '',
+        '| arm | class | status | skip reason | rank-1 | rank-5 | AUC | p50 s | p95 s '
+        '| cost/write USD | device | VRAM MiB |',
+        '|' + '---|' * 12,
+        _table_row(report['baseline']),
+        *(_table_row(row) for row in report['arms']),
+        '',
+        '## Caveats',
+        '',
+        *(f'- {caveat}' for caveat in report['caveats']),
+        '',
+        '## Provenance',
+        '',
+        *(f'- `{key}`: {json.dumps(value)}' for key, value in report['provenance'].items()),
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def write_report(report: Mapping[str, Any], report_path: Path) -> None:
+    """Write the JSON report and its ``.md`` sibling."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    report_path.with_suffix('.md').write_text(render_markdown(report))
+
+
+def run_reranker_eval(
+    *,
+    cases: Sequence[RerankCase],
+    arms: Sequence[_arms.ArmSpec],
+    aliases: Mapping[str, str] | None,
+    context: _arms.ArmContext,
+    provenance: Mapping[str, Any],
+    report_path: str | Path,
+    clock: Callable[[], float],
+    max_spend_usd: float,
+    p95_ceiling_seconds: float,
+) -> dict[str, Any]:
+    """Measure the baseline and every arm in order, then write and return the report."""
+    report_path = Path(report_path)
+    if report_path.suffix != '.json':
+        raise ValueError(
+            f'the report path must end in .json (a .md sibling is written beside it): '
+            f'{report_path}',
+        )
+    baseline = measure_baseline(cases, aliases=aliases)
+    rows = []
+    for spec in arms:
+        logger.info('measuring arm %s (%s)', spec.name, spec.model)
+        rows.append(measure_arm(
+            spec, cases, aliases=aliases, context=context, clock=clock,
+            max_spend_usd=max_spend_usd,
+        ))
+    report = build_report(
+        arm_rows=rows, baseline=baseline, cases=cases, provenance=provenance,
+        context=context, max_spend_usd=max_spend_usd, p95_ceiling_seconds=p95_ceiling_seconds,
+    )
+    write_report(report, report_path)
+    return report
