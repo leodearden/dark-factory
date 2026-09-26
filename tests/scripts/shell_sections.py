@@ -13,15 +13,16 @@ a verbatim second copy:
   3. THE DETECTOR — `grep_q_offenders` and its precondition `sets_pipefail`,
      the source-level rule the quiet-grep sweep asserts, with its
      guard-the-guard in
-     test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
+     test_quiet_grep_sweep.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
 
 (2) and (3) are a rule about ONE specific defect and are not, strictly, about
-slicing. They live here anyway, and that is a decision: both consumers of the
-slicer are exactly the two probe suites, so a third module would be imported
-by the same two files and split one subject across two homes. Should a suite
-ever want the slicer WITHOUT the probe machinery, splitting (2)+(3) into a
-sibling is the right move at that point — the import sites are the only thing
-that would change.
+slicing. They live here anyway, and that is a decision: a suite imports only
+the names it uses, so one that needs the slicer alone, or the detector alone,
+pays nothing for the co-location, and every suite that uses the scaffold also
+slices. Splitting (2)+(3) into a sibling is the right move once this module
+outgrows one file. The import lines are not all that would move with them:
+scripts/tests/test_deploy_w5_recon_reliability.py pins
+`shell_sections.py::SIGPIPE_BULK_BYTES` by name.
 
 Sibling-helper module, following the `systemd_unit_invariants.py` precedent that
 tests/scripts/conftest.py explicitly supports: pyproject sets
@@ -318,10 +319,10 @@ SILENT_FAILURE = "    exit 1\n"
 
 
 # --- the `| grep -q` detector ----------------------------------------------
-# What test_script_probe_pipelines.py::test_never_pipes_a_producer_into_grep_q
+# What test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q
 # asserts over every swept script, so the rule below exists ONCE. Its
 # guard-the-guard —
-# test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline,
+# test_quiet_grep_sweep.py::test_the_grep_q_sweep_detects_a_planted_pipeline,
 # planted spellings that must match plus the shapes that must not — sits beside
 # that sweep.
 
@@ -339,7 +340,7 @@ SILENT_FAILURE = "    exit 1\n"
 # is latent by construction: it would first surface as a confusing sweep failure
 # against a future author's perfectly legitimate line, which is the worst moment
 # to discover a lint rule is wrong. Pinned in the must-not-match set of
-# test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
+# test_quiet_grep_sweep.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
 _GREP_PIPE = re.compile(r"(?<!\|)\|(?!\|)\s*grep\s+(?P<args>[^|;&)]*)")
 
 # Every spelling of "exit on the first match and close the read end": the short

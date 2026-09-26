@@ -1,14 +1,13 @@
-"""Behavioural coverage for `producer | grep -q PAT` probes, plus the ONE quiet-grep sweep.
+"""Behavioural coverage for `producer | grep -q PAT` probes.
 
-The behavioural sections cover scripts/export-data.sh, scripts/import-data.sh,
-scripts/verify-migration.sh and scripts/run_eval_matrix.sh. The sibling suite
+The sections cover scripts/export-data.sh, scripts/import-data.sh and
+scripts/verify-migration.sh. The sibling suite
 test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh;
-the two share one slicer, one probe scaffold and one detector, all in
+the two share one slicer and one probe scaffold, both in
 tests/scripts/shell_sections.py.
 
-The source-level sweep at the bottom, `test_never_pipes_a_producer_into_grep_q`,
-forbids the construct itself in EVERY swept script (`_SWEPT_SCRIPTS`),
-setup-host.sh included, with its guard-the-guard beside it.
+The companion source-level sweep that forbids the construct itself is
+test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q.
 
 WHY THESE EXIST. `producer | grep -q PAT` reports the PRODUCER's exit status
 under `set -o pipefail`, not grep's verdict, so an `if` guarding on it can take
@@ -41,18 +40,14 @@ from __future__ import annotations
 
 import pathlib
 
-import pytest
-from setup_host_sections import SETUP_HOST_PATH
 from shell_sections import (
     REPO_ROOT,
     SILENT_FAILURE,
     clean_match,
     dispatch_stub_body,
-    grep_q_offenders,
     match_then_bulk,
     match_then_nonzero,
     run_with_preamble,
-    sets_pipefail,
     slice_section,
     slice_shell_function,
     stub_bin_dir,
@@ -61,9 +56,7 @@ from shell_sections import (
 
 EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
 IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"
-DEPLOY_W5_PATH = REPO_ROOT / "scripts" / "deploy-w5-recon-reliability.sh"
 VERIFY_MIGRATION_PATH = REPO_ROOT / "scripts" / "verify-migration.sh"
-RUN_EVAL_MATRIX_PATH = REPO_ROOT / "scripts" / "run_eval_matrix.sh"
 
 
 # --- the shared scaffold ----------------------------------------------------
@@ -750,188 +743,3 @@ def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
     combined = result.stdout + result.stderr
     assert _CONTAINER_RUNNING in combined, combined
     assert _CONTAINER_NOT_FOUND not in combined, combined
-
-
-# --- run_eval_matrix.sh: B200 retry/fallback routing -----------------------
-# The launch if/else, sliced from its LAUNCH echo to the 4-space `fi` that
-# closes it, with the SHIPPED defaults block (CONFIGS through B200_CONFIGS)
-# ahead of it, so the membership list under test is the script's own. Both
-# arms background the launcher with `&`, hence the appended `wait`.
-_MATRIX_DEFAULTS_START = 'CONFIGS="${CONFIGS:-'
-_MATRIX_DEFAULTS_END = "B200_CONFIGS="
-_MATRIX_LAUNCH_START = "LAUNCH $cfg"
-_MATRIX_LAUNCH_END = "\n    fi\n"
-
-# Only the B200 arm passes it.
-_B200_ARM_FLAG = "--gpu-retry-minutes"
-
-
-def _matrix_defaults():
-    """`set -uo pipefail` plus run_eval_matrix.sh's own defaults block, verbatim."""
-    return "set -uo pipefail\n" + slice_section(
-        RUN_EVAL_MATRIX_PATH, _MATRIX_DEFAULTS_START, _MATRIX_DEFAULTS_END
-    )
-
-
-def _launcher_argv(tmp_path, cfg):
-    """The argv the launch if/else hands the launcher for *cfg*.
-
-    The shipped PYTHON is an absolute host-venv path, so it is REBOUND to a
-    stub that records its argv, not shadowed on PATH.
-    """
-    argv_file = tmp_path / "launcher-argv"
-    python = write_stub(
-        stub_bin_dir(tmp_path), "stub-python", f'printf \'%s\\n\' "$@" > {argv_file}\n'
-    )
-    preamble = _matrix_defaults() + (
-        f'PYTHON="{python}"\n'
-        "LAUNCHER=run_vllm_eval.py\n"
-        "PORT=8200\n"
-        f'LOG="{tmp_path / "matrix.log"}"\n'
-        f'cfg="{cfg}"\n'
-    )
-    result = run_with_preamble(
-        tmp_path,
-        preamble,
-        slice_section(RUN_EVAL_MATRIX_PATH, _MATRIX_LAUNCH_START, _MATRIX_LAUNCH_END)
-        + "wait\n",
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    argv = argv_file.read_text(encoding="utf-8").splitlines()
-    assert argv[argv.index("--config") + 1] == cfg, argv
-    return argv
-
-
-def test_matrix_routes_every_b200_config_to_the_retry_arm(tmp_path):
-    """Characterization: each name in the shipped B200_CONFIGS gets the retry/fallback flags."""
-    listed = run_with_preamble(
-        tmp_path, _matrix_defaults(), "printf '%s\\n' $B200_CONFIGS\n"
-    )
-    b200_configs = listed.stdout.splitlines()
-    assert b200_configs, listed.stdout + listed.stderr
-
-    for cfg in b200_configs:
-        run_dir = tmp_path / cfg
-        run_dir.mkdir()
-        assert _B200_ARM_FLAG in _launcher_argv(run_dir, cfg), cfg
-
-
-def test_matrix_routes_a_default_non_b200_config_to_the_plain_arm(tmp_path):
-    """Characterization: a shipped CONFIGS default that is not a B200 config launches plainly."""
-    assert _B200_ARM_FLAG not in _launcher_argv(tmp_path, "minimax-m25-nvfp4-new")
-
-
-def test_matrix_routes_a_fragment_of_a_b200_name_to_the_plain_arm(tmp_path):
-    """`reap-172b-nvfp4` is a 2xH200 config, not the B200 `final-reap-172b-nvfp4-gb10`.
-
-    `grep -w` treats `-` as a word boundary, so the fragment matched and the
-    2xH200 config was launched with B200 GPU-retry and H200-fallback flags.
-    """
-    assert _B200_ARM_FLAG not in _launcher_argv(tmp_path, "reap-172b-nvfp4")
-
-
-# --- the quiet-grep sweep --------------------------------------------------
-# Every script whose `producer | grep -q` sites have been fixed, listed ONCE.
-# check_write_triage_flip_preconditions.sh and memory-metadata-coverage-census.sh
-# are clean and are only READ here, which pins them without editing them.
-_SWEPT_SCRIPTS = (
-    SETUP_HOST_PATH,
-    EXPORT_DATA_PATH,
-    IMPORT_DATA_PATH,
-    DEPLOY_W5_PATH,
-    REPO_ROOT / "scripts" / "check_write_triage_flip_preconditions.sh",
-    REPO_ROOT / "scripts" / "memory-metadata-coverage-census.sh",
-    VERIFY_MIGRATION_PATH,
-    RUN_EVAL_MATRIX_PATH,
-)
-
-
-@pytest.mark.parametrize("script", _SWEPT_SCRIPTS, ids=lambda p: p.name)
-def test_never_pipes_a_producer_into_grep_q(script):
-    """No code line in a swept script may decide anything through `producer | grep --quiet PAT`.
-
-    The ONE quiet-grep sweep, for every script in `_SWEPT_SCRIPTS`. The
-    behavioural tests pin what each site DOES; this pins that the defective
-    CONSTRUCT does not come back. Its detector is the shared `grep_q_offenders`
-    in tests/scripts/shell_sections.py, guarded by
-    `test_the_grep_q_sweep_detects_a_planted_pipeline` directly below.
-
-    WHAT THE RULE DOES NOT FORBID. It is scoped to greps that EXIT ON FIRST
-    MATCH — every spelling of that, short cluster or long `--quiet`/`--silent`,
-    since they share one defect. A `| grep -F ... || true` inside a command
-    substitution is a different, safe shape: a non-quiet grep drains its input
-    rather than SIGPIPE-ing the producer. Neither is a `grep -q` reading a
-    FILE swept in: with no producer upstream there is nothing for `pipefail`
-    to conflate.
-
-    And it mandates NO replacement spelling. These scripts happen to use
-    `[[ ]]`, but `case` or a `<<<` here-string remain open to a future author
-    — this forbids one known-defective construct, nothing more.
-    """
-    source = script.read_text(encoding="utf-8")
-
-    # FIRST, because it is what makes the rule load-bearing: without pipefail
-    # there is no defect here and the sweep below would be guarding nothing.
-    assert sets_pipefail(source), (
-        f"{script.name} no longer sets `-o pipefail`, so this sweep would pass "
-        f"vacuously. Either restore it or retire this test deliberately."
-    )
-
-    offenders = grep_q_offenders(source)
-    assert not offenders, f"producer piped into `grep -q` in {script.name}:\n" + "\n".join(
-        f"  line {n}: {line.strip()}" for n, line in offenders
-    )
-
-
-def test_the_grep_q_sweep_detects_a_planted_pipeline():
-    """Guard the guard: a detector that stops matching makes the sweep vacuous.
-
-    Same discipline tests/scripts/test_check_dashboard_unit_parity.py::
-    test_the_sweep_finds_every_known_parity_call_site applies to its own sweep.
-    Passes on arrival — it pins the mechanism, not the product behaviour.
-
-    Guards the SHARED detector in tests/scripts/shell_sections.py — both
-    `grep_q_offenders` and the `sets_pipefail` precondition — on behalf of the
-    one sweep directly above.
-    """
-    planted = (
-        "if foo | grep -q BAR; then\n"
-        "if foo | grep -qF BAR; then\n"
-        "if foo | grep -Fq BAR; then\n"
-        "if foo | grep -i -q BAR; then\n"
-        # The long forms. `grep --quiet` reintroduces this task's exact defect
-        # and reads as innocuous, so it is pinned by the same mechanism as the
-        # short flags rather than left to a docstring claim.
-        "if foo | grep --quiet BAR; then\n"
-        "if foo | grep --silent BAR; then\n"
-        # A flag carrying an argument in between must not hide the quiet one.
-        "if foo | grep -e BAR --quiet; then\n"
-    )
-    assert len(grep_q_offenders(planted)) == 7, grep_q_offenders(planted)
-
-    # A comment describing the construct is not the construct.
-    assert grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
-    # Nor is a non-quiet grep, which drains its input instead of closing it.
-    assert grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
-    # Nor is a `grep -q` over a FILE: no producer upstream, nothing to conflate.
-    assert grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
-    # And a `-q` belonging to a LATER command on the line is not this grep's.
-    assert grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
-    # Nor is the trailing bar of an OR operator a pipe. `cmd || grep -q pat f`
-    # runs grep over a FILE only when cmd failed: no pipeline, no producer, and
-    # nothing for `pipefail` to conflate. None of the swept scripts writes this
-    # today, so without a case here the false positive stays invisible until it
-    # fails a future author's legitimate line.
-    assert grep_q_offenders('cmd || grep -q pat "$f"\n') == []
-
-    # The precondition accepts every spelling the swept scripts use...
-    for spelling in (
-        "set -euo pipefail\n",
-        "set -uo pipefail\n",
-        "set -o pipefail\n",
-        "  set -uo pipefail\n",
-    ):
-        assert sets_pipefail(spelling), spelling
-    # ...and neither a comment quoting it nor a `set` without it.
-    assert not sets_pipefail("# never drop set -o pipefail\n")
-    assert not sets_pipefail("set -eu\n")

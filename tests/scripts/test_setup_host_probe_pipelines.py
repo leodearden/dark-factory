@@ -17,7 +17,7 @@ of scripts/setup-host.sh by code anchors and runs it against PATH stubs, so a
 test asserts on what the script DOES, never on how the fix is spelled.
 
 The companion source-level sweep that forbids the construct itself is
-test_script_probe_pipelines.py::test_never_pipes_a_producer_into_grep_q.
+test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q.
 """
 
 from __future__ import annotations
