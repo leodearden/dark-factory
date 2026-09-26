@@ -148,7 +148,7 @@ Deps: β←{α, δ}; γ←β; ε←γ; θ←η; ι←θ; ζ←θ; ξ←ν. All o
 ## 10. Open questions (tactical, implementation-time)
 
 - Judge prompt wording and few-shot picks (bounded by γ's eval — accuracy report is the arbiter).
-- ~~Phrase-derivation algorithm for ζ (deterministic n-gram vs judge-suggested-then-validated); runtime cluster store location (file vs DB) — must survive restart, merge cleanly with config seeds.~~ **Resolved (task 3135):** derivation is DETERMINISTIC n-gram and abstains rather than emit a weak cluster (`server/topic_cluster_store.py::derive_topic_cluster`). The store is SQLite at `<reconciliation.data_dir>/topic_clusters.db`, keyed `(project_id, topic_id)`, and merged after the config seeds by `server/near_duplicate_guard.py::resolve_topic_guard_clusters`.
+- ~~Phrase-derivation algorithm for ζ (deterministic n-gram vs judge-suggested-then-validated); runtime cluster store location (file vs DB) — must survive restart, merge cleanly with config seeds.~~ **Resolved (task 3135):** derivation is DETERMINISTIC multi-word key-phrase n-gram and abstains rather than emit a weak cluster (`server/topic_cluster_store.py::derive_topic_cluster`). The store is SQLite at `<reconciliation.data_dir>/topic_clusters.db`, keyed `(project_id, topic_id)`, and merged after the config seeds by `server/near_duplicate_guard.py::resolve_topic_guard_clusters`.
 - κ report format and cadence; whether the report also carries D9 sighting-count rankings from day one.
 - Exact ack field names / error codes (schema'd in β; INV-1 requires they live where callers see them).
 - ξ's citation heuristic breadth for legacy entries lacking `reexamine_when` (task-id regex vs semantic) — start narrow (explicit `#id` / "task NNNN" citation), widen from flag precision data.

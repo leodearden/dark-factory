@@ -38,15 +38,22 @@ that derivation needs, so it now seeds the guard itself
   the op's validated `topic` argument, verbatim. The seam invariant that task 3198's
   shared slug namespace exists for therefore holds with no minting step.
 - **Conservative derivation that abstains.** The derivation uses deterministic n-grams.
-  Every rule answers the retired `eval-worktree-plan-tools-missing` cluster, which fired
-  13 off-topic blocks out of 14 because its phrases were ordinary subsystem vocabulary:
+  The rules are motivated by the retired `eval-worktree-plan-tools-missing` cluster, which
+  fired 13 off-topic blocks out of 14 because its phrases were ordinary subsystem vocabulary:
   - a phrase must occur in at least two distinct texts;
+  - a phrase is at least two words and never begins or ends with a closed-class word, so
+    a lone identifier the whole project uses (`add_memory`, `project_id`, `plan.json`)
+    can never qualify, whatever its shape;
   - it must contain a distinctive token: identifier punctuation, a digit, or a long
     word, but never a bare number or a run of punctuation;
   - no phrase may nest inside another;
   - a cluster has at most six phrases, `min_phrase_hits=2` and never any
     `sufficient_phrases`;
   - fewer than two phrases produces no cluster.
+
+  One residual remains: a multi-word construction common across the whole project can
+  still qualify, because rejecting it needs a document-frequency check against the
+  project's other memories, a read this zero-I/O derivation deliberately does not make.
 
   A per-cluster hint shadows the guard's default hint, so the derived hint carries
   everything the writer needs: the canonical UUID, the `allow_near_duplicate` escape,
