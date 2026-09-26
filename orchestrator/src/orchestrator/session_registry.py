@@ -5352,7 +5352,9 @@ def main(argv: list[str] | None = None) -> int:
                 '--pid at all -- only --slug is honoured by all three verbs.'
             )
         if args.verb == 'lease-claim':
-            args.record_slug = resolve_session_slug_for_pid(args.pid) or ''
+            args.record_slug = ''
+            if args.pid is not None:
+                args.record_slug = resolve_session_slug_for_pid(args.pid) or ''
 
     if args.verb == 'close-decision':
         return _run_close_decision(
