@@ -8,17 +8,17 @@
 // LIE: data.js seeded `DONE_COUNTS: {}`, so `DONE_COUNTS[p]` read undefined and
 // both consumers fell through to a count of the done rows in ACTIVE_TASKS. The
 // default render fetches none of those, so every healthy project rendered a
-// confident "0 done". The same two halves as orch_summary_guard.test.mjs, for
-// the same reason (nothing executes a .jsx file):
+// confident "0 done". So the suite has two halves, because nothing executes a
+// .jsx file:
 //
 //   1. BEHAVIOUR: the guard, run over real wire entries, answers a measured
 //      count or datum.js's placeholder, and never a zero it did not read.
 //   2. WIRING: neither consumer still reads DONE_COUNTS, and both take the
 //      guard off window.DF_TASK_DONE_COUNT.
 //
-// LOADED THROUGH A WINDOW SHIM, unlike orch_summary.js. The guard takes its
-// placeholder from window.DF_DATUM at module scope, and datum.js in turn
-// destructures window.DF_ENDPOINT_STALENESS at module scope. So the shim is
+// LOADED THROUGH A WINDOW SHIM. The guard takes its placeholder from
+// window.DF_DATUM at module scope, and datum.js in turn destructures
+// window.DF_ENDPOINT_STALENESS at module scope. So the shim is
 // installed first, datum.js is required through it, and only then the guard:
 // data_poll.test.mjs::loadDataJs has the same shape, and index.html gives the
 // three files the same order.

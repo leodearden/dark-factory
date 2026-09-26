@@ -19,7 +19,7 @@ from _cache_buster_helpers import (
     resolve_redux_base_state,
     sole_cache_buster_version,
 )
-from _dashboard_helpers import assert_script_loads_before, find_script_position
+from _dashboard_helpers import assert_script_loads_before, find_script_position, strip_js_comments
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -497,34 +497,37 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: orch_summary.js is reachable at runtime (task 5587)
+# Retirement guard: the interim orch_summary.js guard is gone (task 5589)
 # ---------------------------------------------------------------------------
 
 _ORCH_SUMMARY_PREFIX = '/static/redux/orch_summary.js'
+_REDUX_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
 
-def test_orch_summary_js_is_served(client) -> None:
-    """GET /static/redux/orch_summary.js returns 200.
+def test_orch_summary_js_is_retired(client, index_html_body: str) -> None:
+    """index.html loads no orch_summary.js, and no served asset reads its global.
 
-    Only the MOUNT is asserted here, deliberately.  The load-order contract —
-    orch_summary.js before all three of app.jsx / tabs.jsx / tab_overview.jsx,
-    each of which destructures ``window.DF_ORCH_SUMMARY`` UNGUARDED at module
-    top level — is pinned once in
-    ``dashboard/tests/js/orch_summary_guard.test.mjs``, which walks the three
-    consumers in one loop.  Restating it here would be a second copy of the
-    same assertion for this suite to drift away from.
+    orch_summary.js was task 5587's crash guard for the per-orchestrator task
+    counts /orchestrators stopped measuring. Its three consumers — the topbar
+    and rail (app.jsx), OrchTab (tabs.jsx) and the Overview (tab_overview.jsx) —
+    now read the served census through task_snapshot.js. A tag left behind
+    would ship a dead module; a surviving ``window.DF_ORCH_SUMMARY`` read
+    would throw at load once the module is gone.
 
-    Reachability is the half that suite cannot see: it reads index.html and
-    the module off disk, so a file present in git but not served (a packaging
-    or StaticFiles-mount regression) would leave it green while the browser
-    404s and every guarded surface throws on its top-level destructure.
+    Every .js/.jsx under static/redux is discovered rather than listed, and
+    read as SERVED with comments stripped, so a later file is covered without
+    enrolment and prose naming the global neither satisfies nor breaks it.
     """
-    resp = client.get(_ORCH_SUMMARY_PREFIX)
-    assert resp.status_code == 200, (
-        f'expected 200 for {_ORCH_SUMMARY_PREFIX}, got {resp.status_code} — the '
-        'module is registered in index.html but not reachable at runtime, so '
-        'app.jsx/tabs.jsx/tab_overview.jsx destructure an undefined global.'
+    assert _ORCH_SUMMARY_PREFIX not in index_html_body, (
+        'index.html still loads orch_summary.js; its consumers read the census now.'
     )
+    readers = []
+    for source in sorted(_REDUX_DIR.glob('*.js*')):
+        resp = client.get(f'/static/redux/{source.name}')
+        assert resp.status_code == 200, f'{source.name} is on disk but not served'
+        if 'DF_ORCH_SUMMARY' in strip_js_comments(resp.text):
+            readers.append(source.name)
+    assert readers == [], f'{readers} still read window.DF_ORCH_SUMMARY'
 
 
 # ---------------------------------------------------------------------------
