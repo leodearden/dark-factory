@@ -269,6 +269,10 @@ def test_the_fixture_serves_on_the_listener_it_allocated_and_releases_it(
     or merely bound, whereas handing that socket to the server makes it the
     kernel's LISTEN socket for the served port. The ``list_tools()``
     round-trip rules out a listener that is up but not serving MCP.
+
+    Teardown stops the loop mid-serve, so uvicorn's own shutdown never runs to
+    close the socket: the fixture's close is the only one, and the ``fileno()``
+    check fails without it (measured).
     """
     real = escalation_conftest._bind_escalation_listener
     allocated: list[socket.socket] = []
@@ -340,6 +344,9 @@ def test_a_server_that_dies_during_startup_ends_the_wait_and_is_named(
     captured only RuntimeError would drop it. Whether a handshake attempt ran
     before the thread died is timing-dependent, so ``last_handshake_error`` is
     not asserted.
+
+    asyncio rejects the socket without closing it, so the listener is released
+    only by the fixture's teardown, on this path as on a healthy one.
     """
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -368,6 +375,9 @@ def test_a_server_that_dies_during_startup_ends_the_wait_and_is_named(
             f'the object it was; got {not_ready.serve_error!r}'
         )
         assert not_ready.port == udp_port
+        assert udp.fileno() == -1, (
+            'teardown must release the listener of a server that died at startup'
+        )
     finally:
         udp.close()
 
