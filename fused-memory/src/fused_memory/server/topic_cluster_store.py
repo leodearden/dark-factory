@@ -262,18 +262,42 @@ _GENERIC_SHAPED_TOKENS = frozenset({
     'specifically', 'successfully', 'understand',
 })
 
+# Closed-class English only (articles, prepositions, conjunctions, pronouns,
+# determiners, auxiliaries, modals): a finite category, not a tuning knob.
+_PHRASE_EDGE_FUNCTION_WORDS = frozenset({
+    'a', 'an', 'the',
+    'and', 'or', 'but', 'nor', 'so', 'if', 'then', 'than', 'when', 'while',
+    'because', 'since', 'unless', 'until',
+    'of', 'to', 'in', 'on', 'at', 'by', 'for', 'from', 'with', 'without',
+    'into', 'onto', 'over', 'under', 'via', 'per', 'as',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'do', 'does', 'did', 'has', 'have', 'had',
+    'can', 'could', 'may', 'might', 'must', 'shall', 'should', 'will', 'would',
+    'it', 'its', 'this', 'that', 'these', 'those', 'there', 'here',
+    'which', 'who', 'what', 'where', 'how',
+    'not', 'no', 'all', 'any', 'each', 'every', 'some', 'one',
+    'you', 'your', 'we', 'our', 'they', 'their', 'i', 'me', 'my',
+    'he', 'she', 'him', 'her', 'them',
+})
+
 
 def derive_topic_cluster(
     texts: Sequence[str], *, topic_id: str, hint: str
 ) -> ProceduralTopicCluster | None:
     """Derive a conservative cluster from a topic's member texts, or ``None`` to abstain.
 
-    Every rule answers the over-blocking MEASURED in the retirement notes on
-    ``config.schema._default_topic_guard_clusters``, where a cluster built
-    from ordinary subsystem vocabulary fired 13 off-topic blocks out of 14:
+    The rules are motivated by the over-blocking MEASURED in the retirement
+    notes on ``config.schema._default_topic_guard_clusters``, where a cluster
+    built from ordinary subsystem vocabulary fired 13 off-topic blocks out of 14:
 
     * a phrase must occur in at least two DISTINCT texts, so it characterises
       the cluster rather than one member (a duplicated input adds no support);
+    * a phrase is at least two words and never begins or ends with a
+      closed-class word. With no background corpus, a token's shape cannot
+      tell a topic identifier (``64kb``) from the project's everyday API
+      vocabulary (``add_memory``), which recurs in every member of a topic
+      about that API; a recurring multi-word construction is topic evidence,
+      a lone identifier is not;
     * a phrase must hold a distinctive token, which keeps generic prose out;
     * no selected phrase nests inside another, because the matcher counts
       substring hits and one occurrence of a longer form would score twice;
@@ -281,6 +305,10 @@ def derive_topic_cluster(
       ``sufficient_phrases``: promoting a phrase to sufficient is a human
       judgement the schema reserves for identifier-shaped names;
     * fewer than two phrases abstains, since such a cluster can never fire.
+
+    Residual: a multi-word construction common across the whole project can
+    still qualify. Rejecting it needs a document-frequency check against the
+    project's other memories, a read this zero-I/O derivation does not make.
 
     Phrases are lowercase, matching the matcher's own ``str.lower`` comparison.
     Ranking is a total order, so the result does not depend on input order.
@@ -333,8 +361,17 @@ def _distinctive_token_count(phrase: str) -> int:
     return sum(_is_distinctive(token) for token in phrase.split(' '))
 
 
+def _is_key_phrase(phrase: str) -> bool:
+    tokens = phrase.split(' ')
+    return (
+        len(tokens) >= 2
+        and tokens[0] not in _PHRASE_EDGE_FUNCTION_WORDS
+        and tokens[-1] not in _PHRASE_EDGE_FUNCTION_WORDS
+    )
+
+
 def _supported_candidates(corpus: list[str]) -> dict[str, int]:
-    """Map each distinctive shared n-gram to the number of texts that literally contain it.
+    """Map each distinctive shared key phrase to the number of texts that literally contain it.
 
     Sharing is counted on n-grams first (cheap), then confirmed with the
     matcher's own substring test, which also drops an n-gram that spans a
@@ -343,7 +380,11 @@ def _supported_candidates(corpus: list[str]) -> dict[str, int]:
     shared = Counter(ngram for text in corpus for ngram in _ngrams(_tokenise(text)))
     support: dict[str, int] = {}
     for phrase, sharing_texts in shared.items():
-        if sharing_texts < _MIN_SUPPORTING_TEXTS or not _distinctive_token_count(phrase):
+        if (
+            sharing_texts < _MIN_SUPPORTING_TEXTS
+            or not _is_key_phrase(phrase)
+            or not _distinctive_token_count(phrase)
+        ):
             continue
         literal = sum(phrase in text for text in corpus)
         if literal >= _MIN_SUPPORTING_TEXTS:
@@ -410,8 +451,8 @@ def seed_topic_cluster(
             return {
                 'outcome': 'skipped',
                 'reason': (
-                    f'fewer than {_MIN_DERIVED_PHRASES} distinctive phrases are shared '
-                    f'by at least {_MIN_SUPPORTING_TEXTS} of the {len(texts)} merged texts'
+                    f'fewer than {_MIN_DERIVED_PHRASES} distinctive multi-word phrases are '
+                    f'shared by at least {_MIN_SUPPORTING_TEXTS} of the {len(texts)} merged texts'
                 ),
             }
         store.upsert(
