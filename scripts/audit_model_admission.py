@@ -263,6 +263,16 @@ DEFAULT_ROLE_CEILINGS_SECS: dict[str, int] = {'merger': 600}
 # merger run, and `merge_finalized` events carry no role of their own.
 MERGER_ROLE = 'merger'
 
+# Roles whose `routing_decision` is recorded BEFORE dispatch, by
+# orchestrator/src/orchestrator/routing_dispatch.py::resolve_and_record_route
+# (these are the role_name literals its callers pass). Every other role runs
+# through orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke,
+# which records the decision AFTER the run's invocation_end. So a run's own
+# decision sits on a different side of the run depending on its role.
+PRE_DISPATCH_DECISION_ROLES = frozenset({
+    'steward', 'triage', 'deep_reviewer', 'unblock_auto', 'module_tagger',
+})
+
 
 @dataclass(frozen=True)
 class MergeOutcome:
@@ -289,6 +299,11 @@ class InvocationRecord:
     :data:`DEFAULT_ROLE_CEILINGS_SECS` for why a healthy run exceeds it.
     ``timed_out`` is the producer's own kill verdict, and is the field to read
     for "did this run die at a wall clock".
+
+    ``subtype`` is the end event's CLI result subtype (e.g. ``error_max_turns``).
+    ``escalation_id`` is the escalation the end event names (steward runs only).
+    ``routing_tier`` and ``dispatch_max_turns`` come from the run's own
+    `routing_decision` (see :func:`_dispatch_decision`).
     """
 
     task_id: str | None
@@ -306,6 +321,10 @@ class InvocationRecord:
     end_event_model: str | None
     merge_outcome: MergeOutcome | None
     at_or_over_flat_role_ceiling: bool | None
+    subtype: str | None
+    escalation_id: str | None
+    routing_tier: int | None
+    dispatch_max_turns: int | None
 
 
 @dataclass(frozen=True)
@@ -331,11 +350,15 @@ def load_events(
     store.
     """
     bounds, params = _time_bounds('timestamp', since, until)
-    cursor = conn.execute(
+    return _event_rows(conn.execute(
         'SELECT timestamp, task_id, role, data FROM events '
         f'WHERE event_type = ? AND {bounds} ORDER BY timestamp, id',
         (event_type, *params),
-    )
+    ))
+
+
+def _event_rows(cursor: Iterable[tuple[Any, ...]]) -> list[EventRow]:
+    """Parse (timestamp, task_id, role, data) rows, skipping non-object payloads."""
     rows = []
     for timestamp, task_id, role, raw in cursor:
         payload = _loads_object(raw)
@@ -348,8 +371,9 @@ def _by_task(rows: Iterable[EventRow]) -> dict[str | None, list[EventRow]]:
     """Group *rows* by task_id, preserving each task's chronological order.
 
     Grouping in Python rather than issuing a correlated subquery per invocation:
-    the whole of :func:`scan_invocations` is three table reads regardless of how
-    many runs match, which is what makes it safe against a 181 MB live store.
+    the whole of :func:`scan_invocations` is a fixed handful of table reads
+    regardless of how many runs match, which is what makes it safe against a
+    181 MB live store.
     """
     grouped: dict[str | None, list[EventRow]] = {}
     for row in rows:
@@ -386,6 +410,47 @@ def _merger_starts_by_task(
     for task_id, started_at in cursor:
         grouped.setdefault(task_id, []).append(started_at)
     return grouped
+
+
+def _dispatch_decisions_by_task(
+    conn: sqlite3.Connection, *, model: str, since: datetime, until: datetime | None
+) -> dict[str | None, list[EventRow]]:
+    """Every `routing_decision` on a task that one of the matched runs worked on.
+
+    Restricted by TASK rather than by time, because a run's own decision falls
+    outside the runs' own time span on both sides: a pre-dispatch decision
+    precedes its run's start (by minutes when the dispatch waits on an account),
+    and a post-completion one follows its run's completion, even past *until*.
+    """
+    bounds, params = _time_bounds('completed_at', since, until)
+    return _by_task(_event_rows(conn.execute(
+        'SELECT timestamp, task_id, role, data FROM events WHERE event_type = ? '
+        f'AND task_id IN (SELECT task_id FROM invocations WHERE model = ? AND {bounds}) '
+        'ORDER BY timestamp, id',
+        ('routing_decision', model, *params),
+    )))
+
+
+def _dispatch_decision(
+    decisions: Sequence[EventRow], *, role: str, started_at: str, completed_at: str
+) -> dict[str, Any] | None:
+    """The run's OWN routing decision, looked for on the side its producer records it.
+
+    For a :data:`PRE_DISPATCH_DECISION_ROLES` role, the last same-role decision
+    at or before the run started. For every other role, the first at or after
+    it completed. The last one before the start belongs to the PREVIOUS run of
+    that role on the task, so borrowing it would report that run's tier and cap.
+    """
+    same_role = [row for row in decisions if row.role == role]
+    if role in PRE_DISPATCH_DECISION_ROLES:
+        before = [row for row in same_role if row.timestamp <= started_at]
+        return before[-1].payload if before else None
+    return next((row.payload for row in same_role if row.timestamp >= completed_at), None)
+
+
+def _int_or_none(value: Any) -> int | None:
+    """*value* if it is a real int (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _merge_outcome(
@@ -429,12 +494,12 @@ def scan_invocations(
 ) -> tuple[InvocationRecord, ...]:
     """Every run of *model* completed in ``[since, until)``, with its outcome.
 
-    Two enrichments the `invocations` table cannot supply on its own:
+    Three enrichments the `invocations` table cannot supply on its own:
 
-    TURNS, from the matching `invocation_end` event — `invocations` has no turns
-    column, so this join is the only way to answer the question at all.  Matched
-    on task_id + role, taking the first such event at or after the invocation's
-    ``started_at``.
+    TURNS (and the end's subtype and escalation_id), from the matching
+    `invocation_end` event — `invocations` has no turns column, so this join is
+    the only way to answer the question at all.  Matched on task_id + role,
+    taking the first such event at or after the invocation's ``started_at``.
 
     MERGE OUTCOME, for merger runs, from the `merge_finalized` events inside
     this run's attribution window — see :func:`_merge_outcome` for the window
@@ -444,14 +509,18 @@ def scan_invocations(
     merge finalized at or after *until* is not attributed, so a later re-run
     over the same window reproduces the same outcomes.
 
-    The `invocation_end` load alone is NOT bounded by *until*: it is the run's
-    OWN record, stamped a few ms after ``invocations.completed_at``, so
-    bounding it would drop the turns of a run completing just inside the window.
+    DISPATCH TIER AND CAP, from the run's own `routing_decision` — see
+    :func:`_dispatch_decision` for which side of the run it sits on.
+
+    The `invocation_end` load is NOT bounded by *until*: it is the run's OWN
+    record, stamped a few ms after ``invocations.completed_at``, so bounding it
+    would drop the turns of a run completing just inside the window.
     """
     ceilings = DEFAULT_ROLE_CEILINGS_SECS if role_ceilings_secs is None else role_ceilings_secs
     ends = _by_task(load_events(conn, 'invocation_end', since))
     merges = _by_task(load_events(conn, 'merge_finalized', since, until))
     merger_starts = _merger_starts_by_task(conn, model=model, since=since, until=until)
+    decisions = _dispatch_decisions_by_task(conn, model=model, since=since, until=until)
     bounds, params = _time_bounds('completed_at', since, until)
     cursor = conn.execute(
         'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
@@ -465,8 +534,12 @@ def scan_invocations(
         end = next(
             (row.payload for row in ends.get(task_id, ())
              if row.role == role and row.timestamp >= started_at),
-            None,
+            {},
         )
+        decision = _dispatch_decision(
+            decisions.get(task_id, ()), role=role,
+            started_at=started_at, completed_at=completed_at,
+        ) or {}
         merge = None
         if role == MERGER_ROLE:
             later_starts = merger_starts.get(task_id, ())
@@ -486,14 +559,18 @@ def scan_invocations(
             capped=bool(capped),
             started_at=started_at,
             completed_at=completed_at,
-            turns=end.get('turns') if end else None,
-            succeeded=end.get('success') if end else None,
-            timed_out=end.get('timed_out') if end else None,
-            end_event_model=end.get('model') if end else None,
+            turns=end.get('turns'),
+            succeeded=end.get('success'),
+            timed_out=end.get('timed_out'),
+            end_event_model=end.get('model'),
             merge_outcome=merge,
             at_or_over_flat_role_ceiling=(
                 None if ceiling_secs is None else duration_ms >= ceiling_secs * 1000
             ),
+            subtype=end.get('subtype'),
+            escalation_id=end.get('escalation_id'),
+            routing_tier=_int_or_none(decision.get('routing_tier')),
+            dispatch_max_turns=_int_or_none(decision.get('max_turns')),
         ))
     return tuple(records)
 
@@ -853,9 +930,11 @@ def render_markdown(result: AuditResult) -> str:
 
     out += [f'### 2. Invocations on `{model}` and how they ended, {span}', '']
     out += markdown_table(
-        ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok', 'timed out',
-         'model @end', 'duration ms', 'over flat ceiling', 'merge'],
-        [(r.task_id or '-', r.project_id, r.role, r.account_name, f'{r.cost_usd:.2f}',
+        ['task', 'project', 'role', 'tier', 'subtype', 'account', 'cost $', 'turns',
+         'ok', 'timed out', 'model @end', 'duration ms', 'over flat ceiling', 'merge'],
+        [(r.task_id or '-', r.project_id, r.role,
+          '-' if r.routing_tier is None else r.routing_tier, r.subtype or '-',
+          r.account_name, f'{r.cost_usd:.2f}',
           '-' if r.turns is None else r.turns, r.succeeded, r.timed_out,
           r.end_event_model or '-', r.duration_ms, r.at_or_over_flat_role_ceiling,
           _merge_cell(r.merge_outcome)) for r in result.invocations],
