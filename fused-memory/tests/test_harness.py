@@ -5535,16 +5535,15 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
     finally, already covered above by
     test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation.
 
-    Unlike run_full_cycle, _run_remediation_pass has NO `except
-    asyncio.CancelledError:` handler — only `except AllAccountsCappedException`
-    and `except Exception`, neither of which catches CancelledError (not an
-    Exception subclass since Python 3.8). So a cancelled stage here
-    propagates straight to the finally with no `_error` breadcrumb stamped.
-    What must survive the second cancellation instead is whatever real
-    stage_reports entries were already recorded before the cancelled stage:
-    this test lets Stage 1 (memory_consolidator) complete normally, then
-    cancels Stage 2 (task_knowledge_sync) mid-flight, and checks Stage 1's
-    report is not lost from the persisted run.
+    Like run_full_cycle, _run_remediation_pass has an `except
+    asyncio.CancelledError:` handler (task 5545) that stamps an `_error`
+    breadcrumb into run.stage_reports before the finally runs. That
+    breadcrumb, and every real stage_reports entry recorded before the
+    cancelled stage, must survive the second cancellation through the
+    finally's shielded persist: this test lets Stage 1 (memory_consolidator)
+    complete normally, then cancels Stage 2 (task_knowledge_sync)
+    mid-flight, and checks that neither Stage 1's report nor the `_error`
+    breadcrumb is lost from the persisted run.
 
     Same injection rig as the run_full_cycle test above: the second
     cancellation is delivered from inside a `journal.update_run_stage_reports`
@@ -5627,6 +5626,11 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
         'update_run_stage_reports so the persisted copy captures whatever '
         'markers either arm stamped", which is hollow while this write '
         'stays unshielded'
+    )
+    assert persisted.stage_reports.get('_error', {}).get('error_type') == 'CancelledError', (
+        'the _error breadcrumb the except asyncio.CancelledError handler '
+        "stamped must survive the second cancellation through the finally's "
+        'shielded update_run_stage_reports'
     )
 
 
@@ -5767,6 +5771,105 @@ async def test_run_full_cycle_failure_records_traceback_and_sqlite_classificatio
         caplog, 'Reconciliation failed:',
         run_id=row.id, errorname=errorname, errorcode=errorcode,
     )
+
+
+def _stalling_stage_run(entered: asyncio.Event):
+    """A stage.run stand-in that sets `entered` and then waits to be cancelled."""
+
+    async def stalled_run(events, watermark, prior_reports, run_id, model=None):
+        entered.set()
+        await asyncio.sleep(999)
+
+    return stalled_run
+
+
+async def _cancel_once_entered(outer_task, entered: asyncio.Event) -> None:
+    """Cancel `outer_task` once `entered` is set, so the cancel lands inside
+    the stalled await. Fails fast if the task finishes before getting there."""
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before the stalled await was entered: {exc}')
+    outer_task.cancel()
+
+
+async def _settled_remediation_row(journal):
+    """The remediation row once it has left 'running', or None if it never does
+    within _poll_until's window."""
+
+    async def _settled():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent and recent[0].status != 'running' else None
+
+    row = await _poll_until(_settled)
+    assert row is not None, 'the remediation row was left running'
+    assert row.run_type == 'remediation'
+    return row
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_cancellation_terminalises_row_as_failed(
+    journal, event_buffer, mock_memory_service,
+):
+    """A cancelled remediation pass propagates the cancellation and leaves its
+    row 'failed' with a CancelledError record. Never 'interrupted', even with
+    resume on: an interrupted row would be re-driven as a full cycle."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = True
+    stage_entered = asyncio.Event()
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _stalling_stage_run(stage_entered)
+    _mock_stage_run(harness.stages[2])
+
+    outer_task = asyncio.create_task(_remediation_pass_under_test(harness))
+    await _cancel_once_entered(outer_task, stage_entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    row = await _settled_remediation_row(journal)
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['error_type'] == 'CancelledError'
+    assert err['failed_stage'] == 'task_knowledge_sync'
+    assert err['traceback']
+    assert err['sqlite_errorname'] is None
+    assert 'memory_consolidator' in row.stage_reports
+    assert row.id not in {r.id for r in await journal.get_running_runs()}
+    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_cancellation_cleanup_failure_still_propagates_cancel(
+    journal, event_buffer, mock_memory_service,
+):
+    """A journal write that fails while terminalising a cancelled pass is
+    logged, and never replaces the CancelledError the caller must see."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stage_entered = asyncio.Event()
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _stalling_stage_run(stage_entered)
+    _mock_stage_run(harness.stages[2])
+
+    complete_run_calls: list[tuple[str, str]] = []
+    original_complete_run = journal.complete_run
+
+    async def locked_on_failed(run_id, status):
+        complete_run_calls.append((run_id, status))
+        if status == 'failed':
+            raise RuntimeError('journal locked')
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = locked_on_failed
+
+    outer_task = asyncio.create_task(_remediation_pass_under_test(harness))
+    await _cancel_once_entered(outer_task, stage_entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    assert [status for _, status in complete_run_calls] == ['failed']
 
 
 @pytest.mark.asyncio
