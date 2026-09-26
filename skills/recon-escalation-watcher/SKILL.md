@@ -178,6 +178,37 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
 
+**A detached `recon-watch/loop.sh` tree on this queue is not a second closer (task 5876).** A
+process probe may show a `scripts/watcher-rearm.sh --queue-dir …/data/reconciliation/escalations`
+you did not start, with its `escalation.watcher` python child, under an ancestor
+`/bin/bash …/.claude/recon-watch/loop.sh`. That is a host-local helper **not tracked in this
+repo**; its own header is the only other statement of this contract. It is a detached re-arm loop,
+reparented away from any Claude session so it survives the harness background-task reaper, and it
+outlives the session that launched it — so a fresh watcher session routinely finds it already
+running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
+`fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
+nothing. Two read-only inotify watchers on one queue are harmless redundancy — fires are journaled
+twice, and there is still exactly one closer.
+
+It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
+lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
+`orchestrator/src/orchestrator/session_registry.py::LEASE_HEARTBEAT_TTL`. A detached process that
+kept heartbeating after its owning session died would pin that lease at `holder_liveness=orphaned`
+indefinitely: every later watcher would take the orphaned stand-down above, and the 8103 queue
+would have no closer. So:
+- **A stale or reapable lease at startup while loop.sh runs is this contract working** — not a
+  fault, and nothing to report. `lease-reap`, then `lease-claim`, exactly as above.
+- **The heartbeat is yours alone.** The loop will never keep your lease alive — not even if you
+  read fires from its journal instead of re-arming your own watcher — so heartbeat every Main Loop
+  cycle regardless.
+- **Only the lease verdict says whether a second closer exists** (`lease-claim`'s `decision=` /
+  `holder_liveness=`), never the process table: a watcher tree with no `claude` process in it
+  cannot close anything.
+- **Do not stop or kill it.** You did not start it, so "Process safety" (under "Starting the
+  watcher") forbids it.
+- **Its `history.log` is corroboration only** — e.g. repeated re-fires of one id reveal a pending
+  record missing from the exclude file. The drain (`get_pending_escalations`) stays authoritative.
+
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
 refused, so no other session can evict your lease or keep a dead one alive. You do not pass the slug:
@@ -301,7 +332,9 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down:
+observes this one as alive and stands down. No other process heartbeats this lease — not even a
+running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
+only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -439,7 +472,8 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `--baseline` — is what is actually consistent across both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern.
+controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
+started, so this rule covers it too.
 
 ## The Action Set
 
