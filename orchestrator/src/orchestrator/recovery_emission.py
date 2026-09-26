@@ -391,18 +391,22 @@ def as_ageable_records(records: Any) -> list[AgeableRecord]:
 
 @dataclass(frozen=True)
 class PinBuckets:
-    """``classify_pins``' three id buckets plus its store-unavailable verdict.
+    """``classify_pins``' three id buckets plus the two verdicts read off the same report.
 
-    The two facts travel together because every consumer needs both: the
-    buckets go into the payload and the signature, and ``store_unavailable``
-    is OR-ed into the caller's own flag (a store the caller read fine can
-    still be reported unreadable by ``classify_pins`` itself).
+    The facts travel together because they come from ONE classification: the
+    buckets go into the payload and the signature, ``store_unavailable`` is
+    OR-ed into the caller's own flag (a store the caller read fine can still be
+    reported unreadable by ``classify_pins`` itself), and ``human_parked``
+    gates the streak alarm's filing.
     """
 
     #: ``{'dead_l0': [...], 'queue_handoff': [...], 'non_pinning': [...]}``.
     buckets: dict[str, list[str]]
     #: ``PinReport.store_unavailable`` — never inferred from an empty bucket.
     store_unavailable: bool
+    #: ``escalation.pins.pinned_only_by_human_parked`` over the same report —
+    #: always ``False`` when the store could not be read.
+    human_parked: bool
 
 
 def pin_buckets(
@@ -419,15 +423,17 @@ def pin_buckets(
     verbatim; a per-site copy is how the same predicate ends up spelled five
     slightly-different ways (see :func:`as_ageable_records`' docstring for the
     same argument), and here a drifted bucket set would silently change the
-    veto SIGNATURE — see :func:`veto_signature`.
+    veto SIGNATURE — see :func:`veto_signature`.  The streak alarm's
+    human-parked gate (PIN-CLASS AWARENESS in this module's docstring) is read
+    off the SAME report, never a second classification.
 
     ``store_unavailable=True`` passes ``records=None`` down to
     ``classify_pins``, which is its documented third state: a read that FAILED
     must never be collapsed into "no records", because a false ``[]`` reads as
     "nothing held this task" (the esc-3163 collapse).
 
-    Consulted for id bucketing and reason selection ONLY — never for a veto
-    answer.  Since task 3541 every call site consumes ``PinReport`` through
+    Consulted for id bucketing, reason selection and the streak alarm's
+    filing gate ONLY — never for a veto answer.  Since task 3541 every call site consumes ``PinReport`` through
     ``orchestrator.recovery_pins`` and has ALREADY decided by the time it
     reaches this function; deciding here too would put the answer in two
     places, which is the drift INV-5 exists to prevent.
@@ -436,13 +442,13 @@ def pin_buckets(
     established no incarnation holds the task) and free at the dispatch gate,
     whose ``vetoes_done_flip`` answer is liveness-independent.
     """
-    from escalation.pins import classify_pins  # noqa: PLC0415
-
-    pins = classify_pins(
-        task_id or '',
-        None if store_unavailable else list(records or ()),
-        live_claimant=False,
+    from escalation.pins import (  # noqa: PLC0415
+        classify_pins,
+        pinned_only_by_human_parked,
     )
+
+    read = None if store_unavailable else list(records or ())
+    pins = classify_pins(task_id or '', read, live_claimant=False)
     return PinBuckets(
         buckets={
             'dead_l0': list(pins.dead_l0),
@@ -450,6 +456,7 @@ def pin_buckets(
             'non_pinning': list(pins.non_pinning),
         },
         store_unavailable=bool(pins.store_unavailable),
+        human_parked=pinned_only_by_human_parked(pins, read),
     )
 
 
@@ -878,8 +885,8 @@ def emit_recovery_veto_streak_escalation(
     escalation_ids: Any,
     ages_secs: Any = None,
     filed_at: dict[str, int] | None = None,
-    pin_records: Any = None,
-    suppress_human_parked: bool = True,
+    human_parked: bool,
+    suppress_human_parked: bool,
 ) -> bool:
     """File ONE blocking L1 when a veto streak clears BOTH halves of the bar.
 
@@ -919,12 +926,9 @@ def emit_recovery_veto_streak_escalation(
             check``).  Keyed on task_id — matching the SENTINEL's own
             granularity — so the memo can never disagree with what
             ``has_open_l1`` would answer.
-        pin_records: The records the caller already read for this hold (never
-            a second read), or ``None``.  With *suppress_human_parked*, an
-            ``escalation_pinned`` hold they show to be
-            ``escalation.pins.pinned_only_by_human_parked`` files nothing — see
-            PIN-CLASS AWARENESS in this module's docstring.  ``None`` (omitted,
-            or an unreadable store) never counts as human-parked.
+        human_parked: :attr:`PinBuckets.human_parked` for this hold.  With
+            *suppress_human_parked*, a human-parked ``escalation_pinned`` hold
+            files nothing — see PIN-CLASS AWARENESS in this module's docstring.
         suppress_human_parked:
             ``config.recovery_emission.streak_escalation_suppress_human_parked``;
             ``False`` restores the pre-4541 filing.
@@ -949,8 +953,8 @@ def emit_recovery_veto_streak_escalation(
     # Before the memo and `has_open_l1`, so a suppressed hold costs no I/O.
     if (
         suppress_human_parked
+        and human_parked
         and reason == LeaveReason.escalation_pinned
-        and _pinned_only_by_human_parked(task_id, pin_records)
     ):
         if streak == threshold:
             logger.info(
@@ -1063,27 +1067,6 @@ def emit_recovery_veto_streak_escalation(
         reason, ','.join(_flatten_ids(escalation_ids)) or '(none)',
     )
     return True
-
-
-def _pinned_only_by_human_parked(task_id: str, pin_records: Any) -> bool:
-    """``escalation.pins.pinned_only_by_human_parked``, failing toward the alarm."""
-    if pin_records is None:
-        return False
-    # Its own guard rather than the filer's fail-open excepts, which answer
-    # "no filing": a classifier fault must mean "not human-parked" and let the
-    # alarm fire, never silence it.
-    try:
-        from escalation.pins import pinned_only_by_human_parked  # noqa: PLC0415 — optional dep
-
-        # live_claimant=False is exact here for the reason pin_buckets gives:
-        # a charging site never reaches the filer with a live claimant.
-        return pinned_only_by_human_parked(task_id, pin_records, live_claimant=False)
-    except Exception as exc:  # noqa: BLE001 — fail toward the alarm
-        logger.warning(
-            'recovery veto streak pin class for task %s could not be read; '
-            'alarming as if not human-parked: %s', task_id, exc,
-        )
-        return False
 
 
 def resolve_recovery_veto_streak_escalation(

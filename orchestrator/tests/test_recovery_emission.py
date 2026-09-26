@@ -9,7 +9,6 @@ observable contract only.
 
 import dataclasses
 import json
-import types
 
 import pytest
 
@@ -581,6 +580,8 @@ def _streak_kwargs(queue, *, task_id='3535', streak=3, threshold=3,
         'shape': 'in-progress|false|on_main|true|-',
         'escalation_ids': {'queue_handoff': ['esc-3535-1'], 'dead_l0': [], 'non_pinning': []},
         'ages_secs': {'esc-3535-1': 7200.0},
+        'human_parked': False,
+        'suppress_human_parked': True,
     }
     kwargs.update(extra)
     return kwargs
@@ -884,8 +885,9 @@ class TestStreakAlarmIsPinClassAware:
 
     The alarm's trigger was "a human-facing escalation is still open", so on a
     queue where L2s legitimately stay parked it re-fired forever.  Suppression
-    applies only to an ``escalation_pinned`` hold and only to the queue write,
-    and every uncertain input still alarms.
+    applies only to an ``escalation_pinned`` hold and only to the queue write.
+    WHICH holds are human-parked is ``pin_buckets``' answer (``TestPinBuckets``);
+    this is the filer's gate on it.
     """
 
     def _queue(self, tmp_path):
@@ -896,54 +898,32 @@ class TestStreakAlarmIsPinClassAware:
     def _pending(self, queue) -> list:
         return queue.get_by_task(_streak_sentinel('3535'), status='pending')
 
-    def test_a_hold_pinned_only_by_an_l2_files_nothing(self, tmp_path):
+    def test_a_human_parked_hold_files_nothing(self, tmp_path):
         """(a) ACCEPTANCE: both halves of the bar clear, yet no alarm is filed."""
         queue = self._queue(tmp_path)
 
-        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 2)]))
+        filed = _file_streak(**_streak_kwargs(queue, human_parked=True))
 
         assert filed is False
         assert self._pending(queue) == []
 
-    def test_a_hold_pinned_by_an_l1_still_files_one_alarm(self, tmp_path):
+    def test_a_hold_that_is_not_human_parked_still_files_one_alarm(self, tmp_path):
         """(b) COUNTER-SIGNAL: a pin nobody has promoted must still alarm."""
         queue = self._queue(tmp_path)
 
-        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 1)]))
+        filed = _file_streak(**_streak_kwargs(queue, human_parked=False))
 
         assert filed is True
         (alarm,) = self._pending(queue)
         assert alarm.severity == 'blocking'
         assert alarm.level == 1
 
-    def test_omitting_pin_records_files_as_before(self, tmp_path):
-        """(c) Backward compatibility for callers that do not pass the rows."""
-        queue = self._queue(tmp_path)
-
-        assert _file_streak(**_streak_kwargs(queue)) is True
-
-    def test_an_unreadable_store_is_never_human_parked(self, tmp_path):
-        """(d) ``pin_records=None`` proves nothing about who holds the task."""
-        queue = self._queue(tmp_path)
-
-        assert _file_streak(**_streak_kwargs(queue, pin_records=None)) is True
-
     def test_the_escape_hatch_restores_filing(self, tmp_path):
         """(e) ``suppress_human_parked=False`` is the pre-4541 behaviour."""
         queue = self._queue(tmp_path)
 
         filed = _file_streak(**_streak_kwargs(
-            queue, pin_records=[_Pin('esc-3535-1', 2)], suppress_human_parked=False,
-        ))
-
-        assert filed is True
-
-    def test_an_l1_beside_an_l2_files(self, tmp_path):
-        """(f) One unpromoted pin is enough to alarm."""
-        queue = self._queue(tmp_path)
-
-        filed = _file_streak(**_streak_kwargs(
-            queue, pin_records=[_Pin('esc-3535-1', 2), _Pin('esc-3535-2', 1)],
+            queue, human_parked=True, suppress_human_parked=False,
         ))
 
         assert filed is True
@@ -955,8 +935,7 @@ class TestStreakAlarmIsPinClassAware:
         queue = self._queue(tmp_path)
 
         filed = _file_streak(**_streak_kwargs(
-            queue, pin_records=[_Pin('esc-3535-1', 2)],
-            reason=LeaveReason.unmapped_shape,
+            queue, human_parked=True, reason=LeaveReason.unmapped_shape,
         ))
 
         assert filed is True
@@ -967,7 +946,7 @@ class TestStreakAlarmIsPinClassAware:
 
         queue = MagicMock()
 
-        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 2)]))
+        filed = _file_streak(**_streak_kwargs(queue, human_parked=True))
 
         assert filed is False
         assert queue.method_calls == []
@@ -979,8 +958,7 @@ class TestStreakAlarmIsPinClassAware:
 
         for streak in range(3, 23):
             assert _file_streak(**_streak_kwargs(
-                queue, streak=streak, filed_at=memo,
-                pin_records=[_Pin('esc-3535-1', 2)],
+                queue, streak=streak, filed_at=memo, human_parked=True,
             )) is False
 
         assert self._pending(queue) == []
@@ -995,27 +973,17 @@ class TestStreakAlarmIsPinClassAware:
         queue = self._queue(tmp_path)
         memo: dict[str, int] = {}
         assert _file_streak(**_streak_kwargs(
-            queue, streak=3, filed_at=memo, pin_records=[_Pin('esc-3535-1', 1)],
+            queue, streak=3, filed_at=memo, human_parked=False,
         )) is True
         (alarm,) = self._pending(queue)
         queue.resolve(alarm.id, 'the pin is with a human now', resolved_by='interactive')
 
         refiled = _file_streak(**_streak_kwargs(
-            queue, streak=6, filed_at=memo, pin_records=[_Pin('esc-3535-1', 2)],
+            queue, streak=6, filed_at=memo, human_parked=True,
         ))
 
         assert refiled is False
         assert self._pending(queue) == []
-
-    def test_a_corrupt_pin_record_fails_toward_the_alarm(self, tmp_path):
-        """(k) FAIL-TOWARD-SIGNAL: a classifier fault neither suppresses nor raises."""
-        queue = self._queue(tmp_path)
-
-        filed = _file_streak(**_streak_kwargs(
-            queue, pin_records=[types.SimpleNamespace(id='esc-3535-1')],
-        ))
-
-        assert filed is True
 
 
 class TestResolveRecoveryVetoStreakEscalation:
@@ -1619,3 +1587,26 @@ class TestPinBuckets:
 
         assert pins.store_unavailable is True
         assert not [i for ids in pins.buckets.values() for i in ids]
+
+    def test_a_hold_pinned_only_by_an_l2_is_human_parked(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [_Pin('esc-1', 2)], store_unavailable=False)
+
+        assert pins.human_parked is True
+
+    @pytest.mark.parametrize('levels', [[1], [2, 1]], ids=['an L1', 'an L1 beside an L2'])
+    def test_one_unpromoted_pin_is_not_human_parked(self, levels):
+        from orchestrator.recovery_emission import pin_buckets
+
+        records = [_Pin(f'esc-{n}', level) for n, level in enumerate(levels)]
+
+        assert pin_buckets('3535', records, store_unavailable=False).human_parked is False
+
+    def test_an_unreadable_store_is_never_human_parked(self):
+        """The rows a failed read left behind prove nothing about who holds the task."""
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [_Pin('esc-1', 2)], store_unavailable=True)
+
+        assert pins.human_parked is False

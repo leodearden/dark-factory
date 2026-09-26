@@ -432,11 +432,8 @@ def classify_pins(
 
 
 def pinned_only_by_human_parked(
-    task_id: str,
+    report: PinReport,
     records: Sequence[PinRecord] | None,
-    *,
-    live_claimant: bool = False,
-    live_claimant_id: str | None = None,
 ) -> bool:
     """Is everything that PINS this task already in front of a human?
 
@@ -444,37 +441,35 @@ def pinned_only_by_human_parked(
     point here.**  True iff the read succeeded, something pins the task, and
     every record in the ``queue_handoff`` bucket — the bucket
     :attr:`PinReport.pins` reads — sits at ``level >= HUMAN_PARKED_MIN_LEVEL``.
-    Built on :func:`classify_pins` with the same arguments, so the info,
-    unknown-severity, dead-L0 and store-unavailable rules are the chain's own:
-    records that do not pin (see :attr:`PinReport.pins`) cannot spoil the
-    answer, and a store that could not be read never counts as parked.
+    *report* is what :func:`classify_pins` returned for these same *records*,
+    taken rather than recomputed so a caller that already classified them does
+    not classify twice; the info, unknown-severity, dead-L0 and
+    store-unavailable rules are therefore the chain's own.  Records that do not
+    pin (see :attr:`PinReport.pins`) cannot spoil the answer, and a store that
+    could not be read never counts as parked.
 
     Every uncertain input answers False — no records, an unreadable store, an
-    L1 nobody has promoted, a level that is missing or not an int — because a
-    false True silences an alarm for a genuinely stranded task, while a false
-    False costs one quick triage.
+    L1 nobody has promoted, a level that is missing or not an int (never
+    coerced: ``'3'``, ``2.9`` and ``True`` are not levels), a handoff id the
+    records do not carry — because a false True silences an alarm for a
+    genuinely stranded task, while a false False costs one quick triage.
 
     The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
     records the promotion to a human, whereas a critical/urgent record still at
     level 0 is the contradictory state link 3b fails safe to pinning, not proof
     that anyone human holds the task.
 
-    Pure: no I/O, and *records* is not mutated.
+    Pure: no I/O, and neither argument is mutated.
     """
-    report = classify_pins(
-        task_id, records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
-    )
-    if records is None or not report.queue_handoff:
+    if report.store_unavailable or records is None or not report.queue_handoff:
         return False
-    handoff_ids = set(report.queue_handoff)
-    return all(
-        _is_human_level(record.level) for record in records if record.id in handoff_ids
-    )
+    levels = {record.id: record.level for record in records}
+    return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
 
 
-def _is_human_level(level: int) -> bool:
-    """``level >= HUMAN_PARKED_MIN_LEVEL``; a rehydrated null or non-int level answers False."""
-    try:
-        return int(level) >= HUMAN_PARKED_MIN_LEVEL
-    except (TypeError, ValueError):
-        return False
+def _is_human_level(level: object) -> bool:
+    return (
+        isinstance(level, int)
+        and not isinstance(level, bool)
+        and level >= HUMAN_PARKED_MIN_LEVEL
+    )

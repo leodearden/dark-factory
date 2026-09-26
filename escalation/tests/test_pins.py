@@ -815,9 +815,10 @@ class TestPinnedOnlyByHumanParked:
     ) -> bool:
         from escalation.pins import pinned_only_by_human_parked
 
-        return pinned_only_by_human_parked(
+        report = classify_pins(
             '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
         )
+        return pinned_only_by_human_parked(report, records)
 
     def test_a_single_l2_is_human_parked(self) -> None:
         assert self._parked([_esc(level=2)]) is True
@@ -890,8 +891,15 @@ class TestPinnedOnlyByHumanParked:
         assert records == before
         assert first == second
 
-    def test_is_exported_with_its_threshold(self) -> None:
-        import escalation.pins as pins_mod
+    @pytest.mark.parametrize('level', ['3', 2.9, True, None])
+    def test_a_level_that_is_not_an_int_is_not(self, level: typing.Any) -> None:
+        """Never coerced: ``int()`` would read ``'3'`` and ``2.9`` as human levels."""
+        assert self._parked([_rec(level=level)]) is False
 
-        assert {'pinned_only_by_human_parked', 'HUMAN_PARKED_MIN_LEVEL'} <= set(pins_mod.__all__)
-        assert pins_mod.HUMAN_PARKED_MIN_LEVEL == 2
+    def test_a_handoff_id_the_records_do_not_carry_is_not(self) -> None:
+        """A report and records that disagree prove nothing about who holds the task."""
+        from escalation.pins import pinned_only_by_human_parked
+
+        report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False

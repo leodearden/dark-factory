@@ -11284,7 +11284,8 @@ class Harness:
           the healthy majority of every sweep, and emitting for it would bury
           the strands this mechanism exists to surface.
 
-        ``classify_pins`` is consulted ONLY to bucket ids for the payload.
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload and
+        to gate the streak alarm on whether the hold is human-parked.
         Since task 3541 the veto answer is the caller's, taken from the SAME
         classifier through ``orchestrator.recovery_pins`` before it ever
         reaches this method — describing and deciding stay separate.
@@ -11336,9 +11337,10 @@ class Harness:
                 self._recovery_veto_tracker = tracker
 
             # Shared with the Scheduler's twin adapter rather than hand-rolled
-            # here: classify_pins is consulted for BUCKETING only (never for
-            # the veto answer), and records=None carries its store-unavailable
-            # third state, which must never collapse into "no records".
+            # here: classify_pins is consulted for BUCKETING and the streak
+            # alarm's human-parked gate only (never for the veto answer), and
+            # records=None carries its store-unavailable third state, which
+            # must never collapse into "no records".
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
             )
@@ -11385,10 +11387,8 @@ class Harness:
                             as_ageable_records(records), now=datetime.now(UTC),
                         ),
                         filed_at=self._recovery_streak_memo(),
-                        pin_records=records,
-                        suppress_human_parked=getattr(
-                            cfg, 'streak_escalation_suppress_human_parked', True,
-                        ),
+                        human_parked=pins.human_parked,
+                        suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
                     )
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
