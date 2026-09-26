@@ -17,6 +17,7 @@ import pytest
 from shared.task_statuses import ACTIVE, TaskStatus
 
 import dashboard.data.burndown as burndown_module
+import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
@@ -129,6 +130,42 @@ class _CannedStore:
 def _serve(store: _CannedStore):
     """Patch the canned substrate in at the public MCP seam."""
     return patch('dashboard.data.tasks.mcp_tool_call', new=store)
+
+
+async def _rows_by_project(conn) -> dict[str, list]:
+    """Every stored row, grouped by project_id, each group in insert order."""
+    grouped: dict[str, list] = {}
+    async with conn.execute('SELECT * FROM snapshots ORDER BY id') as cur:
+        for row in await cur.fetchall():
+            grouped.setdefault(row['project_id'], []).append(row)
+    return grouped
+
+
+def _assert_one_gap(rows_by_project: dict[str, list], root, *reason_fragments: str):
+    """*root* has exactly one row, a gap whose reason carries every fragment; return it.
+
+    A gap row carries no measurement, so every nullable count column is NULL.
+    """
+    rows = rows_by_project.get(str(Path(root).resolve()), [])
+    assert len(rows) == 1, f'{root}: expected exactly one row, got {len(rows)}'
+    (row,) = rows
+    assert row['state'] == 'gap', f'{root}: expected a gap row, got state={row["state"]!r}'
+    for fragment in reason_fragments:
+        assert fragment in (row['reason'] or ''), (
+            f'{root}: reason {row["reason"]!r} does not carry {fragment!r}'
+        )
+    for column in ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows'):
+        assert row[column] is None, f'{root}: gap row {column} must be NULL, got {row[column]!r}'
+    return row
+
+
+def _assert_one_value(rows_by_project: dict[str, list], root):
+    """*root* has exactly one row, a value row; return it."""
+    rows = rows_by_project.get(str(Path(root).resolve()), [])
+    assert len(rows) == 1, f'{root}: expected exactly one row, got {len(rows)}'
+    (row,) = rows
+    assert row['state'] == 'value', f'{root}: expected a value row, got state={row["state"]!r}'
+    return row
 
 
 @pytest.fixture(autouse=True)
@@ -934,7 +971,8 @@ class TestCollectSnapshot:
 
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, burndown_conn_with_config, dummy_client):
-        """PermissionError on one known root is skipped; other roots are still snapshotted."""
+        """PermissionError on one known root costs that root a gap row; the other
+        roots are still measured, and every root gets exactly one row."""
         root_a = Path('/fake/project/root_a')
         root_b = Path('/fake/project/root_b')
         root_c = Path('/fake/project/root_c')
@@ -959,52 +997,12 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            project_ids = {row['project_id'] for row in rows}
-            # main + root_a + root_c should be present
-            assert len(rows) == 3
-            assert str(config.project_root) in project_ids
-            assert str(root_a.resolve()) in project_ids
-            assert str(root_c.resolve()) in project_ids
-            # root_b should NOT be present
-            assert str(root_b.resolve()) not in project_ids
-
-    @pytest.mark.asyncio
-    async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog, dummy_client):
-        """A WARNING naming the root, with exc_info, when its acquisition RAISES.
-
-        The real ``acquire_snapshot`` is total by contract — a substrate failure
-        comes back as a non-fresh unit, never an exception — so only a fake at
-        the collector's public ``acquire_snapshot`` name can exercise this path.
-        """
-        from dashboard.data.task_snapshot import acquire_snapshot as real_acquire
-
-        bad_root = Path('/fake/project/bad_root')
-        bad_root_str = _root_key(bad_root)
-
-        async with burndown_conn_with_config(known_project_roots=[bad_root]) as (db_path, config, conn):
-            async def acquire_or_raise(client, cfg, project_root, *, now):
-                if _root_key(project_root) == bad_root_str:
-                    raise PermissionError('Permission denied')
-                return await real_acquire(client, cfg, project_root, now=now)
-
-            with (
-                _serve(_CannedStore({config.project_root: []})),
-                patch('dashboard.data.burndown.acquire_snapshot', new=acquire_or_raise),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                await collect_snapshot(conn, config, client=dummy_client)
-
-        # At least one WARNING record should name the failing root
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING log record'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert str(bad_root.resolve()) in combined
-        # exc_info must be populated on the warning record
-        assert any(r.exc_info for r in warning_records)
+            assert sum(len(rows) for rows in by_project.values()) == 4, 'one row per root'
+            for healthy in (config.project_root, root_a, root_c):
+                _assert_one_value(by_project, healthy)
+            _assert_one_gap(by_project, root_b, 'Permission denied')
 
     @pytest.mark.asyncio
     async def test_first_root_failure_does_not_block_subsequent_inserts(self, burndown_conn_with_config, dummy_client):
@@ -1028,16 +1026,12 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            assert len(rows) == 2
-            project_ids = {row['project_id'] for row in rows}
-            assert str(config.project_root) in project_ids       # (a) main project row
-            assert str(good_root.resolve()) in project_ids       # (b) good_root row
-            assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
-
-            good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
+            assert sum(len(rows) for rows in by_project.values()) == 3, 'one row per root'
+            _assert_one_value(by_project, config.project_root)      # (a) main project row
+            good_row = _assert_one_value(by_project, good_root)     # (b) good_root row
+            _assert_one_gap(by_project, bad_root, 'denied')         # (c) bad_root's gap row
             assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
@@ -1133,14 +1127,12 @@ class TestCollectSnapshot:
                 assert row[0] == 3
 
     @pytest.mark.asyncio
-    async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config, dummy_client):
-        """One load_task_tree raises OSError; collect_snapshot skips the failing
-        project and inserts healthy rows for the remaining projects.
+    async def test_gather_partial_failure_writes_a_gap_for_the_bad_project(self, burndown_conn_with_config, dummy_client):
+        """One root's reads raise OSError; that root gets a gap row carrying the
+        failure, and the remaining projects get their measured rows.
 
-        Invariant (post Task 519): asyncio.gather(return_exceptions=True) plus
-        per-project isinstance guard mean collect_snapshot does not raise, the
-        failing project is cleanly excluded from the snapshot, and healthy
-        projects are snapshotted normally.
+        Invariant (post Task 519): collect_snapshot does not raise, and one
+        failing project cannot cost any other project its row.
         """
         reify_root = Path('/nonexistent/known/reify')
         autopilot_root = Path('/nonexistent/known/autopilot')
@@ -1159,15 +1151,12 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            project_ids = {row['project_id'] for row in rows}
-
-            assert len(rows) == 2
-            assert str(reify_root.resolve()) not in project_ids
-            assert str(config.project_root) in project_ids
-            assert str(autopilot_root.resolve()) in project_ids
+            assert sum(len(rows) for rows in by_project.values()) == 3, 'one row per root'
+            _assert_one_gap(by_project, reify_root, 'mock disk error')
+            _assert_one_value(by_project, config.project_root)
+            _assert_one_value(by_project, autopilot_root)
 
     @pytest.mark.asyncio
     async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, dummy_client):
@@ -1176,8 +1165,9 @@ class TestCollectSnapshot:
         Regression anchor for task 519: a single unreadable root cannot drop the
         remaining snapshots.  The test uses OSError (not PermissionError) to
         match task 519's 'unreadable tasks.json' wording.  The WARNING-with-
-        exc_info half now lives on the tests whose acquisition actually RAISES
-        (the real snapshot unit absorbs a substrate failure).
+        exc_info half lives on TestCollectSnapshotWritesGapRows' raising and
+        hung acquisitions: the real snapshot unit absorbs a substrate failure,
+        so this one is a routine gap.
         """
         bad_root = Path('/fake/project/bad_root')
         good_root_1 = Path('/fake/project/good_root_1')
@@ -1202,35 +1192,23 @@ class TestCollectSnapshot:
                 # Must NOT raise even though bad_root fails.
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT * FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            # (a) three rows: main + good_root_1 + good_root_2
-            assert len(rows) == 3
+            # (a) four rows: one per discovered root
+            assert sum(len(rows) for rows in by_project.values()) == 4
 
-            by_project = {row['project_id']: row for row in rows}
+            # (b) bad_root has its gap row, carrying the failure
+            _assert_one_gap(by_project, bad_root, 'mock disk error')
 
-            # (b) bad_root must NOT appear
-            assert str(bad_root.resolve()) not in by_project
-
-            # (c) main project and both good roots must appear
-            assert str(config.project_root) in by_project
-            assert str(good_root_1.resolve()) in by_project
-            assert str(good_root_2.resolve()) in by_project
-
-            # (c') main project row must record the correct pending count
-            main_row = by_project[str(config.project_root)]
-            _assert_snapshot_counts(main_row, pending=1)
+            # (c) main project row must record the correct pending count
+            _assert_snapshot_counts(_assert_one_value(by_project, config.project_root), pending=1)
 
             # (d) per-root done counts must reflect the supplied task lists
-            good_1_row = by_project[str(good_root_1.resolve())]
-            _assert_snapshot_counts(good_1_row, done=2)
-
-            good_2_row = by_project[str(good_root_2.resolve())]
-            _assert_snapshot_counts(good_2_row, done=1)
+            _assert_snapshot_counts(_assert_one_value(by_project, good_root_1), done=2)
+            _assert_snapshot_counts(_assert_one_value(by_project, good_root_2), done=1)
 
     @pytest.mark.asyncio
-    async def test_main_project_failure_skips_all_inserts(self, burndown_env, dummy_client):
+    async def test_main_project_failure_writes_only_its_gap_row(self, burndown_env, dummy_client):
         """A failing main project is isolated: collect_snapshot does not raise.
 
         The main project is always the first entry in roots_to_snapshot. With no
@@ -1238,11 +1216,8 @@ class TestCollectSnapshot:
         substrate call raises PermissionError must:
 
         (a) NOT propagate out of collect_snapshot;
-        (b) commit zero rows — the only root failed, so nothing to insert;
+        (b) commit exactly one row — its gap row, carrying the failure;
         (c) never read any other root.
-
-        The WARNING-with-exc_info half lives on the tests whose acquisition
-        actually RAISES (the real snapshot unit absorbs a substrate failure).
         """
         db_path, config, conn = burndown_env
         store = _CannedStore({config.project_root: PermissionError('Permission denied')})
@@ -1256,11 +1231,9 @@ class TestCollectSnapshot:
 
         assert {call['root'] for call in store.calls} == {_root_key(config.project_root)}
 
-        # (b) zero rows committed — the only root failed, so snapshots is empty.
-        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
+        by_project = await _rows_by_project(conn)
+        assert list(by_project) == [str(config.project_root)]
+        _assert_one_gap(by_project, config.project_root, 'Permission denied')
 
     @pytest.mark.parametrize(
         'orchestrator_dict,patch_target,canonical_root',
@@ -1568,33 +1541,6 @@ class TestCollectSnapshotTaskSourceAndCap:
                 str(config.project_root), str(root_a.resolve()), str(root_b.resolve()),
             }
 
-    @pytest.mark.asyncio
-    async def test_offline_marker_still_skips_the_project(
-        self, burndown_env, caplog, dummy_client,
-    ):
-        """An unreachable root is routine: no zeroed row, and no WARNING here.
-
-        The substrate's own fan-out reports the outage under its own logger;
-        the collector's record of a known offline root is DEBUG-level.
-        """
-        db_path, config, conn = burndown_env
-
-        with (
-            _serve(_CannedStore({config.project_root: httpx.ConnectError('boom')})),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0, 'an offline project must not write a zeroed snapshot'
-        assert not [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and r.name == 'dashboard.data.burndown'
-        ], 'a known offline root is a DEBUG-level record, not a WARNING'
-
 
 # ---------------------------------------------------------------------------
 # collect_snapshot — the census through the snapshot unit (task 5591)
@@ -1736,6 +1682,201 @@ class TestCollectSnapshotWritesTheCensus:
             1, 0, 0, 0,
         )
         assert new['done'] == 1
+
+
+def _misbehave_for(bad_root, misbehaviour):
+    """Stand in at the collector's public ``acquire_snapshot`` name.
+
+    *misbehaviour* (a no-argument coroutine function) runs for *bad_root*; every
+    other root gets the REAL unit. The real unit is total by contract and never
+    raises or hangs, so only a fake at this name reaches those two branches.
+    """
+    bad_key = _root_key(bad_root)
+
+    async def acquire(client, config, project_root, *, now):
+        if _root_key(project_root) == bad_key:
+            return await misbehaviour()
+        return await task_snapshot.acquire_snapshot(client, config, project_root, now=now)
+
+    return patch('dashboard.data.burndown.acquire_snapshot', new=acquire)
+
+
+def _burndown_warnings_naming(caplog, root) -> list[logging.LogRecord]:
+    """The collector's own WARNING records whose message names *root*."""
+    return [
+        r for r in caplog.records
+        if r.name == 'dashboard.data.burndown'
+        and r.levelno == logging.WARNING
+        and str(Path(root).resolve()) in r.getMessage()
+    ]
+
+
+class TestCollectSnapshotWritesGapRows:
+    """A root the collector could not measure gets a GAP row, never a hole.
+
+    One row per discovered root per tick: a value row, or a gap row whose
+    ``reason`` carries the failure verbatim. A gap carries no measurement, so
+    its nullable count columns stay NULL.
+    """
+
+    async def test_a_failed_census_half_is_a_gap_not_a_value_row_with_a_split(
+        self, burndown_env, dummy_client,
+    ):
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_live_now(id=1)]},
+            fail_when=lambda root, tool: tool == 'get_statuses',
+            fail_with=PermissionError('census denied'),
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        row = _assert_one_gap(await _rows_by_project(conn), config.project_root, 'census denied')
+        assert row['reason'].startswith('census: '), row['reason']
+
+    async def test_a_failed_rows_half_is_a_gap(self, burndown_env, dummy_client):
+        """The split is unknowable and the legacy split columns cannot say so."""
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_live_now(id=1)]},
+            fail_when=lambda root, tool: tool == 'get_tasks',
+            fail_with=PermissionError('rows denied'),
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        row = _assert_one_gap(await _rows_by_project(conn), config.project_root, 'rows denied')
+        assert row['reason'].startswith('rows: '), row['reason']
+
+    async def test_an_off_vocabulary_status_is_a_gap_naming_it(self, burndown_env, dummy_client):
+        """The retired ``.get(..., 'pending')`` absorption cannot come back."""
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_raw_task(1, 'pending')]},
+            census_only={config.project_root: {2: 'something-weird'}},
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        _assert_one_gap(await _rows_by_project(conn), config.project_root, 'something-weird')
+
+    async def test_a_stale_unit_is_not_restamped_at_a_later_tick(
+        self, burndown_env, dummy_client, monkeypatch,
+    ):
+        _, config, conn = burndown_env
+        monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 0)
+        store = _CannedStore({config.project_root: [_raw_task(1, 'review'), _raw_task(2, 'pending')]})
+
+        await _collect(conn, config, dummy_client, store)
+        store.fail_when = lambda root, tool: True
+        await _collect(conn, config, dummy_client, store)
+
+        # Precondition: the unit really is serving tick 1's census as STALE.
+        with _serve(store):
+            unit = await task_snapshot.acquire_snapshot(
+                dummy_client, config, config.project_root, now=datetime.now(UTC),
+            )
+        assert unit.census.state == 'stale'
+
+        rows = await _snapshot_rows(conn)
+        assert [row['state'] for row in rows] == ['value', 'gap']
+        assert rows[0]['review'] == 1
+        for column in ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows'):
+            assert rows[1][column] is None, f'gap {column}: {rows[1][column]!r}, not tick 1\'s number'
+
+    async def test_a_raising_acquisition_is_a_gap_and_a_warning(
+        self, burndown_conn_with_config, dummy_client, caplog,
+    ):
+        exploding = Path('/fake/project/exploding')
+        other = Path('/fake/project/other')
+
+        async def explode():
+            raise RuntimeError('unit exploded')
+
+        async with burndown_conn_with_config(known_project_roots=[exploding, other]) as (
+            _db, config, conn,
+        ):
+            store = _CannedStore({config.project_root: [], other: [_raw_task(1, 'done')]})
+            with (
+                _serve(store),
+                _misbehave_for(exploding, explode),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config, client=dummy_client)
+            by_project = await _rows_by_project(conn)
+
+        _assert_one_gap(by_project, exploding, 'RuntimeError', 'unit exploded')
+        _assert_one_value(by_project, config.project_root)
+        _assert_one_value(by_project, other)
+        warnings = _burndown_warnings_naming(caplog, exploding)
+        assert warnings, f'expected a WARNING naming {exploding}'
+        assert all(
+            r.exc_info is not None and issubclass(r.exc_info[0], RuntimeError) for r in warnings
+        )
+
+    async def test_a_hung_acquisition_is_a_gap_at_the_backstop(
+        self, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """One root hanging forever costs that root a gap row, not the cycle.
+
+        The hang has NO duration (``asyncio.Event().wait()``, the task 4788
+        idiom), so no choice of budget can make an unbounded collector pass.
+        """
+        hung = Path('/fake/project/hung')
+
+        async def hang():
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+        async with burndown_conn_with_config(known_project_roots=[hung]) as (_db, config, conn):
+            store = _CannedStore({config.project_root: [_raw_task(1, 'pending')]})
+            with (
+                _serve(store),
+                _misbehave_for(hung, hang),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail(
+                        'collect_snapshot did not return within 10s against a root '
+                        'whose acquisition hangs forever — the per-root backstop '
+                        '(_SNAPSHOT_PER_ROOT_BUDGET) is missing.'
+                    )
+            by_project = await _rows_by_project(conn)
+
+        _assert_one_gap(by_project, hung, '0.05')
+        _assert_one_value(by_project, config.project_root)
+        warnings = _burndown_warnings_naming(caplog, hung)
+        assert warnings, f'expected a WARNING naming {hung}'
+        assert all(
+            r.exc_info is not None and issubclass(r.exc_info[0], TimeoutError) for r in warnings
+        )
+
+    async def test_an_offline_root_is_a_routine_gap_without_a_warning(
+        self, burndown_env, caplog, dummy_client,
+    ):
+        """The gap row is the durable record; the collector logs it at DEBUG.
+
+        The substrate's own fan-out reports the outage under its own logger.
+        """
+        db_path, config, conn = burndown_env
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'):
+            await _collect(
+                conn, config, dummy_client,
+                _CannedStore({config.project_root: httpx.ConnectError('boom')}),
+            )
+
+        _assert_one_gap(await _rows_by_project(conn), config.project_root, 'boom')
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.burndown'
+        ], 'a known offline root is a DEBUG-level record, not a WARNING'
 
 
 # ---------------------------------------------------------------------------
@@ -2537,216 +2678,37 @@ class TestCollectSnapshotExplicitRollback:
 # ---------------------------------------------------------------------------
 
 
-# The ~209 s paginated worst case measured for ONE root of this repo's size —
-# ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` sequential round trips at ~0.33-0.35 s each.
-# The measurement and its derivation live on ``burndown._SNAPSHOT_PAGE_SIZE``;
-# this is the test's own copy of the FLOOR it enforces, deliberately spelled
-# as a number rather than derived from ``_SNAPSHOT_PER_ROOT_BUDGET`` (deriving
-# the bound from the value under test would assert nothing).
-_MEASURED_PAGINATED_WORST_CASE = 209.0
-
-
 class TestCollectSnapshotPerRootBudget:
     """``collect_snapshot``'s Phase-2 fan-out is whole-operation bounded per root.
 
-    Before task 4884 this was the LAST unbounded ``fetch_tasks`` caller in the
-    tree: task 4788 gave every route caller a named
-    ``DEFAULT_WHOLE_OPERATION_BUDGET`` wrap and deliberately left the
-    background collector out of scope, so a single hung MCP fan-out could park
-    the collector task forever and silently stop every project's burndown row
-    — the 2026-08-27 19.8h wedge shape, one layer down from the routes.
-
-    The hang stub is ``await asyncio.Event().wait()`` — the 4788 idiom — with
-    NO duration at all, so no choice of budget value can make an unbounded
-    implementation pass these tests.
+    Before task 4884 the collector's read was unbounded, so a single hung MCP
+    fan-out could park the collector task forever and silently stop every
+    project's burndown row. Expiry is now a gap row (see
+    TestCollectSnapshotWritesGapRows' hung-acquisition test); this class pins
+    the VALUE of the bound.
     """
 
-    @pytest.mark.asyncio
-    async def test_hung_root_is_skipped_and_healthy_root_still_snapshots(
-        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
-    ):
-        """(a) One root hanging forever costs that root's row, not the cycle."""
-        healthy_root = tmp_path / 'healthy'
-        healthy_root.mkdir()
-
-        async with burndown_conn_with_config(known_project_roots=[healthy_root]) as (
-            _db_path, config, conn,
-        ):
-            hung_key = _root_key(config.project_root)
-            store = _CannedStore({healthy_root: [{'status': 'pending'}, {'status': 'done'}]})
-
-            async def hang_or_serve(client, url, tool, args, **kwargs):
-                if _root_key(args['project_root']) == hung_key:
-                    # No duration: nothing ever sets this Event, so the only
-                    # thing that can end this await is a caller's bound.
-                    await asyncio.Event().wait()
-                return await store(client, url, tool, args, **kwargs)
-
-            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
-
-            with (
-                patch('dashboard.data.tasks.mcp_tool_call', new=hang_or_serve),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                # Hard external cap, mirroring test_healthz_deadline._call_healthz:
-                # a regression to the unbounded gather must fail fast here rather
-                # than wedge the whole suite behind pytest-timeout.
-                try:
-                    await asyncio.wait_for(
-                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
-                    )
-                except TimeoutError:
-                    pytest.fail(
-                        'collect_snapshot did not return within 10s against a root '
-                        'whose read hangs forever — the Phase-2 fan-out is still '
-                        'unbounded (expected a per-root _SNAPSHOT_PER_ROOT_BUDGET '
-                        'wrap around the per-root read).'
-                    )
-
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
-
-            project_ids = {row['project_id'] for row in rows}
-            assert str(healthy_root.resolve()) in project_ids, (
-                'the healthy root must still get its snapshot row: one hung root '
-                'may not sink the cycle'
-            )
-            assert str(config.project_root) not in project_ids, (
-                'the hung root must be SKIPPED, not written with fabricated zero '
-                'counts — snapshots is an append-only historical record'
-            )
-            assert len(rows) == 1
-
-            warnings = [
-                r for r in caplog.records
-                if r.levelno >= logging.WARNING and str(config.project_root) in r.getMessage()
-            ]
-            assert warnings, (
-                'expected a WARNING naming the hung root; a root that silently '
-                'vanishes from an append-only chart is exactly the invisible '
-                'failure this bound exists to make visible. Saw: '
-                f'{[r.getMessage() for r in caplog.records]}'
-            )
-
-    @pytest.mark.asyncio
-    async def test_expiry_surfaces_through_the_existing_exception_triage(
-        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
-    ):
-        """(b) Task 519's partial-success semantics are preserved.
-
-        Expiry must arrive at Phase 3 as a per-root ``BaseException`` in the
-        gather's result list — i.e. ``return_exceptions=True`` is still in
-        force — so the exception branch logs-and-continues.  A bound that
-        instead let the ``TimeoutError`` escape the gather would abort the
-        cycle and roll nothing back but write nothing more either.
-        """
-        healthy_root = tmp_path / 'healthy'
-        healthy_root.mkdir()
-        late_root = tmp_path / 'late'
-        late_root.mkdir()
-
-        async with burndown_conn_with_config(
-            known_project_roots=[healthy_root, late_root],
-        ) as (_db_path, config, conn):
-            hung_key = _root_key(healthy_root)
-            store = _CannedStore({
-                config.project_root: [{'status': 'pending'}],
-                late_root: [{'status': 'pending'}],
-            })
-
-            async def hang_or_serve(client, url, tool, args, **kwargs):
-                if _root_key(args['project_root']) == hung_key:
-                    await asyncio.Event().wait()
-                return await store(client, url, tool, args, **kwargs)
-
-            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
-
-            with (
-                patch('dashboard.data.tasks.mcp_tool_call', new=hang_or_serve),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                try:
-                    await asyncio.wait_for(
-                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
-                    )
-                except TimeoutError:
-                    pytest.fail('collect_snapshot did not return within 10s (see (a))')
-
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                project_ids = {row['project_id'] for row in await cur.fetchall()}
-
-            # The main project commits FIRST (it is roots_to_snapshot[0]) and a
-            # later root's expiry may not roll it back.  The root AFTER the hung
-            # one is still reached, which is what "isolated, not aborted" means.
-            assert str(config.project_root) in project_ids
-            assert str(late_root.resolve()) in project_ids
-            assert str(healthy_root.resolve()) not in project_ids
-
-            triage = [
-                r for r in caplog.records
-                if r.name == 'dashboard.data.burndown'
-                and r.levelno == logging.WARNING
-                and str(healthy_root.resolve()) in r.getMessage()
-                and r.exc_info is not None
-            ]
-            assert triage, (
-                'the timed-out root must reach the exception triage branch '
-                '(a WARNING naming it, with exc_info), proving '
-                'return_exceptions=True still converts its expiry into a '
-                'handled per-root result. Saw: '
-                f'{[r.getMessage() for r in caplog.records]}'
-            )
-            assert triage[0].exc_info is not None
-            assert issubclass(triage[0].exc_info[0], TimeoutError), (
-                'the exception carried into triage must be the budget expiry '
-                f'itself, not a substitute; got {triage[0].exc_info[0]!r}'
-            )
-
-    def test_budget_is_sized_between_the_route_default_and_one_collector_cycle(self):
-        """(c) The VALUE is derived from the collector's own cycle, not the routes.
-
-        Wrapping at the route convention's 7.0 would be a REGRESSION, not a
-        fix: ``_fetch_snapshot_tasks`` probes unpaginated and, on transport
-        rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call
-        that internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round
-        trips, MEASURED at ~209 s for one root of this repo's size (the
-        measurement and its derivation live on ``_SNAPSHOT_PAGE_SIZE``).  A
-        7.0 s bound would time out every big root on every cycle, and because
-        ``snapshots`` is APPEND-ONLY and no later cycle backfills, that is a
-        permanent unexplained hole in the chart.
-        """
+    def test_budget_sits_between_the_units_own_bounds_and_one_collector_cycle(self):
+        """Floor: the unit's own roster arithmetic, so the backstop never
+        pre-empts a unit still inside its own bounds. Ceiling: half one
+        collector cycle, so cycle N is done before cycle N+1 starts even when a
+        root spends its whole budget."""
         import dashboard.loops as loops_module
-        from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
 
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
-        one_cycle_half = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        floor = task_snapshot.PER_CALL_TIMEOUT * len(task_snapshot.PER_PROJECT_MCP_CALLS)
+        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
 
-        # BOTH bounds are the ones the derivation actually names. An earlier
-        # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
-        # and `< _SAMPLE_INTERVAL_SECONDS` (600) — two orders of magnitude
-        # apart from the stated floor at one end and double the stated ceiling
-        # at the other — so a value of 10.0 passed while doing exactly the
-        # permanent-hole damage the docstring describes.
-        assert budget >= _MEASURED_PAGINATED_WORST_CASE, (
-            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the MEASURED '
-            f'~{_MEASURED_PAGINATED_WORST_CASE} s paginated worst case for one '
-            "root of this repo's size (see _SNAPSHOT_PAGE_SIZE). Anything below "
-            'it times out every big root on EVERY cycle, and because snapshots '
-            'is APPEND-ONLY and no later cycle backfills, that is a permanent '
-            'unexplained hole in the chart — not a degraded read. The shared '
-            f'route default ({DEFAULT_WHOLE_OPERATION_BUDGET}) is the value '
-            'this must NOT be confused with: a BACKGROUND root that walks '
-            'ceil(N/P) sequential pages is not a request-path one.'
+        assert budget >= floor, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
+            f'bounds ({task_snapshot.PER_CALL_TIMEOUT} s x '
+            f'{len(task_snapshot.PER_PROJECT_MCP_CALLS)} bounded operations = {floor} s): '
+            'the backstop would turn a slow-but-bounded read into a gap row.'
         )
-        assert budget <= one_cycle_half, (
+        assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
-            'finish inside one cycle can never finish at all, and the halving '
-            'is what guarantees cycle N is done before cycle N+1 starts even '
-            'when a root spends its whole budget.'
+            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 
