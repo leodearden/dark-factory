@@ -1,6 +1,6 @@
 """Shared detector for leaked serialized tool-call XML fragments (task 3083).
 
-THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Three
+THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Four
 consumers depend on this module, and they must never drift apart:
 
 * ``scripts/scan_task_toolcall_leaks.py`` — the READ-ONLY Taskmaster task-DB
@@ -9,22 +9,30 @@ consumers depend on this module, and they must never drift apart:
 * ``fused-memory/scripts/sweep_toolcall_xml_leak.py`` — the Mem0/Qdrant
   corpus sweep;
 * ``Mem0Backend.scan_payload_text`` / the ``scan_memory_content`` MCP tool —
-  the read capability that makes the corpus sweepable at all.
+  the read capability that makes the corpus sweepable at all;
+* ``fused_memory/backends/task_text_markup_gate.py`` — the storage-layer
+  tripwire that ``SqliteTaskBackend.add_task``/``update_task`` run on every
+  write of task text (task 4419). It is the one consumer that runs at WRITE
+  time, and it shares :data:`SCANNED_COLUMNS` with the task-DB sweep.
 
 This detector is deliberately PRECISE: it requires real whitespace between the
 stray closing tag and the continuation, so prose that merely quotes the leak
-shape with an escaped ``\n`` is not a hit. That matters because every consumer
-above runs over ALREADY-STORED content, where a false positive would provoke an
-unnecessary rewrite of a user's memory.
+shape with an escaped ``\n`` is not a hit. That matters in both positions it
+is used from. The first three consumers run over ALREADY-STORED content, where
+a false positive would provoke an unnecessary rewrite of a user's memory. The
+storage gate runs at write time, where a false positive refuses a legitimate
+write that no caller is placed to resubmit.
 
-It is NOT the live write-boundary guard. That is
-:mod:`fused_memory.server.markup_tripwire`, which is deliberately calibrated
-the other way — a bare substring scan that accepts over-reporting to maximise
-recall at write time, where the cost of a false positive is only a retry. The
-two are complementary and must not be collapsed into one another. Since task
-3688 they DO share the envelope-literal enumeration itself, which lives once
-in :mod:`shared.toolcall_markup` (INV-5); the two calibrations are two named
-predicates over that one set, not two independently spelled sets.
+It is NOT the MCP write-boundary guard. That is
+``fused_memory/server/markup_guard.py::install_markup_guard`` (task 4458,
+which replaced task 3141's in-line ``markup_tripwire`` gate). It is
+deliberately calibrated the other way: a recall-first predicate that accepts
+over-reporting at the MCP boundary, where a false positive costs the live
+caller only a resubmission. The two are complementary and must not be
+collapsed into one another. Since task 3688 they DO share the envelope-literal
+enumeration itself, which lives once in :mod:`shared.toolcall_markup` (INV-5);
+the two calibrations are two named predicates over that one set, not two
+independently spelled sets.
 
 ## Root cause (task 3083, WORK a)
 
