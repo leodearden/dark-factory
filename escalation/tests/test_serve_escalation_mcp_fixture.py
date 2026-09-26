@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import socket
 import threading
 from collections.abc import Iterator
@@ -69,10 +70,10 @@ def test_the_injected_conftest_is_this_directorys_conftest(
 
     Only the file assertion is made. The stronger property, that the injected
     object is the LIVE module pytest loaded rather than a second import of the
-    same file, is pinned BEHAVIOURALLY by the two tests below that
-    ``monkeypatch.setattr`` ``_free_escalation_port`` / ``_READY_TIMEOUT_S`` on
-    it and observe the fixture body pick both up -- something no second import
-    could satisfy. Asserting it here instead against
+    same file, is pinned BEHAVIOURALLY by the tests below that
+    ``monkeypatch.setattr`` ``_bind_escalation_listener`` / ``_READY_TIMEOUT_S``
+    on it and observe the fixture body pick both up -- something no second
+    import could satisfy. Asserting it here instead against
     ``request.config.pluginmanager.get_plugin(str(path))`` would buy nothing
     extra while adding a dependency on pytest's undocumented
     conftest-keyed-by-str(path) internals, which can change on a version bump.
@@ -172,6 +173,107 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route(
 
 
 # ---------------------------------------------------------------------------
+# The fixture OWNS its port from allocation through serve (task 5934).
+# ---------------------------------------------------------------------------
+
+
+def test_an_allocated_listener_holds_its_port_and_refuses_connections_until_served(
+    escalation_conftest: Any,
+) -> None:
+    """An allocated listener is a hold on the port, not a guess at a free one.
+
+    The incident this pins (task 5934): the old picker bound port 0, CLOSED
+    the socket and returned only the number, so under parallel load another
+    process bound that number before uvicorn did, and the server thread died
+    with EADDRINUSE. The thief here uses SO_REUSEADDR -- the most permissive
+    ordinary bind, and the one uvicorn itself makes -- so if even it is
+    refused, no ordinary bind can take the port.
+
+    The refused connect is the second half of the same property: a held but
+    not-yet-served port must REFUSE, not accept into a backlog nobody drains.
+    Accept-and-never-answer is the hang shape that turned the incident's bind
+    loss into a 300s pytest-timeout instead of a fast failure.
+    """
+    listener = escalation_conftest._bind_escalation_listener()
+    try:
+        port = listener.getsockname()[1]
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError) as excinfo:
+                thief.bind(('127.0.0.1', port))
+            assert excinfo.value.errno == errno.EADDRINUSE, (
+                f'expected EADDRINUSE from a second bind of the held port; '
+                f'got {excinfo.value!r}'
+            )
+        finally:
+            thief.close()
+
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(('127.0.0.1', port), timeout=1.0)
+    finally:
+        listener.close()
+
+
+def test_the_fixture_serves_on_the_listener_it_allocated_and_releases_it(
+    escalation_conftest: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server listens on the very socket the fixture allocated, and
+    teardown releases it.
+
+    ``SO_ACCEPTCONN`` on the recorded object is what tells the two designs
+    apart: a close-then-rebind picker would leave the allocated socket closed
+    or merely bound, whereas handing that socket to the server makes it the
+    kernel's LISTEN socket for the served port. The ``list_tools()``
+    round-trip rules out a listener that is up but not serving MCP.
+    """
+    real = escalation_conftest._bind_escalation_listener
+    allocated: list[socket.socket] = []
+
+    def _recording() -> socket.socket:
+        sock = real()
+        allocated.append(sock)
+        return sock
+
+    monkeypatch.setattr(escalation_conftest, '_bind_escalation_listener', _recording)
+
+    gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
+    try:
+        start = next(gen)
+        base_url, port, _queue = start(tmp_path / 'queue')
+
+        assert len(allocated) == 1, (
+            f'expected the fixture to allocate exactly one listener; got {allocated}'
+        )
+        assert port == allocated[0].getsockname()[1]
+        assert allocated[0].getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1, (
+            'the allocated socket is not the one listening: the server bound '
+            'the port afresh instead of serving on the socket the fixture held'
+        )
+
+        async def _list_tools() -> list:
+            transport = StreamableHttpTransport(f'{base_url}/mcp/')
+            async with Client(transport) as client:
+                return await client.list_tools()
+
+        assert asyncio.run(_list_tools()), (
+            f'the server on the allocated listener at {base_url} returned no tools'
+        )
+
+        with pytest.raises(StopIteration):
+            next(gen)
+
+        assert allocated[0].fileno() == -1, (
+            'teardown must close the allocated listener, releasing its port'
+        )
+    finally:
+        gen.close()
+
+
+# ---------------------------------------------------------------------------
 # A startup failure must NAME itself in the readiness-timeout error.
 # ---------------------------------------------------------------------------
 
@@ -183,13 +285,11 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
 ) -> None:
     """A server that dies during startup must name its cause on timeout.
 
-    ``_free_escalation_port()`` binds-then-closes, so there is an inherent
-    TOCTOU window in which another process (or a concurrent worker) steals the
-    port before the real bind. That loss arrives as an OSError, or as the
-    SystemExit uvicorn raises via ``sys.exit`` on a failed bind -- neither of
-    which is a ``RuntimeError``. A fixture that only captures RuntimeError
-    therefore reports the generic "did not become ready" and DROPS the one
-    fact a reader needs, which is what this test forbids.
+    A startup failure need not be a ``RuntimeError``: a listener the server
+    cannot serve on is rejected by asyncio's ``create_server`` with a
+    ValueError. A fixture that only captures RuntimeError therefore reports
+    the generic "did not become ready" and DROPS the one fact a reader needs,
+    which is what this test forbids.
 
     The CLIENT half of the wire is asserted too: ``_mcp_handshake_ready``
     swallows every exception and returns False, so unless it records the last
@@ -198,16 +298,20 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
     empty ``serve_error``, and a timeout message that merely restates the
     timeout. Both halves must be named.
 
-    Driven by monkeypatching the port allocator to hand back a port this test
-    is already holding, so the failure is a real bind conflict rather than a
-    simulated one, and by shortening ``_READY_TIMEOUT_S`` -- the timeout PATH
-    is the subject here, not its production duration, and paying the full ~10s
-    bound on every suite run to re-measure a constant buys nothing. Both
-    patches land on the injected conftest module, which is also what proves it
-    is the live one the fixture body reads.
+    Driven by monkeypatching the listener allocator to hand back a datagram
+    socket, so the failure is a real startup rejection rather than a simulated
+    one -- and a deterministic one, which a bind conflict no longer is once
+    the fixture holds its port from allocation onward. ``_READY_TIMEOUT_S`` is
+    shortened too: the timeout PATH is the subject here, not its production
+    duration, and paying the full ~10s bound on every suite run to re-measure
+    a constant buys nothing. Both patches land on the injected conftest
+    module, which is also what proves it is the live one the fixture body
+    reads.
     """
-    with _listener_without_mcp_route() as port:
-        monkeypatch.setattr(escalation_conftest, '_free_escalation_port', lambda: port)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp.bind(('127.0.0.1', 0))
+        monkeypatch.setattr(escalation_conftest, '_bind_escalation_listener', lambda: udp)
         monkeypatch.setattr(escalation_conftest, '_READY_TIMEOUT_S', 0.5)
 
         gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
@@ -228,8 +332,8 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
         _, marker, detail = message.partition('server thread raised: ')
         assert marker and detail.strip(' )'), (
             'the readiness-timeout error must name the startup failure that '
-            'actually happened (the bind conflict), not just report that the '
-            'server never became ready; got: ' + repr(message)
+            'actually happened (the rejected listener), not just report that '
+            'the server never became ready; got: ' + repr(message)
         )
         _, handshake_marker, handshake_detail = message.partition(
             'last handshake error: '
@@ -240,6 +344,8 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
             'healthy reports nothing at all about why the handshake never '
             'completed; got: ' + repr(message)
         )
+    finally:
+        udp.close()
 
 
 # ---------------------------------------------------------------------------
