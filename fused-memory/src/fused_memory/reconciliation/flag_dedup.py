@@ -358,8 +358,11 @@ from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_TOKEN_FAMILIES,
+    STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
+    STREAK_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    SUPPRESSION_STREAK_THRESHOLD_CYCLES,
 )
 from fused_memory.utils.async_utils import gather_collect
 
@@ -1265,6 +1268,102 @@ async def maybe_escalate_suppression_storm(
     return escalated
 
 
+@dataclass(frozen=True)
+class SuppressionStreakUpdate:
+    """One standing decision's suppression streak after this cycle (task 2943).
+
+    ``streak`` counts the consecutive full cycles, ending with this one, in
+    which the decision on ``(entity_uuid, grounds)`` suppressed at least one
+    flag; 0 records a reset.  ``escalate`` is ``streak >= threshold``.
+    """
+
+    entity_uuid: str
+    grounds: str
+    streak: int
+    escalate: bool
+
+
+def _decoded_streak_payload(row: ReconLedgerRecord) -> dict[str, Any]:
+    """A streak row's payload as a dict, or ``{}`` when it is not a JSON object."""
+    try:
+        payload = json.loads(row.payload_json)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def update_suppression_streaks(
+    memory_service: Any,
+    project_id: str,
+    run_id: str,
+    result: EntityStandingSuppressionResult,
+    *,
+    now: str | None = None,
+    threshold: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+) -> list[SuppressionStreakUpdate]:
+    """Advance every standing decision's cross-cycle suppression streak by one cycle.
+
+    The persistence half of the storm escape's streak arm; filing is
+    :func:`maybe_escalate_suppression_streak`.  Each decision in
+    ``result.suppressed_by_decision`` extends its streak by one, and every
+    stored non-zero streak whose decision suppressed nothing this cycle resets
+    to 0.  A row already at 0 is left alone, so a decision that has gone quiet
+    is written once and then ages out through ``gc()``'s ``expires_at`` arm.
+
+    Replaying a cycle is idempotent: a row whose stored ``last_run_id`` equals
+    *run_id* is re-written without incrementing, so a re-entered stage cannot
+    reach *threshold* before the drain has persisted for that many real cycles.
+
+    Every write refreshes ``expires_at`` to *now* plus
+    ``STANDING_DECISION_TTL_DAYS``, spelled as ``isoformat()`` like the
+    standing-decision writer so ``gc()``'s TEXT comparison stays valid.
+    *now* is an ISO-8601 string defaulting to the current UTC time.
+
+    Returns one :class:`SuppressionStreakUpdate` per row written, sorted by
+    ``(entity_uuid, grounds)``.
+    """
+    ledger = memory_service.recon_ledger
+    rows = await ledger.list_suppression_streaks(project_id)
+    stored = {
+        ((row.entity_uuid or row.run_id).lower(), row.flag_type): _decoded_streak_payload(row)
+        for row in rows
+    }
+
+    next_streaks: dict[tuple[str, str], int] = {}
+    for entity_uuid in result.suppressed_by_decision:
+        key = (entity_uuid, result.grounds_by_decision.get(entity_uuid, ''))
+        prior = stored.get(key, {})
+        prior_streak = _nonnegative_int_from_payload(prior, STREAK_PAYLOAD_KEY)
+        replayed = bool(run_id) and prior.get('last_run_id') == run_id
+        next_streaks[key] = prior_streak if replayed else prior_streak + 1
+    for key, payload in stored.items():
+        if key not in next_streaks and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
+            next_streaks[key] = 0
+
+    now_dt = datetime.now(UTC) if now is None else datetime.fromisoformat(now)
+    expires_at = (now_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
+    updates: list[SuppressionStreakUpdate] = []
+    for (entity_uuid, grounds), streak in sorted(next_streaks.items()):
+        await ledger.upsert_suppression_streak(
+            project_id=project_id,
+            entity_uuid=entity_uuid,
+            grounds=grounds,
+            streak=streak,
+            last_run_id=run_id,
+            updated_at=now_dt.isoformat(),
+            expires_at=expires_at,
+        )
+        updates.append(
+            SuppressionStreakUpdate(
+                entity_uuid=entity_uuid,
+                grounds=grounds,
+                streak=streak,
+                escalate=streak >= threshold,
+            )
+        )
+    return updates
+
+
 # --------------------------------------------------------------------------- #
 # Deduped-against UUID extraction (task-2047 Gap 1)
 # --------------------------------------------------------------------------- #
@@ -1476,22 +1575,29 @@ _DONE_SUPPRESSIONS_PAYLOAD_KEY: str = 'cross_project_done_suppressions'
 _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
 
 
-def _prior_done_suppression_count(prior_payload: Any) -> int:
-    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload.
+def _nonnegative_int_from_payload(payload: Any, key: str) -> int:
+    """Read the non-negative ``int`` counter stored under *key* in a ledger payload.
 
-    Returns 0 for anything that is not a positive ``int`` — an absent key (every
-    marker written before the task 4381 amendment), ``None``, a bool (``True``
-    is an ``int`` in Python and must not be read as the count 1), a string, or a
-    negative value.  Free-form JSON off a ledger row is never trusted for shape.
+    Returns 0 for anything else — a payload that is not a dict, an absent key,
+    ``None``, a bool (``True`` is an ``int`` in Python and must not be read as
+    the count 1), a string, or a negative value.  Free-form JSON off a ledger
+    row is never trusted for shape.
 
     Pure, sync, no I/O — never raises.
     """
-    if not isinstance(prior_payload, dict):
+    if not isinstance(payload, dict):
         return 0
-    value = prior_payload.get(_DONE_SUPPRESSIONS_PAYLOAD_KEY)
+    value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
+
+
+def _prior_done_suppression_count(prior_payload: Any) -> int:
+    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload;
+    0 when absent (every marker written before the task 4381 amendment) or
+    malformed."""
+    return _nonnegative_int_from_payload(prior_payload, _DONE_SUPPRESSIONS_PAYLOAD_KEY)
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
