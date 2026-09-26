@@ -46,46 +46,25 @@ from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
-# Whole-operation bound for ONE root's snapshot read, enforced by
-# collect_snapshot's Phase-2 gather.
+# Whole-operation backstop for ONE root's snapshot acquisition, enforced by
+# collect_snapshot's Phase-2 gather. Expiry is a GAP row naming this budget,
+# never a skipped root.
 #
-# SHARES task 4788's CONVENTION, DIFFERS ONLY IN VALUE.  The convention is a
-# named module constant (never a restated literal), an ``asyncio.wait_for``
-# around the whole operation rather than a per-HTTP-request ``timeout``, and an
-# expiry that surfaces as a handled per-root exception.  All three hold here.
-# What does NOT carry over is the NUMBER.
+# A BACKSTOP around a bounded, total-by-contract unit, and still worth its
+# place: task 4884 showed an unbounded sampler await parks every project's
+# history silently, and the sampler's invariant is one row per root per tick.
 #
-# Deliberately NOT ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET`` (7.0).  That value
-# is derived from ONE cold MCP session (``DEFAULT_PER_CALL_TIMEOUT`` 2.0 x
-# ``len(COLD_SESSION_POSTS)`` 3, plus slack) and is correct for a request-path
-# caller issuing one unpaginated read.  This caller is not that:
-# ``_fetch_snapshot_tasks`` probes unpaginated first and, on transport
-# rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call that
-# internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round trips,
-# MEASURED at ~209 s for one root of this repo's size (the measurement and its
-# derivation live on _SNAPSHOT_PAGE_SIZE above; do not restate them here).
+# FLOOR: the unit's own structural worst case, so the backstop never pre-empts
+# a unit still inside its own bounds. Both halves run concurrently, each under
+# wait_for(task_snapshot.PER_CALL_TIMEOUT) (4.4 s), after the unit cache's
+# bounded lock wait (mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS, 15 s) that
+# precedes a bypass: ~19.4 s.
+# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS (600), so one collector
+# cycle is finished before the next begins.
 #
-# A 7.0 s bound would therefore time out every big root on EVERY cycle.  That
-# is not a degraded read, it is a permanent one: ``snapshots`` is an
-# APPEND-ONLY historical record and no later cycle backfills a missing row, so
-# the chart would grow an unexplained hole for exactly the projects an operator
-# most needs the burndown for.  Wrapping at the route convention's value would
-# be a REGRESSION, not a fix.
-#
-# DERIVATION of 300.0, from two real limits rather than by analogy:
-#   * >= the MEASURED ~209 s paginated worst case, with ~1.4x headroom for a
-#     tree that has grown since the measurement or a slower server day;
-#   * <= half of ``app._SAMPLE_INTERVAL_SECONDS`` (600), so one collector cycle
-#     can never still be running when the next one starts.  A root that cannot
-#     finish inside one cycle can never finish at all.
-#
-# Rejected alternative: bound only the unpaginated probe at 7.0 and leave the
-# paginated fallback unbounded.  That leaves the actual long pole unbounded,
-# which is the whole point of the bound.
-#
-# Pinned by TestCollectSnapshotPerRootBudget in
+# 60.0 is ~3x the floor. Pinned by TestCollectSnapshotPerRootBudget in
 # dashboard/tests/test_burndown_data.py.
-_SNAPSHOT_PER_ROOT_BUDGET = 300.0
+_SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -266,6 +245,79 @@ def _value_row(
     )
 
 
+def _gap_row(project_id: str, ts: str, reason: str) -> _SnapshotRow:
+    """The row recording that *project_id* was NOT measured at *ts*, and why.
+
+    It writes no count column at all: the nullable ones stay NULL, and the
+    legacy NOT NULL ones take their DEFAULT, which carries no meaning.
+    """
+    return _SnapshotRow(
+        project_id=project_id,
+        ts=ts,
+        state=SnapshotState.GAP,
+        reason=reason,
+        measured=MappingProxyType({}),
+    )
+
+
+def _unmeasured_reason(served: TaskSnapshot) -> str:
+    """Each non-fresh half's own reason, verbatim, labelled with its half.
+
+    Routing never reads this text: the state of each half decides value vs
+    gap, and this only records why for the operator.
+    """
+    reasons = [
+        f'{half}: {datum.reason}'
+        for half, datum in (('census', served.census), ('rows', served.rows))
+        if datum.state is not DatumState.FRESH
+    ]
+    return '; '.join(reasons) or 'the snapshot unit carried no measurement'
+
+
+def _acquisition_failure_reason(exc: BaseException) -> str:
+    """Why a root's acquisition produced no unit at all."""
+    if isinstance(exc, TimeoutError):
+        return (
+            f'snapshot acquisition exceeded the {_SNAPSHOT_PER_ROOT_BUDGET}s '
+            'per-root budget'
+        )
+    return f'snapshot acquisition raised {type(exc).__name__}: {exc}'
+
+
+def _row_for_root(
+    root: str, now_dt: datetime, result: TaskSnapshot | BaseException,
+) -> _SnapshotRow:
+    """The one row *root* owes this cycle: a value row, or a gap row saying why not.
+
+    A raise (or the backstop expiring) is a bug signal from a total-by-contract
+    unit, so it logs at WARNING. A non-fresh unit is routine — an offline root
+    is a DEBUG-level record — because the gap row itself is the durable one.
+    """
+    ts = now_dt.isoformat()
+    if isinstance(result, BaseException):
+        logger.warning('Snapshot acquisition failed for %s', root, exc_info=result)
+        return _gap_row(root, ts, _acquisition_failure_reason(result))
+    served = as_served(result, now_dt)
+    measurement = _measurement(served)
+    if measurement is None:
+        reason = _unmeasured_reason(served)
+        logger.debug('Snapshot unit for %s is not wholly fresh: %s', root, reason)
+        return _gap_row(root, ts, reason)
+    # One cap read per ROOT: it touches the filesystem, and the value is a
+    # per-project scalar stored on the row because max_concurrent_tasks varies
+    # across restarts and across projects — see BURNDOWN_SCHEMA.
+    cap = read_max_concurrent_tasks(root)
+    # The `running` sub-view is the one number an operator compares against
+    # max_concurrent_tasks (PRD decision 3).
+    running = measurement.census.sub_views[TaskView.RUNNING]
+    if cap is not None and running > cap:
+        logger.warning(
+            'Concurrency cap breached for %s: %d in-progress vs cap %d (%d stranded)',
+            root, running, cap, measurement.in_progress_stranded,
+        )
+    return _value_row(root, ts, measurement, cap)
+
+
 async def _insert_row(conn: aiosqlite.Connection, row: _SnapshotRow) -> None:
     """INSERT *row* by explicit column names, binding ``project_id`` first."""
     columns: dict[str, object] = {
@@ -287,15 +339,15 @@ async def collect_snapshot(
     config: DashboardConfig,
     client: httpx.AsyncClient,
 ) -> None:
-    """Discover projects and insert one snapshot row per measured project.
+    """Discover projects and insert exactly one snapshot row per project per cycle.
 
     Each root is read through the task snapshot unit
     (``task_snapshot.acquire_snapshot``), and the unit is judged as served at
     this cycle's instant. A root whose census and rows are BOTH fresh gets a
     value row: the census gives the nine member columns, the rows give the
-    live/stranded split. A root whose unit is not wholly fresh is logged at
-    DEBUG and skipped; a root whose acquisition raises (or overruns
-    ``_SNAPSHOT_PER_ROOT_BUDGET``) is logged at WARNING and skipped.
+    live/stranded split. Every other root gets a gap row whose ``reason``
+    says why — a non-fresh half (logged at DEBUG), or an acquisition that
+    raised or overran ``_SNAPSHOT_PER_ROOT_BUDGET`` (logged at WARNING).
 
     Partial-failure semantics:
 
@@ -330,7 +382,6 @@ async def collect_snapshot(
         # instant a unit is measured at, and the one it is served at must be
         # the SAME capture, or a row could claim a measurement its own
         # timestamp contradicts.
-        now = now_dt.isoformat()
         # config.project_root is already resolved by DashboardConfig.__post_init__
         resolved_root = str(config.project_root)
 
@@ -392,11 +443,9 @@ async def collect_snapshot(
         # return_exceptions=True isolates a root whose acquisition raises, so a
         # single bad root can't sink the whole cycle (task 519).
         #
-        # WHOLE-OPERATION BOUND per root (task 4884 / #4424): an unbounded
-        # sampler await once parked every project's history silently, so each
-        # acquisition is wrapped at _SNAPSHOT_PER_ROOT_BUDGET even though the
-        # unit bounds its own reads. Expiry becomes that root's own
-        # TimeoutError result, handled below like any other raise.
+        # WHOLE-OPERATION BACKSTOP per root (task 4884 / #4424), see
+        # _SNAPSHOT_PER_ROOT_BUDGET. Expiry becomes that root's own
+        # TimeoutError result, which Phase 3 records as a gap row.
         all_results = await asyncio.gather(
             *(
                 asyncio.wait_for(
@@ -413,36 +462,8 @@ async def collect_snapshot(
         # Each project gets its own INSERT + commit so a DB failure on one project
         # cannot roll back rows that were already committed for earlier projects.
         for root_str, result in zip(roots_to_snapshot, all_results, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning('Snapshot acquisition failed for %s', root_str, exc_info=result)
-                continue
-            served = as_served(result, now_dt)
-            measurement = _measurement(served)
-            if measurement is None:
-                logger.debug(
-                    'Snapshot unit for %s is not wholly fresh (census %s, rows %s); skipped',
-                    root_str, served.census.state, served.rows.state,
-                )
-                continue
             try:
-                # One cap read per ROOT: it touches the filesystem, and the
-                # value is a per-project scalar stored on the row because
-                # max_concurrent_tasks varies across restarts and across
-                # projects — see BURNDOWN_SCHEMA's concurrency_cap comment.
-                cap = read_max_concurrent_tasks(root_str)
-                # The `running` sub-view is the one number an operator compares
-                # against max_concurrent_tasks (PRD decision 3).
-                running = measurement.census.sub_views[TaskView.RUNNING]
-                if cap is not None and running > cap:
-                    logger.warning(
-                        'Concurrency cap breached for %s: %d in-progress vs cap %d '
-                        '(%d stranded)',
-                        root_str,
-                        running,
-                        cap,
-                        measurement.in_progress_stranded,
-                    )
-                await _insert_row(conn, _value_row(root_str, now, measurement, cap))
+                await _insert_row(conn, _row_for_root(root_str, now_dt, result))
                 await conn.commit()
             except Exception:
                 logger.warning('Failed to insert snapshot for %s', root_str, exc_info=True)

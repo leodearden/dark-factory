@@ -1812,7 +1812,7 @@ class TestCollectSnapshotWritesGapRows:
         warnings = _burndown_warnings_naming(caplog, exploding)
         assert warnings, f'expected a WARNING naming {exploding}'
         assert all(
-            r.exc_info is not None and issubclass(r.exc_info[0], RuntimeError) for r in warnings
+            r.exc_info is not None and isinstance(r.exc_info[1], RuntimeError) for r in warnings
         )
 
     async def test_a_hung_acquisition_is_a_gap_at_the_backstop(
@@ -1854,7 +1854,7 @@ class TestCollectSnapshotWritesGapRows:
         warnings = _burndown_warnings_naming(caplog, hung)
         assert warnings, f'expected a WARNING naming {hung}'
         assert all(
-            r.exc_info is not None and issubclass(r.exc_info[0], TimeoutError) for r in warnings
+            r.exc_info is not None and isinstance(r.exc_info[1], TimeoutError) for r in warnings
         )
 
     async def test_an_offline_root_is_a_routine_gap_without_a_warning(
