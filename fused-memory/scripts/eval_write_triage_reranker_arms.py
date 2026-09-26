@@ -23,7 +23,8 @@ import importlib
 import math
 import os
 import types
-from collections.abc import Callable, Iterable, Iterator, Sequence
+import urllib.parse
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -220,3 +221,216 @@ def open_pairwise(context: ArmContext) -> Iterator[PairwiseScorer]:
     finally:
         scorer.close()
         client.close()
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _remote_facts(url: str) -> ScorerFacts:
+    host = urllib.parse.urlsplit(url).hostname
+    return ScorerFacts(device=f'remote:{host}', vram_peak_mib=None, max_length=None)
+
+
+_HTTP_TIMEOUT_SECONDS = 60.0
+
+
+@contextlib.contextmanager
+def _http_client() -> Iterator[Any]:
+    httpx = _require_module('httpx')
+    client = httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@dataclass(frozen=True)
+class HostedRerankAPI:
+    """One vendor's rerank endpoint as data; :class:`HostedRerankScorer` serves every vendor."""
+
+    name: str
+    model: str
+    url: str
+    env_vars: tuple[str, ...]
+    top_n_field: str
+    results_key: str
+    cost: Callable[[Mapping[str, Any]], float | None]
+
+
+def scores_by_index(results: Sequence[Mapping[str, Any]], count: int) -> tuple[float, ...]:
+    """Map a vendor's ranked ``{index, relevance_score}`` list back to candidate order.
+
+    Strict: every position in range exactly once with a numeric score, or
+    ValueError. A misaligned ranking must never be published as a measurement.
+    """
+    scores: dict[int, float] = {}
+    for item in results:
+        index, score = item.get('index'), item.get('relevance_score')
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < count:
+            raise ValueError(f'result index {index!r} is not a candidate position below {count}')
+        if index in scores:
+            raise ValueError(f'result index {index} returned twice')
+        if not _is_number(score):
+            raise ValueError(f'result {index} has a non-numeric relevance_score {score!r}')
+        scores[index] = float(score)
+    if len(scores) != count:
+        raise ValueError(f'{count - len(scores)} of {count} candidates were never scored')
+    return tuple(scores[index] for index in range(count))
+
+
+class HostedRerankScorer:
+    def __init__(self, api: HostedRerankAPI, client: Any, key: str) -> None:
+        self._api = api
+        self._client = client
+        self._key = key
+
+    def score(self, entry: str, candidate_texts: Sequence[str]) -> SlateScores:
+        api = self._api
+        response = self._client.post(
+            api.url,
+            headers={'Authorization': f'Bearer {self._key}'},
+            json={
+                'model': api.model,
+                'query': entry,
+                'documents': list(candidate_texts),
+                api.top_n_field: len(candidate_texts),
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        return SlateScores(
+            scores=scores_by_index(body[api.results_key], len(candidate_texts)),
+            cost_usd=api.cost(body),
+            pairs_over_max_length=None,
+        )
+
+    def facts(self) -> ScorerFacts:
+        return _remote_facts(self._api.url)
+
+
+def open_hosted(
+    api: HostedRerankAPI,
+) -> Callable[[ArmContext], AbstractContextManager[HostedRerankScorer]]:
+    @contextlib.contextmanager
+    def open_(context: ArmContext) -> Iterator[HostedRerankScorer]:
+        key = _require_env(*api.env_vars)
+        with _http_client() as client:
+            yield HostedRerankScorer(api, client, key)
+
+    return open_
+
+
+def _unpriced(body: Mapping[str, Any]) -> None:
+    """No list price could be confirmed from the vendor's own page; a guess would be fabricated."""
+    return None
+
+
+#: USD per 1M billed tokens for rerank-2.5 (docs.voyageai.com/docs/pricing, read 2026-09-26).
+VOYAGE_RERANK_USD_PER_MTOK = 0.05
+
+
+def _voyage_cost(body: Mapping[str, Any]) -> float | None:
+    tokens = (body.get('usage') or {}).get('total_tokens')
+    return tokens * VOYAGE_RERANK_USD_PER_MTOK / 1e6 if _is_number(tokens) else None
+
+
+#: Each vendor's flagship text reranker per its own docs on 2026-09-26. Jina publishes
+#: token packages, not a per-token price; Cohere's page lists two rerank prices
+#: without naming their models. Both are therefore unpriced.
+HOSTED_APIS = (
+    HostedRerankAPI(
+        name='jina-reranker', model='jina-reranker-v3.5', url='https://api.jina.ai/v1/rerank',
+        env_vars=('JINA_API_KEY',), top_n_field='top_n', results_key='results', cost=_unpriced,
+    ),
+    HostedRerankAPI(
+        name='voyage-rerank', model='rerank-2.5', url='https://api.voyageai.com/v1/rerank',
+        env_vars=('VOYAGE_API_KEY',), top_n_field='top_k', results_key='data', cost=_voyage_cost,
+    ),
+    HostedRerankAPI(
+        name='cohere-rerank', model='rerank-v4.0-pro', url='https://api.cohere.com/v2/rerank',
+        env_vars=('COHERE_API_KEY', 'CO_API_KEY'), top_n_field='top_n', results_key='results',
+        cost=_unpriced,
+    ),
+)
+
+
+JEV_URL = 'https://api.typesafe.ai/v1/systemone'
+JEV_MODEL = 'jev-1.13.0'
+JEV_MAX_OPTIONS = 255
+#: USD per 1M input tokens; output tokens are free (docs.typesafe.ai/models, read 2026-09-26).
+JEV_USD_PER_MTOK_INPUT = 0.042
+
+_JEV_QUESTION = 'same_claim'
+_JEV_INSTRUCTIONS = (
+    'The state is a new ENTRY and each option is a stored CANDIDATE. Pick the candidate '
+    'that states the same claim as the entry: a restatement or a rediscovery of it, not '
+    'merely something on the same topic.'
+)
+
+
+def scores_by_option(probabilities: Mapping[str, Any], names: Sequence[str]) -> tuple[float, ...]:
+    """A choice answer's name -> probability mapping in option order, as strict as the index map."""
+    if set(probabilities) != set(names):
+        raise ValueError(
+            f'the distribution names {sorted(probabilities)!r}, the question asked {list(names)!r}',
+        )
+    for name in names:
+        if not _is_number(probabilities[name]):
+            raise ValueError(f'option {name} has a non-numeric probability {probabilities[name]!r}')
+    return tuple(float(probabilities[name]) for name in names)
+
+
+def _jev_cost(body: Mapping[str, Any]) -> float | None:
+    tokens = (body.get('usage') or {}).get('input_tokens')
+    return tokens * JEV_USD_PER_MTOK_INPUT / 1e6 if _is_number(tokens) else None
+
+
+class JevChoiceScorer:
+    """TypeSafe Jev: one ``choice`` question whose options are the slate, per docs.typesafe.ai/api.
+
+    Its per-option probabilities are the scores; a choice cannot score a pair
+    outside the slate.
+    """
+
+    def __init__(self, client: Any, key: str, *, model: str = JEV_MODEL) -> None:
+        self._client = client
+        self._key = key
+        self._model = model
+
+    def score(self, entry: str, candidate_texts: Sequence[str]) -> SlateScores:
+        if len(candidate_texts) > JEV_MAX_OPTIONS:
+            raise ValueError(
+                f'{len(candidate_texts)} candidates exceed a choice\'s {JEV_MAX_OPTIONS} options',
+            )
+        names = [f'candidate_{position}' for position in range(len(candidate_texts))]
+        response = self._client.post(
+            JEV_URL,
+            headers={'Authorization': f'Bearer {self._key}'},
+            json={
+                'state': entry,
+                'model': self._model,
+                'questions': {_JEV_QUESTION: {
+                    'type': 'choice',
+                    'instructions': _JEV_INSTRUCTIONS,
+                    'criteria': dict(zip(names, candidate_texts, strict=True)),
+                }},
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        return SlateScores(
+            scores=scores_by_option(body['answers'][_JEV_QUESTION]['probabilities'], names),
+            cost_usd=_jev_cost(body),
+            pairs_over_max_length=None,
+        )
+
+    def facts(self) -> ScorerFacts:
+        return _remote_facts(JEV_URL)
+
+
+@contextlib.contextmanager
+def open_jev(context: ArmContext) -> Iterator[JevChoiceScorer]:
+    key = _require_env('TYPESAFE_API_KEY')
+    with _http_client() as client:
+        yield JevChoiceScorer(client, key)
