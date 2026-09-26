@@ -161,7 +161,7 @@ def env(tmp_path, make_tasks_db) -> Env:
             'ruling': _held('Leo 2026-09-14: esc-500-1 option A', 'commit_message'),
             'pins_recovery': [],
         }),
-        _prep_payload(e, 'esc-700-1', options=[], on_apply='', standing={
+        _prep_payload(e, 'esc-700-1', options=[], on_apply='', recommendation={'no_lean': 'held by Leo'}, standing={
             'kind': 'hold', 'owner': 'Leo',
             'release': {'manual': 'Leo lifts the hold'}, 'evidence': 'Leo HOLD 2026-09-24 in the sitting',
         }),
@@ -191,6 +191,12 @@ def _rows(data: dict, bucket: str) -> dict[str, dict]:
 
 def _numbers(data: dict) -> dict[str, int]:
     return {_record_id(row): row['number'] for bucket in (*BUCKETS, 'done') for row in data[bucket]}
+
+
+def _saved_ledger(path: Path) -> ledger_mod.Ledger:
+    saved = ledger_mod.load(path)
+    assert saved is not None, f'no ledger at {path}'
+    return saved
 
 
 def _resolve_in_fixture(env: Env, esc_id: str) -> None:
@@ -229,7 +235,7 @@ class TestBuckets:
     def test_a_ledger_standing_entry_routes_to_standing(self, env, capsys):
         assert _run(capsys, 'brief', *env.args(), '--ledger', str(env.ledger))[0] == 0
         held = ledger_mod.set_standing(
-            ledger_mod.load(env.ledger), env.key('esc-100-1'),
+            _saved_ledger(env.ledger), env.key('esc-100-1'),
             Standing('hold', 'Leo', Manual('Leo lifts it'), 'Leo HOLD 2026-09-26 in the terminal'),
         )
         ledger_mod.save(env.ledger, held)
@@ -374,13 +380,13 @@ class TestLedgerNumbering:
 class TestNewSitting:
     def test_creates_an_empty_sitting_and_resets_an_existing_one(self, env, capsys):
         assert _run(capsys, 'new-sitting', '--ledger', str(env.ledger), '--now', NOW)[0] == 0
-        assert ledger_mod.load(env.ledger).entries == {}
+        assert _saved_ledger(env.ledger).entries == {}
 
         _classify(capsys, env, '--ledger', str(env.ledger))
-        assert ledger_mod.load(env.ledger).entries
+        assert _saved_ledger(env.ledger).entries
 
         assert _run(capsys, 'new-sitting', '--ledger', str(env.ledger), '--now', LATER)[0] == 0
-        reset = ledger_mod.load(env.ledger)
+        reset = _saved_ledger(env.ledger)
         assert reset.entries == {}
         assert reset.started_at == LATER
 
@@ -434,7 +440,7 @@ class TestResolveAnswers:
         return _run(capsys, 'resolve-answers', *env.args(), '--ledger', str(env.ledger), *tokens)
 
     def _rounds(self, env, esc_id: str) -> int:
-        return ledger_mod.load(env.ledger).entries[env.key(esc_id)].answer_rounds
+        return _saved_ledger(env.ledger).entries[env.key(esc_id)].answer_rounds
 
     def test_all_resolved_prints_the_echo_table_and_exits_0(self, env, capsys):
         self._brief(env, capsys)

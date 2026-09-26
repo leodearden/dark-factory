@@ -230,21 +230,33 @@ def build_glossary(items: Iterable[OpenItem], escalation_index: Mapping[str, Map
     task_wanted: dict[str, set[str]] = defaultdict(set)
     for item in items:
         esc_ids, task_ids = item_citations(item)
-        if item.queue_dir in escalation_index:
-            esc_wanted[item.queue_dir] |= esc_ids
-        if item.project and task_ids:
-            task_wanted[item.project] |= task_ids
+        esc_wanted[item.queue_dir] |= esc_ids
+        task_wanted[item.project] |= task_ids
+    return gloss(esc_wanted, task_wanted, escalation_index)
 
+
+def gloss(
+    esc_wanted: Mapping[str, Iterable[str]],
+    task_wanted: Mapping[str, Iterable[str]],
+    escalation_index: Mapping[str, Mapping[str, Path]],
+) -> Glossary:
+    """Gloss escalation ids per queue dir and task ids per project; a scope the index cannot place is skipped."""
+    esc_scoped = {queue: set(ids) for queue, ids in esc_wanted.items() if queue in escalation_index}
+    task_scoped = {project: set(ids) for project, ids in task_wanted.items() if project}
     shortfalls: list[Shortfall] = []
     escalations: dict[str, Mapping[str, str]] = {}
-    for queue_dir, esc_ids in esc_wanted.items():
+    for queue_dir, esc_ids in esc_scoped.items():
+        if not esc_ids:
+            continue
         summaries, queue_shortfalls = _summaries(escalation_index[queue_dir], esc_ids)
         escalations[queue_dir] = MappingProxyType(summaries)
         shortfalls += queue_shortfalls
 
     roots = {queue_project(q): root for q in escalation_index if (root := queue_project_root(q)) is not None}
     tasks: dict[str, Mapping[str, str]] = {}
-    for project, task_ids in task_wanted.items():
+    for project, task_ids in task_scoped.items():
+        if not task_ids:
+            continue
         root = roots.get(project)
         if root is None:
             shortfalls.append(Shortfall('tasks_db', '', f'no queue in the index names a root for {project!r}'))
@@ -279,7 +291,8 @@ def _oldest_first(item: OpenItem) -> tuple[bool, float, str]:
     return (item.age_days is None, -(item.age_days or 0.0), key_str(item.key))
 
 
-def _read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
+def read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
+    """One record read unlocked; a vanished file is None with no shortfall, an unreadable one is a shortfall."""
     esc, outcome = read_escalation_for_scan(path, context=_SCAN_CONTEXT, parse_errors=_SCAN_PARSE_ERRORS)
     if esc is None and outcome != 'vanished':
         return None, Shortfall('escalation_queue', str(path), outcome)
@@ -295,7 +308,7 @@ def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], list[Escalation], list
         index[path.stem] = path
         if path.parent != root:
             continue
-        esc, problem = _read_escalation(path)
+        esc, problem = read_escalation(path)
         if problem is not None:
             shortfalls.append(problem)
         if esc is not None and esc.status == 'pending' and esc.level == 2:
@@ -358,7 +371,7 @@ def _summaries(queue_index: Mapping[str, Path], esc_ids: Iterable[str]) -> tuple
         path = queue_index.get(esc_id)
         if path is None:
             continue
-        esc, problem = _read_escalation(path)
+        esc, problem = read_escalation(path)
         if problem is not None:
             shortfalls.append(problem)
         if esc is not None:
