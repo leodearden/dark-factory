@@ -32,6 +32,8 @@ DOCKET_MIN_HEAVY_ITEMS = 3
 DOCKET_HEAVY_OPTIONS = 3
 """The docket-page threshold Leo ratified in the task's second 2026-09-25 amendment."""
 
+MAX_BRIEF_LEVEL = 4
+
 STANDING_LABELS = {'pin': 'PIN', 'hold': 'HOLD', 'leo_owned': 'Leo-owned', 'owned': 'owned elsewhere'}
 
 _FREE_ESC_RE = re.compile(r'(?<![\w-])' + ESC_ID_RE.pattern)
@@ -107,6 +109,11 @@ class CloseRecord:
             raise ValueError(f'a close needs all six gates held; missed {list(self.verdict.missed_gates)}')
 
 
+def is_audit_sample(position: int) -> bool:
+    """Whether the *position*-th (1-based) autonomous close is one Leo audits."""
+    return position % AUDIT_SAMPLE_EVERY == 0
+
+
 def cite(ref: Citation, glossary: Glossary) -> str:
     label = ref.id if ref.kind == 'esc' else f'task {ref.id}'
     return f'{label} ({_gloss(ref, glossary)})'
@@ -119,15 +126,20 @@ def render_brief(
     *,
     glossary: Glossary,
     generated_at: str,
+    level: int = 1,
+    title: str = 'Sitting brief',
 ) -> str:
-    decisions = [_entry_lines(entry, glossary) for entry in sorted(numbered, key=_number)]
+    """*title* is a heading at *level*; the three sections sit one level below it and each entry two below."""
+    if not 1 <= level <= MAX_BRIEF_LEVEL:
+        raise ValueError(f'level must be 1..{MAX_BRIEF_LEVEL} so entries stay within h6, got {level}')
+    decisions = [_entry_lines(entry, glossary, level + 2) for entry in sorted(numbered, key=_number)]
     footer = [_standing_lines(entry, glossary) for entry in sorted(standing, key=_number)]
     finished = [[_done_line(entry, glossary)] for entry in sorted(done, key=_number)]
     return _document([
-        '# Sitting brief', '', f'generated {generated_at}', '',
-        *_section('Decisions needed', decisions, 'No decisions needed.'),
-        *_section('Standing / no action', footer, 'Nothing standing.'),
-        *_section('Done', finished, 'Nothing done yet.'),
+        f'{"#" * level} {title}', '', f'generated {generated_at}', '',
+        *_section('Decisions needed', decisions, 'No decisions needed.', level + 1),
+        *_section('Standing / no action', footer, 'Nothing standing.', level + 1),
+        *_section('Done', finished, 'Nothing done yet.', level + 1),
     ])
 
 
@@ -207,7 +219,7 @@ class _Glosser:
         """*text* verbatim in a fence, preceded by a gloss line for any escalation id not yet mentioned."""
         unseen = [esc_id for esc_id in dict.fromkeys(_FREE_ESC_RE.findall(text)) if esc_id not in self._seen]
         glosses = [f'ids below: {", ".join(self.cite(Citation("esc", e, self._queue_dir)) for e in unseen)}']
-        return '\n'.join([*(glosses if unseen else []), _fence_safe(text, info)])
+        return '\n'.join([*(glosses if unseen else []), fence_safe(text, info)])
 
     def _first_mention(self, match: re.Match[str]) -> str:
         esc_id = match.group(0)
@@ -229,10 +241,10 @@ def _gloss(ref: Citation, glossary: Glossary) -> str:
     return ' '.join(scoped[ref.id].split()) or 'no gloss: its summary is empty'
 
 
-def _entry_lines(entry: BriefEntry, glossary: Glossary) -> list[str]:
+def _entry_lines(entry: BriefEntry, glossary: Glossary, level: int) -> list[str]:
     item, prep = entry.item, entry.preparation
     g = _Glosser(item.queue_dir, glossary)
-    lines = [f'### {entry.number}. {g.label(item.key)}', '']
+    lines = [f'{"#" * level} {entry.number}. {g.label(item.key)}', '']
     if prep is None:
         lines += ['_awaiting preparation_', '', g.text(item.text), '', *_option_lines(entry, g)]
     else:
@@ -354,7 +366,7 @@ def _done_line(entry: DoneEntry, glossary: Glossary) -> str:
 
 def _close_lines(n: int, close: CloseRecord, glossary: Glossary) -> list[str]:
     g = _Glosser(close.item.queue_dir, glossary)
-    sample = f' — AUDIT SAMPLE (1 in {AUDIT_SAMPLE_EVERY})' if n % AUDIT_SAMPLE_EVERY == 0 else ''
+    sample = f' — AUDIT SAMPLE (1 in {AUDIT_SAMPLE_EVERY})' if is_audit_sample(n) else ''
     lines = [f'### Close {n}: {g.label(close.item.key)}{sample}']
     for gate in close.verdict.gates:
         note = f' — {g.text(gate.note)}' if gate.note else ''
@@ -374,9 +386,9 @@ def _number(entry: BriefEntry | StandingEntry | DoneEntry) -> int:
     return entry.number
 
 
-def _section(title: str, blocks: list[list[str]], empty: str) -> list[str]:
+def _section(title: str, blocks: list[list[str]], empty: str, level: int = 2) -> list[str]:
     body = [line for block in blocks for line in (*block, '')] or [empty, '']
-    return [f'## {title}', '', *body]
+    return [f'{"#" * level} {title}', '', *body]
 
 
 def _document(lines: list[str]) -> str:
@@ -392,7 +404,7 @@ def _indent(text: str, prefix: str) -> str:
     return f'\n{prefix}'.join(text.splitlines())
 
 
-def _fence_safe(text: str, info: str = '') -> str:
+def fence_safe(text: str, info: str = '') -> str:
     """*text* in a code fence longer than any backtick run inside it, so no content can close it early."""
     longest = max((len(run) for run in re.findall(r'`+', text)), default=0)
     fence = '`' * max(3, longest + 1)

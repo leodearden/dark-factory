@@ -571,13 +571,18 @@ def _now(args: argparse.Namespace) -> datetime:
     return args.now or datetime.now(UTC)
 
 
+def handover_file(explicit: Path | None) -> Path | None:
+    """*explicit*, else this checkout's newest handover; None unless it is a file."""
+    handover = explicit if explicit is not None else ownership.resolve_handover_path(_REPO_ROOT)
+    return handover if handover is not None and handover.is_file() else None
+
+
 def _sources(args: argparse.Namespace) -> Sources:
-    handover = args.handover if args.handover is not None else ownership.resolve_handover_path(_REPO_ROOT)
     return read_sources(
         project_roots=args.project_roots,
         decisions_root=fleet_root(args.decisions_root),
         sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
-        handover_path=handover if handover is not None and handover.is_file() else None,
+        handover_path=handover_file(args.handover),
         preparation_path=args.preparation,
         project=args.project,
         now=_now(args),
@@ -671,7 +676,7 @@ def _with_answer_rounds(base: ledgers.Ledger, answered: ledgers.Ledger) -> ledge
     })
 
 
-def _instant(text: str) -> datetime:
+def parse_instant(text: str) -> datetime:
     parsed = inventory.parse_stamp(text)
     if parsed is None:
         raise argparse.ArgumentTypeError(f'{text!r} is not an ISO-8601 timestamp')
@@ -682,7 +687,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='prepare_sitting.py', description='Prepare a sitting brief Leo answers by number.')
     commands = parser.add_subparsers(dest='command', required=True)
     clock = argparse.ArgumentParser(add_help=False)
-    clock.add_argument('--now', type=_instant, help='ISO-8601 instant to run at (default: now)')
+    clock.add_argument('--now', type=parse_instant, help='ISO-8601 instant to run at (default: now)')
     stores = argparse.ArgumentParser(add_help=False, parents=[clock])
     stores.add_argument('--project-root', action='append', dest='project_roots',
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
