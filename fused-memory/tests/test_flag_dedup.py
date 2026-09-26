@@ -14143,7 +14143,11 @@ def _suppressing(*entity_uuids: str) -> flag_dedup.EntityStandingSuppressionResu
 
 async def _stored_streaks(ledger: ReconLedgerStore) -> dict[str, int]:
     rows = await ledger.list_suppression_streaks(_STREAK_PID)
-    return {row.entity_uuid: json.loads(row.payload_json)[STREAK_PAYLOAD_KEY] for row in rows}
+    streaks: dict[str, int] = {}
+    for row in rows:
+        assert row.entity_uuid is not None, 'a suppression-streak row always carries its entity_uuid'
+        streaks[row.entity_uuid] = json.loads(row.payload_json)[STREAK_PAYLOAD_KEY]
+    return streaks
 
 
 async def _run_cycle(
