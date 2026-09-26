@@ -187,8 +187,9 @@ reparented away from any Claude session so it survives the harness background-ta
 outlives the session that launched it — so a fresh watcher session routinely finds it already
 running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
 `fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
-nothing. Two read-only inotify watchers on one queue are harmless redundancy — fires are journaled
-twice, and there is still exactly one closer.
+nothing. Two read-only inotify watchers on one queue are harmless redundancy — each fire is
+observed twice (once by your watcher, once journaled by the loop), and there is still exactly one
+closer.
 
 It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
 lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
