@@ -18,11 +18,10 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import subprocess
-import time
+import threading
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -2354,30 +2353,27 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         file reads per recon status write ONTO the event loop, which is the
         very defect this task exists to fix.
 
-        Both reads are monkeypatched to sleep synchronously for 150 ms; the
-        ticker must keep advancing across them.
+        A blocking read can keep the loop free only by running elsewhere, so
+        the property is asserted directly: each read records the thread it ran
+        on, and neither may be the loop's thread (task 5920, replacing a
+        wall-clock tick floor).
         """
-        ticks = 0
+        loop_thread = threading.get_ident()
+        read_threads: dict[str, int] = {}
 
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
-
-        def _slow_read_scheduler_state(*args, **kwargs):
-            time.sleep(0.15)
-            return None
-
-        def _slow_orchestrator_started_at(*args, **kwargs):
-            time.sleep(0.15)
-            return None
+        def _recording_read(name):
+            def _read(*args, **kwargs):
+                read_threads[name] = threading.get_ident()
+                return None
+            return _read
 
         monkeypatch.setattr(
-            recon_write_policy, 'read_scheduler_state', _slow_read_scheduler_state,
+            recon_write_policy, 'read_scheduler_state', _recording_read('read_scheduler_state'),
         )
         monkeypatch.setattr(
-            recon_write_policy, 'orchestrator_started_at', _slow_orchestrator_started_at,
+            recon_write_policy,
+            'orchestrator_started_at',
+            _recording_read('orchestrator_started_at'),
         )
         monkeypatch.setattr(
             recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
@@ -2390,15 +2386,13 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
             'heartbeat_at': _heartbeat(_STALE_HEARTBEAT),
         })
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await interceptor.set_task_status(
-                '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
-            )
-        finally:
-            ticker.cancel()
+        await interceptor.set_task_status(
+            '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
+        )
 
-        assert ticks >= 5
+        assert set(read_threads) == {'read_scheduler_state', 'orchestrator_started_at'}
+        on_loop = sorted(name for name, ident in read_threads.items() if ident == loop_thread)
+        assert not on_loop, f'blocking reads ran on the event loop thread: {on_loop}'
 
     @pytest.mark.asyncio
     async def test_set_task_status_always_passes_snapshot_token_none(
