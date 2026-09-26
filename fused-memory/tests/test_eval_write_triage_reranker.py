@@ -9,6 +9,7 @@ import functools
 import types
 from pathlib import Path
 
+import pytest
 from _fm_helpers import load_script_module
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -137,6 +138,61 @@ class TestRankingMetrics:
         metrics = _mod().ranking_metrics([], [], aliases={'a': 'b'})
         assert (metrics.rank1.hits, metrics.rank1.total, metrics.rank1.rate) == (0, 0, None)
         assert metrics.rank5.rate is None
+
+
+class TestAucTrueVsHardNegative:
+    @pytest.mark.parametrize(('positives', 'negatives', 'expected'), [
+        ([0.9, 0.8], [0.1], 1.0),
+        ([0.1], [0.9], 0.0),
+        ([0.5], [0.5], 0.5),
+        ([0.9, 0.2], [0.5], 0.5),
+    ])
+    def test_it_is_the_probability_a_positive_outscores_a_negative(
+        self, positives: list, negatives: list, expected: float,
+    ) -> None:
+        assert _mod().auc_true_vs_hard_negative(positives, negatives) == expected
+
+    @pytest.mark.parametrize(('positives', 'negatives'), [([], [0.5]), ([0.5], []), ([], [])])
+    def test_an_empty_class_is_unmeasured_not_zero(self, positives: list, negatives: list) -> None:
+        assert _mod().auc_true_vs_hard_negative(positives, negatives) is None
+
+
+class TestRankingMetricsAuc:
+    def test_pair_scores_split_by_label_and_an_unreached_canonical_is_unscored(self) -> None:
+        reached = _case(_record('d1', 'c1'), [_row('x', 0.9), _row('c1', 0.8)])
+        negative = _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.9), _row('y', 0.8)])
+        unreached = _case(_record('d2', 'c3'), [_row('z', 0.9)])
+        auc = _mod().ranking_metrics(
+            [reached, negative, unreached], [[0.1, 0.9], [0.2, 0.8], [0.7]], aliases=None,
+        ).auc
+        assert (auc.value, auc.n_true, auc.n_hard_negative, auc.unscored) == (1.0, 1, 1, 1)
+
+    def test_the_pair_score_is_the_first_reaching_candidate_in_the_arms_order(self) -> None:
+        child_first = _case(
+            _record('d1', 'c1'), [_row('c1', 0.9), _child('s', 0.8, 'c1')],
+        )
+        negative = _case(
+            _record('n1', 'c2', label='pseudo_contradiction'), [_row('c2', 0.9)],
+        )
+        auc = _mod().ranking_metrics(
+            [child_first, negative], [[0.2, 0.9], [0.5]], aliases=None,
+        ).auc
+        assert auc.value == 1.0
+
+    def test_an_alias_reaches_the_canonical_for_the_pair_score(self) -> None:
+        aliased = _case(
+            _record('d1', 'old'), [_row('new', 0.9)], canonical_present=False,
+        )
+        negative = _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.9)])
+        auc = _mod().ranking_metrics(
+            [aliased, negative], [[0.9], [0.1]], aliases={'old': 'new'},
+        ).auc
+        assert (auc.value, auc.n_true, auc.unscored) == (1.0, 1, 0)
+
+    def test_no_hard_negative_leaves_the_auc_unmeasured(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('c1', 0.9)])
+        auc = _mod().ranking_metrics([case], [[0.9]], aliases=None).auc
+        assert (auc.value, auc.n_true, auc.n_hard_negative) == (None, 1, 0)
 
 
 class TestBaselineScores:
