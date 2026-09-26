@@ -190,7 +190,9 @@ test("the Orchestrators tab's progress bar widths stay finite", () => {
 
 // ── Wiring: no consumer may dereference o.summary directly ────────────────
 
-const CONSUMERS = ['app.jsx', 'tabs.jsx', 'tab_overview.jsx'];
+// app.jsx left in task 5589 (gamma2): its topbar and rail read the census
+// through task_snapshot.js (test_app_chrome_census.py pins that wiring).
+const CONSUMERS = ['tabs.jsx', 'tab_overview.jsx'];
 
 test('no consumer still reads o.summary directly', () => {
   for (const name of CONSUMERS) {

@@ -152,8 +152,8 @@ function StatStrip({ live, lastUpdate, summary }) {
         <span className="val">{summary.orchTotal}</span>
       </span>
       <span className="stat-pill">
-        <span className="lbl">tasks active</span>
-        <span className="val">{summary.tasksActive}</span>
+        <span className="lbl">tasks</span>
+        <span className="val">{summary.tasks}</span>
       </span>
       <span className="stat-pill">
         <span className="lbl">queue</span>
@@ -491,6 +491,15 @@ function Pip({ datum, label, color, format, badge }) {
   );
 }
 
+// ── The reading for surfaces that are neither a tile nor a pip ──
+// The topbar pill, the rail badge, OrchTab's filter buttons, Progress header
+// and legend, the Overview pipeline: one datum and one `format`, the same
+// decision and the same age suffix as Pip, without the dot.
+function DatumReading({ datum, format }) {
+  const view = datumView(datum, { now: Date.now(), format });
+  return <span title={view.title || undefined}>{view.text}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</span>;
+}
+
 // ── Segmented control ──
 function Segmented({ options, value, onChange }) {
   return (
@@ -506,4 +515,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, DatumReading, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
