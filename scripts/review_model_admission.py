@@ -21,10 +21,20 @@ import sqlite3
 from collections import Counter
 from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TypeVar
 
-from audit_model_admission import MERGER_ROLE, InvocationRecord, load_events
+from audit_model_admission import (
+    MERGER_ROLE,
+    InvocationRecord,
+    RoutingRejection,
+    RoutingScan,
+    ScopedCapScan,
+    SpendInWindow,
+    iso,
+    load_events,
+    spend_in_window,
+)
 
 # The CLI's result subtypes for a run killed at its dispatch caps. The _usd
 # spelling is orchestrator/src/orchestrator/routing.py::PROBE_BUDGET_EXHAUSTED_SUBTYPE.
@@ -42,6 +52,11 @@ DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
 DROPPED_PLAN_TARGETS_OUTCOME = 'dropped_plan_targets'
 MERGE_ATTEMPT_EVENT = 'merge_attempt'
 MERGE_FINALIZED_EVENT = 'merge_finalized'
+
+# One of audit_model_admission.MODEL_REJECTION_REASONS: the per-model daily
+# ceiling was spent, so the resolver fell through to another model.
+CEILING_EXHAUSTED_REASON = 'model-ceiling-exhausted'
+DAY = timedelta(days=1)
 UNKNOWN_KEY = '-'
 
 _Number = TypeVar('_Number', int, float)
@@ -187,4 +202,117 @@ def conflict_reopens(
         for r in resolved
         for at in conflicts.get(r.task_id, ())
         if at > r.completed_at
+    )
+
+
+def daily_spend(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    days: int,
+    ceiling_usd: float | None,
+) -> tuple[SpendInWindow, ...]:
+    """*model*'s spend in each of *days* consecutive 24 h slices from *since*.
+
+    Each slice is half-open, so adjacent days never double-count; see
+    audit_model_admission.spend_in_window's docstring for why.
+    """
+    return tuple(
+        spend_in_window(
+            conn, model=model, window_start=since + k * DAY,
+            window_end=since + (k + 1) * DAY, ceiling_usd=ceiling_usd,
+        )
+        for k in range(days)
+    )
+
+
+@dataclass(frozen=True)
+class PeakSpend:
+    """The largest trailing-24 h spend on a model, and the moment it was reached.
+
+    ``at_or_over_ceiling`` is None without a ceiling: unknown, never a
+    plausible-looking False (the SpendInWindow convention).
+    """
+
+    total_usd: float
+    at: str
+    ceiling_usd: float | None
+    at_or_over_ceiling: bool | None
+
+
+def peak_trailing_24h(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    until: datetime,
+    ceiling_usd: float | None,
+) -> PeakSpend | None:
+    """The maximum, over every *model* run completed in ``[since, until)`` at t,
+    of the spend completed in the CLOSED window ``[t - 24h, t]``.
+
+    Closed, unlike the daily slices, because it asks "could the resolver have
+    tripped?", and shared/src/shared/cost_store.py::CostStore.model_cost_in_window
+    sums with an inclusive BETWEEN. None when nothing ran.
+    """
+    runs = [
+        (datetime.fromisoformat(completed_at), cost)
+        for completed_at, cost in conn.execute(
+            'SELECT completed_at, cost_usd FROM invocations WHERE model = ? '
+            'AND completed_at >= ? AND completed_at < ? ORDER BY completed_at, id',
+            (model, iso(since), iso(until)),
+        )
+    ]
+    best: tuple[float, datetime] | None = None
+    window_total, left = 0.0, 0
+    for at, cost in runs:
+        window_total += cost
+        while runs[left][0] < at - DAY:
+            window_total -= runs[left][1]
+            left += 1
+        if best is None or window_total > best[0]:
+            best = (window_total, at)
+    if best is None:
+        return None
+    total, at = best
+    return PeakSpend(
+        total_usd=total,
+        at=iso(at),
+        ceiling_usd=ceiling_usd,
+        at_or_over_ceiling=None if ceiling_usd is None else total >= ceiling_usd,
+    )
+
+
+def model_rejections(scan: RoutingScan) -> tuple[RoutingRejection, ...]:
+    """Every model rejection the resolver recorded, on any role."""
+    return scan.rejections
+
+
+def ceiling_trips(scan: RoutingScan) -> tuple[RoutingRejection, ...]:
+    """The rejections that were a spent per-model ceiling, narrowed to that
+    reason; ``resolved_model`` is the model the resolver fell through to."""
+    trips = []
+    for rejection in scan.rejections:
+        reasons = tuple(
+            reason for reason in rejection.reasons
+            if reason.rpartition(':')[2] == CEILING_EXHAUSTED_REASON
+        )
+        if reasons:
+            trips.append(RoutingRejection(
+                timestamp=rejection.timestamp, task_id=rejection.task_id,
+                role=rejection.role, resolved_model=rejection.resolved_model,
+                reasons=reasons,
+            ))
+    return tuple(trips)
+
+
+def scoped_hits_by_account(scan: ScopedCapScan) -> tuple[tuple[str, int, str], ...]:
+    """(account, scoped cap hits, first hit's created_at), sorted by account."""
+    by_account: dict[str, list[str]] = {}
+    for hit in scan.scoped_hits:
+        by_account.setdefault(hit.account_name, []).append(hit.created_at)
+    return tuple(
+        (account, len(stamps), min(stamps))
+        for account, stamps in sorted(by_account.items())
     )
