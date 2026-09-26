@@ -178,17 +178,11 @@ def pytest_configure(config):
 #   from the hardened `test_status_authority_gate.py` variant when task 3736
 #   deduped these copies by UNION rather than by intersection. Each attempt is
 #   bounded by the remaining readiness deadline, and the wait ends as soon as
-#   the serving thread exits, so a dead server's port is never probed on
-#   (task 5934).
+#   the serving thread exits.
 #
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
-# How long `_start` waits for a server to complete its first MCP handshake.
-# A module-level constant rather than a literal inside `_start` so the one test
-# whose wait can end only at the deadline (a healthy server the client cannot
-# reach) can `monkeypatch.setattr` it down instead of paying the full production
-# bound on every run -- `_start` reads it as a global at call time. The
-# startup-failure test needs no such patch: a dead serving thread ends the wait.
+# Read by `_start` as a global at call time, so tests may shorten it.
 _READY_TIMEOUT_S = 10.0
 
 
@@ -408,12 +402,9 @@ def _serve_escalation_mcp_impl():
             nonlocal serve_error
             asyncio.set_event_loop(loop)
             try:
-                # The Config kwargs are the ones FastMCP.run_http_async applies
-                # itself, so serving through uvicorn directly changes only
-                # WHERE the server listens: on the socket this fixture holds.
+                # MCP here is plain HTTP: no websocket implementation to load.
                 server = uvicorn.Server(uvicorn.Config(
-                    mcp.http_app(), log_level='error', lifespan='on',
-                    ws='websockets-sansio', timeout_graceful_shutdown=2,
+                    mcp.http_app(), log_level='error', ws='none',
                 ))
                 loop.run_until_complete(server.serve(sockets=[listener]))
             except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
