@@ -1517,6 +1517,16 @@ async def main_baseline_failing_ids(
     )
 
 
+def _red_module_prefixes(result: 'VerifyResult') -> frozenset[str] | None:
+    """The modules holding *result*'s red ids; None when they are not all attributed."""
+    by_module = result.failing_test_ids_by_module
+    if not isinstance(by_module, dict) or result.failing_test_ids is None:
+        return None
+    if frozenset().union(*by_module.values()) != frozenset(result.failing_test_ids):
+        return None
+    return frozenset(prefix for prefix, ids in by_module.items() if ids)
+
+
 async def _whole_tree_main_baseline(
     config: 'OrchestratorConfig',
     module_configs: 'list[ModuleConfig]',
@@ -8479,26 +8489,21 @@ async def verify_failure_is_preexisting_on_main(
         # failing_test_ids=None (today's callers, e.g. task-verify at
         # workflow.py) always takes that legacy path too.
         #
-        # Cost note (reviewer_comprehensive finding 2, task 2590): on a cold
-        # cache, main_baseline_failing_ids below pays for a FULL-SUITE
-        # merge-role probe (task_files=None) rather than the cheaper scoped
-        # role='task' probe further down this function — this applies to
-        # every caller that reaches here with a non-None failing_test_ids,
-        # sync (train/merge_gates/solo-reverify, via _classify_main_health_red)
-        # and deferred alike. This is confirmed acceptable, not an oversight:
-        # (1) it is opt-in — failing_test_ids is only ever non-None under
-        # merge_verify_breadth='full' (default remains 'scoped', so every
-        # caller that hasn't opted in pays exactly zero extra cost, byte-
-        # identical to pre-μ behaviour); (2) it is required for correctness
-        # — a full-suite branch id-set is only meaningfully diffable against
-        # an equally full-suite baseline id-set, a scoped signature
-        # comparison would not be apples-to-apples here; and (3) steady-state
-        # cost is amortized to a cache read by the pass-path seeding (B2,
-        # see seed_main_baseline) — a cold probe only happens on the first
-        # gate run against a given main tip, or after a TTL expiry / restart.
+        # Cost (task 5627): DF runs merge_verify_breadth='full', so every red
+        # merge gate takes this fork. A cold baseline probes only the modules
+        # holding the branch's red ids, each with its unchanged full-suite
+        # command. Each module is its own pytest invocation, so its failing
+        # set on main does not depend on the others running: exactly as
+        # apples-to-apples as a whole-tree probe. It is never narrowed to
+        # single test ids (task 4585 measured selection-dependent failures;
+        # that would false-halt the queue). Unattributable ids fall back to
+        # the whole-tree probe. Baselines live for the SHA's lifetime (see
+        # _BASELINE_FAILING_IDS_CACHE), so a gate-pass seed or an earlier
+        # probe at the same tip answers without probing.
         if failing_result.failing_test_ids is not None:
             baseline = await main_baseline_failing_ids(
                 config, module_configs, git_ops, main_sha,
+                red_module_prefixes=_red_module_prefixes(failing_result),
             )
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
