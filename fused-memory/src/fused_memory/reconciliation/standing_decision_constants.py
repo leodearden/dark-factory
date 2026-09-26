@@ -15,7 +15,10 @@ state/expiry_reason vocabularies, and the 90-day TTL. Consumers:
 * **γ/δ** (Hook A filter / Hook B annotation) — consume ``GROUNDS_ENUM`` and
   ``GROUNDS_TOKEN_FAMILIES`` for the fallback token-family match; γ also
   consumes ``SUPPRESSION_STORM_THRESHOLD_PER_CYCLE`` and
-  ``CATEGORY_STANDING_DECISION_STORM`` for its storm escape.
+  ``CATEGORY_STANDING_DECISION_STORM`` for its storm escape, and
+  ``RECORD_KIND_ENTITY_SUPPRESSION_STREAK``,
+  ``SUPPRESSION_STREAK_THRESHOLD_CYCLES`` and ``STREAK_PAYLOAD_KEY`` for that
+  escape's cross-cycle streak arm (task 2943).
 * **ε** (prompt/self-model renderer) — consumes the grounds enum and
   ``MEM0_KIND_INVESTIGATION_OUTCOME``.
 * **ζ** (growth/merge sweeps) — consume ``STATE_*`` and the growth/merge
@@ -97,10 +100,28 @@ GROUNDS_TOKEN_FAMILIES: dict[str, tuple[str, ...]] = {
 # ACTIVE standing decision that suppresses MORE THAN this many flags in a single
 # reconciliation cycle (strict ``>``): an active decision hiding a flood of
 # flags in one cycle is a signal the decision may be over-broad or the entity's
-# situation has changed, warranting a human look. The parenthetical PRD variant
-# ("across a streak of cycles") requires persistent per-decision cross-cycle
-# state and is deferred; γ implements the self-contained per-cycle N.
+# situation has changed, warranting a human look. The PRD's parenthetical
+# variant ("across a streak of cycles") is the second escape, below:
+# SUPPRESSION_STREAK_THRESHOLD_CYCLES.
 SUPPRESSION_STORM_THRESHOLD_PER_CYCLE = 5
+
+# --- Cross-cycle suppression streak (task 2943) -----------------------------
+# The storm escape's second arm: a decision that suppresses at least one flag
+# in K CONSECUTIVE full reconciliation cycles, each under the per-cycle N,
+# files the same storm category. A persistent low-grade drain can hide a new
+# finding as surely as a single-cycle flood.
+#
+# The comparison is inclusive (``streak >= K``) where the per-cycle N is strict
+# (``> N``): "more than N flags in one cycle" is naturally strict, while K
+# consecutive cycles IS a streak of length K. K=3 and the inclusive comparison
+# match ζ's GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open Question 4).
+#
+# The count persists per (project, entity, grounds) as its own ledger record
+# kind rather than a key on the decision row, because the decision row's
+# writer rebuilds its payload from scratch on every upsert.
+RECORD_KIND_ENTITY_SUPPRESSION_STREAK = 'entity_standing_decision_suppression_streak'
+SUPPRESSION_STREAK_THRESHOLD_CYCLES = 3
+STREAK_PAYLOAD_KEY = 'consecutive_suppressing_cycles'
 
 # Escalation category of that storm escape, single-sourced HERE rather than
 # spelled as a literal at each use site (reviewer finding architecture-coherence,
