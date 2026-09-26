@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
@@ -1415,30 +1415,53 @@ def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> boo
     return not diff_new_failures(branch_set, baseline)
 
 
-# Process-wide cache for the per-main-SHA failing-test-id BASELINE (task μ,
-# verify-scope-inversion-prd.md, B2): distinct from _PROBE_CACHE above (that
-# one caches a bool — "is THIS specific failure preexisting"; this one caches
-# the FULL SET of ids already failing on a given main tip). Seeded for free
-# on every successful merge+full gate run (merge_queue.py's
-# _run_post_merge_verify pass path — see seed_main_baseline's docstring) so
-# steady-state lookups never pay for a probe; a probe only runs on a genuine
-# cold-start miss. Same TTL discipline as _PROBE_CACHE (mirrors its
-# docstring/shape) so a long-idle orchestrator doesn't pin a stale baseline
-# forever.
-# Key: main_sha; Value: (seeded_or_probed_at, failing_test_ids frozenset).
-_BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+# Process-wide per-main-SHA failing-test-id BASELINE (task μ,
+# verify-scope-inversion-prd.md, B2). Keyed by an immutable SHA, so an entry
+# is valid for as long as that SHA can be main's tip; the cache is bounded by
+# recency of write/use instead of by wall-clock (task 5627). _PROBE_CACHE
+# above keeps its TTL on purpose: its value is a scoped role='task' verdict
+# about one failure signature, which can be load-flaky, so expiry there is a
+# re-probe chance rather than a staleness guard.
+@dataclass(frozen=True)
+class _MainShaBaseline:
+    """What is known to fail at one main SHA. Rebuilt, never mutated."""
+
+    # The whole tree's failing ids, from a gate-pass seed or a full probe.
+    every_module: frozenset[str] | None = None
+    # Module prefix -> that module's failing ids, from narrowed probes.
+    by_module: Mapping[str, frozenset[str]] = field(default_factory=dict)
+
+
+_BASELINE_CACHE_MAX_SHAS = 16
+_BASELINE_FAILING_IDS_CACHE: OrderedDict[str, _MainShaBaseline] = OrderedDict()
+
+
+def _remember_main_baseline(main_sha: str, record: _MainShaBaseline) -> None:
+    _BASELINE_FAILING_IDS_CACHE[main_sha] = record
+    _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
+    while len(_BASELINE_FAILING_IDS_CACHE) > _BASELINE_CACHE_MAX_SHAS:
+        _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+
+
+def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | None:
+    record = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if record is not None and touch:
+        _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
+    return record
 
 
 def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
     """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
 
-    Called from the PASS path of a merge+full gate run (merge_sha IS the
-    merged tree that is about to CAS-advance to become the next main tip —
-    see merge_queue.py's ``_run_post_merge_verify``), so in steady state
-    ``main_baseline_failing_ids`` below is always a cache hit and never pays
-    for a probe (B2).
+    *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
+    means every module is green there. Called from the PASS path of a
+    merge+full gate run (merge_sha IS the merged tree that is about to
+    CAS-advance to become the next main tip — see merge_queue.py's
+    ``_run_post_merge_verify``), so in steady state
+    ``main_baseline_failing_ids`` below is a cache hit for as long as that
+    SHA is main's tip and never pays for a probe (B2).
     """
-    _BASELINE_FAILING_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+    _remember_main_baseline(main_sha, _MainShaBaseline(every_module=frozenset(ids)))
 
 
 async def main_baseline_failing_ids(
@@ -1449,8 +1472,9 @@ async def main_baseline_failing_ids(
 ) -> 'frozenset[str] | None':
     """Return the set of test ids already failing on *main_sha*, cache-first.
 
-    Cache hit (seeded by a prior gate pass, or a prior probe of this same sha
-    within the TTL window): returned immediately — no probe, no worktree.
+    Cache hit (seeded by a prior gate pass, or a prior probe of this same
+    sha while it is still cached): returned immediately — no probe, no
+    worktree.
 
     Cache miss: runs exactly ONE full-suite, merge-role probe of bare main,
     reusing the same ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ...,
@@ -1468,7 +1492,7 @@ async def main_baseline_failing_ids(
     (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the probe
     itself errored) returns ``None`` (B3 degrade) and is deliberately **not**
     cached, so the next caller retries rather than being stuck with a
-    falsely-empty baseline for the whole TTL window.
+    falsely-empty baseline for the life of the SHA.
 
     Does not alter deferred-probe scheduling/transport (G4, task 2564) — the
     probe body reused here is exactly the one that function already owns.
@@ -1478,16 +1502,13 @@ async def main_baseline_failing_ids(
     if not main_sha:
         return None
 
-    _now = time.monotonic()
-    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
-    if _cached is not None:
-        _cached_at, _cached_ids = _cached
-        if _now - _cached_at < _PROBE_CACHE_TTL:
-            logger.debug(
-                'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
-                main_sha, len(_cached_ids),
-            )
-            return _cached_ids
+    _cached = _recall_main_baseline(main_sha, touch=True)
+    if _cached is not None and _cached.every_module is not None:
+        logger.debug(
+            'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
+            main_sha, len(_cached.every_module),
+        )
+        return _cached.every_module
 
     try:
         # warm_seed=True: this probe shares the rolling warm-lane CoW base
@@ -1515,7 +1536,7 @@ async def main_baseline_failing_ids(
             if probe_result.failing_test_ids is None:
                 # OPAQUE / non-pytest / probe-side failure to collect a junit
                 # report — degrade (B3). Deliberately not cached: a transient
-                # probe hiccup shouldn't pin "no baseline" for the TTL window.
+                # probe hiccup shouldn't pin "no baseline" for the SHA's life.
                 logger.debug(
                     'main_baseline_failing_ids: probe collected no junit ids '
                     '(main_sha=%.8s) — degrading to None (B3)', main_sha,
@@ -1539,21 +1560,16 @@ async def main_baseline_failing_ids(
 def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
     """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
 
-    Pure, synchronous, side-effect-free: returns the cached id set for
-    *main_sha* when present and within :data:`_PROBE_CACHE_TTL`, else
-    ``None``.  Used by the synchronous branch-block reason enrichment in
-    ``merge_queue._run_post_merge_verify`` (task μ, verify-scope-inversion-
-    prd.md), which must NEVER trigger a probe on the critical path (G4, task
-    2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
+    Pure, synchronous, side-effect-free (it never reorders the recency
+    bound): returns the cached whole-tree id set for *main_sha* when
+    present, else ``None``.  Used by the synchronous branch-block reason
+    enrichment in ``merge_queue._run_post_merge_verify`` (task μ,
+    verify-scope-inversion-prd.md), which must NEVER trigger a probe on the
+    critical path (G4, task 2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
     probes on a miss), this helper only ever reads.
     """
-    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
-    if _cached is None:
-        return None
-    _cached_at, _cached_ids = _cached
-    if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
-        return None
-    return _cached_ids
+    _cached = _recall_main_baseline(main_sha, touch=False)
+    return _cached.every_module if _cached is not None else None
 
 
 def _worst_category(categories: list[str]) -> str:
