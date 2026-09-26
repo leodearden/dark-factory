@@ -1228,6 +1228,23 @@ an already-answered record open as the survivor — close it against the recover
 where the ruling lives. The 08-19 pass did the opposite on three clusters and manufactured three
 of the five instances above.
 
+### Sitting markers: `x_prepared` and `x_agreed`
+
+The sitting preparer (`scripts/sitting/`) records its trial instruments on the escalation itself,
+as marker lines in `triage_note`, stamped only when an item Leo has answered is applied — never
+before he answers:
+
+- `x_prepared` — what the sitting recommended: an option label, or an explicit no-lean with its
+  reason.
+- `x_agreed` — Leo's answer, whether it matched that recommendation, and how many turns it took.
+
+Each is one line of sorted JSON built by `scripts/sitting/payloads.py`
+(`render_prepared_marker` / `render_agreed_marker`); a reader takes the last line of each kind.
+`stamp_triage` replaces the whole note (see "CAUTION: `stamp_triage` REPLACES `triage_note`"
+below), so send `payloads.append_markers(existing_note, ...)`, which keeps the existing note —
+including any world-facing predicate line — verbatim. These are distinct from `x_shadow_ruling:`,
+which records what the adjudicator *would* have ruled, never what Leo did.
+
 ### `review_suggestions` (info)
 
 > **This handler is unreachable at L2.** Review suggestions reach live workflows as curator tickets

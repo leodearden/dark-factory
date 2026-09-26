@@ -45,11 +45,25 @@ def _tool_parameters(tool: str) -> tuple[set[str], set[str]]:
 def _server_resolve_actions() -> set[str]:
     tree = ast.parse(ESCALATION_SERVER.read_text(encoding='utf-8'))
     for node in tree.body:
-        target = node.target if isinstance(node, ast.AnnAssign) else (
-            node.targets[0] if isinstance(node, ast.Assign) else None)
-        if isinstance(target, ast.Name) and target.id == 'RESOLVE_ACTIONS' and node.value is not None:
-            return set(ast.literal_eval(node.value))
+        if isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        else:
+            continue
+        if value is not None and any(isinstance(t, ast.Name) and t.id == 'RESOLVE_ACTIONS' for t in targets):
+            return set(ast.literal_eval(value))
     raise AssertionError('RESOLVE_ACTIONS assignment not found in escalation/server.py')
+
+
+def _args(payload: mod.ApplyPayload) -> dict:
+    assert isinstance(payload.args, dict), payload
+    return payload.args
+
+
+def _argvs(payload: mod.ApplyPayload) -> list[list[str]]:
+    assert isinstance(payload.args, list), payload
+    return payload.args
 
 
 def _all_builder_payloads() -> list[mod.ApplyPayload]:
@@ -67,9 +81,8 @@ class TestSignatureContract:
     def test_payload_keys_fit_the_public_tool_definition(self, payload):
         accepted, required = _tool_parameters(payload.tool)
 
-        assert isinstance(payload.args, dict)
-        assert set(payload.args) <= accepted
-        assert required <= set(payload.args)
+        assert set(_args(payload)) <= accepted
+        assert required <= set(_args(payload))
 
     def test_every_mcp_tool_has_a_builder(self):
         assert {p.tool for p in _all_builder_payloads()} == set(TOOL_SOURCES)
@@ -83,7 +96,7 @@ class TestResolveIssuePayload:
     def test_every_server_action_is_accepted(self, action):
         payload = mod.resolve_issue_payload('esc-1-1', 'r', action, resolved_by='leo', resolution_turns=1)
 
-        assert payload.args['action'] == action
+        assert _args(payload)['action'] == action
 
     def test_unknown_action_is_refused(self):
         with pytest.raises(ValueError):
@@ -92,8 +105,8 @@ class TestResolveIssuePayload:
     def test_resolution_turns_is_carried_as_an_int(self):
         payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=3)
 
-        assert payload.args['resolution_turns'] == 3
-        assert type(payload.args['resolution_turns']) is int
+        assert _args(payload)['resolution_turns'] == 3
+        assert type(_args(payload)['resolution_turns']) is int
 
     @pytest.mark.parametrize('turns', ['3', True, 0, -1, 2.0])
     def test_non_int_or_non_positive_turns_are_refused(self, turns):
@@ -106,7 +119,7 @@ class TestUpdateTaskPayload:
         payload = mod.update_task_payload('4803', PROJECT_ROOT, RULING, existing=None)
 
         assert payload.tool == 'update_task'
-        assert payload.args == {
+        assert _args(payload) == {
             'id': '4803',
             'project_root': PROJECT_ROOT,
             'metadata': {mod.X_RULING_KEY: {
@@ -122,7 +135,7 @@ class TestUpdateTaskPayload:
         long = mod.Ruling(esc_id='esc-4803-2', action='resume', text='x' * (mod.X_RULING_TEXT_CAP * 2),
                           resolved_by='leo', at='2026-09-26T09:00:00+00:00')
 
-        text = mod.update_task_payload('4803', PROJECT_ROOT, long, existing=None).args['metadata']['x_ruling']['text']
+        text = _args(mod.update_task_payload('4803', PROJECT_ROOT, long, existing=None))['metadata']['x_ruling']['text']
 
         assert len(text) <= mod.X_RULING_TEXT_CAP
         assert text.startswith('xxx')
@@ -142,7 +155,7 @@ class TestAddDependencyPayload:
     def test_shape(self):
         payload = mod.add_dependency_payload('5255', '4803', PROJECT_ROOT)
 
-        assert payload.args == {'id': '5255', 'depends_on': '4803', 'project_root': PROJECT_ROOT}
+        assert _args(payload) == {'id': '5255', 'depends_on': '4803', 'project_root': PROJECT_ROOT}
 
     def test_self_dependency_is_refused(self):
         with pytest.raises(ValueError):
@@ -154,11 +167,11 @@ class TestRouteFindingToOwner:
         payload = mod.route_finding_to_owner('5255', 'pending', FINDING, PROJECT_ROOT)
 
         assert payload.tool == 'update_task'
-        assert payload.args['id'] == '5255'
-        assert payload.args['append'] is True
-        assert FINDING.detail in payload.args['details']
-        assert 'esc-6798-1' in payload.args['details']
-        assert 'metadata' not in payload.args
+        assert _args(payload)['id'] == '5255'
+        assert _args(payload)['append'] is True
+        assert FINDING.detail in _args(payload)['details']
+        assert 'esc-6798-1' in _args(payload)['details']
+        assert 'metadata' not in _args(payload)
         assert not payload.put_to_leo
 
     @pytest.mark.parametrize('status', ['in-progress', 'blocked', 'done', 'deferred', 'cancelled', 'review', ''])
@@ -167,8 +180,8 @@ class TestRouteFindingToOwner:
 
         assert payload.tool == 'submit_task'
         assert payload.put_to_leo
-        assert payload.args['project_root'] == PROJECT_ROOT
-        metadata = payload.args['metadata']
+        assert _args(payload)['project_root'] == PROJECT_ROOT
+        metadata = _args(payload)['metadata']
         assert metadata['spawned_from'] == '5255'
         assert metadata['escalation_id'] == 'esc-6798-1'
         assert metadata['source'] == 'sitting-preparer'
@@ -179,7 +192,7 @@ class TestCloseDecisionArgv:
         payload = mod.close_decision_argv('df-esc-4803-2', 'answered', 'gate evidence', create=None)
 
         assert payload.tool == 'cli:session_registry'
-        (argv,) = payload.args
+        (argv,) = _argvs(payload)
         assert Path(argv[1]).name == 'session_registry.py'
         assert argv[2:] == ['close-decision', '--id', 'df-esc-4803-2', '--state', 'answered',
                             '--evidence', 'gate evidence']
@@ -190,7 +203,7 @@ class TestCloseDecisionArgv:
 
         payload = mod.close_decision_argv('esc-4803-2', 'dropped', 'Leo: drop it', create=item)
 
-        write, close = payload.args
+        write, close = _argvs(payload)
         assert write[2] == 'write-decision'
         assert write[write.index('--escalations-dir') + 1] == '/q'
         assert write[write.index('--id') + 1] == 'esc-4803-2'
