@@ -67,6 +67,7 @@ import textwrap
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -737,8 +738,8 @@ def wait_pids_exited(
     *,
     timeout: float,
     interval: float = 0.05,
-    _read_state=None,
-    _clock=None,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
 ) -> dict[int, ProcState]:
     """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
 
@@ -752,15 +753,13 @@ def wait_pids_exited(
     descheduled across the deadline never asserts on a stale observation;
     ``timeout=0`` is exactly one probe.
     """
-    read = _read_state or read_proc_state
-    clock = _clock or time.monotonic
-    deadline = clock() + timeout
+    deadline = _clock() + timeout
     while True:
         running = {
             pid: state for pid in pids
-            if (state := read(pid)) is not None and not state.exited
+            if (state := _read_state(pid)) is not None and not state.exited
         }
-        if not running or clock() >= deadline:
+        if not running or _clock() >= deadline:
             return running
         time.sleep(interval)
 
@@ -2745,9 +2744,9 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
         assert not survivors, (
             f'kill_holder_tree left session-escaped descendant(s) of leader '
             f'pid={leader.pid} running, as {{pid: (state, ppid)}}: {state_by_pid} '
-            f'-- the exact orphan task 4092 exists to fix.  State S/T with '
-            f'ppid != {leader.pid} means the descendant walk missed it; R/D '
-            f'means it was signalled but has not yet run to exit'
+            f'-- the exact orphan task 4092 exists to fix.  State S/T means '
+            f'SIGKILL never reached it; R/D means it was signalled but has '
+            f'not yet run to exit'
         )
     finally:
         if leader.poll() is None:
