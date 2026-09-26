@@ -4175,8 +4175,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The trailing ' into ' literal in the --fixed-strings --grep pattern
-        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
+        A marker's subject must EQUAL 'Merge task/1 into main', which
+        'Merge task/10 into main' does not.
         """
         # Merge task/10 and delete branch
         tid = '10'
@@ -4234,7 +4234,7 @@ class TestFindMergeMarker:
         so a git-log invocation with conflicting --max-count=1 and -n 5000 flags would
         return both SHAs newline-joined (last-wins: -n 5000 overrides --max-count=1),
         corrupting done_provenance={'commit': marker_sha} in harness reconcile.
-        After dropping -n 5000, --max-count=1 alone ensures a single SHA is returned.
+        The newest marker must win, as a single SHA.
         """
         tid = 'reopened-1'
 
@@ -4283,7 +4283,7 @@ class TestFindMergeMarker:
         assert marker_sha is not None
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
-        assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+        assert marker_sha == second_sha  # most-recent first (git log is newest-first)
 
 
 @pytest.mark.asyncio
