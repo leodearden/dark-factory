@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-import multiprocessing
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from sitting import preparation as mod
 from sitting.gates import UNKNOWN, Fact
 from sitting.inventory import decision_key, escalation_key, key_str
 
+SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 KEY = escalation_key('/src/dark-factory/data/escalations', 'esc-3881-3')
 OPTIONS = (
     mod.Option('A', 'close as ruled', 'task 3881 keeps its retargeted scope; the L2 leaves the queue'),
@@ -253,24 +255,39 @@ class TestRecord:
         assert sorted(p.name for p in tmp_path.iterdir()) == ['preparation.json', 'preparation.json.lock']
 
 
-def _record_many(path: str, worker: int, count: int) -> None:
-    for n in range(count):
-        key = decision_key(f'w{worker}-{n}')
-        mod.record(Path(path), [mod.to_json_payload(_prep(item_key=key))])
+_RECORD_EACH = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from sitting import preparation
+for payload in json.load(sys.stdin):
+    preparation.record(Path(sys.argv[1]), [payload])
+"""
 
 
 class TestConcurrentRecord:
     def test_two_processes_lose_no_entry(self, tmp_path):
+        # Real interpreters rather than fork(): an xdist worker is multi-threaded, and forking it can deadlock.
         path = tmp_path / 'preparation.json'
-        context = multiprocessing.get_context('fork')
-        workers = [context.Process(target=_record_many, args=(str(path), w, 15)) for w in (1, 2)]
+        batches = [
+            [mod.to_json_payload(_prep(item_key=decision_key(f'w{worker}-{n}'))) for n in range(15)]
+            for worker in (1, 2)
+        ]
+        workers = [
+            subprocess.Popen(
+                [sys.executable, '-c', _RECORD_EACH, str(path), str(SCRIPTS_DIR)],
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in batches
+        ]
 
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join(timeout=120)
+        for worker, batch in zip(workers, batches, strict=True):
+            assert worker.stdin is not None
+            worker.stdin.write(json.dumps(batch))
+            worker.stdin.close()
+        results = [(worker.wait(timeout=120), worker.stderr.read() if worker.stderr else '') for worker in workers]
 
-        assert [worker.exitcode for worker in workers] == [0, 0]
+        assert [code for code, _ in results] == [0, 0], results
         assert len(mod.load(path).entries) == 30
 
 
