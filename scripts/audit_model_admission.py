@@ -612,9 +612,9 @@ def scan_scoped_cap(
     """Cap hits attributable to *model*'s scope, plus the restarts, in ``[since, until)``.
 
     The writer of the shape read here is ``shared/src/shared/usage_gate.py::
-    AccountPool`` — its scoped path emits ``{"reason": ..., "scope": <model>}``
-    and deliberately bypasses the account-level site, which emits a payload with
-    no ``scope`` key at all.  So the KEY'S PRESENCE is the discriminator; a
+    UsageGate._handle_cap_detected`` — its scoped path emits ``{"reason": ...,
+    "scope": <model>}`` and deliberately bypasses the account-level site,
+    ``UsageGate._transition``, which emits a payload with no ``scope`` key at all.  So the KEY'S PRESENCE is the discriminator; a
     substring scan for the model name is not, since it would also match
     unrelated cap-message prose.
 

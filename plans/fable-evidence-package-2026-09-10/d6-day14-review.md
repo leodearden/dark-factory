@@ -730,7 +730,7 @@ D6, in either direction.
 **OBSERVATION: `usage_cap.scoped_cap_models` went live, although no
 orchestrator `service_restart` event is recorded.** The one scoped hit
 carries a `scope` key, and only the scoped path in
-`shared/src/shared/usage_gate.py::AccountPool` emits that key. So by
+`shared/src/shared/usage_gate.py::UsageGate._handle_cap_detected` emits that key. So by
 2026-09-14T14:05Z the orchestrator was running with `claude-fable-5-1` in
 `scoped_cap_models`. Yet the review's restart table lists only
 `fused-memory` and `dashboard` restarts, and the day-1 check found none for
