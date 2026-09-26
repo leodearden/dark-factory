@@ -307,8 +307,11 @@ def derive_topic_cluster(
       about that API; a recurring multi-word construction is topic evidence,
       a lone identifier is not;
     * a phrase must hold a distinctive token, which keeps generic prose out;
-    * no selected phrase nests inside another, because the matcher counts
-      substring hits and one occurrence of a longer form would score twice;
+    * no single occurrence can hold two selected phrases: neither nests in
+      the other, and neither's end overlaps the other's start on a whole word.
+      The matcher counts substring hits, so ``git merge-base`` beside
+      ``merge-base --is-ancestor`` would let the one construction
+      ``git merge-base --is-ancestor`` reach ``min_phrase_hits`` alone;
     * at most six phrases, ``min_phrase_hits`` 2 and never any
       ``sufficient_phrases``: promoting a phrase to sufficient is a human
       judgement the schema reserves for identifier-shaped names;
@@ -317,12 +320,14 @@ def derive_topic_cluster(
     Residual: a multi-word construction common across the whole project can
     still qualify. Rejecting it needs a document-frequency check against the
     project's other memories, a read this zero-I/O derivation does not make.
+    The replay that measures it is recorded in PRD
+    ``docs/prds/memory-write-path-convergence.md`` §10.
 
     Phrases are lowercase, matching the matcher's own ``str.lower`` comparison.
     Ranking is a total order, so the result does not depend on input order.
     """
     corpus = _distinct_normalised_texts(texts)
-    phrases = _select_unnested(_rank(_supported_candidates(corpus)))
+    phrases = _select_non_overlapping(_rank(_supported_candidates(corpus)))
     if len(phrases) < _MIN_DERIVED_PHRASES:
         return None
     return ProceduralTopicCluster(
@@ -413,10 +418,34 @@ def _rank(support: dict[str, int]) -> list[str]:
     )
 
 
-def _select_unnested(ranked: list[str]) -> list[str]:
+def _can_share_one_occurrence(first: str, second: str) -> bool:
+    return (
+        first in second
+        or second in first
+        or _overlaps_on_a_whole_word(first, second)
+        or _overlaps_on_a_whole_word(second, first)
+    )
+
+
+def _overlaps_on_a_whole_word(head: str, tail: str) -> bool:
+    """Whether *head*'s end is *tail*'s start, the shared text being whole words on one side.
+
+    ``git add -f .task/`` and ``.task/plan.json is gitignored`` qualify (the
+    whole word ``.task/`` begins ``tail``'s first word), so the one
+    construction ``git add -f .task/plan.json is gitignored`` holds both. A
+    shared fragment inside a word on BOTH sides (``locks`` / ``set``) does not:
+    only a fused non-word could hold both.
+    """
+    return any(
+        head[-shared:] == tail[:shared] and (head[-shared - 1] == ' ' or tail[shared] == ' ')
+        for shared in range(1, min(len(head), len(tail)))
+    )
+
+
+def _select_non_overlapping(ranked: list[str]) -> list[str]:
     selected: list[str] = []
     for phrase in ranked:
-        if any(phrase in kept or kept in phrase for kept in selected):
+        if any(_can_share_one_occurrence(phrase, kept) for kept in selected):
             continue
         selected.append(phrase)
         if len(selected) == _MAX_DERIVED_PHRASES:

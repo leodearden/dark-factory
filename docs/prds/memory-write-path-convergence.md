@@ -149,6 +149,15 @@ Deps: β←{α, δ}; γ←β; ε←γ; θ←η; ι←θ; ζ←θ; ξ←ν. All o
 
 - Judge prompt wording and few-shot picks (bounded by γ's eval — accuracy report is the arbiter).
 - ~~Phrase-derivation algorithm for ζ (deterministic n-gram vs judge-suggested-then-validated); runtime cluster store location (file vs DB) — must survive restart, merge cleanly with config seeds.~~ **Resolved (task 3135):** derivation is DETERMINISTIC multi-word key-phrase n-gram and abstains rather than emit a weak cluster (`server/topic_cluster_store.py::derive_topic_cluster`). The store is SQLite at `<reconciliation.data_dir>/topic_clusters.db`, keyed `(project_id, topic_id)`, and merged after the config seeds by `server/near_duplicate_guard.py::resolve_topic_guard_clusters`.
+  **Measured before default-on (2026-09-26, task 3135 review).** Read-only replay of `derive_topic_cluster` over every consolidated topic in dark_factory's Mem0 collection: 81 canonicals, each topic's texts being its canonical plus its retained members (supersede victims are already deleted, so real seeds see more text). Off-topic proxy: matches against the 8,628 `procedural_knowledge`/`preferences_and_norms` memories that are not members of that topic. Recall: leave-one-out, deriving without a member and matching that member.
+
+  | Phrase selection | Clusters | Non-member matches (pairs / distinct memories) | Recall |
+  |---|---|---|---|
+  | nesting excluded (as first built) | 71 | 649 / 412 | 0.31 |
+  | nesting and whole-word overlap excluded (shipped) | 71 | 267 / 221 (2.6%) | 0.25 |
+  | nesting excluded, long-word distinctiveness arm dropped | 67 | 660 / — | 0.26 |
+
+  Overlap was the dominant over-match: `git merge-base` beside `merge-base --is-ancestor` let the one construction `git merge-base --is-ancestor` reach `min_phrase_hits` alone. Dropping the long-word arm (the review's other candidate) did not help, and it cost clusters, so it was not adopted. Judged samples: of 40 shipped-rule matches, 19 are on-topic (unconsolidated restatements of the topic or its close family), 2 are ambiguous and 19 are off-topic, so about 1.2% of gated memories would draw an off-topic soft block. Of 20 matches the overlap rule removed, 12 were off-topic. What remains off-topic is the document-frequency residual: project-wide constructions such as `git merge-base`, `git log --oneline`, `pytest tests/` and `uv run --project`. The worst clusters are `worktree-stale-base-premise-verification` (39), `orchestrator-full-suite-runtime-budget` (33) and `wip-requeue-plan-step-attribution` (27).
 - κ report format and cadence; whether the report also carries D9 sighting-count rankings from day one.
 - Exact ack field names / error codes (schema'd in β; INV-1 requires they live where callers see them).
 - ξ's citation heuristic breadth for legacy entries lacking `reexamine_when` (task-id regex vs semantic) — start narrow (explicit `#id` / "task NNNN" citation), widen from flag precision data.

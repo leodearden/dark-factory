@@ -1326,14 +1326,13 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
 _SEED_TOPIC = 'task-dir-gitignore-force-add'
 _SEED_CANONICAL = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 _SEED_TEXTS = (
-    'Never force-add .task/plan.json: the .task/ directory is gitignored and '
-    'git add -f .task/ sweeps task metadata into the commit.',
+    'Never force-add task metadata: git add -f .task/ sweeps plan.json into the commit. '
+    'Run git status --short before every commit.',
     'Gotcha: git add -f .task/ bypasses the gitignore and commits .task/plan.json; '
-    'stage files by name instead.',
-    'Stage by path, not with git add -f, because .task/plan.json lives under the '
-    'gitignored .task/ directory.',
+    'git status --short shows it staged.',
+    'Stage by path, not with git add -f .task/, and confirm with git status --short.',
 )
-_SEED_PROBE = 'Reminder: git add -f .task/ is wrong because the .task/ directory is gitignored.'
+_SEED_PROBE = 'Reminder: git add -f .task/ is wrong; check git status --short before committing.'
 _UNRELATED_WRITE = 'Restart the dashboard after editing its config file.'
 
 

@@ -46,7 +46,9 @@ that derivation needs, so it now seeds the guard itself
     can never qualify, whatever its shape;
   - it must contain a distinctive token: identifier punctuation, a digit, or a long
     word, but never a bare number or a run of punctuation;
-  - no phrase may nest inside another;
+  - no single occurrence may hold two phrases: neither nests in the other, and neither's
+    end overlaps the other's start on a whole word, so `git merge-base --is-ancestor`
+    cannot score `git merge-base` and `merge-base --is-ancestor` at once;
   - a cluster has at most six phrases, `min_phrase_hits=2` and never any
     `sufficient_phrases`;
   - fewer than two phrases produces no cluster.
@@ -54,6 +56,10 @@ that derivation needs, so it now seeds the guard itself
   One residual remains: a multi-word construction common across the whole project can
   still qualify, because rejecting it needs a document-frequency check against the
   project's other memories, a read this zero-I/O derivation deliberately does not make.
+  A replay over dark_factory's 81 consolidated topics measures it. The overlap rule cut
+  non-member matches from 649 to 267. About half of those that remain are off-topic,
+  roughly 1.2% of gated memories. The table is in PRD
+  `docs/prds/memory-write-path-convergence.md` §10.
 
   A per-cluster hint shadows the guard's default hint, so the derived hint carries
   everything the writer needs: the canonical UUID, the `allow_near_duplicate` escape,

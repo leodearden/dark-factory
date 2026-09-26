@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import random
@@ -333,6 +334,43 @@ _PAYLOAD_LIMIT_PARAPHRASE = (
     'PayloadTooLarge error.'
 )
 
+# Each fixture's members share two constructions that one occurrence could
+# hold together: overlapping word n-grams of one long command, and a path
+# ('.task/') that begins a longer path ('.task/plan.json').
+_STALE_BASE_TEXTS = [
+    'On a requeued task, run git merge-base --is-ancestor main HEAD before trusting the '
+    'branch; git rev-list --count HEAD..main says how far behind it is.',
+    'Stale worktree base: git merge-base --is-ancestor main HEAD fails once main has moved, '
+    'so rebase before calling the premise false.',
+    'Check the worktree base with git merge-base --is-ancestor main HEAD, then '
+    'git rev-list --count HEAD..main, before calling a premise false.',
+]
+
+_TASK_PATH_TEXTS = [
+    'Never run git add -f .task/ in a task worktree: .task/plan.json is gitignored on purpose. '
+    'Check git status --short before committing.',
+    'Gotcha: git add -f .task/ drags task metadata into the commit because .task/plan.json is '
+    'gitignored; git status --short shows the damage.',
+    '.task/plan.json is gitignored, so stage files by name; git add -f .task/ bypasses that.',
+]
+
+_ONE_OCCURRENCE_CASES = [
+    pytest.param(
+        _STALE_BASE_TEXTS,
+        'The pre-push hook runs git merge-base --is-ancestor main HEAD and refuses a push '
+        'that would rewrite history.',
+        'Before trusting a resumed branch, run git merge-base --is-ancestor main HEAD and '
+        'git rev-list --count HEAD..main.',
+        id='overlapping_words',
+    ),
+    pytest.param(
+        _TASK_PATH_TEXTS,
+        'A pasted snippet read git add -f .task/plan.json is gitignored and nothing else.',
+        '.task/plan.json is gitignored; confirm with git status --short before committing.',
+        id='path_prefix',
+    ),
+]
+
 _TOPIC = 'pytest-xdist-serial-override'
 _HINT = 'Consolidated topic; update canonical 8bb3eb15 instead.'
 
@@ -369,14 +407,30 @@ class TestDeriveTopicCluster:
             support = [text for text in _XDIST_TEXTS if phrase.lower() in text.lower()]
             assert len(support) >= 2, phrase
 
-    def test_no_phrase_nests_inside_another(self) -> None:
-        cluster = _derive(_XDIST_TEXTS)
+    @pytest.mark.parametrize(
+        'texts',
+        [
+            pytest.param(_XDIST_TEXTS, id='xdist'),
+            pytest.param(_PAYLOAD_LIMIT_TEXTS, id='payload_limit'),
+            pytest.param(_STALE_BASE_TEXTS, id='stale_base'),
+            pytest.param(_TASK_PATH_TEXTS, id='task_path'),
+        ],
+    )
+    def test_no_phrase_nests_inside_another(self, texts: list[str]) -> None:
+        cluster = _derive(texts)
         assert cluster is not None
-        lowered = [phrase.lower() for phrase in cluster.phrases]
-        for i, outer in enumerate(lowered):
-            for j, inner in enumerate(lowered):
-                if i != j:
-                    assert inner not in outer, (inner, outer)
+        for inner, outer in itertools.permutations(cluster.phrases, 2):
+            assert inner not in outer, (inner, outer)
+
+    @pytest.mark.parametrize(('texts', 'one_occurrence', 'paraphrase'), _ONE_OCCURRENCE_CASES)
+    def test_one_occurrence_of_a_construction_never_scores_twice(
+        self, texts: list[str], one_occurrence: str, paraphrase: str
+    ) -> None:
+        cluster = _derive(texts)
+
+        assert cluster is not None
+        assert find_matching_topic_cluster(one_occurrence, [cluster]) is None, cluster.phrases
+        assert find_matching_topic_cluster(paraphrase, [cluster]) is not None, cluster.phrases
 
     def test_the_cluster_matches_its_own_sources(self) -> None:
         cluster = _derive(_XDIST_TEXTS)
