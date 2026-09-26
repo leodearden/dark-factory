@@ -633,3 +633,45 @@ class TestCli:
             calibrate.RETRIEVAL_PRODUCTION
         ]
         assert [row['arm'] for row in report['arms']] == ['constant']
+
+
+class TestCommittedRerankerReport:
+    """The committed report is traceable to this code. It asserts no measured value: Γ2 does."""
+
+    @pytest.fixture(scope='class')
+    def report(self) -> dict:
+        return json.loads(_COMMITTED_REPORT.read_text())
+
+    _METRICS = ('rank1_rate', 'rank5_rate', 'p50_seconds', 'p95_seconds')
+
+    def test_one_row_per_d1_arm_in_registry_order(self, report: dict) -> None:
+        assert [row['arm'] for row in report['arms']] == [spec.name for spec in _arms().D1_ARMS]
+
+    def test_each_row_is_either_measured_or_skipped_with_a_reason(self, report: dict) -> None:
+        arms = _arms()
+        case_count = report['provenance']['case_count']
+        for row in report['arms']:
+            assert row['status'] in set(arms.ArmStatus)
+            if row['status'] == arms.ArmStatus.skipped:
+                assert row['skip_reason'] in set(arms.SkipReason)
+                assert row['skip_detail']
+                assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+            else:
+                assert all(isinstance(row[key], float | int) for key in self._METRICS)
+                assert row['rank1']['total'] == case_count
+
+    def test_best_is_the_selection_rule_over_the_committed_rows(self, report: dict) -> None:
+        best = report['best']
+        assert best == _mod().choose_best(
+            report['arms'], p95_ceiling_seconds=best['p95_ceiling_seconds'],
+        )
+        assert {'arm', 'rank1_rate', 'p95_seconds', 'qualified'} <= set(best)
+
+    def test_it_measured_the_whole_labelled_fixture(self, report: dict) -> None:
+        provenance = report['provenance']
+        assert (provenance['case_count'], provenance['record_count']) == (84, 104)
+        assert provenance['limit'] is None
+        assert provenance['canonical_aliases_count'] == 3
+
+    def test_the_markdown_is_rendered_from_the_json(self, report: dict) -> None:
+        assert _COMMITTED_REPORT.with_suffix('.md').read_text() == _mod().render_markdown(report)
