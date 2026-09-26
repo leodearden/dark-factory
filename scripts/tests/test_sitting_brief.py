@@ -1,6 +1,7 @@
 """Tests for scripts/sitting/brief.py — the pure sitting-brief renderer (task 5376)."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 
@@ -172,6 +173,39 @@ class TestSections:
 
     def test_the_generated_at_stamp_is_injected(self):
         assert NOW in _render()
+
+    def test_a_nested_brief_shifts_every_heading_by_its_level_and_changes_nothing_else(self):
+        paid = _item(4001, 1)
+        numbered = [dataclasses.replace(_entry(1, paid), payloads=_payloads(paid)), _entry(3)]
+        standing = [_standing(2, Standing('hold', 'Leo', Manual('Leo lifts the hold'), 'held in the handover'), None)]
+
+        flat = _render(numbered, standing)
+        nested = mod.render_brief(numbered, standing, [], glossary=GLOSSARY, generated_at=NOW,
+                                  level=2, title='1. Decisions needed')
+
+        flat_headings, flat_body = _partition(flat)
+        nested_headings, nested_body = _partition(nested)
+        assert flat_headings[0] == '# Sitting brief'
+        assert nested_headings[0] == '## 1. Decisions needed'
+        assert nested_headings[1:] == ['#' + heading for heading in flat_headings[1:]]
+        assert nested_body == flat_body
+
+    @pytest.mark.parametrize('level', [0, 5])
+    def test_a_level_that_would_push_entries_past_h6_is_refused(self, level):
+        with pytest.raises(ValueError, match='level'):
+            mod.render_brief([], [], [], glossary=GLOSSARY, generated_at=NOW, level=level)
+
+
+def _partition(text: str) -> tuple[list[str], list[str]]:
+    """(heading lines, every other line), telling a heading from a fenced line that merely starts with '#'."""
+    headings, body, fence = [], [], ''
+    for line in text.splitlines():
+        marker = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+        if marker and (not fence or marker.group(1).startswith(fence)):
+            fence = '' if fence else marker.group(1)
+        is_heading = not fence and not marker and re.match(r'^#{1,6} ', line)
+        (headings if is_heading else body).append(line)
+    return headings, body
 
 
 class TestNumberedEntry:
