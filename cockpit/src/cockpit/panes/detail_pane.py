@@ -97,7 +97,9 @@ def render_decision_detail(
     that predates it, or a filer whose pid pointer was unresolvable, leaving
     only session_id, a C8 watcher's lease token -- or that its session record
     has been reaped. It is therefore rendered raw and marked unresolved, so
-    an operator can tell a broken link from no link.
+    an operator can tell a broken link from no link. When the link is not
+    session_id itself, session_id follows on a ``filer:`` line: the filer's
+    own identity, which still names who filed after its record is reaped.
     """
     lines = [
         f'decision_id: {decision.id}',
@@ -109,6 +111,8 @@ def render_decision_detail(
         f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
         f'session: {_linked_session(decision.linked_session_slug, sessions)}',
     ]
+    if decision.session_id and decision.session_id != decision.linked_session_slug:
+        lines.append(f'filer: {decision.session_id}')
     if decision.options:
         lines.append(f'options: {", ".join(decision.options)}')
     lines.append(f'question: {decision.text}')
