@@ -30,7 +30,6 @@ import aiosqlite
 import pytest
 
 from dashboard.data.burndown import (
-    _INSERT_SNAPSHOT_SQL,
     BURNDOWN_SCHEMA,
     aggregate_burndown_series,
     compute_parity_alarm,
@@ -63,12 +62,22 @@ def _ts(minute: int) -> str:
     return (datetime.now(UTC) - timedelta(minutes=minute)).isoformat()
 
 
+_FIXTURE_COLUMNS = (
+    'project_id', 'ts', 'pending', 'in_progress', 'blocked', 'deferred', 'cancelled',
+    'done', 'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+)
+_INSERT_FIXTURE_ROW = (
+    f'INSERT INTO snapshots ({", ".join(_FIXTURE_COLUMNS)}) '
+    f'VALUES ({", ".join("?" for _ in _FIXTURE_COLUMNS)})'
+)
+
+
 def _make_db(path: Path, rows: list[dict]) -> None:
     conn = sqlite3.connect(str(path))
     conn.executescript(BURNDOWN_SCHEMA)
     for row in rows:
         conn.execute(
-            _INSERT_SNAPSHOT_SQL,
+            _INSERT_FIXTURE_ROW,
             (
                 row.get('project_id', 'p1'),
                 row['ts'],
