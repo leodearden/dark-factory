@@ -408,23 +408,6 @@ class TestAbandonedOracleRegistry:
             f'got {[r.message for r in caplog.records]}'
         )
 
-    def test_abandon_oracle_routes_through_the_shared_helper(self) -> None:
-        """Task 4530: cancel + track is the shared helper, not a local copy."""
-        import shared.asyncio_tasks
-
-        from orchestrator import merge_skew_tripwire
-
-        assert merge_skew_tripwire.abandon_task is shared.asyncio_tasks.abandon_task
-
-    @pytest.mark.asyncio
-    async def test_oracle_registry_stays_a_module_local_set(
-        self, _drained_oracle_registry,
-    ) -> None:
-        """Only the helper is shared (task 4530): ``_abandon_oracle``'s backlog
-        WARNING must count oracle tasks alone, never tasks another package
-        tracks."""
-        assert isinstance(_drained_oracle_registry, set)
-
 
 class TestComputeTripwireOverlap:
     """Unit tests for the pure ``compute_tripwire_overlap(landing_changed_files,

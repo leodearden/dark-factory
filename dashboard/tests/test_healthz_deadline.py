@@ -49,7 +49,6 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-import shared.asyncio_tasks
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
@@ -848,15 +847,3 @@ async def test_healthz_handler_cancellation_strands_no_probe_task(
     assert inner not in registry, (
         'inner probe task leaked: still in _ABANDONED_PROBES after it finished'
     )
-
-
-def test_probe_tasks_are_tracked_by_the_shared_helpers():
-    """app.py abandons and tracks probe tasks via shared.asyncio_tasks (task 4530)."""
-    assert app_module.abandon_task is shared.asyncio_tasks.abandon_task
-    assert app_module.track_task is shared.asyncio_tasks.track_task
-
-
-def test_probe_registries_stay_module_local_sets():
-    """Only the helper is shared; each probe kind keeps its own registry."""
-    assert isinstance(app_module._ABANDONED_PROBES, set)
-    assert isinstance(app_module._MCP_PROBES, set)

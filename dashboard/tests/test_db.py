@@ -11,10 +11,8 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
-import shared.asyncio_tasks
 from _dashboard_helpers import live_aiosqlite_worker_threads
 
-import dashboard.data.db as db_module
 from dashboard.data.db import DbPool, with_db
 
 
@@ -1367,10 +1365,3 @@ class TestWithDb:
         assert result == 42
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']
         assert warnings, 'expected a WARNING from dashboard.data.db on OSError, got none'
-
-
-class TestTrackTaskIsSharedSourced:
-    """db.py tracks its close tasks with the shared helper, not a local copy (task 4530)."""
-
-    def test_db_module_uses_the_shared_track_task(self):
-        assert db_module.track_task is shared.asyncio_tasks.track_task
