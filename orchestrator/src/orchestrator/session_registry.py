@@ -669,6 +669,14 @@ def _is_record_key(slug: str) -> bool:
     return bool(slug) and sanitize_slug(slug) == slug and not _ALL_DOTS_RE.match(slug)
 
 
+def _read_session_pointer(path: Path) -> str | None:
+    """The slug a pointer file holds, stripped; None when it cannot be read."""
+    try:
+        return path.read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return None
+
+
 def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -> bool:
     """Record *slug* as the record key of claude process *pid*'s current record.
 
@@ -676,6 +684,7 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     wins. *pid* is the OWNING ``claude`` process's pid (the value
     ``$CLAUDE_PID`` carries), never the record's ``launcher_pid``.
 
+    Returns True without rewriting when the pointer already holds *slug*.
     Returns False without writing for a non-positive *pid* or a *slug* that
     is not a record key, and False (after a WARNING) when the write itself
     fails. Never raises: its callers are session hooks.
@@ -683,6 +692,8 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     if pid <= 0 or not _is_record_key(slug):
         return False
     path = session_pointer_path_for_pid(pid, root=root)
+    if _read_session_pointer(path) == slug:
+        return True
     try:
         _atomic_write_text(path, slug)
     except OSError as exc:
@@ -709,11 +720,8 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
     """
     if pid <= 0:
         return None
-    try:
-        slug = session_pointer_path_for_pid(pid, root=root).read_text(encoding='utf-8').strip()
-    except (OSError, ValueError):
-        return None
-    if not _is_record_key(slug):
+    slug = _read_session_pointer(session_pointer_path_for_pid(pid, root=root))
+    if slug is None or not _is_record_key(slug):
         return None
     try:
         record = read_record(slug, root=root)
@@ -793,6 +801,12 @@ class CorruptSessionRecord(Exception):
     """Raised by read_record when a record.json exists but fails to parse."""
 
 
+_ATOMIC_WRITE_TEMP_SUFFIX = '.tmp'
+"""Suffix of ``_atomic_write_text``'s in-flight temp file. A sweep that visits
+every entry of a dir this module writes into (``reap_stale_session_pointers``)
+keys on it to leave a concurrent writer's temp file alone."""
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
@@ -850,7 +864,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        suffix='.tmp',
+        suffix=_ATOMIC_WRITE_TEMP_SUFFIX,
         prefix=path.stem,
         dir=str(path.parent),
     )
@@ -2567,18 +2581,35 @@ def reap_stale_records(
     return reaped
 
 
+_POINTER_TEMP_FILE_GRACE = timedelta(minutes=5)
+"""How long a ``sessions-by-pid/`` temp file is presumed to belong to a writer
+still between ``mkstemp`` and ``os.replace``. Past it, the writer was killed."""
+
+
+def _is_abandoned_temp_file(path: Path) -> bool:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    age = datetime.now(UTC) - datetime.fromtimestamp(mtime, tz=UTC)
+    return age > _POINTER_TEMP_FILE_GRACE
+
+
 def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
+    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+        return _is_abandoned_temp_file(path)
     try:
         pid = int(path.name)
     except ValueError:
         return True
     if pid <= 0 or path.name != str(pid) or not _pid_alive(pid):
         return True
-    try:
-        slug = path.read_text(encoding='utf-8').strip()
-    except (OSError, ValueError):
-        return True
-    return not _is_record_key(slug) or not record_path_for_slug(slug, root=root).is_file()
+    slug = _read_session_pointer(path)
+    return (
+        slug is None
+        or not _is_record_key(slug)
+        or not record_path_for_slug(slug, root=root).is_file()
+    )
 
 
 def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
@@ -2586,7 +2617,10 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
 
     An entry is stale when its name is not a canonical positive pid, its pid
     is dead, its content is not a record key, or the record it names has no
-    ``record.json``. A dead pid's pointer goes even while its record still
+    ``record.json``. The one exception is a ``write_session_pointer`` temp
+    file, which is left to its writer until ``_POINTER_TEMP_FILE_GRACE`` has
+    passed, so a sweep never unlinks it out from under a concurrent
+    ``os.replace``. A dead pid's pointer goes even while its record still
     exists: its owner can never query it again, and a process that reuses
     the pid must not inherit it. Record bodies are never parsed, so the cost
     is O(pointer files), not O(records).

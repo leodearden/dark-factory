@@ -63,6 +63,18 @@ class TestSessionPointerPaths:
         path = sr.session_pointer_path_for_pid(1234, root=tmp_path)
         assert path.read_text(encoding='utf-8') == 'second-slug'
 
+    def test_rewriting_the_slug_a_pointer_already_holds_leaves_the_file_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path)
+        path = sr.session_pointer_path_for_pid(1234, root=tmp_path)
+        inode_before = path.stat().st_ino
+
+        assert sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is True
+
+        assert path.stat().st_ino == inode_before
+        assert _pointer_files(tmp_path) == [path]
+
     def test_non_positive_pids_are_refused_without_writing(self, tmp_path: Path) -> None:
         assert sr.write_session_pointer(0, 'role-proj-uuid', root=tmp_path) is False
         assert sr.write_session_pointer(-1, 'role-proj-uuid', root=tmp_path) is False
@@ -283,6 +295,24 @@ class TestReapStaleSessionPointers:
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
+
+    def test_a_writers_in_flight_temp_file_is_left_alone(self, tmp_path: Path) -> None:
+        temp = self._pointer_path(f'{os.getpid()}xyz.tmp', tmp_path)
+        temp.parent.mkdir(parents=True)
+        temp.write_text(self._SLUG, encoding='utf-8')
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert temp.is_file()
+
+    def test_a_temp_file_abandoned_by_a_killed_writer_is_removed(self, tmp_path: Path) -> None:
+        temp = self._pointer_path(f'{os.getpid()}xyz.tmp', tmp_path)
+        temp.parent.mkdir(parents=True)
+        temp.write_text(self._SLUG, encoding='utf-8')
+        a_day_ago = (datetime.now(UTC) - timedelta(days=1)).timestamp()
+        os.utime(temp, (a_day_ago, a_day_ago))
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [temp]
+        assert not temp.exists()
 
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
