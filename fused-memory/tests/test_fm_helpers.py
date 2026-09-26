@@ -1,5 +1,7 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
+import asyncio
+import concurrent.futures
 import json
 import sys
 import types
@@ -9,6 +11,7 @@ import httpx
 import pytest
 from _fm_helpers import (
     _LOADED_SCRIPT_MODULE_NAMES,
+    LoopFreedomProbe,
     load_script_module,
     submit_and_resolve,
 )
@@ -1547,6 +1550,74 @@ class TestRetryUntilObserved:
             await retry_until_observed(observe, attempts=bad_attempts)
 
         assert log == [], f'expected no observation at all, got {log!r}'
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared LoopFreedomProbe oracle (task 5920)
+# ---------------------------------------------------------------------------
+# Pins the probe's discriminating power: a free loop reads True, and each of
+# the two loop-holding call-site shapes reads False without hanging. Every
+# verdict is driven by loop TURNS, never wall clock, so this suite cannot
+# itself become the next flake.
+
+class TestLoopFreedomProbe:
+    """Unit tests for LoopFreedomProbe.suspend() / .observations / .assert_loop_stayed_free()."""
+
+    @pytest.mark.asyncio
+    async def test_a_free_loop_reads_true(self):
+        probe = LoopFreedomProbe()
+
+        await probe.suspend()
+
+        assert probe.observations == (True,)
+        probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_that_resumes_the_coroutine_itself_reads_false(self):
+        probe = LoopFreedomProbe()
+
+        coro = probe.suspend()
+        with pytest.raises(StopIteration):
+            while True:
+                coro.send(None)
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_waiting_on_another_threads_loop_reads_false(self):
+        probe = LoopFreedomProbe()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, probe.suspend()).result()
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_an_unreached_probe(self):
+        probe = LoopFreedomProbe()
+
+        with pytest.raises(AssertionError, match='never reached'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_a_held_loop(self):
+        probe = LoopFreedomProbe()
+        coro = probe.suspend()
+        with pytest.raises(StopIteration):
+            while True:
+                coro.send(None)
+
+        with pytest.raises(AssertionError, match='held'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_each_suspension_is_recorded(self):
+        probe = LoopFreedomProbe()
+
+        await probe.suspend()
+        await probe.suspend()
+
+        assert probe.observations == (True, True)
 
 
 # ---------------------------------------------------------------------------
