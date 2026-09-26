@@ -1997,18 +1997,12 @@ class TestDeclaredPinMarker:
 class TestEscalationProjectId:
     """`project_id` — the SUBJECT project of a record on a cross-project queue (task 4951).
 
-    The queue is shared across every project the factory operates, so "which
-    project is this record about" is a fact consumers need.  Before this field
-    the emitters held it in a variable and threw it away into ``detail`` prose,
-    leaving readers to parse it back out — the INV-2 gap this field closes.
-
-    These tests pin the FIELD's storage/round-trip behaviour only.  Who stamps
-    it is pinned in fused-memory/tests/reconciliation/test_stage1_stall_detector.py;
-    who prefers it is pinned in
-    fused-memory/tests/reconciliation/test_orphaned_recon_escalation_sweep.py.
+    These tests pin the FIELD's storage/round-trip behaviour only; which
+    producers stamp it and how the reader prefers it are pinned at those
+    producers' and that reader's own tests.
     """
 
-    def _make_base_esc(self) -> Escalation:
+    def _make_base_esc(self, **overrides) -> Escalation:
         return Escalation(
             id='esc-4951-1',
             task_id='4951',
@@ -2016,6 +2010,7 @@ class TestEscalationProjectId:
             severity='blocking',
             category='risk_identified',
             summary='test escalation for project_id',
+            **overrides,
         )
 
     # --- (a) default is None ---
@@ -2028,15 +2023,7 @@ class TestEscalationProjectId:
 
     def test_project_id_round_trip_via_to_dict_from_dict(self):
         """project_id='dark_factory' is preserved through to_dict() / from_dict()."""
-        esc = Escalation(
-            id='esc-4951-1',
-            task_id='4951',
-            agent_role='implementer',
-            severity='blocking',
-            category='risk_identified',
-            summary='test project_id round-trip',
-            project_id='dark_factory',
-        )
+        esc = self._make_base_esc(project_id='dark_factory')
         restored = Escalation.from_dict(esc.to_dict())
         assert restored.project_id == 'dark_factory'
 
@@ -2048,15 +2035,7 @@ class TestEscalationProjectId:
         A DIFFERENT value from the to_dict case above, so an implementation
         hardcoding one constant cannot satisfy both round-trips.
         """
-        esc = Escalation(
-            id='esc-4951-1',
-            task_id='4951',
-            agent_role='implementer',
-            severity='blocking',
-            category='risk_identified',
-            summary='test project_id json round-trip',
-            project_id='reify',
-        )
+        esc = self._make_base_esc(project_id='reify')
         restored = Escalation.from_json(esc.to_json())
         assert restored.project_id == 'reify'
 
@@ -2064,22 +2043,14 @@ class TestEscalationProjectId:
 
     def test_project_id_appears_in_to_json_output(self):
         """project_id is serialised (not silently dropped) when set."""
-        esc = Escalation(
-            id='esc-4951-1',
-            task_id='4951',
-            agent_role='implementer',
-            severity='blocking',
-            category='risk_identified',
-            summary='test project_id in json',
-            project_id='autopilot_video',
-        )
+        esc = self._make_base_esc(project_id='autopilot_video')
         payload = json.loads(esc.to_json())
         assert 'project_id' in payload
         assert payload['project_id'] == 'autopilot_video'
 
     # --- (e) legacy JSON backward compat (zero-migration) ---
 
-    def test_from_dict_legacy_json_omits_project_id(self):
+    def test_from_json_legacy_json_omits_project_id(self):
         """from_json() on JSON without the project_id key returns None — zero migration."""
         old_dict = {
             'id': 'esc-task-1-0001',

@@ -357,34 +357,13 @@ class TestMaybeEscalateStalledTasks:
         assert '1155' in submitted.summary
         assert '7' in submitted.summary
         # The queue is shared across projects, so the SUBJECT project is a
-        # structured field on the record — not only a rendered detail line.
+        # structured field on the record — the same fact as the rendered
+        # detail line, both written from the one `project_id` parameter.
         assert submitted.project_id == 'dark_factory'
+        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
         # detail includes flag description and run_id
         assert 'Task stalled waiting for human review' in submitted.detail
         assert 'run-abc' in submitted.detail
-
-    @pytest.mark.asyncio
-    async def test_stamped_project_id_agrees_with_the_detail_prose(self):
-        """The field and the detail line are the SAME fact — they must not drift.
-
-        Both copies are written from the one `project_id` parameter, so this is
-        the SPOT guard: either copy alone would stay individually plausible
-        while naming a different project from the other.
-        """
-        queue = self._make_queue(has_open_l1_return=False)
-
-        await maybe_escalate_stalled_tasks(
-            escalation_queue=queue,
-            project_id='dark_factory',
-            run_id='run-abc',
-            stalled_task_ids=['1155'],
-            stall_counts={'1155': 7},
-            flags=[],
-        )
-
-        submitted = queue.submit.call_args[0][0]
-        assert submitted.project_id == 'dark_factory'
-        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
 
     @pytest.mark.asyncio
     async def test_skips_when_open_l1_exists(self):
@@ -815,7 +794,11 @@ class TestMaybeEscalateStalledGateBacklog:
         assert submitted.agent_role == 'reconciliation-stage1'
         # A DIFFERENT project id from the stalled-tasks site above, so an
         # implementation hardcoding one constant cannot satisfy both stamps.
+        # It must agree with the detail line, from which
+        # `escalation/dedupe.py::gate_backlog_fingerprint_key` recovers a
+        # legacy parent's identity.
         assert submitted.project_id == 'autopilot_video'
+        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
 
         combined = f'{submitted.summary}\n{submitted.detail}'
         assert '645' in combined
@@ -844,30 +827,6 @@ class TestMaybeEscalateStalledGateBacklog:
         # `age_hours_at_filing` so it no longer reads as a live counter.
         assert 'age_hours_at_filing: 49.0' in submitted.detail
         assert 'age_hours:' not in submitted.detail
-
-    @pytest.mark.asyncio
-    async def test_stamped_project_id_agrees_with_the_detail_prose(self):
-        """The field and the detail line are the SAME fact — they must not drift.
-
-        The prose line is load-bearing here beyond legibility:
-        `escalation/dedupe.py::gate_backlog_fingerprint_key` recovers a legacy
-        parent's identity from exactly that line, so a stamp that disagreed
-        with it would make one record name two projects.
-        """
-        queue = self._make_queue(has_open_l1_return=False)
-
-        await maybe_escalate_stalled_gate_backlog(
-            escalation_queue=queue,
-            project_id='autopilot_video',
-            run_id='run-xyz',
-            stalled_task_ids=['645'],
-            task_by_id={'645': _gate_task_record(645, hours_ago=49)},
-            now=_GATE_NOW,
-        )
-
-        submitted = queue.submit.call_args[0][0]
-        assert submitted.project_id == 'autopilot_video'
-        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
 
     @pytest.mark.asyncio
     async def test_unparseable_stamp_uses_threshold_summary_and_at_filing_label(self):
