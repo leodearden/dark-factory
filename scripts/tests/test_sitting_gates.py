@@ -26,7 +26,7 @@ def _closeable_facts(**overrides) -> mod.CarveoutFacts:
 
 
 SINGLE_MISSES = {
-    'ruling_is_leos_own': {'ruling': mod.UNKNOWN},
+    'ruling_is_leos_own': {'ruling': mod.Fact(held=True, evidence=RULING, source_kind='triage_note')},
     'ruling_names_this_record': {
         'ruling': mod.Fact(held=True, evidence='Leo: retarget 3881', source_kind='task_description'),
     },
