@@ -27,6 +27,7 @@ const {
   combinedDatum: combineSnapshotDatums,
   isDatum: isSnapshotDatum,
   assertDatum: assertSnapshotDatum,
+  EM_DASH: SNAPSHOT_PLACEHOLDER,
 } = window.DF_DATUM;
 const { VIEWS: TASK_VIEW_MEMBERS } = window.DF_TASK_VOCAB;
 
@@ -62,6 +63,10 @@ function snapshotDatum(data, project, half) {
 
 function projectCensus(data, project) {
   return snapshotDatum(data, project, 'census');
+}
+
+function projectRows(data, project) {
+  return snapshotDatum(data, project, 'rows');
 }
 
 // ── A census over several projects ──
@@ -185,6 +190,39 @@ function censusHistory(data, projects, tile) {
   return projectSeries[tile.series] || [];
 }
 
+// ── The rows a view filter lists ──
+// `filter` is OrchTab's {in_flight, backlog, terminal} booleans. In-flight and
+// backlog rows come from the snapshot's rows Datum, terminal rows from the
+// on-demand window, and every view selects by the generated membership, so a
+// member the census counts under a view is listed under that same view. Rows
+// concatenate in view order, whatever order the filter's keys were set in.
+//
+// A selected view whose Datum is a hole lists nothing and is named in ONE
+// placeholder, titled with its reason: an offline project reads why, not a
+// confident "No in-flight tasks". Nothing selected answers no placeholder —
+// that sentence is orch_filter.js's.
+function viewRows(rowsDatum, terminalDatum, filter) {
+  const sourced = CENSUS_VIEWS
+    .filter(view => filter[view.key])
+    .map(view => [view, view.key === 'terminal' ? terminalDatum : rowsDatum]);
+  const holes = sourced.filter(([, datum]) => assertSnapshotDatum(datum, 'viewRows').value === null);
+  return {
+    rows: sourced.flatMap(([view, datum]) => rowsInView(view.key, datum.value || [])),
+    placeholder: holes.length === 0 ? null : viewRowsPlaceholder(holes),
+  };
+}
+
+function rowsInView(key, rows) {
+  return rows.filter(row => TASK_VIEW_MEMBERS[key].includes(row.status));
+}
+
+function viewRowsPlaceholder(holes) {
+  return {
+    text: SNAPSHOT_PLACEHOLDER + ' ' + holes.map(([view]) => view.label).join(', ') + ' rows',
+    title: holes.map(([view, datum]) => view.label + ': ' + datum.reason).join('; '),
+  };
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced by classic_script_scope.test.mjs.
 const TASK_SNAPSHOT_API = {
@@ -199,6 +237,8 @@ const TASK_SNAPSHOT_API = {
   censusTotal,
   censusSegments,
   censusHistory,
+  projectRows,
+  viewRows,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
