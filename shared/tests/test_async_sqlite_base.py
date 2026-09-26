@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -910,6 +912,96 @@ async def _seed_scan_table(conn: aiosqlite.Connection) -> None:
     await conn.execute("INSERT INTO items VALUES ('live', 'live', 1, '0')")
     await conn.execute("INSERT INTO items VALUES ('foreign', 'dead', 0, '0')")
     await conn.commit()
+
+
+# A hang guard only: never elapses on a passing run.  It turns a harness bug
+# into a legible failure instead of a wedged worker thread.
+_GATE_HANG_GUARD_SECS = 30.0
+
+# The WHERE term depends on a column, so SQLite calls scan_gate once per row
+# scanned; the FIRST row parks.
+_GATED_SCAN = "SELECT id, v FROM items WHERE scan_gate(flag) = 'live'"
+
+
+class _ScanGate:
+    """The ``scan_gate(value)`` SQL function: parks the first row until released.
+
+    It runs on the connection's worker thread in the middle of
+    ``sqlite3_step``, so the read's snapshot stays pinned while it is parked.
+    Every call comes from that one thread, so ``_has_parked`` needs no lock.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.parked = asyncio.Event()
+        self._loop = loop
+        self._released = threading.Event()
+        self._has_parked = False
+
+    def __call__(self, value: object) -> object:
+        if not self._has_parked:
+            self._has_parked = True
+            self._loop.call_soon_threadsafe(self.parked.set)
+        if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
+            raise TimeoutError('scan_gate was never released')
+        return value
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def _open_collision_pair(
+    open_conn: Callable[[Path], Awaitable[aiosqlite.Connection]], db_path: Path
+) -> tuple[aiosqlite.Connection, aiosqlite.Connection, _ScanGate]:
+    """Open ``owner`` (with ``scan_gate`` registered) and ``foreign`` on one seeded file."""
+    owner = await open_conn(db_path)
+    foreign = await open_conn(db_path)
+    await owner.execute('CREATE TABLE items (id TEXT PRIMARY KEY, flag TEXT, v TEXT)')
+    await owner.execute("INSERT INTO items VALUES ('live', 'live', '0')")
+    await owner.execute("INSERT INTO items VALUES ('foreign', 'dead', '0')")
+    await owner.commit()
+    gate = _ScanGate(asyncio.get_running_loop())
+    await owner.create_function('scan_gate', 1, gate)
+    return owner, foreign, gate
+
+
+async def _sqlite_error_name(op: Callable[[], Awaitable[None]]) -> str | None:
+    """Await ``op`` and return its SQLite error name, or None if it raised nothing."""
+    try:
+        await op()
+    except sqlite3.OperationalError as exc:
+        return exc.sqlite_errorname
+    return None
+
+
+async def _collide_with_a_pinned_read(
+    foreign: aiosqlite.Connection,
+    gate: _ScanGate,
+    *,
+    read: Callable[[], Awaitable[list[aiosqlite.Row]]],
+    write: Callable[[], Awaitable[None]],
+) -> tuple[list[aiosqlite.Row], str | None]:
+    """Issue ``write`` into ``read``'s pinned-snapshot window after a foreign commit.
+
+    Returns the read's rows and the write's SQLite error name (None if it
+    raised nothing).  The order is constructed, not raced:
+
+    1. ``read`` parks inside ``scan_gate`` with its snapshot pinned.
+    2. The writer task is created, then the test suspends on ``foreign``'s
+       statement.  asyncio's FIFO ready queue runs the writer's first step
+       during that suspension, which either queues its statement behind the
+       parked hop or parks it on :class:`AtomicConnection`'s lock.
+    3. ``foreign`` commits, so the owner's pinned snapshot is now stale.
+    4. Only then is the gate released.
+    """
+    reader = asyncio.create_task(read())
+    try:
+        await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+        writer = asyncio.create_task(_sqlite_error_name(write))
+        await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
+        await foreign.commit()
+    finally:
+        gate.release()
+    return await reader, await writer
 
 
 @pytest.fixture
