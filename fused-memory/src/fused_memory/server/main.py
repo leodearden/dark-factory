@@ -1001,7 +1001,7 @@ async def run_server():
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
     # its consumers (consolidate_memories and the add_memory guard) run either
     # way, and the leaf is read live at each of them.
-    topic_cluster_store = _build_topic_cluster_store(wj_data_dir)
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -1744,7 +1744,7 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
     return store
 
 
-def _build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
     """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
 
     Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the

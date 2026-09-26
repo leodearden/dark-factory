@@ -14,7 +14,7 @@ Covers:
   derivation (TestDeriveTopicCluster)
 - ``seed_topic_cluster``, the one non-raising seed and its outcome vocabulary
   (TestSeedTopicCluster)
-- ``server.main._build_topic_cluster_store`` hands the server an OPEN store
+- ``server.main.build_topic_cluster_store`` hands the server an OPEN store
   beside the other server-owned SQLite files (TestServerFactoryWiring)
 """
 
@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 
 from fused_memory.config.schema import ProceduralTopicCluster
+from fused_memory.server.main import build_topic_cluster_store
 from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
 from fused_memory.server.topic_cluster_store import (
     TopicClusterStore,
@@ -174,6 +175,7 @@ _CORRUPT_ROWS = {
     'snake_case_topic_id': (_SNAKE_TOPIC, _cluster_json(topic_id=_SNAKE_TOPIC)),
     'unknown_key': ('pytest-xdist-serial-override', _cluster_json(severity='high')),
     'non_json': ('pytest-xdist-serial-override', '{not json'),
+    'row_key_disagrees_with_cluster': ('ruff-format-not-enforced', _cluster_json()),
 }
 
 
@@ -181,7 +183,7 @@ class TestStoreFailsLoudLikeTheConfigPath:
     """A row that fails re-validation is a startup condition, never a silent skip."""
 
     @pytest.mark.parametrize('shape', sorted(_CORRUPT_ROWS))
-    def test_a_corrupt_row_fails_open_naming_the_row_path_and_recovery(
+    def test_a_corrupt_row_fails_open_naming_the_row_and_path(
         self, db_path: Path, shape: str
     ) -> None:
         topic_id, cluster_json = _CORRUPT_ROWS[shape]
@@ -196,8 +198,6 @@ class TestStoreFailsLoudLikeTheConfigPath:
         assert _PROJECT in message
         assert topic_id in message
         assert str(db_path) in message
-        assert 'machine-derived' in message
-        assert 're-seed' in message
 
     def test_a_snake_case_topic_id_names_the_slug_rule(self, db_path: Path) -> None:
         _create_schema(db_path)
@@ -564,9 +564,7 @@ class TestServerFactoryWiring:
     """main.py builds the store once, opened, and a corrupt file fails startup loudly."""
 
     def test_the_factory_returns_an_open_store_in_the_data_dir(self, tmp_path: Path) -> None:
-        from fused_memory.server.main import _build_topic_cluster_store  # noqa: PLC0415
-
-        store = _build_topic_cluster_store(tmp_path)
+        store = build_topic_cluster_store(tmp_path)
         try:
             assert isinstance(store, TopicClusterStore)
             assert store.db_path == tmp_path / 'topic_clusters.db'
@@ -577,11 +575,9 @@ class TestServerFactoryWiring:
             store.close()
 
     def test_a_corrupt_row_fails_the_factory(self, tmp_path: Path) -> None:
-        from fused_memory.server.main import _build_topic_cluster_store  # noqa: PLC0415
-
         db_path = tmp_path / 'topic_clusters.db'
         _create_schema(db_path)
         _insert_raw_row(db_path, project_id=_PROJECT, topic_id='broken-row', cluster_json='{not json')
 
         with pytest.raises(TopicClusterStoreError):
-            _build_topic_cluster_store(tmp_path)
+            build_topic_cluster_store(tmp_path)

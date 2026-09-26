@@ -95,8 +95,10 @@ class TopicClusterStoreError(RuntimeError):
     """A persisted topic-cluster row failed re-validation at :meth:`TopicClusterStore.open`.
 
     Rows land only through :meth:`TopicClusterStore.upsert`, which accepts
-    nothing but a validated :class:`ProceduralTopicCluster`. A row that fails
-    re-validation therefore means tampering or an unmigrated model change.
+    nothing but a validated :class:`ProceduralTopicCluster` and keys the row
+    by that cluster's own ``topic_id``. A row that fails re-validation, or
+    whose key disagrees with its cluster, therefore means tampering or an
+    unmigrated model change.
     Both are startup conditions an operator must fix, which is exactly the
     config path's posture when a cluster fails validation at load.
     """
@@ -221,6 +223,12 @@ def _hydrate(
         except ValueError as exc:
             offenders.append(f'  ({project_id!r}, {topic_id!r}): {exc}')
             continue
+        if cluster.topic_id != topic_id:
+            offenders.append(
+                f'  ({project_id!r}, {topic_id!r}): the row key disagrees with the '
+                f"cluster's own topic_id {cluster.topic_id!r}"
+            )
+            continue
         clusters.setdefault(project_id, {})[topic_id] = cluster
     if offenders:
         raise TopicClusterStoreError(_invalid_rows_message(db_path, offenders))
@@ -231,8 +239,8 @@ def _invalid_rows_message(db_path: Path, offenders: list[str]) -> str:
     listing = '\n'.join(offenders)
     return (
         f'topic-cluster store {db_path} holds {len(offenders)} row(s) that fail '
-        f're-validation as ProceduralTopicCluster (topic_id is a slug per '
-        f'fused_memory.topic_slug):\n{listing}\n'
+        f're-validation: each must be a ProceduralTopicCluster whose topic_id, a '
+        f"slug per fused_memory.topic_slug, equals the row's topic_id key:\n{listing}\n"
         f'These rows are machine-derived: only a validated upsert writes them, so '
         f'this means tampering or an unmigrated model change. Delete the offending '
         f'row(s) or the file; that loses only derived clusters, which the next '
