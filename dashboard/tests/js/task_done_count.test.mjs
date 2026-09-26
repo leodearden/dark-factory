@@ -230,7 +230,9 @@ test('(c) the verdict is read off the census alone, whatever banner the rows ear
 
 // ── Wiring: no consumer reads DONE_COUNTS, both take the guard ─────────────
 
-const CONSUMERS = ['tab_tasks.jsx', 'tabs.jsx'];
+// tabs.jsx left in task 5589 (gamma2): OrchTab reads the census through
+// task_snapshot.js. tab_tasks.jsx is gamma3's, which deletes this module.
+const CONSUMERS = ['tab_tasks.jsx'];
 
 test('no consumer still reads DONE_COUNTS', () => {
   for (const name of CONSUMERS) {
@@ -256,4 +258,14 @@ test('every consumer destructures the guard it depends on', () => {
         'has no guard to go through',
     );
   }
+});
+
+test('tabs.jsx no longer takes the interim guard', () => {
+  const source = fs.readFileSync(path.join(REDUX_DIR, 'tabs.jsx'), 'utf8');
+  assert.equal(
+    /window\.DF_TASK_DONE_COUNT/.test(source),
+    false,
+    'tabs.jsx still destructures window.DF_TASK_DONE_COUNT; OrchTab reads the ' +
+      "census's terminal view through task_snapshot.js instead",
+  );
 });

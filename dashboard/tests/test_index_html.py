@@ -529,7 +529,7 @@ def test_orch_summary_js_is_served(client) -> None:
 
 # ---------------------------------------------------------------------------
 # Regression guard: task_done_count.js is served, and loads after datum.js and
-# before its two consumers (task 5587)
+# before its consumer (task 5587)
 # ---------------------------------------------------------------------------
 
 _TASK_DONE_COUNT_PREFIX = '/static/redux/task_done_count.js'
@@ -538,10 +538,10 @@ _TASK_DONE_COUNT_PREFIX = '/static/redux/task_done_count.js'
 def test_task_done_count_js_is_served(client) -> None:
     """GET /static/redux/task_done_count.js returns 200.
 
-    tabs.jsx and tab_tasks.jsx destructure ``window.DF_TASK_DONE_COUNT`` at
-    module top level with no fallback, so a 404 here throws at load and blanks
-    the Orchestrators and Tasks tabs. The load-order guard below only reads tag
-    positions, which a file present in git but not served would still pass.
+    tab_tasks.jsx destructures ``window.DF_TASK_DONE_COUNT`` at module top
+    level with no fallback, so a 404 here throws at load and blanks the Tasks
+    tab. The load-order guard below only reads tag positions, which a file
+    present in git but not served would still pass.
     """
     resp = client.get(_TASK_DONE_COUNT_PREFIX)
     assert resp.status_code == 200, (
@@ -552,7 +552,6 @@ def test_task_done_count_js_is_served(client) -> None:
 
 _TASK_DONE_COUNT_ORDER_CASES = [
     (_DATUM_PREFIX, 'datum.js', _TASK_DONE_COUNT_PREFIX, 'task_done_count.js'),
-    (_TASK_DONE_COUNT_PREFIX, 'task_done_count.js', _TABS_PREFIX, 'tabs.jsx'),
     (_TASK_DONE_COUNT_PREFIX, 'task_done_count.js', _TAB_TASKS_PREFIX, 'tab_tasks.jsx'),
 ]
 
@@ -560,7 +559,7 @@ _TASK_DONE_COUNT_ORDER_CASES = [
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label',
     _TASK_DONE_COUNT_ORDER_CASES,
-    ids=['datum-before-guard', 'guard-before-tabs', 'guard-before-tab-tasks'],
+    ids=['datum-before-guard', 'guard-before-tab-tasks'],
 )
 def test_task_done_count_js_load_order(
     index_html_body: str,
@@ -572,9 +571,9 @@ def test_task_done_count_js_load_order(
     """The guard sits between the placeholder it borrows and the tabs that read it.
 
     task_done_count.js destructures ``EM_DASH`` from ``window.DF_DATUM`` at
-    module scope, so datum.js must run first. tabs.jsx and tab_tasks.jsx then
-    destructure ``window.DF_TASK_DONE_COUNT`` at module scope, so the guard must
-    run before either. Every edge is its own case, as in
+    module scope, so datum.js must run first. tab_tasks.jsx then destructures
+    ``window.DF_TASK_DONE_COUNT`` at module scope, so the guard must run before
+    it. Every edge is its own case, as in
     ``_DATUM_ORDER_CASES``, because each one breaks a different surface.
     """
     assert_script_loads_before(
