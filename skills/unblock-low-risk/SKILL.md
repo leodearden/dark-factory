@@ -301,6 +301,54 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
+   - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
+     submit-terminal and is not a live state, so it reaches this step either straight from step 8's
+     submission or on the first poll tick that returns it — step 8's loop exits immediately
+     because `superseded ∉ {queued, verifying, gate, finalizing}`. It means your request was
+     replaced by a successor that may still be in flight and whose landing will carry this
+     branch's work. Reporting it as a failure would report a **false failure** and leave the
+     escalation pending on a branch that is about to land.
+     - **Do not call `merge_cancel(request_id)`.** On an absorbed id that call is a no-op which
+       resolves to `unknown` (`escalation/src/escalation/server.py` — "callers holding a coalesced
+       id will resolve to 'unknown' here"), so it buys nothing and muddies the record. There is no
+       cancel path for an in-flight train at all.
+     - **Read `superseded_by`'s shape.** It names one of two mechanisms, and only one of them is a
+       request id:
+       - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
+         coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
+         `orchestrator/src/orchestrator/merge_queue.py`). Do **not** poll it by `request_id` —
+         that returns an honest `unknown` which never resolves to anything else.
+       - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
+         (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).
+         Nothing was absorbed, and that id *is* pollable by `request_id`.
+     - **Resolve it by ancestry, not by re-polling the id you already hold.** Run the ancestry
+       disposition in [Deriving the landed sha](#deriving-the-landed-sha) — it already carries the
+       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. It has three
+       dispositions here, and **two of them are success**:
+       - **A stampable sha** — proceed with sub-steps **a–d** above.
+       - **Resolved, landed and already credited** — the `coalesce-*` arm's `done`-status
+         outcome: signal (a) shows the tip landed, and this task's scheduler status, re-read
+         fresh, already reads `done`. There is **nothing to stamp**, and that is **success, not
+         an abort**: skip sub-step (a), then run sub-steps **(c)** cleanup and **(d)**
+         `resolve_issue`, recording the tip merge sha in the resolution text. Without this
+         disposition a landed, correctly-credited task falls through to the polling exit below
+         and gets abandoned as in-flight — see [Deriving the landed
+         sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
+       - **Not resolved yet** — the two exits in the next bullet.
+
+       On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
+       not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
+       which exit applies, never whether a write is permitted.
+     - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
+       the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
+       clamped cadence) for whatever remains of step 8's 20-minute deadline, re-running the
+       ancestry disposition on each tick; or, once that deadline is spent, **ABORT with an
+       explicitly non-failure disposition** — report the branch as *in flight on a successor*,
+       naming the `superseded_by` value, and leave the escalation pending for a human. In neither
+       case call `merge_cancel`, and in neither case claim a failure: this is **not** the plain
+       abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
+       resubmit and never direct-merge while the successor is unresolved.
+
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
      [Deriving the landed sha](#deriving-the-landed-sha) below) to check whether this task's
@@ -391,12 +439,24 @@ eyeballed listing.
 - **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
-  `merge-queue/SKILL.md`: rules 2–3 govern rc=1 (take its **landed-but-not-credited** exit),
-  rule 2a governs rc=128-with-empty-marker (check the tip's merge marker and this task's
-  scheduler status; on either landing signal it is landed). In **neither** case
-  `merge_cancel`, and in neither case report not-landed. This is the one carve-out that most
-  matters here: this skill is fully autonomous, so a wrong not-landed reading cancels and
-  abandons work that actually landed.
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
+  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  argument rather than restating it; the disposition here is the **same on both arms**, and it
+  turns on re-reading this task's scheduler status **fresh**:
+  - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
+    **and already credited**. There is nothing to write: **skip sub-step (a) entirely** and
+    proceed to sub-steps **(c)** and **(d)**. This is a **success** path — not an abort, and not
+    a landed-but-not-credited report. (Sub-step (c)'s `git branch -d` will refuse on this arm:
+    the member ref is stale-by-rebase and not an ancestor of main. `git branch -D
+    task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+    starts with `-`; leaving the ref in place is also fine.)
+  - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
+    cannot read — **never write**. Keep polling to step 8's 20-minute ceiling, then take the
+    **landed-but-not-credited** report, citing the tip merge sha and the current status.
+
+  In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  the one carve-out that most matters here: this skill is fully autonomous, so a wrong
+  not-landed reading cancels and abandons work that actually landed.
 - **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
   it as either outcome.
 

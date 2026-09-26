@@ -67,8 +67,27 @@ contract](#doneprovenance-contract) for what a stamp must carry.
 ### Step 1 — exact-subject merge-marker search
 
 ```bash
-git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
+S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
 ```
+
+It prints the newest commit on main whose **subject** is exactly the marker, or nothing. The
+`--grep` half is a whole-message prefilter that git evaluates *during* the revision walk — there is
+no commit-message index, so it reads commit objects as it goes; the `awk` half is the subject
+selection, and **[it is not optional](#step-1-subject-check)** — the two paragraphs below are
+why, and why there is no `--max-count=1` here.
+
+**The `awk` has no `exit`, and putting one back breaks the pipeline.** A `{print $1; exit}` closes
+the pipe while `git log` is still walking, so git dies of `SIGPIPE` and the pipeline reports **141
+on its success path** — intermittently, because it is a race between git finishing the walk and
+`awk` exiting. Measured 2026-09-22 in this repo, on a query that printed the correct sha every
+time: 4 of 10 runs of the `exit` form returned 141, against 0 of 15 for the sticky-flag form above.
+Under `set -o pipefail` that aborts the surrounding block, or leaves the captured `sha` empty — and
+an empty `sha` reads everywhere here as *no marker on main*, a false **not-landed** verdict, which
+is the exact harm this section exists to prevent. An `|| true` would silence the 141, but it also
+silences genuine git failures such as `main` not resolving; the sticky flag keeps newest-first-wins
+without ever closing the pipe early.
 
 This mirrors the in-repo authority, `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`
 — the same function `merge_status`'s git-authority tier calls on the deleted-branch path.
@@ -81,8 +100,78 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 `task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or
 `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding it.
 
-- **Returned a sha** → go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
-- **Returned nothing** → go to [step 3](#step-3). An empty search is **not** a not-landed verdict.
+**Substring-safety is not subject-scoping, and the search alone does not give you the latter.**
+`git log --grep` matches the **whole commit message**, not the subject, so this command also
+returns any ordinary commit whose *body* happens to quote the marker string — a documentation
+commit describing this very mechanism, a revert, a commit message citing another task's merge.
+That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
+`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
+returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
+rather than the true train merge `d25b24468c` — which the command above does return. The
+substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
+about a body match.
+
+<a id="step-1-subject-check"></a>
+**So a hit is not a marker until its SUBJECT matches.** A message match whose subject is something
+else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
+[step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
+no further check, so this selection is the only thing standing between a body match and a stamped
+`done_provenance`. Equality is against the `_merge_subject` string you searched for; nothing weaker
+(prefix, substring, case-folded) counts.
+
+**Select the newest subject-matching hit — do not take the newest hit and then test it.** These
+differ, and the difference is a false negative on work that genuinely landed. `git log --grep
+--max-count=1` stops at the newest *message* match; if that one is a body match, testing it and
+rejecting it discards the search, and the genuine marker sitting deeper in history is never
+examined. The `awk` selection above keeps newest-first-wins while scanning past body matches, so it
+finds that marker instead. **Never reintroduce `--max-count=1`** — it is precisely what makes the
+guard lossy.
+
+**Re-adding it will look like a free optimization. It is a real one, and you take the cost anyway.**
+Selecting correctly means walking the whole history on every call, and when the marker is recent —
+the common case, a task you just landed — that is the difference between a short-circuit and a full
+walk. Measured 2026-09-22 over main's ~68k commits, against a marker a few hundred commits back:
+`--max-count=1` returned in a median ~0.08s (range 0.00–0.69s), the selecting form in a median
+~2.1s (range 1.3–3.0s). On a query with **no** match the two are indistinguishable — both walk
+everything — so benchmarking a missing marker will wrongly suggest the flag is free to restore.
+Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
+documentation commit as a merge. Note that **nothing enforces this mechanically** — no test greps
+these snippets for the flag, so this paragraph is the only thing standing between a plausible-looking
+optimization and a wrong `done_provenance`.
+
+The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
+quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches
+whose newest `--grep` hit is not a subject match, **8 of them shadowing a genuine marker** —
+`task/77`, `task/321`, `task/777`, `task/2637`, `task/3446`, `task/3698`, `task/4181`, `task/5668`.
+For `task/4181` the shadowed marker is `d25b24468c`; for `task/5668` the shadowing commit is a
+`Revert "Merge task/5668 into main"`, a reminder that locating a marker is not on its own proof the
+work is still present — that is what [step 2](#step-2)'s containment check and the server's
+effect-present check are for.
+
+Reading a subject back with `git log -1 --format=%s "<sha>"` is still the right spot check when you
+are holding a sha from somewhere else and want to know whether it is a marker. It is not a
+substitute for selecting correctly in the first place.
+
+Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
+command explicitly mirrors (`GitOps.find_merge_marker` resolves through `_lookup_merge_marker`'s
+full-message `%B` index, falling back to `_scan_merge_marker`'s bare `--grep`; both derive the
+pattern from `_merge_subject`, and neither restricts to merge commits nor checks the subject —
+`_merge_marker_pattern` is deliberately unanchored to mirror `--grep`), whose whole value is that
+writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
+measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker
+with a **single parent**, which `--merges` drops — and which the command above does return.
+Subject equality as selected above loses nothing and needs no divergence. (That claim is only true
+of the selecting form: paired with `--max-count=1` subject equality *was* lossy, in the 8 measured
+cases above.)
+
+The root cause is in that production lookup, which this doc faithfully mirrors; the shell-side
+subject check is the guard available to an agent. It is the same relationship [step 2](#step-2)'s
+containment check already has to `find_merge_marker`'s branch-existence gate: the agent re-supplies
+in the shell a guard the bare search does not carry. The production half is tracked as **task
+5765**; while that is open this shell-side guard is the only one there is.
+
+- **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
+- **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.
 
 <a id="step-2"></a>
 ### Step 2 — is the marker authoritative? Ref existence, then containment
@@ -90,8 +179,9 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 Establish ref existence per [Two entry points](#entry-points) — the `rev-parse --verify
 --quiet` probe, or the ancestry rc you already hold.
 
-- **ref rc≠0 / ancestry rc=128 (branch GONE)** → the marker **is** authoritative on its own.
-  This is the ordinary post-merge state, not an anomaly:
+- **ref rc≠0 / ancestry rc=128 (branch GONE)** → the marker **is** authoritative on its own —
+  *provided it passed [step 1](#step-1-subject-check)'s subject-equality check*, which is the only
+  guard on this arm. This is the ordinary post-merge state, not an anomaly:
   `orchestrator/src/orchestrator/git_ops.py::GitOps._delete_branch_if_on_main` deletes any
   branch carrying no commits beyond main, which is exactly what a successful merge leaves
   behind — it is "the single most common post-merge state". A deleted ref is also precisely the
@@ -104,7 +194,8 @@ Establish ref existence per [Two entry points](#entry-points) — the `rev-parse
   request), `found_on_main` when the work was already on main when you found it. Carry the `note`
   either way: it is **mandatory** for `found_on_main`, and it is what makes a `merged` stamp
   auditable.
-- **ref rc=0 / ancestry rc=0 or rc=1 (branch still EXISTS)** → the marker is **NOT authoritative
+- **ref rc=0 / ancestry rc=0 or rc=1 (branch still EXISTS)** → the marker (again, only one that
+  passed [step 1](#step-1-subject-check)'s subject-equality check) is **NOT authoritative
   on its own**, and `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in
   exactly that situation — it "prevents finding a stale merge marker from a *previous* run of a
   re-opened task that shared the same branch name". Running the search anyway (as we do, because
@@ -314,10 +405,13 @@ especially damaging at call sites already holding a server-issued `done`/`alread
 verdict.
 
 Instead follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
-successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status,
-honour rule 2b's **veto** (any non-`done` status means never self-stamp), confirm by content
-with `git cherry main task/<TASK_ID>`, and take rule 2b's **landed-but-not-credited** exit
-rather than reporting not-landed. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
+successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status, and
+on either landing signal the verdict is **landed** rather than not-landed. **Rule 2b licenses no
+write on this arm** — there is no self-stamp — exactly as rule 2a licenses none on the rc=128 arm
+below; the two arms agree. Rule 2b is the authority for the whole disposition — read which exit
+each scheduler status yields, its **landed-but-not-credited** report, and the `git cherry main
+task/<TASK_ID>` content proof (including why that proof cannot discharge the veto) from there, not
+from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is rc=1 a genuine
 not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
@@ -335,14 +429,15 @@ to prevent, and the one call sites act on hardest, since a not-landed reading he
 
 On that arm, follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" **rule 2a**, which governs precisely rc=128-with-empty-marker: check the **TIP's**
-merge marker on main and this task's own scheduler status, and on either landing signal take
-rule 2a's self-stamp (`found_on_main` with the tip merge sha) rather than reporting not-landed.
-[`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Here an
-empty rc=128 marker search does NOT mean 'not landed.'"* Note that rule 2a carries **no** veto
-on a non-`done` scheduler status — unlike rule 2b on the rc=1 arm — and merge-queue flags whether
-it should as an open question it deliberately leaves unaddressed; do not import 2b's veto here,
-and do not resolve that question from this doc. **rc=128-with-empty-marker is NOT not-landed on
-the `coalesce-*` arm.**
+merge marker on main and this task's own scheduler status, and on either landing signal the
+verdict is **landed** rather than not-landed. **Rule 2a licenses no write on this arm** — there
+is no self-stamp — exactly as rule 2b licenses none on the rc=1 arm; the two arms agree. Rule 2a
+is the authority for the whole disposition — read which exit each scheduler status yields, its
+**landed-but-not-credited** report, and why the `git cherry` content proof is unavailable on
+this arm from there, not from here.
+[`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Neither an
+empty rc=128 marker search nor rc=1 means 'not landed' here."* **rc=128-with-empty-marker is NOT
+not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is this a genuine
 not-landed outcome. There the branch ref is gone and nothing on main cites the task, so no ref
