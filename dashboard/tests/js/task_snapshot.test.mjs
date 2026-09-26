@@ -36,10 +36,22 @@ function loadTaskSnapshot() {
 
 const { api: snapshot, window: loadedWindow } = loadTaskSnapshot();
 const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
-const { isDatum, EM_DASH } = loadedWindow.DF_DATUM;
+const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
+const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal } = snapshot;
+const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
+const { VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
-const EXPECTED_FUNCTION_NAMES = ['projectCensus', 'censusOver'];
-const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'TASKS_ENDPOINT'];
+const EXPECTED_FUNCTION_NAMES = [
+  'projectCensus',
+  'censusOver',
+  'inFlightCount',
+  'runningOfInFlight',
+  'terminalOfTotal',
+  'censusTotal',
+  'censusSegments',
+  'censusHistory',
+];
+const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'TASKS_ENDPOINT', 'CENSUS_VIEWS', 'CENSUS_TILES'];
 
 // ── Fixtures: boundary sketch #1 ────────────────────────────────────────────
 //
@@ -249,7 +261,6 @@ test('censusOver: a delivered payload with no project in scope says so, not "not
 });
 
 test('censusOver: the total renders the placeholder, never a 0, when nothing is known', () => {
-  const { datumView } = loadedWindow.DF_DATUM;
   const view = datumView(censusOver({ TASKS_SNAPSHOT: {}, __receipt: {} }, null), {
     now: NOW,
     format: () => {
@@ -257,4 +268,230 @@ test('censusOver: the total renders the placeholder, never a 0, when nothing is 
     },
   });
   assert.equal(view.text, EM_DASH);
+});
+
+// ── The named readings ──────────────────────────────────────────────────────
+//
+// A surface's number is a `format` over the WHOLE census Datum — never a
+// per-view envelope the client built. datumView never invokes a format on a
+// hole, so no reading below ever sees a missing value, and none needs a guard.
+
+const byKey = (entries, key) => entries.find(e => e.key === key);
+
+test('CENSUS_VIEWS: the three generated views, in order, frozen', () => {
+  assert.deepEqual(CENSUS_VIEWS.map(v => v.key), ['in_flight', 'backlog', 'terminal']);
+  assert.deepEqual(CENSUS_VIEWS.map(v => v.key).sort(), Object.keys(VIEWS).sort());
+  assert.deepEqual(CENSUS_VIEWS.map(v => v.label), ['in-flight', 'backlog', 'terminal']);
+  assert.deepEqual(CENSUS_VIEWS.map(v => v.tone), ['accent', 'warn', 'ok']);
+  assert.ok(Object.isFrozen(CENSUS_VIEWS));
+  for (const v of CENSUS_VIEWS) {
+    assert.ok(Object.isFrozen(v), `${v.key} entry is frozen`);
+    assert.equal(typeof v.count, 'function', `${v.key}.count`);
+    assert.equal(typeof v.reading, 'function', `${v.key}.reading`);
+  }
+});
+
+test('CENSUS_TILES: members, not views — each paired with the burndown series of that member', () => {
+  // Burndown persists MEMBERS; a view-level tile beside a member series would
+  // be a spark of a different quantity than its headline.
+  assert.deepEqual(
+    CENSUS_TILES.map(t => [t.key, t.label, t.series, t.tone]),
+    [
+      ['running', 'Running / in-flight', 'in_progress', 'accent'],
+      ['blocked', 'Blocked', 'blocked', 'bad'],
+      ['pending', 'Pending', 'pending', 'warn'],
+    ],
+  );
+  assert.ok(Object.isFrozen(CENSUS_TILES));
+  const membersShown = { running: SUB_VIEWS.running, blocked: ['blocked'], pending: ['pending'] };
+  for (const t of CENSUS_TILES) {
+    assert.ok(Object.isFrozen(t), `${t.key} entry is frozen`);
+    assert.deepEqual(
+      membersShown[t.key].map(member => member.replace('-', '_')),
+      [t.series],
+      `${t.key}'s spark must be the history of the member its headline shows`,
+    );
+  }
+});
+
+test('the retired "active" word appears in no label and no reading', () => {
+  const labels = [...CENSUS_VIEWS, ...CENSUS_TILES].map(e => e.label);
+  const readings = [
+    ...CENSUS_VIEWS.flatMap(v => [v.count, v.reading]),
+    ...CENSUS_TILES.map(t => t.reading),
+    inFlightCount,
+    runningOfInFlight,
+    terminalOfTotal,
+    censusTotal,
+  ].map(reading => reading(DF_CENSUS_VALUE));
+  for (const text of [...labels, ...readings]) {
+    assert.doesNotMatch(text, /active/i, `"${text}"`);
+  }
+});
+
+// ── The surface table: boundary sketches #1–#3 ─────────────────────────────
+//
+// One row per rendered surface, naming the census it reads and the reading its
+// JSX passes as `format`. The JSX wiring to exactly these pairs is pinned in
+// the Python structural suites; here the pairs are EXECUTED.
+
+const perProject = data => projectCensus(data, 'dark-factory');
+const fleet = data => censusOver(data, null);
+const runningTile = byKey(CENSUS_TILES, 'running');
+
+const VIEW_READING_TEXT = { in_flight: '25 running of 43 in-flight', backlog: '1310 backlog', terminal: '4106 terminal' };
+const VIEW_COUNT_TEXT = { in_flight: '43', backlog: '1310', terminal: '4106' };
+const TILE_READING_TEXT = { running: '25 / 43', blocked: '10', pending: '1300' };
+
+const SURFACES = [
+  ['OrchTab Progress header', perProject, () => terminalOfTotal, '4106/5459'],
+  ...CENSUS_VIEWS.map(v => [`OrchTab pip + legend (${v.key})`, perProject, () => v.reading, VIEW_READING_TEXT[v.key]]),
+  ...CENSUS_VIEWS.map(v => [`OrchTab filter button (${v.key})`, perProject, () => v.count, VIEW_COUNT_TEXT[v.key]]),
+  ...CENSUS_TILES.map(t => [`OrchTab tile (${t.key})`, fleet, () => t.reading, TILE_READING_TEXT[t.key]]),
+  ['Overview running tile', fleet, () => runningTile.reading, '25 / 43'],
+  ['Overview pipeline total', fleet, () => censusTotal, '5459 total'],
+  ['Overview Orchestrators table Terminal cell', perProject, () => terminalOfTotal, '4106/5459'],
+  ['topbar pill', fleet, () => runningOfInFlight, '25 running of 43 in-flight'],
+  ['rail badge', fleet, () => inFlightCount, '43'],
+];
+
+function oneProjectData(census, rows) {
+  return sketchData({ TASKS_SNAPSHOT: { 'dark-factory': entryWith(census, rows || FRESH_ROWS) } });
+}
+
+test('#1 fresh: every surface renders exactly the named number, no tooltip, no badge', () => {
+  const data = oneProjectData(datumIn('fresh', DF_CENSUS_VALUE));
+  for (const [surface, censusOf, readingOf, expected] of SURFACES) {
+    const view = datumView(censusOf(data), { now: NOW, format: readingOf() });
+    assert.equal(view.text, expected, surface);
+    assert.equal(view.title, null, `${surface}: title`);
+    assert.equal(view.age, null, `${surface}: age`);
+  }
+});
+
+test('#1 fresh: the topbar and the rail read ONE fleet datum and show one in-flight number', () => {
+  const data = oneProjectData(datumIn('fresh', DF_CENSUS_VALUE));
+  const tasksCensus = censusOver(data, null);
+  const topbar = datumView(tasksCensus, { now: NOW, format: runningOfInFlight }).text;
+  const rail = datumView(tasksCensus, { now: NOW, format: inFlightCount }).text;
+  assert.equal(topbar.match(/of (\d+) in-flight/)[1], rail);
+});
+
+function spyOn(reading) {
+  const spy = value => {
+    spy.calls += 1;
+    return reading(value);
+  };
+  spy.calls = 0;
+  return spy;
+}
+
+test('#2 unknown: every surface renders the placeholder with the reason — never 0, never 0/1', () => {
+  const served = oneProjectData(datumIn('unknown', null, { reason: 'not yet fetched' }));
+  const preFetch = { TASKS_SNAPSHOT: {}, __receipt: {} };
+  for (const data of [served, preFetch]) {
+    for (const [surface, censusOf, readingOf] of SURFACES) {
+      const format = spyOn(readingOf());
+      const view = datumView(censusOf(data), { now: NOW, format });
+      assert.equal(view.text, EM_DASH, surface);
+      assert.match(view.title, /not yet fetched/, `${surface}: title`);
+      assert.equal(format.calls, 0, `${surface}: format ran on a hole`);
+      assert.doesNotMatch(view.text, /0/, surface);
+    }
+  }
+});
+
+test('#3 stale: the aged value renders, with its reason and a growing age badge', () => {
+  const threeHoursBefore = new Date(Date.parse(SERVED_AT) - 3 * 3600_000).toISOString();
+  const data = oneProjectData(
+    datumIn('stale', DF_CENSUS_VALUE, { as_of: threeHoursBefore, reason: 'ReadTimeout' }),
+  );
+  for (const [surface, censusOf, readingOf, expected] of SURFACES) {
+    const census = censusOf(data);
+    const view = datumView(census, { now: NOW, format: readingOf() });
+    assert.equal(view.text, expected, surface);
+    assert.match(view.title, /ReadTimeout/, `${surface}: title`);
+    assert.equal(view.age, staleness.formatAge(displayedAgeMs(census, NOW)), `${surface}: age`);
+    assert.equal(view.age, '3h', `${surface}: age`);
+
+    const anHourLater = datumView(census, { now: NOW + 3600_000, format: readingOf() });
+    assert.equal(anHourLater.age, '4h', `${surface}: the age must grow with no new payload`);
+  }
+});
+
+test('the reported shape cannot render: an unknown census beside 33 in-flight rows', () => {
+  // The bug this leaf closes: the Progress card said "0/1" while the filter bar
+  // counted 33 rows. Both now read the census, so both say the same thing.
+  const rows = Array.from({ length: 33 }, (_, i) => ({ id: i, project: 'dark-factory', status: 'in-progress' }));
+  const data = oneProjectData(datumIn('unknown'), datumIn('fresh', rows));
+  const census = perProject(data);
+  const inFlight = byKey(CENSUS_VIEWS, 'in_flight');
+
+  assert.equal(datumView(census, { now: NOW, format: terminalOfTotal }).text, EM_DASH);
+  assert.equal(datumView(census, { now: NOW, format: inFlight.count }).text, EM_DASH);
+});
+
+// ── censusSegments: the Progress and pipeline bar widths ────────────────────
+
+test('censusSegments: fresh — one segment per view, in view order, summing to 100', () => {
+  const segments = censusSegments(perProject(oneProjectData(datumIn('fresh', DF_CENSUS_VALUE))));
+  assert.deepEqual(segments.map(s => [s.key, s.tone]), CENSUS_VIEWS.map(v => [v.key, v.tone]));
+  assert.ok(Math.abs(segments.reduce((sum, s) => sum + s.share, 0) - 100) < 1e-9);
+  assert.equal(byKey(segments, 'terminal').share, (4106 / 5459) * 100);
+});
+
+test('censusSegments: stale — the widths come from the aged value (sketch #3)', () => {
+  const fresh = censusSegments(perProject(oneProjectData(datumIn('fresh', DF_CENSUS_VALUE))));
+  const stale = censusSegments(perProject(oneProjectData(datumIn('stale', DF_CENSUS_VALUE))));
+  assert.deepEqual(stale, fresh);
+});
+
+test('censusSegments: a measured empty census has zero-width segments, never NaN', () => {
+  const empty = {
+    counts: Object.fromEntries(Object.keys(DF_CENSUS_VALUE.counts).map(k => [k, 0])),
+    total: 0,
+    views: { in_flight: 0, backlog: 0, terminal: 0 },
+    sub_views: { running: 0 },
+  };
+  const segments = censusSegments(perProject(oneProjectData(datumIn('fresh', empty))));
+  assert.equal(segments.length, CENSUS_VIEWS.length);
+  for (const s of segments) assert.equal(s.share, 0, s.key);
+});
+
+test('censusSegments: an unknown census draws no bar at all', () => {
+  assert.deepEqual(censusSegments(perProject(oneProjectData(datumIn('unknown')))), []);
+});
+
+// ── censusHistory: the tile spark, over the tile's own scope ────────────────
+
+const BURNDOWN_DATA = {
+  BURNDOWN: { labels: ['a', 'b', 'c'], in_progress: [1, 2, 3], blocked: [4, 5, 6], pending: [7, 8, 9] },
+  BURNDOWN_BY_PROJECT: {
+    'dark-factory': { labels: ['a', 'b'], in_progress: [10, 11], blocked: [12, 13], pending: [14, 15] },
+  },
+};
+
+test('censusHistory: no project filter reads the server aggregate', () => {
+  for (const t of CENSUS_TILES) {
+    assert.deepEqual(censusHistory(BURNDOWN_DATA, null, t), BURNDOWN_DATA.BURNDOWN[t.series], t.key);
+  }
+});
+
+test('censusHistory: one project reads that project\'s series', () => {
+  for (const t of CENSUS_TILES) {
+    assert.deepEqual(
+      censusHistory(BURNDOWN_DATA, ['dark-factory'], t),
+      BURNDOWN_DATA.BURNDOWN_BY_PROJECT['dark-factory'][t.series],
+      t.key,
+    );
+    assert.deepEqual(censusHistory(BURNDOWN_DATA, ['hive'], t), [], `${t.key}: absent project`);
+  }
+});
+
+test('censusHistory: two or more projects draw no spark — no client re-aggregation', () => {
+  // Summing ragged per-project series would be a second copy of
+  // redux_api.py::shape_burndown's aggregation. A missing spark is honest.
+  for (const t of CENSUS_TILES) {
+    assert.equal(censusHistory(BURNDOWN_DATA, ['dark-factory', 'reify'], t), null, t.key);
+  }
 });
