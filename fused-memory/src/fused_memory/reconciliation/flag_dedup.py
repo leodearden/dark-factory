@@ -865,11 +865,25 @@ class EntityStandingSuppressionResult:
     - ``grounds_by_decision`` — ``{entity_uuid(lower): grounds}`` for each
       decision that suppressed at least one flag (observability + escalation
       detail).
+    - ``suppression_evaluated`` — True when the active-decision index was
+      consulted and every flag was evaluated against it, so a decision absent
+      from ``suppressed_by_decision`` really did go quiet this cycle. False
+      marks a fail-open cycle that observed nothing; cross-cycle streak
+      accounting (:func:`update_suppression_streaks`) must neither increment
+      nor reset on it, because an unread ledger is not evidence that a
+      decision went quiet. An empty flag batch stays True: a cycle with
+      nothing to suppress is a cycle in which no decision drained anything.
     """
 
     kept_flags: list[dict[str, Any]]
     suppressed_by_decision: dict[str, int]
     grounds_by_decision: dict[str, str]
+    suppression_evaluated: bool = True
+
+    @classmethod
+    def empty_batch(cls) -> EntityStandingSuppressionResult:
+        """The evaluated, nothing-suppressed outcome of an empty flag batch."""
+        return cls(kept_flags=[], suppressed_by_decision={}, grounds_by_decision={})
 
 
 def _match_entity_standing_decision(
@@ -1010,7 +1024,9 @@ async def filter_entity_standing_decisions(
     *flags* is empty, or ``memory_service.recon_ledger`` is unset/``None``, or
     the ledger read raises, NO suppression is applied this cycle (all flags
     kept) — a ledger read failure must never hide a finding. The ledger-None
-    path logs DEBUG; the read-exception path logs WARNING.
+    path logs DEBUG; the read-exception path logs WARNING. Those two ledger
+    fail-open returns carry ``suppression_evaluated=False``; the empty-flags
+    return does not (see :class:`EntityStandingSuppressionResult`).
 
     A read row is not automatically a licence to suppress: rows whose TTL has
     lapsed and entities carrying more than one active row are dropped from the
@@ -1027,9 +1043,7 @@ async def filter_entity_standing_decisions(
     recurrence history is preserved (see the consolidator wiring).
     """
     if not flags:
-        return EntityStandingSuppressionResult(
-            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
-        )
+        return EntityStandingSuppressionResult.empty_batch()
 
     ledger = getattr(memory_service, 'recon_ledger', None)
     if ledger is None:
@@ -1040,7 +1054,10 @@ async def filter_entity_standing_decisions(
             len(flags),
         )
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
         )
 
     try:
@@ -1057,7 +1074,10 @@ async def filter_entity_standing_decisions(
             exc_info=True,
         )
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
         )
 
     active_by_uuid = _index_active_standing_decisions(
