@@ -14414,3 +14414,144 @@ class TestUpdateSuppressionStreaksFailSafe:
             rec.levelno == logging.WARNING and _ESD_U1 in rec.getMessage()
             for rec in caplog.records
         ), 'a WARNING naming the failed entity must be logged'
+
+
+# ---------------------------------------------------------------------------
+# maybe_escalate_suppression_streak — the streak arm's filer (task 2943)
+# ---------------------------------------------------------------------------
+
+
+def _streak_update(
+    entity_uuid: str = _ESD_U1, streak: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES + 1
+) -> flag_dedup.SuppressionStreakUpdate:
+    return flag_dedup.SuppressionStreakUpdate(
+        entity_uuid=entity_uuid,
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        streak=streak,
+        escalate=streak >= SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+    )
+
+
+class TestMaybeEscalateSuppressionStreak:
+    """Streak escalation filing, against a REAL EscalationQueue (task 2943 step-11).
+
+    A mock cannot witness a fold, a dedupe_count, or whether two records share
+    a fingerprint, and those are what this filer's contract is about.
+    """
+
+    _PID = 'p'
+    _RUN = 'run-1'
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path / 'escalations')
+
+    @staticmethod
+    def _pending(queue, entity_uuid: str = _ESD_U1) -> list:
+        return queue.get_by_task(entity_uuid, status='pending', level=1)
+
+    @pytest.mark.asyncio
+    async def test_escalating_update_files_one_storm_category_record(self, queue):
+        update = _streak_update()
+        escalated = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [update]
+        )
+        assert escalated == [_ESD_U1]
+
+        (esc,) = self._pending(queue)
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == CATEGORY_STANDING_DECISION_STORM
+        assert esc.agent_role == 'reconciliation-stage1'
+        assert esc.task_id == _ESD_U1
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert _ESD_U1 in blob
+        assert GROUNDS_STRUCTURAL_SIZE_CONFLATION in blob
+        assert f'streak: {update.streak}' in esc.detail
+        assert f'threshold: {SUPPRESSION_STREAK_THRESHOLD_CYCLES}' in esc.detail
+
+    @pytest.mark.asyncio
+    async def test_update_below_threshold_files_nothing(self, queue):
+        below = _streak_update(streak=SUPPRESSION_STREAK_THRESHOLD_CYCLES - 1)
+        assert below.escalate is False
+        escalated = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [below]
+        )
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_streak_and_per_cycle_storm_never_fold_into_each_other(self, queue):
+        """Same entity, same cycle, both escapes: two records, two fingerprints.
+
+        A flood in one cycle and a persistent low-grade drain are different
+        diagnoses; folding either into the other would hide it for any entity
+        that had ever tripped the other escape.
+        """
+        await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, _storm_result()
+        )
+        await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [_streak_update()]
+        )
+
+        pending = self._pending(queue)
+        assert len(pending) == 2
+        assert pending[0].dedupe_fingerprint != pending[1].dedupe_fingerprint
+        assert all(esc.dedupe_count == 0 for esc in pending)
+
+    @pytest.mark.asyncio
+    async def test_two_entities_each_get_their_own_record(self, queue):
+        escalated = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [_streak_update(_ESD_U1), _streak_update(_ESD_U2)]
+        )
+        assert sorted(escalated) == sorted([_ESD_U1, _ESD_U2])
+        (first,) = self._pending(queue, _ESD_U1)
+        (second,) = self._pending(queue, _ESD_U2)
+        assert first.dedupe_fingerprint != second.dedupe_fingerprint
+
+    @pytest.mark.asyncio
+    async def test_recurring_streak_folds_into_one_parent(self, queue):
+        """A streak keeps firing past K every suppressing cycle; each recurrence
+        folds onto the first record rather than minting a new one."""
+        assert await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, 'run-3', [_streak_update(streak=3)]
+        ) == [_ESD_U1]
+
+        second = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, 'run-4', [_streak_update(streak=4)]
+        )
+
+        assert second == [], 'a folded recurrence is not a new filing'
+        (parent,) = self._pending(queue)
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_escalation_unavailable_returns_empty(self, queue, monkeypatch):
+        monkeypatch.setattr(flag_dedup, 'Escalation', None, raising=False)
+        escalated = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [_streak_update()]
+        )
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_logs_warning_and_excludes_entity(self, tmp_path, caplog):
+        from escalation.queue import EscalationQueue
+
+        class _BrokenQueue(EscalationQueue):
+            def submit(self, escalation):
+                raise RuntimeError('boom')
+
+        queue = _BrokenQueue(tmp_path / 'escalations')
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            escalated = await flag_dedup.maybe_escalate_suppression_streak(
+                queue, self._PID, self._RUN, [_streak_update()]
+            )
+        assert escalated == []
+        assert any(
+            rec.levelno == logging.WARNING and _ESD_U1 in rec.getMessage()
+            for rec in caplog.records
+        ), 'a WARNING naming the entity must be logged'
