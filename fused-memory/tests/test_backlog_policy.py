@@ -256,9 +256,10 @@ async def test_second_window_folds_into_the_one_pending_record(
     # being dropped by the rate limit.
     assert child_id != body['id']
 
-    # The four policy-only keys survive the fold: neither Escalation.to_json()
-    # (submit) nor from_json -> _rewrite (attach_dedupe_child) round-trips
-    # them, so both branches must re-merge.
+    # The record's identity survives the fold: project_id as a dataclass
+    # field, the policy-only keys because both branches re-merge them —
+    # neither Escalation.to_json() (submit) nor from_json -> _rewrite
+    # (attach_dedupe_child) round-trips them.
     assert body['project_id'] == 'proj'
     assert body['error_type'] == 'ReconciliationBacklogExceeded'
     assert body['backlog'] == 12
@@ -1191,8 +1192,8 @@ class TestOnJudgeUnhalt:
 
         # The CLOSED record must still identify its project and fault kind.
         # resolve() persists Escalation.to_json(), and from_dict keeps only
-        # dataclass fields, so without a re-merge these four policy-owned keys
-        # are destroyed on close — and the forensic query that diagnosed this
+        # dataclass fields, so without a re-merge the policy-owned keys are
+        # destroyed on close — and the forensic query that diagnosed this
         # incident ('which escalation files carry ReconciliationJudgeHalted')
         # stops working against every auto-closed record.
         persisted = _persisted_record(esc_dir, halt_id)
@@ -1483,7 +1484,7 @@ class TestPolicyKeyCoupling:
 
     The constant is consumed by the close path and the write path, and nothing
     about the language couples the two: before ``_policy_keys`` the write path
-    repeated the four names in a literal, so adding a fifth key would have
+    repeated the names in a literal, so adding a key would have
     restored it on close while never stamping it on write — leaving a key that
     exists only on archived records. These pin both halves of the coupling.
     """
@@ -1512,16 +1513,15 @@ class TestDegradedFilingPaths:
     """What the policy REPORTS when a record is filed but cannot be stamped.
 
     Filing is two phases — ``submit_or_dedupe`` then the policy-key merge — so
-    a record can exist on disk while carrying none of the keys that make it
-    attributable. ``queue.submit`` persists ``Escalation.to_json()`` and
+    a record can exist on disk while carrying none of the keys that attribute
+    it to a fault kind. ``queue.submit`` persists ``Escalation.to_json()`` and
     ``attach_dedupe_child`` re-hydrates through ``Escalation.from_json``, so
     BOTH phases strip them and only the merge puts them back.
 
-    A record in that state cannot be auto-closed: ``on_judge_unhalt`` skips
-    every candidate whose ``project_id`` does not match. So the verdict must
-    report NO path — ``harness._notify_judge_halt`` claims its per-process halt
-    sentinel only on a non-None ``escalation_path``, and claiming it on an
-    unattributable record retires the retry that would have rescued it.
+    So the verdict must report NO path — ``harness._notify_judge_halt`` claims
+    its per-process halt sentinel only on a non-None ``escalation_path``, and
+    claiming it on such a record retires the retry whose merge would restore
+    the keys.
     """
 
     @staticmethod
@@ -1579,26 +1579,25 @@ class TestDegradedFilingPaths:
         assert verdict.escalation_path is None
         assert 'could not stamp' in caplog.text
 
+        # What queue.submit actually persisted: the constructor's fields only.
+        [filed] = (project_root / 'data' / 'escalations').glob(
+            'esc-reconciliation-backlog-*.json',
+        )
+        record = json.loads(filed.read_text(encoding='utf-8'))
+        assert record['project_id'] == 'proj'
+        assert 'error_type' not in record
+
     @pytest.mark.asyncio
     async def test_a_fold_whose_merge_fails_also_reports_no_path(
         self, event_buffer, tmp_path, monkeypatch, caplog,
     ):
         """The fold branch degrades the SAME way, because it breaks the same way.
 
-        Measured on this branch: ``attach_dedupe_child`` re-hydrates through
-        ``Escalation.from_json``, so a fold strips the policy keys its parent's
-        own first merge put there. A fold whose merge then fails leaves exactly
-        the unattributable record a failed first write leaves — so reporting
-        the parent's path here would claim the halt sentinel on a record
-        nothing can ever close.
-
-        ``project_id`` is the ONE member of ``_POLICY_ONLY_KEYS`` that is NOT
-        stripped any more, which is why the assertion below names
-        ``error_type`` instead: task 4951 made ``project_id`` a real
-        ``Escalation`` field, so it now survives the round-trip that still
-        strips its three siblings. The contract under test is unchanged — the
-        record remains unattributable to a FAULT KIND, which is what the
-        degraded no-path report exists to signal.
+        ``attach_dedupe_child`` re-hydrates through ``Escalation.from_json``,
+        so a fold strips the policy keys its parent's own first merge put
+        there. A fold whose merge then fails leaves exactly the record a failed
+        first write leaves — so reporting the parent's path here would claim
+        the halt sentinel on a record missing its fault kind.
         """
         await _seed_buffered(event_buffer, 'proj', n=12)
         project_root = tmp_path / 'proj_root'
@@ -1634,9 +1633,9 @@ class TestDegradedFilingPaths:
             Path(first.escalation_path).read_text(encoding='utf-8'),
         )
         assert parent['dedupe_count'] == 1
-        # And the record really is unattributable, which is why no path is
-        # named. Asserted on ``error_type`` rather than ``project_id`` — only
-        # the latter became a dataclass field in 4951 (see docstring).
+        # And the record really lacks its fault kind, which is why no path is
+        # named — while its project, a dataclass field, survives.
+        assert parent['project_id'] == 'proj'
         assert 'error_type' not in parent
 
     @pytest.mark.asyncio

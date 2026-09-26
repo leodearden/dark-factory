@@ -96,9 +96,11 @@ _ESC_ID_PREFIXES: dict[str, str] = {
 # so the fold key and the record's own category can never drift apart.
 _ESCALATION_CATEGORY = 'infra_issue'
 
-# Keys BacklogPolicy stamps onto its escalation records. THREE queue
-# operations destroy them, not one, because each persists a record
-# round-tripped through the dataclass:
+# Keys BacklogPolicy stamps onto its escalation records that are NOT
+# ``Escalation`` dataclass fields (the record's project IS one — the
+# ``project_id`` field, set at construction). THREE queue operations destroy
+# these keys, not one, because each persists a record round-tripped through
+# the dataclass:
 #   * ``EscalationQueue.resolve()`` rewrites from ``Escalation.to_json()``
 #     (== ``asdict(Escalation)``) — the close path;
 #   * ``EscalationQueue.submit()`` persists the same ``to_json()`` — so the
@@ -111,26 +113,16 @@ _ESCALATION_CATEGORY = 'infra_issue'
 # That is why ``_merge_onto_persisted`` runs on the write and fold paths
 # (``_maybe_write_escalation``) as well as the close path
 # (``_restore_policy_keys``).
-#
-# ``project_id`` is no longer one of the non-field keys — task 4951 made it a
-# first-class ``Escalation`` field, so it alone now survives all three
-# operations above. It stays in this constant because the ``Escalation(...)``
-# call in ``_maybe_write_escalation`` still does not pass ``project_id=``:
-# this merge remains the only thing that puts the value on the record, and
-# dropping the name here without adding that constructor argument would remove
-# project attribution outright.
-_POLICY_ONLY_KEYS: tuple[str, ...] = ('project_id', 'error_type', 'backlog', 'threshold')
+_POLICY_ONLY_KEYS: tuple[str, ...] = ('error_type', 'backlog', 'threshold')
 
 
-def _policy_keys(
-    project_id: str, error_type: str, backlog: int, threshold: int,
-) -> dict[str, Any]:
+def _policy_keys(error_type: str, backlog: int, threshold: int) -> dict[str, Any]:
     """Build the policy-only mapping FROM ``_POLICY_ONLY_KEYS``.
 
     The constant is the single definition of WHICH keys this policy owns, so
-    the write path derives its mapping from it instead of repeating the four
+    the write path derives its mapping from it instead of repeating the
     names in a literal beside it. ``strict=True`` is what makes the coupling
-    enforced rather than merely asserted in prose: add a fifth name to the
+    enforced rather than merely asserted in prose: add a name to the
     constant without adding its value here and the next escalation write fails
     loudly, instead of the key quietly existing only on records the close path
     has touched.
@@ -144,7 +136,7 @@ def _policy_keys(
     """
     return dict(zip(
         _POLICY_ONLY_KEYS,
-        (project_id, error_type, backlog, threshold),
+        (error_type, backlog, threshold),
         strict=True,
     ))
 
@@ -401,14 +393,9 @@ class BacklogPolicy:
 
         Only ``judge_halt``-prefixed records that are still ``pending`` AND
         carry a matching ``project_id`` are touched — backlog/wedge records
-        and other projects' halts are left alone. The project filter reads the
-        RAW json. That was once the only option, because
-        ``Escalation.from_dict`` kept only dataclass fields and therefore
-        DROPPED the ``project_id`` key this policy writes. Task 4951 made
-        ``project_id`` a real field, so ``get_pending()`` is filterable by
-        project now — including for records written before 4951, whose raw key
-        ``from_dict`` reads into the field. The raw read is kept because it is
-        still correct here, not because it is still forced.
+        and other projects' halts are left alone. Candidates are read as RAW
+        json because ``_restore_policy_keys`` needs the non-field policy keys
+        that ``Escalation.from_dict`` drops.
 
         Returns the ids actually resolved (empty when there is nothing to do),
         so the caller can report them to the operator. An id is reported ONLY
@@ -586,9 +573,8 @@ class BacklogPolicy:
 
         ``resolve()`` persists ``Escalation.to_json()``, and ``from_dict``
         keeps only dataclass fields, so closing a halt silently strips
-        ``project_id``/``error_type``/``backlog``/``threshold`` — see
-        ``_POLICY_ONLY_KEYS``. Re-merging keeps an auto-closed halt
-        attributable to its project and its fault kind.
+        ``error_type``/``backlog``/``threshold`` — see ``_POLICY_ONLY_KEYS``.
+        Re-merging keeps an auto-closed halt attributable to its fault kind.
 
         Best-effort by construction: ``_merge_onto_persisted`` logs and
         swallows every failure. A record that IS closed but lost its forensic
@@ -812,11 +798,12 @@ class BacklogPolicy:
 
         The ONE thing that overrides that, on both the submit and the fold
         branch, is a record the policy keys could not be stamped onto: it
-        cannot be attributed to a project, so ``on_judge_unhalt`` can never
-        close it, and naming it here would claim the sentinel on a record that
-        stays pending forever. Reporting None there trades a bounded cost (the
-        callback re-enters, and the rate-limit gate turns each one away at
-        INFO) for an unbounded one. See the merge site below.
+        names its project but not its fault kind, and naming it here would
+        claim the sentinel and so retire the re-file whose merge would restore
+        those keys. Reporting None there trades a bounded cost (the callback
+        re-enters, and the rate-limit gate turns each one away at INFO) for a
+        record that stays out of the fault-kind forensic query. See the merge
+        site below.
 
         PRIOR-TASK INTERACTION, recorded rather than absorbed. A 900s
         cadence is the ``dedupe_children`` growth case task 4335 describes
@@ -926,6 +913,7 @@ class BacklogPolicy:
             level=1,
             workflow_state='infra',
             dedupe_fingerprint=fingerprint,
+            project_id=project_id,
         )
         # BROAD by intent, and the breadth is the point. This used to guard a
         # single ``path.write_text`` where OSError was the whole failure
@@ -1002,7 +990,7 @@ class BacklogPolicy:
         # (stamped by attach_dedupe_child) and dedupe_count/dedupe_children
         # (the queue's to write).
         outcome = self._merge_onto_persisted(esc_dir, record_id, {
-            **_policy_keys(project_id, error_type, backlog, threshold),
+            **_policy_keys(error_type, backlog, threshold),
             'summary': summary,
             'detail': detail,
         })
@@ -1018,33 +1006,29 @@ class BacklogPolicy:
             return None
         if not outcome.merged:
             # Located, but the merge WRITE did not land — so the record on disk
-            # carries NONE of the policy keys. Without ``project_id`` it is
-            # un-attributable, and on_judge_unhalt (which skips every candidate
-            # whose project_id does not match) can never auto-close it: the
-            # 'pending halt the dashboard shows forever' symptom task 2998
-            # exists to prevent.
+            # carries NONE of the policy keys. It still names its project (the
+            # ``project_id`` field, so on_judge_unhalt can close it), but not
+            # its fault kind: it drops out of the 48h-reify forensic query.
             #
-            # BOTH BRANCHES, not just the first write. Measured on this branch:
-            # attach_dedupe_child re-hydrates through Escalation.from_json, so
-            # a fold strips the same four keys its parent's own first merge put
-            # there — stamp them, fold once, and they are gone again. A fold
-            # whose merge fails therefore leaves exactly the same broken record
-            # as a first write whose merge fails, and treating the two
-            # differently would enforce the invariant on only one of the paths
-            # that can break it.
+            # BOTH BRANCHES, not just the first write. attach_dedupe_child
+            # re-hydrates through Escalation.from_json, so a fold strips the
+            # same keys its parent's own first merge put there. A fold whose
+            # merge fails therefore leaves exactly the same record as a first
+            # write whose merge fails, and treating the two differently would
+            # enforce the invariant on only one of the paths that can break it.
             #
             # Report NO path. harness._notify_judge_halt claims its per-process
             # halt sentinel only on a non-None escalation_path, and claiming it
-            # here retires the one thing that rescues this state: the next tick
+            # here retires the one thing that restores the keys: the next tick
             # re-filing, folding into the pending parent, and re-attempting the
             # merge. The cost of standing down instead is bounded and cheap —
             # the halt re-enters on each ~5s tick, and every one of those is
             # turned away by the rate-limit gate at INFO until the window
-            # reopens. A permanently un-closable pending record is not bounded.
+            # reopens.
             logger.error(
                 'backlog_policy: filed %s for %s (kind=%s) but could not stamp '
                 '%s onto it — reporting no escalation path so the next tick '
-                're-files rather than standing down on an unattributable record',
+                're-files rather than standing down on a record missing them',
                 record_id, project_id, kind, sorted(_POLICY_ONLY_KEYS),
             )
             return None
