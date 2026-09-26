@@ -5,6 +5,7 @@ literals in the test. Nothing touches the network, torch or a live store.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import types
 from pathlib import Path
@@ -22,6 +23,13 @@ SCRIPTS = Path(__file__).parent.parent / 'scripts'
 @functools.cache
 def _mod() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'eval_write_triage_reranker.py', 'eval_write_triage_reranker')
+
+
+@functools.cache
+def _arms() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
+    )
 
 
 def _record(memory_id: str, cluster_id: str, label: str = 'duplicate') -> dict:
@@ -208,3 +216,161 @@ class TestBaselineScores:
         case = _case(_record('d1', 'c1'), [_row('c1', None), _row('x', 0.3)])
         metrics = _mod().ranking_metrics([case], [_mod().baseline_scores(case)], aliases=None)
         assert (metrics.rank1.hits, metrics.rank5.hits) == (0, 1)
+
+
+class _FakeScorer:
+    """Answers each entry from *answers*; ``calls`` lists the entries it was asked about."""
+
+    def __init__(self, answers: dict, *, facts=None, fail_on_call: int | None = None) -> None:
+        self.answers = answers
+        self.calls: list[str] = []
+        self.fail_on_call = fail_on_call
+        self._facts = facts or _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+
+    def score(self, entry: str, candidate_texts):
+        self.calls.append(entry)
+        if self.fail_on_call == len(self.calls):
+            raise RuntimeError('boom')
+        return self.answers[entry]
+
+    def facts(self):
+        return self._facts
+
+
+def _spec(scorer: _FakeScorer | None = None, *, name: str = 'fake', unavailable=None, log=None):
+    arms = _arms()
+
+    @contextlib.contextmanager
+    def open_(context):
+        if unavailable is not None:
+            raise unavailable
+        try:
+            yield scorer
+        finally:
+            if log is not None:
+                log.append('closed')
+
+    return arms.ArmSpec(
+        name=name, arm_class=arms.ArmClass.local_cross_encoder, model='fake-model', open=open_,
+    )
+
+
+def _context():
+    return _arms().ArmContext(
+        device='cpu', local_batch_size=4, vram_cap_gib=8.0, pairwise_concurrency=20,
+    )
+
+
+def _slate(scores: tuple, cost: float | None = 0.0, over: int | None = 0):
+    return _arms().SlateScores(scores=scores, cost_usd=cost, pairs_over_max_length=over)
+
+
+def _measure(spec, cases: list, clock: list, *, max_spend_usd: float = 10.0, aliases=None):
+    return _mod().measure_arm(
+        spec, cases, aliases=aliases, context=_context(),
+        clock=iter(clock).__next__, max_spend_usd=max_spend_usd,
+    )
+
+
+_METRIC_KEYS = (
+    'rank1_rate', 'rank5_rate', 'rank1', 'rank5', 'auc', 'p50_seconds', 'p95_seconds',
+    'latency', 'cost_per_write_usd', 'device', 'vram_peak_mib', 'max_length',
+    'pairs_over_max_length',
+)
+
+
+class TestMeasureArm:
+    @staticmethod
+    def _cases() -> list:
+        return [
+            _case(_record('d3', 'c4'), []),
+            _case(_record('d1', 'c1'), [_row('x', 0.9), _row('c1', 0.8)]),
+            _case(
+                _record('n1', 'c2', label='distinct'),
+                [_row('c2', 0.9), _row('y', 0.8), _row('z', 0.7)],
+            ),
+            _case(_record('d2', 'c3'), [_row('w', 0.9)]),
+        ]
+
+    @staticmethod
+    def _answers(*, b_cost: float | None = 0.5, b_over: int | None = 0) -> dict:
+        return {
+            'the entry d1': _slate((0.2, 0.9), cost=0.25, over=1),
+            'the entry n1': _slate((0.1, 0.8, 0.3), cost=b_cost, over=b_over),
+            'the entry d2': _slate((0.6,), cost=0.75, over=2),
+        }
+
+    _CLOCK = [0.0, 1.5, 10.0, 10.25, 20.0, 20.5, 30.0, 31.0]
+
+    def test_a_measured_row_carries_ranking_latency_cost_and_facts(self) -> None:
+        facts = _arms().ScorerFacts(device='cuda:0 fake', vram_peak_mib=512.0, max_length=8192)
+        scorer = _FakeScorer(self._answers(), facts=facts)
+        row = _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()
+        assert (row['arm'], row['arm_class'], row['model']) == (
+            'fake', 'local_cross_encoder', 'fake-model',
+        )
+        assert (row['status'], row['skip_reason'], row['skip_detail']) == ('measured', None, None)
+        assert (row['rank1_rate'], row['rank1']) == (0.25, {'hits': 1, 'total': 4})
+        assert (row['rank5_rate'], row['rank5']) == (0.5, {'hits': 2, 'total': 4})
+        assert row['auc'] == {'value': 1.0, 'n_true': 1, 'n_hard_negative': 1, 'unscored': 2}
+        assert (row['p50_seconds'], row['p95_seconds']) == (0.5, 1.0)
+        assert row['latency'] == {
+            'slates_timed': 3, 'pairs_per_slate_min': 1, 'pairs_per_slate_max': 3,
+            'load_seconds': 1.5, 'warmup_slates': 1,
+        }
+        assert row['cost_per_write_usd'] == pytest.approx(0.5)
+        assert row['pairs_over_max_length'] == 3
+        assert (row['device'], row['vram_peak_mib'], row['max_length']) == (
+            'cuda:0 fake', 512.0, 8192,
+        )
+
+    def test_the_first_non_empty_slate_warms_up_and_an_empty_slate_is_never_sent(self) -> None:
+        scorer = _FakeScorer(self._answers())
+        _measure(_spec(scorer), self._cases(), self._CLOCK)
+        assert scorer.calls == ['the entry d1', 'the entry d1', 'the entry n1', 'the entry d2']
+
+    def test_an_unpriced_slate_leaves_the_cost_unmeasured(self) -> None:
+        scorer = _FakeScorer(self._answers(b_cost=None))
+        assert _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()[
+            'cost_per_write_usd'
+        ] is None
+
+    def test_an_unreported_truncation_count_stays_unmeasured(self) -> None:
+        scorer = _FakeScorer(self._answers(b_over=None))
+        assert _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()[
+            'pairs_over_max_length'
+        ] is None
+
+    def test_an_unavailable_arm_is_skipped_with_every_metric_unmeasured(self) -> None:
+        arms = _arms()
+        spec = _spec(unavailable=arms.ArmUnavailable(
+            arms.SkipReason.no_credential, 'JINA_API_KEY unset',
+        ))
+        row = _measure(spec, self._cases(), []).to_json()
+        assert (row['status'], row['skip_reason'], row['skip_detail']) == (
+            'skipped', 'no_credential', 'JINA_API_KEY unset',
+        )
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+
+    def test_a_scorer_failure_mid_run_is_skipped_as_an_error_with_no_partial_numbers(self) -> None:
+        log: list[str] = []
+        scorer = _FakeScorer(self._answers(), fail_on_call=2)
+        row = _measure(_spec(scorer, log=log), self._cases(), self._CLOCK).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'error')
+        assert row['skip_detail'] == 'RuntimeError: boom'
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+        assert log == ['closed']
+
+    def test_spend_past_the_ceiling_stops_the_arm_as_over_budget(self) -> None:
+        scorer = _FakeScorer(self._answers())
+        row = _measure(_spec(scorer), self._cases(), self._CLOCK, max_spend_usd=0.4).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'over_budget')
+        assert '0.5000' in row['skip_detail']
+        assert scorer.calls == ['the entry d1', 'the entry d1']
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+
+    def test_a_score_list_not_matching_the_slate_is_an_error_never_padded(self) -> None:
+        answers = {**self._answers(), 'the entry n1': _slate((0.1, 0.8))}
+        row = _measure(_spec(_FakeScorer(answers)), self._cases(), self._CLOCK).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'error')
+        assert row['skip_detail'].startswith('ValueError: ')
