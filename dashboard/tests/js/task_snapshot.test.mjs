@@ -38,6 +38,7 @@ const { api: snapshot, window: loadedWindow } = loadTaskSnapshot();
 const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
 const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal } = snapshot;
+const { projectRows, viewRows } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
@@ -50,6 +51,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'censusTotal',
   'censusSegments',
   'censusHistory',
+  'projectRows',
+  'viewRows',
 ];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'TASKS_ENDPOINT', 'CENSUS_VIEWS', 'CENSUS_TILES'];
 
@@ -494,4 +497,126 @@ test('censusHistory: two or more projects draw no spark — no client re-aggrega
   for (const t of CENSUS_TILES) {
     assert.equal(censusHistory(BURNDOWN_DATA, ['dark-factory', 'reify'], t), null, t.key);
   }
+});
+
+// ── Rows by VIEW ────────────────────────────────────────────────────────────
+//
+// OrchTab's table lists the rows of the selected views: in-flight and backlog
+// from the snapshot's rows Datum, terminal from the on-demand window. Selection
+// is by the generated vocabulary, so a member the census counts under a view is
+// listed under that same view.
+
+test('projectRows: the served rows Datum, stamped with the /tasks receipt', () => {
+  const data = sketchData();
+  const wire = data.TASKS_SNAPSHOT['dark-factory'].rows;
+  const pristine = structuredClone(wire);
+
+  const rows = projectRows(data, 'dark-factory');
+
+  assert.equal(isDatum(rows), true);
+  assert.deepEqual(rows.value, wire.value);
+  assert.equal(rows._served_at, SERVED_AT);
+  assert.equal(rows._received_at, RECEIVED_AT);
+  assert.deepEqual(wire, pristine, 'the wire rows were mutated');
+});
+
+test('projectRows: an absent project or rows half is a reasoned hole', () => {
+  assert.equal(projectRows({ TASKS_SNAPSHOT: {}, __receipt: {} }, 'dark-factory').reason, 'not yet fetched');
+
+  const missing = projectRows(sketchData(), 'hive');
+  assert.equal(missing.state, 'unknown');
+  assert.match(missing.reason, /hive/);
+
+  const noRows = projectRows(sketchData({ TASKS_SNAPSHOT: { 'dark-factory': { census: FRESH_ROWS } } }), 'dark-factory');
+  assert.equal(noRows.state, 'unknown');
+  assert.ok(noRows.reason);
+});
+
+// One row per non-terminal member — including the three the old filter bar
+// silently dropped (review, merge-deferred, infra-hold).
+const SNAPSHOT_ROWS = [
+  { id: 1, status: 'in-progress' },
+  { id: 2, status: 'blocked' },
+  { id: 3, status: 'review' },
+  { id: 4, status: 'merge-deferred' },
+  { id: 5, status: 'infra-hold' },
+  { id: 6, status: 'pending' },
+  { id: 7, status: 'deferred' },
+];
+const TERMINAL_ROWS = [
+  { id: 8, status: 'done' },
+  { id: 9, status: 'cancelled' },
+];
+
+const rowsDatum = rows => datumIn('fresh', rows);
+const unknownTerminal = reason => datumIn('unknown', null, { reason });
+const ids = rows => rows.map(r => r.id);
+
+test('viewRows: in-flight and backlog select the snapshot rows by generated membership', () => {
+  const rows = rowsDatum(SNAPSHOT_ROWS);
+  const terminal = rowsDatum(TERMINAL_ROWS);
+
+  assert.deepEqual(ids(viewRows(rows, terminal, { in_flight: true }).rows), [1, 2, 3, 4, 5]);
+  assert.deepEqual(ids(viewRows(rows, terminal, { backlog: true }).rows), [6, 7]);
+  assert.deepEqual(ids(viewRows(rows, terminal, { terminal: true }).rows), [8, 9]);
+});
+
+test('viewRows: every snapshot row lands in exactly one view', () => {
+  const rows = rowsDatum(SNAPSHOT_ROWS);
+  const terminal = rowsDatum([]);
+  for (const row of SNAPSHOT_ROWS) {
+    const views = CENSUS_VIEWS.filter(v =>
+      ids(viewRows(rows, terminal, { [v.key]: true }).rows).includes(row.id),
+    );
+    assert.equal(views.length, 1, `${row.status} is listed under ${views.length} views`);
+  }
+});
+
+test('viewRows: several views concatenate in view order, whatever the filter\'s key order', () => {
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), rowsDatum(TERMINAL_ROWS), {
+    terminal: true,
+    backlog: true,
+    in_flight: true,
+  });
+  assert.deepEqual(ids(result.rows), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.equal(result.placeholder, null);
+});
+
+test('viewRows: a selected view whose Datum is unknown lists nothing and says why', () => {
+  // The terminal window is fetched on request only (leaf gamma3 wires that
+  // request); before it arrives, data.js::datumFor answers 'not yet fetched'.
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), unknownTerminal('not yet fetched'), {
+    in_flight: true,
+    terminal: true,
+  });
+
+  assert.deepEqual(ids(result.rows), [1, 2, 3, 4, 5]);
+  assert.ok(result.placeholder.text.startsWith(EM_DASH), result.placeholder.text);
+  assert.match(result.placeholder.text, /terminal/);
+  assert.doesNotMatch(result.placeholder.text, /in-flight/);
+  assert.match(result.placeholder.title, /not yet fetched/);
+});
+
+test('viewRows: an unknown rows Datum names every selected view it feeds', () => {
+  const result = viewRows(datumIn('unknown', null, { reason: 'task data unavailable' }), rowsDatum(TERMINAL_ROWS), {
+    in_flight: true,
+    backlog: true,
+  });
+  assert.deepEqual(result.rows, []);
+  assert.match(result.placeholder.text, /in-flight/);
+  assert.match(result.placeholder.text, /backlog/);
+  assert.match(result.placeholder.title, /task data unavailable/);
+});
+
+test('viewRows: stale rows still list — an aged value is still a value', () => {
+  const stale = datumIn('stale', SNAPSHOT_ROWS);
+  const result = viewRows(stale, rowsDatum([]), { in_flight: true });
+  assert.deepEqual(ids(result.rows), [1, 2, 3, 4, 5]);
+  assert.equal(result.placeholder, null);
+});
+
+test('viewRows: nothing selected lists nothing and leaves the sentence to orch_filter', () => {
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), unknownTerminal('not yet fetched'), {});
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.placeholder, null);
 });

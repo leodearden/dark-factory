@@ -1236,7 +1236,7 @@ def test_task_vocab_js_loads_before_app(index_html_body: str) -> None:
 #
 # task_snapshot.js is the ONE client reader of the /tasks snapshot unit. It
 # destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope, and
-# shell.jsx, tab_overview.jsx, tabs.jsx and app.jsx destructure
+# orch_filter.js, tab_overview.jsx, tabs.jsx and app.jsx destructure
 # window.DF_TASK_SNAPSHOT at module scope — none with a fallback. Every edge is
 # its own case, as in _DATUM_ORDER_CASES, because each one blanks a different
 # surface.
@@ -1293,6 +1293,7 @@ _TASK_SNAPSHOT_ORDER_CASES = [
     (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _TAB_OVERVIEW_PREFIX, 'tab_overview.jsx', _READS_AT_MODULE_SCOPE),
     (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _TABS_PREFIX, 'tabs.jsx', _READS_AT_MODULE_SCOPE),
     (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _APP_JSX_PREFIX, 'app.jsx', _READS_AT_MODULE_SCOPE),
+    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _ORCH_FILTER_PREFIX, 'orch_filter.js', _READS_AT_MODULE_SCOPE),
 ]
 
 
@@ -1306,6 +1307,7 @@ _TASK_SNAPSHOT_ORDER_CASES = [
         'snapshot-before-tab-overview',
         'snapshot-before-tabs',
         'snapshot-before-app',
+        'snapshot-before-orch-filter',
     ],
 )
 def test_task_snapshot_js_load_order(
