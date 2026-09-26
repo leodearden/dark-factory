@@ -1477,6 +1477,28 @@ class TestDecisionHelpersAdoptLock:
         assert rc == 0
         assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
 
+    def test_close_decision_with_evidence_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The FIFTH writer (task 5376): the sitting preparer's apply step, via close-decision."""
+        rec = _make_decision(id='dec-spy-6', state=sr.DecisionState.OPEN)
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.close_decision_with_evidence('dec-spy-6', sr.DecisionState.ANSWERED, 'gate evidence', root=tmp_path)
+
+        assert 'dec-spy-6' in acquired, f'Expected lock acquisition for dec-spy-6; got {acquired}'
+
     def test_main_write_decision_refusal_takes_no_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -6183,6 +6205,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         state=sr.DecisionState.DROPPED,
         manual_boost=7,
         escalations_dir=queue,
+        closing_evidence='the operator dropped it: superseded by esc-5914-2',
     )
     incoming = _make_decision(
         text="the watcher's current view",
@@ -6214,6 +6237,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         'filed_at',
         'state',
         'manual_boost',
+        'closing_evidence',
         'escalations_dir',
     }
 
@@ -9900,3 +9924,215 @@ def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
     never raises" -- and that promise cannot hold if the pid check can throw.
     """
     assert sr._pid_alive(_UNREPRESENTABLE_PID) is False
+
+
+# ---------------------------------------------------------------------------
+# DecisionRecord.closing_evidence and the close-decision verb (task 5376)
+# ---------------------------------------------------------------------------
+
+_EVIDENCE = 'gate 1 ruling_is_leos_own: held\nLeo 2026-09-20: esc-400-1 option A'
+
+
+class TestClosingEvidence:
+    """The deciding evidence, quoted verbatim on the closed record, and the one mutator that writes it."""
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        sr.write_decision(_make_decision(id='dec-close', **{'state': sr.DecisionState.OPEN, **overrides}), root=root)
+        return sr.decision_path_for_id('dec-close', root=root)
+
+    def _close(self, root: Path, state: str = sr.DecisionState.ANSWERED, evidence: str = _EVIDENCE):
+        return sr.close_decision_with_evidence('dec-close', state, evidence, root=root)
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closing_evidence == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, escalations_dir='/p/data/escalations')
+
+        assert d.to_dict()['closing_evidence'] == _EVIDENCE
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closing_evidence': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closing_evidence']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closing_evidence == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closing_evidence == ''
+
+    @pytest.mark.parametrize('state', [sr.DecisionState.ANSWERED, sr.DecisionState.DROPPED])
+    def test_open_to_terminal_sets_state_and_evidence_in_one_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        self._seed(tmp_path)
+        real_write = sr.write_decision
+        written: list[dict[str, Any]] = []
+
+        def recording_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            written.append(record.to_dict())
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', recording_write)
+
+        updated = self._close(tmp_path, state)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (state, _EVIDENCE)
+        assert [(w['state'], w['closing_evidence']) for w in written] == [(state, _EVIDENCE)]
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread == updated
+
+    def test_evidence_attaches_to_a_record_the_reaper_already_closed(self, tmp_path: Path) -> None:
+        self._seed(tmp_path, state=sr.DecisionState.ANSWERED)
+
+        updated = self._close(tmp_path)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize(('seeded', 'state', 'evidence', 'reason'), [
+        ({}, sr.DecisionState.OPEN, _EVIDENCE, r"not 'open'"),
+        ({}, sr.DecisionState.ANSWERED, '', 'evidence is empty'),
+        ({}, sr.DecisionState.ANSWERED, '  \n\t', 'evidence is empty'),
+        ({'state': sr.DecisionState.ANSWERED}, sr.DecisionState.DROPPED, _EVIDENCE, 'between terminal states'),
+        ({'state': sr.DecisionState.ANSWERED, 'closing_evidence': 'the reaper-era evidence'},
+         sr.DecisionState.ANSWERED, _EVIDENCE, 'overwrite'),
+    ], ids=['to-open', 'empty', 'whitespace', 'terminal-to-terminal', 'overwrite'])
+    def test_refusals_raise_naming_the_refusal_and_write_nothing(
+        self, tmp_path: Path, seeded: dict, state: str, evidence: str, reason: str
+    ) -> None:
+        path = self._seed(tmp_path, **seeded)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match=reason):
+            self._close(tmp_path, state, evidence)
+
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(('state', 'evidence'), [
+        (sr.DecisionState.OPEN, _EVIDENCE),
+        (sr.DecisionState.ANSWERED, ' '),
+    ])
+    def test_argument_refusals_take_no_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, evidence: str
+    ) -> None:
+        """Mirrors test_main_write_decision_refusal_takes_no_lock: a lock sidecar is never cleaned up."""
+        self._seed(tmp_path)
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        with pytest.raises(sr.DecisionCloseRefused):
+            self._close(tmp_path, state, evidence)
+
+        assert acquired == []
+
+    def test_fail_soft_when_absent(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_a_corrupt_body(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = sr.decision_path_for_id('dec-close', root=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{not valid json')
+
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_an_unwritable_root(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+
+        with caplog.at_level(logging.ERROR):
+            assert sr.close_decision_with_evidence(
+                'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=blocker / 'fleet'
+            ) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    @pytest.mark.timeout(30)
+    def test_a_concurrent_boost_loses_neither_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same technique as test_concurrent_state_and_boost_updates_do_not_lose_a_field."""
+        self._seed(tmp_path, manual_boost=0)
+        real_write = sr.write_decision
+
+        def delayed_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            time.sleep(0.3)
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', delayed_write)
+        threads = [
+            threading.Thread(target=self._close, args=(tmp_path,)),
+            threading.Thread(target=sr.set_manual_boost, args=('dec-close', 7, tmp_path)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence, reread.manual_boost) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, 7,
+        )
+
+    def test_same_queue_refile_keeps_the_evidence(self) -> None:
+        existing = _make_decision(state=sr.DecisionState.ANSWERED, closing_evidence=_EVIDENCE, escalations_dir='/q')
+        incoming = _make_decision(state=sr.DecisionState.OPEN, escalations_dir='/q')
+
+        assert sr.merge_same_queue_refile(existing, incoming).closing_evidence == _EVIDENCE
+        assert sr.merge_decision_enrichment(existing, incoming).closing_evidence == _EVIDENCE
+
+
+class TestCloseDecisionVerb:
+    def _argv(self, root: Path, *, state: str = 'answered', evidence: str = _EVIDENCE) -> list[str]:
+        return ['close-decision', '--id', 'dec-close', '--state', state, '--evidence', evidence, '--root', str(root)]
+
+    def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
+        args = sr._build_parser().parse_args(self._argv(tmp_path))
+
+        assert (args.verb, args.id, args.state, args.evidence, args.root) == (
+            'close-decision', 'dec-close', 'answered', _EVIDENCE, str(tmp_path),
+        )
+
+    def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'dec-close'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    def test_a_refusal_exits_nonzero_naming_it(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, evidence=' '))
+
+        assert rc != 0
+        assert 'evidence is empty' in capsys.readouterr().err
+
+    def test_an_absent_record_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc != 0
+        assert 'dec-close' in capsys.readouterr().err
