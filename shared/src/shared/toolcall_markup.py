@@ -1017,7 +1017,9 @@ def escape_envelope_literals(text: str) -> str:
     For text that deliberately QUOTES envelope literals as data — census
     sighting evidence, for one — and is headed for a guarded MCP write. The
     spelling is the one this module's "Sentinel-literal hazard" section uses,
-    so a reader recognises it and substituting the bracket back inverts it.
+    so a reader recognises it. Substituting the bracket back inverts it only
+    for text that held no ``\\x3c`` spelling beforehand: an already-escaped
+    literal passes through unchanged, and would come back as a raw bracket.
 
     Post-condition: ``detect_for(result, param, schema_params) is None`` for
     every *param* and *schema_params*, and :func:`repair` finds no candidate.

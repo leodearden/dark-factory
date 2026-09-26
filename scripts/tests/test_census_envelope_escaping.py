@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import census as mod
+import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
@@ -41,6 +42,7 @@ _QUOTED_EVIDENCE = (
     'agent emitted ' + INVOKE_CLOSER + ', then ' + closer_for('content')
     + ' and ' + closer_for('rationale')
 )
+_SELF_NAME_TITLE = 'Agents mis-close ' + closer_for('title') + ' before ' + INVOKE_CLOSER
 
 
 class _GuardedSubmit(NamedTuple):
@@ -132,14 +134,27 @@ def test_evidence_quoting_envelope_closers_submits_and_round_trips_escaped():
 
 
 def test_title_quoting_a_self_name_closer_submits():
-    title = 'Agents mis-close ' + closer_for('title') + ' before ' + INVOKE_CLOSER
-    payload = _payload_for(_quoting_cluster(title=title))
+    payload = _payload_for(_quoting_cluster(title=_SELF_NAME_TITLE))
 
     outcome = _submit_through_guard(payload)
 
     assert outcome.refusal is None
     assert outcome.escalations == []
     assert outcome.received['title'] == payload['title']
+
+
+@pytest.mark.parametrize('field', ['title', 'description'])
+def test_the_harness_refuses_that_payload_with_one_field_left_raw(field):
+    """Negative control: the tests above mean "the guard let it through" only
+    if the harness really reaches the guard."""
+    payload = _payload_for(_quoting_cluster(title=_SELF_NAME_TITLE))
+    raw_payload = {**payload, field: payload[field].replace(_ESCAPE, chr(60))}
+
+    outcome = _submit_through_guard(raw_payload)
+
+    assert outcome.refusal is not None
+    assert outcome.escalations != []
+    assert outcome.received == {}
 
 
 def test_every_string_field_is_safe_to_requote_downstream():
