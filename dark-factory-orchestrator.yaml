@@ -1390,12 +1390,6 @@ routing:
         min_routing_tier: 1
       set:
         model: "+1"
-    - id: steward-retry-fable
-      match:
-        role: [steward]
-        min_routing_tier: 1
-      set:
-        model: claude-fable-5-1
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
