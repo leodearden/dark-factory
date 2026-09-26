@@ -32,6 +32,7 @@ def _routing_payload(
     rule_id=None,
     rejected=(),
     routing_tier=0,
+    max_turns=100,
 ):
     """The exact 11-key `routing_decision` payload the producer emits.
 
@@ -45,7 +46,7 @@ def _routing_payload(
         'model': model,
         'effort': 'max',
         'budget_usd': 8.0,
-        'max_turns': 100,
+        'max_turns': max_turns,
         'source_layer': source_layer,
         'rule_id': rule_id,
         'rejected': list(rejected),
@@ -760,6 +761,9 @@ def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     }
     assert payload['meta']['model'] == FABLE
     assert payload['invocations'][0]['turns'] == 45
+    assert {'subtype', 'escalation_id', 'routing_tier', 'dispatch_max_turns'} <= set(
+        payload['invocations'][0]
+    )
 
 
 def _tier_section(result):
@@ -1100,3 +1104,184 @@ def test_main_without_until_still_ends_the_spend_window_now(
     assert payload['meta']['until'] is None
     latest_seeded = APPLY + timedelta(days=1)  # the steward routing decision
     assert datetime.fromisoformat(payload['spend']['window_end']) >= latest_seeded
+
+
+# --- InvocationRecord: kill subtype, linked escalation, dispatch tier and cap ---
+
+
+def _run_with_end(conn, *, role, task_id, started_at, completed_at, end=None, model=FABLE):
+    """Seed one run plus its invocation_end; *end* overrides payload keys."""
+    conn.seed_invocation(
+        model=model, role=role, task_id=task_id,
+        started_at=started_at, completed_at=completed_at,
+    )
+    conn.seed_event(
+        completed_at, 'invocation_end', task_id=task_id, role=role,
+        data={**_invocation_end_payload(turns=12, model=model), **(end or {})},
+    )
+
+
+def _decision(conn, timestamp, *, task_id, role, routing_tier=0, max_turns=100, model=FABLE):
+    conn.seed_event(
+        timestamp, 'routing_decision', task_id=task_id, role=role,
+        data=_routing_payload(
+            role=role, model=model, routing_tier=routing_tier, max_turns=max_turns,
+        ),
+    )
+
+
+def _only_run(conn, **kwargs):
+    rows = audit_model_admission.scan_invocations(conn, model=FABLE, since=APPLY, **kwargs)
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_a_turn_cap_kill_reports_the_end_events_subtype(runs_db):
+    _run_with_end(
+        runs_db, role='merger', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'success': False, 'subtype': 'error_max_turns'},
+    )
+
+    run = _only_run(runs_db)
+
+    assert run.subtype == 'error_max_turns'
+    assert run.escalation_id is None  # a merger's end event names no escalation
+
+
+def test_a_steward_run_reports_the_escalation_its_end_event_names(runs_db):
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'escalation_id': 'esc-4377-10'},
+    )
+
+    assert _only_run(runs_db).escalation_id == 'esc-4377-10'
+
+
+def test_a_run_with_no_end_event_and_no_decision_reports_none_for_all_four(runs_db):
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.subtype, run.escalation_id, run.routing_tier, run.dispatch_max_turns) == (
+        None, None, None, None,
+    )
+
+
+def test_a_steward_run_takes_tier_and_cap_from_its_last_decision_before_dispatch(runs_db):
+    """The steward's decision is recorded BEFORE dispatch
+    (routing_dispatch.py::resolve_and_record_route), so the last one at or
+    before started_at is the run's own."""
+    _decision(runs_db, _at(hours=1), task_id='4377', role='steward', routing_tier=0,
+              max_turns=50)
+    _decision(runs_db, _at(hours=2), task_id='4377', role='steward', routing_tier=1,
+              max_turns=80)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2, milliseconds=10), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (1, 80)
+
+
+@pytest.mark.parametrize(
+    ('offset', 'role'),
+    [
+        ({'hours': 2, 'seconds': 5}, 'steward'),  # stamped after the run started
+        ({'hours': 1}, 'merger'),                  # same task, another role
+    ],
+)
+def test_a_decision_that_is_not_the_steward_runs_own_is_not_used(runs_db, offset, role):
+    _decision(runs_db, _at(**offset), task_id='4377', role=role, routing_tier=1)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (None, None)
+
+
+def test_a_run_just_inside_since_finds_its_decision_stamped_before_since(runs_db):
+    """The decision load is bounded by the matched runs, never by *since*."""
+    _decision(runs_db, _at(seconds=-2), task_id='4377', role='steward', routing_tier=2,
+              max_turns=100)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(seconds=-1), completed_at=_at(minutes=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (2, 100)
+
+
+def test_a_merger_run_takes_its_decision_recorded_just_after_completion(runs_db):
+    """The merger's decision is recorded AFTER the run completes
+    (workflow.py::TaskWorkflow._invoke emits it after invocation_end).
+    The last decision before its start belongs to the PREVIOUS merger run
+    on the task — here an opus run at the pre-D4 cap of 50."""
+    _decision(runs_db, _at(hours=1), task_id='4259', role='merger', model='opus',
+              routing_tier=0, max_turns=50)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=2), completed_at=_at(hours=2, minutes=13),
+    )
+    _decision(runs_db, _at(hours=2, minutes=13, milliseconds=10), task_id='4259',
+              role='merger', routing_tier=1, max_turns=100)
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (1, 100)
+
+
+def test_a_merger_run_without_its_own_decision_does_not_borrow_an_earlier_one(runs_db):
+    _decision(runs_db, _at(hours=1), task_id='4259', role='merger', model='opus',
+              max_turns=50)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=2), completed_at=_at(hours=2, minutes=13),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (None, None)
+
+
+def test_a_merger_decision_recorded_just_after_until_is_still_joined(runs_db):
+    """Like invocation_end, the post-completion decision is the run's OWN
+    record, so bounding its load by *until* would drop it."""
+    completed = UNTIL - timedelta(milliseconds=5)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=11), completed_at=completed.isoformat(),
+    )
+    _decision(runs_db, (completed + timedelta(milliseconds=15)).isoformat(),
+              task_id='4259', role='merger', max_turns=100)
+
+    run = _only_run(runs_db, until=UNTIL)
+
+    assert run.dispatch_max_turns == 100
+
+
+def test_the_invocations_section_renders_tier_and_subtype(runs_db):
+    _run_with_end(
+        runs_db, role='merger', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'success': False, 'subtype': 'error_max_turns'},
+    )
+    _decision(runs_db, _at(hours=3, milliseconds=10), task_id='4377', role='merger',
+              routing_tier=1)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    assert '| tier | subtype |' in section
+    assert '| 1 | error_max_turns |' in section
