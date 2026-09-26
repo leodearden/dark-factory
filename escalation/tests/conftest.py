@@ -233,6 +233,7 @@ def _drain_pending_tasks(loop) -> None:
 
 async def _mcp_handshake_ready(
     base_url: str, error_box: list[BaseException] | None = None,
+    *, timeout_s: float,
 ) -> bool:
     """True iff a real MCP client completes initialize+ping against
     ``{base_url}/mcp/``.
@@ -253,14 +254,21 @@ async def _mcp_handshake_ready(
     the most recent exception is recorded into it (last write wins: the final
     poll's failure is the one that describes why the deadline was reached) for
     the caller to name in its timeout message.
+
+    Each attempt is bounded by the required *timeout_s*: an endpoint that
+    accepts but never answers would otherwise hold the attempt far past the
+    caller's readiness deadline, since the client's own read timeout is minutes.
     """
+    import asyncio
+
     from fastmcp import Client
     from fastmcp.client.transports import StreamableHttpTransport
 
     transport = StreamableHttpTransport(f'{base_url}/mcp/')
     try:
-        async with Client(transport) as client:
-            await client.ping()
+        async with asyncio.timeout(timeout_s):
+            async with Client(transport) as client:
+                await client.ping()
     except Exception as exc:  # noqa: BLE001 - any failure just means "not ready yet"
         if error_box is not None:
             error_box[:] = [exc]
@@ -397,8 +405,10 @@ def _serve_escalation_mcp_impl():
         deadline = time.monotonic() + _READY_TIMEOUT_S
         handshake_errors: list[BaseException] = []
         ready = False
-        while time.monotonic() < deadline:
-            if asyncio.run(_mcp_handshake_ready(base_url, handshake_errors)):
+        while (remaining := deadline - time.monotonic()) > 0:
+            if asyncio.run(_mcp_handshake_ready(
+                base_url, handshake_errors, timeout_s=remaining,
+            )):
                 ready = True
                 break
             time.sleep(0.05)
