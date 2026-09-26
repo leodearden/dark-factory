@@ -482,13 +482,83 @@ def _column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
         conn.close()
 
 
+def _column_types(path: Path) -> dict[str, str]:
+    """``{column: declared type}`` from ``PRAGMA table_info(snapshots)``."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[1]: r[2] for r in conn.execute('PRAGMA table_info(snapshots)')}
+    finally:
+        conn.close()
+
+
+# The pre-δ1 DDL (task 5591), verbatim: the 11-column shape every deployed
+# burndown.db is on today — six zones, the NOT NULL DEFAULT 0 split, the
+# nullable cap.  Like _LEGACY_BURNDOWN_SCHEMA, it only reaches the new column
+# set through ensure_snapshot_columns.
+_PRE_DELTA1_BURNDOWN_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT    NOT NULL,
+    ts          TEXT    NOT NULL,
+    pending     INTEGER NOT NULL DEFAULT 0,
+    in_progress INTEGER NOT NULL DEFAULT 0,
+    blocked     INTEGER NOT NULL DEFAULT 0,
+    deferred    INTEGER NOT NULL DEFAULT 0,
+    cancelled   INTEGER NOT NULL DEFAULT 0,
+    done        INTEGER NOT NULL DEFAULT 0,
+    in_progress_live     INTEGER NOT NULL DEFAULT 0,
+    in_progress_stranded INTEGER NOT NULL DEFAULT 0,
+    concurrency_cap      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
+"""
+
+_DELTA1_COLUMNS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows', 'state', 'reason')
+_DELTA1_COUNT_COLUMNS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows')
+_DELTA1_TEXT_COLUMNS = ('state', 'reason')
+
+# The pre-δ1 row's eleven stored values, keyed by column.
+_PRE_DELTA1_ROW = {
+    'project_id': 'pre-delta1',
+    'ts': '2026-01-01T00:00:00+00:00',
+    'pending': 5,
+    'in_progress': 3,
+    'blocked': 1,
+    'deferred': 0,
+    'cancelled': 0,
+    'done': 20,
+    'in_progress_live': 2,
+    'in_progress_stranded': 1,
+    'concurrency_cap': 24,
+}
+
+
+def _pre_delta1_burndown_db(path: Path, **overrides) -> None:
+    """Create a pre-δ1 (11-column) burndown DB carrying ONE measured row.
+
+    *overrides* replace fields of :data:`_PRE_DELTA1_ROW` (e.g. ``ts=`` so a
+    read-side test can place the row inside its window).
+    """
+    row = {**_PRE_DELTA1_ROW, **overrides}
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_PRE_DELTA1_BURNDOWN_SCHEMA)
+    conn.execute(
+        f'INSERT INTO snapshots ({", ".join(row)}) VALUES ({", ".join("?" for _ in row)})',
+        tuple(row.values()),
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestSnapshotSchemaColumns:
     def test_created_table_declares_the_new_column_constraints(self, tmp_path):
-        """The split columns are NOT NULL DEFAULT 0; ``concurrency_cap`` is nullable.
+        """The split columns are NOT NULL DEFAULT 0; ``concurrency_cap`` and the
+        six δ1 columns are nullable with no default.
 
         NULL is the honest "cap unknown" value for the cap — never 0, which
-        would read as a cap of zero and alarm on every snapshot.  The split
-        counts, by contrast, are always known, so they default to 0.
+        would read as a cap of zero and alarm on every snapshot.  The δ1
+        columns take NULL for "not recorded when the row was written": a
+        DEFAULT 0 would fabricate measured zeros across all of history.
         """
         db = tmp_path / 'shape.db'
         _create_burndown_db(db)
@@ -503,11 +573,36 @@ class TestSnapshotSchemaColumns:
         assert 'concurrency_cap' in specs, 'concurrency_cap missing from snapshots'
         assert specs['concurrency_cap'][0] == 0, 'concurrency_cap must stay nullable'
 
+        for col in _DELTA1_COLUMNS:
+            assert col in specs, f'{col} missing from the created snapshots table'
+            assert specs[col] == (0, None), (
+                f'{col} must be nullable with no default, got (notnull, dflt)={specs[col]!r}'
+            )
+
     def test_fresh_db_is_already_at_the_new_shape(self, tmp_path):
         db = tmp_path / 'fresh.db'
         _create_burndown_db(db)
 
         assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_fresh_and_migrated_stores_declare_the_delta1_columns_identically(
+        self, tmp_path,
+    ):
+        """A fresh store (BURNDOWN_SCHEMA) and a migrated pre-δ1 store cannot
+        drift: the six δ1 columns carry the same (notnull, default, type)."""
+        fresh = tmp_path / 'fresh.db'
+        _create_burndown_db(fresh)
+        migrated = tmp_path / 'migrated.db'
+        _pre_delta1_burndown_db(migrated)
+        async with aiosqlite.connect(str(migrated)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        fresh_specs, migrated_specs = _column_specs(fresh), _column_specs(migrated)
+        fresh_types, migrated_types = _column_types(fresh), _column_types(migrated)
+        for col in _DELTA1_COLUMNS:
+            assert fresh_specs[col] == migrated_specs[col] == (0, None), col
+            assert fresh_types[col] == migrated_types[col], col
 
 
 _NEW_SNAPSHOT_COLUMNS_SET = set(_NEW_SNAPSHOT_COLUMNS)
@@ -576,6 +671,94 @@ class TestEnsureSnapshotColumns:
             await conn.commit()
 
         assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_adds_the_six_delta1_columns_nullable_with_no_default(self, tmp_path):
+        """The δ1 migration (task 5591) on today's deployed 11-column shape.
+
+        ``DEFAULT 0`` is the thing ruled out: it would stamp a measured zero
+        onto every historical row for statuses nobody counted back then.
+        """
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+        assert not (set(_DELTA1_COLUMNS) & _columns(db))
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        specs, types = _column_specs(db), _column_types(db)
+        for col in _DELTA1_COLUMNS:
+            assert col in specs, f'{col} not added by the migration'
+            notnull, default = specs[col]
+            assert notnull == 0, f'{col} must be nullable'
+            assert default is None, f'{col} must carry no default, got {default!r}'
+        for col in _DELTA1_COUNT_COLUMNS:
+            assert types[col] == 'INTEGER', f'{col}: {types[col]!r}'
+        for col in _DELTA1_TEXT_COLUMNS:
+            assert types[col] == 'TEXT', f'{col}: {types[col]!r}'
+
+    async def test_pre_delta1_row_reads_null_for_every_added_column(self, tmp_path):
+        """NULL = "not recorded when the row was written" — never 0 — and the
+        row's eleven existing values are untouched."""
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                'SELECT * FROM snapshots WHERE project_id = ?', (_PRE_DELTA1_ROW['project_id'],),
+            )
+            rows = await cur.fetchall()
+
+        assert len(rows) == 1
+        row = rows[0]
+        for col in _DELTA1_COLUMNS:
+            assert row[col] is None, f'{col}: expected NULL, got {row[col]!r}'
+        for col, value in _PRE_DELTA1_ROW.items():
+            assert row[col] == value, f'{col}: expected {value!r}, got {row[col]!r}'
+
+    async def test_delta1_migration_is_idempotent(self, tmp_path):
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            await ensure_snapshot_columns(conn)  # must not raise
+            await conn.commit()
+
+        assert _columns(db) >= set(_DELTA1_COLUMNS)
+
+    async def test_pre_3543_store_reaches_the_full_current_column_set(self, tmp_path):
+        """A store two migrations behind lands on exactly the fresh shape."""
+        legacy = tmp_path / 'legacy.db'
+        _legacy_burndown_db(legacy)
+        fresh = tmp_path / 'fresh.db'
+        _create_burndown_db(fresh)
+
+        async with aiosqlite.connect(str(legacy)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(legacy) == _columns(fresh)
+        assert _columns(legacy) >= _NEW_SNAPSHOT_COLUMNS_SET | set(_DELTA1_COLUMNS)
+
+    async def test_migrated_store_carries_all_nine_member_columns(self, tmp_path):
+        """One column per ``TaskStatus`` member, written out literally here so
+        a renamed member cannot silently rename its column with it."""
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(db) >= {
+            'pending', 'in_progress', 'blocked', 'deferred', 'review',
+            'merge_deferred', 'infra_hold', 'done', 'cancelled',
+        }
 
     async def test_widened_insert_succeeds_after_migration(self, tmp_path):
         db = tmp_path / 'legacy.db'
