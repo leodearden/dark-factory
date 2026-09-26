@@ -5873,6 +5873,89 @@ async def test_remediation_pass_cancellation_cleanup_failure_still_propagates_ca
 
 
 @pytest.mark.asyncio
+async def test_remediation_pass_cancelled_during_freshness_precheck_terminalises_row(
+    journal, event_buffer, mock_memory_service,
+):
+    """The row exists from start_run on, so a cancel landing in the freshness
+    precheck, before any stage is built, still terminalises it."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages_run: list[str] = []
+
+    async def record_stage(stage):
+        stages_run.append(stage.stage_id.value)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=record_stage)
+
+    precheck_entered = asyncio.Event()
+
+    async def stalled_precheck(**kwargs):
+        precheck_entered.set()
+        await asyncio.sleep(999)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=stalled_precheck,
+    ):
+        outer_task = asyncio.create_task(_remediation_pass_under_test(harness))
+        await _cancel_once_entered(outer_task, precheck_entered)
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
+
+    row = await _settled_remediation_row(journal)
+    assert row.status == 'failed'
+    assert row.stage_reports['_error']['error_type'] == 'CancelledError'
+    assert row.stage_reports['_error']['failed_stage'] is None
+    assert stages_run == []
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_short_circuit_write_failure_terminalises_row(
+    journal, event_buffer, mock_memory_service,
+):
+    """A lock error on the all-fresh short-circuit's own complete_run is
+    handled like any other remediation failure: the row ends 'failed' with the
+    SQLite classification, and the error does not escape the pass."""
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    finding = _make_s3_findings()[0]
+    all_fresh = ScopeFreshnessResult(
+        to_reinvestigate=[],
+        skipped=[finding],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    original_complete_run = journal.complete_run
+
+    async def locked_on_completed(run_id, status):
+        if status == 'completed':
+            raise _sqlite_busy_error()
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = locked_on_completed
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=AsyncMock(return_value=all_fresh),
+    ):
+        await _remediation_pass_under_test(harness)
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'remediation'
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['error_type'] == 'OperationalError'
+    assert err['failed_stage'] is None
+    assert err['sqlite_errorname'] == 'SQLITE_BUSY'
+    assert err['sqlite_errorcode'] == 5
+    assert 'integrity_check' in row.stage_reports
+
+
+@pytest.mark.asyncio
 async def test_shielded_stage_report_persistence_still_propagates_cancellation(
     journal, event_buffer, mock_memory_service,
 ):
