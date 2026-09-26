@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import shutil
 import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from _filing_tools import call_blocker as _blocker
+from _filing_tools import call_info as _info
 
 from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
@@ -52,16 +55,6 @@ async def _make_lookup(status: str | None):
         return status
 
     return _lookup
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -4030,8 +4023,9 @@ class _ExplodingMetadata:
     Models a malformed task record reaching the degeneracy probe: the server
     reads ``task.get('metadata') or {}``, which passes any truthy non-dict
     straight through to ``branch_is_degenerate``, where ``.get`` blows up
-    INSIDE the probe rather than inside ``_git_authority_task_metadata``'s
-    own handler.  That is the only way to reach merge_request's outer
+    INSIDE the probe rather than inside
+    ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+    handler.  That is the only way to reach merge_request's outer
     fast-path ``except`` — see
     ``test_probe_fault_inside_the_guard_preserves_the_fast_path``.
     """
@@ -4334,7 +4328,8 @@ class TestMergeRequestDegenerateBranchFastPath:
 
         NOTE this does NOT reach merge_request's own fast-path ``except``: the
         RuntimeError is swallowed one level deeper, inside
-        ``_git_authority_task_metadata``'s handler, which returns ``{}`` — so
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s
+        handler, which returns an empty ``metadata`` — so
         the probe then runs normally and reads "no degeneracy signal".  The
         outer handler is covered by
         ``test_probe_fault_inside_the_guard_preserves_the_fast_path`` below.
@@ -4360,7 +4355,8 @@ class TestMergeRequestDegenerateBranchFastPath:
         malformed metadata record is the reachable way to trigger it: the
         server passes any truthy ``task['metadata']`` through verbatim, so a
         non-dict raises on ``.get`` inside the probe, PAST
-        ``_git_authority_task_metadata``'s own handler.
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+        handler.
 
         Fail-soft direction: the fault degrades the guard (treat as
         non-degenerate) and the legacy fast path answers, rather than the
@@ -4424,24 +4420,38 @@ class TestMergeRequestDegenerateBranchFastPath:
     async def test_guard_probes_at_most_once_across_both_arms(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The probe is memoized, and is not paid when no arm hits.
+        """The task-metadata read is paid at most once, and the arms share it.
 
-        The guard's only power is to SUPPRESS an already_merged return, so it
-        runs after an arm tests positive — never on the common
-        not-yet-merged submission, where it would add a scheduler round-trip
-        (a Taskmaster MCP dispatch with an internal timeout=15) to the submit
-        path for no possible effect.  When an arm does hit, the two arms share
-        one lookup.
+        Task 4888 superseded the zero-read half of this contract, deliberately
+        and by its design decision 5: honouring ``metadata.merge_lane``
+        requires reading the metadata, so a submission that supplies no
+        explicit ``lane`` now pays exactly one memoized
+        ``scheduler.get_task``.  The superseded assertion rested on the
+        premise that the read could have no possible effect on a plain
+        not-yet-merged submission — true while the PROBE was its only
+        consumer, false now that the same read also resolves the lane.
+
+        The two consumers stay individually attributable.  With neither arm
+        hitting, the guard's ``_declined()`` is never awaited, so the single
+        recorded lookup can only be the lane fallback's.  With an arm hitting,
+        both consumers want the metadata and the memo is the whole reason the
+        count is one rather than two.  The remaining cell — an explicit
+        ``lane=`` skipping the fallback, so nothing reads at all — is pinned
+        in scope by ``escalation/tests/test_merge_request_lane.py``
+        ``::TestMetadataReadIsPaidAtMostOnce``
+        ``::test_explicit_lane_pays_no_metadata_read_at_all``.
         """
-        # Neither arm hits → the probe must not run at all.
-        quiet: list[str] = []
+        # Neither arm hits → the probe stays off, and the lane fallback pays
+        # the one read on its own.
+        lane_only: list[str] = []
         await _run_fast_path_probe(
             tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=False,
-            metadata={'branch_base_sha': 'b' * 40}, requested_ids=quiet,
+            metadata={'branch_base_sha': 'b' * 40}, requested_ids=lane_only,
         )
-        assert quiet == [], (
-            f'A plain not-yet-merged submission must not consult the task '
-            f'store at all, got: {quiet}'
+        assert lane_only == ['591'], (
+            f'A plain not-yet-merged submission must consult the task store '
+            f'exactly once — the lane fallback, not the suppressed probe — '
+            f'got: {lane_only}'
         )
 
         # The patch-id arm hits (is_ancestor misses first) → exactly one lookup.
@@ -4603,23 +4613,30 @@ class TestHonestResponseContract:
 
         assert result.get('level') == 2, f"No persisted level echoed: {result}"
 
-    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+    # -- A bookkeeping read must never lose a filing, nor confirm one ------
 
     @pytest.mark.asyncio
-    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read returning None falls back to 'queued' rather than raising."""
+    async def test_absent_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read returning None reports 'accepted_unpersisted', not 'queued'.
+
+        The filing is never lost — the id still comes back — but an
+        unconfirmed write is no longer reported in the words that mean a
+        confirmed one (task 5368).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         queue.get = lambda escalation_id: None  # type: ignore[method-assign]
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
 
     @pytest.mark.asyncio
-    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+    async def test_raising_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read that RAISES reports 'accepted_unpersisted' and does not propagate."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -4630,5 +4647,149 @@ class TestHonestResponseContract:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 5368 (S8-25): an unknown queue position is reported as unknown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPositionIsNoneWhenTheSnapshotIsUnavailable:
+    """`_nonblocking_state_response` must not fabricate a position.
+
+    Three of its four branches set `position` from something real — the index
+    the request_id was found at, or `max(0, queue_depth - 1)` for a request
+    that was just enqueued.  The fourth, where `worker.snapshot()` raises,
+    returned the `0` initialiser: the single most misleading value in the
+    range, since it is indistinguishable from a genuine front-of-queue and is
+    what an operator reads as "next to merge".
+    """
+
+    @staticmethod
+    def _raising_worker_harness():
+        def _boom():
+            raise RuntimeError('simulated merge-worker snapshot failure')
+
+        return types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(snapshot=_boom),
+            git_ops=None,  # skip already_merged fast-path and worktree scan
+        )
+
+    @staticmethod
+    async def _submit(server, tmp_path: Path, *, branch: str = 'snap-fail'):
+        return await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id=branch,
+                branch=branch,
+                worktree=str(tmp_path / f'wt-{branch}'),
+                wait_secs=0,
+            ),
+            timeout=3.0,
+        )
+
+    async def test_raising_snapshot_reports_position_none(self, tmp_path: Path):
+        """(a) A snapshot that raises yields position=None, never 0."""
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        assert result['position'] is None, (
+            'A position nobody computed must be reported as unknown, not as '
+            f'front-of-queue: {result}'
+        )
+
+    async def test_rest_of_the_shape_survives_a_raising_snapshot(self, tmp_path: Path):
+        """(b) Only `position` degrades — every other key is present and real.
+
+        `queue_depth` in particular still reports the bare `merge_queue.qsize()`
+        initialiser, which is a genuine measurement the snapshot failure does
+        not invalidate.  `position` must stay PRESENT so a caller keying on it
+        reads "unknown" rather than hitting a KeyError.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        for key in ('request_id', 'snapshot_tip', 'generation', 'position',
+                    'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r}: {result}'
+        assert result['status'] == 'queued', f'Unexpected status: {result}'
+        assert result['request_id'].startswith('mr-'), f'Malformed request_id: {result}'
+        assert result['generation'] == 0, f'Unexpected generation: {result}'
+        assert result['queue_depth'] >= 1, (
+            f'queue_depth is a real measurement and must survive: {result}'
+        )
+
+    async def test_raising_snapshot_is_logged_not_swallowed(self, tmp_path: Path, caplog):
+        """(c) The failure is visible: a WARNING naming the request_id.
+
+        `except Exception: pass` left an operator with no way to learn the
+        live worker was unreachable.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await self._submit(server, tmp_path)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and result['request_id'] in r.getMessage()
+        ]
+        assert matching, (
+            f"Expected a WARNING naming request_id {result['request_id']!r}; got: "
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    async def test_succeeding_snapshot_still_reports_an_int(self, tmp_path: Path):
+        """(d) The None is confined to the failure branch.
+
+        A live worker whose snapshot works keeps returning an int, so this
+        change cannot be mistaken for "position is now optional everywhere".
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        healthy_harness = types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(
+                snapshot=lambda: {'entries': [], 'depth': 1, 'head_of_line': None},
+            ),
+            git_ops=None,
+        )
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=healthy_harness,
+        )
+
+        result = await self._submit(server, tmp_path, branch='snap-ok')
+
+        assert isinstance(result['position'], int), (
+            f"Expected an int position from a healthy snapshot, got: {result}"
+        )

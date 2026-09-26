@@ -350,6 +350,23 @@ class TestDefaults:
             'orchestrator_restart_min_interval_secs) and must NOT be in '
             'RELOADABLE_FIELDS'
         )
+        # task 4755: how old the in-flight fleet-redeploy lease may get before
+        # its readers stop believing it. DERIVED from the drain busy-grace
+        # (worst legitimate sweep ~6270s), not picked, and deliberately far
+        # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
+        # delays at most one window. Red-tier / restart-only like its
+        # siblings — captured at coordinator construction.
+        assert config.orchestrator_restart_lease_max_age_secs == 7200.0
+        assert (
+            'orchestrator_restart_lease_max_age_secs' not in RELOADABLE_FIELDS
+        ), (
+            'orchestrator_restart_lease_max_age_secs requires a process '
+            'restart to take effect (matches its siblings '
+            'orchestrator_restart_merge_phase_grace_secs / '
+            'orchestrator_restart_force_fire_after_secs / '
+            'orchestrator_restart_min_interval_secs) and must NOT be in '
+            'RELOADABLE_FIELDS'
+        )
 
     def test_fused_memory_restart_force_fire_default(self, monkeypatch, tmp_path):
         """Bare OrchestratorConfig() exposes the fused-memory force-fire default.
@@ -1387,23 +1404,37 @@ class TestSccacheConfig:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigSccache:
-    """OrchestratorConfig.sccache field and effective_verify_env property."""
+    """OrchestratorConfig.sccache field and effective_verify_env property.
 
-    def test_sccache_defaults_to_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    All four tests construct a bare/kwargs-only ``OrchestratorConfig()`` and
+    assert on the CODE defaults, so all four need the same isolation from the
+    ambient operational yaml — hence one class-level fixture rather than a
+    per-test mix. Two of them used to hand-roll it as ``monkeypatch.chdir`` +
+    ``delenv('ORCH_CONFIG_PATH')``, which is the weaker form: it leans on the
+    cwd-relative fallback in ``settings_customise_sources`` instead of
+    pointing ``ORCH_CONFIG_PATH`` at a guaranteed-absent file, and two
+    mechanisms for one job in one class invite the next editor to copy the
+    wrong one.
+    """
+
+    def test_sccache_defaults_to_disabled(self):
         config = OrchestratorConfig()
         assert isinstance(config.sccache, SccacheConfig)
         assert config.sccache.enabled is False
 
-    def test_effective_verify_env_equals_verify_env_when_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    def test_effective_verify_env_equals_verify_env_when_disabled(self):
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 
-    def test_effective_verify_env_merges_sccache_backend(self):
+    def test_effective_verify_env_merges_sccache_backend(self, monkeypatch, tmp_path):
+        # Isolate from the ambient dark-factory-orchestrator.yaml, which the
+        # autouse _isolate_orch_config fixture pins ORCH_CONFIG_PATH at: its
+        # verify_env block merges into any bare OrchestratorConfig and would
+        # add keys the exact-equality assertion below does not expect.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
             sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'}),
@@ -1845,8 +1876,18 @@ class TestStarvationWatchdogConfig:
           block is loaded via load_config and all three fields adopt the override values.
       (c) partial override — overriding only `enabled: false` keeps skip_threshold and
           idle_secs at their defaults (deep-merge / no clobber).
+
+    Every (a)-shaped test here carries @pytest.mark.usefixtures("code_default_config"),
+    without exception: the autouse _isolate_orch_config pins ORCH_CONFIG_PATH at the
+    operational dark-factory-orchestrator.yaml, which now carries a starvation_watchdog
+    block (a47b5a506e), so ANY leaf an operator parks in it bleeds into a bare
+    OrchestratorConfig() and reddens the default that leaf overrides.  Which leaves are
+    currently parked is not a property this class may depend on.  (b)/(c) build through
+    load_config and isolate themselves with monkeypatch.delenv('ORCH_CONFIG_PATH')
+    instead; they need no fixture.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes starvation_watchdog with correct defaults."""
         from orchestrator.config import StarvationWatchdogConfig
@@ -1911,6 +1952,7 @@ class TestStarvationWatchdogConfig:
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_idle_only_secs_default(self):
         """Bare OrchestratorConfig() exposes idle_only_secs == 259200.0 (== idle_secs default).
 
@@ -3145,7 +3187,7 @@ class TestOrchestratorConfigPrices:
     _MODEL_COSTS).
     """
 
-    _SEED_KEYS = {'gpt-5.4', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+    _SEED_KEYS = {'gpt-5.4', 'gpt-6-astra', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
 
     def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -3154,6 +3196,8 @@ class TestOrchestratorConfigPrices:
         assert set(config.prices) == self._SEED_KEYS
         assert config.prices['gpt-5.4'].input_per_1m == 2.50
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].input_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].output_per_1m == 50.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3331,24 +3375,50 @@ class TestSessionResumeConfig:
     SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
     kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
     under the literal field name `session_resume` (delivered-check contract),
-    and all five leaves are green-tier hot-reloadable via the
+    and all seven leaves are green-tier hot-reloadable via the
     `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
     group in RELOADABLE_FIELDS.
+
+    THE COUNT IS LOAD-BEARING, so keep it honest. This docstring and
+    `test_leaves_in_reloadable_fields`'s both said FIVE while the body already
+    enumerated SIX — they went stale when task 3578 added
+    `restore_from_archive`, and task 3730 found them stale by one while adding
+    the seventh (`absolute_resume_age_secs`). A count that drifts is worse than
+    no count: it reads as a checked claim.
     """
 
-    def test_defaults(self):
-        """SessionResumeConfig() carries the γ default knobs."""
+    def test_defaults(self, code_default_config):
+        """SessionResumeConfig() carries the γ default knobs.
+
+        Takes ``code_default_config`` so these assert the SHIPPED CODE
+        defaults: `session_resume` is absent from
+        dark-factory-orchestrator.yaml today, but an operator adding it must
+        not silently turn this row green against a tuned value (the convention
+        e9d1055ed8 established after two suites went red pinning live yaml).
+        """
         from orchestrator.config import SessionResumeConfig
 
         cfg = SessionResumeConfig()
         assert cfg.enabled is True
         assert cfg.freshness_window_secs == 86400
         assert cfg.max_resumes_per_task == 3
+        # task ε/3733: the window, NOT the threshold, was the binding
+        # constraint — at the old 3600s nothing chained at any threshold. 5
+        # stays, two above the measured null's longest run of 3 inside 24h.
         assert cfg.fallback_storm_threshold == 5
-        # task 3256: the storm streak is a rolling window, not a cumulative
-        # per-boot counter. 3600s is read off the measured signature — bursts
-        # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
-        assert cfg.storm_window_secs == 3600
+        # task ε/3733: a DERIVED bound, re-derived from the population that
+        # actually feeds the streak after 3728 carved out the
+        # session_resume_fallback bursts the old 3600s was read off. 86400s
+        # sits inside the measured admissible interval [5.82h, 53.00h); the
+        # derivation, its provenance and its live re-derivation guard are in
+        # orchestrator/storm_window_bound.py and test_storm_window_bound.py.
+        assert cfg.storm_window_secs == 86400
+        # task 3730 (PRD leaf δ / D3): a DERIVED bound, not a chosen number.
+        # 432000s = 5 days is the 2026-09-07 requirement (355,803s = 4.12d)
+        # rounded up to the next whole day; the derivation and its provenance
+        # live in orchestrator/resume_age_bound.py and are re-checked every run
+        # by test_resume_age_bound.py's live guard.
+        assert cfg.absolute_resume_age_secs == 432000
 
     def test_storm_window_secs_ge_1_rejects_zero(self):
         """storm_window_secs < 1 must raise ValidationError (ge=1 bound)."""
@@ -3386,6 +3456,98 @@ class TestSessionResumeConfig:
         with pytest.raises(ValidationError):
             SessionResumeConfig(fallback_storm_threshold=-1)
 
+    def test_absolute_resume_age_secs_ge_1_rejects_zero(self):
+        """absolute_resume_age_secs < 1 must raise ValidationError (ge=1 bound).
+
+        Bounded like its siblings: a zero or negative backstop would reject
+        every recovered session outright, silently turning the whole
+        session-resume feature off through a knob that reads as a tuning dial.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(absolute_resume_age_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(absolute_resume_age_secs=-1)
+
+    def test_absolute_resume_age_secs_round_trips_from_yaml(self, tmp_path):
+        """The backstop is settable from dark-factory-orchestrator.yaml."""
+        cfg_path = tmp_path / 'orch.yaml'
+        cfg_path.write_text(
+            'session_resume:\n  absolute_resume_age_secs: 600000\n'
+        )
+        config = load_config(cfg_path)
+
+        assert config.session_resume.absolute_resume_age_secs == 600000
+        # The sibling leaves keep their defaults — a partial block must not
+        # reset the rest of the submodel.
+        assert config.session_resume.enabled is True
+        assert config.session_resume.freshness_window_secs == 86400
+
+    def test_absolute_bound_is_looser_than_the_freshness_window(self):
+        """The absolute backstop must sit ABOVE freshness, never below it.
+
+        The two knobs answer different questions and δ (task 3730 / D2+D3)
+        makes them independent: `freshness_window_secs` applies ONLY when no
+        durable archive exists, while `absolute_resume_age_secs` applies
+        unconditionally. If the absolute bound were the TIGHTER of the two it
+        would fire first on the no-archive path as well, and
+        `freshness_window_secs` would become dead config that an operator
+        could retune with no observable effect.
+
+        RELATIONAL on purpose: it tracks a retune of either knob rather than
+        pinning two numbers that can be changed independently into an
+        inconsistent pair.
+
+        Asserted against the VALIDATOR, not only the shipped defaults. Both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable, so the defaults are not the boundary where
+        this relation can be violated — an operator raising
+        freshness_window_secs past the backstop is, and that has to fail
+        loudly rather than silently turning 'stale' into 'aged_out'.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        cfg = SessionResumeConfig()
+        assert cfg.absolute_resume_age_secs > cfg.freshness_window_secs, (
+            f'absolute_resume_age_secs ({cfg.absolute_resume_age_secs}s) must '
+            f'exceed freshness_window_secs ({cfg.freshness_window_secs}s), or '
+            'the backstop fires first on the no-archive path and the freshness '
+            'window becomes unreachable config'
+        )
+
+        # INVERTED FROM EITHER SIDE — the operator can reach the bad pair by
+        # raising freshness or by lowering the backstop, and both are rejected.
+        with pytest.raises(ValidationError) as freshness_raised:
+            SessionResumeConfig(
+                freshness_window_secs=cfg.absolute_resume_age_secs + 1
+            )
+        with pytest.raises(ValidationError) as backstop_raised:
+            SessionResumeConfig(
+                absolute_resume_age_secs=cfg.freshness_window_secs - 1
+            )
+        for raised in (freshness_raised, backstop_raised):
+            # The message names BOTH values, so an operator reading a failed
+            # load or a rolled-back reload can see which knob to move.
+            message = str(raised.value)
+            assert 'absolute_resume_age_secs' in message
+            assert 'freshness_window_secs' in message
+
+        # EQUALITY is rejected too: at equal values 'stale' can never fire
+        # without 'aged_out' beside it, so freshness is still unreachable —
+        # the failure this guards is dead config, not a crossed ordering.
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(
+                freshness_window_secs=cfg.absolute_resume_age_secs
+            )
+
+        # ...and a WIDER gap in the honest direction stays constructible, so
+        # the validator bounds the relation rather than pinning the defaults.
+        widened = SessionResumeConfig(
+            freshness_window_secs=cfg.freshness_window_secs // 2
+        )
+        assert widened.absolute_resume_age_secs > widened.freshness_window_secs
+
     def test_exposed_on_orchestrator_config(self):
         """A default OrchestratorConfig exposes `.session_resume` as a
         SessionResumeConfig instance under the literal field name.
@@ -3398,13 +3560,24 @@ class TestSessionResumeConfig:
         assert config.session_resume.enabled is True
 
     def test_leaves_in_reloadable_fields(self):
-        """All five session_resume leaves are green-tier hot-reloadable
+        """All seven session_resume leaves are green-tier hot-reloadable
         (membership assertions, robust to future growth of RELOADABLE_FIELDS).
 
         `storm_window_secs` (task 3256) needed no RELOADABLE_FIELDS edit —
         `_submodel_leaf_paths` enumerates `model_fields` dynamically, which is
         exactly the property its docstring advertises. This assertion is what
-        pins that the property actually held.
+        pins that the property actually held, and it has now held three times:
+        `restore_from_archive` (task 3578) and `absolute_resume_age_secs`
+        (task 3730) both joined the green tier with no RELOADABLE_FIELDS edit
+        either.
+
+        `absolute_resume_age_secs` is asserted on its EXACT dotted name because
+        that is task 3730's delivered-check contract: the backstop must be
+        hot-appliable via reload_config with no restart, so an operator who has
+        to widen it after a long outage does not have to bounce the fleet.
+
+        (This docstring said FIVE while the list below held six until task 3730
+        corrected it — see the class docstring.)
         """
         for leaf in (
             'session_resume.enabled',
@@ -3413,6 +3586,7 @@ class TestSessionResumeConfig:
             'session_resume.fallback_storm_threshold',
             'session_resume.storm_window_secs',
             'session_resume.restore_from_archive',
+            'session_resume.absolute_resume_age_secs',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
@@ -3789,12 +3963,17 @@ class TestRecoveryEmissionConfig:
     this class only pins the operator-facing surface.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes recovery_emission with the shipped defaults.
 
         Registration is load-bearing, not cosmetic: ``model_config`` sets
         ``extra='ignore'``, so an UNREGISTERED yaml block is silently dropped
         and the operator edits a stanza that does nothing.
+
+        ``code_default_config`` because the assertions below are about the
+        SHIPPED defaults, not the live project yaml — which an operator may
+        retune at any time (and did: ``streak_escalation_enabled: false``).
         """
         from orchestrator.config import OrchestratorConfig
 
@@ -3811,6 +3990,15 @@ class TestRecoveryEmissionConfig:
         # The narrower kill switch for the only part that WRITES to the
         # escalation queue — separate from `enabled` on purpose.
         assert cfg.recovery_emission.streak_escalation_enabled is True
+        # Task 4647: the landing-detector git_error storm escape hatch shares
+        # this section because it is the same KIND of knob — a recovery-site
+        # detector whose alarm an operator must be able to retune or silence
+        # live.  10/hour is well above any healthy rate (the recovery sweeps
+        # run every 900s) and well below a storm.
+        assert cfg.recovery_emission.landing_git_error_rate_per_hour == 10
+        # Its own narrow kill switch, for the same reason
+        # streak_escalation_enabled has one.
+        assert cfg.recovery_emission.landing_git_error_escalation_enabled is True
 
     def test_veto_streak_threshold_must_be_at_least_one(self):
         """threshold=0 would file an L1 on the very first observed veto."""
@@ -3829,6 +4017,20 @@ class TestRecoveryEmissionConfig:
         with pytest.raises(ValidationError):
             RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
 
+    def test_landing_git_error_rate_must_be_at_least_one(self):
+        """rate=0 would file the storm L1 on the very first git_error.
+
+        One git_error is a transient — a repo lock, a ref that lost a race.
+        The alarm exists for the REPEATED shape, which is the one that means
+        the detector rather than the repo.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=-1)
+
     def test_defaults_yaml_block_matches_the_field_defaults(self):
         """The shipped stanza must not drift from the pydantic defaults.
 
@@ -3846,6 +4048,11 @@ class TestRecoveryEmissionConfig:
         assert block['veto_streak_threshold'] == 3
         assert block['veto_streak_min_span_secs'] == 1500.0
         assert block['streak_escalation_enabled'] is True
+        # Task 4647 — a Field(default=...) with no stanza key is exactly the
+        # silent drift this test exists to catch, so the new leaves are pinned
+        # here alongside the sibling four rather than trusted to pydantic.
+        assert block['landing_git_error_rate_per_hour'] == 10
+        assert block['landing_git_error_escalation_enabled'] is True
 
     def test_leaves_are_green_tier_hot_reloadable(self):
         """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).

@@ -60,6 +60,7 @@ import re
 __all__ = [
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
+    'derive_topic_slug',
     'is_valid_topic_slug',
 ]
 
@@ -113,3 +114,54 @@ def is_valid_topic_slug(value: object) -> bool:
         and bool(TOPIC_SLUG_RE.match(value))
         and len(value) <= TOPIC_SLUG_MAX_LEN
     )
+
+
+#: Any run of characters that cannot appear inside a slug segment.  Note the
+#: complement class is ``[a-z0-9]`` only: ``_`` is NOT preserved, which is the
+#: whole point of the fold (98 of 352 live topic values are snake_case).
+#:
+#: This is deliberately NOT the anchored slug validator :data:`TOPIC_SLUG_RE`
+#: above — two different patterns doing two different jobs.  The *verdict*
+#: still has one home: :func:`derive_topic_slug` never decides validity
+#: itself, it asks :func:`is_valid_topic_slug`.
+_NON_SLUG_RUN_RE = re.compile(r'[^a-z0-9]+')
+
+
+def derive_topic_slug(value: object) -> str | None:
+    """Fold *value* into this module's topic-slug shape, or ``None``.
+
+    The fold: lowercase, strip, collapse every run of non-``[a-z0-9]``
+    characters (which includes ``_``, so snake_case becomes hyphen-case) to a
+    single ``-``, then strip leading/trailing hyphens.  The result is returned
+    **only** if :func:`is_valid_topic_slug` accepts it — which is also where
+    the :data:`TOPIC_SLUG_MAX_LEN` cap is enforced.
+
+    Returning ``None`` rather than a repaired value is load-bearing.  An
+    over-long topic truncated to 100 chars, or ``'!!!'`` turned into
+    ``'unnamed-topic'``, would file a record under a topic no human chose;
+    the caller instead reports it and moves on (loud over silent).
+
+    NOT a copy of ``memory_eval_retrieval_probe._slugify``, and the two must
+    not be "unified": that one preserves ``_`` and falls back to
+    ``'unnamed-topic'``, so it emits slugs this module *rejects*.  It is right
+    for its own job (naming derivation candidates for human review) and wrong
+    for this one (writing a validated vocabulary key to the corpus).
+
+    Lives here rather than in a script because it has two consumers and INV-5
+    gives a shared rule one home (task 4878): ``scripts/retro_stamp_topics.py``
+    (the bounded, id-addressed stamping sweep, which defined it first) and
+    ``scripts/normalize_topic_slugs.py`` (the corpus-wide normalization
+    migration).  Both import it; neither re-expresses it.
+
+    Args:
+        value: Any object.  A non-``str`` is a ``None`` verdict, matching
+            :func:`is_valid_topic_slug`'s "non-str is False" convention — both
+            are handed untrusted values off live records and fixtures.
+
+    Returns:
+        The conforming slug, or ``None`` when no honest fold exists.
+    """
+    if not isinstance(value, str):
+        return None
+    folded = _NON_SLUG_RUN_RE.sub('-', value.strip().lower()).strip('-')
+    return folded if is_valid_topic_slug(folded) else None

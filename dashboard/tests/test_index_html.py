@@ -8,66 +8,31 @@ Guards against:
 
 from __future__ import annotations
 
-import html.parser
 import re
+from pathlib import Path
 
 import pytest
+from _cache_buster_helpers import (
+    ReduxBaseState,
+    cache_buster_violation,
+    redux_cache_buster_versions,
+    resolve_redux_base_state,
+    sole_cache_buster_version,
+)
+from _dashboard_helpers import assert_script_loads_before, find_script_position
 
-_INDEX_URL = '/static/redux/index.html'
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Matches well-formed SRI hashes: sha256/384/512 followed by a base64 payload.
 _SRI_HASH_RE = re.compile(r'^sha(256|384|512)-[A-Za-z0-9+/=]{20,}$')
 
 
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-
-    ``index`` is the tag's 0-based position in ``_ScriptTagCollector.script_attrs``
-    (document order, since the list preserves insertion order).  Returning attrs
-    alongside the position avoids a second parse when the caller also needs the
-    src or other attributes.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-@pytest.fixture(scope='module')
-def index_html_body():
-    """Fetch /static/redux/index.html once for the whole test module."""
-    from starlette.testclient import TestClient
-
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        return c.get(_INDEX_URL).text
-
-
 def test_static_index_html_serves_200(client):
     """GET /static/redux/index.html via the StaticFiles mount returns 200."""
-    resp = client.get(_INDEX_URL)
+    resp = client.get('/static/redux/index.html')
     assert resp.status_code == 200, (
-        f'expected 200 for {_INDEX_URL}, got {resp.status_code}'
+        f'expected 200 for /static/redux/index.html, '
+        f'got {resp.status_code}'
     )
 
 
@@ -100,7 +65,7 @@ def test_cdn_script_has_sri_integrity(
     Parametrised over marked and DOMPurify — both are required by the
     MarkdownText component in tab_tasks.jsx.
     """
-    result = _find_script_position(index_html_body, src_prefix)
+    result = find_script_position(index_html_body, src_prefix)
     attrs = result[1] if result is not None else None
     assert attrs is not None, (
         f'No <script src="{src_prefix}..."> tag found in index.html. '
@@ -118,7 +83,7 @@ def test_cdn_script_has_sri_integrity(
 
 
 # ---------------------------------------------------------------------------
-# Helper-level coverage for _find_script_position (synthetic HTML)
+# Helper-level coverage for find_script_position (synthetic HTML)
 # ---------------------------------------------------------------------------
 
 _MARKED_TAG = '<script src="https://unpkg.com/marked@x/y.js"></script>'
@@ -150,14 +115,14 @@ _FIND_SCRIPT_POSITION_CASES = [
 def test_find_script_position_returns_document_order(
     body: str, src_prefix: str, expected_position: int | None
 ) -> None:
-    """_find_script_position returns the 0-indexed document position of the
+    """find_script_position returns the 0-indexed document position of the
     first <script> tag whose src starts with src_prefix, or None if absent.
 
     Exercises synthetic HTML so that a future bad ordering of the real
     index.html would actually be caught (i.e. proves the helper distinguishes
     good-order from bad-order).
     """
-    result = _find_script_position(body, src_prefix)
+    result = find_script_position(body, src_prefix)
     actual_pos = result[0] if result is not None else None
     assert actual_pos == expected_position
 
@@ -167,61 +132,6 @@ def test_find_script_position_returns_document_order(
 # ---------------------------------------------------------------------------
 
 _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'If it loads after, {after_label} may execute before {before_label} '
-        f'is defined — the silent-failure class the smoke test was added to catch.'
-    )
 
 
 @pytest.mark.parametrize(
@@ -249,7 +159,7 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
     future edit adding those attributes fails loudly rather than silently passing
     a check that no longer reflects execution order.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         src_prefix,
         _TAB_TASKS_PREFIX,
@@ -303,7 +213,7 @@ def test_load_order_assertion_fires_on_deferred_cdn(
     )
     body = cdn_tag + _TAB_TASKS_TAG
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_script_loads_before(
+        assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
@@ -338,7 +248,7 @@ def test_load_order_assertion_fires_on_deferred_tab_tasks(
     )
     body = cdn_tag + bad_tab_tasks_tag
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_script_loads_before(
+        assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
@@ -356,6 +266,7 @@ _TAB_CURATOR_PREFIX = '/static/redux/tab_curator.jsx'
 _CHARTS_PREFIX = '/static/redux/charts.jsx'
 _SHELL_PREFIX = '/static/redux/shell.jsx'
 _DATA_JS_PREFIX = '/static/redux/data.js'
+_DATUM_PREFIX = '/static/redux/datum.js'
 _TABS_PREFIX = '/static/redux/tabs.jsx'
 _APP_JSX_PREFIX = '/static/redux/app.jsx'
 
@@ -394,9 +305,9 @@ def test_tab_curator_loads_before_app_jsx(
     """tab_curator.jsx must load AFTER its deps and BEFORE app.jsx.
 
     Parametrized over the four required ordering pairs using the generic
-    _assert_script_loads_before helper rather than bespoke per-case logic.
+    assert_script_loads_before helper rather than bespoke per-case logic.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         before_prefix,
         after_prefix,
@@ -418,7 +329,7 @@ def test_load_order_assertion_passes_for_classic_scripts() -> None:
     cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
     body = cdn_tag + _TAB_TASKS_TAG
     # Must complete without raising — classic script, correct document order.
-    _assert_script_loads_before(
+    assert_script_loads_before(
         body,
         'https://unpkg.com/marked@',
         _TAB_TASKS_PREFIX,
@@ -444,7 +355,7 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
     undefined, and TaskGraph would throw the moment it tries to call one of
     those functions.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _GRAPH_LAYOUT_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -473,7 +384,7 @@ def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
     would silently produce undefined, and the "group by PRD" view would throw
     the moment it tries to call one of those functions.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PRD_GROUPING_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -503,7 +414,7 @@ def test_runtime_format_js_loads_before_tabs(index_html_body: str) -> None:
     all), that destructure would silently produce undefined, and OrchTab would
     throw the moment it tries to call rtCell/rtAge.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RUNTIME_FORMAT_PREFIX,
         _TABS_PREFIX,
@@ -525,7 +436,7 @@ def test_runtime_format_js_loads_before_tab_tasks(index_html_body: str) -> None:
     all), that destructure would silently produce undefined, and TaskDetail
     would throw the moment it tries to call rtCell.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RUNTIME_FORMAT_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -572,7 +483,7 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
     losing the per-facet sentence this task added. Correct load order is the
     real contract; the guard only keeps a missing module from blanking the tab.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _ORCH_FILTER_PREFIX,
         _TABS_PREFIX,
@@ -620,7 +531,7 @@ def test_spark_path_js_loads_before_charts(index_html_body: str) -> None:
     (loud-over-silent degradation); this ordering guard is what keeps that
     loudness from ever reaching a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _SPARK_PATH_PREFIX,
         _CHARTS_PREFIX,
@@ -669,7 +580,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
     The destructure is deliberate (loud-over-silent degradation); this
     ordering guard is what keeps that loudness from ever reaching a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_STATUS_COUNTS_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -700,7 +611,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 # satisfied `'pins_recovery' in body` with the render arm deleted).
 #
 # The assertions below are NOT that anti-pattern returning under a new name.
-# `_assert_script_loads_before` walks real <script> tags with html.parser and
+# `assert_script_loads_before` walks real <script> tags with html.parser and
 # compares their document positions, checking defer/async/type=module along the
 # way; it reads the page's STRUCTURE, not its source text, and there is no
 # other way to state a load-order invariant. The served-200 checks exercise the
@@ -710,8 +621,65 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 _TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
 _BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
 _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
+_RECON_STATUS_PREFIX = '/static/redux/recon_status.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+_SCHED_HEATMAP_BOUNDS_PREFIX = '/static/redux/scheduler_heatmap_bounds.js'
+_SCHEDULER_HEATMAP_PREFIX = '/static/redux/scheduler_heatmap.jsx'
+
+
+def test_scheduler_heatmap_bounds_js_is_served(client) -> None:
+    """GET /static/redux/scheduler_heatmap_bounds.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s.  scheduler_heatmap.jsx destructures
+    window.DF_SCHED_HEATMAP_BOUNDS at top level with no `|| {}` fallback, so a
+    404 here throws at load and blanks the whole Scheduler tab.
+
+    The body check is what makes this more than a reachability probe: a 200
+    serving the wrong file (a stale mount, a path collision) would otherwise
+    pass.
+    """
+    resp = client.get(_SCHED_HEATMAP_BOUNDS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_SCHED_HEATMAP_BOUNDS_PREFIX}, got {resp.status_code} '
+        '— the module is registered in index.html but not reachable at runtime.'
+    )
+    assert 'boundHeatmapAxes' in resp.text, (
+        f'{_SCHED_HEATMAP_BOUNDS_PREFIX} was served but does not define '
+        'boundHeatmapAxes — the route resolves to the wrong file.'
+    )
+
+
+def test_scheduler_heatmap_bounds_js_loads_before_scheduler_heatmap(
+    index_html_body: str,
+) -> None:
+    """scheduler_heatmap_bounds.js must load BEFORE scheduler_heatmap.jsx.
+
+    scheduler_heatmap.jsx destructures {boundHeatmapAxes, rowTouchesModule}
+    from window.DF_SCHED_HEATMAP_BOUNDS at top-level execution time with no
+    fallback — a later (or missing) tag makes it throw at load, so the
+    Scheduler tab never renders.  The destructure is deliberate
+    (loud-over-silent degradation); this ordering guard keeps that loudness
+    out of a browser.
+
+    Satisfied structurally by the bounds module being a CLASSIC script: every
+    classic tag precedes the first type="text/babel" tag in index.html.  That
+    is the arrangement this asserts, not a coincidence to rely on.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _SCHED_HEATMAP_BOUNDS_PREFIX,
+        _SCHEDULER_HEATMAP_PREFIX,
+        before_label='scheduler_heatmap_bounds.js',
+        after_label='scheduler_heatmap.jsx',
+        consumer_note=(
+            'scheduler_heatmap.jsx destructures window.DF_SCHED_HEATMAP_BOUNDS '
+            'at top level; scheduler_heatmap_bounds.js must define it first.'
+        ),
+    )
 
 
 def test_task_row_cells_js_is_served(client) -> None:
@@ -740,7 +708,7 @@ def test_task_row_cells_js_loads_before_tab_tasks(index_html_body: str) -> None:
     Tasks tab never renders. The destructure is deliberate (loud-over-silent
     degradation); this ordering guard keeps that loudness out of a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_ROW_CELLS_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -763,7 +731,7 @@ def test_task_row_cells_js_loads_before_tabs(index_html_body: str) -> None:
     of. Both consumers need their own ordering assertion; covering only
     tab_tasks.jsx would let a tag inserted between the two JSX files pass.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_ROW_CELLS_PREFIX,
         _TABS_PREFIX,
@@ -799,7 +767,7 @@ def test_burndown_bands_js_loads_before_tabs(index_html_body: str) -> None:
     bands: it throws while tabs.jsx is evaluating, so every tab that file
     defines goes with it.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _BURNDOWN_BANDS_PREFIX,
         _TABS_PREFIX,
@@ -832,7 +800,7 @@ def test_pins_recovery_js_loads_before_tab_escalations(index_html_body: str) -> 
     window.DF_PINS_RECOVERY at top-level execution time with no fallback; it
     feeds the "pinning" StatTile in the analytics strip.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PINS_RECOVERY_PREFIX,
         _TAB_ESCALATIONS_PREFIX,
@@ -856,7 +824,7 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
     while tab_escalations.jsx holds the StatTile. Each consumer therefore needs
     its own ordering assertion.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PINS_RECOVERY_PREFIX,
         _TAB_ESC_ANALYTICS_PREFIX,
@@ -871,68 +839,451 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: recon_status.js must load BEFORE tabs.jsx and app.jsx
+# (task 5320)
+# ---------------------------------------------------------------------------
+
+
+def test_recon_status_js_is_served(client) -> None:
+    """GET /static/redux/recon_status.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Both consumers destructure window.DF_RECON_STATUS at top
+    level with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking the whole dashboard, not just the Recon tab.
+    """
+    resp = client.get(_RECON_STATUS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_RECON_STATUS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_recon_status_js_loads_before_tabs(index_html_body: str) -> None:
+    """recon_status.js must load BEFORE tabs.jsx.
+
+    tabs.jsx destructures {reconRunCounts, reconSuccessPct, reconStatusTone}
+    from window.DF_RECON_STATUS at top-level execution time with no fallback,
+    for ReconTab's tiles and its Recent Runs badges. A later (or missing) tag
+    throws while tabs.jsx is evaluating, so every tab that file defines goes
+    with it.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _TABS_PREFIX,
+        before_label='recon_status.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (ReconTab) destructures window.DF_RECON_STATUS at top '
+            'level; recon_status.js must define it first.'
+        ),
+    )
+
+
+def test_recon_status_js_loads_before_app(index_html_body: str) -> None:
+    """recon_status.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    app.jsx destructures {reconRunCounts} at top level to compute the Recon
+    rail badge. Ordering this one wrong is the quieter failure of the two —
+    the rail count is a single digit an operator has no independent way to
+    check, which is how the vocabulary mismatch this task fixes survived.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='recon_status.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_RECON_STATUS at top level for the '
+            'Recon rail badge; recon_status.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: endpoint_staleness.js is served and loads before app.jsx
+# (task 4884, #4791)
+# ---------------------------------------------------------------------------
+
+_ENDPOINT_STALENESS_PREFIX = '/static/redux/endpoint_staleness.js'
+
+
+def test_endpoint_staleness_js_is_served(client) -> None:
+    """GET /static/redux/endpoint_staleness.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. app.jsx destructures window.DF_ENDPOINT_STALENESS at top
+    level with no fallback, so that 404 throws at app.jsx's evaluation and
+    takes the WHOLE page down, not just the indicator.
+    """
+    resp = client.get(_ENDPOINT_STALENESS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_ENDPOINT_STALENESS_PREFIX}, got '
+        f'{resp.status_code} — the module is registered in index.html but not '
+        'reachable at runtime.'
+    )
+
+
+def test_endpoint_staleness_js_loads_before_app_jsx(index_html_body: str) -> None:
+    """endpoint_staleness.js must load as a classic script BEFORE app.jsx.
+
+    app.jsx destructures {staleNoticesForTab} from
+    window.DF_ENDPOINT_STALENESS at top-level execution time; it decides the
+    per-endpoint staleness notices rendered above every tab body. Load order is
+    the enforced contract here rather than a `|| {}` fallback, precisely
+    because a silently-absent staleness indicator is the failure this task
+    closes: the 2026-08-27 wedge ran 19.8h with the UI showing stale numbers
+    and saying nothing about it.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _ENDPOINT_STALENESS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='endpoint_staleness.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_ENDPOINT_STALENESS at top level; '
+            'endpoint_staleness.js must define it first.'
+        ),
+    )
+
+
+def test_endpoint_staleness_js_loads_before_data_js(index_html_body: str) -> None:
+    """endpoint_staleness.js must load BEFORE data.js.
+
+    This is the floor of the datum.js chain (PRD leaf gamma1):
+    endpoint_staleness.js -> datum.js -> data.js. datum.js destructures
+    {formatAge} from window.DF_ENDPOINT_STALENESS at top level so the tile age
+    badge and the endpoint banner state an age in ONE format, and data.js in
+    turn destructures window.DF_DATUM at top level to validate datum-kinded
+    payloads. Both destructures are deliberate load-order contracts rather than
+    `|| {}` fallbacks, so the whole chain has to run in document order.
+
+    Pinned ahead of datum.js existing, and as its own commit, so the tag MOVE
+    is reviewable on its own: endpoint_staleness.js reads no other global, so
+    hoisting it above data.js is inert today and cannot be confused with the
+    new module's behaviour when that lands next door.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _ENDPOINT_STALENESS_PREFIX,
+        _DATA_JS_PREFIX,
+        before_label='endpoint_staleness.js',
+        after_label='data.js',
+        consumer_note=(
+            'datum.js destructures window.DF_ENDPOINT_STALENESS at top level '
+            'and loads between these two; endpoint_staleness.js must define '
+            'it first.'
+        ),
+    )
+
+
+def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
+    """endpoint_staleness.js is present among the VERSIONED redux assets.
+
+    The presence half of what `test_redux_cache_buster_bumped` asserts for its
+    eight top-level-destructured siblings: a tag added without a `?v=` misses
+    every already-open browser, and a tag deleted outright takes app.jsx down
+    with it (that destructure has no fallback). The uniformity half is already
+    covered for this asset with no edit at all — `redux_cache_buster_versions`
+    collects EVERY `/static/redux/*?v=N` tag, so a mismatched version here
+    fails over there automatically.
+
+    WHY IT IS HERE AND NOT IN test_redux_cache_buster_bumped, where the plan
+    for task 4884 put it. That function is called with SYNTHETIC bodies by
+    `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, built from
+    its own `_REQUIRED_ASSETS` roster — a second mirror of the asset list, in
+    a file outside this task's scope. Adding a ninth presence assertion there
+    would have failed those synthetic-body callers until that roster was
+    edited too. Asserting over the `index_html_body` fixture instead keeps the
+    protection identical (it runs against the REAL index.html, which is the
+    body that ships) while leaving the synthetic-body contract untouched.
+    """
+    assert re.search(r'/static/redux/endpoint_staleness\.js\?v=\d+', index_html_body), (
+        'endpoint_staleness.js is not present among the versioned '
+        '/static/redux/* assets in index.html — app.jsx destructures '
+        'window.DF_ENDPOINT_STALENESS at top level with no fallback, so a '
+        'missing tag throws at app.jsx evaluation and blanks the whole page; '
+        'a tag added without a cache-buster misses already-open browsers. Bump '
+        'all /static/redux/* ?v= uniformly.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: task_vocab.js is served and loads before its JSX consumers
+# (task 5585, PRD leaf alpha)
+#
+# task_vocab.js is the first /static/redux/ asset that is GENERATED rather than
+# hand-written: scripts/gen_dashboard_task_vocab.py renders it from
+# shared/src/shared/task_statuses.py and dashboard/src/dashboard/data/census.py,
+# and tests/scripts/test_dashboard_task_vocab.py pins the two byte-for-byte.
+# That parity test compares generated output against generated output, so it is
+# silent about whether the artifact is WIRED IN at all. These four assertions
+# are the other half: the file is reachable over HTTP, it is versioned, and it
+# runs before the JSX that reads it.
+# ---------------------------------------------------------------------------
+
+_TASK_VOCAB_PREFIX = '/static/redux/task_vocab.js'
+
+
+def test_task_vocab_js_is_served(client) -> None:
+    """GET /static/redux/task_vocab.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. The consumers destructure window.DF_TASK_VOCAB at top level
+    with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking every tab those files define, not one panel.
+    """
+    resp = client.get(_TASK_VOCAB_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_TASK_VOCAB_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_task_vocab_js_has_cache_buster(index_html_body: str) -> None:
+    """task_vocab.js is present among the VERSIONED redux assets.
+
+    The presence half of what `test_redux_cache_buster_bumped` asserts for its
+    top-level-destructured siblings: a tag added without a `?v=` misses every
+    already-open browser, and a tag deleted outright takes its consumers down
+    with it. The uniformity half needs no edit at all —
+    `redux_cache_buster_versions` collects EVERY `/static/redux/*?v=N` tag, so
+    a mismatched version here fails over there automatically.
+
+    A stale cached copy is the sharper risk for THIS asset than for the
+    hand-written ones. Its whole purpose is to be the single copy of the task
+    vocabulary the SPA reads; a browser holding last week's task_vocab.js while
+    running this week's JSX sees a vocabulary that disagrees with the census the
+    server computed, which is the class of mismatch the generator exists to
+    make impossible.
+
+    Deliberately its OWN test rather than a ninth assertion inside
+    `test_redux_cache_buster_bumped`, following the endpoint_staleness.js
+    precedent next door: that function is also driven with SYNTHETIC bodies
+    from `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, whose
+    `_REQUIRED_ASSETS` roster is a separate mirror in a file outside this
+    task's scope.
+    """
+    assert re.search(r'/static/redux/task_vocab\.js\?v=\d+', index_html_body), (
+        'task_vocab.js is not present among the versioned /static/redux/* '
+        'assets in index.html — the generated task vocabulary never reaches '
+        'the browser, so every consumer destructuring window.DF_TASK_VOCAB at '
+        'top level throws; a tag added without a cache-buster leaves an '
+        'already-open browser reading a stale vocabulary against fresh census '
+        'payloads. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+def test_task_vocab_js_loads_before_tabs(index_html_body: str) -> None:
+    """task_vocab.js must load BEFORE tabs.jsx.
+
+    PRD leaves gamma1 and gamma2 both read the vocabulary from tabs.jsx — the
+    shared `ST`/`LocksCell` renderers and OrchTab's census views — via a
+    top-level `window.DF_TASK_VOCAB` destructure with no fallback. A later (or
+    missing) tag throws while tabs.jsx is evaluating, so every tab that file
+    defines goes with it.
+
+    The tag lands in alpha, ahead of those consumers, on purpose: alpha ships
+    the seam and its guards, and an unwired artifact is the one failure the
+    byte-parity test cannot see.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _TASK_VOCAB_PREFIX,
+        _TABS_PREFIX,
+        before_label='task_vocab.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'gamma1 (ST, LocksCell) and gamma2 (OrchTab) destructure '
+            'window.DF_TASK_VOCAB at tabs.jsx top level; task_vocab.js must '
+            'define it first.'
+        ),
+    )
+
+
+def test_task_vocab_js_loads_before_app(index_html_body: str) -> None:
+    """task_vocab.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    gamma2 reads the census views in app.jsx for the topbar and rail counts.
+    Ordering this one wrong is the quieter failure of the two — a rail badge is
+    a single number an operator has no independent way to check, which is how
+    the "0/1 vs Active 33" mismatch this PRD closes survived in the first
+    place.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _TASK_VOCAB_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='task_vocab.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'gamma2 destructures window.DF_TASK_VOCAB at app.jsx top level for '
+            'the topbar and rail census counts; task_vocab.js must define it '
+            'first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: datum.js is served and sits between endpoint_staleness.js
+# and its consumers (task 5588, PRD leaf gamma1)
+#
+# datum.js is the client half of the Datum envelope whose server half is
+# dashboard/src/dashboard/data/datum.py. It destructures {formatAge} from
+# window.DF_ENDPOINT_STALENESS at module scope with no fallback, and data.js in
+# turn destructures window.DF_DATUM at module scope, so the chain
+# endpoint_staleness.js -> datum.js -> data.js is a real, checkable load-order
+# contract rather than a convention. The floor of that chain is pinned next
+# door in test_endpoint_staleness_js_loads_before_data_js.
+# ---------------------------------------------------------------------------
+
+
+def test_datum_js_is_served(client) -> None:
+    """GET /static/redux/datum.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Its consumers destructure window.DF_DATUM at top level with
+    no fallback, so a 404 here throws while data.js is evaluating — and data.js
+    is what publishes DF_DATA, so the whole dashboard goes, not one tile.
+    """
+    resp = client.get(_DATUM_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_DATUM_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_datum_js_has_cache_buster(index_html_body: str) -> None:
+    """datum.js is present among the VERSIONED redux assets.
+
+    The presence half of what `test_redux_cache_buster_bumped` asserts for its
+    top-level-destructured siblings: a tag added without a `?v=` misses every
+    already-open browser, and a tag deleted outright takes its consumers down
+    with it. The uniformity half needs no edit — `redux_cache_buster_versions`
+    collects EVERY `/static/redux/*?v=N` tag, so a mismatched version here
+    fails over there automatically.
+
+    Deliberately its OWN test rather than another assertion inside
+    `test_redux_cache_buster_bumped`, following the endpoint_staleness.js and
+    task_vocab.js precedents above: that function is also driven with SYNTHETIC
+    bodies from `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`,
+    whose `_REQUIRED_ASSETS` roster is a separate mirror in a file outside this
+    task's scope.
+    """
+    assert re.search(r'/static/redux/datum\.js\?v=\d+', index_html_body), (
+        'datum.js is not present among the versioned /static/redux/* assets in '
+        'index.html — data.js, task_row_cells.js, charts.jsx, shell.jsx and '
+        'tabs.jsx all destructure window.DF_DATUM at top level with no '
+        'fallback, so a missing tag blanks the dashboard; a tag added without '
+        'a cache-buster leaves an already-open browser rendering unprovenanced '
+        'numbers. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+_DATUM_ORDER_CASES = [
+    (_ENDPOINT_STALENESS_PREFIX, 'endpoint_staleness.js', _DATUM_PREFIX, 'datum.js'),
+    (_DATUM_PREFIX, 'datum.js', _DATA_JS_PREFIX, 'data.js'),
+    (_DATUM_PREFIX, 'datum.js', _TASK_ROW_CELLS_PREFIX, 'task_row_cells.js'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _DATUM_ORDER_CASES,
+    ids=['staleness-before-datum', 'datum-before-data', 'datum-before-task-row-cells'],
+)
+def test_datum_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """The datum chain must run in document order, both edges.
+
+    datum.js destructures {formatAge} from window.DF_ENDPOINT_STALENESS at
+    module scope so the tile age badge and the endpoint staleness banner state
+    an age in ONE format; data.js destructures window.DF_DATUM at module scope
+    to validate datum-kinded payloads before applying them, and
+    task_row_cells.js destructures it for locksCellState's placeholder and
+    tooltip decision. None of these destructures has a `|| {}` fallback, by the
+    DF_SPARK_PATH convention — a missing dependency throws at load with a clear
+    message rather than deferring to a TypeError inside a render or silently
+    degrading.
+
+    The two datum.js -> consumer edges are separate cases rather than one,
+    because breaking either one breaks a different surface: data.js publishes
+    DF_DATA (so the whole dashboard goes), while task_row_cells.js publishes
+    DF_TASK_ROW_CELLS (so the task rows in tab_tasks.jsx and tabs.jsx go).
+
+    Parametrized over both edges using the generic assert_script_loads_before
+    helper (which also carries the defer/async/type=module false-pass guard)
+    rather than bespoke per-case logic, following _TAB_CURATOR_ORDER_CASES.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=(
+            f'{after_label} destructures the global {before_label} defines at '
+            'module scope with no fallback; the definition must run first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 45,
-    and graph_layout.js / prd_grouping.js / task_status_counts.js /
-    runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
-    must all be among the versioned assets.
+    """All /static/redux/*?v= cache-busters must share ONE version, and the
+    eight assets destructured at module top level must be among them.
 
     This is the sole home of the UNIFORMITY check ("all versions are the
-    same"); every other module asserts only its own `min(versions) >= N`
-    floor, which needs no uniformity precondition to be sound (the OLDEST
+    same").  Every other module asserts only its own absolute floor over the
+    same tags, which needs no uniformity precondition to be sound (the OLDEST
     asset is the one that would still serve stale code).
 
-    The floor tracks the newest bump — currently 45, for task 3489's
-    null-sample fix in the four padded chart primitives (LineChart /
-    StackedAreaChart / BarChart / HistBar). Raising it matters more than a
-    routine bump for the usual reason: an already-open browser holds a cached
-    copy of the BROKEN file, so without a new ?v= the fix never reaches it.
+    THERE IS NO LONGER A FLOOR HERE.  This test used to also assert
+    `v >= 45`, a hardcoded number that had to be hand-raised on every asset
+    task.  It was not being maintained — index.html shipped v=49 while the
+    constant still read 45, four releases stale — and, more damningly, a
+    constant cannot catch the failure that actually bites: a branch whose
+    version is high enough to clear the floor but not newer than what main
+    already released.  That case now has its own assertion in
+    `test_redux_cache_buster_is_newer_than_merge_base` below, which is
+    base-relative and therefore cannot go stale.
 
-    3489 is the sharpest case in this chain, because it can BLANK the page
-    rather than only mis-draw it: charts.jsx's module-top-level
-    `window.DF_SPARK_PATH` destructure now reaches for five NEW names
-    (plottableMax, axisY, axisPaths, barFractions, stackedAreaPaths), so a
-    browser holding a cached spark_path.js at ANY previously released version
-    next to a fresh charts.jsx binds five undefined builders and blanks every
-    tab that renders a chart. A fully cached older pair is the milder failure:
-    it keeps drawing missing samples as measured zeros at the chart floor,
-    zero-height bars and 1px HistBar stubs.
-
-    3489 PLANNED 43, THEN 44, AND LANDED AT 45 — worth recording because the
-    reason generalises. Main kept bumping while 3489 sat in flight (43 wired
-    in memory_evals_fmt.js; 44 followed), and each of those releases already
-    serves the OLD four-export spark_path.js — isPlottable, sparkScale,
-    sparkPaths, stepPaths, with none of 3489's five padded builders. Landing
-    3489 at a number main already released would leave the URL unchanged while
-    its content changed, which is precisely the pairing this guard exists to
-    make impossible. A version number is only a cache key if it is strictly
-    newer than every version already released: when a branch that bumps sits
-    in flight long enough for main to bump too, re-check the number before
-    merging rather than trusting the one the plan named.
+    Anti-revert cover is unchanged: seven sibling modules still pin their own
+    absolute floors over these tags — test_charts_axis_labels.py (44),
+    test_tab_memory_evals.py (43), test_esc_flow_diagram.py (33),
+    test_tab_escalation_analytics.py (30), test_tab_scheduler.py (19),
+    test_tab_escalations.py (10), test_scheduler_page.py (10) — and none of
+    them was touched by the retirement.  Their docstrings say that "whether
+    the newest bump landed is asserted in test_index_html.py"; that
+    cross-reference is true for the first time now that a stale constant has
+    been replaced by a real freshness check.
     """
-    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    versions = redux_cache_buster_versions(index_html_body)
     assert len(versions) == 1, (
         f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
         'bump all of them uniformly to the same value.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 45, (
-        f'index.html cache-buster version is {v}, expected >= 45 (proves the '
-        "uniform bump for task 3489's null-sample fix in LineChart / "
-        'StackedAreaChart / BarChart / HistBar actually reaches already-open '
-        'browsers. This one can BLANK the page rather than merely mis-draw it: '
-        "charts.jsx's top-level window.DF_SPARK_PATH destructure now reaches "
-        'for five new builder names, so a cached spark_path.js at any '
-        'previously released version (42, 43, 44 — all of which ship the OLD '
-        'four-export module) next to a fresh charts.jsx binds five undefined '
-        'builders and every tab that renders a chart goes blank; a fully '
-        'cached older pair instead keeps drawing missing samples as measured '
-        'zeros at the chart floor. 44 is NOT sufficient here precisely because '
-        'main already released it.).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -979,3 +1330,74 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'a tag added without a cache-buster misses already-open browsers. Bump '
         'all /static/redux/* ?v= uniformly.'
     )
+    # endpoint_staleness.js's presence check deliberately lives NEXT DOOR, in
+    # test_endpoint_staleness_js_has_cache_buster, rather than here — see that
+    # test's docstring for why (this function is also invoked with SYNTHETIC
+    # bodies from test_cache_buster_freshness.py, whose asset roster is a
+    # separate mirror).
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: the cache-buster is strictly newer than what main released
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def redux_base_state() -> ReduxBaseState | None:
+    """What `merge-base(main, HEAD)` says about the redux assets, or `None`.
+
+    Module-scoped so the three git calls run once for the file, matching the
+    `index_html_body` fixture's scope.
+    """
+    return resolve_redux_base_state(REPO_ROOT)
+
+
+def test_redux_cache_buster_is_newer_than_merge_base(
+    index_html_body: str,
+    redux_base_state: ReduxBaseState | None,
+) -> None:
+    """The cache-buster must be newer than the version main already released.
+
+    THE RULE, evaluated against `merge-base(main, HEAD)`:
+
+      * MONOTONIC, always — the version may not move backwards.
+      * FRESH, when a file under /static/redux/ that EXISTED at the merge base
+        now holds different bytes — the version must be strictly greater.
+      * EXEMPT otherwise.  A branch that touches no redux asset owes no bump,
+        which is what keeps this guard from taxing every unrelated task in the
+        repo.  An ADDED asset is exempt too: its URL was never in any cache.
+
+    WHY IT EXISTS.  Task/3490 planned a 43 -> 44 bump, sat in flight while
+    main released 44 itself, and its rebase then dropped the now-redundant
+    bump patch — so it merged carrying main's number while still shipping
+    modified JSX.  Every /static/redux/ URL was unchanged while its content
+    changed, which is precisely the pairing a cache-buster exists to prevent,
+    and the hardcoded floor that used to live next door was green throughout:
+    the branch's version cleared it easily.  A version number is only a cache
+    key if it is strictly newer than every version already released, and that
+    is a property of the BASE, not of any constant a human remembers to raise.
+
+    Measured against the merge base rather than main's tip on purpose.  The
+    two coincide at the moment this actually gates a merge, because the merge
+    lane rebases first; before that, comparing against a moving tip would turn
+    an in-flight branch red the instant an unrelated merge landed, with no
+    change of its own to explain it.  This way a branch's result stays a
+    function of the branch.
+
+    The rule itself lives in `_cache_buster_helpers.cache_buster_violation`,
+    where its truth table is pinned against literals and its git resolver
+    against throwaway repos — including a replay of the 3490 shape — because
+    on a healthy branch this assertion is vacuously satisfied and could
+    otherwise rot unnoticed.  See test_cache_buster_freshness.py.
+    """
+    if redux_base_state is None:
+        pytest.skip(
+            'no main or origin/main ref resolves from '
+            f'{REPO_ROOT}, so there is no merge base to compare the '
+            'cache-buster against (an sdist install or a shallow clone). '
+            'Skipping rather than failing: this tree is unmeasurable, not broken.'
+        )
+
+    head_version = sole_cache_buster_version(index_html_body)
+    violation = cache_buster_violation(head_version, redux_base_state)
+    assert violation is None, violation

@@ -69,6 +69,18 @@ set -euo pipefail
 #                                         heartbeat (default: 30)
 #   ORCH_DRAIN_UNKNOWN_GRACE_SECS         grace for a stale/absent heartbeat
 #                                         before proceeding anyway (default: 120)
+#   ORCH_FLEET_LEASE                      in-flight sweep lease this script
+#                                         writes and removes (default:
+#                                         $REPO_DIR/data/orchestrator/fleet_redeploy_lease.json)
+#   ORCH_FLEET_LEASE_MAX_AGE_SECS         listed for completeness: read by the
+#                                         lease's READERS, never by this
+#                                         script, which holds its lease for as
+#                                         long as the sweep takes
+#                                         (default: 7200 = 2h)
+#   ORCH_DRAIN_POLL_TRACE_FILE            append one <verdict>\t<unit> line per
+#                                         drain poll to this file (default:
+#                                         unset = off; no other behaviour
+#                                         changes)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -144,6 +156,28 @@ FLEET_DIR="${ORCH_FLEET_DIR:-/home/leo/src/dark-factory/data/fleet}"
 # FLEET_DEPLOY_CLOCK_RELPATH / _persist_last_fire_wall) so both the
 # coordinator and scripts/orchestrator-watchdog.py read what this writes.
 CLOCK_FILE="${ORCH_FLEET_DEPLOY_CLOCK:-$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json}"
+# In-flight sweep lease (task 4755): the clock says when a sweep last
+# FINISHED, which says nothing while one is still running. This says a sweep
+# is running RIGHT NOW, and is the only coordination state the three readers
+# -- the watchdog's staleness backstop, the merge-landed coordinator, and the
+# watchdog's liveness probe -- have during a sweep. This script is its SOLE
+# writer, as it is the clock's.
+#
+# $REPO_DIR-relative for exactly the same reason CLOCK_FILE above is, and
+# deliberately NOT absolute like FLEET_DIR: see the FLEET_DIR comment for why
+# those two differ (data/fleet/ is a machine-global cross-project rendezvous;
+# both of these are dark-factory repo artifacts, for which per-checkout is the
+# correct scope). Mirrors orchestrator.service_restart FLEET_LEASE_RELPATH.
+# Pinned across all four mirrors -- this line, that constant,
+# scripts/orchestrator-watchdog.py's FLEET_LEASE_PATH and
+# df_pytest_isolation.FLEET_LEASE_RELPATH -- by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+# Test isolation is achieved by SETTING ORCH_FLEET_LEASE, never by changing
+# this default.
+LEASE_FILE="${ORCH_FLEET_LEASE:-$REPO_DIR/data/orchestrator/fleet_redeploy_lease.json}"
+# Stamped once by lease_acquire and preserved by every later rewrite, so the
+# readers' age bound measures the SWEEP, not its most recent unit transition.
+LEASE_STARTED_TS=""
 # TEMPORARY MITIGATION 2026-08-26 (was 4500 = 75m; revert to 4500 once the
 # tasks below land). A permanently-busy unit burns this ENTIRE grace on EVERY
 # sweep, and dark-factory is restarted LAST (SELF_UNIT), so the grace sets how
@@ -169,10 +203,72 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-600}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
 # Return channel for drain_await_fresh -- never declare 'local' anywhere
 # (full contract and incident rationale live in drain_await_fresh's own
 # docstring, task 3852).
 _DRAIN_VERDICT=""
+
+# The lease functions are defined HERE, above the argument parser, while every
+# other function in this script is defined below it. That is forced by the two
+# ordering constraints they sit between: the EXIT trap must be armed before any
+# exit is reachable (so it has to be installable this early), and the lease must
+# be acquired only AFTER parsing (so a rejected argument never writes one).
+# tests/scripts/test_restart_all_orchestrators.py and
+# scripts/tests/test_restart_all_orchestrators.py pin both halves.
+
+lease_set_current_unit() {
+    # $1 = the unit being restarted right now, "" before the loop begins.
+    #
+    # Also THE writer -- lease_acquire below is this plus the started_ts stamp,
+    # rather than a second copy of the printf. Atomic mktemp-sibling + `mv -f`
+    # exactly like stamp_fleet_deploy_clock, so a reader polling this file
+    # always sees either the whole previous body or the whole new one.
+    #
+    # Deliberately NOT carrying the clock's `source`/`pytest_session`
+    # provenance keys. Those exist so deploy_clock_change_report can DOWNGRADE
+    # a benign production redeploy observed during a test run; a lease has no
+    # benign-external-write case at all, so any write to the real lease path
+    # during a test run must stay FALSIFIED and fail the run.
+    local lease_dir tmp_file
+    lease_dir="$(dirname "$LEASE_FILE")"
+    mkdir -p "$lease_dir"
+    tmp_file="$(mktemp "$lease_dir/.fleet_redeploy_lease.XXXXXX")"
+    printf '{"pid": %s, "started_ts": %s, "current_unit": "%s"}\n' \
+        "$$" "$LEASE_STARTED_TS" "$1" > "$tmp_file"
+    mv -f "$tmp_file" "$LEASE_FILE"
+}
+
+lease_acquire() {
+    LEASE_STARTED_TS="$(date +%s)"
+    lease_set_current_unit ""
+}
+
+lease_release() {
+    # Removes the lease ONLY if it is still the one this process wrote.
+    #
+    # The pid check is not defensiveness: the fixed transient-unit-name guard
+    # stops the staleness backstop running two sweeps at once, but the
+    # merge-landed coordinator uses a DIFFERENT transient unit name and is not
+    # covered by it -- which is the overlap task 4755 exists to close. Under an
+    # unconditional `rm -f`, the shorter of two overlapping sweeps would delete
+    # the longer one's lease on its way out, re-arming all three readers while
+    # units are still being restarted.
+    #
+    # Matched against the format this script itself writes, and kept to
+    # coreutils: the one python3 call in this file (drain_check_verdict) is
+    # reached only under --drain, so a python3 dependency on a path that EVERY
+    # invocation takes would be new.
+    if grep -q "\"pid\": $$," "$LEASE_FILE" 2>/dev/null; then
+        rm -f "$LEASE_FILE"
+    elif [[ -e "$LEASE_FILE" ]]; then
+        echo "leaving the in-flight fleet-redeploy lease in place: it belongs to another sweep, not to pid $$" >&2
+    fi
+    # Never let this trap decide the script's exit status: `set -e` is in force
+    # inside an EXIT trap too, so a non-zero last command here would replace the
+    # status the sweep actually earned.
+    return 0
+}
 
 DRAIN_ENABLED=0
 for arg in "$@"; do
@@ -186,6 +282,25 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Arm FIRST, acquire second: an exit between the two is harmless because
+# `rm -f` is idempotent, whereas the reverse order strands a lease on any
+# failure inside lease_acquire. Both must precede the first line that can call
+# a function, so that an `exit` inside a function body -- drain_gate's
+# _drain_validate_verdict abort, say -- cannot escape the release.
+#
+# The TERM and INT traps exist so a signalled sweep ROUTES THROUGH the EXIT
+# trap: an untrapped SIGTERM kills the shell without running one, which is how
+# an operator stopping a sweep would otherwise strand a lease for the readers'
+# whole max-age bound. SIGKILL is uncatchable by construction and DOES strand
+# it -- that is precisely why the readers bound the lease's age and never trust
+# its presence alone.
+trap lease_release EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+# Unconditional, not only under --drain: a non-drain sweep is still a fleet
+# restart that the other tiers must not stack on top of.
+lease_acquire
 
 read_field() {
     # $1 = `systemctl show` output blob, $2 = field name
@@ -267,17 +382,34 @@ drain_check_verdict() {
     # must not become a hard dependency on drain_check.py always behaving.
     # stderr is left unsuppressed so a real failure is still visible in the
     # script's own output.
-    local raw
+    local raw verdict
     raw="$(python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
         --fresh-window "$DRAIN_FRESH_WINDOW_SECS")" || raw="absent"
     case "$raw" in
-        idle|busy|stale|absent)
-            printf '%s\n' "$raw"
-            ;;
-        *)
-            printf '%s\n' "absent"
-            ;;
+        idle|busy|stale|absent) verdict="$raw" ;;
+        *)                      verdict="absent" ;;
     esac
+    # POLL LEDGER (task 4486), off unless ORCH_DRAIN_POLL_TRACE_FILE is set.
+    # Written HERE because this function is the single funnel every `python3
+    # drain_check.py` invocation passes through -- drain_await_fresh's opening
+    # poll, its in-loop re-polls, and drain_gate's busy poll loop -- so one
+    # write site yields a COMPLETE ledger. It records the COERCED verdict, not
+    # $raw, so the ledger's vocabulary is exactly the four tokens the gate
+    # branches on, and a reading the gate never acted on cannot appear in it.
+    #
+    # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
+    # the latter returns non-zero when the knob is unset and `set -e` would
+    # read that as this function failing. `|| true` guards the same class of
+    # hazard one remove out -- this function is only ever called via command
+    # substitution assigned to a plain variable, so a failed `>>` must never
+    # be able to abort a whole fleet redeploy over a mis-typed operator path.
+    # NO `2>/dev/null`: bash's own diagnostic stays on stderr, so an operator
+    # who set the knob and got no trace is told why (no-silent-fail-soft).
+    if [[ -n "$DRAIN_POLL_TRACE_FILE" ]]; then
+        printf '%s\t%s\n' "$verdict" "$1" >> "$DRAIN_POLL_TRACE_FILE" || true
+    fi
+    # LAST, so the function's exit status stays that of its contractual output.
+    printf '%s\n' "$verdict"
 }
 
 drain_await_fresh() {
@@ -289,6 +421,12 @@ drain_await_fresh() {
     # stale/absent verdict if the grace elapsed with no fresh reading
     # (fail-toward-convergence: the caller proceeds with the restart) --
     # returns 0, and prints nothing to stdout.
+    #
+    # That stdout silence is unchanged and load-bearing (see drain_gate's
+    # callers and test_idle_unit_restarts_transparently_with_no_defer_line).
+    # The poll loop's observability seam is drain_check_verdict's
+    # ORCH_DRAIN_POLL_TRACE_FILE ledger, a FILE precisely so seeing the loop
+    # iterate costs this contract nothing.
     #
     # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
     # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
@@ -436,17 +574,47 @@ stamp_fleet_deploy_clock() {
     # Atomically stamps CLOCK_FILE with the current epoch/UTC-ISO time:
     # mktemp a sibling file IN the same directory, write it, then `mv -f`
     # onto CLOCK_FILE (same-filesystem rename -- atomic). Schema is {ts,
-    # iso}, matching the coordinator's _persist_last_fire_wall, so
-    # float(raw['ts']) reads it identically from either writer. Called ONLY
-    # from the all-units-verified-fresh exit-0 path below -- never on a
-    # failed/partial verify or the early no-running-units exit -- so a
-    # failed fleet restart can never silence the watchdog backstop (I2).
-    local clock_dir tmp_file
+    # iso, source, pytest_session}; the {ts, iso} half matches the
+    # coordinator's _persist_last_fire_wall, so float(raw['ts']) reads it
+    # identically from either writer. Called ONLY from the
+    # all-units-verified-fresh exit-0 path below -- never on a failed/partial
+    # verify or the early no-running-units exit -- so a failed fleet restart
+    # can never silence the watchdog backstop (I2).
+    #
+    # `source` and `pytest_session` are ADDITIVE (task 4823) and inert to
+    # every reader -- all three extract `ts` and nothing else. They mirror
+    # df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
+    # ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
+    # df_pytest_isolation.py::deploy_clock_change_report reads and is the one
+    # place that explains what they are for. Neither side can import the
+    # other, so both mirrors are pinned together by
+    # tests/scripts/test_restart_all_orchestrators.py.
+    #
+    # The one contract this writer must hold on its own: `pytest_session` is
+    # ALWAYS present, empty included. Empty is the positive statement "no
+    # pytest session was an ancestor of this write"; an OMITTED key is
+    # indistinguishable from a pre-4823 writer and fails the run.
+    local clock_dir tmp_file raw_token session_token
     clock_dir="$(dirname "$CLOCK_FILE")"
     mkdir -p "$clock_dir"
     tmp_file="$(mktemp "$clock_dir/.last_redeploy_orchestrator.XXXXXX")"
-    printf '{"ts": %s, "iso": "%s"}\n' \
-        "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" > "$tmp_file"
+    # printf cannot escape JSON, so an env value carrying a quote, a
+    # backslash or a newline could otherwise emit a syntactically broken
+    # clock file -- and _read_clock_epoch fails OPEN on a corrupt body, which
+    # would disarm the very min-interval cap this stamp exists to arm. A
+    # uuid4().hex passes through untouched.
+    raw_token="${DF_PYTEST_SESSION_TOKEN:-}"
+    session_token="$(printf '%s' "$raw_token" | tr -cd '[:alnum:]_-')"
+    # Sanitising must never MANUFACTURE the empty token. Empty is not a
+    # neutral fallback here: it is the one value that forgives a change, so a
+    # token that stripped down to nothing would forgive precisely the
+    # test-spawned write it proves. Any loss at all becomes a non-empty
+    # sentinel, which keeps the guard on its accusing path -- fail-closed, as
+    # the pytest side is throughout.
+    [[ "$raw_token" == "$session_token" ]] || session_token="unsanitizable"
+    printf '{"ts": %s, "iso": "%s", "source": "%s", "pytest_session": "%s"}\n' \
+        "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+        "restart-all-orchestrators.sh" "$session_token" > "$tmp_file"
     mv -f "$tmp_file" "$CLOCK_FILE"
 }
 
@@ -479,6 +647,10 @@ echo "Restarting ${#ordered_units[@]} orchestrator unit(s): ${ordered_units[*]}"
 
 failures=()
 for unit in "${ordered_units[@]}"; do
+    # Before the gate, not after it: a unit deferred for its whole busy grace
+    # is still the unit this sweep is working on, and the liveness probe scopes
+    # its stand-down on exactly this field.
+    lease_set_current_unit "$unit"
     if [[ $DRAIN_ENABLED -eq 1 ]]; then
         drain_gate "$unit"
     fi
@@ -492,6 +664,12 @@ if [[ ${#failures[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# Clock first, lease second -- automatic, but easy to misread as unordered.
+# The stamp runs here, `exit 0` below fires the EXIT trap, and only then is the
+# lease released. Inverting it would open a window in which no sweep is
+# declared in flight and no completion has been recorded yet, which is exactly
+# the gap the two files close between them. I2 is untouched: this remains the
+# only call site, so a failed or partial verify still never stamps.
 stamp_fleet_deploy_clock
 
 echo "All ${#ordered_units[@]} orchestrator unit(s) restarted and verified fresh."

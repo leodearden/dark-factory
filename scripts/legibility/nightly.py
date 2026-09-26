@@ -22,6 +22,7 @@ systemd ``legibility-trickle@.service`` template runs nightly, and what
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import subprocess
@@ -42,6 +43,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
+    account_pool,
     census_trigger,
     codebook,
     coder,
@@ -52,6 +54,7 @@ from legibility import (  # noqa: E402
 )
 from legibility.config import (  # noqa: E402
     LegibilityConfig,
+    _require_absolute,
     configure_logging,
     load_config,
 )
@@ -486,6 +489,13 @@ def post_escalation(
     """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
     8): extractor crash, coder storm, or commit failure.
 
+    Also used by the exit-0 notices that are NOT fail-loud triggers, which
+    pass ``level=logging.WARNING``: budget suppression, the barren streak,
+    the deletion directive, and (task 4736) the CAPPED-night deferral. The
+    level rule is exactly that — ERROR iff this escalation is itself the
+    fail-loud trigger returning ``exit_code=1``, WARNING iff it deliberately
+    leaves the exit code untouched.
+
     JOURNALS THE PAIR FIRST, AT *level*, BEFORE ANYTHING ELSE HAPPENS.
     That single line is the contract this function now carries: EVERY
     escalation this module posts is written to the journal here, at the
@@ -586,21 +596,56 @@ def _default_entrypoint_exists() -> bool:
     return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
 
 
-def _default_census_launcher() -> None:
-    """Best-effort subprocess launch of the census entrypoint (task η).
+_RELATIVE_CENSUS_ARG_DETAIL = (
+    "A relative one would resolve against the trickle's cwd "
+    "(legibility-trickle@.service's WorkingDirectory) -- task 3269's defect."
+)
+
+
+def _default_census_launcher(
+    project_root: str | Path, *, config_path: str | Path | None = None, env=None,
+) -> None:
+    """Best-effort subprocess launch of the census entrypoint (task η)
+    against the project named by *project_root*.
+
+    The target is an ARGUMENT, never inherited from the process cwd (task
+    3269): ``legibility-trickle@.service`` pins one ``WorkingDirectory`` for
+    every ``%i`` instance, so an argv-less launch censused dark_factory for
+    every project. Fixing that in the unit file was rejected -- it would move
+    the invariant somewhere no test reaches. *config_path*, when given, also
+    pins the EXACT ``legibility.yaml`` the trickle loaded. A relative value
+    for either would resolve against that same cwd, so it is refused with
+    ``ValueError`` before anything is launched.
 
     Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
     warning (PRD decision 8: degradation never silent -- the silent-census
     incident, task 2952). census.py's own main() files the escalation for the
     failing stage; this loud log is the trickle-side trace so a failed census
-    is never invisible in the nightly's own journal. Keeps ``check=False`` and
-    never raises: census runs AFTER the trickle's own commit work, so a census
-    failure must never crash or fail the nightly run.
+    is never invisible in the nightly's own journal. Keeps ``check=False``:
+    census runs AFTER the trickle's own commit work, so a census failure must
+    never crash or fail the nightly run.
+
+    *env*, when given, is the environment the census runs in -- an account
+    drawn from the night's own pool (``account_pool.subprocess_env``), bound by
+    ``run_nightly``. ``None`` is subprocess's own "inherit the parent
+    unchanged", which is what this launcher did before the parameter existed
+    and what it must keep doing whenever no account is available: a census
+    launch is best-effort, so a pool problem must never be able to block one.
     """
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME)],
-        check=False,
-    )
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
+        '--project-root', _require_absolute(
+            str(project_root), field_name='census project_root',
+            detail=_RELATIVE_CENSUS_ARG_DETAIL,
+        ),
+    ]
+    if config_path is not None:
+        argv += ['--config', _require_absolute(
+            str(config_path), field_name='census config_path',
+            detail=_RELATIVE_CENSUS_ARG_DETAIL,
+        )]
+    result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(
             "legibility trickle: census subprocess exited non-zero (returncode=%s) "
@@ -618,6 +663,7 @@ def evaluate_census_step(
     decide=census_trigger.decide_for_project,
     entrypoint_exists=None,
     launcher=None,
+    config_path: Path | str | None = None,
 ) -> tuple[str, bool]:
     """Evaluate the periodic-census trigger (ζ) at the end of a nightly
     run, returning ``(one_line_decision, fire)``.
@@ -630,6 +676,11 @@ def evaluate_census_step(
     of ε, so a fired trigger before η lands must never crash or fail the
     nightly run. If the entrypoint is present, *launcher* (default:
     best-effort subprocess launch) is called once.
+
+    The *launcher* seam's contract is ``launcher(project_root, *,
+    config_path=None)``, always called with the CONFIG's ``project_root`` --
+    never argv-less, so the census target is never left to the process cwd
+    (task 3269). *config_path* is forwarded unchanged.
 
     This function never raises and never fails the run, and that guarantee is
     its OWN: both the *decide* call and the *launcher* call are guarded here,
@@ -709,7 +760,7 @@ def evaluate_census_step(
         return line, True
 
     try:
-        launcher()
+        launcher(cfg.project_root, config_path=config_path)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
@@ -772,6 +823,35 @@ class NightlyResult:
     live trickle's 14 fully-suppressed nights (2026-07-16..29) went
     unnoticed. ``exit_code`` deliberately stays 0 -- see
     :func:`_report_sample_outcome`."""
+
+    capped: bool = False
+    """True when this night's coding was DEFERRED by a usage/auth cap rather
+    than failing (``coder.is_cap_deferral(run)``) — task 4736.
+
+    A structured fact rather than a log line to scrape, in the shape of
+    ``budget_suppressed`` above and for the same reason: without it a
+    deferred night and a genuine coder storm are indistinguishable in every
+    observable a caller has beyond the exit code.
+
+    ``exit_code`` is deliberately 0. An all-accounts-capped night is a NORMAL
+    operating condition, not an incident (Leo's directive; sibling task
+    4503): the systemd unit must not fail, no L0/L2 promotion should fire,
+    and nothing is fabricated to fill the gap. On 2026-08-24 the absence of
+    this branch turned expected weather into ``exit_code=1`` plus an
+    ERROR-level escalation.
+
+    VOCABULARY RESERVATION for task 4514. This task lands the token ``capped``
+    for a run whose coding was deferred by a usage cap. 4514's fourth
+    ``classify_run`` outcome must ACCOUNT for it rather than collapsing
+    ``capped`` into ``failed``: the two warrant different operator responses —
+    a capped night needs no action and self-clears at the reset, a failed
+    night does not. ``trickle_state.py`` and ``check_trickle_progress.py`` are
+    deliberately NOT touched here so 4514 owns those files uncontended (which
+    is also why this night still recorded ``outcome=productive``:
+    ``classify_run`` keys only on ``selected_count > 0``). What this task does
+    change is the input 4514 will read — the exit code recorded into
+    trickle-state.json for a capped night is now an honest 0 rather than a
+    misleading 1."""
 
     barren_escalated: bool = False
     """True when THIS run crossed the barren-streak threshold and posted the
@@ -927,18 +1007,47 @@ def _record_trickle_progress(
 
     Maps *sample*'s six conservation counters plus *result* onto
     :func:`trickle_state.record_run`, which classifies the run
-    productive/quiet/barren and folds it into the running barren streak
-    that :mod:`check_trickle_progress` reads. This is the write half of
-    the pair; ``check_trickle_liveness.sh`` still answers the separate
-    "did the unit run" question and is untouched.
+    failed/productive/quiet/barren and folds it into the running barren
+    and failed streaks that :mod:`check_trickle_progress` reads. This is
+    the write half of the pair; ``check_trickle_liveness.sh`` still
+    answers the separate "did the unit run" question and is untouched.
 
-    CLASSIFICATION USES THE SAMPLER COUNTERS, so a run that crashed AFTER
-    selecting digests still classifies ``productive``. That is deliberate:
-    crashes are already caught loudly by ``check_trickle_liveness.sh``
-    (``Result=failed``) and by the decision-8 escalations, so the progress
-    probe answers the DIFFERENT question "is signal flowing through the
-    pipeline". The recorded ``exit_code`` preserves the crash fact for an
-    operator reading the state file, so nothing is hidden.
+    CLASSIFICATION READS ``exit_code`` FIRST (task 4514). A non-zero exit
+    classifies ``failed`` whatever the sampler counters say, because the
+    counters answer "did signal flow IN" and cannot answer "did the
+    pipeline FINISH". The counters are still recorded in full, so the
+    first question stays answerable.
+
+    THE OLD CONTRACT WAS WRONG, AND NOT AS A MISLABEL. It read: "a run
+    that crashed AFTER selecting digests still classifies ``productive``".
+    On 2026-08-18 that was applied to a reify run exactly as prescribed —
+    six digests selected, exit 1, ``applied=0``, ``commit_made=false`` —
+    and recorded ``productive``. It was a VOCABULARY HOLE: a permanently
+    broken coder would sample > 0, storm, exit 1, and record
+    ``productive`` / streak 0 / a FRESH ``last_productive_at`` every night
+    forever, while ``check_trickle_progress.py`` printed "OK: last run was
+    productive 0h ago" indefinitely. That is the 2026-07-16..29
+    silent-degradation shape (task 3270) entering through a different
+    door.
+
+    THE MITIGATION IT LEANED ON WAS NOT OPERATIONALLY REAL. The old text
+    claimed crashes "are already caught loudly by
+    ``check_trickle_liveness.sh`` (``Result=failed``)". True as a
+    statement about that script's LOGIC; false as a claim about the
+    world, because NOTHING INVOKED IT — see OPERATIONS.md §"Legibility
+    trickle health probe (04:30)" for the full account. What runs the
+    probes now is ``legibility-trickle-health@<project>.timer`` ->
+    ``scripts/legibility/check_trickle_health.py``, and the old claim is
+    true again only while that timer is installed FOR THIS PROJECT. The
+    one partial mitigation that predates it is
+    :func:`_escalate_barren_streak`'s detail string ending "Probe on
+    demand with: check_trickle_progress.py ...", which is
+    DISCOVERABILITY, not level-triggering: it makes the probe
+    hand-runnable, not bound.
+
+    A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
+    ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment
+    for why, and for the decision to leave it that way.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1021,6 +1130,13 @@ def _escalate_barren_streak(
     ``summary -- detail`` for this escalation (task 4511); this function
     does not log the pair itself, so a streak night produces exactly one
     such line.
+
+    The health probe's own non-zero exit is safe for exactly this reason,
+    and only this reason: it runs in a SEPARATE unit
+    (``legibility-trickle-health@<project>.service``), so it can never
+    flip ``legibility-trickle@<project>.service`` to ``Result=failed`` and
+    invert ``check_trickle_liveness.sh`` into the permanent false alarm
+    this paragraph refuses.
     """
     if not isinstance(doc, dict):
         return
@@ -1108,6 +1224,13 @@ def run_nightly(
     condition dead on the production path (task 4148). A test wanting the
     fail-safe path injects a raising/empty fake instead.
 
+    *invoke* reads the same way (task 5488): ``None`` means "build the
+    shared multi-account pool and draw every one-shot from it"
+    (:func:`account_pool.build_pool` + :func:`account_pool.pool_invoke`),
+    not "no invoker". Left unresolved it reached ``coder.code_digest``'s
+    ``invoke or _invoke_cli`` fallback, which authenticates as whatever
+    login ``~/.claude`` holds -- one account for the whole fleet.
+
     *recorder* (default :func:`trickle_state.record_run`) is the run-state
     seam, alongside the existing ``invoke``/``status_fetcher``/``poster``/
     ``committer`` ones. Called exactly once per run from a ``finally``
@@ -1115,7 +1238,9 @@ def run_nightly(
     (``check_trickle_progress.py``) can tell a barren night from a quiet
     one — the distinction ``check_trickle_liveness.sh`` structurally
     cannot make, and the reason 2026-07-16..29 went unnoticed for 14
-    nights.
+    nights — and, since task 4514, a FAILED night from a productive one,
+    which is the distinction that let a crashed run read as productive
+    indefinitely. The seam's contract is all four outcomes.
 
     Happy-path wiring only in this step: inventory+sample -> digest ->
     code -> merge -> docs-only commit (only when the merge actually
@@ -1126,7 +1251,7 @@ def run_nightly(
     steps.
     """
     if config_path is not None:
-        resolved_config_path = Path(config_path)
+        resolved_config_path = Path(config_path).resolve()
     else:
         if project_id is None:
             raise ValueError('run_nightly requires either config_path or project_id')
@@ -1174,6 +1299,27 @@ def run_nightly(
         status_fetcher if status_fetcher is not None
         else census_trigger.default_status_fetcher(cfg.project_root)
     )
+
+    # Task 5488, and the SAME lesson one seam over: `invoke` was the last seam
+    # here resolving None to nothing. main() holds nothing to build a gate
+    # from, so `invoke=None` reached coder.code_digest, hit its
+    # `invoke or _invoke_cli` fallback, and every one of the night's one-shots
+    # authenticated as whatever login ~/.claude happened to hold -- so ONE
+    # capped login deferred a whole night while six live accounts in
+    # config/usage-accounts.yaml sat idle, and a 2026-09-14 drop-in pinned the
+    # unit to a single account to paper over it. Resolved HERE, beside
+    # status_fetcher, so the next reader sees every seam defaulted in one
+    # place and this one is no longer the odd one out.
+    #
+    # ONE gate for the whole night. Cap state lives in the gate's memory and
+    # only there, so a per-digest pool would forget every cap it had just
+    # learned and re-try capped accounts for all 33 digests. Held in a local
+    # because the night's other subprocess -- the census launched below --
+    # needs an account from this same pool.
+    gate = None
+    if invoke is None:
+        gate = account_pool.build_pool()
+        invoke = account_pool.pool_invoke(gate, reverse=True)
 
     # One render cache for the whole run: select_digest_sessions renders each
     # candidate to CHARGE it against the byte budget, and build_digests reuses
@@ -1257,6 +1403,42 @@ def run_nightly(
         run = coder.code_digests(
             digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
         )
+
+        if coder.is_cap_deferral(run):
+            # A capped night is a DEFERRAL, not a failure (task 4736).
+            # Placed immediately above the storm branch because it is a
+            # refinement of it: the batch really did exceed the storm
+            # threshold, but its failures are majority CAPS -- digests the
+            # CLI never actually looked at. Charging those to the coder made
+            # 2026-08-24 read as an infra incident for a condition ruled
+            # normal (Leo's directive; sibling task 4503).
+            #
+            # Same skip-everything discipline as the storm branch below --
+            # no merge, no dump, no commit, nothing fabricated -- but
+            # exit_code 0, and the escalation journalled at WARNING rather
+            # than ERROR, per post_escalation's level rule: ERROR iff the
+            # escalation is itself the fail-loud trigger returning
+            # exit_code=1.
+            summary = (
+                f'legibility trickle coder DEFERRED: all accounts capped, '
+                f'{run.capped}/{run.total} digests returned a usage-limit '
+                f'banner instead of a model turn'
+            )
+            # Joined exactly as the storm branch does, so the marker text
+            # reaches BOTH the journal and the escalation detail. Without it
+            # the operator reads a deferral with no stated cause.
+            detail = '; '.join(f'{session}: {reason}' for session, reason in run.failures)
+            escalated = post_escalation(
+                cfg, summary, detail, poster=poster, level=logging.WARNING,
+            )
+            return NightlyResult(
+                exit_code=0,
+                coder_status=run.status,
+                capped=True,
+                escalated=escalated or suppression_escalated,
+                budget_suppressed=budget_suppressed,
+                reason=summary,
+            )
 
         if run.status == 'failure':
             # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
@@ -1419,7 +1601,26 @@ def run_nightly(
         # reach the journal after the whole census subprocess finished -- see
         # the log site inside that function for the full reasoning. Do not
         # re-add one here; that would double the line, not advance it.
-        census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
+        # Task 5488. census.py is a GRANDCHILD -- it re-invokes the CLI itself
+        # and never passes through this process's gate -- so the only way it
+        # can authenticate as a pool account is for the launcher to hand it
+        # one. Bound HERE rather than beside the pool itself, so the account
+        # chosen reflects the cap state the night has actually learned by now
+        # (the trickle's own digests run first and may well have capped the
+        # account that looked live at 03:00).
+        # Task 3269: the census is pinned to the config THIS run loaded -- never
+        # a fresh resolution, never the process cwd.
+        census_line, census_fire = evaluate_census_step(
+            cfg, now=now, status_fetcher=status_fetcher,
+            config_path=resolved_config_path,
+            launcher=(
+                None if gate is None
+                else functools.partial(
+                    _default_census_launcher,
+                    env=account_pool.subprocess_env(gate),
+                )
+            ),
+        )
 
         result = NightlyResult(
             exit_code=0,

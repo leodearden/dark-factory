@@ -7,7 +7,8 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,7 +54,9 @@ from .metrics import (
     compose_cost_source,
     detect_invocation_error,
     is_proxied_endpoint,
+    read_decline_artifacts,
     resolve_cost_usd,
+    resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
@@ -113,10 +116,19 @@ RESULTS_DIR = Path(__file__).parent / 'results'
 # exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
 # an invocation returned and was classified as a cap. It bounds cap-RETRY
 # patience and nothing else — the unbounded `_open.wait()` above is out of its
-# reach, and raising it does not change that. Making a fully-capped park
-# VISIBLE (rather than indistinguishable from a slow campaign) is filed as
-# follow-up; it is the "fail loud" the original comment wanted, implemented in
-# the wrong place.
+# reach, and raising it does not change that. That remains true, and it is why
+# the park needed a separate remedy rather than a bigger number here.
+#
+# THE PARK IS NO LONGER SILENT (task 4945). It is still unbounded — by design,
+# since no wall-clock value makes a weekly exhaustion loud without also
+# aborting the 5-hour windows this constant exists to skate — but it now
+# ANNOUNCES itself: `shared/usage_gate.py::UsageGate.before_invoke` emits a
+# throttled `all_capped_park` WARNING carrying elapsed seconds, the account
+# count and the soonest expected reopen, for as long as the pool stays frozen.
+# So a parked campaign is distinguishable from a hung one by reading the log,
+# which is the "fail loud" the original comment wanted — delivered as
+# visibility rather than as an abort, because aborting a park throws away
+# banked spend that `--resume` would otherwise recover.
 _EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
 
 
@@ -177,6 +189,153 @@ async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate |
             logger.warning('shutdown of the discarded empty UsageGate failed', exc_info=True)
         return None
     return gate
+
+
+class _UnsetGate:
+    """Sentinel TYPE for "the caller passed no ``usage_gate`` at all".
+
+    WHY NOT a plain ``usage_gate: UsageGate | None = None`` default (task 4427):
+    :func:`_build_eval_usage_gate` legitimately returns ``None`` three ways
+    (``usage_cap.enabled=False``, the constructor raised, zero accounts
+    resolved). A campaign whose gate degraded that way would hand ``None`` to
+    every cell; with a ``None`` default each cell would read that as "the caller
+    supplied nothing" and build its own gate — silently restoring the exact
+    per-cell construction the hoist exists to remove, and re-paying a probe-dir
+    allocation plus a SIGHUP-handler steal per cell on the zero-account path.
+
+    The sentinel keeps "not provided" (build and own one) and "provided as
+    ``None``" (deliberately ungated for the whole campaign) distinguishable. A
+    private CLASS rather than a bare ``object()`` so the parameter annotation
+    ``UsageGate | None | _UnsetGate`` and ``isinstance(usage_gate, _UnsetGate)``
+    are pyright-clean.
+    """
+
+
+_GATE_UNSET = _UnsetGate()
+
+
+# The `usage_gate=` parameter type shared by all three eval executors
+# (:func:`run_eval`, :func:`run_architect_eval`, :func:`run_end_to_end`). Named
+# so a reader of a public signature meets ONE concept with three readings
+# rather than a three-way union to decode at each site — and so the private
+# :class:`_UnsetGate` appears in exactly one place instead of three:
+#
+#   a ``UsageGate``  — a campaign owner handed its live gate down.
+#   ``None``         — a campaign owner that is deliberately UNGATED; run
+#                      without failover and do NOT build one.
+#   ``_GATE_UNSET``  — nobody supplied anything; build and own a gate.
+#
+# THE SHARED-OWNERSHIP CONTRACT (task 4427), stated once here because all three
+# executors obey it identically and three copies of the argument is the shape
+# that drifts: THE GATE IS TORN DOWN ONLY BY WHOEVER BUILT IT, i.e. by the
+# ``_GATE_UNSET`` reading alone. Each executor's ``finally`` spells that as
+# ``if owns_gate and usage_gate is not None``, where ``owns_gate`` is decided
+# from the CALLER's argument before any build can overwrite the parameter.
+#
+# Why an OWNED gate must come down: a campaign loops fixtures × candidates ×
+# trials in ONE process, so a gate left running leaks a live account-resume
+# probe loop firing real CLI probes for the rest of the campaign, and each new
+# gate steals the SIGHUP handler from predecessors kept alive by exactly those
+# background tasks. (469a2b5bd0 closed that leak for :func:`run_architect_eval`
+# only; :func:`run_eval` and :func:`run_end_to_end` leaked one gate per cell
+# until this task.)
+#
+# Why a BORROWED gate must NOT: it carries the one cap-state view every sibling
+# cell shares, so cell N+1 no longer re-leases the account cell N proved capped
+# — exactly the wasted invocation plus cooldown per cell the per-cell gate
+# cost. Shutting it down here would take failover from every sibling still to
+# run, including ones already in flight.
+#
+# Teardown is best-effort everywhere: the cell is already scored by then, so a
+# failing ``shutdown()`` must never turn it into a harness error.
+InjectedGate = UsageGate | None | _UnsetGate
+
+
+@asynccontextmanager
+async def campaign_usage_gate(
+    base_config: OrchestratorConfig | None,
+) -> AsyncIterator[UsageGate | None]:
+    """Own ONE account-failover gate for a whole eval campaign (task 4427).
+
+    A campaign is any loop that runs several cells in ONE process: the four
+    methodology stages here (:func:`run_ofat_stage` / :func:`run_matrix_stage` /
+    :func:`run_confirm_stage` / :func:`run_eval_matrix`, each expanding
+    ``fixtures × candidates × trials``) and ``cli._run_single_eval``'s config
+    loop. Each of those needs build-once + tear-down-exactly-once, and five
+    hand-rolled copies is precisely the shape :func:`_build_eval_usage_gate`
+    itself was extracted to avoid, so the lifecycle lives here in one place.
+
+    WHY ``base_config`` IS THE RIGHT THING TO BUILD FROM.
+    :func:`_build_eval_usage_gate` reads exactly one leaf,
+    ``orch_config.usage_cap``. Every cell's orch config is
+    ``build_eval_orch_config(...)`` =
+    ``apply_eval_profile(base_config).model_copy(update=...)``, and neither
+    ``EVAL_PROFILE`` nor that update dict mentions ``usage_cap`` — so the leaf
+    is inherited verbatim and this gate is byte-identical to the one each cell
+    would have built for itself. That equivalence is emergent across two files
+    rather than enforced, so it is pinned as a tripwire by
+    ``test_eval_architect.py::TestCampaignGatePremise``.
+
+    WHY SHARING ONE GATE ACROSS CONCURRENT CELLS IS SAFE. It is the production
+    shape, not a new one: :class:`orchestrator.harness.Harness` builds exactly
+    ONE ``UsageGate`` per orchestrator process and shares it across every
+    concurrently-running workflow, tearing it down once in its own shutdown.
+    The gate's account leasing exists precisely to arbitrate concurrent
+    consumers — and sharing is what makes cap state MEAN anything: a cell that
+    proves an account capped must inform its in-flight siblings, not merely its
+    successors.
+
+    A ``None`` yield means "this campaign is deliberately UNGATED" — either
+    ``base_config`` was ``None`` (nothing to build from; the stage functions all
+    default it) or :func:`_build_eval_usage_gate` degraded. It MUST be threaded
+    to cells as an explicit ``usage_gate=None``, never dropped: a cell reads a
+    missing argument as "build your own" (see the ``_GATE_UNSET`` sentinel), so
+    dropping a degraded ``None`` would silently restore the per-cell
+    construction this exists to remove. The cell's half of that bargain — who
+    may tear a gate down, and what breaks either way — is stated once at
+    :data:`InjectedGate`.
+
+    WHAT ELSE ONE GATE SHARES: THE SPEND TALLY. The equivalence argument above
+    is about CONSTRUCTION; sharing also makes the gate's RUNTIME state
+    campaign-scoped, and ``UsageGate._cumulative_cost`` is part of that state.
+    ``before_invoke`` raises ``SessionBudgetExhausted`` once the tally reaches
+    ``usage_cap.session_budget_usd``, and nothing resets it between cells — so
+    ONE gate means ONE cumulative tally and ONE session ceiling for the WHOLE
+    campaign, where a per-cell gate gave each cell a fresh budget. With the
+    ceiling set, a long campaign trips partway through
+    ``fixtures × candidates × trials`` and every remaining cell blocks or is
+    stamped ``harness_error`` — losses the report would attribute to the
+    CANDIDATE under test rather than to the campaign budget.
+
+    Latent, not live: ``session_budget_usd`` defaults to ``None`` and no config
+    in this repo sets it, and one process-wide ceiling is exactly the
+    :class:`~orchestrator.harness.Harness` shape this adopts. A campaign that
+    does want per-cell budgeting should build from a ``usage_cap`` copy with
+    ``session_budget_usd=None`` (``base_config.model_copy`` over that leaf) and
+    let each invocation's ``max_budget_usd`` bound it instead.
+    """
+    if base_config is None:
+        yield None
+        return
+    gate = await _build_eval_usage_gate(base_config)
+    try:
+        yield gate
+    finally:
+        if gate is not None:
+            # Best-effort, exactly as in run_architect_eval's finally: the
+            # campaign's results are already collected by the time we get here,
+            # so a teardown failure must never turn a finished campaign into a
+            # raise. Left un-torn-down, the gate leaks a live account-resume
+            # probe loop firing real CLI probes, and the next gate built in this
+            # process steals the SIGHUP handler from it.
+            try:
+                await gate.shutdown()
+            except Exception:
+                logger.warning(
+                    'campaign UsageGate shutdown failed — continuing '
+                    '(the campaign is already complete)',
+                    exc_info=True,
+                )
 
 
 @dataclass
@@ -435,6 +594,8 @@ async def run_eval(
     worktree_path: Path | None = None,
     memory_endpoint: str | None = None,
     judge_config: EvalConfig | None = None,
+    *,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
@@ -523,77 +684,95 @@ async def run_eval(
     if not worktree_path:
         logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
-    # 5b. Usage gate for account failover (judge hits Claude API, may cap)
-    usage_gate = await _build_eval_usage_gate(orch_config)
-
-    # 6. Run the real workflow
-    workflow = build_workflow(
-        assignment=assignment,
-        config=orch_config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=briefing,
-        mcp=mcp,  # type: ignore[arg-type]
-        initial_plan=initial_plan,
-        usage_gate=usage_gate,
+    # 5b. Usage gate for account failover (judge hits Claude API, may cap).
+    #     Built only when this cell OWNS it — see :data:`InjectedGate` for the
+    #     three readings of the argument and who may tear the gate down.
+    owns_gate = isinstance(usage_gate, _UnsetGate)
+    usage_gate = (
+        await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
     )
-
-    # Override worktree since we created it ourselves
-    workflow.worktree = worktree
-
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     try:
-        # W9-γ: workflow.run() now returns a TerminalReport (TR-1); unwrap to
-        # the WorkflowOutcome this function has always propagated.
-        terminal_report = await asyncio.wait_for(
-            workflow.run(), timeout=timeout_minutes * 60,
+        # 6. Run the real workflow
+        workflow = build_workflow(
+            assignment=assignment,
+            config=orch_config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=briefing,
+            mcp=mcp,  # type: ignore[arg-type]
+            initial_plan=initial_plan,
+            usage_gate=usage_gate,
         )
-        outcome = terminal_report.outcome
-    except TimeoutError:
-        logger.error(
-            f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'
+
+        # Override worktree since we created it ourselves
+        workflow.worktree = worktree
+
+        timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+        try:
+            # W9-γ: workflow.run() now returns a TerminalReport (TR-1); unwrap to
+            # the WorkflowOutcome this function has always propagated.
+            terminal_report = await asyncio.wait_for(
+                workflow.run(), timeout=timeout_minutes * 60,
+            )
+            outcome = terminal_report.outcome
+        except TimeoutError:
+            logger.error(
+                f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'
+            )
+            outcome = 'timeout'
+        except Exception as e:
+            logger.error(f'Eval {task_id} × {config.name} failed: {e}')
+            outcome = WorkflowOutcome.BLOCKED
+
+        wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+
+        # 7. Collect metrics
+        try:
+            metrics = await collect_metrics(workflow, worktree, task)
+            metrics_dict = metrics.to_dict()
+        except Exception as e:
+            logger.warning(f'Metric collection failed: {e}')
+            metrics_dict = {}
+        # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
+        # own survivor group (collect_metrics itself does not know which role/stage
+        # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
+        # no stamp fires, so every existing caller is byte-identical.
+        if judge_config is not None:
+            metrics_dict['role_under_test'] = 'judge'
+
+        result = EvalResult(
+            task_id=task_id,
+            config_name=result_label,
+            outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
+            metrics=metrics_dict,
+            worktree_path=str(worktree),
+            wall_clock_ms=wall_clock_ms,
+            run_id=run_id,
+            trial=trial,
         )
-        outcome = 'timeout'
-    except Exception as e:
-        logger.error(f'Eval {task_id} × {config.name} failed: {e}')
-        outcome = WorkflowOutcome.BLOCKED
 
-    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+        # 8. Persist result
+        save_result(result)
 
-    # 7. Collect metrics
-    try:
-        metrics = await collect_metrics(workflow, worktree, task)
-        metrics_dict = metrics.to_dict()
-    except Exception as e:
-        logger.warning(f'Metric collection failed: {e}')
-        metrics_dict = {}
-    # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
-    # own survivor group (collect_metrics itself does not know which role/stage
-    # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
-    # no stamp fires, so every existing caller is byte-identical.
-    if judge_config is not None:
-        metrics_dict['role_under_test'] = 'judge'
-
-    result = EvalResult(
-        task_id=task_id,
-        config_name=result_label,
-        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-        metrics=metrics_dict,
-        worktree_path=str(worktree),
-        wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
-        trial=trial,
-    )
-
-    # 8. Persist result
-    save_result(result)
-
-    logger.info(
-        f'Eval complete: {task_id} × {config.name} → {result.outcome} '
-        f'(total={wall_clock_ms / 1000:.1f}s, '
-        f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
-    )
-    return result
+        logger.info(
+            f'Eval complete: {task_id} × {config.name} → {result.outcome} '
+            f'(total={wall_clock_ms / 1000:.1f}s, '
+            f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
+        )
+        return result
+    finally:
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
+        if owns_gate and usage_gate is not None:
+            try:
+                await usage_gate.shutdown()
+            except Exception:
+                logger.warning(
+                    f'UsageGate shutdown failed for {task_id} × {config.name} '
+                    f'— continuing (the cell is already scored)',
+                    exc_info=True,
+                )
 
 
 def _verdict_cost_usd(verdict: object) -> float:
@@ -634,6 +813,8 @@ async def run_architect_eval(
     trial: int = 1,
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
+    *,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
 
@@ -740,6 +921,20 @@ async def run_architect_eval(
     pre-invoke cap) skips the resolution altogether: $0.00 has no provenance to
     resolve, and resolving it would attach a loud degradation WARNING to spend
     that never happened.
+
+    TERMINAL OUTCOME (task 4760). The cell also carries
+    ``metrics.terminal_kind``: WHAT the architect's last statement about the
+    task actually was — a scorable plan, one of the five explicit plan-tools
+    decline exits, or neither. A DECLINE IS NOT A CONTENT FAILURE: it is the
+    correct refusal the prompt tells the architect to make INSTEAD of planning,
+    so ``plan_steps``, ``cap_tainted`` and ``plan_quality`` are all left exactly
+    as they were and planRate keeps its historical ``plan_steps > 0``
+    derivation. The field exists so a ``plan_steps = 0`` cell can be split by
+    CAUSE without transcript forensics. When a cell carries BOTH a plan and a
+    decline, LAST TERMINAL CALL WINS — see
+    :func:`~orchestrator.evals.metrics.resolve_terminal_kind` for the policy and
+    its ambiguity direction. The artifacts are read in the ``finally`` block
+    below, which is the last moment they exist.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -768,16 +963,26 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
+    # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
+    # are: the finally block READS the decline artifacts, and it must not
+    # NameError on a failure that happened before that read.
+    declines: dict[str, dict | None] = {}
     # Pre-initialised so the cap-exhaustion handler below can best-effort
     # re-read the plan artifact: that handler runs on an exception raised AT
     # the invoke, which is before the normal ``artifacts.read_plan()``, and on
     # the earlier failure paths (worktree/config) the name is genuinely unbound
     # — which pyright correctly flags without this.
     artifacts: TaskArtifacts | None = None
-    # Pre-initialised for the SAME reason, plus one more: the finally block
-    # shuts the gate down, and it must not NameError when the failure happened
-    # before the gate was built (worktree/orch-config).
-    usage_gate: UsageGate | None = None
+    # Ownership is decided by what the CALLER did, never by what a build
+    # returned — so it is computed here, before anything can overwrite the
+    # parameter. See :data:`InjectedGate` for the three readings.
+    owns_gate = isinstance(usage_gate, _UnsetGate)
+    # Narrowed off the sentinel union so the invoke call site and the finally
+    # below both see a plain ``UsageGate | None``. Pre-initialised for the SAME
+    # reason as ``artifacts`` above, plus one more: the finally block shuts the
+    # gate down, and it must not NameError when the failure happened before the
+    # gate was built (worktree/orch-config).
+    usage_gate = None if owns_gate else usage_gate
     # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
     # architect invocation's spend. The cell's persisted ``cost_usd`` below
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
@@ -860,7 +1065,10 @@ async def run_architect_eval(
         #     degrade) lives in _build_eval_usage_gate so all three entry
         #     points build the gate from ONE definition rather than three
         #     copies that can drift.
-        usage_gate = await _build_eval_usage_gate(orch_config)
+        #
+        #     Built only when this cell OWNS it — see :data:`InjectedGate`.
+        if owns_gate:
+            usage_gate = await _build_eval_usage_gate(orch_config)
 
         # 3. Init artifacts so the architect has a place to write plan.json.
         #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
@@ -1064,27 +1272,37 @@ async def run_architect_eval(
         arch_error = arch_error or f'harness_error: {type(e).__name__}: {reason}'
         arch_unmeasurable = True
     finally:
+        # The architect's DECLINE artifacts (task 4760) — read HERE, and only
+        # here, for two reasons. (a) This single site is reached by ALL FOUR
+        # exits: success, TimeoutError, AllAccountsCappedException and the
+        # generic harness-error handler. Reading beside ``artifacts.read_plan()``
+        # on the happy path instead would leave the timeout and harness-error
+        # cells with no terminal kind at all, and would need a SECOND copy on
+        # the cap-exhaustion re-read path — the duplication that path's own
+        # comment exists to justify avoiding. (b) It is the LAST moment the
+        # artifacts exist: the very next statement rmtree's the relocated
+        # .task-meta/<name>/ root (snapshots.cleanup_eval_worktree), so any read
+        # placed after it — which is everywhere post-``finally`` — finds nothing.
+        #
+        # Best-effort for the same reason the gate teardown below is: a failure
+        # while cleaning up must never turn an already-scored cell into a lost
+        # run. read_decline_artifacts already degrades PER KIND; this is the
+        # outer backstop.
+        try:
+            declines = read_decline_artifacts(artifacts)
+        except Exception:
+            logger.warning(
+                f'decline-artifact read failed for {task_id} × {config.name}; '
+                f'the cell keeps its plan-derived terminal kind',
+                exc_info=True,
+            )
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
-        # The gate is built PER CELL — cli.py loops this coroutine over every
-        # config, and a campaign loops fixtures × trials in ONE process — so it
-        # has to be torn DOWN per cell too (reviewer: resource-cleanup). Left
-        # running, every cell that hit a cap leaks a live account-resume probe
-        # loop firing real CLI probes for the rest of the campaign, and each
-        # new gate steals the SIGHUP handler from predecessors that are still
-        # alive via those background tasks.
-        #
-        # What this does NOT do is carry cap STATE across cells: cell N+1 still
-        # re-leases the account cell N proved capped, costing one wasted
-        # invocation plus a cooldown per cell. Fixing that means hoisting the
-        # gate to the campaign level and threading it through cli.py — outside
-        # this task's locked modules, so it is filed as follow-up rather than
-        # smuggled in here.
-        #
-        # Best-effort: a teardown failure must never turn a scored cell into a
-        # harness error.
-        if usage_gate is not None:
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
+        if owns_gate and usage_gate is not None:
             try:
                 await usage_gate.shutdown()
             except Exception:
@@ -1285,6 +1503,13 @@ async def run_architect_eval(
             # bound plan_quality validity into uselessness.
             judged_without_reference = not reference_diff
 
+    # The terminal outcome (task 4760), resolved from the two facts now in
+    # scope: the ``plan`` local the scoring block above just used, and the
+    # decline artifacts the finally block read while they still existed.
+    # ADDITIVE — no existing metric consults it, so plan_steps / cap_tainted /
+    # plan_quality, and therefore planRate, are byte-identical to before.
+    terminal_kind = resolve_terminal_kind(plan, declines)
+
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
     # The marker names WHICH stage failed; the join keeps the field well-defined
@@ -1349,6 +1574,10 @@ async def run_architect_eval(
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
+        # See the TERMINAL OUTCOME paragraph in the docstring: a decline is a
+        # correct refusal, reported ALONGSIDE plan_steps rather than folded into
+        # it, so both facts survive on a plan-then-decline cell.
+        terminal_kind=terminal_kind,
         # NO test signal exists for a plan-only cell (task 3099): this path
         # freezes implementer/debugger/reviewer/verify, so verification never
         # runs. ``None`` is the documented "unknown" sentinel; the dataclass
@@ -1441,6 +1670,9 @@ async def run_architect_eval(
         )
         # So a run's OWN log carries the validity bound, not just the report.
         + (' [judged_without_reference]' if judged_without_reference else '')
+        # ...and the terminal outcome, so an operator watching a LIVE campaign
+        # sees a decline as it happens instead of reconstructing it afterwards.
+        + f' [terminal_kind={terminal_kind}]'
     )
     return result_obj
 
@@ -1453,6 +1685,8 @@ async def run_end_to_end(
     trial: int = 1,
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
+    *,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
 
@@ -1509,67 +1743,84 @@ async def run_end_to_end(
     briefing = BriefingAssembler(orch_config)
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
-    usage_gate = await _build_eval_usage_gate(orch_config)
-
-    # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
-    #    feeds the live implementer (the both-live path; run_eval hands a frozen
-    #    plan here instead).
-    workflow = build_workflow(
-        assignment=assignment,
-        config=orch_config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=briefing,
-        mcp=mcp,  # type: ignore[arg-type]
-        initial_plan=None,
-        usage_gate=usage_gate,
+    # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
+    owns_gate = isinstance(usage_gate, _UnsetGate)
+    usage_gate = (
+        await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
     )
-    workflow.worktree = worktree
-
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     try:
-        terminal_report = await asyncio.wait_for(
-            workflow.run(), timeout=timeout_minutes * 60,
+        # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
+        #    feeds the live implementer (the both-live path; run_eval hands a frozen
+        #    plan here instead).
+        workflow = build_workflow(
+            assignment=assignment,
+            config=orch_config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=briefing,
+            mcp=mcp,  # type: ignore[arg-type]
+            initial_plan=None,
+            usage_gate=usage_gate,
         )
-        outcome = terminal_report.outcome
-    except TimeoutError:
-        logger.error(
-            f'End-to-end eval {task_id} × {config_name} timed out after '
-            f'{timeout_minutes}m'
+        workflow.worktree = worktree
+
+        timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+        try:
+            terminal_report = await asyncio.wait_for(
+                workflow.run(), timeout=timeout_minutes * 60,
+            )
+            outcome = terminal_report.outcome
+        except TimeoutError:
+            logger.error(
+                f'End-to-end eval {task_id} × {config_name} timed out after '
+                f'{timeout_minutes}m'
+            )
+            outcome = 'timeout'
+        except Exception as e:
+            logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
+            outcome = WorkflowOutcome.BLOCKED
+
+        wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+
+        # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
+        #    itself does not know which methodology stage invoked it).
+        try:
+            metrics = await collect_metrics(workflow, worktree, task)
+            metrics_dict = metrics.to_dict()
+        except Exception as e:
+            logger.warning(f'Metric collection failed: {e}')
+            metrics_dict = {}
+        metrics_dict['role_under_test'] = 'end_to_end'
+
+        result = EvalResult(
+            task_id=task_id,
+            config_name=config_name,
+            outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
+            metrics=metrics_dict,
+            worktree_path=str(worktree),
+            wall_clock_ms=wall_clock_ms,
+            run_id=run_id,
+            trial=trial,
         )
-        outcome = 'timeout'
-    except Exception as e:
-        logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
-        outcome = WorkflowOutcome.BLOCKED
-
-    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-
-    # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
-    #    itself does not know which methodology stage invoked it).
-    try:
-        metrics = await collect_metrics(workflow, worktree, task)
-        metrics_dict = metrics.to_dict()
-    except Exception as e:
-        logger.warning(f'Metric collection failed: {e}')
-        metrics_dict = {}
-    metrics_dict['role_under_test'] = 'end_to_end'
-
-    result = EvalResult(
-        task_id=task_id,
-        config_name=config_name,
-        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-        metrics=metrics_dict,
-        worktree_path=str(worktree),
-        wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
-        trial=trial,
-    )
-    save_result(result)
-    logger.info(
-        f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
-        f'({wall_clock_ms / 1000:.1f}s)'
-    )
-    return result
+        save_result(result)
+        logger.info(
+            f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
+            f'({wall_clock_ms / 1000:.1f}s)'
+        )
+        return result
+    finally:
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
+        if owns_gate and usage_gate is not None:
+            try:
+                await usage_gate.shutdown()
+            except Exception:
+                logger.warning(
+                    f'UsageGate shutdown failed for {task_id} × {config_name} '
+                    f'— continuing (the cell is already scored)',
+                    exc_info=True,
+                )
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
@@ -1621,100 +1872,111 @@ async def run_eval_matrix(
     """
     configs = configs or EVAL_CONFIGS
 
-    combos = [
-        (task_path, config, t)
-        for task_path in task_paths
-        for config in configs
-        for t in range(1, trials + 1)
-    ]
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate
+        # for why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        #
+        # Specific to this fan-out: the `async with` spans the monitor loop AND
+        # its sibling-cancellation drain, so the teardown also fires on the
+        # CancelledError re-raise, where a leaked probe loop would otherwise
+        # survive the aborted campaign.
 
-    if max_parallel is None:
-        max_parallel = len(combos)
-    sem = asyncio.Semaphore(max_parallel)
+        combos = [
+            (task_path, config, t)
+            for task_path in task_paths
+            for config in configs
+            for t in range(1, trials + 1)
+        ]
 
-    async def _run_one(
-        task_path: Path, config: EvalConfig, trial: int,
-    ) -> EvalResult | None:
-        task = load_task(task_path)
-        if not force and _result_exists(task['id'], config.name):
-            logger.info(f'Skipping existing: {task["id"]} × {config.name}')
-            return None
-        async with sem:
-            return await run_eval(
-                task_path, config, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
+        if max_parallel is None:
+            max_parallel = len(combos)
+        sem = asyncio.Semaphore(max_parallel)
 
-    # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
-    # asyncio.gather(return_exceptions=True).
-    #
-    # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
-    # the post-gather loop can detect CancelledError and re-raise it.  For a large
-    # matrix where one eval is cancelled early, N-1 siblings continue running their
-    # full duration — wasting CPU proportional to matrix size × timeout_minutes.
-    #
-    # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
-    # individually: on CancelledError we immediately cancel all remaining tasks and
-    # re-raise, typically within milliseconds.  Non-cancel exceptions are still
-    # logged and the loop continues — identical happy-path/error-path semantics to
-    # the previous gather loop, with strictly better cancellation behaviour.
-    #
-    # This is the same pattern used in harness.py (lines 305, 317) for managing
-    # concurrent workflow tasks.  Cleanup follows the established pattern from
-    # steward.py (lines 101-104): cancel tasks explicitly then await them with
-    # return_exceptions=True to ensure clean teardown before re-raising.
-    active: set[asyncio.Task] = {
-        asyncio.create_task(_run_one(tp, cfg, t))
-        for tp, cfg, t in combos
-    }
-    results: list[EvalResult] = []
-    # Distinguish two cancellation scenarios:
-    #   Inner-task cancellation — an individual _run_one coroutine was cancelled
-    #     or raised CancelledError.  asyncio.wait surfaces this via
-    #     task.cancelled() or task.exception() inside the monitor loop below;
-    #     we log it, cancel siblings, and re-raise to propagate.
-    #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
-    #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
-    #     the *await asyncio.wait(...)* call directly and is caught by the
-    #     outer except clause, which performs the same sibling cleanup.
-    try:
-        while active:
-            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            # Task 586: scan the full done batch for ALL CancelledErrors before
-            # processing any results.  Multiple tasks can complete in the same
-            # event-loop iteration and land in the same done set (e.g. when a
-            # shutdown signal fires while two evals are parked at the same
-            # await point).  The old code raised on the first cancel it saw,
-            # silently discarding subsequent cancels in the batch.
-            cancel_errors = _collect_cancel_errors(done)
-            if cancel_errors:
-                for ce in cancel_errors:
-                    logger.error('Eval cancelled', exc_info=ce)
-                for t in active:
-                    t.cancel()
-                await asyncio.gather(*active, return_exceptions=True)
-                active.clear()
-                raise cancel_errors[0]
-            # No cancellations in this batch — handle results and non-cancel
-            # exceptions.  task.cancelled() is False for all remaining tasks so
-            # task.exception() / task.result() are safe to call.
-            for task in done:
-                exc = task.exception()
-                if exc is not None:
-                    logger.error('Eval failed', exc_info=exc)
-                else:
-                    r = task.result()
-                    if r is not None:
-                        results.append(r)
-    except asyncio.CancelledError:
-        # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
-        # Cancel all remaining sibling tasks and await their cleanup before
-        # re-raising so we don't leave orphaned tasks behind.
-        for t in active:
-            t.cancel()
-        await asyncio.gather(*active, return_exceptions=True)
-        raise
-    return results
+        async def _run_one(
+            task_path: Path, config: EvalConfig, trial: int,
+        ) -> EvalResult | None:
+            task = load_task(task_path)
+            if not force and _result_exists(task['id'], config.name):
+                logger.info(f'Skipping existing: {task["id"]} × {config.name}')
+                return None
+            async with sem:
+                return await run_eval(
+                    task_path, config, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+
+        # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
+        # asyncio.gather(return_exceptions=True).
+        #
+        # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
+        # the post-gather loop can detect CancelledError and re-raise it.  For a large
+        # matrix where one eval is cancelled early, N-1 siblings continue running their
+        # full duration — wasting CPU proportional to matrix size × timeout_minutes.
+        #
+        # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
+        # individually: on CancelledError we immediately cancel all remaining tasks and
+        # re-raise, typically within milliseconds.  Non-cancel exceptions are still
+        # logged and the loop continues — identical happy-path/error-path semantics to
+        # the previous gather loop, with strictly better cancellation behaviour.
+        #
+        # This is the same pattern used in harness.py (lines 305, 317) for managing
+        # concurrent workflow tasks.  Cleanup follows the established pattern from
+        # steward.py (lines 101-104): cancel tasks explicitly then await them with
+        # return_exceptions=True to ensure clean teardown before re-raising.
+        active: set[asyncio.Task] = {
+            asyncio.create_task(_run_one(tp, cfg, t))
+            for tp, cfg, t in combos
+        }
+        results: list[EvalResult] = []
+        # Distinguish two cancellation scenarios:
+        #   Inner-task cancellation — an individual _run_one coroutine was cancelled
+        #     or raised CancelledError.  asyncio.wait surfaces this via
+        #     task.cancelled() or task.exception() inside the monitor loop below;
+        #     we log it, cancel siblings, and re-raise to propagate.
+        #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
+        #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
+        #     the *await asyncio.wait(...)* call directly and is caught by the
+        #     outer except clause, which performs the same sibling cleanup.
+        try:
+            while active:
+                done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                # Task 586: scan the full done batch for ALL CancelledErrors before
+                # processing any results.  Multiple tasks can complete in the same
+                # event-loop iteration and land in the same done set (e.g. when a
+                # shutdown signal fires while two evals are parked at the same
+                # await point).  The old code raised on the first cancel it saw,
+                # silently discarding subsequent cancels in the batch.
+                cancel_errors = _collect_cancel_errors(done)
+                if cancel_errors:
+                    for ce in cancel_errors:
+                        logger.error('Eval cancelled', exc_info=ce)
+                    for t in active:
+                        t.cancel()
+                    await asyncio.gather(*active, return_exceptions=True)
+                    active.clear()
+                    raise cancel_errors[0]
+                # No cancellations in this batch — handle results and non-cancel
+                # exceptions.  task.cancelled() is False for all remaining tasks so
+                # task.exception() / task.result() are safe to call.
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        logger.error('Eval failed', exc_info=exc)
+                    else:
+                        r = task.result()
+                        if r is not None:
+                            results.append(r)
+        except asyncio.CancelledError:
+            # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
+            # Cancel all remaining sibling tasks and await their cleanup before
+            # re-raising so we don't leave orphaned tasks behind.
+            for t in active:
+                t.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+            raise
+        return results
 
 
 async def _bounded_fanout(
@@ -1793,39 +2055,45 @@ async def run_ofat_stage(
     list across every ``(candidate, fixture, trial)`` cell; a failed cell is
     logged and skipped via :func:`_bounded_fanout`.
     """
-    def _thunk(
-        task_path: Path, candidate: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            if candidate.role == 'architect':
-                return await run_architect_eval(
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, candidate: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                if candidate.role == 'architect':
+                    return await run_architect_eval(
+                        task_path, candidate, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        usage_gate=gate,
+                    )
+                if candidate.role == 'judge':
+                    # ο: vary ONLY the judge — pin the implementer to the fixed cloud
+                    # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
+                    # candidate on judge_config, so run_eval derives the ζ completion
+                    # judge's model/effort while implementer/architect/reviewer stay
+                    # fixed (true OFAT). run_eval relabels + stamps role_under_test.
+                    return await run_eval(
+                        task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        judge_config=candidate, usage_gate=gate,
+                    )
+                return await run_eval(
                     task_path, candidate, base_config,
                     trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
                 )
-            if candidate.role == 'judge':
-                # ο: vary ONLY the judge — pin the implementer to the fixed cloud
-                # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
-                # candidate on judge_config, so run_eval derives the ζ completion
-                # judge's model/effort while implementer/architect/reviewer stay
-                # fixed (true OFAT). run_eval relabels + stamps role_under_test.
-                return await run_eval(
-                    task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
-                    trial=trial, timeout_override=timeout_override,
-                    judge_config=candidate,
-                )
-            return await run_eval(
-                task_path, candidate, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+            return _run
 
-    thunks = [
-        _thunk(tp, candidate, trial)
-        for tp in task_paths
-        for candidate in candidates
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, candidate, trial)
+            for tp in task_paths
+            for candidate in candidates
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_matrix_stage(
@@ -1848,24 +2116,29 @@ async def run_matrix_stage(
     semantics to :func:`run_ofat_stage`). Both roles run LIVE. Returns the
     flattened ``EvalResult`` list; a failed cell is logged and skipped.
     """
-    def _thunk(
-        task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch, impl, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch, impl, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    pairs = matrix_pairs(arch_survivors, impl_survivors)
-    thunks = [
-        _thunk(tp, arch, impl, trial)
-        for tp in task_paths
-        for arch, impl in pairs
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        pairs = matrix_pairs(arch_survivors, impl_survivors)
+        thunks = [
+            _thunk(tp, arch, impl, trial)
+            for tp in task_paths
+            for arch, impl in pairs
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_confirm_stage(
@@ -1889,22 +2162,27 @@ async def run_confirm_stage(
     :func:`run_matrix_stage`. Both roles run LIVE. Returns the flattened
     ``EvalResult`` list for the confirmation batch.
     """
-    def _thunk(
-        task_path: Path, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch_winner, impl_winner, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch_winner, impl_winner, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    thunks = [
-        _thunk(tp, trial)
-        for tp in task_paths
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, trial)
+            for tp in task_paths
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:

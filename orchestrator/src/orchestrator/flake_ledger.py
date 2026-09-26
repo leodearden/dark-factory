@@ -25,8 +25,8 @@ TWO BINDING CONTRACTS, both machine-checked:
 2. **No public entry point ever raises** (§8.3, boundary row B12).  The merge path has
    no ``VerifyInfraError`` handler, so an uncaught raise here stalls the merge queue —
    a ledger failure must never fail a verify or a merge.  Every entry point degrades to
-   an honest value (``None`` / ``[]``) and logs LOUDLY with ``exc_info``; it never fails
-   silently.  This mirrors ``chronic_flake``'s catch-all-defensive contract.
+   an honest value (``None`` / ``[]`` / ``False``) and logs LOUDLY with ``exc_info``; it
+   never fails silently.  This mirrors ``chronic_flake``'s catch-all-defensive contract.
 
 RETENTION — a named, accepted position, not an oversight (§5.2, §11 Q1).  ``flake_debt``
 is bounded by construction (one row per test); resolved rows are retained DELIBERATELY
@@ -63,16 +63,21 @@ do NOT wire a second filing path through this module — ζ owns the single fili
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+from shared.task_metadata import DoneProvenance, parse_metadata
+from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +173,120 @@ class FlakeSuppression:
     runner: str  # 'local' | remote host name — WHERE the re-run ran
     psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
+
+
+def _coerce_test_ids(value: object, *, context: str) -> tuple[str, ...]:
+    """Normalize a ``test_ids`` payload to a tuple, stating the wrap-not-drop rule ONCE.
+
+    A bare ``str`` where a tuple belongs is an easy mistake to make (one node-id passed
+    unwrapped), it is TRUTHY, and ``tuple('a::t')`` explodes it into one entry PER
+    CHARACTER — a dozen garbage test_ids silently written into the evidence trail this
+    PRD exists to make trustworthy.  WRAP rather than drop: a single node-id string has
+    exactly one honest reading, so the observation is preserved and the warning still
+    surfaces the upstream bug.
+
+    Both the WRITE path (:func:`record_flake_occurrence`) and the WIRE path
+    (:func:`flake_suppression_from_wire`) route through here.  They had two separate
+    copies of this rule with two separately-worded warnings, which could drift
+    independently — e.g. a ``bytes`` or generator case added to one and not the other,
+    which would then behave differently depending only on whether the observation
+    crossed the wire.  *context* names the caller for the log line (a ``call_site``
+    value at write time, ``'the wire'`` on the deserialization path) so one rule can
+    still produce a locatable message.
+
+    Raises ``TypeError`` on a non-iterable, deliberately: both callers wrap this in a
+    catch-all (B12 at write time, the never-raise guard on the wire), and each already
+    knows how to degrade loudly.
+    """
+    if isinstance(value, str):
+        logger.warning(
+            'flake_ledger: test_ids arrived as a bare str (%r) from %s; treating it as '
+            'ONE node-id — the producer should pass a list/tuple',
+            value,
+            context,
+        )
+        return (value,)
+    return tuple(value)  # type: ignore[call-overload]
+
+
+def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
+    """Rebuild a :class:`FlakeSuppression` from its JSON-decoded wire form (§8, §8.4).
+
+    The READ half of the ``VerifyResult.flake_suppression`` carrier.  ``result_to_dict``
+    is ``dataclasses.asdict`` and ``result_from_dict`` is a bare ``VerifyResult(**d)``
+    (``orchestrator/src/orchestrator/verify_runner.py::result_to_dict`` /
+    ``::result_from_dict``), so the WRITE half needs nothing — ``json.dumps``
+    flattens a ``StrEnum`` to its value and a tuple to an array losslessly — but the read
+    half hands ``verdict``/``call_site`` back as plain ``str`` and ``test_ids`` as a
+    ``list``.  Coercing here is what makes the field's annotation true on the
+    deserialized path and makes the round-trip equality-preserving.
+
+    It NEVER raises, and that is the load-bearing property, not politeness:
+    ``RemoteRunner.run_merge_verify`` converts any ``TypeError``/``ValueError`` escaping
+    ``result_from_json`` into a ``RunnerUnavailable``
+    (``orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify``),
+    which the pool pays for with a whole local re-verify.  Letting one malformed
+    sub-payload cost a re-verify would be strictly worse than dropping the one
+    observation it carried, so a
+    bad payload degrades to ``None`` plus a LOUD warning (B12's discipline, applied to
+    the wire).
+
+    It is deliberately NOT a validator.  An unrecognised ``verdict``/``call_site`` string
+    is PRESERVED on the field rather than rejected, so that
+    :func:`record_flake_occurrence`'s existing coercion guard stays the SINGLE write-time
+    vocabulary policy.  Duplicating that policy here would give a producer that went
+    off-vocabulary two different failure modes depending on whether it ran locally or
+    across the wire — and would delete the evidence before the log line that names the
+    bug could be emitted.
+    """
+    if d is None:
+        return None
+    try:
+        # `bool` is an `int` and neither is a payload; the isinstance check below rejects
+        # every non-mapping uniformly, which is what B13's "old remote sent something
+        # else entirely" case needs.
+        if not isinstance(d, dict):
+            logger.warning(
+                'flake_ledger: flake_suppression arrived as %s, not a dict; dropping the '
+                'observation (%r)',
+                type(d).__name__,
+                d,
+            )
+            return None
+
+        # Project onto exactly the declared field names: an unknown key from a NEWER
+        # producer must not cost the observation it rides along with (forward-compat),
+        # and `FlakeSuppression(**d)` would `TypeError` on it.
+        field_names = tuple(f.name for f in fields(FlakeSuppression))
+        kwargs = {name: d[name] for name in field_names if name in d}
+
+        # Coerce the two vocabulary fields back to members, falling back to the RAW value
+        # so an off-vocabulary string reaches `record_flake_occurrence`'s B12 guard
+        # intact (see the docstring — one coercion policy, at write time).
+        for name, enum_cls in (('verdict', FlakeVerdict), ('call_site', FlakeCallSite)):
+            if name in kwargs:
+                with contextlib.suppress(ValueError):
+                    kwargs[name] = enum_cls(kwargs[name])
+
+        # Same bare-str hazard `record_flake_occurrence` guards, and literally the same
+        # code: `_coerce_test_ids` states the wrap-not-drop rule once so the two paths
+        # cannot drift.  A MISSING key is left missing so the `FlakeSuppression(**kwargs)`
+        # below still raises for a truncated payload (caught, warned, dropped).
+        if kwargs.get('test_ids') is not None:
+            kwargs['test_ids'] = _coerce_test_ids(kwargs['test_ids'], context='the wire')
+
+        # A missing REQUIRED key raises TypeError here and is caught below — a truncated
+        # payload is a producer bug worth a loud line, not a half-built observation.
+        return FlakeSuppression(**kwargs)
+    except Exception:
+        logger.warning(
+            'flake_ledger: could not rebuild a FlakeSuppression from the wire payload '
+            '%r; dropping the observation (a malformed sub-payload must never cost a '
+            're-verify)',
+            d,
+            exc_info=True,
+        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -314,6 +433,13 @@ def _canonicalize_utc(dt: datetime, *, origin: str | None = None) -> str:
     call site passing ``datetime.now()`` instead of ``datetime.now(UTC)``, producing a
     stamp that is wrong by the host offset while still looking canonical.
     """
+    return _aware(dt, origin=origin).astimezone(UTC).isoformat()
+
+
+def _aware(dt: datetime, *, origin: str | None = None) -> datetime:
+    """*dt* with UTC ATTACHED if it is naive — the half of :func:`_canonicalize_utc` a
+    caller needs when it must hand one instant on as a ``datetime``, so the naive
+    warning (same *origin* rule) fires once rather than once per consumer."""
     if dt.tzinfo is None:
         if origin is not None:
             logger.warning(
@@ -322,7 +448,7 @@ def _canonicalize_utc(dt: datetime, *, origin: str | None = None) -> str:
                 origin,
             )
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).isoformat()
+    return dt
 
 
 def _normalize_observed_at(raw: str) -> str:
@@ -395,21 +521,13 @@ def record_flake_occurrence(
         call_site = FlakeCallSite(s.call_site)
         observed_at = _normalize_observed_at(s.observed_at)
 
-        # A bare `str` where a tuple belongs is an easy mistake at ε's call site (one
-        # node-id passed unwrapped), it is TRUTHY, and `tuple('a::t')` explodes it into
-        # one row PER CHARACTER — a dozen garbage test_ids silently written into the
-        # evidence trail this PRD exists to make trustworthy.  Wrap rather than drop: a
-        # single node-id string has exactly one honest reading, so the observation is
-        # preserved, and the warning still surfaces the upstream bug.
-        supplied_test_ids: tuple[str, ...] | str = s.test_ids
-        if isinstance(supplied_test_ids, str):
-            logger.warning(
-                'flake_ledger: test_ids arrived as a bare str (%r) at call_site=%s; '
-                'treating it as ONE node-id — the producer should pass a tuple',
-                supplied_test_ids,
-                call_site.value,
-            )
-            supplied_test_ids = (supplied_test_ids,)
+        # The bare-`str` hazard (one node-id passed unwrapped, TRUTHY, and
+        # `tuple('a::t')` explodes it into one row PER CHARACTER) is handled by the
+        # shared `_coerce_test_ids` — same rule, same warning, as the wire path, stated
+        # in exactly one place.
+        supplied_test_ids: tuple[str, ...] = _coerce_test_ids(
+            s.test_ids, context=f'call_site={call_site.value}',
+        )
 
         # §8: EMPTY test_ids is legal only for `unconfirmable`.  An unconfirmable
         # observation that resolved no node-ids is still COUNTED, under the sentinel —
@@ -592,6 +710,125 @@ def read_occurrences(
         return []
 
 
+# ---------------------------------------------------------------------------
+# The de-flake task ζ files at write time (§5.5, §5.9)
+# ---------------------------------------------------------------------------
+
+# The binding corollary of §5.5, carried IN the filed task rather than left for the
+# de-flake agent to already know.  Task 1836 widened a 10s timeout to 30s and thereby
+# MASKED a real SIGHUP bug for a day, until task 1841 found it; `esc-3650-2` was itself
+# a real production bug (SIGPIPE under `pipefail`, task 3552), not a bad test.
+#
+# DELIBERATE NON-DEDUP with `chronic_flake.py::_ROOT_CAUSE_INSTRUCTION`, which says the
+# same thing in remedy framing ('ROOT-CAUSE this...').  The two texts differ in FRAMING,
+# which is the entire point of §5.5: chronic_flake's presupposes a fix, and this one must
+# not.  Sharing one string would force one framing on both.  Importing `chronic_flake`
+# here would also break this module's import discipline: the dependency runs ledger ->
+# nothing-but-`shared`, and chronic_flake is the layer ABOVE, so the edge would point
+# backwards.  (It would NOT drag in `orchestrator.config`, as this comment previously
+# claimed: chronic_flake imports that only under `if TYPE_CHECKING`, and at runtime pulls
+# stdlib plus `shared.safe_io`/`shared.task_statuses` only -- measured, not assumed.  The
+# layering reason is real; the import-weight one was not.)
+# Task κ — which migrates chronic_flake onto this ledger — OWNS converging the two texts.
+NEVER_WIDEN_A_TIMEOUT = (
+    'CONSTRAINT, binding: do NOT widen a timeout, lengthen a sleep, or add a retry as '
+    'the remedy. That makes the observation rarer and harder to reproduce without '
+    'removing its cause, and it has already masked a real defect here (task 1836 '
+    'widened 10s->30s and hid a genuine SIGHUP bug for a day, until task 1841 found '
+    'it). Prefer condition-polling (wait for the state the test actually depends on) '
+    'and structural asserts (assert on state, not on log/prose output).'
+)
+
+# §5.9's invariant names TWO responsibilities, and both belong to the SAME task.  Split
+# into two constants because a task carrying only the first would fix the defect and
+# leave the ledger row open forever — which is precisely what task θ's class-2 AGE
+# backstop then escalates on, turning a successful fix into a false non-convergence
+# signal.
+RESPONSIBILITY_FIX_ROOT_DEFECT = (
+    'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
+)
+RESPONSIBILITY_REMOVE_FROM_LEDGER = (
+    'You are ALSO responsible for removing this test from the flake ledger once it is '
+    'fixed (resolve its debt row), which is what closes the cycle'
+)
+
+
+def build_deflake_task_arguments(row: DebtRow) -> dict:
+    """The ``submit_task`` argument block for the task that owns *row*'s debt (§5.9).
+
+    Pure and side-effect free: :func:`open_debt` files the result, this only shapes it.
+
+    Follows ``orchestrator/src/orchestrator/chronic_flake.py::build_chronic_flake_fix_task_arguments``'s
+    block shape (title / description / priority / metadata), RE-FRAMED per §5.5 so the
+    text records the OBSERVATION and never presupposes a remedy — see
+    :data:`NEVER_WIDEN_A_TIMEOUT` for why the instruction text is re-derived here rather
+    than shared with that module's ``_ROOT_CAUSE_INSTRUCTION``, and which task owns
+    converging them.
+
+    Two keys are load-bearing and easy to "clean up" wrongly:
+
+    - ``planning_mode: True`` — this is what makes ``submit_task`` return a REAL task id
+      SYNCHRONOUSLY (fused-memory ``task_interceptor.py::_submit_task_planning_mode``),
+      bypassing the curator ticket store, which PRD §5.4 explicitly sanctions "for
+      exactly the tasks this subsystem files".  The default two-phase path returns only
+      ``{'ticket': 'tkt_...'}`` and the curator decides create/combine/drop
+      ASYNCHRONOUSLY — so there would be no id to store in ``owner_task_id`` and the task
+      might never exist at all, making §5.9's invariant silently hollow exactly where
+      §5.7 has already landed the merge.  The task is born ``deferred``; the caller
+      completes it with ``commit_planning``.
+    - NO ``project_root`` — :func:`open_debt` takes a ``db_path``, not a project root
+      (§8.3), and the only way to name one from here would be ``db_path.parent.parent
+      .parent``, a silent position-dependent inversion of :func:`ledger_db_path` that
+      breaks for every non-standard path.  The adapter already HOLDS the project root and
+      injects it (``chronic_flake.py::SchedulerChronicFlakeTaskClient.submit_task``).
+
+    ``metadata.files`` is likewise omitted deliberately: a ``test_id`` may be a reify
+    script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
+    derived from a guess is worse than no lock — the de-flake agent discovers the files.
+    """
+    return {
+        'title': (
+            f'Flake debt: {row.test_id} — {FlakeVerdict.passes_in_isolation.value} '
+            f'after a merge-gate red was suppressed'
+        ),
+        'description': (
+            f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
+            f'observation for this test and SUPPRESSED the red it produced, so a merge '
+            f'landed on a gate that had gone red:\n'
+            f'\n'
+            f'  test:        {row.test_id}\n'
+            f'  project:     {row.project_id}\n'
+            f'  opened_at:   {row.opened_at}\n'
+            f'  open_count:  {row.open_count}\n'
+            f'\n'
+            f'What that verdict means, precisely: the test failed under load in the '
+            f'merge verify and then PASSED on an isolated, serial re-run. Read that as '
+            f'evidence about the SYSTEM, not as a verdict on the test — a test that '
+            f'passes alone and fails under load has repeatedly turned out to be a real '
+            f'production defect here (task 1836 -> 1841: a widened timeout masked a '
+            f'genuine SIGHUP bug for a day; esc-3650-2 was a real SIGPIPE-under-pipefail '
+            f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
+            f'\n'
+            f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
+            f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+            f'\n'
+            f'{NEVER_WIDEN_A_TIMEOUT}\n'
+            f'\n'
+            f'Auto-filed by the flake ledger when the debt row was opened (PRD '
+            f'plans/flake-ledger-prd.md §5.9). The merge already landed, so this is '
+            f'visible, owned debt rather than an incident.'
+        ),
+        'priority': 'medium',
+        'planning_mode': True,
+        'metadata': {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': row.test_id,
+            'flake_debt_open_count': row.open_count,
+            'flake_debt_opened_at': row.opened_at,
+        },
+    }
+
+
 def _to_debt_row(row: sqlite3.Row) -> DebtRow:
     return DebtRow(
         test_id=row['test_id'],
@@ -630,13 +867,631 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+# `submit_task`'s TWO-PHASE (non-planning) response names a ticket, not a task:
+# `{"ticket": "tkt_<id>"}`, which the curator resolves into a task asynchronously.
+# `chronic_flake::extract_task_id` accepts that key as a fallback, so the prefix is the
+# one machine-checkable signal that `planning_mode: True` did NOT take effect and the id
+# in hand can never be resolved by `get_statuses`.  Kept as a constant, beside the
+# Protocol whose `submit_task` docstring states the "not a ticket id" requirement in
+# prose, so the guard and the contract it enforces are read together.
+_TICKET_ID_PREFIX = 'tkt_'
+
+
+class FlakeLedgerTaskClient(Protocol):
+    """The task seam :func:`open_debt` needs to enforce §5.9, and :func:`resolve_debt`
+    needs to corroborate a resolution — declared STRUCTURALLY (``typing.Protocol``) so
+    it is machine-checked (INV-1) rather than prose, and so no import edge is created to
+    the module that satisfies it.
+
+    ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient``
+    is the concrete adapter.  It is NOT imported here, deliberately: this module depends
+    on ``shared`` alone and sits BELOW ``chronic_flake``, so importing it would point the
+    dependency backwards through the layer that is meant to build on this one.  (The cost
+    is layering, not import weight -- ``chronic_flake`` imports ``orchestrator.config``
+    only under ``if TYPE_CHECKING``, so an import edge here would pull in stdlib plus
+    ``shared`` and nothing else.  Measured; an earlier version of this docstring asserted
+    the opposite.)
+
+    Every method must degrade rather than raise where it can, but the ledger does not
+    RELY on that — :func:`_ensure_owner_task` and :func:`resolve_debt` guard each call
+    independently, because a partial or older adapter (one lacking a method entirely,
+    hence ``AttributeError``) is a shape that really arrives.
+
+    ``get_statuses`` and ``get_task`` go further and report their failures IN BAND,
+    because degrading to a bare ``{}`` or ``None`` is not a safe degrade at this seam:
+    an empty mapping and a missing task already MEAN something here (see their
+    docstrings).
+    """
+
+    async def submit_task(self, arguments: dict) -> str:
+        """File the task described by *arguments* (see
+        :func:`build_deflake_task_arguments`) and return its id.  The block carries
+        ``planning_mode: True``, so this must return a REAL, synchronously-known task id
+        — not a ticket id — or the invariant it backs is hollow.  A falsy return is
+        treated as a failed filing."""
+        ...
+
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        """Live ``{id: status}`` for *ids*, as a ``(statuses, error)`` pair —
+        ``scheduler.py::SchedulerFacade.get_statuses``' convention, and the shape that
+        makes the seam's FAILURE/ABSENCE distinction machine-checked (INV-1) instead of
+        resting on an adapter's exception discipline.
+
+        An unknown id is OMITTED from the mapping rather than reported as a status, and
+        the ledger reads that omission as a CORROBORATED ABSENCE — the task was deleted
+        — and files a replacement for it.  So a FAILED read must NEVER be reported as an
+        empty mapping: put it in the error half.  An implementation that swallows a
+        failure into ``{}`` is indistinguishable from a real absence at this seam, and
+        the ledger will act on it — one duplicate de-flake task per suppression, for the
+        length of the outage, with no rate limit to bound it.
+        """
+        ...
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        """The task *task_id*, read LIVE, as a ``(task, error)`` pair that keeps failure
+        and absence machine-distinguishable (INV-1, the lesson of :meth:`get_statuses`):
+
+        - ``(task, None)`` — a task was read;
+        - ``(None, None)`` — a CORROBORATED ABSENCE: the server answered that no such
+          task exists;
+        - ``(None, exc)`` — a FAILED read: nothing is known about the task.
+
+        :func:`resolve_debt` stamps a resolution ONLY from a task it actually read, so
+        an absence and a failure both leave the cycle open; the pair is what lets its
+        log say which of the two happened.  :func:`open_debt`'s owner enforcement acts
+        on the same read, and there the distinction is :meth:`get_statuses`' again: an
+        absence files a replacement owner, a failure files nothing.
+        """
+        ...
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        """Release planning-mode tasks from ``deferred`` to ``pending`` — the second
+        phase of the initial filing, without which the task never dispatches."""
+        ...
+
+
+@dataclass(frozen=True)
+class _OwnerRead:
+    """One SUCCESSFUL live ``get_task`` read of the owner *owner_task_id*.  *task* is
+    ``None`` when the server answered that no such task exists: a corroborated absence.
+
+    :func:`open_debt` takes it from its lazy close and hands it to ζ's enforcement, so
+    an owner is read ONCE per call.  One live fact then has one source, and the
+    resolution and the owner verdict cannot disagree about it.
+    """
+
+    owner_task_id: str
+    task: dict | None
+
+    @property
+    def status(self) -> str | None:
+        return None if self.task is None else self.task.get('status')
+
+
+def _owner_liveness(status: str | None) -> str:
+    """Four-way verdict on a stored owner's LIVE status:
+    ``open`` | ``deferred`` | ``done`` | ``closed``.
+
+    Mirrors ``orchestrator/src/orchestrator/chronic_flake.py::_is_open_status``'s
+    ``status not in TERMINAL and status != 'deferred'`` predicate against the same source
+    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to four values
+    so ``deferred`` and ``done`` stay distinguishable.
+
+    Why that refinement is load-bearing and not a nicety: ``planning_mode=True`` creates
+    the task ``deferred``, so between ``submit_task`` and ``commit_planning`` there is a
+    real window in which a crash or a failed second round-trip leaves a task that EXISTS
+    but will never be dispatched.  The boolean predicate classifies that as NOT open, so
+    every subsequent suppression of the same test would file another orphan — a
+    duplicate-generating loop that gets worse the more the test flakes.  The
+    ``deferred`` branch finishes the half-done filing instead.
+
+    ``done`` is split out of ``closed`` (task η) for the same reason: its correct action
+    differs.  With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a
+    done owner's cycle and the re-entry upsert discharges that owner, so a done owner on
+    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised,
+    timed out or is missing and the ``get_statuses`` fallback read the owner done, or
+    the stamp itself failed.  Replacing it would overwrite the only pointer to the fix
+    that did not hold, so the cycle would never close, ``prior_resolving_commit`` would
+    never be written, and no ``regressed_after_resolution`` L2 would fire.  ``closed``
+    therefore means only a non-done terminal status (``cancelled``) or an absent owner.
+
+    Empty/absent is ``closed``: a SUCCESSFUL read that finds no such task — ``get_task``
+    answering ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
+    corroborated absence (the task was deleted).  A FAILED read never reaches here — see
+    :func:`_ensure_owner_task`, where an unreadable status is explicitly not treated as
+    evidence of anything.
+
+    That last sentence is a GUARANTEE, not an aspiration, and it rests on both reads
+    reporting failure in band — ``get_task``'s ``(task, error)`` and
+    :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses, error)`` pair: the caller
+    returns early on a non-``None`` error, so only a successful read is classified here.
+    It was NOT true while the adapter swallowed failures into a bare ``{}`` — that
+    arrived indistinguishable from an absence and was classified ``closed``, filing a
+    replacement task for an owner that was alive and merely unread.
+    """
+    if not status:
+        return 'closed'
+    if status == 'deferred':
+        return 'deferred'
+    if status == 'done':
+        return 'done'
+    return 'closed' if status in TERMINAL else 'open'
+
+
+class _OwnerClaimLost(RuntimeError):
+    """The conditional owner UPDATE matched no row — another lane won the claim, or the
+    row is gone.  Raised by :func:`_write_owner_task_id` so the filed task is reported as
+    the ORPHAN it is, instead of a success line for a pointer that never landed."""
+
+
+def _write_owner_task_id(
+    db_path: Path, test_id: str, owner_task_id: str, *, expected_owner: str | None,
+) -> None:
+    """CLAIM *test_id*'s debt row for *owner_task_id*, conditionally on
+    *expected_owner* still being what is on disk.
+
+    Exists so :func:`_ensure_owner_task` never hand-rolls an UPDATE at a call site —
+    contract 1 of the module docstring ("writes go only through this API") applies
+    inside the module too, since a second spelling of this statement is exactly how the
+    column would drift.
+
+    CONDITIONAL, AND THE CONDITION IS THE POINT.  The caller decided to write this
+    pointer by READING ``row.owner_task_id`` (from ``open_debt``'s read-back), then
+    awaiting a task filing — so between the read and this write sit at least two
+    ``await`` points, and every ``open_debt`` call is one.  Two merge lanes suppressing
+    the same test in one event loop genuinely interleave there.  An UNCONDITIONAL
+    ``SET owner_task_id = ?`` would be exactly the read-modify-write race §5.1 chose
+    SQLite to avoid (see ``open_debt``'s single-statement upsert, which carries that
+    reasoning), reintroduced inside the ledger itself on the one column §5.9's whole
+    dedup rests on: the loser would silently clobber the winner's pointer, and the
+    winner's task — a real, non-terminal task — would never be referenced again.
+
+    So the WHERE clause carries the expectation:
+
+    * ``expected_owner is None`` — a FRESH claim, guarded by ``owner_task_id IS NULL``.
+      A concurrent lane that already claimed the row wins, and this filing is the orphan.
+    * ``expected_owner`` set — a REPLACEMENT for the terminal/absent owner the caller
+      corroborated, guarded by ``owner_task_id = <that id>``.  If it changed underneath,
+      what is there now was not corroborated by this call and must not be overwritten.
+
+    Raises on a ledger failure, and on a matched-zero-rows claim
+    (:class:`_OwnerClaimLost`), deliberately: the sole caller wraps the whole filing in
+    its own guard and knows how to degrade loudly, and swallowing either would report a
+    filing as recorded when the pointer never landed.
+    """
+    conn = _open(db_path)
+    try:
+        if expected_owner is None:
+            cursor = conn.execute(
+                'UPDATE flake_debt SET owner_task_id = ? '
+                'WHERE test_id = ? AND owner_task_id IS NULL',
+                (owner_task_id, test_id),
+            )
+        else:
+            cursor = conn.execute(
+                'UPDATE flake_debt SET owner_task_id = ? '
+                'WHERE test_id = ? AND owner_task_id = ?',
+                (owner_task_id, test_id, expected_owner),
+            )
+        conn.commit()
+        if cursor.rowcount == 0:
+            # Not a ledger failure — a LOST CLAIM.  Distinguished from an OperationalError
+            # because the remedy differs: nothing is retried here, and the next
+            # suppression will corroborate whatever owner did land rather than file again.
+            raise _OwnerClaimLost(
+                f'owner claim for test_id={test_id!r} matched no row '
+                f'(expected owner {expected_owner!r}); another lane claimed it first, '
+                f'or the row is gone'
+            )
+    finally:
+        conn.close()
+
+
+async def _owner_status(
+    task_client: FlakeLedgerTaskClient, owner_task_id: str, owner_read: _OwnerRead | None,
+) -> tuple[str | None, Exception | None]:
+    """*owner_task_id*'s LIVE status as a ``(status, error)`` pair, the status ``None``
+    for a corroborated absence.
+
+    It is *owner_read*, the lazy close's read, when that read is of THIS owner, so the
+    owner is not read twice.  Otherwise (that read failed or timed out, or a concurrent
+    lane re-pointed the row since) it is a ``get_statuses`` read, whose failure arrives
+    in TWO shapes that land on ONE path, so the fail-safe direction cannot drift between
+    them.  The real adapter never raises: it reports the failure as the ERROR HALF of
+    its pair, because a failure returned as a bare ``{}`` is byte-identical to a
+    corroborated absence and would be acted on as one.  A partial or older adapter, or
+    one returning a non-tuple that the unpack rejects, raises instead, and that is
+    caught here.
+    """
+    if owner_read is not None and owner_read.owner_task_id == owner_task_id:
+        return owner_read.status, None
+    try:
+        statuses, error = await task_client.get_statuses([owner_task_id])
+    except Exception as exc:
+        return None, exc
+    if error is not None:
+        return None, error
+    return statuses.get(owner_task_id), None
+
+
+async def _ensure_owner_task(
+    db_path: Path,
+    project_id: str,
+    row: DebtRow,
+    *,
+    task_client: FlakeLedgerTaskClient | None,
+    owner_read: _OwnerRead | None = None,
+) -> DebtRow:
+    """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
+
+    > Any test in the flaky ledger has a non-terminal de-flake task explicitly
+    > responsible both for fixing the root defect and for removing the test from the
+    > ledger.
+
+    Enforced at WRITE TIME, inside :func:`open_debt`, so it is SELF-MAINTAINING rather
+    than audited after the fact.  Dedup follows
+    ``orchestrator/src/orchestrator/flake_recorder.py::_bump_suppression_streak_and_maybe_escalate``,
+    which already dedupes on a fixed sentinel; here the sentinel is ``owner_task_id`` on
+    the debt row.
+
+    INV-3, verbatim and load-bearing: a stored ``owner_task_id`` is a SNAPSHOT.  The
+    task behind it may have gone terminal, been cancelled, or been deleted since it was
+    written, so it is re-read against LIVE status every time and NEVER assumed
+    still-open.  Short-circuiting on a non-NULL ``owner_task_id`` would satisfy the
+    invariant's letter while pointing stale rows at done tasks forever.  The live read is
+    *owner_read* when :func:`open_debt`'s lazy close made one of this owner, so each call
+    reads its owner once (:func:`_owner_status`).  Only a cancelled or absent owner is
+    REPLACED: a done one is kept, because on an open row it means the lazy close did not
+    land and the next suppression retries it (:func:`_owner_liveness`).
+
+    COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
+    except the initial filing.  It never marks a task done, never blocks one, never
+    reprioritises one — a de-flake task's lifecycle belongs to the orchestrator, and the
+    ledger only observes it.  That is what keeps INV-6 (``status-matches-liveness``) N/A
+    by construction rather than merely satisfied.
+
+    Never raises: it runs under :func:`open_debt`'s catch-all (B12) and step-8 adds its
+    own inner per-call guards so ONE failing client call costs only that signal.
+    """
+    if task_client is None:
+        # A legitimate configuration (a CLI, or ε's two `_run_post_merge_verify` callers
+        # that thread nothing) — but it is also the one way the invariant silently stops
+        # being enforced in production, so it is stated rather than assumed.
+        logger.info(
+            'flake_ledger: no task_client wired — debt for test_id=%s is opened with no '
+            'owner and §5.9 is NOT enforced for it (ι renders it as an invariant breach)',
+            row.test_id,
+        )
+        return row
+
+    if row.owner_task_id:
+        # INV-3: corroborate BEFORE acting.  The stored id is a snapshot; it is re-read
+        # against live status on every suppression and never assumed still-open.
+        #
+        # On a FAILED read the fail-safe direction is do-NOT-file.  This is the
+        # opposite of `chronic_flake._has_open_dedup_match`'s fail-open-towards-filing,
+        # deliberately: there a duplicate is bounded by `FilingLedger`'s multi-day
+        # per-test rate limit, here there is none, so a transient MCP outage during a
+        # suppression burst would file one duplicate PER SUPPRESSION.  An unreadable
+        # status is also simply not evidence that the owner went terminal, and INV-3
+        # says corroborate before acting.  A missed filing is cheaply recoverable — the
+        # next suppression of the same test retries, and θ's age backstop catches a row
+        # that stays stuck; a duplicate task tree is not.
+        #
+        # It is the TYPED PAIR, not the caller's exception discipline, that now makes
+        # `_owner_liveness`'s standing claim ("a FAILED read never reaches here") true
+        # through the production composition rather than merely aspirational.
+        status, read_error = await _owner_status(task_client, row.owner_task_id, owner_read)
+        if read_error is not None:
+            logger.warning(
+                'flake_ledger: could not corroborate owner %s for test_id=%s — KEEPING '
+                'the stored owner and filing nothing (an unreadable status is not '
+                'evidence the task went terminal)',
+                row.owner_task_id,
+                row.test_id,
+                exc_info=read_error,
+            )
+            return row
+        liveness = _owner_liveness(status)
+        if liveness == 'open':
+            logger.debug(
+                'flake_ledger: debt for test_id=%s is already owned by live task %s',
+                row.test_id,
+                row.owner_task_id,
+            )
+            return row
+        if liveness == 'deferred':
+            # A half-completed initial filing, not a closed one.  Finish it — filing a
+            # SECOND task here is the duplicate-generating loop _owner_liveness exists
+            # to prevent.  Completing the initial filing is explicitly exempted from
+            # §5.9's coupling rule; this is still never lifecycle management.
+            logger.info(
+                'flake_ledger: completing the half-filed de-flake task %s for test_id=%s '
+                '(deferred — its commit_planning never landed)',
+                row.owner_task_id,
+                row.test_id,
+            )
+            try:
+                await task_client.commit_planning([row.owner_task_id])
+            except Exception:
+                logger.warning(
+                    'flake_ledger: could not complete the half-filed de-flake task %s '
+                    'for test_id=%s — it stays deferred and the next suppression retries',
+                    row.owner_task_id,
+                    row.test_id,
+                    exc_info=True,
+                )
+            return row
+        if liveness == 'done':
+            # The resolution did not land this call (see `_owner_liveness`).  Keep the
+            # pointer and file nothing, the unreadable-status branch's fail-safe
+            # direction: the next lazy resolve_debt closes the cycle through it, where a
+            # replacement would erase it for good.
+            logger.warning(
+                'flake_ledger: owner %s of test_id=%s is done but its debt cycle could not '
+                'be closed — KEEPING the owner rather than replacing it; '
+                'regressed_after_resolution detection is DEFERRED to the next suppression '
+                "(or θ's sweep)",
+                row.owner_task_id,
+                row.test_id,
+            )
+            return row
+        logger.info(
+            'flake_ledger: de-flake task %s owning test_id=%s was cancelled or no longer '
+            'exists (status=%r) — filing a replacement',
+            row.owner_task_id,
+            row.test_id,
+            status,
+        )
+
+    # The filing gets its OWN guard for the same reason the corroboration does: one
+    # failing client call must cost exactly that signal, never the merge (B12) and never
+    # the other side-effects — the "independently guarded side-effects" discipline
+    # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
+    try:
+        new_id = str(await task_client.submit_task(build_deflake_task_arguments(row)) or '')
+        if not new_id:
+            # A falsy id is a FAILED filing, not a filing with an empty name.  Storing
+            # '' would hide the breach behind a truthy-looking column value; leaving the
+            # column NULL is what `flake_report` renders as the invariant breach it is.
+            raise ValueError('submit_task returned no task id')
+        if new_id.startswith(_TICKET_ID_PREFIX):
+            # A STRUCTURALLY WRONG id is also a failed filing, and the falsy guard above
+            # does not catch it because a ticket id is truthy.  `chronic_flake
+            # ::extract_task_id` falls back to submit_task's NON-planning two-phase
+            # response key, `{'ticket': 'tkt_<id>'}`; if `planning_mode` is ever dropped,
+            # rejected, or the server falls back to that path, a `tkt_...` string arrives
+            # here.  Storing it is strictly WORSE than storing nothing: a ticket id is not
+            # a task id, so every later `get_statuses(['tkt_...'])` legitimately OMITS it,
+            # `_owner_liveness` reads the omission as a CORROBORATED ABSENCE, and a
+            # REPLACEMENT is filed -- on every suppression, unbounded, on a path with no
+            # rate limit (see this function's own note).  Refused here, the row simply
+            # stays unowned and the next suppression RETRIES the filing, which terminates.
+            raise ValueError(
+                f'submit_task returned a ticket id ({new_id!r}), not a task id -- '
+                'planning_mode did not take effect'
+            )
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
+            '— the debt row stays UNOWNED and §5.9 is breached for it until the next '
+            'suppression retries',
+            row.test_id,
+            project_id,
+            exc_info=True,
+        )
+        return row
+
+    # The pointer is written BEFORE commit_planning is awaited, and the order picks
+    # which failure is survivable.  Written last, a commit_planning failure would orphan
+    # a task that really was created — invisible, unreferenced, and re-created on every
+    # subsequent suppression.  Written first, the worst case is a row pointing at a
+    # `deferred` task, which ι renders (owner shown) and which the `deferred` branch
+    # above repairs on the next suppression.  Same principle as the recorder's "durable
+    # row first, lose the recoverable half".
+    #
+    # The claim is CONDITIONAL on what this call actually corroborated — NULL for a fresh
+    # filing, the terminal id for a replacement — because `row` is a snapshot taken
+    # before two awaits (the status read and the filing) and a concurrent lane may have
+    # claimed the row in between.  See `_write_owner_task_id`.
+    prior_owner = row.owner_task_id or None
+    try:
+        _write_owner_task_id(db_path, row.test_id, new_id, expected_owner=prior_owner)
+    except _OwnerClaimLost:
+        # The task exists server-side and nothing will ever reference it, so the warning
+        # NAMES it: that string is the only trace a human can search for.  Deliberately
+        # not a clobber and deliberately not a retry — the row now carries some other
+        # lane's owner (or is gone), and the next suppression corroborates THAT rather
+        # than filing again, so the leak is one task, not a loop.
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but LOST the owner claim '
+            '(expected owner %r) — another merge lane owns the row, so this task is '
+            'ORPHANED; the winner is left in place rather than clobbered',
+            new_id,
+            row.test_id,
+            prior_owner,
+            exc_info=True,
+        )
+        return row
+    except Exception:
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but could not store the '
+            'pointer — the task is ORPHANED and the next suppression will file another',
+            new_id,
+            row.test_id,
+            exc_info=True,
+        )
+        return row
+
+    # `planning_mode=True` created the task `deferred`; commit_planning is the SECOND
+    # PHASE of the initial filing, not lifecycle management, and without it the task
+    # exists but is never dispatched.
+    try:
+        await task_client.commit_planning([new_id])
+    except Exception:
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but could not release it '
+            'from deferred — the pointer IS stored, so the next suppression completes it '
+            'rather than filing a duplicate',
+            new_id,
+            row.test_id,
+            exc_info=True,
+        )
+    logger.info(
+        'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
+        new_id,
+        row.test_id,
+        project_id,
+    )
+    # No re-read.  After a ROWCOUNT-CHECKED conditional UPDATE, `new_id` is exactly what
+    # is in that column on disk — so patching the one column this function owns is not a
+    # "local copy" of the row, it is the row.
+    #
+    # This used to `read_debt` and fall back to `replace(...)` only on a `None` return,
+    # which was wrong in both directions: `read_debt` returns `None` for a DEGRADED READ
+    # and for a GENUINELY ABSENT row alike (it catches and logs), so the fallback also
+    # fired when the row had been deleted underneath us — handing the caller a row
+    # asserting an ownership the database does not hold.  That is the same
+    # present-vs-absent conflation the `(statuses, error)` pair was introduced to
+    # eliminate one function away.  It also cost a THIRD connection on the owned path
+    # (upsert, UPDATE, re-read), each paying the full five-pragma durability triad on
+    # the merge path — the cost `TestOneConnectionPerCall` exists to bound.
+    return replace(row, owner_task_id=new_id)
+# Stay well under SQLite's SQLITE_MAX_VARIABLE_NUMBER (999 on older builds, 32766 on
+# modern ones -- measured 32766 on SQLite 3.50.4 here) -- the test universe a report
+# covers is unbounded, so a single `IN (...)` over it is not safely bounded.  500 and the
+# chunking shape are the in-repo precedent at
+# `evals/reviewer_trial/__main__.py::_FETCH_TITLES_CHUNK_SIZE`; one spelling of this
+# pattern in the orchestrator package rather than a second idiom.
+_READ_DEBT_CHUNK_SIZE = 500
+
+
+def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]:
+    """The debt rows for *test_ids*, keyed by ``test_id`` — one connection for the batch.
+
+    The batched form of :func:`read_debt`, and deliberately nothing more: it calls the
+    same :func:`_to_debt_row` on the same columns, so the two cannot drift in how a row
+    becomes a :class:`DebtRow`.  It exists because ι's report builds one chain per test
+    and a per-test :func:`read_debt` pays :func:`_open`'s full cost EACH TIME —
+    ``parent.mkdir`` → ``connect`` → the five-pragma durability triad (including a
+    ``journal_mode=WAL`` switch and ``synchronous=FULL``) → ``executescript(_SCHEMA)`` —
+    against the live ``runs.db`` the merge lane holds a 5s ``busy_timeout`` on.  That is
+    DDL per test on a nominally read-only report; here it is DDL once per report.
+
+    RESOLVED rows are returned, exactly as :func:`read_debt` returns them: §5.2 retains
+    them deliberately because η's recurrence trigger reads them, and they are the whole
+    reason a batched reader is wanted — ι's chain goes blank precisely when a test is
+    BETWEEN cycles, which is the PRD's motivating case.
+
+    A test_id with NO debt row is ABSENT from the result, never present with a ``None``
+    value.  That makes ``read_debt_many(db, ids).get(t)`` reproduce
+    ``read_debt(db, t)``'s ``DebtRow | None`` contract with zero adaptation at the call
+    site, and it keeps "we looked and found nothing" distinguishable from "we never
+    asked" — the collapse a ``dict[str, DebtRow | None]`` would force on every consumer.
+
+    B12: never raises.  A failure degrades the WHOLE call to ``{}`` rather than returning
+    whatever was read so far, uniform with every sibling reader here (``[]`` / ``None``)
+    — the realistic failures are per-DATABASE (corrupt, truncated, lock-contended), not
+    per-row, so a partial result is a state that essentially cannot arise.  The report
+    already renders a missing debt row honestly, and the loud ``exc_info`` warning still
+    names the cause.
+    """
+    # Deduped because the caller passes a set difference and a repeat would waste one of
+    # SQLite's bounded variable slots; SORTED because a `set` iterates in arbitrary
+    # order, and without this the emitted SQL — and, once chunked, the chunk CONTENTS —
+    # would vary run to run in a subsystem whose renderer is contractually byte-stable.
+    # Bound BEFORE the try so the handler's `len(ids)` can never itself raise NameError,
+    # mirroring `record_flake_occurrence`'s `test_ids: tuple[str, ...] = ()` precedent.
+    ids: tuple[str, ...] = ()
+    try:
+        ids = tuple(sorted(set(test_ids)))
+        # Short-circuit BEFORE `_open`: ι's contract is that printing a report never
+        # provisions a DB, and `_open` would `mkdir` + `connect` + run the schema DDL.
+        if not ids:
+            return {}
+
+        found: dict[str, DebtRow] = {}
+        # ONE connection for the whole batch, hoisted OUTSIDE the chunk loop.  A
+        # per-chunk connection would each pay the five-pragma durability triad and
+        # re-run the schema DDL -- the same amplification this reader exists to remove,
+        # merely at 1/500th the rate -- and would break the module's machine-checked
+        # one-connection-per-entry-point contract for any batch over the chunk size.
+        conn = _open(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            for i in range(0, len(ids), _READ_DEBT_CHUNK_SIZE):
+                chunk = ids[i : i + _READ_DEBT_CHUNK_SIZE]
+                placeholders = ','.join('?' for _ in chunk)
+                rows = conn.execute(
+                    f'SELECT * FROM flake_debt WHERE test_id IN ({placeholders})', chunk
+                ).fetchall()
+                found.update((row['test_id'], _to_debt_row(row)) for row in rows)
+        finally:
+            conn.close()
+        return found
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read debt for %d test(s) from %s',
+            len(ids),
+            db_path,
+            exc_info=True,
+        )
+        return {}
+
+
+def _this_call_reentered(row: DebtRow, *, stamp: str) -> bool:
+    """Whether the upsert that read back *row* RE-ENTERED a resolved cycle at *stamp*.
+
+    The upsert's re-entry branch is the only writer that moves ``opened_at`` on an
+    existing row, and it writes THIS call's *stamp*; ``open_count > 1`` excludes the
+    fresh insert, which writes the stamp too.  Two calls sharing one canonical stamp —
+    only an injected clock does that — would both read as re-entries.
+    """
+    return row.open_count > 1 and row.opened_at == stamp
+
+
+def _report_regression(row: DebtRow, hook: Callable[[DebtRow], None] | None) -> None:
+    """Hand the re-entered *row* to *hook* (``open_debt``'s
+    ``on_regressed_after_resolution``), or log the regression LOUDLY when none is wired.
+    Never raises: a failing hook costs only the report."""
+    if hook is None:
+        logger.warning(
+            'flake_ledger: test_id=%s re-entered debt after a resolution '
+            '(regressed_after_resolution, cycle %d, prior resolving commit %s) but no hook '
+            'is wired, so it is visible only in `orchestrator flake-ledger`',
+            row.test_id,
+            row.open_count,
+            row.prior_resolving_commit or '(none recorded)',
+        )
+        return
+    try:
+        hook(row)
+    except Exception:
+        logger.warning(
+            'flake_ledger: reporting regressed_after_resolution for test_id=%s raised — '
+            'the re-entered debt row IS written and its owner is still enforced',
+            row.test_id,
+            exc_info=True,
+        )
+
+
+# How long, in seconds, the owner read that closes a cycle may take.  A healthy
+# `get_task` answers in well under a second, but `mcp_call` retries through a
+# fused-memory restart for ~120s
+# (`orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession._retry_backoffs`), as long
+# as the recorder's whole per-observation filing budget.
+_RESOLVE_BUDGET_SECS = 10.0
+
+
 async def open_debt(
     db_path: Path,
     project_id: str,
     test_id: str,
     *,
-    task_client: Any = None,
+    task_client: FlakeLedgerTaskClient | None = None,
     now: datetime | None = None,
+    on_regressed_after_resolution: Callable[[DebtRow], None] | None = None,
+    resolve_budget_secs: float = _RESOLVE_BUDGET_SECS,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
 
@@ -645,12 +1500,44 @@ async def open_debt(
     honest degrade is ``None`` rather than a fabricated row, and consumers must handle
     ledger unavailability explicitly.
 
-    ``task_client`` is accepted for SIGNATURE STABILITY and is UNUSED in α.  Task ζ
-    adds the invariant enforcement here — re-corroborate ``owner_task_id``'s live
-    status and file a de-flake task if none is non-terminal — and declaring the
-    parameter (and the ``async`` colour) now means ζ never has to churn ``await`` at
-    ε's merge-path call sites.  The coupling rule ζ inherits: the ledger READS task
-    status but never WRITES it, except for the initial filing.
+    ``task_client`` is where §5.9's invariant is ENFORCED (see
+    :func:`_ensure_owner_task`): after the upsert, ``owner_task_id`` is re-corroborated
+    against live task status and a de-flake task is filed if there is no owner, or it was
+    cancelled or deleted.  Pass
+    ``None`` — the CLI and storeless callers do — and the row is written exactly as α
+    wrote it, with no owner; that is a legitimate degrade, logged, and rendered by ι as
+    an invariant breach rather than hidden.
+
+    CLOSE, THEN UPSERT (task η).  With a ``task_client`` wired, the current cycle is
+    first closed via :func:`resolve_debt` if its stored owner reads back live-done, so
+    this observation RE-ENTERS the debt (``open_count`` +1, the fix's commit carried
+    forward) instead of ζ quietly replacing a finished owner.  That makes recurrence
+    detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
+    function, so the done owner is still on the row when the next suppression arrives,
+    whether or not an eager sweep has run.  The eager sweep is task θ's.  The close's
+    live ``get_task`` read of the owner is also the read ζ's enforcement acts on, so one
+    call reads its owner once; ``get_statuses`` is only the fallback when that read
+    failed.
+
+    The close's owner read is the only network wait BEFORE the upsert, so it is bounded
+    by *resolve_budget_secs*: a slow or hung read fails like any other, costing the
+    resolution and never the occurrence.  Only a caller's own budget that expires inside
+    that bound can still cancel the call ahead of its upsert, which loses the same thing
+    as a test that budget skipped outright.
+
+    REGRESSION REPORT (task η).  A RE-ENTRY means the test flaked again after its fix
+    landed, and *on_regressed_after_resolution* receives the re-entered row EXACTLY ONCE
+    per re-entry: never for a first suppression, never for a repeat inside a cycle.  It
+    is called synchronously right after the upsert commits, with no await in between and
+    BEFORE ζ's owner filing awaits anything, so a filing that hangs, or that the caller's
+    budget cancels (task 4974), cannot lose the report; that is also why the row it
+    receives has no owner yet.  A raising hook costs only the report, never the row or
+    its owner.  Unwired, the re-entry is logged as a WARNING instead: a legitimate
+    configuration, never a silent one.
+
+    COUPLING RULE, binding: the ledger READS task status but never WRITES it, except
+    for the initial filing (``submit_task`` plus the ``commit_planning`` that completes
+    it).  It never marks a task done, never blocks one, never reprioritises one.
 
     ``UNKNOWN_TEST_ID`` must never be passed here: a sentinel names no test, so it can
     own no de-flake task.  That is REFUSED, not merely documented — ε/ζ plausibly iterate
@@ -667,22 +1554,48 @@ async def open_debt(
     (``datetime.now(UTC)``) — a naive ``now`` is coerced rather than rejected, to honour
     the never-raises invariant, but it also logs a loud warning, because here (unlike
     :func:`_normalize_observed_at`'s wire-supplied ``observed_at``) a missing offset is
-    a caller bug, not untrusted input.
+    a caller bug, not untrusted input.  It is ONE instant for the whole call: a
+    lazily-closed cycle's ``resolved_at`` and the re-entered ``opened_at`` are the same
+    observation.
     """
-    try:
-        if test_id == UNKNOWN_TEST_ID:
-            logger.warning(
-                'flake_ledger: refusing to open debt for the %s sentinel — it names no '
-                'test, so it can own no de-flake task',
-                UNKNOWN_TEST_ID,
-            )
-            return None
+    if test_id == UNKNOWN_TEST_ID:
+        logger.warning(
+            'flake_ledger: refusing to open debt for the %s sentinel — it names no '
+            'test, so it can own no de-flake task',
+            UNKNOWN_TEST_ID,
+        )
+        return None
 
-        stamp = _canonicalize_utc(now or datetime.now(UTC), origin='open_debt')
+    # Resolved ahead of the lazy close, which needs the same instant, so it gets its own
+    # guard: B12 holds for a `now` that is not a datetime at all.
+    try:
+        observed = _aware(now or datetime.now(UTC), origin='open_debt')
+        stamp = _canonicalize_utc(observed)
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to open debt for test_id=%s (project_id=%s) — now=%r '
+            'is not a usable observation instant',
+            test_id,
+            project_id,
+            now,
+            exc_info=True,
+        )
+        return None
+
+    owner_read: _OwnerRead | None = None
+    if task_client is not None:
+        # Outside the upsert's guard, and safe there: the close never raises and its
+        # read is bounded, so a failed or slow resolution costs only the resolution.
+        _closed, owner_read = await _resolve(
+            db_path, project_id, test_id,
+            task_client=task_client, now=observed, read_budget_secs=resolve_budget_secs,
+        )
+
+    try:
         conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
-            # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
+            # the PRE-UPDATE row, so all four CASE guards observe the OLD `resolved_at`
             # even though the same clause sets it to NULL — which is what lets a re-entry
             # (was resolved) and an ordinary repeat (still open) be distinguished without a
             # prior SELECT.  Verified empirically on SQLite 3.50.4: open_count=2,
@@ -695,6 +1608,13 @@ async def open_debt(
             # `prior_resolving_commit` is deliberately NOT touched — `resolve_debt` already
             # wrote it, and it must survive the re-open verbatim for η's
             # regressed_after_resolution citation.
+            #
+            # A re-entry DISCHARGES the resolved cycle's owner (`owner_task_id` -> NULL);
+            # a repeat keeps it.  Left on the re-opened row, the done owner would let a
+            # concurrent lane's `resolve_debt` — a compare-and-set on exactly that owner —
+            # close the new cycle it never worked on: a phantom cycle, open_count +2, and a
+            # duplicate L2.  With the column NULL, ζ's fresh claim (`owner_task_id IS
+            # NULL`) assigns the new cycle its own owner.
             conn.execute(
                 'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
                 ' last_occurrence_at) '
@@ -707,6 +1627,8 @@ async def open_debt(
                 '                        THEN excluded.opened_at ELSE opened_at END, '
                 '    prior_resolved_at = CASE WHEN resolved_at IS NOT NULL '
                 '                        THEN resolved_at ELSE prior_resolved_at END, '
+                '    owner_task_id     = CASE WHEN resolved_at IS NOT NULL '
+                '                        THEN NULL ELSE owner_task_id END, '
                 '    resolved_at       = NULL',
                 (test_id, project_id, stamp, stamp),
             )
@@ -719,7 +1641,9 @@ async def open_debt(
             row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
         finally:
             conn.close()
-        return _to_debt_row(row) if row is not None else None
+        if row is None:
+            return None
+        debt_row = _to_debt_row(row)
     except Exception:
         logger.warning(
             'flake_ledger: failed to open debt for test_id=%s (project_id=%s)',
@@ -729,64 +1653,239 @@ async def open_debt(
         )
         return None
 
+    if _this_call_reentered(debt_row, stamp=stamp):
+        _report_regression(debt_row, on_regressed_after_resolution)
+
+    # ENSURING THE OWNER IS OUTSIDE THE TRY ABOVE, AND THE BOUNDARY IS THE COMMIT.
+    # `None` is a contract -- it means "the ledger was unavailable, the measurement is
+    # lost" (see this function's docstring), and `record_merge_flake_suppression` logs it
+    # as exactly that.  By the time we get here the upsert has COMMITTED, so the debt row
+    # is durably on disk and that statement would be false.  `_ensure_owner_task` claims
+    # never to raise, but it drives a duck-typed `task_client` and does its own sqlite
+    # write, so "claims" is not "cannot": were it inside the try, one raise would report a
+    # successful write as a lost one, and the row would be re-opened as if fresh.
+    # A filing failure must degrade to "row WITHOUT an owner" -- which `flake_report`
+    # already renders as the §5.9 breach it is -- never to "no row at all".
+    try:
+        return await _ensure_owner_task(
+            db_path, project_id, debt_row, task_client=task_client, owner_read=owner_read
+        )
+    except Exception:
+        logger.warning(
+            'flake_ledger: opened debt for test_id=%s (project_id=%s) but enforcing the '
+            'owner invariant raised -- the debt row IS durably written and is returned '
+            'UNOWNED, which flake_report renders as the breach it is',
+            test_id,
+            project_id,
+            exc_info=True,
+        )
+        return debt_row
+
+
+async def _read_owner(
+    task_client: FlakeLedgerTaskClient, test_id: str, owner_task_id: str, *, budget_secs: float,
+) -> _OwnerRead | None:
+    """*owner_task_id*'s task, read LIVE; ``None`` when the read FAILED, which is logged
+    and is evidence of nothing.
+
+    Its own guard, like :func:`_owner_status`'s fallback read: a raising or partial
+    adapter (no ``get_task`` at all, hence ``AttributeError``) lands on the SAME path as
+    the real adapter's in-band error, so the two failure shapes cannot drift.  So does a
+    read that outlives *budget_secs* (``TimeoutError``): see :data:`_RESOLVE_BUDGET_SECS`.
+    """
+    try:
+        task, error = await asyncio.wait_for(
+            task_client.get_task(owner_task_id), timeout=budget_secs,
+        )
+    except Exception as exc:
+        task, error = None, exc
+    if error is not None:
+        logger.warning(
+            'flake_ledger: could not read owner %s of test_id=%s — the cycle stays open '
+            '(an unreadable owner is not evidence the fix landed)',
+            owner_task_id,
+            test_id,
+            exc_info=error,
+        )
+        return None
+    return _OwnerRead(owner_task_id, task)
+
+
+def _finished_task(owner: _OwnerRead, test_id: str) -> dict | None:
+    """*owner*'s task if and only if it reads back ``done``, the one status that closes
+    a cycle; ``None`` otherwise, the reason logged at the level it deserves."""
+    if owner.task is None:
+        logger.info(
+            'flake_ledger: owner %s of test_id=%s no longer exists — the cycle stays open',
+            owner.owner_task_id,
+            test_id,
+        )
+        return None
+    if owner.status != 'done':
+        logger.debug(
+            'flake_ledger: owner %s of test_id=%s is %r, not done — the cycle stays open',
+            owner.owner_task_id,
+            test_id,
+            owner.status,
+        )
+        return None
+    return owner.task
+
+
+def _resolving_commit(task: dict) -> str | None:
+    """The commit that landed *task*'s fix, from its ``metadata.done_provenance``, read
+    with the one typed metadata parser.  ``None`` when none was recorded: a task that
+    predates ``done_provenance``, or a commitless kind.
+
+    ``isinstance`` rather than ``is not None``: a blob that fails whole-model validation
+    comes back from ``parse_metadata`` UNVALIDATED, and then ``done_provenance`` is the
+    raw dict (measured).
+    """
+    metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
+    provenance = metadata.done_provenance
+    return provenance.commit if isinstance(provenance, DoneProvenance) else None
+
+
+def _stamp_resolution(
+    db_path: Path,
+    test_id: str,
+    *,
+    owner_task_id: str,
+    resolving_commit: str | None,
+    stamp: str,
+) -> bool:
+    """Close *test_id*'s open cycle for *owner_task_id* — the ONE spelling of the
+    resolution UPDATE.  ``True`` iff this call closed it.
+
+    A compare-and-set on the owner, for the reason :func:`_write_owner_task_id` is
+    conditional: the caller decided to stamp from a live read of that owner, the read
+    was an await, and another lane may have re-pointed, re-opened or closed the row
+    since.  A row the WHERE clause no longer matches was not corroborated by this call.
+    Raises on a ledger failure; the caller's B12 guard owns that.
+    """
+    conn = _open(db_path)
+    try:
+        cursor = conn.execute(
+            'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
+            'WHERE test_id = ? AND resolved_at IS NULL AND owner_task_id = ?',
+            (stamp, resolving_commit, test_id, owner_task_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
 
 async def resolve_debt(
     db_path: Path,
     project_id: str,
     test_id: str,
     *,
-    resolving_commit: str | None,
+    task_client: FlakeLedgerTaskClient,
     now: datetime | None = None,
-) -> None:
-    """Close *test_id*'s current debt cycle (PRD §8.3).  Called when the owning task
-    goes terminal.
+) -> bool:
+    """Close *test_id*'s current debt cycle if its owning de-flake task is live-done
+    (PRD §8.3).  ``True`` iff THIS call closed it.
 
-    The row is RETAINED, not deleted (§5.2) — η's recurrence trigger reads resolved
-    rows, so reaping one would silently disarm it.  Resolution's observable effect is
-    that the test leaves :func:`list_open_debt` while :func:`read_debt` still finds it.
+    CORROBORATED, NEVER TRUSTED (INV-3).  A stored ``owner_task_id`` is a snapshot, and
+    so is any status a caller could hand in.  The decision is therefore taken here, from
+    a live ``get_task`` read of the stored owner, and the stamp is a compare-and-set on
+    that owner (:func:`_stamp_resolution`).  The resolving commit comes from the same
+    read (``metadata.done_provenance.commit``), so status and commit cannot disagree and
+    no caller can supply a commit for a task this function never read.
 
-    ``prior_resolving_commit`` is written HERE, not on the next re-open: after a
-    resolution there is no "current" cycle for it to describe, and writing it now is
-    what lets step-18's re-entry carry it forward untouched for η's
-    ``regressed_after_resolution`` citation.
+    ONLY ``done`` RESOLVES.  ``prior_resolving_commit`` is what the
+    ``regressed_after_resolution`` L2 cites as the fix that did not hold, and a
+    cancelled de-flake task landed no fix: resolving on it would manufacture a false
+    regression.  An absent or unreadable owner is evidence of nothing, so the cycle
+    stays open and ζ's owner enforcement deals with it.  A done task with no recorded
+    commit (a legacy task, a commitless kind) does resolve, with a NULL commit.
 
-    The lookup keys on ``test_id`` ALONE — §5.3: runs.db is per-project, so test_id is
-    the primary key.  *project_id* is accepted per the §8.3 signature and used only in
-    log messages; it is NOT a dropped filter.
+    ``resolved_at`` is the LEDGER's observation time (§5.4): the task store keeps no
+    timestamps, so it records when the ledger SAW the owner done.
 
-    IDEMPOTENT, and the ``resolved_at IS NULL`` guard is what makes it so: a resolution
-    closes the CURRENT cycle exactly once, and a replayed "owning task went terminal"
-    event is a no-op rather than a second, later resolution.  Last-write-wins was the
-    alternative and is WRONG here — it would walk ``resolved_at`` forward and overwrite
-    ``prior_resolving_commit`` on an already-closed row, so the values carried into the
-    next re-open (and cited verbatim in η's ``regressed_after_resolution`` L2) would
-    describe a phantom resolution that never happened.  The guard is per-CYCLE, not
-    permanent: :func:`open_debt` sets ``resolved_at`` back to NULL on re-entry, so the
-    next cycle resolves normally.
+    CALLERS.  :func:`open_debt` is the LAZY one, before its upsert, so a recurrence after
+    a landed fix re-enters the cycle instead of quietly replacing the owner.  Task θ's
+    periodic sweep is the intended EAGER one.
 
-    A zero-rowcount UPDATE — no debt for this test, or its cycle is already closed — is a
-    legitimate no-op, not an error.  ``async`` for the same forward-compat reason as
-    :func:`open_debt` — η adds the recurrence escalation inside this function.
+    COUPLING RULE (§5.9): the ledger reads task state and never writes it; the live read
+    is the only client call made here.
 
-    *now* is canonicalised through :func:`_canonicalize_utc` exactly as ``open_debt``
-    does for ``opened_at``/``last_occurrence_at``, so an injected naive or non-UTC clock
-    cannot write ``resolved_at`` in a spelling that sorts differently from the default
-    aware-UTC path.  Same loud-on-naive treatment as ``open_debt`` too: in-repo callers
-    should always pass aware-UTC, and a naive ``now`` here is a caller bug rather than
-    untrusted input, so it is coerced (never-raises) but logged.
+    The row is RETAINED (§5.2): the recurrence trigger reads resolved rows.  An absent,
+    unowned or already-closed row returns ``False`` with no live read, so a replayed
+    resolution never walks ``resolved_at`` forward or overwrites
+    ``prior_resolving_commit``; :func:`open_debt` sets ``resolved_at`` back to NULL on
+    re-entry, so each cycle resolves once.
+
+    ONE connection when nothing is stamped, TWO when it stamps: the row read and the
+    stamp straddle a network await, so they cannot share a transaction, and the
+    compare-and-set is what makes the split safe.
+
+    Keyed on ``test_id`` alone (§5.3); *project_id* is used only in log messages.  *now*
+    goes through :func:`_canonicalize_utc` with the same loud-on-naive treatment as
+    ``open_debt``.  The live read is bounded by :data:`_RESOLVE_BUDGET_SECS`, and one
+    that outlives it is a failed read.  Never raises (B12): a failure logs with
+    ``exc_info`` and returns ``False``.
     """
+    closed, _owner_read = await _resolve(
+        db_path, project_id, test_id,
+        task_client=task_client, now=now, read_budget_secs=_RESOLVE_BUDGET_SECS,
+    )
+    return closed
+
+
+async def _resolve(
+    db_path: Path,
+    project_id: str,
+    test_id: str,
+    *,
+    task_client: FlakeLedgerTaskClient,
+    now: datetime | None,
+    read_budget_secs: float,
+) -> tuple[bool, _OwnerRead | None]:
+    """:func:`resolve_debt`'s body: whether this call closed the cycle, and the live
+    owner read it made when one SUCCEEDED, so :func:`open_debt` acts on that read rather
+    than repeating it.  The read's bound is the caller's: :func:`open_debt` passes its
+    own ``resolve_budget_secs``."""
     try:
         stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
-        conn = _open(db_path)
-        try:
-            conn.execute(
-                'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
-                'WHERE test_id = ? AND resolved_at IS NULL',
-                (stamp, resolving_commit, test_id),
+        row = read_debt(db_path, test_id)
+        if row is None or row.resolved_at is not None:
+            return False, None
+        owner_task_id = row.owner_task_id
+        if not owner_task_id:
+            logger.info(
+                'flake_ledger: debt for test_id=%s has no owner, so no finished task can '
+                'close it',
+                test_id,
             )
-            conn.commit()
-        finally:
-            conn.close()
+            return False, None
+        owner = await _read_owner(
+            task_client, test_id, owner_task_id, budget_secs=read_budget_secs,
+        )
+        task = None if owner is None else _finished_task(owner, test_id)
+        if task is None:
+            return False, owner
+        commit = _resolving_commit(task)
+        if not _stamp_resolution(
+            db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
+        ):
+            logger.info(
+                'flake_ledger: did not resolve debt for test_id=%s — the row changed while '
+                'owner %s was being read (re-pointed, re-opened or already closed)',
+                test_id,
+                owner_task_id,
+            )
+            return False, owner
+        logger.info(
+            'flake_ledger: resolved debt for test_id=%s (project_id=%s): owner %s is done, '
+            'resolving commit %s',
+            test_id,
+            project_id,
+            owner_task_id,
+            commit or '(none recorded)',
+        )
+        return True, owner
     except Exception:
         logger.warning(
             'flake_ledger: failed to resolve debt for test_id=%s (project_id=%s)',
@@ -794,7 +1893,7 @@ async def resolve_debt(
             project_id,
             exc_info=True,
         )
-        return None
+        return False, None
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:

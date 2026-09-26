@@ -15,15 +15,15 @@ that must agree byte-for-byte with the real one and cannot be kept in agreement.
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'repair_recon_citation.py'
 
@@ -33,22 +33,7 @@ DANGLING = 'beacf7fc-b76a-4c0b-876d-f4cf6d906d42'
 SUCCESSOR = '746b4ab9-ca3c-418b-982a-32b85bfcf94b'
 
 
-def _load_module() -> types.ModuleType:
-    mod_name = 'repair_recon_citation'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='repair_recon_citation')
 
 
 def _parse(*argv: str):
@@ -91,6 +76,34 @@ class TestBuildParser:
 
     def test_replacement_defaults_to_none_for_drop_only_mode(self):
         assert _parse(*_REQUIRED).replacement_memory_id is None
+
+    def test_reason_defaults_to_the_dangling_class(self):
+        """The default must stay the class this script shipped with (task 5552).
+
+        ``memory_not_found`` is the corroboration an operator gets without
+        saying anything; ``wrong_memory`` removes a citation that still
+        resolves, so it has to be asked for explicitly.
+        """
+        assert _parse(*_REQUIRED).reason == 'memory_not_found'
+
+    def test_reason_accepts_the_wrong_memory_class(self):
+        assert _parse(*_REQUIRED, '--reason', 'wrong_memory').reason == 'wrong_memory'
+
+    def test_reason_outside_the_enum_is_rejected_by_argparse(self):
+        """Closed at the CLI boundary, mirroring ``--store``'s ``choices``.
+
+        The repair also refuses an unknown reason with ``invalid_reason``, but
+        an operator typo should not need a journal open to be told.
+        """
+        with pytest.raises(SystemExit):
+            _parse(*_REQUIRED, '--reason', 'detach')
+
+    def test_justification_defaults_to_none(self):
+        assert _parse(*_REQUIRED).justification is None
+
+    def test_justification_round_trips_the_supplied_prose(self):
+        prose = 'mis-cites task 168 rolling summary; claim confirmed via get_task(182)'
+        assert _parse(*_REQUIRED, '--justification', prose).justification == prose
 
 
 # ===========================================================================
@@ -145,6 +158,29 @@ class TestRunDelegates:
         await _mod.run(_parse(*_REQUIRED), journal=None, memory=None)
         assert 'repair_recon_citation' in spy.await_args.kwargs['repaired_by']
 
+    @pytest.mark.asyncio
+    async def test_forwards_the_defect_class_and_its_justification(self, spy):
+        """Both reach the repair as kwargs; the script gates neither (task 5552)."""
+        prose = 'cites the pre-consolidation summary, not the decision it claims'
+        args = _parse(*_REQUIRED, '--reason', 'wrong_memory', '--justification', prose)
+
+        await _mod.run(args, journal=None, memory=None)
+
+        assert spy.await_args.kwargs['reason'] == 'wrong_memory'
+        assert spy.await_args.kwargs['justification'] == prose
+
+    @pytest.mark.asyncio
+    async def test_omitted_reason_and_justification_forward_their_defaults(self, spy):
+        """Forwarded EXPLICITLY, not left to the function's own defaults.
+
+        A script that omitted the kwargs would still repair today, and would
+        silently stop tracking the enum the day either default changed.
+        """
+        await _mod.run(_parse(*_REQUIRED), journal=None, memory=None)
+
+        assert spy.await_args.kwargs['reason'] == 'memory_not_found'
+        assert spy.await_args.kwargs['justification'] is None
+
 
 # ===========================================================================
 # Exit-code mapping
@@ -161,6 +197,19 @@ class TestExitCode:
     def test_any_error_exits_one(self):
         assert _mod.exit_code_for({'error': 'citation_not_dangling'}) == 1
         assert _mod.exit_code_for({'error': 'run_still_live'}) == 1
+
+    def test_the_reason_scoped_refusals_exit_one(self):
+        """The task-5552 refusals need no mapping entry — but they are pinned.
+
+        ``exit_code_for`` allowlists the two SUCCESS statuses rather than
+        enumerating errors, so a new refusal exits 1 for free. That is the
+        property worth pinning: it is what keeps the script from having to be
+        edited every time the repair grows a gate.
+        """
+        assert _mod.exit_code_for({'error': 'citation_not_resolving'}) == 1
+        assert _mod.exit_code_for({'error': 'justification_required'}) == 1
+        assert _mod.exit_code_for({'error': 'invalid_reason'}) == 1
+        assert _mod.exit_code_for({'error': 'replacement_is_victim'}) == 1
 
     def test_a_run_status_is_never_read_as_an_outcome_status(self):
         """The real ``run_still_live`` shape, with its own status key present.
@@ -205,6 +254,54 @@ class TestExitCode:
 # ===========================================================================
 
 
+@pytest.fixture
+def wiring(monkeypatch):
+    """Stand in for the three live constructions ``main()`` makes.
+
+    ``_run_live`` imports each one INSIDE the function, so patching the
+    defining module is what the call actually resolves through.
+
+    Module-scoped rather than a ``TestMain`` method so ``TestMainStartupFailures``
+    can share this ONE definition: a copy in each class would have to be kept in
+    lockstep with the script's construction order, and subclassing TestMain to
+    inherit it would re-run every one of its tests under a second name.
+    """
+    seen: dict[str, Any] = {'closed': []}
+
+    class FakeJournal:
+        def __init__(self, data_dir):
+            seen['data_dir'] = data_dir
+            seen['journal'] = self
+
+        async def initialize(self):
+            seen['journal_initialized'] = True
+
+        async def close(self):
+            seen['closed'].append('journal')
+
+    class FakeMemory:
+        def __init__(self, config):
+            seen['memory_config'] = config
+
+        async def initialize(self):
+            seen['memory_initialized'] = True
+
+        async def close(self):
+            seen['closed'].append('memory')
+
+    class FakeConfig:
+        reconciliation = SimpleNamespace(data_dir='/configured/recon')
+
+    monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', FakeConfig)
+    monkeypatch.setattr(
+        'fused_memory.reconciliation.journal.ReconciliationJournal', FakeJournal
+    )
+    monkeypatch.setattr(
+        'fused_memory.services.memory_service.MemoryService', FakeMemory
+    )
+    return seen
+
+
 class TestMain:
     """What ``main()`` actually constructs, and what it closes.
 
@@ -212,50 +309,6 @@ class TestMain:
     ``finally`` teardown live ONLY here — asserting that argparse stores the
     string it was handed exercises no project code at all.
     """
-
-    @pytest.fixture
-    def wiring(self, monkeypatch):
-        """Stand in for the three live constructions ``main()`` makes.
-
-        ``_run_live`` imports each one INSIDE the function, so patching the
-        defining module is what the call actually resolves through.
-        """
-        seen: dict[str, Any] = {'closed': []}
-
-        class FakeJournal:
-            def __init__(self, data_dir):
-                seen['data_dir'] = data_dir
-                seen['journal'] = self
-
-            async def initialize(self):
-                seen['journal_initialized'] = True
-
-            async def close(self):
-                seen['closed'].append('journal')
-
-        class FakeMemory:
-            def __init__(self, config):
-                seen['memory_config'] = config
-
-            async def initialize(self):
-                seen['memory_initialized'] = True
-
-            async def close(self):
-                seen['closed'].append('memory')
-
-        class FakeConfig:
-            reconciliation = SimpleNamespace(data_dir='/configured/recon')
-
-        monkeypatch.setattr(
-            'fused_memory.config.schema.FusedMemoryConfig', FakeConfig
-        )
-        monkeypatch.setattr(
-            'fused_memory.reconciliation.journal.ReconciliationJournal', FakeJournal
-        )
-        monkeypatch.setattr(
-            'fused_memory.services.memory_service.MemoryService', FakeMemory
-        )
-        return seen
 
     @staticmethod
     def _patch_repair(monkeypatch, **kwargs) -> AsyncMock:
@@ -314,3 +367,171 @@ class TestMain:
             _mod.main()
 
         assert wiring['closed'] == ['memory', 'journal']
+
+
+class TestMainStartupFailures:
+    """A backend that fails to CONNECT yields structured JSON and a closed
+    journal — not a bare traceback and a leaked handle.
+
+    ``journal.initialize()`` ran before ``MemoryService`` was even constructed,
+    so a Qdrant/OpenAI connect failure (the common case) left the SQLite handle
+    open with nothing to close it, and the operator got a traceback instead of
+    the JSON the module docstring promises under INV-2.
+
+    Scoped to STARTUP on purpose: an exception out of ``run()`` still
+    propagates — see ``TestMain::test_journal_is_closed_even_when_the_repair_raises``,
+    which is the regression guard that this restructure did not start swallowing
+    real errors from the repair itself.
+    """
+
+    def test_memory_initialize_failure_closes_the_journal_and_reports_json(
+        self, monkeypatch, wiring, capsys
+    ):
+        class ExplodingMemory:
+            def __init__(self, config):
+                wiring['memory_config'] = config
+
+            async def initialize(self):
+                raise RuntimeError('qdrant connect refused')
+
+            async def close(self):  # pragma: no cover - must never be reached
+                wiring['closed'].append('memory')
+
+        # A later setattr wins over the fixture's.
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', ExplodingMemory
+        )
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 1  # and does NOT raise
+
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome['error'] == 'startup_failed'
+        assert outcome['error_type'] == 'ReconCitationStartupFailed'
+        assert outcome['component'] == 'memory_service'
+        assert outcome['exception_type'] == 'RuntimeError'
+        assert 'qdrant connect refused' in outcome['exception_message']
+        assert outcome['hint']
+
+        # The leak the finding names: the already-initialized journal WAS
+        # closed. ``memory`` is absent because it never finished initializing —
+        # a half-constructed backend is what close() would have to guess about.
+        assert wiring['closed'] == ['journal']
+
+    def test_journal_initialize_failure_reports_json_and_never_constructs_the_memory_service(
+        self, monkeypatch, wiring, capsys
+    ):
+        """``initialize()`` opens the connection BEFORE it applies pragmas, runs
+        the schema script and the migrations, so a failure part-way through
+        leaves a live handle that only this except can close."""
+        class ExplodingJournal:
+            def __init__(self, data_dir):
+                wiring['data_dir'] = data_dir
+
+            async def initialize(self):
+                raise OSError('unable to open database file')
+
+            async def close(self):
+                wiring['closed'].append('journal')
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.journal.ReconciliationJournal',
+            ExplodingJournal,
+        )
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 1
+
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome['error'] == 'startup_failed'
+        assert outcome['component'] == 'journal'
+        assert outcome['exception_type'] == 'OSError'
+        assert 'unable to open database file' in outcome['exception_message']
+        assert wiring['closed'] == ['journal']
+        # Nothing downstream was even constructed.
+        assert 'memory_config' not in wiring
+
+    def test_a_journal_close_that_also_raises_does_not_lose_the_startup_verdict(
+        self, monkeypatch, wiring, capsys
+    ):
+        """Best-effort teardown: the second exception must not replace the first.
+
+        A DB that failed to open is exactly the one whose close is most likely
+        to fail too, and the operator needs the ORIGINAL cause — a traceback
+        from the cleanup would bury it.
+        """
+        class ExplodingJournal:
+            def __init__(self, data_dir):
+                pass
+
+            async def initialize(self):
+                raise OSError('unable to open database file')
+
+            async def close(self):
+                raise RuntimeError('close failed too')
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.journal.ReconciliationJournal',
+            ExplodingJournal,
+        )
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 1  # and does NOT raise
+
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome['component'] == 'journal'
+        assert outcome['exception_type'] == 'OSError'
+        assert 'close failed too' not in outcome['exception_message']
+
+    def test_config_failure_is_reported_as_config_not_as_journal(
+        self, monkeypatch, wiring, capsys
+    ):
+        """The component decides the HINT, which is the operator-facing half.
+
+        A malformed config.yaml or a missing required setting fails before the
+        journal exists; reporting it under ``journal`` would answer a
+        config-parse failure with "check --data-dir" and name a
+        reconciliation.db that was never opened.
+        """
+        class ExplodingConfig:
+            def __init__(self):
+                raise ValueError('1 validation error for FusedMemoryConfig')
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', ExplodingConfig
+        )
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 1
+
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome['error'] == 'startup_failed'
+        assert outcome['component'] == 'config'
+        assert outcome['exception_type'] == 'ValueError'
+        assert outcome['hint'] == _mod._STARTUP_ERROR_HINTS['config']
+        # Nothing downstream was constructed — not even the journal.
+        assert 'data_dir' not in wiring
+        assert wiring['closed'] == []
+
+    def test_startup_failure_exit_code_comes_from_the_shared_contract(
+        self, monkeypatch, wiring, capsys
+    ):
+        """The structured startup error goes through the same ``status``-keyed
+        contract as every other refusal, not a bespoke exit path."""
+        class ExplodingMemory:
+            def __init__(self, config):
+                pass
+
+            async def initialize(self):
+                raise RuntimeError('qdrant connect refused')
+
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', ExplodingMemory
+        )
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 1
+
+        outcome = json.loads(capsys.readouterr().out)
+        assert 'status' not in outcome
+        assert _mod.exit_code_for(outcome) == 1

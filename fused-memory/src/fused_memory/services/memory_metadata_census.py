@@ -29,26 +29,12 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections import deque
 from collections.abc import Callable, Iterable, Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
+
+from shared.storm_counter import StormCounter
 
 from fused_memory.memory_metadata import MetadataViolation
-
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-# Defensive import of the optional ``escalation`` workspace package, mirroring
-# ``middleware/candidate_key_escalation.py``.  When it is missing (minimal CI
-# envs, deployments that have not installed it) this module degrades to a
-# logged no-op rather than breaking the memory write path that calls it.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +129,16 @@ class UnknownKeyStormDetector:
     processes.  Because it IS process-lifetime, the per-writer state is
     swept — see :meth:`_evict_silent_writers`; without that, a long-running
     MCP server accumulates one entry per distinct writer forever.
+
+    Each writer's window IS a
+    :class:`shared.storm_counter.StormCounter` in ``fire_mode='latched'``
+    (task 4519, INV-5).  The rolling-window body this class used to hand-roll
+    — append, half-open prune, count, compare to the threshold, latch — has
+    one home, and this is one of its consumers rather than a copy of it.  The
+    per-writer KEYING stays here because it is this class's own contract, and
+    is the established one-counter-per-key shape
+    (``shared/mcp_markup_middleware.py::MarkupGuardMiddleware._record_storm``,
+    ``services/memory_service.py``'s ``_mem0_update_storm_counters``).
     """
 
     def __init__(
@@ -156,9 +152,12 @@ class UnknownKeyStormDetector:
         self._threshold = threshold
         self._window_seconds = window_seconds
         self._time_fn = time_fn
-        self._warns: dict[tuple[str, str], deque[float]] = {}
-        #: Writers already over the line, so the crossing fires exactly once.
-        self._firing: set[tuple[str, str]] = set()
+        #: One latched ``StormCounter`` per writer, built lazily on that
+        #: writer's first warn.  The latch — "fire on the crossing, re-arm
+        #: when the window drains" — lives INSIDE each counter, so evicting a
+        #: dormant writer clears it structurally rather than by remembering to
+        #: reset a parallel set (see :meth:`_evict_silent_writers`).
+        self._warns: dict[tuple[str, str], StormCounter] = {}
         #: Amortization counter for the stale-writer sweep.  Injectable for
         #: the same reason ``time_fn`` is: so the eviction contract is
         #: testable without issuing ``DEFAULT_SWEEP_EVERY`` records.
@@ -179,7 +178,20 @@ class UnknownKeyStormDetector:
 
         The latch clears once the window drains back below the threshold, so
         a writer that drifts, is fixed, and later drifts again is heard both
-        times.
+        times.  That whole policy lives in
+        :class:`shared.storm_counter.StormCounter` under
+        ``fire_mode='latched'`` (task 4519) — this method only keys the
+        counters per writer and aggregates one CALL's worth of per-key events
+        into one answer.
+
+        The call's instant is resolved ONCE from ``time_fn`` and threaded
+        through every per-key
+        :meth:`~shared.storm_counter.StormCounter.record` as its ``now=``,
+        because the body this replaced computed a single ``cutoff`` for the
+        whole call: a shared instant keeps every key in a call landing in the
+        same window.  (It is a local, not a parameter of this method — the
+        ``*name*`` emphasis in this file is reserved for real arguments, as it
+        is on :meth:`~shared.storm_counter.StormCounter.record` itself.)
         """
         new_keys = list(keys)
         if not new_keys:
@@ -187,69 +199,88 @@ class UnknownKeyStormDetector:
 
         writer = (project_id, agent_id if agent_id else UNSET_AGENT_ID)
         now = self._time_fn()
-        window = self._warns.setdefault(writer, deque())
+        counter = self._warns.get(writer)
+        if counter is None:
+            counter = StormCounter(time_provider=self._time_fn, fire_mode='latched')
+            self._warns[writer] = counter
 
+        # The counter decides per EVENT; this class's contract is one decision
+        # per CALL, and a call may carry several keys (``memory_service.py``
+        # passes every ``unknown_key`` violation from one write).  Capturing the
+        # latch state BEFORE the loop is what keeps those two granularities
+        # equivalent: within a call the count only rises, so a writer already
+        # latched on entry must stay suppressed even if the first key of the
+        # call happens to land below the threshold and re-arm the counter
+        # mid-loop.  Without this guard a latched writer whose window had
+        # drained into ``[threshold - len(keys), threshold - 2]`` would be
+        # reported again — a real change of behaviour on the live memory-write
+        # path, not a refactor.  See task 4519 / esc-4519-2: the pre-existing
+        # semantics are preserved deliberately here, and whether the latch
+        # SHOULD survive a fully drained window is a separate question filed
+        # as its own follow-up.
+        was_latched = counter.latched
+
+        # An explicit loop, never ``any(counter.record(...) for ...)``: a
+        # generator short-circuits on the first fire and would skip the
+        # remaining keys, silently under-counting a multi-key burst.
+        crossed = False
         for _ in new_keys:
-            window.append(now)
-
-        cutoff = now - self._window_seconds
-        while window and window[0] <= cutoff:
-            window.popleft()
+            summary = counter.record(
+                threshold=self._threshold,
+                window_seconds=self._window_seconds,
+                now=now,
+            )
+            crossed = crossed or summary is not None
 
         self._records_since_sweep += 1
         if self._records_since_sweep >= self._sweep_every:
             self._records_since_sweep = 0
-            self._evict_silent_writers(cutoff)
+            self._evict_silent_writers(now)
 
-        if len(window) < self._threshold:
-            # Back under the line — re-arm, so a recurrence is heard again.
-            self._firing.discard(writer)
-            return False
+        return crossed and not was_latched
 
-        if writer in self._firing:
-            return False
-        self._firing.add(writer)
-        return True
+    def _evict_silent_writers(self, now: float) -> None:
+        """Drop every writer whose entire window has aged out, as of *now*.
 
-    def _evict_silent_writers(self, cutoff: float) -> None:
-        """Drop every writer whose entire window has aged out.
-
-        Stale timestamps inside a writer's deque are pruned only when that
-        SAME writer records again, so a writer that falls silent otherwise
-        leaves its dict entry — plus a window's worth of floats — behind for
-        the life of the process.  ``agent_id`` is free-form per-task text in
-        this fleet (``claude-task-3195``, ``recon-stage-2``,
-        ``claude-interactive``, ...), so that key space is effectively
-        unbounded and the residue grows without limit in a long-lived MCP
-        server.  This sweep is what bounds it.
+        Stale events inside a writer's counter are pruned only when that SAME
+        writer records again, so a writer that falls silent otherwise leaves
+        its dict entry — plus a window's worth of state — behind for the life
+        of the process.  ``agent_id`` is free-form per-task text in this fleet
+        (``claude-task-3195``, ``recon-stage-2``, ``claude-interactive``,
+        ...), so that key space is effectively unbounded and the residue grows
+        without limit in a long-lived MCP server.  This sweep is what bounds
+        it.
 
         Amortized over ``sweep_every`` records rather than run per record:
         the sweep is O(writers) while the leak is slow, so paying it on every
         write would tax the hot path to fix a problem that only exists in
         aggregate.  Note the writer that triggered the sweep can never be
-        evicted by it — its deque was appended at ``now`` immediately above,
-        so its newest timestamp is strictly after ``cutoff``.
+        evicted by it — its counter was recorded at ``now`` immediately above,
+        so :meth:`~shared.storm_counter.StormCounter.prune` cannot report it
+        empty.
 
-        Evicting from ``_firing`` too is deliberate and matches the
-        documented re-arm semantics: a writer whose window has fully drained
-        is no longer over the line, so a later recurrence should be heard
-        again rather than suppressed by a latch nothing can clear.
+        Dropping the counter OBJECT is what now clears that writer's latch,
+        and the documented re-arm semantics are structural rather than a
+        separate ``discard`` a future edit could forget: a writer whose window
+        has fully drained is no longer over the line, so a later recurrence is
+        heard again.  ``StormCounter.prune``'s docstring carries the licence —
+        an empty window is below any threshold ``>= 1``, so a reconstructed
+        counter cannot decide differently from the one it replaced (pinned by
+        ``shared/tests/test_storm_counter.py::TestLatchedState::
+        test_a_latched_drained_counter_decides_like_a_fresh_one``).
         """
         stale = [
             writer
-            for writer, window in self._warns.items()
-            if not window or window[-1] <= cutoff
+            for writer, counter in self._warns.items()
+            if counter.prune(self._window_seconds, now=now) == 0
         ]
         for writer in stale:
             del self._warns[writer]
-            self._firing.discard(writer)
 
 
 # ---------------------------------------------------------------------------
 # The escalation filer
 # ---------------------------------------------------------------------------
-
-_QUEUE_DIRNAME: str = 'data/escalations'
 
 #: Stable PREFIX of the anchor task id, so every escalation in this series
 #: (``esc-memory-metadata-unknown-key-storm-<project>-<agent>-N``) is greppable
@@ -329,48 +360,6 @@ def file_unknown_key_storm_escalation(
     writer = agent_id if agent_id else UNSET_AGENT_ID
     anchor = writer_anchor_task_id(project_id, agent_id)
 
-    if not HAS_ESCALATION:
-        logger.debug(
-            'memory_metadata_census: escalation package unavailable; '
-            'unknown-key storm from project_id=%r agent_id=%r (%d key(s)) '
-            'will not be escalated',
-            project_id, writer, len(keys),
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: could not open the escalation queue at '
-            'project_root=%r; unknown-key storm from project_id=%r '
-            'agent_id=%r not escalated',
-            project_root, project_id, writer,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # suppressing. Failing closed here would let a broken queue read swallow
-    # the storm signal entirely, which is the outcome this escape exists to
-    # prevent.
-    try:
-        existing = queue.get_by_task(anchor, status='pending')
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: failed to check for an existing open '
-            'storm escalation at project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'memory_metadata_census: %s already open for this writer; '
-            'unknown-key storm from project_id=%r agent_id=%r (%d key(s)) '
-            'folded into it',
-            existing[0].id, project_id, writer, len(keys),
-        )
-        return existing[0].id
-
     key_list = ', '.join(repr(k) for k in keys)
     detail = '\n'.join([
         f'project_id={project_id!r}',
@@ -394,35 +383,25 @@ def file_unknown_key_storm_escalation(
         'fused-memory config.',
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(anchor),
-            task_id=anchor,
-            agent_role=_AGENT_ROLE,
-            severity='info',
-            category=_CATEGORY,
-            summary=(
-                f'unknown metadata-key storm from project_id={project_id} '
-                f'agent_id={writer} ({len(keys)} key(s): {key_list})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'bless, x_-prefix, or fix the drifting writer'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: failed to submit the unknown-key storm '
-            'escalation for project_id=%r agent_id=%r (%d key(s))',
-            project_id, writer, len(keys),
-        )
-        return None
-
-    logger.warning(
-        'memory_metadata_census: filed %s for an unknown-key storm from '
-        'project_id=%r agent_id=%r (%d key(s): %s)',
-        esc_id, project_id, writer, len(keys), key_list,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='info',
+        summary=(
+            f'unknown metadata-key storm from project_id={project_id} '
+            f'agent_id={writer} ({len(keys)} key(s): {key_list})'
+        ),
+        detail=detail,
+        suggested_action=(
+            'bless, x_-prefix, or fix the drifting writer'
+        ),
+        logger=logger,
+        log_label='memory_metadata_census',
+        context=(
+            f'unknown-key storm from project_id={project_id!r} '
+            f'agent_id={writer!r} ({len(keys)} key(s): {key_list})'
+        ),
+        level=1,
     )
-    return esc_id

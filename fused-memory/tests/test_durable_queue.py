@@ -1775,6 +1775,304 @@ class TestTerminalHook:
             await q.close()
 
     @pytest.mark.asyncio
+    async def test_post_execute_flag_survives_a_retry_into_a_later_failed_attempt(
+        self, tmp_path
+    ):
+        """"The backend write LANDED" is an ITEM-level fact, not a per-attempt one.
+
+        POST_EXECUTE_DEAD_PREFIX's own definition, and the write journal's
+        terminal_status schema comment, both describe it as separating "safe to
+        replay" from "already landed; do not blind-replay" — a property of the
+        ITEM. It was computed from a fresh per-attempt local, so it evaporated
+        the instant an item retried.
+
+        The sequence here is ordinary, not exotic: attempt 1 executes (the
+        write LANDS), its callback raises, the item reschedules; attempt 2 dies
+        inside _execute_write and dead-letters. The operator is then told the
+        exact opposite of the truth — no prefix, i.e. "safe to replay" — and a
+        replay DUPLICATES the landed write.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W9'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W9', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'attempt 1 landed a write; the item is NOT safe to blind-replay '
+                'just because the attempt that finally killed it never reached '
+                'the backend'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_executed_fact_is_sticky_across_replay_dead(self, tmp_path):
+        """replay_dead resets the retry BUDGET, not the item's history.
+
+        "A backend write for this item landed at some point" does not stop
+        being true because an operator pressed replay — and it is precisely
+        the fact that makes a SECOND blind replay dangerous. So the flag is
+        deliberately sticky even though replay_dead does reset attempts and
+        error.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+                RuntimeError('post-replay attempt 1 never reached the backend'),
+                RuntimeError('post-replay attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W10'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert await q.replay_dead(group_id='proj1') == 1
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 2, timeout=20.0, interval=0.05)
+
+            assert len(calls) == 2
+            write_op_id, status, error = calls[1]
+            assert (write_op_id, status) == ('W10', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'a replayed item is fresh with respect to its retry budget, '
+                'not with respect to whether a write already landed'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_get_dead_items_reports_whether_the_write_already_landed(
+        self, tmp_path
+    ):
+        """The replay decision should read a boolean, not parse an error string.
+
+        get_dead_items is what the ``get_dead_letters`` MCP tool serves to
+        operators, and "did this already land?" was recoverable only by
+        string-matching POST_EXECUTE_DEAD_PREFIX against free-text error
+        prose. That is the one fact a replay decision turns on, so it gets a
+        structured field.
+
+        Two items, one per polarity: a landed write killed by its callback,
+        and a plain execute failure that never reached the backend.
+        """
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        async def _execute(operation, payload):
+            if payload.get('content') == 'landed':
+                return {'episode_uuid': 'ep-1'}
+            raise RuntimeError('never reached the backend')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='landed-grp', operation='add_episode',
+                payload={'content': 'landed', '_write_op_id': 'W11'},
+                callback_type='dual_write_episode',
+            )
+            await q.enqueue(
+                group_id='never-grp', operation='add_episode',
+                payload={'content': 'never', '_write_op_id': 'W12'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='landed-grp', expected_dead=1, timeout=20.0)
+            await _poll_until_dead(q, group_id='never-grp', expected_dead=1, timeout=20.0)
+
+            landed = (await q.get_dead_items(group_id='landed-grp'))[0]
+            never = (await q.get_dead_items(group_id='never-grp'))[0]
+
+            assert landed['executed'] is True, 'this write landed — replaying duplicates it'
+            assert never['executed'] is False, 'this write never landed — safe to replay'
+        finally:
+            await q.close()
+
+    @staticmethod
+    async def _fail_flag_writes_while_in_flight(data_dir) -> None:
+        """Make the pre-callback `executed` flag write fail, on the real DB file.
+
+        A trigger installed through a second connection, so the fault lands
+        where a SQLITE_BUSY or disk error would. It is scoped to writes made
+        while the item is still in flight, which models a transient fault that
+        has cleared by the time the attempt is settled as a retry or a
+        dead-letter.
+        """
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            await db.execute(
+                'CREATE TRIGGER fail_in_flight_executed_flag '
+                'BEFORE UPDATE OF executed ON write_queue '
+                "WHEN NEW.status = 'in_flight' "
+                "BEGIN SELECT RAISE(ABORT, 'injected: executed flag write failed'); END"
+            )
+            await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_does_not_re_execute_the_landed_write(
+        self, tmp_path, caplog
+    ):
+        """Losing the `executed` flag must never cost a retry of a landed write.
+
+        The flag write is a commit between "the backend write landed" and the
+        callback. Routed like any other failure, it would reschedule the item
+        and the retry would call execute_write AGAIN. That duplicates a landed
+        backend write, which is exactly what the flag exists to prevent, and
+        no callback failure is needed to cause it.
+        """
+        calls, hook = self._recorder()
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
+        callback = AsyncMock()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                item_id = await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'x', '_write_op_id': 'W13'},
+                    callback_type='dual_write_episode',
+                )
+                await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert calls == [('W13', 'completed', None)]
+            assert execute.await_count == 1, (
+                'the backend write landed once; a failed flag write must not '
+                'send it round again'
+            )
+            callback.assert_awaited_once()
+            warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and r.name == dq_module.__name__
+            ]
+            assert any(
+                f'Item {item_id} ' in m and 'executed' in m for m in warnings
+            ), f'the lost flag write must still be audible; got {warnings}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_is_re_recorded_when_the_attempt_fails(
+        self, tmp_path
+    ):
+        """A lost flag write must not surface later as "never landed".
+
+        Once the early flag write is best-effort, its failure leaves the row
+        saying no backend write landed. Attempt 1 lands and its callback
+        raises; attempt 2 never reaches the backend and dead-letters. If
+        nothing recorded the fact again, the dead-letter would report
+        `executed: False` with no POST_EXECUTE_DEAD_PREFIX. That tells the
+        operator a landed write is safe to replay. The commit that schedules
+        the retry has to carry the fact instead.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W14'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            dead = await q.get_dead_items(group_id='proj1')
+            assert dead[0]['executed'] is True, (
+                'attempt 1 landed a write; a failed flag write must not turn '
+                'that into a licence to replay it'
+            )
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W14', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
     async def test_callback_still_sees_journal_metadata_popped_by_execute(
         self, tmp_path
     ):
@@ -1994,5 +2292,703 @@ class TestTerminalHook:
                 return stats['counts'].get('completed', 0) >= 1
 
             await poll_until(_completed, timeout=20.0, interval=0.05)
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
+# Schema: the `executed` column (task 4116)
+#
+# POST_EXECUTE_DEAD_PREFIX is documented — in its own definition and again in
+# the write journal's terminal_status schema comment — as an ITEM-level fact:
+# "the backend write LANDED; do not blind-replay". It was computed from a
+# per-ATTEMPT local, so it evaporated the moment an item retried. Persisting it
+# on the row is what makes the item-level claim true.
+# ------------------------------------------------------------------
+
+
+# The pre-4116 DDL, copied literally so this is a real legacy fixture rather
+# than a reference to the current constant (which would make the migration test
+# vacuous the moment the constant changes).
+_LEGACY_CREATE_TABLE = """\
+CREATE TABLE IF NOT EXISTS write_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT    NOT NULL,
+    operation   TEXT    NOT NULL,
+    payload     TEXT    NOT NULL,
+    callback_type TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    next_retry_at REAL  NOT NULL DEFAULT 0,
+    created_at  REAL    NOT NULL,
+    completed_at REAL,
+    error       TEXT
+);
+"""
+
+
+class TestExecutedColumnSchema:
+    @staticmethod
+    async def _column_names(data_dir) -> tuple[str, ...]:
+        """The on-disk column order, read through a connection of our own."""
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            cursor = await db.execute('PRAGMA table_info(write_queue)')
+            return tuple(row[1] for row in await cursor.fetchall())
+
+    @pytest.mark.asyncio
+    async def test_fresh_db_has_executed_column_in_slot_order(self, tmp_path):
+        """PRAGMA column order must equal QueueItem.__slots__, exactly.
+
+        QueueItem.__init__ positionally unpacks a `SELECT *` row into its
+        slots, and NOTHING at either end references the other: the schema
+        never mentions QueueItem and QueueItem never mentions the schema. So
+        the next column added in the wrong position does not raise — every
+        field silently shifts by one, `status` reading as `callback_type` and
+        `attempts` as `status`. This assertion converts that latent
+        silent-corruption trap into a named failure.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(tmp_path / 'queue')
+            assert 'executed' in cols
+            # Both facts in one assertion: the column exists, AND the SELECT *
+            # order still lines up with the unpack.
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_is_migrated_and_still_round_trips(self, tmp_path):
+        """A pre-4116 DB gains the column in the SAME position as a fresh one.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so
+        a legacy DB needs an explicit ALTER — and ALTER can only APPEND. If the
+        fresh CREATE put `executed` anywhere but last, migrated and fresh DBs
+        would disagree on column order and one of them would corrupt every
+        QueueItem it unpacked. This pins that they agree, and that a row
+        pending at upgrade time still drains: the worker hands execute_write
+        the row's own operation and payload, and the item completes.
+        """
+        data_dir = tmp_path / 'queue'
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as legacy:
+            await legacy.execute(_LEGACY_CREATE_TABLE)
+            await legacy.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, created_at) '
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                ('legacy-grp', 'add_episode', '{"content": "pre-migration"}',
+                 None, time.time()),
+            )
+            await legacy.commit()
+
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
+        q = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(data_dir)
+            assert 'executed' in cols, 'a legacy DB must be migrated, not left behind'
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+
+            async def _completed():
+                stats = await q.get_stats(group_id='legacy-grp')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            execute.assert_awaited_once_with('add_episode', {'content': 'pre-migration'})
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_legacy_dead_row_reports_executed_as_unknown_not_false(
+        self, tmp_path
+    ):
+        """A migrated row's NULL means UNKNOWN, and must not report as False.
+
+        ``ALTER TABLE ... ADD COLUMN executed INTEGER`` backfills NULL, so
+        every row written before task 4116 carries no evidence either way.
+        Collapsing that into ``False`` asserts a negative the queue cannot
+        prove — and it is load-bearing, because get_dead_items' replay rule
+        has operators read this field IN PREFERENCE to
+        POST_EXECUTE_DEAD_PREFIX.
+
+        The failure scenario in full: a pre-4116 dead-letter whose backend
+        write LANDED and whose callback then killed it reads NULL after
+        migration. Reported as ``False``, an operator following that guidance
+        replays it and DUPLICATES the landed write — the exact corruption this
+        feature exists to prevent. The prefix is no fallback for such a row
+        either: it is applied only to the terminal-hook error (which lands in
+        ``write_ops.terminal_error``), never to ``write_queue.error``.
+        """
+        data_dir = tmp_path / 'queue'
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / 'write_queue.db'
+
+        async with aiosqlite.connect(str(db_path)) as legacy:
+            await legacy.execute(_LEGACY_CREATE_TABLE)
+            await legacy.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, '
+                ' attempts, created_at, error) '
+                "VALUES (?, ?, ?, ?, 'dead', 5, ?, ?)",
+                ('legacy-grp', 'add_episode', '{"content": "pre-migration"}',
+                 'dual_write_episode', time.time(), 'callback keeps failing'),
+            )
+            await legacy.commit()
+
+        q = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=0,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['executed'] is None, (
+                'a row that predates the column has no evidence either way; '
+                'reporting False would license a replay of a landed write'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_records_the_never_executed_negative(self, tmp_path):
+        """A negative has to be RECORDED at insert time, not inferred.
+
+        The unknown state above is only worth anything if the queue also
+        states the negative it CAN prove. A producer that left the column
+        NULL would make an item the queue knows never touched a backend
+        indistinguishable from a legacy row of unknown history, and the honest
+        ``None`` would swallow every genuinely safe-to-replay item too.
+        ``enqueue`` is covered by TestTerminalHook's
+        test_get_dead_items_reports_whether_the_write_already_landed; this is
+        the same check for the batch producer.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=RuntimeError('never reached the backend')),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue_batch([
+                {'group_id': 'batch-grp', 'operation': 'add_episode',
+                 'payload': {'content': 'via enqueue_batch'}},
+            ])
+            await _poll_until_dead(q, group_id='batch-grp', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items(group_id='batch-grp')
+            assert dead[0]['executed'] is False, (
+                'the batch producer must record the negative, not leave it '
+                'indistinguishable from an unmigrated row'
+            )
+        finally:
+            await q.close()
+
+
+class TestDeadLetterHook:
+    """The PUSH seam (task 3583): `on_dead_letter`, fired for every dead item.
+
+    Distinct from `on_terminal` above, which exists to write a terminal outcome
+    back onto a `write_ops` row and therefore correctly skips an item with no
+    `_write_op_id` to join on, and fires on 'completed' too. This hook is an
+    operator ALARM: it fires only on 'dead', and it fires whether or not a join
+    key exists.
+    """
+
+    @staticmethod
+    def _recorder():
+        events: list = []
+
+        async def hook(event):
+            events.append(event)
+
+        return events, hook
+
+    @staticmethod
+    def _queue(
+        tmp_path, *, hook, execute_write, max_attempts=1,
+        retry_base_seconds=0.05, **kwargs,
+    ):
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            write_timeout_seconds=2.0,
+            on_dead_letter=hook,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_the_hook_once_with_a_structured_event(
+        self, tmp_path
+    ):
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'never lands', '_write_op_id': 'W1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1, f'exactly one alarm per death, got {events}'
+            event = events[0]
+            assert isinstance(event, dq_module.DeadLetterEvent)
+            assert isinstance(event.item_id, int) and event.item_id > 0
+            assert event.group_id == 'proj1'
+            assert event.operation == 'add_episode'
+            # The COMMITTED attempt count, matching the row and the WARN line —
+            # not the pre-increment value the claimed item carried.
+            assert event.attempts == 1
+            assert event.error is not None
+            assert event.error.startswith('RuntimeError: boom'), event.error
+            assert event.write_op_id == 'W1'
+            assert event.payload == {'content': 'never lands', '_write_op_id': 'W1'}
+            # _execute_write itself failed, so the backend write did NOT land:
+            # this one is safe to replay, and the alarm must say so structurally.
+            assert event.post_execute is False
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_rescheduled_retry_does_not_fire_the_hook(self, tmp_path):
+        """Only permanent abandonment is worth paging on.
+
+        A retry is the queue working as designed; firing here would page once
+        per attempt for every write that eventually lands.
+        """
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            max_attempts=3,
+            # Long enough that the item sits visibly in 'retry' while we
+            # assert, instead of racing exhaustion at the 0.05s default.
+            retry_base_seconds=10.0,
+            retry_max_delay_seconds=30.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'fails once', '_write_op_id': 'W2'},
+            )
+
+            async def _in_retry():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('retry', 0) >= 1
+
+            await poll_until(_in_retry, timeout=20.0, interval=0.05)
+            assert events == [], f'a retry is not a death, got {events}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_completion_does_not_fire_the_hook(self, tmp_path):
+        """Unlike on_terminal, which fires on 'completed' as well."""
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            max_attempts=3,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'lands fine', '_write_op_id': 'W3'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert events == []
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_the_alarm_is_not_gated_on_a_write_op_id(self, tmp_path):
+        """The hole task 3582 left, and the one point the two hooks diverge.
+
+        `_notify_terminal` skips a payload with no `_write_op_id` — correctly,
+        since there is genuinely nothing to join the outcome back to, and its
+        docstring names `replay_from_store` and `mem0_classify_and_add` as the
+        operations that shape. But that gate silently exempts every
+        `mem0_classify_and_add` (one per extracted fact per episode) from the
+        alarm, whose death today reaches nothing but a log line. An operator
+        alarm needs no join key.
+        """
+        events, hook = self._recorder()
+        terminal_calls: list = []
+
+        async def terminal_hook(write_op_id, status, error):
+            terminal_calls.append((write_op_id, status, error))
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            on_terminal=terminal_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='mem0_proj1', operation='mem0_classify_and_add',
+                payload={'fact_text': 'no join key here', 'project_id': 'proj1'},
+            )
+            await _poll_until_dead(
+                q, group_id='mem0_proj1', expected_dead=1, timeout=20.0
+            )
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            assert events[0].write_op_id is None
+            assert events[0].operation == 'mem0_classify_and_add'
+            assert events[0].group_id == 'mem0_proj1'
+            assert terminal_calls == [], (
+                'on_terminal still has nothing to join back to and must stay '
+                'gated; only the alarm fires'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_post_execute_death_is_flagged_structurally(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        The callback runs after `_execute_write` has already returned, so a
+        callback that keeps failing dead-letters an item whose write DID land.
+        That flag is what tells a triager a blind replay would DUPLICATE it, so
+        it must reach the alarm as a boolean rather than as a prefix the
+        consumer has to notice and parse.
+        """
+        events, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'the write landed', '_write_op_id': 'W4'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            event = events[0]
+            assert event.post_execute is True
+            assert event.error is not None
+            assert event.error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in event.error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_is_swallowed_and_logged(self, tmp_path, caplog):
+        """The queue's correctness must never depend on the alarm succeeding.
+
+        The item is already committed dead by the time this runs; a raise here
+        would escape `_process_item` into `_worker_loop` and kill the worker,
+        so one failed alarm would stop the group draining entirely.
+        """
+        seen: list[int] = []
+
+        async def exploding_hook(event):
+            seen.append(event.item_id)
+            raise RuntimeError('the escalation queue is on fire')
+
+        q = self._queue(
+            tmp_path,
+            hook=exploding_hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        db_path = tmp_path / 'queue' / 'write_queue.db'
+        await q.initialize()
+        try:
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                first = await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'a', '_write_op_id': 'W5'},
+                )
+                await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'b', '_write_op_id': 'W6'},
+                )
+                # The worker keeps draining despite the hook raising on item 1.
+                await _poll_until_dead(
+                    q, group_id='proj1', expected_dead=2, timeout=20.0
+                )
+                await poll_until(
+                    lambda: len(seen) >= 2, timeout=20.0, interval=0.05
+                )
+
+            assert f'{first}' in caplog.text, caplog.text
+            assert 'add_episode' in caplog.text, caplog.text
+        finally:
+            await q.close()
+
+        async with aiosqlite.connect(str(db_path)) as raw_db:
+            raw_db.row_factory = aiosqlite.Row
+            cursor = await raw_db.execute(
+                'SELECT status FROM write_queue ORDER BY id'
+            )
+            rows = await cursor.fetchall()
+        assert [r['status'] for r in rows] == ['dead', 'dead'], (
+            'a failing alarm must not disturb the committed terminal state'
+        )
+
+
+class TestDeadByOperation:
+    """`get_stats()['dead_by_operation']` — the PULL surface for option (b).
+
+    The `durable_write_dead_letter` escalation is the PUSH alarm; this counter
+    is its health-probe confirmation, not a substitute for it. `counts['dead']`
+    alone is aggregate: it says writes were permanently abandoned but not WHICH
+    operation is dying, so an operator cannot separate a NodeNotFoundError
+    storm on `add_episode` from an unrelated failure of `add_memory_graphiti`.
+
+    Both probes the task names — `MemoryService.get_status` and the
+    `get_queue_stats` MCP tool — assign this dict straight through, so the
+    attribution reaches both of them from here.
+    """
+
+    @staticmethod
+    def _failing_queue(tmp_path):
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_attributes_deaths_to_the_operation(self, tmp_path):
+        """Each dead row is counted under its own operation name."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'ep{i}', 'group_id': 'proj_a', 'name': f'ep{i}'},
+                )
+            await q.enqueue(
+                group_id='proj_a', operation='add_memory_graphiti',
+                payload={'content': 'mem', 'group_id': 'proj_a'},
+            )
+            await _poll_until_dead(q, expected_dead=3)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {
+                'add_episode': 2,
+                'add_memory_graphiti': 1,
+            }, (
+                'dead_by_operation must attribute each death to its operation; '
+                f'got {stats.get("dead_by_operation")!r}'
+            )
+            # The aggregate stays the sum, so the two surfaces cannot disagree.
+            assert stats['counts'].get('dead', 0) == sum(
+                stats['dead_by_operation'].values()
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_counts_only_dead_rows(self, tmp_path):
+        """An operation that COMPLETED must not appear — this counts deaths,
+        not traffic. A probe reading it as throughput would page on success."""
+        async def fail_the_marked(op, payload):
+            if payload.get('fail'):
+                raise RuntimeError('nope')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=fail_the_marked,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'good', 'group_id': 'proj_a', 'name': 'good'},
+            )
+            await q.enqueue(
+                group_id='proj_a', operation='add_memory_graphiti',
+                payload={'content': 'bad', 'group_id': 'proj_a', 'fail': True},
+            )
+            await _poll_until_dead(q, expected_dead=1)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {'add_memory_graphiti': 1}, (
+                'only status=dead rows may be counted; the completed '
+                f'add_episode must be absent. Got {stats.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_is_empty_mapping_never_absent(self, tmp_path):
+        """With no deaths the key is present and `{}` — never missing.
+
+        A probe must never have to distinguish "no deaths" from "an older
+        server that does not report this", which is exactly the ambiguity that
+        let 28 permanently-failed writes read as healthy.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            stats = await q.get_stats()
+            assert 'dead_by_operation' in stats, (
+                f'key must always be present; got keys {sorted(stats)}'
+            )
+            assert stats['dead_by_operation'] == {}
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_scoped_by_group_id(self, tmp_path):
+        """`group_id=` scopes the breakdown, matching how `counts` and
+        `oldest_pending_age_seconds` are already scoped — otherwise a
+        per-project probe would report another project's deaths."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'},
+            )
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_b', operation='add_memory_graphiti',
+                    payload={'content': f'b{i}', 'group_id': 'proj_b'},
+                )
+            await _poll_until_dead(q, expected_dead=3)
+
+            stats_a = await q.get_stats(group_id='proj_a')
+            stats_b = await q.get_stats(group_id='proj_b')
+            stats_c = await q.get_stats(group_id='proj_c')
+
+            assert stats_a['dead_by_operation'] == {'add_episode': 1}
+            assert stats_b['dead_by_operation'] == {'add_memory_graphiti': 2}
+            assert stats_c['dead_by_operation'] == {}, (
+                'a project with no rows at all reports an empty mapping, not '
+                f'the global breakdown. Got {stats_c.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_projects_mem0_deaths_sit_in_its_mem0_group(self, tmp_path):
+        """A project occupies TWO groups, and a scoped probe sees only one.
+
+        `_dual_write_callback` enqueues each derived fact as
+        `mem0_classify_and_add` in group `mem0_{project_id}`, while the
+        project's Graphiti writes use a group_id that IS the project_id. So
+        the scoped call an operator reaches for after a
+        `durable_write_dead_letter` alarm confirms a dead `add_episode` but
+        reports nothing for a dead `mem0_classify_and_add` in that same
+        project — the push alarm fires per item whatever group it sat in.
+
+        Pinned rather than merely documented because the gap is silent: `{}`
+        reads as "no deaths", not as "not in this group". Unioning the two
+        groups is deliberately NOT the remedy — `counts` and the
+        oldest-pending age have always meant one group, and a breakdown that
+        outgrew `counts['dead']` would break their promised consistency.
+        """
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'},
+            )
+            await q.enqueue(
+                group_id='mem0_proj_a', operation='mem0_classify_and_add',
+                payload={'fact_text': 'a derived fact', 'project_id': 'proj_a'},
+            )
+            await _poll_until_dead(q, expected_dead=2)
+
+            scoped = await q.get_stats(group_id='proj_a')
+            mem0_scoped = await q.get_stats(group_id='mem0_proj_a')
+            unscoped = await q.get_stats()
+
+            assert scoped['dead_by_operation'] == {'add_episode': 1}, (
+                "the project-scoped probe covers the project's Graphiti group "
+                f'only. Got {scoped.get("dead_by_operation")!r}'
+            )
+            assert mem0_scoped['dead_by_operation'] == {
+                'mem0_classify_and_add': 1,
+            }, mem0_scoped.get('dead_by_operation')
+            assert unscoped['dead_by_operation'] == {
+                'add_episode': 1,
+                'mem0_classify_and_add': 1,
+            }, 'the unscoped call is the one that sees both groups'
+            # The invariant the docstring promises, per scope.
+            for stats in (scoped, mem0_scoped, unscoped):
+                assert stats['counts'].get('dead', 0) == sum(
+                    stats['dead_by_operation'].values()
+                )
         finally:
             await q.close()

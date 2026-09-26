@@ -1081,6 +1081,475 @@ class TestPollUntilStable:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the shared retry_until_observed() observation barrier (task 4972)
+# ---------------------------------------------------------------------------
+# The third member of the barrier family, and the reason it exists: poll_until
+# and poll_until_stable both assume the condition, once it arrives, stays
+# observable long enough for a client read to catch it. A racy TRANSIENT breaks
+# that assumption -- it can close before any client read lands, and then no
+# interval and no deadline on a single attempt can help, because there is
+# nothing left to observe. The only lever that acts on an absent window is to
+# RE-OPEN it and look again.
+#
+# The motivating call site is
+# tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow, whose
+# post-DROP rebuild window measured only 28/30 first-attempt observations under
+# the offline lane's own `nice -n 19 ionice -c3` scheduling: on a miss FalkorDB
+# had finished the rebuild INSIDE the DROP round-trip, so the very first
+# post-DROP read (6.8 ms after DROP returned) already showed one settled
+# OPERATIONAL row.
+#
+# Every assertion below is on CALL COUNTS and CALL ORDER against a shared
+# append-only log -- never on wall clock -- so this suite is load-independent
+# and cannot itself become the next flake, the same discipline TestPollUntil
+# and TestPollUntilStable above already keep.
+
+class TestRetryUntilObserved:
+    """Unit tests for retry_until_observed(observe, *, reopen, attempts, message)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_observation_on_the_first_attempt_returns_verbatim_and_never_reopens(self):
+        """A first-attempt observation returns the value verbatim, at zero reopen cost.
+
+        The no-miss path costing nothing is what makes this barrier safe to
+        adopt in a fixture-backed live test: when the window IS open (the
+        measured 28/30 case) the helper is indistinguishable from the single
+        un-retried observation it replaces.
+
+        Returning the observed value verbatim rather than coerced to True
+        mirrors poll_until's documented return contract, so all three
+        primitives in the family chain the same way.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_observation_on_the_first_attempt_is_awaited(self):
+        """A coroutine-function `observe` is awaited, matching poll_until's isawaitable contract.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is always truthy, so a helper that failed to await would still
+        "succeed" on the first attempt -- but it would return the coroutine
+        rather than the payload, and the log would stay empty because the
+        coroutine body never ran.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        async def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_two_misses_then_an_observation_reopens_exactly_between_attempts(self):
+        """THE BEHAVIOUR THIS BARRIER EXISTS FOR: a missed window is RE-OPENED and observed again.
+
+        `observe` misses on attempts 1 and 2, then observes on attempt 3. The
+        ORDER assertion is the load-bearing one and is what call counts alone
+        cannot express:
+
+        * `reopen` is never called BEFORE the first attempt -- the caller has
+          already opened the window once, and re-opening first would silently
+          discard that opening and double the cost of the common case;
+        * `reopen` is called exactly ONCE BETWEEN attempts -- an extra
+          re-opening would leave the graph in a state the caller did not ask
+          for, and a missing one would re-observe a window that already closed.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected reopen to fire exactly once BETWEEN attempts and never '
+            f'before the first one, got {log!r}'
+        )
+        assert log.count('observe') == 3, f'expected exactly 3 observations, got {log!r}'
+        assert log.count('reopen') == 2, f'expected exactly 2 reopens, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_reopen_is_awaited_between_attempts(self):
+        """A coroutine-function `reopen` is awaited, matching the sync/async symmetry of `observe`.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is silently discarded, so a helper that failed to await would
+        still produce the right CALL ORDER while never actually re-opening the
+        window -- the log entry proves the coroutine BODY ran, not merely that
+        the callable was invoked.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        async def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        async def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected the awaited reopen to fire exactly once between attempts, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausting_every_attempt_raises_after_spending_the_whole_budget(self):
+        """An always-missing `observe` raises AssertionError, having spent its whole budget.
+
+        This is what preserves the motivating live test's PRIMARY durable job:
+        fail loudly if FalkorDB ever stops opening the rebuild window at all.
+        Returning None on exhaustion would let that failure be read as an
+        ordinary miss and silently swallowed by the caller, leaving every
+        post-drop barrier task 4748 added as undetected dead weight.
+
+        AssertionError, not a bespoke type, matches the family convention --
+        poll_until and poll_until_stable both raise AssertionError on timeout.
+
+        The call-count assertions prove the helper spent its budget rather
+        than giving up early, and that it did not re-arm a window nobody
+        would read: exactly `attempts` observations and exactly
+        `attempts - 1` reopens.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert log.count('observe') == 5, f'expected exactly 5 observations, got {log!r}'
+        assert log.count('reopen') == 4, f'expected exactly 4 reopens, got {log!r}'
+        assert log[-1] == 'observe', (
+            f'expected the final act to be an observation, not a reopen nobody reads: {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_message_names_the_attempt_count(self):
+        """The raised message names how many attempts were made.
+
+        Without the count an operator cannot tell a one-shot miss from a
+        budget genuinely spent, which is the whole distinction that makes
+        exhaustion evidence the transient is GONE rather than hard to catch.
+        """
+        from _fm_helpers import retry_until_observed
+
+        # match=r'in 7 attempt\(s\)', not a bare '7': a lone digit matches
+        # anywhere in the message -- a timeout value, a count of something
+        # else, a future prefix -- so it would pass on a message that had
+        # stopped naming the ATTEMPT COUNT, which is the only thing this test
+        # exists to pin.
+        with pytest.raises(AssertionError, match=r'in 7 attempt\(s\)'):
+            await retry_until_observed(lambda: None, attempts=7)
+
+    @pytest.mark.asyncio
+    async def test_caller_message_survives_verbatim_into_the_exhaustion_error(self):
+        """A caller-supplied `message` appears verbatim in the raised AssertionError.
+
+        Matches poll_until's caller-message contract, and matters here for a
+        concrete reason: the live call site's message is the "see this class
+        docstring before deleting these barriers" guidance, and it must
+        survive into the failure an operator actually reads.
+        """
+        from _fm_helpers import retry_until_observed
+
+        with pytest.raises(AssertionError, match='see this class docstring before deleting'):
+            await retry_until_observed(
+                lambda: None,
+                attempts=2,
+                message='see this class docstring before deleting them',
+            )
+
+    @pytest.mark.asyncio
+    async def test_reopen_none_is_a_supported_no_op_re_arm(self):
+        """`reopen=None` still makes exactly `attempts` observations and still raises.
+
+        Supports a transient that re-arms ITSELF (an external producer, a
+        periodic emitter): there is nothing for the caller to do between
+        attempts, but the budget and the loud exhaustion must be identical.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'observe', 'observe'], (
+            f'expected exactly 3 observations with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_miss_path_always_yields_and_never_sleeps_after_the_final_miss(self, monkeypatch):
+        """`delay` defaults to 0.0, but the miss path still AWAITS it -- so the loop always yields.
+
+        Without this, a synchronous `observe` with `reopen=None` burns the
+        whole attempt budget inside one event-loop tick: no wall-clock time
+        passes and no other coroutine runs between attempts, so a barrier
+        that gates nothing wears a plausible-looking exhaustion message. That
+        directly contradicts the documented `reopen=None` use case -- a
+        transient that re-arms ITSELF (an external producer, a periodic
+        emitter) -- since nothing can possibly re-arm it in zero time.
+
+        `await asyncio.sleep(0)` is the cheapest thing that fixes it: it costs
+        one event-loop tick and hands control back, which is exactly what a
+        self-re-arming producer needs to make progress.
+
+        The sleep is inside the between-attempts guard, alongside `reopen`,
+        for the same reason: sleeping after the FINAL miss is pure latency
+        paid on the failure path for an attempt nobody will make.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'sleep:0.0', 'observe', 'sleep:0.0', 'observe'], (
+            f'expected a yield between every pair of attempts and none after the last, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_delay_is_slept_between_attempts_after_reopen(self, monkeypatch):
+        """An explicit `delay` is slept AFTER `reopen` and BEFORE the next observation.
+
+        The order is the assertion: `reopen` opens the window, then the delay
+        gives it time to develop, then it is observed. Sleeping BEFORE the
+        re-open would spend the wait on a window that does not exist yet.
+
+        `delay` is the knob the two sibling primitives already expose as
+        `interval`; naming it differently here is deliberate, because it is
+        not a poll cadence -- it is the gap between two independent openings.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+        payload = {'rows': 2}
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        results = [None, payload]
+
+        def observe():
+            log.append('observe')
+            return results.pop(0)
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4, delay=0.25)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe', 'reopen', 'sleep:0.25', 'observe'], (
+            f'expected the delay to fall between reopen and the next observation, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_observe_propagates_instead_of_counting_as_a_miss(self):
+        """A raising `observe` propagates on the spot; it is NOT absorbed as a falsy observation.
+
+        This is the contract the motivating live call site's SECOND durable
+        job rests on. There, `observe` reads `CALL db.indexes()` and raises
+        IndexHeaderError when FalkorDB no longer exposes the label/types/status
+        columns the barriers depend on. Absorbing that as an ordinary miss
+        would spend the whole attempt budget re-opening a window nobody can
+        read, and then report the FIRST durable job's diagnosis ("FalkorDB
+        stopped rebuilding the merged index in place") for a completely
+        different defect -- the two-modes-one-string collapse IndexHeaderError
+        exists to prevent.
+
+        Only a FALSY observation means "missed". Every other outcome is the
+        caller's to see. Pinned here because a future edit wrapping the loop
+        body in a broad try/except would leave every other test in this class
+        green while silently deleting that guarantee.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('CALL db.indexes() changed shape')
+
+        def observe():
+            log.append('observe')
+            raise boom
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe'], (
+            f'expected the raise to abort on the FIRST attempt with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_reopen_aborts_the_retry_rather_than_being_retried_around(self):
+        """A raising `reopen` propagates after the first miss; the retry does not continue past it.
+
+        The live call site's `reopen` re-creates and re-drops a real index and
+        holds two index-readiness barriers, any of which can raise. If those
+        failures were swallowed and retried around, the helper would keep
+        observing a window that was never successfully re-opened and then
+        report exhaustion -- again the wrong diagnosis for the actual defect.
+        `_reopen_rebuild_window`'s comment asserts this in prose; this test is
+        what makes it checkable.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('could not re-create the vector index')
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+            raise boom
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe', 'reopen'], (
+            f'expected exactly one observation and one failed reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_attempts_one_degenerates_to_a_single_un_retried_observation(self):
+        """`attempts=1` observes exactly once, never reopens, and still raises on a miss.
+
+        That is EXACTLY the semantics of the un-retried single observation
+        this helper replaces at the live call site, which makes
+        retry_until_observed a strict generalisation of that code rather than
+        a behaviour change wearing a new name.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=1)
+
+        assert log == ['observe'], (
+            f'expected exactly one observation and no reopen, got {log!r}'
+        )
+
+    @pytest.mark.parametrize('bad_attempts', [0, -1])
+    @pytest.mark.asyncio
+    async def test_non_positive_attempts_raises_value_error_without_observing(self, bad_attempts):
+        """THE LOUD-OVER-SILENT GUARD: `attempts` < 1 is a ValueError, raised before any observation.
+
+        With a bare loop, `attempts=0` observes ZERO times and then raises the
+        ordinary exhaustion AssertionError -- a barrier that gated nothing
+        while reporting a plausible-looking failure. That is precisely the
+        silent-no-op class await_index_operational's empty-`result_set` note
+        already guards against in this same module.
+
+        ValueError, deliberately NOT AssertionError: a caller that catches the
+        exhaustion error to handle a genuine missed observation must not
+        swallow a mis-configuration with it. The zero-call assertion is what
+        proves the guard runs BEFORE the loop rather than being an
+        after-the-fact relabelling of the exhaustion path.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(ValueError, match='attempts'):
+            await retry_until_observed(observe, attempts=bad_attempts)
+
+        assert log == [], f'expected no observation at all, got {log!r}'
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
 # ---------------------------------------------------------------------------
 # Idempotent + 409-tolerant collection (re)creation, used by the qdrant

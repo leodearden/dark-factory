@@ -29,6 +29,7 @@ import logging
 import os
 import posixpath
 import re
+import tempfile
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,51 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+#: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
+#: i.e. the main tips a GREEN gate run has actually been observed on.
+#:
+#: Written at the single clean-landing return of :func:`_finalize_advanced_merge`
+#: (shared by SpeculativeMergeWorker's CAS advance and the train pipeline), read
+#: by :func:`_reverify_rebased_tree` to decide whether footprint-disjointness may
+#: be trusted (see :func:`_disjoint_skip_blockers`).
+#:
+#: Process-global rather than worker-owned on purpose: there is exactly one merge
+#: queue per orchestrator process, both landing paths funnel through
+#: ``_finalize_advanced_merge``, and the alternative (threading a handle through
+#: the module-level finalize/advance helpers and the ``_TrainMergeHost`` protocol)
+#: would fan the same one fact out across four signatures.  Same shape as
+#: ``verify._suppressed_flake_records`` and ``MergeProvenance``'s process-global
+#: facade.
+#:
+#: NOT durable, and deliberately so: after a restart the set is empty, every
+#: rebase-under-drift re-verifies, and the registry refills from the first
+#: landing onward.  Empty means "I have not seen this tip go green", which is
+#: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
+#: fails.
+_QUEUE_VERIFIED_MAIN_TIPS: list[str] = []
+
+#: Cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most recent tips can ever
+#: be a rebase target (a rebase is onto CURRENT main), so a short window is
+#: sufficient; the bound exists so a long-lived process cannot grow the list
+#: without limit.
+_QUEUE_VERIFIED_MAIN_TIPS_CAP = 64
+
+
+def note_queue_verified_main_tip(sha: str) -> None:
+    """Record *sha* as a main tip this queue landed after a green gate run."""
+    if not sha:
+        return
+    if sha in _QUEUE_VERIFIED_MAIN_TIPS:
+        return
+    _QUEUE_VERIFIED_MAIN_TIPS.append(sha)
+    del _QUEUE_VERIFIED_MAIN_TIPS[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
+
+
+def main_tip_is_queue_verified(sha: str) -> bool:
+    """True iff *sha* is a main tip this queue landed after a green gate run."""
+    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS
 
 
 @dataclass
@@ -530,14 +576,19 @@ async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
         'branch HEAD and advanced main %s diverge in: %r',
         ctx.req.task_id, ctx.log_label, ctx.advanced_sha[:12], equiv_failed,
     )
+    tip12 = (ctx.resolved_merged_tip or '<branch-tip>')[:12]
     return GateVerdict.block(
         reason=(
             f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
             f'branch and main diverge in '
             f'{", ".join(equiv_failed)}. '
-            f'Conflict resolution likely dropped or rewrote '
-            f'work; review {ctx.advanced_sha[:12]} against the '
-            f'task branch tip.'
+            f'Conflict resolution may have dropped or rewritten work. '
+            f'Triage with `git diff {tip12} {ctx.advanced_sha[:12]} '
+            f'-- <path>` (that order): "+" lines are content that IS on '
+            f'main, "-" lines are content only the branch tip had. '
+            f'On a relocated path use `git log --follow <path>` — '
+            f'without --follow the history looks empty and the file '
+            f'reads as missing.'
         ),
         merge_sha=ctx.advanced_sha,
         emit_subtype=OutcomeKind.post_merge_equivalence_failed,
@@ -807,6 +858,14 @@ async def _finalize_advanced_merge(
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
         chain_ctx.counts.pop(req.branch.bare_id, None)
+    # Main is now at *advanced_sha* and every post-advance gate passed, so this
+    # tip is one a green gate run has been observed on.  Recorded here — the
+    # single clean-landing return shared by the speculative CAS advance and the
+    # train pipeline — so that a LATER request rebased onto it may trust the
+    # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
+    # produced by any other writer (nightly job, direct commit, push) never
+    # reaches this line and is therefore never trusted.
+    note_queue_verified_main_tip(advanced_sha)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -1104,6 +1163,263 @@ async def _map_advance_failure(
     )
 
 
+async def _rename_pairs(
+    from_ref: str,
+    to_ref: str,
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> list[tuple[str, str]] | None:
+    """Return ``(old_path, new_path)`` for every rename between two trees.
+
+    The one place in this module that asks git "what was renamed between
+    these two trees".  Both rename-aware gates are built on it, on
+    opposite ranges: the equivalence gate resolves the BRANCH side
+    (``base..branch_head``) and the plan-target drop-guard the MERGE side
+    (``task_head..merge_commit``).
+
+    A tree-to-tree ``-M`` diff collapses a multi-commit rename chain into
+    a single pair, so no hop-by-hop walk is needed here — contrast
+    :func:`_rename_pair_for` / :func:`_resolve_renamed_plan_path`, which
+    must walk commits because they start from a path that no longer
+    exists rather than from two trees.
+
+    ``-M``'s default 50% similarity threshold is deliberate: a rename
+    edited too heavily for git to pair simply does not appear here, and
+    the caller degrades to its pre-rename-awareness behaviour — a
+    possible false block, which is the fail-CLOSED direction and the safe
+    way to be wrong.  ``-C`` (copy detection) is deliberately NOT passed:
+    a copy leaves its source in place, so treating a copy target as
+    accounted-for, or a copy source as relocated, would suppress a path
+    whose content genuinely could have been dropped.
+
+    Returns ``None`` — never a partial list — on rc != 0, so every caller
+    can tell "git could not answer" from "git answered: no renames".
+    """
+    rc, out, err = await _run(
+        ['git', 'diff', '-M', '--name-status', from_ref, to_ref],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: rename-pair diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            log_prefix, from_ref, to_ref, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return None
+
+    pairs: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path and new_path:
+            pairs.append((old_path, new_path))
+    return pairs
+
+
+async def _branch_delta_survives(
+    before: tuple[str, str],
+    after: tuple[str, str],
+    merged: tuple[str, str],
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> bool:
+    """True only when the branch's own delta is demonstrably in the merge.
+
+    Each argument is a ``(rev, path)`` pair: what the branch started
+    from, what it produced, and where the merge landed it.  A rename pair
+    alone proves nothing — ``git diff -M`` pairs at ~50% similarity, so a
+    resolution that relocates a file and discards the branch's edit still
+    pairs.  A pair is therefore only a CANDIDATE for suppression; this is
+    the check that confirms one.
+
+    EVERY failure mode returns False, i.e. "keep flagging".  That is the
+    safe direction even though the surrounding gates fail OPEN on git
+    errors: declining an unproven suppression merely restores the
+    pre-rename-awareness behaviour, which by construction cannot
+    introduce a false block relative to main, whereas failing open here
+    would hide genuine work loss.
+
+    Evidence is gathered in three ascending steps, each cheaper and
+    stronger than the one below it:
+
+    1. The merged path must RESOLVE TO A BLOB.  This is checked first and
+       unconditionally, because a branch delta can legitimately be EMPTY —
+       a pure relocation edits nothing — and an empty patch reverse-applies
+       against anything, including a resolution that deleted the file
+       outright.  Existence is the whole of the branch's claim in that
+       case and the only thing separating "relocated" from "dropped"; an
+       empty delta may be trusted only once it holds.
+    2. Byte identity.  When the merged blob is identical to the one the
+       branch produced, its content landed verbatim and nothing need be
+       read at all — which is also what makes a binary or otherwise
+       undecodable file suppressible in the common case where only the
+       branch touched it.
+    3. Reverse-application of the branch's patch against the merged blob,
+       for the case where main edited the same content on top.
+
+    Deliberately conservative in four known ways, every one erring
+    toward a false flag and never toward a false negative.  ``git apply`` matches
+    exact context with no fuzz, so a main-side edit landing inside the
+    branch hunk's three context lines yields a flag (measured: an edit
+    three lines away still reverse-applies cleanly).  A blob that is not
+    valid UTF-8 — binary, or text in a legacy encoding — cannot reach step
+    3 at all, because ``_run`` decodes stdout strictly; the read is
+    therefore guarded and flags.  (Step 3 is reached only when step 2
+    failed, i.e. main also edited it — a binary file the branch alone
+    touched suppresses at step 2 without a read.)  A third follows from
+    ``_run`` stripping stdout: a patch whose final context line carries
+    trailing whitespace loses it and will not apply — again a flag, never
+    a silent suppression.  A fourth is step 2's asymmetry: OID equality
+    proves survival but inequality proves nothing, so it may only
+    short-circuit toward True.
+    """
+    rc, patch, err = await _run(
+        ['git', 'diff', f'{before[0]}:{before[1]}', f'{after[0]}:{after[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: branch-delta diff %s:%s..%s:%s failed (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, before[0], before[1], after[0], after[1],
+            rc, err.strip(), task_id or '<unknown>',
+        )
+        return False
+    rc, _oid, err = await _run(
+        ['git', 'rev-parse', '--verify', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: merged path %s:%s resolves to no blob (rc=%d, stderr=%s); '
+            'the branch delta did not survive, not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
+    if not patch.strip():
+        return True
+
+    # ``--quiet`` implies ``--exit-code`` and prints nothing, so this asks
+    # "are these two blobs identical?" without decoding either — the one
+    # question about an undecodable payload that can still be answered.
+    rc, _out, _err = await _run(
+        ['git', 'diff', '--quiet',
+         f'{after[0]}:{after[1]}', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc == 0:
+        return True
+
+    try:
+        rc, blob, err = await _run(
+            ['git', 'show', f'{merged[0]}:{merged[1]}'],
+            cwd=git_ops.project_root,
+        )
+    except UnicodeDecodeError:
+        logger.warning(
+            '%s: merged blob %s:%s is not valid UTF-8 and cannot be '
+            'patch-verified; not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], task_id or '<unknown>',
+        )
+        return False
+    if rc != 0:
+        logger.warning(
+            '%s: merged blob %s:%s unreadable (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # ``_run`` returns ``stdout.decode().strip()``, and ``git apply``
+        # rejects a patch with no final newline as "corrupt patch at line
+        # N".  Re-terminate rather than reaching for an unstripped runner.
+        (tmp / 'delta.patch').write_text(patch + '\n')
+        # The AFTER path, NOT the merged path: `git apply -R` locates the
+        # file by the patch's ``b/`` (new) side.  A fresh tmpdir is also
+        # required — with differing a/b paths, reverse-apply additionally
+        # demands the ``a/`` path be absent.
+        staged = tmp / after[1]
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(blob)
+        rc, _, _ = await _run(
+            ['git', 'apply', '--check', '-R', '-p1', 'delta.patch'], cwd=tmp,
+        )
+    return rc == 0
+
+
+async def _rename_aware_real_drops(
+    dropped_in_merge: list[str],
+    branch_changed: set[str],
+    base: str,
+    task_head: str,
+    merge_commit_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Intersect the drop set with branch-authored work, discounting renames.
+
+    A path can disappear from ``task_head`` for two very different
+    reasons: the merge DISCARDED it, or the merge carried it to a new
+    name.  Under ``--no-renames`` those look identical, so a rename
+    SOURCE in ``task_head..merge_commit`` is a candidate for exclusion.
+
+    A pair alone is NOT sufficient to discount a drop.  ``git diff -M``
+    pairs at ~50% similarity, so a resolution that relocates a file and
+    throws the branch's edit away still pairs (measured ``R095``) — the
+    two outcomes are indistinguishable by pairing alone.  The candidate
+    is therefore confirmed by :func:`_branch_delta_survives`, which
+    re-applies the branch's own delta against the merged blob; only a
+    confirmed pair is discounted.
+
+    Merge-diff order is preserved, as the caller's warning reports it.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than flagging a phantom drop on a transient error.
+    """
+    pairs = await _rename_pairs(
+        task_head, merge_commit_sha, git_ops,
+        log_prefix='drop-guard', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    relocated = {old: new for old, new in pairs}
+    authored = [p for p in dropped_in_merge if p in branch_changed]
+
+    real_drops: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in authored:
+        new = relocated.get(p)
+        if new is not None and await _branch_delta_survives(
+            (base, p), (task_head, p), (merge_commit_sha, new),
+            git_ops, log_prefix='drop-guard', task_id=task_id,
+        ):
+            suppressed.append((p, new))
+        else:
+            real_drops.append(p)
+
+    if suppressed:
+        logger.info(
+            'drop-guard: content verified at the new name, not flagging '
+            '%r (old, new). task_id=%s merge_commit_sha=%s',
+            suppressed, task_id or '<unknown>', merge_commit_sha,
+        )
+    return real_drops
+
+
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
@@ -1129,9 +1445,26 @@ async def _check_plan_targets_in_tree(
     (``merge-base(task_HEAD, main_sha)``).  ``main_sha`` is the pre-merge
     main tip the merge was computed against (actual or speculative), not
     the post-merge advanced SHA — using it keeps the subtraction robust to
-    ``advance_main``'s CAS-retry rebase.  ``--no-renames`` is deliberate:
-    a sibling rename appears as a delete of the old path on main, which is
-    absent from the branch's add/modify set and therefore dropped here.
+    ``advance_main``'s CAS-retry rebase.
+
+    That intersection alone covers only HALF of the sibling-rename case,
+    and the missing half is what produced a measured false block
+    (esc-6436-4).  When the branch never touched the relocated path, the
+    old path is absent from the branch's add/modify set and the
+    intersection correctly discards it (the esc-3861 case, pinned by
+    ``test_merge_queue.py::TestCheckPlanTargetsInTree::
+    test_sibling_moved_file_not_flagged``).  When the branch MODIFIED it,
+    the old path IS in ``branch_changed`` — so the intersection fires and
+    reports a drop of work that is sitting, intact, at the new name.
+    ``--no-renames`` is retained on both set-building diffs, whose ``AM``
+    / ``D`` filters are what make the intersection meaningful; rename
+    resolution is applied instead as a separate, additive ``-M`` pass over
+    ``task_head..merge_commit`` (:func:`_rename_aware_real_drops`), which
+    treats an apparently-dropped path that is really a rename SOURCE as a
+    CANDIDATE for exclusion — and, because ``-M`` pairs at ~50%
+    similarity and so cannot distinguish a faithful relocation from one
+    that discarded the branch's edit, confirms it by re-applying the
+    branch's own delta against the merged blob before discounting it.
 
     Fail-open on rc != 0: post-merge verify is the next safety net, and
     flagging a phantom drop on a transient git error is worse than missing
@@ -1204,8 +1537,13 @@ async def _check_plan_targets_in_tree(
 
     dropped_in_merge = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # Subtract main-side change: only a path the branch actually produced
-    # AND the merge discarded is a real drop.  Preserve merge-diff order.
-    real_drops = [p for p in dropped_in_merge if p in branch_changed]
+    # AND the merge discarded — not merely relocated — is a real drop.
+    real_drops = await _rename_aware_real_drops(
+        dropped_in_merge, branch_changed, base, task_head, merge_commit_sha,
+        git_ops, task_id=task_id,
+    )
+    if real_drops is None:
+        return DropGuardResult()
     if real_drops:
         logger.warning(
             'drop-guard: dropped_plan_targets '
@@ -1693,22 +2031,52 @@ def _ls_tree_object_type(ls_out: str) -> str | None:
     return None
 
 
+class _RenameProbeUnmeasurable:
+    """Sentinel type: git could not ANSWER the rename probe.
+
+    Distinct from ``None`` ("git answered, and there is no rename pair
+    here") so the resolver can fail CLOSED on an unmeasurable probe
+    instead of silently degrading to the weaker basename heuristic.
+
+    An out-of-band sentinel TYPE, not the in-band ``_OVERLAP_GIT_ERROR_SENTINEL``
+    value idiom used elsewhere in this module: that sentinel is a
+    non-empty list, safely distinguishable because its callers never
+    expect a real list back, but ``_rename_pair_for``'s real return value
+    IS a tuple, so only a distinct type is safely distinguishable from a
+    genuine result.  Not an ``Exception`` subclass, to match this module's
+    control flow (rc-checking plus sentinel returns, no private
+    control-flow exceptions) — named without "Error"/"Exception" so a
+    future reader is not tempted to ``raise`` or ``except`` it (either
+    would be a ``TypeError`` at runtime, since it inherits from neither).
+    """
+
+    __slots__ = ()
+
+
+_RENAME_PROBE_UNMEASURABLE = _RenameProbeUnmeasurable()
+
+
 async def _rename_pair_for(
     path: str,
     branch_head: str,
     git_ops: GitOps,
     *,
     task_id: str | None = None,
-) -> tuple[str, str] | None:
-    """One hop of git's own rename detection for *path*, or ``None``.
+) -> tuple[str, str] | _RenameProbeUnmeasurable | None:
+    """One hop of git's own rename detection for *path*.
 
     Finds the commit reachable from *branch_head* that DELETED *path*
     (``git log --diff-filter=D -1``), then re-reads that commit with
     rename detection on (``git show --name-status -M``) looking for an
     ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
 
-    Returns ``(new_path, deleting_sha)``.  Fails CLOSED: a git error, no
-    deleting commit, or no pairable rename all return ``None``.
+    Three-valued outcome: returns ``(new_path, deleting_sha)`` when a pair
+    is found; ``None`` when git answered and there genuinely is no
+    deleting commit or no pairable rename; and ``_RENAME_PROBE_UNMEASURABLE`` when
+    a git error means the question could not be answered at all.  Callers
+    MUST distinguish the last from ``None`` — see
+    :func:`_resolve_renamed_plan_path`, which fails CLOSED on it rather
+    than falling through to the basename heuristic on unmeasured evidence.
     """
     rc, del_out, del_err = await _run(
         ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
@@ -1722,7 +2090,7 @@ async def _rename_pair_for(
             'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
             rc, (del_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_UNMEASURABLE
 
     del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
     if not del_sha:
@@ -1740,7 +2108,7 @@ async def _rename_pair_for(
             f'git show --name-status -M --format= {del_sha[:12]}',
             rc, (show_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_UNMEASURABLE
 
     for line in show_out.splitlines():
         fields = line.split('\t')
@@ -1794,19 +2162,33 @@ async def _resolve_renamed_plan_path(
     tree_paths: Callable[[], Awaitable[list[str] | None]],
     *,
     task_id: str | None = None,
-) -> tuple[str, str] | None:
+) -> list[tuple[str, str]]:
     """Resolve a declared path that is ABSENT from the branch tree to its
-    current name, or ``None`` when no resolution is recoverable.
+    current name(s), or ``[]`` when no resolution is recoverable.
 
-    Returns ``(resolved_path, mechanism)`` where *mechanism* is a short
-    human-readable description for the audit log.
+    Returns a PREFERENCE-ORDERED list of ``(resolved_path, mechanism)``
+    candidates, where *mechanism* is a short human-readable description
+    for the audit log.  A LIST rather than a single winner deliberately:
+    mechanism 2 can produce two independently-bounded candidates (the
+    last resolved hop's basename and the originally declared path's), and
+    the tie-breaker that actually matters — which candidate the branch
+    TOUCHED — is known only to the caller, which owns the touched set.
+    Picking a single winner here would let a coincidental hop match
+    SHADOW a declared-key candidate that the branch genuinely delivered,
+    re-introducing the very false-positive class this gate exists to
+    remove (task 4158 review).  The caller
+    (:func:`_check_plan_files_touched_in_branch`) selects the first
+    candidate that is in the touched set, and falls back to the first
+    candidate overall for the audit trail when none is touched.  Ordering
+    is therefore the resolver's only preference statement: mechanism 1's
+    authoritative answer, else hop-key before declared-key.
 
-    **Invariant: a returned ``resolved_path`` always EXISTS in the branch
-    tree at ``branch_head``.**  Both mechanisms enforce it (mechanism 1
-    verifies each hop against the tree listing; mechanism 2 draws its
-    candidates from that listing), so a resolution can never point a human
-    at a second phantom path, and an entry that resolved is never
-    ``missing_from_tree``.
+    **Invariant: every returned ``resolved_path`` always EXISTS in the
+    branch tree at ``branch_head``.**  Both mechanisms enforce it
+    (mechanism 1 verifies each hop against the tree listing; mechanism 2
+    draws its candidates from that listing), so a resolution can never
+    point a human at a second phantom path, and an entry that resolved is
+    never ``missing_from_tree``.
 
     Mechanism 1 (authoritative — git's own rename detection): follow the
     rename CHAIN from *norm*, hop by hop, via :func:`_rename_pair_for`.
@@ -1825,15 +2207,72 @@ async def _resolve_renamed_plan_path(
     *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
     delete and add commits (git pairs renames only within one commit),
     which is exactly how the reify harness-consolidation programme staged
-    its moves.  The fallback is deliberately conservative and bounded four
-    ways: it requires EXACTLY ONE candidate; it only runs for a path that
-    exists nowhere in the branch tree; it only runs for a path with actual
-    history under its declared name (see
-    :func:`_path_existed_in_branch_history` — an invented path is a stale
-    declaration, not a rename); and a resolution never passes the gate on
-    its own — the caller additionally requires the resolved path to be in
-    the touched set.  So an ambiguous or coincidental basename cannot
-    silently satisfy the gate.
+    its moves.  TWO keys are tried and BOTH surviving candidates are
+    RETURNED, in preference order: the LAST RESOLVED HOP (``current``)
+    first, then the ORIGINALLY DECLARED path (``norm``).  The hop is
+    ordered first because it is the more RECENTLY PROVEN name — mechanism 1
+    produced authoritative git rename evidence for it — whereas ``norm`` is
+    the one name mechanism 1 already showed is stale (``current == norm``
+    when the chain never advanced, so the no-chain case yields a single
+    candidate because the two keys coincide).  The declared path is kept,
+    not discarded, because a chain hop can CHANGE a file's basename and a
+    LATER hop can RESTORE it: the hop is evidence of the file's current
+    name only when it actually HAS a match, not strictly better evidence
+    in every shape.  Critically, the hop candidate does NOT SHADOW the
+    declared one — both are handed to the caller, which prefers whichever
+    the branch actually TOUCHED, and only falls back to this ordering when
+    the touched set cannot break the tie.  That is what makes the two-key
+    lookup a genuine SUPERSET of either single-key behaviour at the GATE:
+    every resolution the ``norm`` key made in production before task 4158
+    still passes the gate, and the chained-rename resolutions the
+    ``current`` key added pass too.  (Ordering alone would NOT be a
+    superset — a coincidental, untouched hop match would shadow a touched
+    declared match and wrongly block; measured against real git in the
+    task 4158 review.)  Both keys are
+    bounded the SAME four ways: each requires EXACTLY ONE candidate; the
+    lookup only runs for a path that exists nowhere in the branch tree; it
+    only runs for a path with actual history under its ORIGINALLY DECLARED
+    name, checked via :func:`_path_existed_in_branch_history` on ``norm``
+    (never ``current``, which would be vacuous — a hop only exists because
+    a commit deleted it; an invented path is a stale declaration, not a
+    rename); and a resolution never passes the gate on its own — the
+    caller additionally requires the resolved path to be in the touched
+    set.  So an ambiguous or coincidental basename cannot silently satisfy
+    the gate on EITHER key, and returning a second candidate escapes none
+    of these bounds — it only widens which name they are evaluated
+    against.  Ambiguity WITHIN a key fails closed (``len(matches) == 1``);
+    ambiguity ACROSS keys is not silently collapsed here at all — both
+    candidates are returned and the caller breaks the tie on the touched
+    set, which is the only evidence that distinguishes them.
+
+    Known, ACCEPTED limitation, shared by BOTH keys: none of the four
+    bounds above can distinguish "the file was relocated again as separate
+    delete+add commits" (the case the two-key lookup exists to resolve)
+    from "the file was genuinely DELETED OUTRIGHT" (removed, never
+    re-added anywhere).  If an unrelated file elsewhere in the tree
+    happens to share a dead hop's (or the declared path's) basename,
+    mechanism 2 resolves the declared path to that unrelated file even
+    though nothing on the branch actually delivered against it.  This is
+    NOT a new class of risk introduced by trying ``current`` — the
+    no-chain case (``current == norm``) already has it, since a path that
+    was committed and later deleted outright still has git history under
+    its own name, so :func:`_path_existed_in_branch_history` does not stop
+    it either; the hop key only extends the SAME accepted tradeoff to
+    chained renames, where a hop's basename is more likely to be generic
+    (``mod.rs``, ``__init__.py``, ``index.ts``) than the originally
+    declared path's.  A tighter bound is possible (e.g. requiring the
+    candidate to have been ADDED at-or-after the commit that deleted the
+    lookup key) but is deliberately not implemented here.  The tradeoff is
+    bounded in practice by the surrounding invariants — EXACTLY ONE
+    candidate, the resolved path must additionally be in the touched set —
+    and every resolution that passes is logged loudly at WARNING regardless
+    of mechanism or key, so the false-positive class this paragraph
+    documents is never silent.  The declared-path fallback key carries the
+    identical tradeoff under the identical bounds — a coincidental
+    basename match on the declared name is exactly as unable to
+    distinguish a re-relocation from an outright deletion as one on a hop
+    is.  See ``TestHopBasenameAcceptedTradeoff`` in the test module for the
+    pinned shape on the hop key.
 
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
@@ -1852,7 +2291,8 @@ async def _resolve_renamed_plan_path(
     renaming commit is necessarily an ancestor of ``branch_head``.
 
     Fails CLOSED — any git error, missing deleting commit, or unmatched
-    rename pair returns ``None`` and the caller still blocks.  (Contrast
+    rename pair returns ``[]`` (NO candidates) and the caller still
+    blocks.  (Contrast
     with the whole-gate fail-OPEN on the touched-set fetch: a transient
     error there would block every plan entry at once, whereas a per-entry
     probe failure can only leave one already-suspect entry flagged.)
@@ -1874,6 +2314,15 @@ async def _resolve_renamed_plan_path(
     shas: list[str] = []
     for _hop in range(_MAX_RENAME_HOPS):
         pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if isinstance(pair, _RenameProbeUnmeasurable):
+            logger.warning(
+                'plan-files-touched: rename-probe UNMEASURABLE for %s (declared %s) '
+                'at head=%s — resolution abandoned and the basename fallback '
+                'deliberately not attempted (fail CLOSED: never resolve on evidence '
+                'we could not measure). task_id=%s',
+                current, norm, branch_head, task_id or '<unknown>',
+            )
+            return []
         if pair is None:
             break
         new_path, del_sha = pair
@@ -1886,13 +2335,15 @@ async def _resolve_renamed_plan_path(
 
         live = await _tree_set()
         if live is None:
-            return None
+            return []
         if current in live:
             mechanism = (
                 f'rename in {shas[0][:12]}' if len(shas) == 1
                 else f'{len(shas)}-hop rename chain ending in {shas[-1][:12]}'
             )
-            return current, mechanism
+            # Authoritative: git's own rename evidence, verified live in
+            # the tree.  A single candidate — mechanism 2 never runs.
+            return [(current, mechanism)]
         # The hop landed on a path that is itself gone from the tree: it was
         # relocated again.  Keep walking rather than returning a dead answer.
 
@@ -1900,7 +2351,20 @@ async def _resolve_renamed_plan_path(
     # Reached when no commit deleted the path (never created, or the
     # relocation predates any reachable delete), when the deleting commit
     # carried no pairable rename (separate delete+add commits), or when
-    # the chain dead-ended on a path that is absent from the tree.
+    # the chain dead-ended on a path that is absent from the tree.  TWO
+    # keys are tried and BOTH surviving candidates are RETURNED, ordered:
+    # `current` — the LAST RESOLVED HOP, which equals `norm` when the
+    # chain never advanced — FIRST, because mechanism 1 produced
+    # authoritative git rename evidence for it; then `norm` — the
+    # ORIGINALLY DECLARED path — because a chain hop can CHANGE a file's
+    # basename and a LATER hop can RESTORE it, so a hop with no unique
+    # candidate is not evidence that the declared name has none.
+    #
+    # The hop candidate must NOT SHADOW the declared one: a hop match can
+    # be a coincidental, untouched file while the declared key resolves
+    # to the file the branch actually delivered (task 4158 review,
+    # reproduced against real git).  Only the caller holds the touched
+    # set, so only the caller can break that tie — hand it both, ordered.
     if not await _path_existed_in_branch_history(
         norm, branch_head, git_ops, task_id=task_id,
     ):
@@ -1910,20 +2374,61 @@ async def _resolve_renamed_plan_path(
             'never existed is an invented declaration, not a rename). task_id=%s',
             norm, branch_head, task_id or '<unknown>',
         )
-        return None
+        return []
 
     live = await _tree_set()
     if live is None:
-        return None
+        return []
 
-    basename = posixpath.basename(norm)
-    if not basename:
-        return None
-    candidates = [p for p in live if posixpath.basename(p) == basename]
-    if len(candidates) == 1:
-        return candidates[0], 'unique basename match'
+    # `live` is narrowed to `set[str]` above; rebind so the closure below
+    # keeps that narrowing (pyright does not carry narrowing into a nested
+    # function through the original name).
+    live_set = live
 
-    return None
+    def _sole_candidate(key: str) -> str | None:
+        """The ONE tree path sharing *key*'s basename, or None.
+
+        None covers both "no candidate" and "ambiguous" — mechanism 2's
+        `len(candidates) == 1` bound applies identically to BOTH lookup
+        keys, so the fallback can never be looser than the first attempt.
+        """
+        base = posixpath.basename(key)
+        if not base:
+            return None
+        matches = [p for p in live_set if posixpath.basename(p) == base]
+        return matches[0] if len(matches) == 1 else None
+
+    candidates: list[tuple[str, str]] = []
+
+    # First candidate: the LAST RESOLVED HOP.  Mechanism 1 produced
+    # authoritative git rename evidence for it, whereas `norm` is the one
+    # name already PROVEN stale — so when the touched set cannot break
+    # the tie, this ordering makes the hop win.
+    hop_match = _sole_candidate(current)
+    if hop_match is not None:
+        candidates.append((
+            hop_match,
+            'unique basename match' if current == norm
+            else f'unique basename match on {current} (after {len(shas)}-hop rename chain)',
+        ))
+
+    # Second candidate: the ORIGINALLY DECLARED path.  A chain hop can
+    # CHANGE the basename and a later hop can RESTORE it, so a hop match
+    # is not evidence that the declared name's match is wrong — it is
+    # offered alongside, never overwritten by, the hop's.  Skipped when
+    # the chain never advanced (`current == norm`: the two keys coincide,
+    # so the lookup would be identical) or when both keys land on the
+    # same tree path (one candidate, not two).
+    if current != norm:
+        declared_match = _sole_candidate(norm)
+        if declared_match is not None and declared_match != hop_match:
+            candidates.append((
+                declared_match,
+                f'unique basename match on declared {norm} '
+                f'(after {len(shas)}-hop rename chain dead-ended on {current})',
+            ))
+
+    return candidates
 
 
 async def _check_plan_files_touched_in_branch(
@@ -2062,16 +2567,26 @@ async def _check_plan_files_touched_in_branch(
         # Path is ABSENT from the branch tree: the declared path is stale,
         # so the touched set can say nothing about it.  Try to resolve the
         # rename before blaming the branch (task 3110).
-        resolution = await _resolve_renamed_plan_path(
+        candidates = await _resolve_renamed_plan_path(
             norm, branch_head, git_ops, _tree_paths, task_id=task_id,
         )
-        if resolution is not None:
-            resolved, mechanism = resolution
+        if candidates:
+            # The resolver hands back every candidate that survived its
+            # bounds, in ITS preference order, because only this site holds
+            # the touched set — the evidence that actually distinguishes a
+            # coincidental basename match from the file the branch
+            # delivered.  Prefer the first TOUCHED candidate; when none is
+            # touched the tie is unbreakable, so fall back to the
+            # resolver's own ordering for the audit trail (task 4158).
+            chosen, mechanism = next(
+                ((c, m) for c, m in candidates if c in touched_set),
+                candidates[0],
+            )
             # Key on the ORIGINAL declared string so the diagnostic names
             # exactly what plan.json says (composes with task 1587's
             # ./-prefix normalization instead of re-solving it).
-            resolved_renames[entry] = resolved
-            if resolved in touched_set:
+            resolved_renames[entry] = chosen
+            if chosen in touched_set:
                 # A resolved rename means the task's declared metadata.files
                 # is stale — a real data-quality signal on a path that
                 # otherwise produces no output at all.  Log it LOUD even
@@ -2079,7 +2594,7 @@ async def _check_plan_files_touched_in_branch(
                 logger.warning(
                     'plan-files-touched: declared %s resolved to %s via %s; '
                     'branch touched the resolved path — gate PASSES. task_id=%s',
-                    entry, resolved, mechanism, task_id or '<unknown>',
+                    entry, chosen, mechanism, task_id or '<unknown>',
                 )
                 continue
         else:
@@ -2109,6 +2624,75 @@ async def _check_plan_files_touched_in_branch(
     )
 
 
+async def _rename_aware_compare_set(
+    branch_touched: list[str],
+    main_touched: set[str],
+    base_sha: str,
+    branch_head: str,
+    advanced_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Subtract main-side change from *branch_touched*, following renames.
+
+    The string-only rule — "keep a branch-touched path main did not touch"
+    — misses the case where the branch RELOCATED a path main edited: the
+    two halves of the rename are unrelated strings, so main's edit lands
+    in ``main_touched`` under the SOURCE name while the branch's work is
+    compared under the TARGET name.
+
+    A pair whose source main touched is only a CANDIDATE for exclusion,
+    never a licence to skip the path.  ``git diff -M`` pairs at ~50%
+    similarity, so a resolution that keeps the relocation and throws the
+    branch's edit away still pairs (measured ``R095``) — and nothing else
+    covers that case, since the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    Exclusion therefore requires :func:`_branch_delta_survives` to
+    re-apply the branch's delta against the merged blob.
+
+    The branch's OLD path deliberately stays in the compare set when main
+    did not touch it: a resolution that RESURRECTS a path the branch
+    deleted is caught precisely because that path is still compared.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than silently running the buggy string-only rule.
+    """
+    pairs = await _rename_pairs(
+        base_sha, branch_head, git_ops,
+        log_prefix='post-merge-equiv', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    sources = {new: old for old, new in pairs}
+    compare_set: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in branch_touched:
+        if p in main_touched:
+            continue
+        old = sources.get(p)
+        # The branch's delta SPANS the rename here (base:old ->
+        # branch_head:new), unlike the drop-guard's case where the branch
+        # edited in place and the MERGE relocated.  The blob-to-blob diff
+        # form absorbs both without special-casing.
+        if old is not None and old in main_touched and await _branch_delta_survives(
+            (base_sha, old), (branch_head, p), (advanced_sha, p),
+            git_ops, log_prefix='post-merge-equiv', task_id=task_id,
+        ):
+            suppressed.append((p, old))
+        else:
+            compare_set.append(p)
+
+    if suppressed:
+        logger.info(
+            'post-merge-equiv: content verified at the new name, not '
+            'comparing %r (target, source). task_id=%s',
+            suppressed, task_id or '<unknown>',
+        )
+    return compare_set
+
+
 async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
@@ -2135,6 +2719,28 @@ async def _check_post_merge_equivalence(
     so merged main differs from the branch tip there without anything being
     dropped.  Anchoring the base on ``main_sha`` rather than ``advanced_sha``
     keeps the gate robust to ``advance_main``'s CAS-retry rebase.
+
+    That subtraction is on path STRINGS, so it needs a rename
+    correspondence to be sound: when the branch RELOCATED a path main
+    edited, main's edit is recorded under the rename SOURCE and the
+    branch's work under the TARGET, and the target survives a subtraction
+    that should have removed it.  :func:`_rename_aware_compare_set`
+    therefore treats a branch-touched path whose rename SOURCE main
+    touched as a CANDIDATE for exclusion (task 5342; measured as reify
+    task 5694 / esc-5694-5) — and, because ``-M`` pairs at ~50%
+    similarity and so cannot tell a faithful relocation from one that
+    discarded the branch's edit, takes the exclusion only when the
+    branch's own delta re-applies against the merged blob.  Nothing else
+    covers that case: the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    ``--no-renames`` on both set-building diffs is retained
+    and is load-bearing in that design: main's own rename must stay
+    DECOMPOSED so its source path appears in ``main_touched`` — that is
+    exactly the set the branch's rename sources are looked up in, and a
+    rename-collapsed main diff would hide the source and reintroduce the
+    miss.  The branch's OLD path likewise stays in the compare set when
+    main did not touch it, so a merge that RESURRECTS a path the branch
+    deleted is still flagged.
 
     The surviving compare set is the branch's own work that main did not
     touch; we ask git whether any of those paths differ between
@@ -2260,7 +2866,12 @@ async def _check_post_merge_equivalence(
         return []
     main_touched = {ln.strip() for ln in main_touched_out.splitlines() if ln.strip()}
 
-    compare_set = [p for p in branch_touched if p not in main_touched]
+    compare_set = await _rename_aware_compare_set(
+        branch_touched, main_touched, base_sha, branch_head, advanced_sha,
+        git_ops, task_id=task_id,
+    )
+    if compare_set is None:
+        return []
     if not compare_set:
         # Empty pathspec on ``git diff -- `` means *all files*, not none, so
         # short-circuit rather than running an unscoped diff.
@@ -2453,6 +3064,94 @@ async def _rebase_delta_touched_overlap(
     return sorted(branch_touched & intervening)
 
 
+def _disjoint_skip_blockers(
+    req: MergeRequest,
+    *,
+    rebased_onto: str,
+) -> list[str]:
+    """Reasons footprint-disjointness may NOT be trusted for this rebase.
+
+    Empty list means the disjoint fast path in :func:`_reverify_rebased_tree`
+    is sound and the post-rebase re-verify may be skipped.
+
+    WHY THIS EXISTS (the 2026-09-22 whole-tree-drift incident).  On that day an
+    unattended nightly job committed prose straight onto main at 03:20:36
+    carrying a stale test-path citation.  That reddened a WHOLE-TREE merge gate
+    — one every merge runs regardless of its own diff.  At 03:48:49 a request
+    whose own verify had run against the PRE-drift tip was rebased onto the
+    drift, this function found the two footprints disjoint (``docs/prds/**`` vs
+    ``docs/legibility/**``), skipped re-verification, and the queue advanced —
+    and reported "merged to main successfully" for — a tree no verification had
+    ever seen green.
+
+    The inference "disjoint footprints, therefore still green" rests on two
+    premises, and the overlap probe on its own checks NEITHER:
+
+    P1 (compositionality)
+        The gate's verdict decomposes over disjoint file sets — i.e. every check
+        it runs is diff-scoped.  A whole-tree check violates this by
+        construction: its entire premise is that an unrelated file can fail you.
+        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
+        declaration that the merge gate runs every registered module's suite
+        rather than just the touched ones.  It is a declaration, not a gate name,
+        so this stays project-agnostic.  It is also only a PARTIAL detector of a
+        non-compositional gate (a project whose own verify script runs whole-tree
+        checks internally reads as 'scoped' here — reify is exactly that), which
+        is why P2 below, not P1, is the arm that actually closes the incident.
+
+    P2 (the drift is itself green)
+        Main at *rebased_onto* passes the gate on its own.  This premise is
+        needed even for a perfectly diff-scoped gate — a merge onto an
+        already-red base is red — and it is the one the incident violated.
+        Signal used: :func:`main_tip_is_queue_verified`, i.e. *rebased_onto* is
+        a tip THIS queue landed after a green gate run.  Drift from any other
+        writer (an unattended job, a direct commit, a push) has unknown health.
+        Generic and observed, not declared: it needs no project config at all.
+
+    FAIL-SAFE DIRECTION.  Both arms answer "distrust" when the answer is
+    unknown — an unrecognised tip, a missing/partial ``req.config`` — matching
+    ``_OVERLAP_GIT_ERROR_SENTINEL``'s fail-CLOSED policy above.  The cost of a
+    false distrust is one extra verify; the cost of a false trust was nine hours
+    of laundered red main.
+
+    WHY THE OPTIMISATION IS NOT REMOVED WHOLESALE.  It is not unsound in all
+    cases: when main drifted because ANOTHER queued merge landed, P2 holds by
+    observation, and for a diff-scoped gate P1 holds too — which is the common
+    case and the case the optimisation was built for.  Only the premises are
+    now checked instead of assumed.
+
+    TRANSITIVITY.  A tip landed via this fast path is itself recorded as
+    queue-verified by :func:`_finalize_advanced_merge`, so trust chains.  That
+    is sound under P1 ∧ P2 by the same argument: those premises make the landed
+    tree green, not merely unverified.  The one exception is the operator
+    kill switch below, which by definition restores the pre-fix (unsound)
+    inference; that is what "restore the previous behaviour" means.
+    """
+    blockers: list[str] = []
+    config = getattr(req, 'config', None)
+
+    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
+    # the kill switch: a project that has declared its merge gate whole-tree has
+    # declared this skip unsound outright, not merely expensive.
+    if getattr(config, 'merge_verify_breadth', None) == 'full':
+        blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
+
+    # P2 — drift provenance.  Guarded by the green-tier kill switch so ops can
+    # trade the extra re-verifies back under load without a fleet restart.
+    requires_verified_drift = getattr(
+        config, 'merge_disjoint_skip_requires_verified_drift', True,
+    )
+    if requires_verified_drift is not False and not main_tip_is_queue_verified(
+        rebased_onto,
+    ):
+        blockers.append(
+            f'intervening main tip {rebased_onto[:8]} was not landed green by '
+            f'this queue (unverified drift)'
+        )
+
+    return blockers
+
+
 async def _reverify_rebased_tree(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2476,9 +3175,14 @@ async def _reverify_rebased_tree(
     ---------
     1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
        the branch-touched file set and the intervening main delta.
-    2. **Disjoint** (empty intersection): return ``None``.  The caller can
-       advance immediately — the intervening churn cannot interact with the
-       branch's changes.  No extra verify call is made.
+    2. **Disjoint** (empty intersection): consult
+       :func:`_disjoint_skip_blockers`.  With NO blockers, return ``None`` —
+       the caller can advance immediately and no extra verify call is made.
+       With blockers, fall through to the re-verify in step 3 exactly as an
+       overlap would, logging which premise of the disjointness inference could
+       not be established.  Disjointness alone is NOT sufficient: see that
+       function's docstring for the two premises and the incident that proved
+       skipping on the intersection alone unsound.
     3. **Overlapping** (non-empty intersection): log a warning and delegate to
        ``_run_post_merge_verify``, which runs the full post-merge scoped
        verification against the rebased *merge_wt*.
@@ -2514,21 +3218,33 @@ async def _reverify_rebased_tree(
     )
 
     if not overlap:
-        # Disjoint: the intervening main churn does not intersect the branch's
-        # touched files — the rebased tree is safe to advance without re-verify.
-        logger.debug(
-            'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
-            '— skipping re-verify',
+        blockers = _disjoint_skip_blockers(req, rebased_onto=rebased_onto)
+        if not blockers:
+            # Disjoint AND both premises hold: the intervening main churn does
+            # not intersect the branch's touched files, and that churn is itself
+            # a tip this queue landed green.  Safe to advance without re-verify.
+            logger.debug(
+                'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
+                '— skipping re-verify',
+                req.task_id, rebased_from[:8], rebased_onto[:8],
+            )
+            return None
+        logger.warning(
+            'Task %s: rebased tree is disjoint from the intervening delta '
+            '(%s..%s) but disjointness is NOT trustworthy here [%s] — '
+            'triggering re-verify. Footprint-disjointness only licenses a skip '
+            'when the gate is diff-scoped AND the drift is itself known green; '
+            'see _disjoint_skip_blockers.',
             req.task_id, rebased_from[:8], rebased_onto[:8],
+            ', '.join(blockers),
         )
-        return None
-
-    logger.warning(
-        'Task %s: rebased tree overlaps intervening delta (%s..%s) '
-        'on %d file(s) [%s] — triggering re-verify',
-        req.task_id, rebased_from[:8], rebased_onto[:8],
-        len(overlap), ', '.join(overlap[:5]),
-    )
+    else:
+        logger.warning(
+            'Task %s: rebased tree overlaps intervening delta (%s..%s) '
+            'on %d file(s) [%s] — triggering re-verify',
+            req.task_id, rebased_from[:8], rebased_onto[:8],
+            len(overlap), ', '.join(overlap[:5]),
+        )
     return await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,

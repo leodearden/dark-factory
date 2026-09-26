@@ -118,9 +118,16 @@ was gated**: an observation degrades to identity fields only, while the run's ex
 keeps `exit_code` / `killed_by_probe` / `stderr_len` (scalar-filtered) and drops only the
 CLI-authored text — it is stamped onto every observation of the run, so an observation-shaped
 stand-in there would cost the whole capture its exit provenance. A degraded observation also
-carries `captured_at` and `session_id` when they match their probe-authored shapes, because
-`--out` is appended to and one JSONL file routinely holds several runs: without them a
-`redaction_failed` row cannot be traced back to the run that produced it.
+carries `captured_at`, `session_id` and `probe_run_id` when they match their probe-authored
+shapes, because `--out` is appended to and one JSONL file routinely holds several runs: without
+them a `redaction_failed` row cannot be traced back to the run that produced it. `probe_run_id`
+is the one that matters most, and not merely for attribution: it is the key the curated corpus
+JOINS on — `test_every_row_is_linked_to_a_raw_probe_run` fails a curated row whose `probe_run_id`
+is absent from the raw capture — and `session_id` does not stand in for it. Its shape is the
+anchored `<mode>-<12 hex>` that `main()` generates by default; an operator-supplied
+`--probe-run-id` that does not match degrades to `null`, exactly as before it was carried.
+`wedge_shape` is carried too, closed-set-checked against `MODE_WEDGE_SHAPE`'s values — the same
+treatment `mode` gets, against a set the probe itself owns.
 
 The config dir holding that token is reclaimed three ways: an exception-safe `finally` that wraps
 the credential write itself (every step of it independently failure-isolated, and a dir that

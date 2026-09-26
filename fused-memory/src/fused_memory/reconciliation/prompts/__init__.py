@@ -5,6 +5,8 @@ import inspect
 import logging
 from collections.abc import Mapping
 
+from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
+
 logger = logging.getLogger(__name__)
 
 # Base template — use {{project_id}} so it survives .format(tools=...) as {project_id}.
@@ -70,6 +72,237 @@ destroys entities and edges exclusively sourced from that episode.\
 """
 
 # ---------------------------------------------------------------------------
+# Stage-gated citation-repair tool listing (task 4395)
+# ---------------------------------------------------------------------------
+# Stage 1 and Stage 2 both HOLD `repair_memory_citation` — it appears only in
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES, which only STAGE3_DISALLOWED folds
+# (cli_stage_runner.py) — yet neither stage's prompt named it, so neither agent
+# ever learned it exists. `--disallowed-tools` OMITS a denied tool rather than
+# rejecting a call, so a held-but-unadvertised tool is indistinguishable from
+# one the stage does not have: there is nothing for the agent to probe.
+#
+# The stage-agnostic server-level listing is NOT the channel for this. The
+# claude CLI truncates FastMCP server `instructions` at 2048 characters and
+# RECON_REPORT_INSTRUCTIONS (server/recon_report.py) is ~7560: the tool NAME
+# survives in the roster line near the top, while the numbered entry carrying
+# its call shape, its two-id contract and its error codes sits past the cut and
+# reaches no agent. The stage prompt is passed as the system prompt and is
+# subject to no such cap, so this block is the ONLY channel that delivers the
+# contract — which is why it states the call shape in full rather than
+# deferring to the server listing.
+#
+# SHARED between Stage 1 and Stage 2 because every sentence below is true
+# verbatim in both: the holding map, the two-id contract, and the reasons
+# Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
+# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py
+# and by test_recon_report_guidance_drift.py's absence guard.
+#
+# The block states the TRIGGER, not only the capability, because an
+# advertisement whose trigger is unstated is inert. Measured while writing it:
+# no MCP tool either stage holds reads a closed run's findings back (the
+# recon-report surface writes the in-flight report and repairs the journal; it
+# has no journal READ), and no stage prompt describes a handoff from the stage
+# that detects a dangling cross-run citation to the two that may repair one —
+# stage3.py names neither the defect nor the tool, which is correct for the
+# denial but leaves the detect->repair route unbuilt. So the block says
+# plainly that the caller does not prospect for candidates and that the ids
+# must arrive from outside the tool. Building that handoff is deliberately NOT
+# this task (it would touch stage3.py and the Stage 3 detector, both outside
+# its scope); it is filed as follow-up work.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. MUST NOT reference any section by HEADING NAME: the
+# block is shared between two prompts whose section sets differ, so a heading
+# that exists in one may not exist in the other (the hazard
+# STALE_KNOWLEDGE_ANNOTATION_NORM's comment records twice) — name parameters and
+# tools instead. Every `mcp__recon-report__` call example below carries BOTH
+# `run_id` and `target_run_id`, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py: the existing assembled-
+# prompt run_id scan is scoped to the shared-guidance tools and does not reach
+# this one. Not an f-string: it is interpolated INTO f-strings, and braces
+# inside an interpolated value are not re-parsed by the enclosing f-string, so
+# its own text needs no {{/}} escaping.
+CITATION_REPAIR_TOOL_BLOCK = """\
+## Repairing a Prior Run's Dangling Citation
+You hold `mcp__recon-report__repair_memory_citation`. Stage 1 and Stage 2 both hold it; \
+Stage 3 is denied it because Stage 3 is read-only and is the stage that DETECTS dangling \
+citations — detect and repair must not be the same actor. Nothing in your tool listing \
+distinguishes a tool you lack from one nobody told you about, so treat this paragraph as \
+the grant.
+
+**When to reach for it.** A memory cited by a PRIOR, already-completed run's finding no \
+longer backs that finding — either it no longer resolves (a consolidation or supersession \
+dropped the record) or it resolves but is the wrong record. The `cite_*` tools cannot \
+reach such a finding: they require the OWNING run to have a live active stage, and a \
+closed run's report state is evicted within minutes. This tool rewrites the durable \
+journal instead, which is why it is the only path.
+
+**Where `target_run_id` and `finding_id` come from — you do NOT go prospecting.** No \
+tool you hold reads a closed run's findings back, so you cannot enumerate candidates and \
+must not try. Act only when something OUTSIDE this tool has already named both ids for \
+you: an operator instruction or an escalation that carries them, or a finding in your own \
+payload that does. Note there is currently no automated handoff from detection to repair \
+— the stage positioned to detect a dangling cross-run citation is read-only by contract \
+and nothing routes its detection here — so absent such a pointer, this tool is not your \
+move.
+
+**Call shape.**
+`mcp__recon-report__repair_memory_citation(run_id=<your current run_id>, \
+target_run_id=<the run that OWNS the finding>, finding_id=..., memory_id=<the cited \
+memory>, store="mem0", replacement_memory_id=<the correct memory, or omit to DROP the \
+citation>, reason=..., justification=...)`
+
+The two ids are the trap: `run_id` keeps its usual meaning everywhere else here — YOUR \
+current run, which also supplies the repair's attribution — and `target_run_id` is the \
+run that owns the finding. Passing the target's id as `run_id` does not silently do the \
+right thing; it just fails `run_id_unknown`. Omit `replacement_memory_id` to DROP the \
+citation rather than re-point it.
+
+**`reason` names the defect CLASS and is CHECKED, not trusted** — it is written verbatim \
+into the durable provenance record. `"memory_not_found"` (the default) requires the cited \
+memory to be CONFIRMED ABSENT. `"wrong_memory"` requires it to RESOLVE, and additionally \
+requires a non-blank `justification` saying why it does not back the finding — that record \
+is the only surviving account of removing a citation that was still live. Picking the \
+wrong class is not a judgement call you win: it is a refusal naming the other one.
+
+**Two containment rules.** Only `store="mem0"` can be corroborated (`"graphiti"` is \
+refused with `unsupported_store` — the absence check is a Mem0 point read and would \
+false-flag every graphiti citation as dangling). And the repair is confined to YOUR OWN \
+project: the journal holds runs for every project this process reconciles, so a \
+`target_run_id` owned by another project is refused with `project_mismatch` before any \
+lookup or write.
+
+On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
+`"status"`, so `status` is safe to branch on.\
+"""
+
+# ---------------------------------------------------------------------------
+# Stage-2-only entity-standing-decision writer listing (task 4395)
+# ---------------------------------------------------------------------------
+# STAGE 2 ONLY. `write_entity_standing_decision` sits in
+# DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py), which STAGE1_DISALLOWED
+# and STAGE3_DISALLOWED both fold — it is the first recon-report tool with a durable
+# SQLite-ledger write. So this section must be interpolated into stage2.py and
+# NOWHERE else: naming the tool in Stage 1 or Stage 3 licenses a ledger write from a
+# stage that is read-only with respect to the ledger, and is failed by
+# test_recon_report_guidance_drift.py's absence guard as well as
+# test_recon_report_stage_gated_tool_advertisement.py.
+#
+# A RENDERER rather than a plain constant, matching the form of the two sections it
+# is wedged between and cross-references (render_entity_standing_decision_schema_section
+# / render_investigation_outcome_section, recon_self_model.py): they are functions
+# precisely so the values that live in code reach the prompt by INTERPOLATION rather
+# than by being re-typed. The value this one owes the agent is ARM2_MIN_DISTINCT_RUNS
+# (standing_decision_writer.py) — the arm-2 threshold. Omitting it does not satisfy
+# SPOT, it just moves the cost: with the number unstated, the only way to learn it is
+# to make a doomed call and read the `insufficient_evidence` hint, which is a wasted
+# round-trip on every arm-2 write and an arm the agent cannot plan toward. Neither
+# cross-referenced section states the number (render_investigation_outcome_section()
+# says only that the writer "counts" the records), so interpolating it here is the
+# FIRST statement of it in any prompt, not a second one.
+# The house form for that is adjacent string literals with an f-string only on the
+# segment that interpolates — which is also what keeps the literal `{status: ...}`
+# braces in the Responses paragraph out of any f-string, so no {{/}} escaping arises
+# anywhere in this section. (The rendered TEXT is interpolated INTO stage2.py's
+# f-string, where a value's braces are not re-parsed.)
+#
+# A SEPARATE ENTITY rather than an extension of either existing renderer:
+#   - render_entity_standing_decision_schema_section() is pinned BYTE-IDENTICALLY into
+#     BOTH the Stage 1 and Stage 2 prompts by test_standing_decision_prompt_drift.py,
+#     so anything added there leaks the tool name into Stage 1.
+#   - render_investigation_outcome_section() is Stage-2-only and could carry it, but
+#     that function renders the investigation_outcome RECORD schema; folding the
+#     writer tool into it would make its name lie. A sibling section placed immediately
+#     after it buys the same narrative adjacency — record schema, then the arm-2
+#     evidence pool, then the writer those records unlock — at no cost to either
+#     entity's purpose.
+# It is also separate from CITATION_REPAIR_TOOL_BLOCK above because the two have
+# different HOLDING SETS (Stage 1 + Stage 2 vs. Stage 2 alone); one merged block
+# would force this text into Stage 1.
+#
+# The server-level listing is not an alternative channel: the claude CLI truncates
+# FastMCP server `instructions` at 2048 characters and RECON_REPORT_INSTRUCTIONS
+# (server/recon_report.py) is ~7560, so this tool's numbered entry — the one carrying
+# its "Stage-2 ONLY" gating and both evidence arms — falls past the cut and reaches no
+# agent. Only the roster line naming it survives. That is why the text below states
+# the contract in full instead of pointing at the listing.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Unlike the two shared blocks above, this one DOES reference
+# sections by heading name, and points at them with "above"; that is safe only because
+# it is single-stage, so both headings are reachable, and both their PRESENCE and their
+# ORDER relative to this section are pinned by
+# test_recon_report_stage_gated_tool_advertisement.py rather than left to trust.
+# Restates no OTHER value that lives in code: the grounds enum stays single-sourced by
+# render_entity_standing_decision_schema_section(), which is why this section names the
+# enum's home instead of re-listing its members.
+def render_entity_standing_decision_write_section() -> str:
+    """Render the STAGE-2-ONLY write_entity_standing_decision advertisement (task 4395).
+
+    Wired into the Stage-2 prompt only — Stage 1 and Stage 3 are denied the tool via
+    ``DISALLOW_RECON_REPORT_LEDGER_WRITES``, and naming a tool a stage cannot call
+    surfaces as a silently missing tool rather than a refusal it could act on.
+
+    Interpolates :data:`~fused_memory.reconciliation.standing_decision_writer.ARM2_MIN_DISTINCT_RUNS`
+    into the arm-2 sentence, so the threshold the writer actually enforces reaches the
+    agent as a number it can plan toward rather than as a hint it must provoke a
+    rejection to read.  Everything else it states is a tool-contract fact with no
+    in-code value to track; the grounds enum is deliberately left to the section this
+    one points at.
+    """
+    return (
+        '## Writing an Entity Standing Decision\n'
+        '`mcp__recon-report__write_entity_standing_decision(project_id=..., '
+        'entity_uuid=..., grounds=..., evidence=[...])` is the tool that WRITES the '
+        '`entity_standing_decision` ledger record described under `## Entity Standing '
+        'Decisions` above, and the records you write under `## Investigation Outcome '
+        'Records` are what unlock it. Stage 2 is the ONLY stage that holds it — Stage 1 '
+        'and Stage 3 are denied it (it is the one recon-report tool with a durable '
+        'ledger write, and they are read-only with respect to that ledger). Nothing in '
+        'your tool listing distinguishes a tool you lack from one nobody told you about, '
+        'so treat this paragraph as the grant.\n\n'
+        'It takes NO `run_id`: the decision is about an ENTITY, not about an entry in '
+        "this run's report. It also takes no `authorized_by` — that operator bypass "
+        'lives on the underlying helper and deliberately not on this tool, so your write '
+        'is ALWAYS evidence-gated.\n\n'
+        '**The gate has two arms, and EITHER one authorizes the write.**\n'
+        '- **Arm 1 — cited human-authored evidence.** At least one ref in `evidence` '
+        'must be a mem0 ref that resolves locally IN THIS PROJECT and whose record was '
+        "authored by a HUMAN (checked against the record's own `agent_id`, not against "
+        'anything you assert). An agent-authored record, or one that does not resolve, '
+        'does not count however many you cite.\n'
+        '- **Arm 2 — independent investigation outcomes.** Satisfied by the record pool '
+        'described under `## Investigation Outcome Records` above, with no `evidence` '
+        'cited at all: `investigation_outcome` records for this same `entity_uuid`, '
+        'marked `actionable=false`, spanning at least '
+        f'{ARM2_MIN_DISTINCT_RUNS} DISTINCT `run_id`s. A record carrying no `run_id` '
+        'cannot establish independence and is not counted. Distinct RUNS are the point '
+        '— repeating the same conclusion inside one run buys nothing.\n\n'
+        '**`evidence` is OPTIONAL.** Supply it for arm 1. OMIT it when you are relying '
+        'on arm 2, which is satisfied by mem0 record history alone and needs nothing '
+        'cited: do NOT fabricate an evidence list to reach that path. Refs to other '
+        'stores (escalation ids, task ids) are recorded as provenance but never count '
+        'toward EITHER arm.\n\n'
+        '`grounds` must be a value from the closed enum named under `## Entity Standing '
+        'Decisions` above — that section is where the enum is stated; do not invent a '
+        'value.\n\n'
+        "**Responses.** On success: `{status: 'written', entity_uuid, grounds, "
+        'edge_count_at_decision, expires_at, decided_at}`. Three structured errors, each '
+        'keyed by `error`: `insufficient_evidence` when NEITHER arm holds — it carries '
+        '`unmet_arms` (each unmet arm with what it needs, and for arm 2 the distinct-run '
+        'count observed so far) plus a `hint`, so read it and act on it rather than '
+        'retrying the same call; `invalid_grounds` when `grounds` is outside the enum; '
+        'and `service_not_configured` when the ledger is not wired, which is an operator '
+        'problem and not something more evidence will fix. A BACKEND FAILURE is a fourth '
+        'outcome and does NOT arrive in that shape: the decision-time edge-count '
+        'sampling fails loudly by design rather than persisting a poisoned count, so it '
+        'reaches you as a RAISED tool error with no `error` key at all. It is raised '
+        'BEFORE the ledger row is written — nothing was persisted, so a retry is safe.'
+    )
+
+# ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
 # States the precedence order for annotating superseded, wrong, or corrupted
@@ -78,6 +311,9 @@ destroys entities and edges exclusively sourced from that episode.\
 # face value. Shared between Stage 1 and Stage 2 because both hold every tool
 # named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
 # DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
+# That precondition is what lets clause (d) name `consolidate_memories`
+# (task 3134): the op sits behind DISALLOW_MEMORY_WRITES, which neither stage
+# folds, so both stages hold it.
 # Placed in the prompt rather than CLAUDE.md because the recon stages are the
 # only consumer of raw episode prose.
 #
@@ -88,7 +324,13 @@ destroys entities and edges exclusively sourced from that episode.\
 # and requires every such example to carry `run_id=`; this section introduces
 # none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
 # stage2.py has no such section; refer to `replacement_memory_id` by
-# parameter name instead, a tool-level fact true in both stages. Not an
+# parameter name instead, a tool-level fact true in both stages. For the same
+# reason MUST NOT reference "## Executing a Cluster Fold" by heading name
+# (task 3134): that section is stage1.py-only, so clause (d) names the op by
+# tool name and the stage-1 section cross-references the op, never the
+# reverse. These four MUST-NOTs are pinned in
+# tests/test_stage1_consolidation_guidance.py::TestSharedNormNamesTheSanctionedPath.
+# Not an
 # f-string: it is interpolated INTO f-strings, and braces inside an
 # interpolated value are not re-parsed by the enclosing f-string, so its own
 # text needs no {{/}} escaping (there are none below regardless).
@@ -123,10 +365,17 @@ for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve 
 problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
 exists precisely to avoid the cascade, so a rejected redaction means fix the \
 `new_content` and retry (b), never escalate to (c).
-(d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
-`mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
-delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
-delete and re-add the survivor.
+(d) **Mem0 cluster consolidation**: to fold a MULTI-record duplicate cluster, call \
+`mcp__fused-memory__consolidate_memories`. It writes the canonical BEFORE any delete, \
+repoints task-metadata citations onto it, tags the retained peers in place (preserving \
+their point ids) and corroborates closure by a deterministic re-read — none of which the \
+hand-rolled sequence guarantees, which is why that sequence nets +1 entry per failed pass. \
+The amend-in-place-then-delete sequence remains right for exactly two cases: (i) \
+superseding a SINGLE record, where `mcp__fused-memory__update_memory` preserves the \
+survivor's id — see the tool listing above for why that matters — and (ii) hand-finishing \
+a `partial` consolidation. In both, amend the SURVIVOR in place FIRST and only THEN delete \
+the redundant entries, naming the survivor via `replacement_memory_id`. Never delete and \
+re-add the survivor.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
@@ -263,6 +512,79 @@ detail as redundant.\
 """
 
 
+# Canonical finding-provenance metadata keys (esc-3796-1, task 4373).
+#
+# The recon prompts have always mandated CAPTURING a Stage-1 `finding_id`, but
+# never said WHERE to persist it on a task filed from that finding. Neither key
+# has a code writer — the PROMPT is the writer — so an unnamed key is an
+# uninstructed one, and the corpus duly forked into 64 bespoke spellings. These
+# constants are the ratified names, single-sourced: every prompt surface that
+# names a finding-provenance metadata key interpolates them, so the three
+# stages cannot drift apart and a future rename is one edit rather than a hunt.
+#
+# Deliberately plain string literals, NOT imported from
+# `shared.task_metadata`: this module imports stdlib only, and widening the
+# prompt-import path to reach the allowlist would couple prompt rendering to
+# the task-metadata package for a two-token agreement. That agreement is
+# enforced instead by tests/test_finding_provenance_prompt_guidance.py, which
+# cross-checks both constants against `parse_metadata` — where this repo
+# already puts its drift guards.
+FINDING_ID_METADATA_KEY = 'source_finding_id'
+FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
+
+# The OTHER vocabulary — and the distinction an earlier revision of this module
+# collapsed, at the cost of making the whole Stage-1 half of the provenance rule
+# a silent no-op.
+#
+# The two constants ABOVE are TASK METADATA keys: what a task filed from a
+# finding carries in its `metadata=`. The two BELOW are ASSEMBLED FLAGGED-ITEM
+# field names: what `server/recon_report.py::ReconReportState.get_assembled_report`
+# projects onto each flagged item as it hands Stage 1's report to Stage 2. The
+# relay hop and the persistence hop carry the same two values under DIFFERENT
+# names, and the earlier text told Stage 1 to relay them under the metadata
+# spellings — onto a projection that rebuilds each item field-by-field and has
+# no passthrough at all, so those fields were discarded before Stage 2 saw them.
+#
+# Plain string literals for the same reason as above: this module is stdlib-only
+# by design and does not import the server package for a two-token agreement.
+# That agreement is enforced instead by an in-process `get_assembled_report`
+# round-trip in tests/test_finding_provenance_prompt_guidance.py — the same
+# place, and the same discipline, as the `parse_metadata` cross-check that
+# guards the metadata keys.
+FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
+FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
+
+# The negative half of the vocabulary rule, single-sourced per INV-5
+# `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
+# above is: it was briefly written twice — once in the shared recon-report block
+# and once in the per-stage provenance section — so every Stage 1/2 prompt
+# carried two near-identical paragraphs that a maintainer rewording either copy
+# would not know about. It now lives HERE only; reword HERE.
+#
+# It is interpolated by `render_finding_provenance_section` alone, which is the
+# only ACTIONABLE surface (Stage 1 and Stage 2 — the stages that can cause one
+# of these keys to be written, directly or by relay). The shared block that
+# Stage 3 sees deliberately gets the NAMES without this rule: Stage 3 folds
+# DISALLOW_TASK_WRITES, so it cannot mint a variant key, and this package does
+# not tell a stage about an action it is not sanctioned to take
+# (`render_escalation_boundary_note`). A second interpolation site is not
+# forbidden — but it must interpolate this constant rather than re-type it, and
+# the assembled-prompt occurrence counts in
+# tests/test_finding_provenance_prompt_guidance.py must move with it.
+#
+# NOTE: a PLAIN (non-f) string, so the two key names are appended by the caller
+# rather than interpolated here.
+FINDING_PROVENANCE_VOCABULARY_RULE = (
+    'Those two spellings are the whole vocabulary. Never mint a per-topic '
+    'variant of either name: the corpus already forked into 64 such spellings '
+    '(e.g. `title_count_corrected_source_finding`, '
+    '`stage2_addendum_finding_latest`), which is what made finding provenance '
+    'ungreppable in the first place. A genuinely one-off annotation goes under '
+    'the `x_` namespace — silently allowed — rather than becoming a 65th '
+    'bespoke top-level key.'
+)
+
+
 def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     """Render the escalation-store boundary note for one stage.
 
@@ -305,6 +627,121 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
         else _ESCALATION_BOUNDARY_NO_ACTION
     )
     return f'{ESCALATION_BOUNDARY_NOTE} {clause}\n\n{_GATE_CLOSURE_ARCHIVE_GUIDANCE}'
+
+
+def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
+    """Render the finding-provenance section for one stage (esc-3796-1, task 4373).
+
+    Follows the :func:`render_escalation_boundary_note` /
+    :func:`render_source_completion_section` (recon_self_model.py) precedent:
+    ONE shared stage-agnostic body plus a single clause selected by a
+    keyword-only capability flag, so the shared half exists exactly once
+    (INV-5 ``no-lockstep-duplication``).
+
+    The clause is parameterized because ``submit_task`` IS in
+    ``DISALLOW_TASK_WRITES``: Stage 2 holds it and sets the keys itself, while
+    Stage 1 does not and can only relay. Naming a tool in a stage's prompt is a
+    live positive license, not inert prose, so handing Stage 1 the Stage-2 text
+    would instruct it to take an action it cannot take. Read the per-stage
+    disallow lists at their source in ``cli_stage_runner.py`` — their
+    composition is deliberately NOT restated here, because a mirrored inventory
+    in a docstring goes stale silently (exactly the failure mode that hid the
+    Stage-2 escalation-read gap until task 3163).
+
+    THE RELAY CHANNEL, as verified rather than assumed. The relay branch does
+    NOT tell Stage 1 to attach the two values to the flagged item under names of
+    its own choosing — it cannot.
+    ``server/recon_report.py::ReconReportState.get_assembled_report`` rebuilds
+    each flagged item as a fixed projection with no passthrough, and
+    ``add_finding`` accepts no ``**kwargs``, so a field Stage 1 invents is
+    discarded before Stage 2 ever sees it. What DOES survive is that projection,
+    which ``stages/task_knowledge_sync.py::_format_flagged`` json.dumps into
+    Stage 2's context unmodified. So the branch names the projected fields the
+    two ``FLAGGED_ITEM_*`` constants hold, and names ``cite_memory`` — which
+    Stage 1 does hold — as the only way to populate the citation one. The
+    projection's field list is deliberately NOT transcribed here; read it at the
+    source, for the same reason the disallow lists are not restated above.
+
+    An earlier revision of this branch asserted the opposite, that flagged items
+    are free-form objects, which made the entire Stage-1 half inert while every
+    prose-level expectation still read as satisfied. The in-process round-trip
+    in tests/test_finding_provenance_prompt_guidance.py is the guard that now
+    catches that class of claim, and it is why a channel named here must be one
+    the assembler actually emits.
+
+    One deliberate DIVERGENCE from ``render_source_completion_section``'s
+    relay branch: that one names the tool it is denying ("you do NOT hold
+    submit_task in this stage"), whereas this one does not name it at all — a
+    name surfaced to a model in a negation is still a name surfaced. That is a
+    style choice, not a capability rule (the two sections make opposite calls
+    about the same tool and both are safe); tests/test_finding_provenance_prompt_guidance.py
+    pins the token's absence from this branch, so harmonising the two sections
+    means deciding it here and moving that expectation with the edit.
+
+    Args:
+        can_file_tasks: True for Stage 2, which holds the task-write tools and
+            persists the keys itself; False for Stage 1, which holds none and
+            must relay to Stage 2.
+
+    Returns:
+        The shared provenance body plus the matching capability clause. The
+        value is interpolated into the stage f-strings at runtime, and an
+        interpolated value is never re-scanned for braces (nor is either
+        assembled prompt ever ``.format()``-ed — ``build_stage2_system_prompt``
+        does string injection, not formatting), so unlike the plain-string
+        constants above this text is under no brace-doubling constraint.
+    """
+    if can_file_tasks:
+        capability_clause = (
+            'You hold `submit_task` in this stage, so set both keys yourself. Both '
+            'values come off the flagged item you are triaging: its '
+            f'`{FLAGGED_ITEM_FINDING_ID_FIELD}` field goes into '
+            f'`metadata.{FINDING_ID_METADATA_KEY}`, and the `memory_id` of each '
+            f'entry in its `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` list into '
+            f'`metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — a list of bare '
+            'memory-id strings, NOT the citation objects themselves. Each entry '
+            f'of `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` is an object carrying '
+            '`memory_id`, `store` and a nested `metadata_fingerprint`; copying '
+            'those objects through whole writes a nested blob under a key whose '
+            'ratified shape is a flat id list. Set them in the '
+            '`metadata=` you pass to `mcp__fused-memory__submit_task` at the moment '
+            'you file the task — not as a later `update_task` repair, which leaves a '
+            'window in which the task exists with no provenance at all. Not every '
+            f'flagged item carries `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` — some '
+            'reach you as re-projections that carry the finding id alone, or '
+            'neither — so when that field is absent or empty, OMIT '
+            f'`{FINDING_MEMORY_IDS_METADATA_KEY}` entirely rather than inventing a '
+            'value for it.'
+        )
+    else:
+        capability_clause = (
+            'You cannot file tasks in this stage (task writes are disallowed '
+            'here), so Stage 2 persists these keys, not you. Your job is to make '
+            'sure both values reach it, and they travel by different routes. The '
+            f'finding id arrives on its own, as the `{FLAGGED_ITEM_FINDING_ID_FIELD}` '
+            'field of the flagged item assembled from your finding — you do not '
+            'attach it by hand, and a field you add yourself is dropped during '
+            'assembly. The memory ids arrive ONLY if you cite them with '
+            '`mcp__recon-report__cite_memory`, which is what lands them in that '
+            f'same flagged item under `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}`. A '
+            'finding whose memories were never cited reaches Stage 2 with an empty '
+            'list, and its provenance cannot be reconstructed afterwards — so cite '
+            'every memory the finding rests on, at the time you file it.'
+        )
+    return (
+        '## Finding Provenance\n'
+        'A task filed from a Stage-1 finding must carry that finding\'s provenance '
+        'under two named keys:\n'
+        f'- `metadata.{FINDING_ID_METADATA_KEY}` — the `finding_id`, captured '
+        'verbatim from the filing response. How you obtain it is governed by the '
+        '`## Verifying add_finding responses` rule; never compose or guess one.\n'
+        f'- `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — the memory ids that '
+        'finding cites, as a flat list of bare memory-id strings (e.g. '
+        '`["90bd6ecf-..."]`), never a list of citation objects.\n\n'
+        + FINDING_PROVENANCE_VOCABULARY_RULE
+        + ' '
+        + capability_clause
+    )
 
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
@@ -353,7 +790,19 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 # Call shapes below are GENERATED from live FastMCP tool signatures (task-2559
 # root-cause fix for run_id-omission drift that survived two reviewer rounds) —
 # see render_recon_report_tool_guidance() — rather than hand-transcribed, so a
-# rendered example can never silently omit a required kwarg again.
+# rendered example can never silently omit a required KWARG again.
+#
+# Which TOOLS get a call shape at all is derived too (task 3878): the renderer
+# iterates the keys of the signature mapping it is handed, so it can no longer
+# silently omit a whole tool the way its predecessor — nine hard-coded
+# render_call('...') invocations that ignored the mapping's other keys — did.
+# The mapping is the live tool set minus the harness-called and stage-gated
+# tools (start_report keeps its PROSE mention below — the sentence that tells
+# the agent not to call it — but no call shape).
+#
+# Classification rules and rationale: see the "Tool classification" block in
+# server/recon_report.py, which is the single canonical statement of them and
+# sits where an author registering a new @mcp.tool() is already looking.
 _RECON_REPORT_PLACEHOLDERS = {
     'run_id': '<from Reconciliation Context>',
     'finding_id': '<finding_id from add_finding response>',
@@ -364,6 +813,7 @@ _RECON_REPORT_PLACEHOLDERS = {
     'actionable': '<actionable>',
     'task_id': '<task_id>',
     'flag_type': '<flag_type>',
+    'supersedes': '<finding_id of the earlier finding this one makes historical>',
     'key': '<key>',
     'value': '<value>',
     'delta': '<delta>',
@@ -374,6 +824,159 @@ _RECON_REPORT_PLACEHOLDERS = {
     'memory_id': '<uuid>',
     'store': "<'mem0'|'graphiti'>",
     'cited_run_id': '<full 36-char run UUID>',
+}
+
+
+
+# The curated NARRATIVE order the guidance renders KNOWN tools in — deliberately
+# NOT registration order (``signatures.keys()`` yields start_report /
+# add_finding / set_stat / inc_stat / complete / delete_finding / cite_*),
+# because the prose tells a story: file a finding -> attach typed citations ->
+# record stats -> terminal complete.
+#
+# This tuple governs PLACEMENT and prose richness ONLY — never PRESENCE (task
+# 3878). :func:`_render_recon_report_tool_guidance` renders every key of the
+# mapping it is handed, appending a generic call-shape bullet for any tool not
+# named here, so a newly-registered tool cannot be silently omitted from the
+# guidance; the worst that can happen is that it lands in the trailing "Also
+# registered on this server" list with no curated annotation until someone
+# writes one. A name here that is ABSENT from the mapping is skipped rather
+# than raising, so this tuple going stale in the other direction (a tool
+# deregistered upstream) cannot break rendering either.
+#
+# This tuple and _GUIDANCE_TOOL_PROSE below must stay in sync — every name here
+# except the _GUIDANCE_STATS_GROUP pair needs a prose entry. That is pinned by
+# tests/test_recon_report_guidance_drift.py::TestCuratedGuidanceTablesStayInSync,
+# and a slip degrades to a generic bullet rather than raising (see
+# _render_recon_report_tool_guidance's is_annotated()).
+_GUIDANCE_TOOL_ORDER: tuple[str, ...] = (
+    'add_finding',
+    'delete_finding',
+    'cite_entity',
+    'cite_edge',
+    'cite_task',
+    'cite_memory',
+    'cite_run',
+    'set_stat',
+    'inc_stat',
+    'complete',
+)
+
+# The citation tools share ONE lead-in sentence introducing them as a list.
+# It is emitted immediately before whichever of them renders FIRST (rather
+# than being welded onto add_finding's paragraph, where it used to live), so
+# inserting delete_finding between filing and citing does not strand a
+# colon-terminated 'Then attach typed citations:' in front of unrelated prose
+# — and so the lead-in disappears entirely if no citation tool is present.
+_GUIDANCE_CITATION_GROUP: tuple[str, ...] = (
+    'cite_entity',
+    'cite_edge',
+    'cite_task',
+    'cite_memory',
+    'cite_run',
+)
+_GUIDANCE_CITATIONS_LEAD_IN = 'Then attach typed citations:\n'
+
+# set_stat and inc_stat share ONE sentence because they are ALTERNATIVES ("use
+# X or Y"), not successive steps like the rest of the narrative. They render as
+# a group, at the position of whichever of them comes first in
+# _GUIDANCE_TOOL_ORDER, with whichever are present joined by ' or ' — splitting
+# them into two independent sentences would change the shipped wording.
+_GUIDANCE_STATS_GROUP: tuple[str, ...] = ('set_stat', 'inc_stat')
+
+# Opening prose. Unconditional, and deliberately NOT derived from *signatures*:
+# start_report's mention here is the sentence that tells the agent the harness
+# already called it, so it must survive even though no start_report CALL SHAPE
+# is rendered (the caller filters it out — see HARNESS_CALLED_REPORT_TOOLS in
+# server/recon_report.py).
+_GUIDANCE_PREAMBLE = (
+    'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
+    ' — do NOT call it yourself. '
+)
+
+# Curated per-tool prose. The `{call}` marker is substituted with the rendered
+# call shape via ``str.replace`` (NOT ``str.format``), so prose containing
+# literal braces needs no escaping.
+#
+# Keys must cover _GUIDANCE_TOOL_ORDER minus _GUIDANCE_STATS_GROUP (whose two
+# tools share one sentence rendered from this table's peer above). A missing or
+# renamed key does NOT raise — the tool degrades to an uncurated "Also
+# registered on this server" bullet — so the sync is pinned by a test rather
+# than by a crash; see _render_recon_report_tool_guidance's is_annotated().
+#
+# This prose is LOAD-BEARING, not decoration: the cite_task dedup-anchor
+# paragraph, the cite_edge/cite_memory verbatim-UUID rules, cite_run's
+# never-paraphrase rule and complete's terminal-action rule are all behavioural
+# contracts the stages depend on. Edit the wording here and it propagates to
+# every stage prompt at once; delete it and a stage silently loses the rule.
+_GUIDANCE_TOOL_PROSE: dict[str, str] = {
+    # The provenance-keys sentence names the two canonical metadata keys for
+    # EVERY stage (Stage 3 sees only this block); the vocabulary rule and the
+    # actionable set-them-here instruction live in
+    # FINDING_PROVENANCE_VOCABULARY_RULE / render_finding_provenance_section,
+    # which Stage 1 and Stage 2 also get. Keep this entry free of a
+    # hand-written recon-report call example — the call shape is GENERATED from
+    # live signatures via the '{call}' placeholder (task-2559), and
+    # test_recon_report_guidance_drift.py fails any call opener in an assembled
+    # prompt that omits `run_id=`.
+    'add_finding': (
+        'For each finding, call `{call}` and capture the `finding_id` from the'
+        ' response.'
+        ' When that finding\'s provenance is persisted on a task, the canonical'
+        f' metadata keys are `metadata.{FINDING_ID_METADATA_KEY}` for the'
+        ' `finding_id` captured verbatim above, and'
+        f' `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` for the memory ids that'
+        ' finding cites. '
+    ),
+    'delete_finding': (
+        'To retract a finding you filed in error, call `{call}` — IRREVERSIBLE, and'
+        ' scoped by run_id + finding_id. It is rejected once that finding\'s OWNING'
+        ' stage entry has been completed, so retraction is for in-progress stages'
+        ' only: because every stage calls `complete` as its terminal action, that'
+        ' guard means you are retracting a finding your own still-running stage'
+        ' filed, not overriding a verdict a finished stage already closed.'
+        ' Structured errors: run_id_unknown / finding_unknown /'
+        ' report_already_completed. Retract and re-file rather than filing a'
+        ' correction alongside a finding you know to be wrong — that applies to'
+        ' your OWN stage. To retire an EARLIER stage\'s claim, which this tool'
+        ' refuses, pass `supersedes=<that finding_id>` on `add_finding` instead:'
+        ' it marks the old finding historical and keeps it readable rather than'
+        ' destroying it.\n'
+    ),
+    'cite_entity': (
+        '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
+        ' internally.\n'
+    ),
+    'cite_edge': (
+        '- `{call}` — copy the UUID verbatim from the `id` field of a fresh tool result'
+        ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
+    ),
+    'cite_task': (
+        '- `{call}` — both project_id and task_id are required. **Dedup anchor**:'
+        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
+        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
+        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
+        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
+        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
+        ' supplementary stable anchor when one clear primary subject exists. Exception:'
+        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
+        ' sole dedup anchor there.\n'
+    ),
+    'cite_memory': (
+        '- `{call}` — `memory_id` must be the full 36-char UUID from the `id` field of a'
+        ' fresh tool result.\n'
+    ),
+    'cite_run': (
+        '- `{call}` — whenever a finding\'s description or suggested_action references'
+        " another reconciliation run's run_id, call this to confirm it exists and attach"
+        ' it. Copy `cited_run_id` verbatim from the `run_id` or `metadata.run_id` field of'
+        ' a fresh tool result — never re-type or paraphrase a run_id from memory.\n'
+    ),
+    'complete': (
+        'When all findings are recorded and all work is done, call `{call}` as your'
+        ' terminal action — do NOT produce a structured JSON response; the assembled'
+        ' recon_report state is the authoritative output channel for this stage.'
+    ),
 }
 
 
@@ -415,8 +1018,35 @@ def _render_recon_report_tool_guidance(
     renders bare, mirroring common CLI usage-string conventions
     (``cmd required [optional]``).
 
-    start_report is harness-called (agents never call it themselves) and is
-    intentionally excluded from generation — its mention below stays prose.
+    This function excludes NOTHING. start_report is absent from the rendered
+    call shapes because the CALLER does not hand it over; the exclusion is data
+    applied by :func:`render_recon_report_tool_guidance`, not a property of
+    this function, which renders whatever mapping it is given. Filtering which
+    tools an agent should be told about at all is the CALLER's job (rules and
+    rationale: the "Tool classification" block in ``server/recon_report.py``).
+    The start_report PROSE mention in :data:`_GUIDANCE_PREAMBLE` is
+    unconditional and deliberately not derived from *signatures* — it is the
+    sentence that tells the agent the harness already called it.
+
+    PRESENCE is derived, PLACEMENT is curated (task 3878). Every key of
+    *signatures* is rendered: :data:`_GUIDANCE_TOOL_ORDER` +
+    :data:`_GUIDANCE_TOOL_PROSE` decide only WHERE a known tool appears and how
+    richly it is annotated, and any tool NOT named there still renders as a
+    generic call-shape bullet under a trailing "Also registered on this server"
+    lead-in. So a newly-registered tool can never be silently absent from the
+    guidance — which is what the previous design, nine hard-coded
+    ``render_call('...')`` calls that ignored the mapping's other keys, allowed.
+
+    Neither curated table can turn a slip into a crash. A curated name MISSING
+    from *signatures* is skipped, and a name in :data:`_GUIDANCE_TOOL_ORDER`
+    with no matching :data:`_GUIDANCE_TOOL_PROSE` entry degrades to the same
+    generic bullet an unknown tool gets (reviewer robustness finding) rather
+    than raising ``KeyError``. That matters because this renderer is shared
+    with the frozen fallback: a raise here would take out BOTH paths at once
+    and surface as an ImportError for every consumer of the ``prompts``
+    package, the exact blast radius the lazy-render design exists to contain.
+    So this function renders whatever it is handed, and never depends on the
+    caller supplying a particular tool or on the two curated tables agreeing.
     """
 
     def render_call(tool_name: str) -> str:
@@ -427,49 +1057,59 @@ def _render_recon_report_tool_guidance(
             parts.append(kwarg if required else f'[{kwarg}]')
         return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
-    add_finding_call = render_call('add_finding')
-    cite_entity_call = render_call('cite_entity')
-    cite_edge_call = render_call('cite_edge')
-    cite_task_call = render_call('cite_task')
-    cite_memory_call = render_call('cite_memory')
-    cite_run_call = render_call('cite_run')
-    set_stat_call = render_call('set_stat')
-    inc_stat_call = render_call('inc_stat')
-    complete_call = render_call('complete')
+    def is_annotated(tool_name: str) -> bool:
+        """Does *tool_name* have curated prose (or a curated group sentence) to render?
 
-    return (
-        'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
-        f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
-        ' and capture the `finding_id` from the response. Then attach typed citations:\n'
-        f'- `{cite_entity_call}` —'
-        ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
-        f'- `{cite_edge_call}` —'
-        ' copy the UUID verbatim from the `id` field of a fresh tool result'
-        ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
-        f'- `{cite_task_call}`'
-        ' — both project_id and task_id are required. **Dedup anchor**:'
-        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
-        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
-        ' supplementary stable anchor when one clear primary subject exists. Exception:'
-        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-        ' sole dedup anchor there.\n'
-        f'- `{cite_memory_call}` — `memory_id` must be the full 36-char UUID from the'
-        ' `id` field of a fresh tool result.\n'
-        f'- `{cite_run_call}` — whenever a finding\'s description or'
-        ' suggested_action references another reconciliation run\'s run_id, call this'
-        ' to confirm it exists and attach it. Copy `cited_run_id` verbatim from the'
-        ' `run_id` or `metadata.run_id` field of a fresh tool result — never re-type'
-        ' or paraphrase a run_id from memory.\n'
-        f'For stats counters use `{set_stat_call}` or'
-        f' `{inc_stat_call}`. When all findings are recorded'
-        ' and all work is done, call'
-        f' `{complete_call}` as your'
-        ' terminal action — do NOT produce a structured JSON response; the assembled'
-        ' recon_report state is the authoritative output channel for this stage.'
-    )
+        _GUIDANCE_TOOL_ORDER and _GUIDANCE_TOOL_PROSE are two tables that must
+        stay in sync, and nothing structurally forces them to. A name in the
+        ORDER with no matching PROSE entry — added to one table only, or a key
+        renamed/typo'd in the other — must NOT raise ``KeyError`` here: this
+        function is shared by the live path AND the frozen fallback, so a raise
+        would take out both and become an ImportError for every consumer of the
+        ``prompts`` package (see :func:`_frozen_recon_report_tool_guidance`).
+        Instead the tool degrades to the same generic call-shape bullet an
+        unknown tool gets, losing one annotation rather than every stage prompt.
+        """
+        return tool_name in _GUIDANCE_STATS_GROUP or tool_name in _GUIDANCE_TOOL_PROSE
+
+    stats_present = [tool for tool in _GUIDANCE_STATS_GROUP if tool in signatures]
+    citations_lead_in_pending = _GUIDANCE_CITATIONS_LEAD_IN
+    sections = [_GUIDANCE_PREAMBLE]
+    for tool in _GUIDANCE_TOOL_ORDER:
+        if tool not in signatures or not is_annotated(tool):
+            # Either a curated name that is no longer registered, or one with no
+            # curated prose to render. Skip it rather than raising: a
+            # deregistered tool degrades to a missing paragraph, an unannotated
+            # one falls through to the generic bullet list below. The
+            # annotation check happens HERE, before the citation lead-in is
+            # emitted, so an unannotated cite_* tool cannot strand a
+            # colon-terminated 'Then attach typed citations:' in front of
+            # unrelated prose.
+            continue
+        if tool in _GUIDANCE_CITATION_GROUP and citations_lead_in_pending:
+            sections.append(citations_lead_in_pending)
+            citations_lead_in_pending = ''
+        if tool in _GUIDANCE_STATS_GROUP:
+            if tool != stats_present[0]:
+                continue  # already covered by the shared stats sentence below
+            joined = ' or '.join(f'`{render_call(name)}`' for name in stats_present)
+            sections.append(f'For stats counters use {joined}. ')
+            continue
+        sections.append(_GUIDANCE_TOOL_PROSE[tool].replace('{call}', render_call(tool)))
+
+    extra = [
+        tool
+        for tool in signatures
+        if tool not in _GUIDANCE_TOOL_ORDER or not is_annotated(tool)
+    ]
+    if extra:
+        bullets = '\n'.join(f'- `{render_call(tool)}`' for tool in extra)
+        sections.append(
+            '\nAlso registered on this server (see the server instructions for full'
+            f' semantics):\n{bullets}'
+        )
+
+    return ''.join(sections)
 
 
 def render_recon_report_tool_guidance() -> str:
@@ -493,23 +1133,42 @@ def render_recon_report_tool_guidance() -> str:
     renders bare, mirroring common CLI usage-string conventions
     (``cmd required [optional]``).
 
-    start_report is harness-called (agents never call it themselves) and is
-    intentionally excluded from generation — its mention below stays prose.
+    Filters the live tool set down to the SHARED-GUIDANCE tools before
+    rendering: harness-called tools (start_report) and stage-gated tools
+    (denied in some stages via DISALLOW_RECON_REPORT_LEDGER_WRITES) are
+    dropped, per the classification constants that live next to the
+    ``@mcp.tool()`` registrations in ``server/recon_report.py``. That filtering
+    is this function's job precisely so that
+    :func:`_render_recon_report_tool_guidance` can stay a pure "render every
+    key I was handed" function shared with the frozen fallback. start_report
+    still gets a prose mention in the rendered text — just no call shape.
 
     Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
     FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
     catches this and falls back to the frozen fallback rather than letting
     it become an ImportError for every consumer of this package.
     """
-    from fused_memory.server.recon_report import get_recon_report_tool_signatures
+    from fused_memory.server.recon_report import (
+        HARNESS_CALLED_REPORT_TOOLS,
+        STAGE_GATED_REPORT_TOOLS,
+        get_recon_report_tool_signatures,
+    )
 
     signatures = get_recon_report_tool_signatures()
+    # WHICH tools an agent is told about is decided by the classification that
+    # lives next to the @mcp.tool() registrations — see the "Tool
+    # classification" block in server/recon_report.py for the rules and why
+    # they exist. Filtering HERE rather than inside
+    # _render_recon_report_tool_guidance() is what lets that renderer stay a
+    # pure 'render everything I was handed' function shared with the frozen
+    # fallback, so the two paths cannot drift in wording.
     specs = {
         tool: tuple(
             (name, param.default is inspect.Parameter.empty)
             for name, param in sig.parameters.items()
         )
         for tool, sig in signatures.items()
+        if tool not in HARNESS_CALLED_REPORT_TOOLS and tool not in STAGE_GATED_REPORT_TOOLS
     }
     return _render_recon_report_tool_guidance(specs)
 
@@ -523,12 +1182,19 @@ def render_recon_report_tool_guidance() -> str:
 # the live guidance uses, so its WORDING cannot drift from the generated
 # guidance -- there is only one prose template and one renderer. The one
 # remaining hand-maintained surface is the snapshot's parameter data (names,
-# order, required-ness): a tool signature change needs that dict updated, and
+# order, required-ness) and its tool-set COVERAGE: this dict must hold exactly
+# the shared-guidance tools, so a newly registered agent-callable tool needs a
+# key here as well as a classification in server/recon_report.py.
 # tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer
-# fails loudly until it is. Every call shape below still carries run_id (true
-# by construction: run_id is required in the snapshot for all 9 tools), so
-# even a stale snapshot cannot regress the original run_id-omission bug
-# task-2559 fixed.
+# fails loudly until it is, comparing this dict against the DERIVED
+# shared-guidance set rather than against a second hand-maintained list.
+# Every call shape below still carries run_id (true by construction: run_id is
+# required in the snapshot for all 10 tools), so even a stale snapshot cannot
+# regress the original run_id-omission bug task-2559 fixed.
+#
+# Key ORDER here mirrors _GUIDANCE_TOOL_ORDER purely so this dict reads in the
+# same sequence as the text it renders; the renderer keys off the curated order
+# tuple, not off this insertion order.
 _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = {
     'add_finding': (
         ('run_id', True),
@@ -539,7 +1205,9 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
         ('actionable', False),
         ('task_id', False),
         ('flag_type', False),
+        ('supersedes', False),
     ),
+    'delete_finding': (('run_id', True), ('finding_id', True)),
     'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),
     'cite_edge': (('run_id', True), ('finding_id', True), ('edge_uuid', True)),
     'cite_task': (
@@ -567,11 +1235,16 @@ def _frozen_recon_report_tool_guidance() -> str:
 
     Deliberately NOT rendered at module-import time (reviewer robustness
     finding). :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS` is hand-maintained,
-    and ``render_call`` (inside :func:`_render_recon_report_tool_guidance`)
-    looks up each of the 9 agent-called tool names in it directly — a future
-    edit that drops, renames, or typos one of those keys raises a bare
-    ``KeyError``. Computing this eagerly at import time turned that into an
-    ImportError for every consumer of the ``prompts`` package, including
+    and rendering it can still fail or silently degrade. A dropped, renamed or
+    typo'd key no longer raises ``KeyError`` — since task 3878 the renderer
+    iterates the mapping it is handed and SKIPS a curated name that is absent —
+    but the failure modes that remain are real: a typo'd key renders as an
+    uncurated "Also registered on this server" bullet instead of its annotated
+    paragraph, a dropped key loses that tool's guidance (and its behavioural
+    rules) entirely, and a malformed VALUE — anything that is not an iterable of
+    ``(name, required)`` pairs — still raises from ``render_call``. Computing
+    this eagerly at import time turned any such raise into an ImportError for
+    every consumer of the ``prompts`` package, including
     sibling submodules such as ``prompts.judge`` that never touch
     recon-report guidance at all — exactly the blast radius
     :func:`get_recon_report_tool_guidance`'s try/except exists to contain.

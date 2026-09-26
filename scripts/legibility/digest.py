@@ -594,6 +594,103 @@ def _signal_text_sources(
     return sources
 
 
+def _dialogue_text_sources(
+    records: list[dict[str, Any]],
+    *,
+    tool_result: bool = False,
+    assistant_text: bool = False,
+    user_text: bool = False,
+) -> list[tuple[int, str]]:
+    """The carriers :func:`_signal_text_sources` yields, minus every one that
+    is re-ingested machine content (:func:`is_reingested_content`).
+
+    Two layers, two questions: :func:`_signal_text_sources` answers "which
+    native carriers exist", and this answers "which of them are this
+    session's own dialogue". Every signal detector reads this layer.
+
+    Dropping is WHOLE-carrier on every carrier kind, tool_results and
+    assistant text included, so a genuine literal printed beside a harness
+    prompt goes with it. That cost is accepted on measurement: across the
+    2026-09-23 dark-factory corpus the harness rule dropped 59 non-user
+    carriers with signal hits, each one foreign material (a Read of a
+    module holding the marker literals, a task record, a dump of another
+    session). Merely NAMING a harness heading drops nothing, because the
+    heading rules are line-anchored.
+    """
+    return [
+        (index, text)
+        for index, text in _signal_text_sources(
+            records,
+            tool_result=tool_result,
+            assistant_text=assistant_text,
+            user_text=user_text,
+        )
+        if not is_reingested_content(text)
+    ]
+
+
+CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
+"""The two top-level keys of a trickle-coder judgment, whose canonical source
+is the response schema in scripts/legibility/coder.py::build_prompt.
+Restated rather than imported: this module PRODUCES the digest coder.py
+consumes, and importing the consumer would invert that layering for two key
+names. A lockstep test over the reply build_prompt prescribes holds the two
+in step, so renaming that schema fails a test instead of silently letting
+coder answers back into the signal counts."""
+
+_JSON_FENCE_RE = re.compile(r'\A```(?:json)?\s*\n(.*)\n```\Z', re.DOTALL)
+"""One outer ```/```json fence enclosing an ENTIRE stripped carrier."""
+
+
+def is_coder_judgment_payload(text: str) -> bool:
+    """True when the WHOLE of *text* is a trickle-coder judgment: a JSON
+    object carrying every :data:`CODER_JUDGMENT_KEYS` key, bare or inside at
+    most ONE outer fence spanning the entire carrier -- the two spellings
+    coder.py::parse_coder_output already reads as one payload.
+
+    Deliberately narrower than that parser, which brace-slices an object out
+    of surrounding prose because its job is rescuing a reply. Here that
+    looseness would read an assistant turn that merely QUOTES the schema as
+    machine content and suppress a genuine self-correction in it, and
+    over-excluding genuine dialogue is the worse error -- the same trade-off
+    :func:`is_harness_injected_turn` makes.
+
+    Any carrier json.loads cannot handle answers False, RecursionError
+    included (it is not a ValueError): this runs on every carrier of
+    arbitrary transcripts and must answer, never abort a digest.
+    """
+    stripped = text.strip()
+    fence = _JSON_FENCE_RE.match(stripped)
+    if fence:
+        stripped = fence.group(1).strip()
+    if not stripped.startswith('{'):
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict) and parsed.keys() >= CODER_JUDGMENT_KEYS
+
+
+def is_reingested_content(text: str) -> bool:
+    """True when *text* is machine content re-ingested as session material
+    rather than this session's own dialogue.
+
+    Two shapes are known: a prior trickle-coder answer
+    (:func:`is_coder_judgment_payload`) and an injected harness prompt or
+    briefing (:func:`is_harness_injected_turn`). Both quote signal literals
+    that belong to another session or to the harness. Session b203a05c
+    record 22, a coder answer, fired self_correct; session 6a527d51 record 3,
+    the trickle-coder prompt embedding the digest it codes, fired df_guard.
+
+    Consulted by EVERY signal bucket, never by one: task 5685's ruling is
+    that this contamination is fixed at the content-classification layer,
+    not per bucket. A newly-sighted machine-payload shape is a one-line
+    addition to this union.
+    """
+    return is_coder_judgment_payload(text) or is_harness_injected_turn(text)
+
+
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect curated self-correction markers in assistant TEXT blocks only.
 
@@ -602,10 +699,13 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     test data, not a real correction) is never scanned -- restricting the
     scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
     structurally excludes both. A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line.
+    suppresses an otherwise-matching line, and a block that is re-ingested
+    machine content as a WHOLE (a prior coder judgment quoting the digest it
+    coded, say) is dropped before the scan by :func:`_dialogue_text_sources`.
+    Block type, whole carrier and single line are three separate filters.
     """
     hits = []
-    for index, text in _signal_text_sources(records, assistant_text=True):
+    for index, text in _dialogue_text_sources(records, assistant_text=True):
         stripped = _strip_decoy_lines(text)
         lowered = stripped.lower()
         for pattern in SELF_CORRECTION_PATTERNS:
@@ -653,11 +753,15 @@ INTERRUPT_PATTERN = 'request interrupted by user'
 def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect NOT_FOUND_PATTERNS in tool_result content only.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A tool_result that is re-ingested machine content as a whole -- a coder
+    judgment, or foreign material carrying a harness prompt such as a dump
+    of another session's digest -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(records, tool_result=True):
+    for index, text in _dialogue_text_sources(records, tool_result=True):
         lowered = _strip_decoy_lines(text).lower()
         for pattern in NOT_FOUND_PATTERNS:
             if pattern in lowered:
@@ -670,11 +774,15 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tool_result content, assistant text, and user-turn text (incl. isMeta
     system injections, excluding isSidechain subagent turns).
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A carrier that is re-ingested machine content as a whole -- the
+    trickle-coder prompt embedding the digest it codes, or a coder judgment
+    quoting that digest back -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(
+    for index, text in _dialogue_text_sources(
         records, tool_result=True, assistant_text=True, user_text=True,
     ):
         lowered = _strip_decoy_lines(text).lower()
@@ -687,18 +795,16 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect the injected interrupt marker in non-sidechain user turns.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line, for parity with the other text-pattern detectors (not_found,
-    df_guard, self_correct) and PRD Sec 13.2's decoy-FAIL suppression
-    contract.
+    A user turn that is re-ingested machine content as a whole -- notably
+    the trickle-coder prompt, whose embedded digest lists earlier
+    '(turn N) request interrupted by user' hits -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line, for parity with the other
+    text-pattern detectors (not_found, df_guard, self_correct) and PRD Sec
+    13.2's decoy-FAIL suppression contract.
     """
     hits = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user' or record.get('isSidechain'):
-            continue
-        text = _user_turn_text(_message_content(record))
-        if not text:
-            continue
+    for index, text in _dialogue_text_sources(records, user_text=True):
         if INTERRUPT_PATTERN in _strip_decoy_lines(text).lower():
             hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
     return hits
@@ -1194,6 +1300,11 @@ def classify_agent_class(
     alpha never guesses when the caller already knows. Otherwise: a
     genuinely empty transcript classifies as 'unknown'; a non-empty
     transcript with no marker match falls back to 'interactive'.
+
+    Unlike every signal detector, it reads the RAW carriers
+    (:func:`_signal_text_sources`), not :func:`_dialogue_text_sources`: it
+    classifies BY injected markers, so filtering them out would delete its
+    own evidence.
     """
     if override is not None:
         return override
@@ -1222,19 +1333,25 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt/
-    report/context-block turns -- the orchestrator briefing, the
-    trickle-coder and resume prompts, the reconciliation judge's
-    run-review prompt and a lone memory-context block alike (see
-    :func:`is_harness_injected_turn`). Every one of those injected shapes
-    lands in the transcript as ordinary user-role text (isMeta unset), so
-    isMeta alone cannot exclude any of them. This function is the SINGLE
-    source for both the gold user_corrections section and render_digest's
-    n_user_turns score component, so this one filter excludes such a turn
-    from the body AND the score together -- which is exactly what
-    confusion-census-2026-07-31 §3.1 asks for, its clusters 1.1(b) and 1.2
-    being one event observed from two surfaces. User corrections are gold
-    (PRD Sec 5) -- this is the highest-priority digest section.
+    entirely tool_result blocks, and re-ingested machine content
+    (:func:`is_reingested_content`): a pasted coder judgment, and every
+    harness-injected briefing/prompt/report/context-block turn -- the
+    orchestrator briefing, the trickle-coder and resume prompts, the
+    reconciliation judge's run-review prompt and a lone memory-context
+    block alike (see :func:`is_harness_injected_turn`). Every one of those
+    injected shapes lands in the transcript as ordinary user-role text
+    (isMeta unset), so isMeta alone cannot exclude any of them. The gold
+    bucket asks the SAME predicate every scalar detector asks rather than
+    holding a private copy of the rule: task 5685's ruling that the fix
+    belongs at the content-classification layer, not per bucket.
+
+    This function is the SINGLE source for both the gold user_corrections
+    section and render_digest's n_user_turns score component, so this one
+    filter excludes such a turn from the body AND the score together --
+    which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
+    clusters 1.1(b) and 1.2 being one event observed from two surfaces.
+    User corrections are gold (PRD Sec 5) -- this is the highest-priority
+    digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -1247,7 +1364,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if is_harness_injected_turn(text):
+        if is_reingested_content(text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
@@ -1267,7 +1384,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 2
+DIGEST_INSTRUMENT_VERSION: int = 3
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1285,6 +1402,9 @@ keys do NOT bump it.
   2 -- the relaxed anchor+corroborator briefing filter
        (:func:`is_harness_injected_turn`) plus the genuine/designed error
        split (:func:`iter_genuine_errors`).
+  3 -- the re-ingested-content classifier (:func:`is_reingested_content`,
+       task 5685), consulted by every text-pattern detector and the
+       gold-turn filter.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.

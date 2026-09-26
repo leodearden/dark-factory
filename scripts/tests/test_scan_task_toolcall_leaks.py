@@ -303,11 +303,9 @@ def test_format_json_empty_list_is_empty_array():
 # ---------------------------------------------------------------------------
 # CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
 #
-# test_recon_busy_check.py's own _run_cli still hardcodes timeout=10 and is
-# presumably subject to the same interpreter-startup-under-load flake (task
-# 4217); it was deliberately left as-is here because it sits outside this
-# task's locked scope (scripts/tests/test_scan_task_toolcall_leaks.py only).
-# A follow-up task was filed to bring it in line.
+# test_recon_busy_check.py now carries the same defensive-timeout pattern
+# under its own RECON_BUSY_CHECK_TEST_TIMEOUT env var (task 4515), so the two
+# harnesses no longer diverge on this point.
 # ---------------------------------------------------------------------------
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"

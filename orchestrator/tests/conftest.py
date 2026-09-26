@@ -5,6 +5,7 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import asyncio
 import itertools
 import json
 import os
@@ -56,6 +57,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
+    CLAIMANT_TTL_SECS,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -67,6 +69,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
@@ -91,32 +94,45 @@ merge_queue._DEBUG_ASSERTS = True
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _reap_leaked_merge_workers():
+async def _drain_leaked_tasks():
+    """Cancel every task a test left pending, then wait, before its loop closes.
+
+    A task cancelled between spawning a subprocess and connecting its pipes
+    survives ONE cancel: asyncio then awaits a transport exit that an
+    unconnected pipe can never signal. pytest-asyncio's ``Runner.close``
+    delivers exactly one, and hung on it. This cancel is the first of the two
+    such a task needs, and the bounded wait lets it land before ``Runner.close``
+    throws the second. Pinned end to end by test_leaked_task_drain.py.
+    """
+    yield
+    own = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not own and not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.wait(pending, timeout=5.0)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_merge_workers(_drain_leaked_tasks):
     """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
 
-    A merge-queue test that raises before its own ``await worker.stop()`` (e.g. an
-    assertion fails partway through) leaks the worker's ``run()`` task and its
-    four background loops, which do real ``git`` subprocess work. If
-    pytest-asyncio's per-test loop teardown (``asyncio.runners._cancel_all_tasks``)
-    then cancels a loop caught mid-subprocess-spawn
-    (``BaseSubprocessTransport._connect_pipes``), the cancellation ``gather``
-    deadlocks and the whole ``pytest tests/`` process HANGS forever at teardown
-    (this is the remaining full-suite teardown stall once the worker-kill hang is
-    fixed; there are 100+ ``create_task(worker.run())`` sites with inline-only
-    cleanup, so per-test ``try/finally`` is not tractable).
-
-    Reaping here — in the test's own loop, before it is closed — via the graceful
-    ``worker.stop()`` (sets ``_running=False`` + sends sentinels + bounded drain)
-    lets each loop FINISH its in-flight subprocess and exit cleanly, instead of
-    being abruptly cancelled mid-spawn. Best-effort and bounded: it never fails a
-    test and is a cheap no-op for the (vast majority of) tests that leak nothing.
+    A merge-queue test that raises before its own ``await worker.stop()`` leaks
+    the worker's ``run()`` task and its background loops, which do real ``git``
+    subprocess work. The graceful ``worker.stop()`` (sets ``_running=False`` +
+    sends sentinels + bounded drain) lets each loop FINISH its in-flight
+    subprocess and exit cleanly; the abrupt cancel that loop teardown would
+    apply instead can wedge. Requesting ``_drain_leaked_tasks`` keeps that net
+    tearing down AFTER this one even if fixture names change. There are 100+
+    ``create_task(worker.run())`` sites with inline-only cleanup, so per-test
+    ``try/finally`` is not tractable. Best-effort and bounded: it never fails a
+    test and is a cheap no-op for tests that leak nothing.
 
     Works for sync and async tests alike: pytest-asyncio (strict mode) provides a
     loop for this async fixture even under a sync test, where ``all_tasks()`` is
     simply empty.
     """
     yield
-    import asyncio
     import contextlib
 
     for task in list(asyncio.all_tasks()):
@@ -834,37 +850,62 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    This is the suite's steward factory, with ONE documented exception (below).
-    Task 3461 merged the two near-identical ``_make_steward`` copies from
-    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``;
-    task 3514 folded in the two that remained —
-    ``test_out_of_band_routing.py``'s ``_steward_config`` / ``_build_steward``,
-    and ``test_steward.py``'s five-fixture graph (whose ``worktree`` /
-    ``mock_config`` / ``mock_queue`` / ``mock_mcp`` / ``mock_briefing`` names
-    survive there as one-line views onto this factory's build).  If you are here
-    to add another, EXTEND this one instead.
+    This is the suite's steward factory, and THE SINGLE OWNER of the rationale
+    for every construction that sits outside it.  Task 3461 merged the two
+    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
+    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
+    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
+    ``mock_briefing`` names survive there as one-line views onto this factory's
+    build).  If you are here to add another, EXTEND this one instead.
 
-    The exception, examined and left standing by task 3551:
-    ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``.  It
-    structurally cannot fold in, for three independent reasons — recorded here so
-    the next reader does not re-litigate it:
+    THE SPLIT IS PERMANENT — a RULING, closed by task 3647, not a deferral.
+    Say so plainly because 3461, 3514 and 3551 each recorded their findings in
+    prose and each successor re-litigated them from scratch anyway.  Task 3647
+    re-derived the census one final time and confirmed:
 
-    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
-       declares inside ``_make_real_steward_factory``, whereas this fixture
-       returns a constructed ``TaskSteward``;
-    2. that construction passes ``config_dir=``, a parameter this fixture does
-       not accept;
-    3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
-       later, with a worktree the *workflow* chooses — it is not a fixture and
-       cannot request ``tmp_path`` at the moment of construction, whereas this
-       one owns its worktree by design.
+    * ``test_steward.py`` and ``test_out_of_band_routing.py`` have NOTHING left
+      to fold — 3514 already did it.  ``test_steward.py``'s ``mock_config`` is
+      literally ``return steward.config``, and what remains in
+      ``test_out_of_band_routing.py`` (``_review_config`` / ``_unblock_config`` /
+      ``_full_role_config``) are ReviewCheckpoint / unblock_auto /
+      byte-equivalence configs, not steward factories;
+    * ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``
+      structurally cannot fold, for three independent reasons:
 
-    Absorbing all three would mean adding ``steward_cls=`` / ``config_dir=``
-    surface AND relaxing the strictly-below-``tmp_path`` worktree assertion below
-    (which task 3514 promoted from convention to an enforced invariant) to serve
-    exactly one consumer.  That factory instead adopted this one's ``project_root``
-    recipe directly (task 3551), so the sandbox invariant is shared even though
-    the construction is not.
+      1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
+         declares inside ``_make_real_steward_factory``, whereas this fixture
+         returns a constructed ``TaskSteward``;
+      2. that construction passes ``config_dir=``, a parameter this fixture does
+         not accept;
+      3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
+         later, with a worktree the *workflow* chooses — it is not a fixture and
+         cannot request ``tmp_path`` at the moment of construction, whereas this
+         one owns its worktree by design.
+
+      Absorbing it would mean adding ``steward_cls=`` / ``config_dir=`` surface
+      AND relaxing the strictly-below-``tmp_path`` worktree assertion below
+      (which task 3514 promoted from convention to an enforced invariant) to
+      serve exactly one consumer.  That factory instead adopted this one's
+      ``project_root`` recipe directly (task 3551), so the sandbox invariant is
+      shared even though the construction is not;
+    * a THIRD sanctioned site exists, which the lineage had missed:
+      ``test_verdict_servers_integration_gate.py``'s
+      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
+      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
+      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
+      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
+      not decided here.
+
+    ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
+    a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
+    construction in this tree against an allowlist that carries the reason for
+    each.  A fourth idiom cannot appear silently — its author must either use
+    this fixture or record why they cannot.  That module also owns the
+    recurrence guard for the sandboxed-``project_root`` block; the assertion
+    itself is ``_orch_helpers.assert_sandboxed_project_root``, which the
+    ``project_root`` recipe below must keep satisfying.
 
     Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
     non-fixture helpers — because it must close over ``tmp_path`` to own the
@@ -1097,6 +1138,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Task 3540: harness._resume_repend_liveness feeds this straight into
+    # timedelta(seconds=...); a spec_set MagicMock attribute raises
+    # TypeError there. THIS is the single owner of the value for the suite —
+    # no test should re-pin it locally. Sourced from _orch_helpers so the
+    # knob and the fixture rows built by `claimant_row` (whose fresh/stale
+    # ages are 0.5x/2x this) can never drift apart.
+    config.claimant_liveness_ttl_secs = CLAIMANT_TTL_SECS
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

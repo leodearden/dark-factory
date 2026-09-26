@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from orchestrator.session_registry import normalize_project_token
 
 logger = logging.getLogger(__name__)
 
@@ -225,8 +226,120 @@ def _weight_table(data: dict[str, Any], key: str, fallback: dict[str, float]) ->
     return section if isinstance(section, dict) else fallback
 
 
+def _canonical_project_weights(table: dict[Any, Any]) -> dict[str, float]:
+    """Re-key *table* so every project weight is keyed on the CANONICAL token.
+
+    A priorities.yaml is hand-edited, so its ``project_weights`` keys drift
+    exactly like the registry's own project tokens do -- ``dark-factory``,
+    ``df`` and ``dark_factory`` are all plausible things for an operator to
+    type for one project. Since task 3812 the cockpit compares those keys
+    against an ALREADY-canonical ``item.project`` (registry_reader folds both
+    record kinds at the read boundary), so an un-folded key here would match
+    nothing at all: the operator's weight would silently do nothing, and
+    ``panes.weight_editor.known_projects`` -- which unions this table's keys
+    with the scanned projects -- would offer the drifted key as a SECOND
+    weightable project alongside the real one.
+
+    COLLISION RULE, deterministic and independent of yaml order: when several
+    raw keys fold to the same token, an ALREADY-CANONICAL key (one where
+    ``normalize_project_token(k) == k``) wins; among non-canonical spellings
+    alone, the lexicographically-LAST raw key wins. The sort below encodes
+    exactly that -- non-canonical keys are applied first, so a canonical key,
+    if present, is the last write into the fresh dict.
+
+    A collision DISCARDS the losing key's weight, so each one is logged at
+    WARNING naming both raw keys, the winner and the dropped value -- the
+    same visible-not-silent idiom as the empty-fold drop below. Silence here
+    would be the very failure this task exists to remove, merely relocated
+    from the lookup to the load: an operator who typed ``dark-factory: 9.0``
+    months ago and ``dark_factory: 1.0`` today loses the 9.0 outright, and
+    the next save (which re-emits only the in-memory table) then deletes the
+    losing line from the file. The rule itself is right -- a weights table
+    cannot hold two weights for one project -- but the operator has to be
+    told which one survived.
+
+    SCOPE: ``project_weights`` only. ``severity_weights`` and
+    ``category_weights`` are deliberately NOT folded -- they are unrelated
+    key vocabularies (an escalation severity, an operator's own category
+    names), not project tokens, and folding them would silently rewrite
+    labels the operator chose. Values pass through verbatim -- numeric
+    coercion is not this helper's job.
+
+    TOTALITY, and why *table* is annotated ``dict[Any, Any]``: this runs on
+    the load path of a HAND-EDITED file, and ``yaml.safe_load`` yields
+    non-str mapping keys for perfectly ordinary unquoted edits -- ``2085:``
+    is an int, ``1.5:`` a float, ``yes:`` a bool, ``~:`` None. This helper
+    must never raise out of ``load_priorities`` (its documented never-raises
+    contract, and PRD section 2's rule that a view is never a dependency: a
+    raise here would stop the cockpit starting). Two things make it total
+    over any key type. The sort key coerces with ``str(k)``, so keys of
+    different types are always comparable -- necessary because
+    ``normalize_project_token(k) == k`` is False for EVERY non-str key and
+    also for a non-canonical str key like ``dark-factory``, which puts them
+    in the same first-element group where the tuple falls through to the
+    second element. And ``normalize_project_token`` is itself total, because
+    it coerces its argument with ``str()`` first -- which is exactly why
+    ``str(k)`` is the right coercion here: the key-space the sort orders and
+    the key-space the fold produces stay in agreement. For str keys
+    ``str(k) == k``, so the COLLISION RULE above is provably unmoved (pinned
+    by TestProjectWeightKeyFolding's two collision tests, which are green
+    unchanged).
+
+    EMPTY FOLD IS DROPPED, visibly: a key normalizing to '' (``~:``, ``'':``,
+    ``'   ':``) is skipped with a WARNING naming the raw key and its type,
+    mirroring _warn_if_severity_weights_missing_escalation_vocabulary's
+    visible-not-silent idiom. '' is the UNSET-project sentinel, not a token:
+    keeping it would silently apply that weight to every row whose project is
+    unset, and would put the scorer back in disagreement with
+    ``panes.weight_editor.known_projects``, which already excludes '' -- the
+    exact scorer/picker divergence task 3812 exists to make impossible. Note
+    this drops only keys that fold to nothing: a non-str key with real
+    content is folded BY VALUE and kept (``2085:`` -> ``'2085'``), since
+    bare-task-id project tokens are real in this fleet.
+
+    Because ``save_priorities`` re-emits whatever keys the in-memory table
+    holds, a load->save cycle HEALS a drifted priorities.yaml in place: the
+    next save writes the canonical keys back.
+    """
+    canonical: dict[str, float] = {}
+    winning_key: dict[str, Any] = {}
+    for key in sorted(table, key=lambda k: (normalize_project_token(k) == k, str(k))):
+        folded = normalize_project_token(key)
+        if not folded:
+            logger.warning(
+                'load_priorities: project_weights key %r (%s) normalizes to the empty '
+                'unset-project token and is DROPPED -- keeping it would silently weight '
+                'every row whose project is unset. Use a real project token as the key.',
+                key,
+                type(key).__name__,
+            )
+            continue
+        if folded in canonical:
+            logger.warning(
+                'load_priorities: project_weights keys %r and %r both name project %r -- '
+                'keeping %r=%r and DROPPING %r=%r. Keep one key per project, spelled %r; '
+                'saving from the cockpit rewrites the file with that key alone.',
+                winning_key[folded],
+                key,
+                folded,
+                key,
+                table[key],
+                winning_key[folded],
+                canonical[folded],
+                folded,
+            )
+        canonical[folded] = table[key]
+        winning_key[folded] = key
+    return canonical
+
+
 def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
-    """Build a Priorities from a parsed YAML dict, defaulting missing sections/fields."""
+    """Build a Priorities from a parsed YAML dict, defaulting missing sections/fields.
+
+    ``project_weights`` is additionally re-keyed onto canonical project
+    tokens -- see _canonical_project_weights for the collision rule and for
+    why severity/category are deliberately left alone (task 3812).
+    """
     fallback = Priorities.default()
     defaults_section = _section_dict(data, 'defaults')
     age_curve_section = _section_dict(data, 'age_curve')
@@ -234,7 +347,18 @@ def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
     return Priorities(
         severity_weights=_weight_table(data, 'severity_weights', fallback.severity_weights),
         category_weights=_weight_table(data, 'category_weights', fallback.category_weights),
-        project_weights=_weight_table(data, 'project_weights', fallback.project_weights),
+        # Folded AFTER _weight_table has resolved absent/null/non-mapping
+        # sections, so the helper only ever sees a mapping. That alone is NOT
+        # why it cannot raise into load_priorities' never-raises contract --
+        # a mapping's KEYS can still be any type yaml.safe_load produced. The
+        # totality argument has three legs: a mapping from _weight_table, a
+        # sort key total over arbitrary key types via str(k), and
+        # normalize_project_token total via its own str() coercion. See
+        # _canonical_project_weights' TOTALITY paragraph.
+        # Folding the bundled fallback is a no-op -- it is {}.
+        project_weights=_canonical_project_weights(
+            _weight_table(data, 'project_weights', fallback.project_weights)
+        ),
         defaults=Defaults(
             severity=defaults_section.get('severity', fallback.defaults.severity),
             category=defaults_section.get('category', fallback.defaults.category),
@@ -334,6 +458,13 @@ def load_priorities(path: Path | None = None) -> Priorities:
     ``_warn_if_severity_weights_missing_escalation_vocabulary`` -- since a
     decision with one of those severities would otherwise silently score at
     ``defaults.severity`` instead of its real weight.
+
+    The loaded ``project_weights`` table IS re-keyed, onto canonical project
+    tokens (task 3812) -- that is not a migration of the file but a fold of
+    the in-memory table, so an operator's hand-typed ``dark-factory`` key
+    matches the canonical ``item.project`` score() sees. A later
+    ``save_priorities`` then heals the file in place. See
+    ``_canonical_project_weights``.
     """
     target = path if path is not None else _default_priorities_path()
 

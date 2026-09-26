@@ -44,8 +44,8 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about. Includes the C1 schema
     extensions (parent_session_id/spawn_mode/display/question) and the
-    task-4193 hook-owner binding (claude_session_id) alongside the original
-    rail fields.
+    task-4193 hook-owner binding (claude_session_id, claude_owner_pid)
+    alongside the original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -74,6 +74,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
         'claude_session_id': 'uuid-claude-abc123',
+        'claude_owner_pid': 424242,
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -83,6 +84,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 # established by orchestrator.harness._pid_alive's own test suite: 2**31 - 1,
 # orchestrator/tests/test_reconcile_stranded.py:34).
 _DEAD_PID = 2**31 - 1
+
+# A pid that is not merely dead but UNREPRESENTABLE: larger than the platform's
+# C pid_t, so os.kill cannot even be asked about it. Sibling of _DEAD_PID and a
+# genuinely different class of input -- _DEAD_PID exercises the
+# ProcessLookupError branch, this one the OverflowError that branch never sees.
+_UNREPRESENTABLE_PID = 2**70
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
@@ -249,6 +256,77 @@ def test_session_record_defaults_claude_session_id_to_none() -> None:
     assert record.claude_session_id is None
 
 
+def test_session_record_round_trip_includes_claude_owner_pid() -> None:
+    # esc-4193-11 suggestion 3: to_dict/from_dict must actually carry
+    # claude_owner_pid -- without a non-None value in _make_record's fields,
+    # the round-trip pin above is vacuous (both sides default to None even
+    # if to_dict silently dropped the key).
+    r = _make_record()
+    assert r.claude_owner_pid == 424242
+    assert r.to_dict()['claude_owner_pid'] == 424242
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),  # bool is an int subclass; must be rejected before the int check
+        ('x', None),
+        (3.0, None),
+        (0, None),
+        (-1, None),
+        (None, None),
+        (4242, 4242),
+    ],
+)
+def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
+    assert sr._coerce_owner_pid(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),
+        (123, None),
+        (3.0, None),
+        (None, None),
+        ('', None),
+        ('   ', None),
+        ('uuid-claude-abc123', 'uuid-claude-abc123'),
+        ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
+    ],
+)
+def test_coerce_session_id(raw: object, expected: str | None) -> None:
+    assert sr._coerce_session_id(raw) == expected
+
+
+def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
+    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
+    # carrying a non-string claude_session_id must not survive into the
+    # SessionRecord -- session_hooks does `(record.claude_session_id or
+    # '').strip()` outside a try/except, so a raw int here would raise
+    # AttributeError and lose the whole hook event.
+    data = _make_record().to_dict()
+    data['claude_session_id'] = 123
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_session_id is None
+
+
+def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
+    # Sibling to the claude_session_id regression test above (task 4660
+    # review follow-up): pins the from_dict call site for claude_owner_pid
+    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
+    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
+    # otherwise survive as a real-looking pid, which could silently compare
+    # equal to a real pid in session_hooks._env_slug_ownership
+    # (session_hooks.py:329).
+    data = _make_record().to_dict()
+    data['claude_owner_pid'] = True
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_owner_pid is None
+
+
 def test_spawn_mode_enum_values() -> None:
     assert issubclass(sr.SpawnMode, str)
     assert {m.value for m in sr.SpawnMode} == {'child', 'sibling', 'detached'}
@@ -320,6 +398,36 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
+
+
+def _names_the_destination_token(message: str) -> bool:
+    """True when *message* names ``solar_challenge`` as a token in its OWN
+    right -- not merely as the tail of ``my_solar_challenge``.
+
+    Exists because the obvious spelling of that assertion is VACUOUS:
+    ``'solar_challenge' in msg`` is implied by ``'my_solar_challenge' in
+    msg``, so a regression that dropped the destination token entirely --
+    leaving the operator exactly where the silent zero-row no-op did --
+    passes it. The word-boundary lookaround is what makes the check
+    discriminating; a bare substring test is not.
+
+    Deliberately boundary-based rather than quote-based (``"'solar_challenge'"``
+    would also work today) so it survives a message that renders the token
+    without ``!r`` quoting -- it pins the CLAIM, not the formatting.
+    """
+    return re.search(r'(?<!\w)solar_challenge(?!\w)', message) is not None
+
+
+def _claims_zero_matches(message: str) -> bool:
+    """True when *message* asserts the passed token matched nothing.
+
+    The one wording pin in this area, and a deliberate one: that claim is
+    TRUE for ``reap-decisions`` (which matches) and FALSE for
+    ``write-decision`` (which creates, and files a row under exactly that
+    token one line later). Pinning it in both directions is what keeps the
+    hint's verb-awareness from silently regressing to a single message.
+    """
+    return re.search(r'matches (no|zero)\b', message, re.IGNORECASE) is not None
 
 
 def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
@@ -779,6 +887,128 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
     reread = sr.read_record(r.session_slug, root=tmp_path)
     assert reread.status == sr.Status.RUNNING
     assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
+
+
+# ---------------------------------------------------------------------------
+# apply_refresh -- the PURE (no-I/O) half of refresh_record (task 4662)
+#
+# session_hooks performs three reads of one record.json per hook event; the
+# third is refresh_record's own internal read. Splitting the upsert body out
+# as a pure function lets a caller that ALREADY holds the record produce the
+# refreshed body without a second read, so one event can settle on ONE
+# snapshot and ONE write. These tests pin that the split half is genuinely
+# I/O-free and that refresh_record, re-expressed on top of it, is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ANY registry filesystem access explode.
+
+    apply_refresh is the seam session_hooks needs precisely because it
+    touches no disk; asserting "we passed no root" would not catch an
+    implementation that reached for the default root, so the read/write
+    entry points are booby-trapped instead.
+    """
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('apply_refresh must perform no filesystem access')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+
+def test_apply_refresh_updates_prior_in_place_and_does_no_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    before = prior.to_dict()
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=sr.Status.IDLE)
+
+    # In-place read-modify, exactly like refresh_record/update_status today.
+    assert result is prior
+    assert result.status is sr.Status.IDLE
+    # Every other field survives byte-identical.
+    after = result.to_dict()
+    del before['status'], after['status']
+    assert after == before
+
+
+def test_apply_refresh_with_no_status_is_a_pure_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status=None must leave the prior status alone.
+
+    This is the case the launch-window withhold path relies on: it wants the
+    mtime heartbeat bumped without promoting a still-LAUNCHING record.
+    """
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=None)
+
+    assert result is prior
+    assert result.status is sr.Status.LAUNCHING
+
+
+def test_apply_refresh_synthesizes_a_well_formed_record_when_prior_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=sr.Status.RUNNING)
+
+    assert result.session_slug == 'hand-launched-slug'
+    assert result.status is sr.Status.RUNNING
+    assert result.schema_version == sr.SCHEMA_VERSION
+    # A parseable ISO-8601 start_ts, not merely a non-empty string.
+    assert result.start_ts
+    assert datetime.fromisoformat(result.start_ts)
+
+
+def test_apply_refresh_synthesis_defaults_to_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LAUNCHING is refresh_record's documented default for a new record."""
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=None)
+
+    assert result.status is sr.Status.LAUNCHING
+
+
+@pytest.mark.parametrize('status', [sr.Status.RUNNING, None])
+def test_refresh_record_equals_read_apply_write(
+    tmp_path: Path, status: sr.Status | None
+) -> None:
+    """refresh_record(...) == write_record(apply_refresh(read_record(...))).
+
+    The equivalence is the whole point of the split: session_hooks composes
+    the second spelling from a snapshot it already holds, so it must produce
+    a byte-identical body to the one refresh_record writes today.
+    """
+    seed = _make_record(status=sr.Status.LAUNCHING)
+    sr.write_record(seed, root=tmp_path)
+    via_refresh = sr.refresh_record(seed.session_slug, root=tmp_path, status=status)
+    refreshed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    # Re-seed and take the composed route over the same starting body.
+    sr.write_record(_make_record(status=sr.Status.LAUNCHING), root=tmp_path)
+    composed = sr.apply_refresh(
+        seed.session_slug,
+        sr.read_record(seed.session_slug, root=tmp_path),
+        status=status,
+    )
+    sr.write_record(composed, root=tmp_path)
+    composed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    assert composed_bytes == refreshed_bytes
+    assert composed.to_dict() == via_refresh.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -4987,6 +5217,85 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+def test_main_write_decision_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Passing a DECLINED alias target warns, and changes nothing else.
+
+    This is the load-bearing pair of assertions for task 3813: the record is
+    still filed under EXACTLY what the caller passed (we warn, we do not
+    silently move another project's rows -- rewriting here would be the very
+    cross-project behaviour change the task declined), and the return code
+    is unaffected (advisory, never a refusal -- contrast the two hard
+    refusals in _run_write_decision, which return without filing).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-declined',
+                '--project',
+                'my_solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    # NOT rewritten: filed under exactly the token the caller passed.
+    assert sr.list_decisions(root=tmp_path)[0].project == 'my_solar_challenge'
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # ...and the message must be TRUE on this path. write-decision CREATES;
+    # it matches nothing by definition, and one line after this warning it
+    # files a row under this very token. A "matches no decisions" line here
+    # would be false the moment it is acted on.
+    assert not any(_claims_zero_matches(m) for m in warnings)
+
+
+def test_main_write_decision_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token the skills recommend must stay silent.
+
+    Same strict no-noise assertion as
+    test_main_write_decision_already_canonical_project_logs_nothing: a
+    watcher following the documented ``--project solar_challenge`` guidance
+    must not be warned on every park, or the new hint is noise rather than
+    signal.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-solar-ok',
+                '--project',
+                'solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'solar_challenge'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def test_main_write_decision_stamps_severity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5697,6 +6006,217 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
 
     assert merged == dataclasses.replace(existing, severity='urgent')
 
+# ---------------------------------------------------------------------------
+# Task 3872: merge_same_queue_refile -- the SAME watcher re-filing its own id
+# ---------------------------------------------------------------------------
+
+
+def test_merge_same_queue_refile_holds_the_cockpit_owned_fields() -> None:
+    """The three COCKPIT-owned fields survive a same-queue re-file at any state.
+
+    Sibling of test_merge_decision_enrichment_keeps_custody_fields_with_the_
+    first_filer: the custody set is the same one, because custody does not
+    depend on which queue re-filed. ``filed_at`` is queue age (it drives the
+    cockpit's ordering, and a watcher restart is not news about it),
+    ``manual_boost`` is the operator's C5 field (set_manual_boost's), and
+    ``state`` is the operator's / reaper's disposition
+    (update_decision_state's) -- so a watcher restart must not restamp the
+    age, reset the boost, or RE-OPEN a row the human already dropped.
+
+    ``id``/``project`` are asserted unchanged as the caller's PRECONDITION,
+    not as a field this helper forces: unlike merge_decision_enrichment (which
+    rebuilds from *existing* and so pins them structurally), this helper
+    rebuilds from *incoming*, and is only ever reached from
+    _run_write_decision after ``existing.project == project`` and with the id
+    as the on-disk file key. Stating it here is what makes a future caller
+    that widens those preconditions fail loudly rather than silently reassign
+    a live row to another project.
+    """
+    existing = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+    )
+    incoming = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.filed_at == '2026-07-07T00:00:00+00:00'
+    assert merged.state == sr.DecisionState.DROPPED
+    assert merged.manual_boost == 7
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_same_queue_refile_takes_the_watcher_owned_fields_verbatim() -> None:
+    """The WATCHER-owned half lands exactly as filed -- downgrades and empties too.
+
+    This is the half that keeps the watcher the sole authority on its own
+    escalation, and the one place this helper deliberately differs from
+    merge_decision_enrichment: there a second watcher may only FILL fields
+    the first left empty and may never downgrade severity
+    (_max_decision_severity), because two watchers are two views of one gate.
+    Here there is only ONE view -- the same watcher's, revised -- so freezing
+    the first values would strand stale prose and a stale severity in the
+    cockpit queue forever.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='the original prose',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text='the rephrased prose',
+        severity='info',
+        task_id=None,
+        session_id=None,
+        escalation_id='esc-5914-2',
+        options=None,
+        escalations_dir=queue,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.text == 'the rephrased prose'
+    assert merged.severity == 'info'  # a DOWNGRADE lands (unlike enrichment)
+    assert merged.task_id is None  # ...and so does an EMPTYING
+    assert merged.session_id is None
+    assert merged.escalation_id == 'esc-5914-2'
+    assert merged.options is None
+    assert merged.escalations_dir == queue
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        sr.DecisionState.ANSWERED,
+        sr.DecisionState.DROPPED,
+        'deferred-by-hand',
+    ],
+)
+def test_merge_same_queue_refile_preserves_an_unrecognized_state_verbatim(
+    state: str,
+) -> None:
+    """``state`` is copied as an opaque str, never coerced through DecisionState.
+
+    Mirrors DecisionState's own documented additive-safe contract:
+    DecisionRecord.state is a plain ``str`` with NO from_dict coercion, so an
+    unrecognized value must round-trip rather than raise -- or, here, be
+    silently reset to 'open'. A disposition some future writer adds is
+    therefore held back by this helper for free, instead of needing this
+    module to be taught about it first.
+    """
+    existing = _make_decision(state=state)
+    incoming = _make_decision(state=sr.DecisionState.OPEN)
+
+    assert sr.merge_same_queue_refile(existing, incoming).state == state
+
+
+def test_merge_same_queue_refile_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    Mirrors test_merge_decision_enrichment_is_pure. The helper is
+    deliberately side-effect-free -- including of LOGGING, which stays in the
+    CLI verb at the policy boundary -- so it is trivially testable in
+    isolation, and so a caller holding the pre-merge record (e.g. to name the
+    held-back state in its divergence warning) still sees what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', state='dropped')
+    incoming = _make_decision(id='esc-5914-1', text='second?', state='open')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> None:
+    """THE ANTI-DIVERGENCE INVARIANT: one custody set, two merge branches.
+
+    After task 3872 the write-decision upsert has two merge arms --
+    merge_decision_enrichment (cross-queue) and merge_same_queue_refile
+    (same-queue) -- and the load-bearing shared rule is WHICH fields are
+    cockpit-owned. They differ only in how the WATCHER-owned half is taken
+    (fill-if-empty + severity-max vs. verbatim). Add a fourth custody field
+    to one and forget the other and the regression is silent: every
+    field-specific test above still passes.
+
+    Arranged so the two halves are separable. *existing* leaves every
+    fill-if-empty field empty (text/task_id/session_id/escalation_id/options/
+    severity), so BOTH helpers take the watcher-owned half from *incoming*
+    and the two runs can only differ on custody. The queue axis is
+    neutralized (equal normalized ``escalations_dir`` on both), which is also
+    the precondition of the same-queue arm.
+
+    ``id``/``project``/``escalations_dir`` land in the set because both
+    records agree on them, not because either helper had to choose -- that
+    agreement is exactly the caller's precondition for this arm, so the set
+    is spelled out in full rather than filtered down to the three fields that
+    genuinely differ.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='',
+        task_id=None,
+        session_id=None,
+        escalation_id=None,
+        options=None,
+        severity='',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text="the watcher's current view",
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        severity='critical',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+        escalations_dir=queue,
+    )
+
+    def _kept_from_existing(merged: sr.DecisionRecord) -> set[str]:
+        return {
+            f.name
+            for f in dataclasses.fields(sr.DecisionRecord)
+            if getattr(merged, f.name) == getattr(existing, f.name)
+        }
+
+    enriched = _kept_from_existing(sr.merge_decision_enrichment(existing, incoming))
+    refiled = _kept_from_existing(sr.merge_same_queue_refile(existing, incoming))
+
+    assert enriched == refiled
+    assert refiled == {
+        'id',
+        'project',
+        'filed_at',
+        'state',
+        'manual_boost',
+        'escalations_dir',
+    }
+
 
 # ---------------------------------------------------------------------------
 # Project-token canonicalization (task 3807)
@@ -5811,22 +6331,33 @@ def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
     assert sr.normalize_project_token(None) != 'none'
 
 
-def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
-    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+def test_solar_challenge_alias_was_decided_and_declined() -> None:
+    """The naming mismatch is a DECIDED, standing state -- not a pending gap.
 
-    Folding DOES merge solar-challenge's two filed spellings into one bucket
-    -- an improvement, since a reap scoped to either previously missed the
-    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
-    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    Folding merges solar-challenge's two filed spellings into one bucket --
+    an improvement, since a reap scoped to either previously missed the
+    other (re-measured 2026-09-07 over 748 records: 3 OPEN under
+    ``solar-challenge``, 2 under ``solar_challenge``, ZERO under
+    ``my_solar_challenge``; unchanged from 2026-08-07). But that bucket is
+    ``solar_challenge``, while
     ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
     ``my_solar_challenge``, and no alias bridges them. So a reaper passing
     the config-declared token matches ZERO of those 5 rows.
 
-    This test exists so nobody reads the folding rows above as "solved" and
-    so the day an alias IS added (its own filed decision task, 3813) this
-    test fails loudly and must be updated deliberately -- rather than the
-    gap silently changing shape. The skills' ``--project`` guidance carries
-    the same caveat for the humans and watchers that read it.
+    Task 3813 was the decision task for that bridge, and it DECLINED it --
+    chiefly because the fold left no split to heal (an alias would rename a
+    populated bucket onto an empty one) and because the identity question is
+    an open human gate in that project, marked "Do NOT auto-act". See
+    ``sr.PROJECT_TOKEN_ALIASES_DECLINED`` for the full evidence.
+
+    So this is no longer "pending"; the assertions below pin a settled
+    outcome. They keep their fail-loudly-on-promotion property -- adding the
+    alias breaks the last two -- which
+    test_project_token_alias_declines_registry_shape now also enforces from
+    the other side, via the disjointness of the two tables. The skills'
+    ``--project`` guidance carries the same, now-permanent caveat for the
+    humans and watchers that read it, and both CLI verbs warn if you pass
+    the config-declared token.
     """
     assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
     assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
@@ -5847,6 +6378,167 @@ def test_project_token_aliases_maps_folded_to_folded() -> None:
     for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
         assert sr.normalize_project_token(alias) == canonical
         assert sr.normalize_project_token(canonical) == canonical
+
+
+def test_project_token_alias_declines_registry_shape() -> None:
+    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    it is what makes task 3813's decision durable rather than prose.
+
+    A decision task's product has to survive the session that made it. Task
+    3807 already tried a docstring ("KNOWN RESIDUAL GAP ... owned by its own
+    filed decision task") and prose cannot fail a test -- someone could add
+    ``solar_challenge -> my_solar_challenge`` tomorrow and nothing would
+    object. The DISJOINTNESS assertion below is that objection: promoting a
+    declined alias into the live table without first REMOVING the decline
+    fails here by name, forcing the next editor to read the recorded
+    evidence instead of rediscovering it from scratch.
+    """
+    declined = sr.PROJECT_TOKEN_ALIASES_DECLINED
+    assert isinstance(declined, dict)
+
+    # Exactly one recorded decline: the solar-challenge alias (task 3813).
+    assert set(declined) == {'solar_challenge'}
+    assert declined['solar_challenge'][0] == 'my_solar_challenge'
+
+    # A decline can never be added without STATING WHY. Existence and
+    # non-emptiness of the reason field only -- deliberately not a pin on
+    # its wording.
+    for alias, entry in declined.items():
+        assert len(entry) == 2, alias
+        assert isinstance(entry[1], str), alias
+        assert entry[1].strip(), alias
+
+    # THE GUARD: the two tables partition the alias space. Adding a declined
+    # alias to the live table without removing the decline fails right here.
+    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+
+    # Same folded-to-folded hygiene invariant the live table carries (see
+    # test_project_token_aliases_maps_folded_to_folded), so promoting an
+    # entry is a one-line move between the two dicts.
+    for alias, (canonical, _reason) in declined.items():
+        assert sr.normalize_project_token(alias) == alias
+        assert sr.normalize_project_token(canonical) == canonical
+
+    # The decline is IN FORCE in the fold, not merely recorded beside it.
+    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+        'my_solar_challenge'
+    )
+
+
+def test_declined_project_token_hint_names_both_tokens() -> None:
+    """The hint must name BOTH tokens: what the operator typed, and where the
+    rows actually are.
+
+    Declining the alias makes the naming mismatch PERMANENT, so the honest
+    companion to the decline is that the mismatch announces itself. A message
+    naming only one side leaves the operator exactly where the silent
+    zero-row no-op did.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge')
+
+    assert hint is not None
+    assert isinstance(hint, str)
+    # Token PRESENCE, deliberately not sentence wording. The destination
+    # token goes through _names_the_destination_token because the bare
+    # `'solar_challenge' in hint` spelling is VACUOUS -- it is implied by the
+    # line above it, so a message that named only the typed token would pass.
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+
+    # The fold runs FIRST, so a spelling variant still hits. This is the case
+    # that matters: an operator copying the config-declared value with
+    # different case/separators must still be warned.
+    assert sr.declined_project_token_hint('My-Solar-Challenge') is not None
+    assert sr.declined_project_token_hint('  MY_SOLAR_CHALLENGE  ') is not None
+
+
+def test_declined_project_token_hint_consequence_is_verb_aware() -> None:
+    """One message cannot be true for both callers, so *action* picks one.
+
+    ``reap-decisions`` MATCHES, so its consequence is a zero-row no-op.
+    ``write-decision`` CREATES: it matches nothing by definition, and one
+    line after the warning it files a row under exactly the token passed --
+    so the reap wording would be false the moment it is acted on. Its real
+    consequence is also the worse of the two (the row lands where no
+    documented reap scopes, and can never auto-close), which the shared
+    wording left unstated entirely.
+
+    Asserts on the CLAIM each message makes, not its sentences: the
+    zero-match claim must be present on the reap path and absent on the
+    write path, and every variant must still name both tokens.
+    """
+    reap = sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    file_ = sr.declined_project_token_hint('my_solar_challenge', action='file')
+
+    assert reap is not None and file_ is not None
+    assert reap != file_
+    for message in (reap, file_):
+        assert 'my_solar_challenge' in message
+        assert _names_the_destination_token(message)
+
+    assert _claims_zero_matches(reap)
+    assert not _claims_zero_matches(file_)
+
+
+@pytest.mark.parametrize('action', ['', 'bogus-verb'])
+def test_declined_project_token_hint_unknown_action_stays_verb_neutral(action: str) -> None:
+    """An omitted or unrecognised *action* is not an error, and is not guessed.
+
+    Fail-soft in the direction that matters for a message a human acts on: a
+    future caller that forgets the argument gets the verb-neutral core --
+    less specific, but TRUE on any path -- rather than a confident
+    description of the wrong verb. Pinning this is what stops the default
+    from quietly being set to one of the two real verbs later.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge', action=action)
+
+    assert hint is not None
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+    # No verb-specific claim, in either direction.
+    assert not _claims_zero_matches(hint)
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='file')
+    # The default really is the neutral variant, not one of the two verbs.
+    assert sr.declined_project_token_hint('my_solar_challenge') == hint
+
+
+@pytest.mark.parametrize(
+    'token',
+    [
+        'dark_factory',
+        # Aliases to dark_factory -- a healthy project must never be warned.
+        'df',
+        # The RECOMMENDED token, in both spellings. A warning here would be
+        # pure noise a watcher accrues every Main Loop cycle.
+        'solar_challenge',
+        'solar-challenge',
+        # The collapse-guard sibling: a distinct project root. A false
+        # warning here would be actively misleading.
+        'solar_challenge_platform',
+        'reify',
+        '',
+        '   ',
+    ],
+)
+def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> None:
+    """The hint fires on the declined VALUE, never on the declined KEY.
+
+    The trap being closed is "operator reads their project's config, types
+    the declared ``memory.project_id``, matches zero rows". So the warning
+    must land on ``my_solar_challenge`` and stay SILENT on
+    ``solar_challenge`` -- the token both SKILL.md files tell people to
+    pass -- or the signal degrades into noise.
+    """
+    assert sr.declined_project_token_hint(token) is None
+
+
+@pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
+    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    watch loop calls on its filing path never raises into the caller.
+    """
+    assert sr.declined_project_token_hint(token) is None
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -6047,6 +6739,112 @@ def test_main_reap_decisions_leaves_pending_escalation_open(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-pending'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operationally important half of task 3813's hint.
+
+    Filing under the wrong token is recoverable -- the record still exists
+    and is still visible. REAPING under it is the silent zero-row no-op that
+    started this whole thread: it looks exactly like "nothing to reap", and
+    the only way to discover otherwise today is the hand-run Counter
+    one-liner both SKILL.md files tell humans to paste.
+
+    A decision is seeded under ``solar_challenge`` so there IS a populated
+    bucket to miss, exactly as the live population has it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'my_solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # On THIS path the zero-match claim is the true one -- the reap really is
+    # matching, and really does match none of the seeded rows.
+    assert any(_claims_zero_matches(m) for m in warnings)
+    # The warning changes NO reaping behaviour: the seeded decision would
+    # have been closed under the right token, and is still OPEN under this
+    # one. All the hint does is make the zero-match visible.
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same fixture with the DOCUMENTED token: reaps, and stays silent.
+
+    A watcher reaping with the token both SKILL.md files recommend runs this
+    every Main Loop cycle, so a warning here would accumulate indefinitely
+    and drown the one case the hint exists to surface.
+
+    The ANSWERED assertion below also keeps its sibling honest: it proves
+    this fixture's decision really is reapable, so the sibling's "still
+    OPEN under my_solar_challenge" is a genuine contrast rather than a
+    vacuous pass for some unrelated reason.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.ANSWERED
 
 
 def test_main_reap_decisions_scopes_to_project(
@@ -6963,6 +7761,250 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     assert listed[0].manual_boost == 9  # the operator's boost survives
     assert listed[0].filed_at == filed_at  # queue age not restamped
 
+@pytest.mark.parametrize(
+    'closed_state',
+    [
+        sr.DecisionState.DROPPED,
+        sr.DecisionState.ANSWERED,
+        'deferred-by-hand',
+    ],
+)
+def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3872), at the CLI boundary.
+
+    An operator dismisses a still-PARKED row in the cockpit decision queue
+    (C5b), and the watcher that filed it restarts. Both watcher SKILLs tell
+    an agent to re-file the same stable id on every restart while an item
+    stays parked -- so before this change the dismissal was silently undone
+    on the very next restart, and again, and again: the guarded upsert block
+    was scoped to an OPEN record, so a non-open one fell through to
+    ``record = incoming``, a freshly constructed record carrying state=open,
+    manual_boost=0 and a restamped filed_at. reap_answered_decisions likewise
+    skips a non-open decision, so nothing downstream re-closed it either.
+    C5b's drop action was therefore INERT for exactly the class of row it
+    exists for, and the operator's dismissal could never stick.
+
+    Arranged through the REAL cross-subsystem sequence rather than a
+    hand-built record: filed through the verb, then triaged via the same
+    set_manual_boost / update_decision_state helpers cockpit/app.py calls,
+    then re-filed through the verb from the SAME queue.
+
+    Parametrized over an unrecognized state as well as the two DecisionState
+    members, since DecisionRecord.state is a plain str with no from_dict
+    coercion -- a disposition a future writer adds must be held back too,
+    not silently reset to 'open' by a module that has not been taught it.
+
+    The final two asserts are what keep this from over-firing into "a closed
+    row is frozen": the watcher's OWN fields still land, so the row's prose
+    and severity stay current even while it stays closed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    # The operator triages the row in the cockpit: boosts it, then dismisses
+    # it. Same two helpers cockpit/app.py's C5b drop action calls.
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+
+    # ...and the watcher restarts, re-filing its own id from its own queue.
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == closed_state  # the operator's disposition STICKS
+    assert survivor.manual_boost == 9  # ...as does their boost
+    assert survivor.filed_at == filed_at  # ...and queue age is not restamped
+    assert survivor.text == 'reify? (rephrased)'  # but the row is not FROZEN
+    assert survivor.severity == 'info'  # ...a downgrade still lands
+
+
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
+def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """The deliberately-UNCHANGED neighbour: the QUEUE is the discriminator.
+
+    Stated adjacently to the test above so a future reader cannot mistake
+    task 3872's change for "non-open records are now always protected". The
+    axis is the QUEUE, not the state: within ONE queue an ``esc-<taskid>-<n>``
+    id is unique (task 3528's premise), so a same-queue re-file is
+    definitively the same gate the human already dealt with. ACROSS queues
+    the id namespaces genuinely collide -- dark_factory runs
+    ``data/escalations`` and ``data/reconciliation/escalations`` over one
+    namespace -- so a non-open cross-queue filing may be an unrelated NEW
+    ask, and holding it closed would make a live gate invisible, which is
+    the fail-CLOSED direction _run_reap_decisions' docstring rules out.
+
+    Absorbs (task 3872's amendment pass) the older
+    test_main_write_decision_non_open_record_is_still_overwritten, which
+    pinned this same orch-seed -> recon-file shape for an ANSWERED record and
+    is now parametrized in here instead of kept as a near-clone whose
+    docstring ("protection is scoped to an OPEN record") had gone false on
+    the same-queue axis. This version files through the CLI verb on both
+    sides and carries an operator boost as well, so the contrast with the
+    same-queue case is visible in every custody field rather than only in
+    `state`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+
+    # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question that merely shares the id',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == sr.DecisionState.OPEN  # re-opened: a new ask
+    assert survivor.manual_boost == 0
+    assert survivor.text == 'a brand new question that merely shares the id'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+
+def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Holding a closed row closed must be LOUD, not silent.
+
+    This is the ONE place the verb deliberately declines to do what the filer
+    asked: the watcher's filing carries ``state=open`` (the verb's own
+    default) and the row stays closed. The repo's loud-over-silent-degradation
+    norm applies, and the watcher SKILLs' own discipline is to ADJUDICATE such
+    a divergence rather than assume the re-file landed -- which it can only do
+    if the divergence is visible.
+
+    The message must name BOTH the decision id and the held state, so an
+    operator or agent reading the log can tell WHICH row and WHAT disposition
+    was preserved; a bare "held back" line would send them to read the file.
+
+    stdout is asserted UNCHANGED on purpose: both SKILLs document "if the id
+    doesn't come back on stdout, your filing did not land" as the
+    did-it-work signal, and this filing DID land (its text and severity were
+    written) -- so repurposing that channel as a failure indicator here would
+    break a contract agents already rely on. The divergence goes to the log.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert (
+        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
+    )
+    capsys.readouterr()  # discard the first filing's stdout
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == 'esc-5914-1'  # the id still lands
+    held = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert held, 'holding a closed row closed must be logged, not silent'
+    assert 'dropped' in held[0].getMessage()  # names the PRESERVED disposition
+
+
+def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE NOISE GUARD: the ordinary restart re-file must say nothing.
+
+    A same-queue re-file against an OPEN record is by far the common path --
+    every watcher restart, for every still-parked item. Nothing the filer
+    asked for was declined there (it files ``state=open`` and the row IS
+    open), so a warning would be pure noise, and a warning on every restart
+    is how the genuinely-actionable one above gets tuned out.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
+    noise = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert not noise, f'the common restart path must be quiet, got: {noise}'
+
 
 def test_main_write_decision_same_id_different_project_is_refused(
     monkeypatch: pytest.MonkeyPatch,
@@ -7043,43 +8085,78 @@ def test_main_write_decision_same_id_different_project_is_refused(
     assert 'dark_factory' in refusals[0].getMessage()
 
 
-def test_main_write_decision_non_open_record_is_still_overwritten(
+def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrites(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Protection is scoped to an OPEN record, as the task words it.
+    """The cross-PROJECT refusal keeps its OPEN scoping (task 3872).
 
-    An ANSWERED record is a question the human already dealt with; a second
-    watcher filing that id is starting a NEW ask, not enriching a live one,
-    so it gets today's plain overwrite (which re-opens it -- state comes
-    from the incoming record). Enriching instead would silently graft the
-    new question onto a closed row's history.
+    The other half of the test above, and the arm task 3872 left deliberately
+    alone: the refusal fires only while the INCUMBENT is open, because
+    refusing exists to protect a LIVE row (with an operator's boost and
+    disposition on it) from being deleted. A closed incumbent is not such a
+    row, and two projects always run different queue dirs -- so a
+    cross-project collision is by construction a CROSS-queue filing, on the
+    axis where ``esc-<taskid>-<n>`` namespaces genuinely collide and a closed
+    record cannot be shown to be the same gate. Holding it closed there would
+    hide a live gate, the fail-CLOSED direction _run_reap_decisions rules
+    out, so it takes today's plain overwrite instead.
+
+    Pinned at the CLI boundary because the restructured guard in
+    _run_write_decision made ``existing.state == OPEN`` a NEW decision point
+    INSIDE the cross-project arm, whose false branch is this overwrite: with
+    nothing here, tightening that arm to refuse EVERY cross-project filing
+    (including against a closed incumbent) passes the whole decision suite.
+
+    The no-ERROR assert is half the point: a refusal here would be the
+    silent-drop failure -- the row overwritten or not, but this project's ask
+    never reaching the cockpit either way.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
-    sr.write_decision(
-        _make_decision(
-            id='esc-5914-1',
-            project='df',
-            text='the old, answered question',
-            state=sr.DecisionState.ANSWERED,
-            escalations_dir=sr.normalize_escalations_dir(orch),
-        ),
-        root=tmp_path,
-    )
 
     _file_decision(
-        id='esc-5914-1',
+        id='esc-42-1',
         project='df',
-        text='a brand new question',
-        escalations_dir=str(recon),
+        text='Adopt the reify plan?',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+    # The operator triages df's row in the cockpit and dismisses it.
+    assert sr.set_manual_boost('esc-42-1', 9, root=tmp_path) is not None
+    assert (
+        sr.update_decision_state('esc-42-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
     )
 
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
-    assert listed[0].text == 'a brand new question'
-    assert listed[0].state == sr.DecisionState.OPEN
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert [d.id for d in listed] == ['esc-42-1']
+    survivor = listed[0]
+    # Fully overwritten -- not refused, and no custody held for the other
+    # project's dead row.
+    assert survivor.project == 'reify'
+    assert survivor.text == 'an unrelated reify gate that merely shares the id'
+    assert survivor.severity == 'critical'
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.manual_boost == 0
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+    refusals = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
+    ]
+    assert not refusals, f'a closed incumbent must not be defended, got: {refusals}'
 
 
 def test_main_write_decision_enriches_a_legacy_unstamped_record(
@@ -7361,7 +8438,7 @@ class TestAtomicWriteSemantics:
     ``shared.safe_io.atomic_write_text``, but this module is the deliberate
     exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
     with no venv (see ``TestStdlibOnlySelfContainment`` below and
-    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+    ``_ALLOWED_RENAMERS`` in ``tests/scripts/test_atomic_write_regrowth.py``).
 
     So these assert the OBSERVABLE result on disk rather than that a particular
     helper was called. That is the more durable pin anyway: it holds whether
@@ -8793,3 +9870,33 @@ def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
     assert rc == 0
     assert capsys.readouterr().out.strip() == ''
     assert not (blocker / 'fleet').exists()
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive against an out-of-range pid (task 4755 review fix 1/4)
+#
+# This predicate is not only asked about pids this module itself recorded:
+# orchestrator/src/orchestrator/service_restart.py imports it to evaluate the
+# fleet-redeploy lease, whose pid is parsed out of JSON that
+# scripts/restart-all-orchestrators.sh wrote. A value no C pid_t can hold is
+# therefore ordinary untrusted input, and os.kill answers it with
+# OverflowError -- which is NOT an OSError, so the predicate's final except
+# clause does not catch it and it escapes to every caller.
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
+    """A pid larger than C ``pid_t`` reads as DEAD and must not raise.
+
+    ``os.kill(2**70, 0)`` raises ``OverflowError('Python int too large to
+    convert to C long')``. "Cannot name a live process" is exactly the
+    judgment the existing ``other OSError -> treated as dead`` branch already
+    makes for every other value the syscall refuses, so answering False here
+    is this predicate's own documented contract rather than a new tolerance.
+
+    It is also the contract ``service_restart.lease_is_live`` states
+    absolutely on this predicate's behalf -- "FAIL-OPEN throughout: a missing,
+    corrupt, unreadable or nonsensical lease reads as 'no sweep in flight' and
+    never raises" -- and that promise cannot hold if the pid check can throw.
+    """
+    assert sr._pid_alive(_UNREPRESENTABLE_PID) is False

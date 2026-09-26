@@ -64,6 +64,10 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
 - RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
 
+**Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
+- Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
+- Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the escalations the record already names as open on the held task: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
+
 ## Shallow-by-default → Deepen-on-signal RCA
 
 RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — the top-level rotation now runs on sonnet/high-effort (task 2629), sized for cheap mechanical triage on a quiet queue, under a $50/day ceiling. When a signal below does call for deepening, delegate the deep dive itself to an opus subagent (see [Delegating deep RCA to an opus subagent](#delegating-deep-rca-to-an-opus-subagent)) rather than deepening in the top-level context.
@@ -216,6 +220,26 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
 
 Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
+
+### Declared pins: a close can be REFUSED (`declared_pin_refused`)
+
+Some pending records are **load-bearing**: something outside the escalation store relies on the record staying OPEN, because an open escalation preserves its subject task (`orchestrator/task_ground_truth.py::_RECOVERY` has no row for that shape, so the task row falls through to `LEAVE`; closing the record flips `has_open_escalation` and the task reverts). Closing one is therefore a **state-changing act on the subject task even under `action='close_only'`**.
+
+Such a record now carries `pin_declared_by` (task 4377). `resolve_issue` refuses **every non-`park` action** — `close_only` included — when the target **or ANY CASCADE MEMBER** carries it, returning:
+
+```json
+{"error": "...", "code": "declared_pin_refused",
+ "declared_pins": [{"escalation_id": "esc-...", "declared_by": ["..."], "reason": "..."}]}
+```
+
+Nothing is mutated on a refusal: the head and every member stay pending and un-archived. Read the structured `declared_pins` payload — don't parse the message.
+
+- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to pull the full record with `get_escalation`.
+- **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
+- **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
+- **You cannot declare a pin yourself — REPORT one.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: leave it pending, `stamp_triage` it with what you found, and say in your report that it is a *candidate pin* naming what appears to rely on it. A human runs `declare_pin` to make it machine-readable.
+
+Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member cluster esc-3237-5 dismissed esc-3371-2 — the only pin preserving mu-gate validation specimen task 3371, which is permanently gone. Every member was indistinguishable by id, level, category, severity, agent_role and summary, and the sole marker lived in prose nothing linked from. The surviving sibling pin is **esc-3105-3** (a 15-member L2 head — exactly the shape a rotation bulk-closes).
 
 ### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
 
@@ -430,17 +454,27 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 
 **If the task DOES exist**, fall through to the steps below unchanged. This branch must never close a record whose task exists — that would silently drop real scope work.
 
-1. **Do not `resume`.** A `resume` here re-pends the task into a non-terminating escalate/resume loop — the reasoning is traced below, and it holds for *every* real-task `scope_violation` reaching this queue, not just some of them.
+1. **`resume` + `granted_files` is now a real disposition here — use it when the request is a clean widening.** Since **task 3540** the grant is delivered on the re-pend path, not only to a live workflow, so the escalate/resume loop this step used to warn about no longer applies to a well-formed grant.
 
-   **The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place**: `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` has a single call site, inside `workflow.py::TaskWorkflow._drive`'s live verify/review loop, reached only after `_wait_for_resolution()` returns **for a workflow process that is still alive** — i.e. the **L0, in-workflow** resume path the per-task steward uses. That is why the `granted_files` wording is correct in the steward's own role text (`orchestrator/src/orchestrator/agents/roles.py::STEWARD`) and is **not** correct here.
+   **Where it lands.** An L1 `scope_violation` is normally on a `blocked` — or stranded `in-progress` — task whose workflow slot is gone, so its `_escalation_events` entry has been popped and resolution takes the orphan branch (`orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`. That method now calls `harness.py::Harness._fold_granted_files_on_repend` between the re-block guard and the status write: it unions `granted_files` across **every resolved** escalation for the task (order-preserving, the same union `workflow.py::TaskWorkflow._collect_granted_files` computes for the live-L0 path) and writes it to **both** `plan.json`'s `files` and `metadata.files` before the row goes re-pendable. `plans/task-escalation-state-graph-prd.md` **D8** and `docs/task-escalation-state-spec.md` **E9** list this as semantics to be built; 3540 built it. Do not cite either as evidence that the mechanism is missing.
 
-   **You are the L1 watcher, and an L1 `scope_violation` is normally on a `blocked` task whose workflow slot is gone.** Its `_escalation_events` entry has been popped, so resolution takes the orphan branch (`escalation.task_id not in self._escalation_events`, in `orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which **only flips `blocked` → `pending`**. It never reads `granted_files`, never calls `_set_task_scope`, and never touches `plan.files` / `metadata.files` / locks — read the method; the gap is visible in its body, not inferred. The repo agrees in writing: `plans/task-escalation-state-graph-prd.md` **D8** lists “`granted_files` scope grants deliver on the re-pend path” among the semantics it proposes to *build*, which is the authority for the blocked/re-pend case here. (`docs/task-escalation-state-spec.md` **E9** says “`granted_files` scope grants deliver to nobody”, but that sentence is scoped to the adjacent **strand** case, where `_cascade_unblock_member`'s `status == 'blocked'` requirement means no re-pend happens at all — do not cite E9 for a `blocked` record.)
+   **Resume when** the agent named concrete **file-level, project-relative paths** that are a plain widening of what the task already does — e.g. an adjacent file in a subsystem the task already owns. File-level paths only: not module names, not directories. That distinction is load-bearing — a module name is not a file the orchestrator can add to a plan, and a directory entry is stripped before the metadata write.
 
-   So a bare `resume` re-pends the task with its ORIGINAL `plan.files`; the re-dispatched agent hits the same scope wall and escalates again. **And nothing else delivers the widening either**: `_set_task_scope` (the only writer of both `plan.files` and `metadata.files`) is reachable only from a live workflow, and an `update_task(metadata={"files": ...})` does not reliably reach lock derivation — `scheduler.py::Scheduler._get_modules` is **cache-first** (it returns out of `self._module_cache` before ever reading `metadata.files`), and `scheduler.py::Scheduler._phase_stale_sweep` evicts that cache only for terminal-status or absent-from-`tasks_by_id` tasks, which a `blocked` task is neither. Independently, whenever the widening changes the derived module set such a write is narrowed back to `plan.files` by `workflow.py::TaskWorkflow._reconcile_scope_locks` on the next dispatch (that function no-ops only when the module set is unchanged) — and it never widens `plan.files` (what the implementer actually works to) at all.
+   ```python
+   mcp__escalation__resolve_issue(
+     escalation_id=<escalation_id>,
+     resolution="Scope expanded to include [<files>]; resuming. Grant folded into plan.files/metadata.files on the re-pend (harness.py::Harness._fold_granted_files_on_repend).",
+     action='resume',
+     granted_files=["<project-relative file path>", ...],
+     resolved_by="escalation-watcher-auto",
+   )
+   ```
 
-   A `scope_violation` exists *because* an agent could not touch a file it needed, so the widening always has to be effective — there is no variant of this category where resuming is the right call.
+   **Promote instead (step 2) when** the request is module- or directory-shaped, reaches into a subsystem the task does not own, or reads as *new work* rather than a widening (the agent is describing a second task). Those are judgement calls above this rotation's authority, and the architect is the sanctioned widener for them.
 
-2. **Promote to L2 with a re-plan rationale.** This is the terminal disposition. The real fix is a **re-plan** — the architect is the sanctioned widener — and that is a judgement call above your authority. Carry the requested files in `evidence`: `granted_files` is a parameter of `resolve_issue` only, and is consumed **solely** on the live-L0 resume path (`escalation/src/escalation/server.py::resolve_issue` documents that it is not even forwarded to `park`), so there is no way to record it here except as text. Do **not** tell the human to "widen the scope" as if a mechanism existed.
+   **Caveats worth carrying into the `resolution` text.** The fold is best-effort: a failed plan write or `update_task` logs a WARNING and the task re-pends against the *unwidened* scope anyway — deliberately, since withholding the re-pend would park the task with its record already closed. A task with no `plan.json` (never reached the architect) has nothing to widen. And if the re-block guard withholds the flip, nothing is re-pended and so nothing is widened. Module **locks** are re-established branch-side by `workflow.py::TaskWorkflow._reconcile_scope_locks` rather than by the fold — `scheduler.py::Scheduler._get_modules` is cache-first and its `_module_cache` entry survives a `blocked` task — which is exactly why writing **`plan.json`** is the load-bearing half: `_reconcile_scope_locks` persists `metadata.files = plan_files`, so a metadata-only widen would be narrowed straight back down.
+
+2. **Promote to L2 with a re-plan rationale** — for the "promote instead" cases above, and whenever you cannot name the files. Carry the requested files in `evidence`: `granted_files` is a parameter of `resolve_issue` only (`escalation/src/escalation/server.py::resolve_issue` documents that it is not forwarded to `park`), so there is no way to record them on a promotion except as text.
    ```python
    mcp__escalation__promote_to_l2(
      task_id=<task_id>,
@@ -448,10 +482,13 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
      member_ids=[<escalation_id>],
      root_cause="scope-violation-needs-replan:" + <task_id>,
      evidence=<escalation detail> + "\n\nFiles the agent reported needing: [<project-relative file paths>]. "
-              "Not resumed: no mechanism folds a scope grant into a blocked task with no live workflow "
-              "(_collect_granted_files is live-L0-only; _cascade_unblock_member only flips blocked->pending), "
-              "so a resume would re-pend against the original plan.files and re-escalate.",
-     options=["A: re-plan the task with the widened file set (architect widens at plan time)", "B: split the out-of-scope work into a separate task", "C: narrow the task so the extra files are not needed", "D: something else"],
+              "Not resumed: the requested widening is not a clean file-level grant "
+              "(module/directory-shaped, or reaches outside the task's subsystem, or reads as new work), "
+              "so it is a re-plan/split decision rather than a scope grant. "
+              "Note a well-formed grant IS deliverable on the re-pend path since task 3540 "
+              "(harness.py::Harness._fold_granted_files_on_repend folds granted_files into "
+              "plan.files and metadata.files before the flip).",
+     options=["A: re-plan the task with the widened file set (architect widens at plan time)", "B: split the out-of-scope work into a separate task", "C: narrow the task so the extra files are not needed", "D: resume with a file-level granted_files grant after all", "E: something else"],
      summary="scope_violation needs a re-plan — " + <task_id> + " — agent blocked on files outside plan.files",
      category="scope_violation",
    )
@@ -460,7 +497,9 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 
    File-level, project-relative paths only — not module names, not directories. That distinction is load-bearing: the old form of this recipe was module-shaped, and a module name is not a file the orchestrator can add to a plan.
 
-3. Add to digest: `PROMOTED (L2 <result['id']>): scope_violation — <task_id> — widening needs a re-plan; requested files [<files>]`
+3. Add to digest — one line per disposition:
+   - resumed: `RESOLVED: scope_violation — <task_id> — resumed with granted_files [<files>] (folded into plan.files/metadata.files on the re-pend)`
+   - promoted: `PROMOTED (L2 <result['id']>): scope_violation — <task_id> — widening needs a re-plan; requested files [<files>]`
 
 #### `dependency_discovered`
 
@@ -742,13 +781,78 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): infra_issue — <task_id or N/A> — <summary>`
 
+#### Recovery veto-streak sentinel L1s (`__recovery_veto_streak__*`)
+
+The orchestrator files ONE blocking L1 when the same recovery veto has held a task for `threshold` consecutive sweeps over a minimum elapsed span (`orchestrator/src/orchestrator/recovery_emission.py::emit_recovery_veto_streak_escalation`). These are **monitor signals**, not work: the record's `task_id` is a SYNTHETIC sentinel (`__recovery_veto_streak__<real_task_id>`) precisely so that observing a hold cannot itself deepen it.
+
+Every record in this class looks alike at the mechanism level, so the generic `"risk:<module-or-area-slug>"` key below folds **unrelated** streaks into one perpetually-growing L2 that eventually self-truncates. Key the promote on the ORIGINATING INCIDENT instead — identified by the escalations the sweep found open on the held task, which the record already names — so streaks belonging to different incidents land in different L2s.
+
+**Class discriminator.** Match a pending L1 where **both** hold:
+- `task_id` starts with `__recovery_veto_streak__` (`RECOVERY_VETO_STREAK_SENTINEL_PREFIX`)
+- `category == "risk_identified"` (`_STREAK_CATEGORY`)
+
+Both come from the emitter. The category half is what keeps an **unrelated** record filed on the same sentinel id out of this class — the sentinel prefix alone does not discriminate it.
+
+**Extraction.** From `esc["detail"]`, take the single line beginning `Pinning escalations: `. Each comma-separated entry reads `<listed_esc_id> (<age> old)` or `<listed_esc_id> (age unknown)`; take the id and discard the parenthetical. So
+
+```
+Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)
+```
+
+yields `esc-1000-2`, `esc-5000-3`, `esc-9999-1`. The emitter already renders these **sorted and deduplicated** across its buckets (`_flatten_ids` returns `sorted(set(...))`), so read them in the order given — do not re-sort, re-order, or drop any. That format is pinned by `orchestrator/tests/test_recovery_emission.py::TestEmitRecoveryVetoStreakEscalation::test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated`, so you may rely on it rather than re-deriving the order.
+
+**That line is not filtered to pins — read this before you word the options.** Despite its label it lists EVERY escalation the pin sweep found open on the task. The emitter flattens all three buckets of `orchestrator/src/orchestrator/recovery_emission.py::pin_buckets`, which the production caller hands it whole: `queue_handoff` (a live supervised handoff — PINS), `dead_l0` (vetoes a done-flip but does NOT pin recovery) and `non_pinning` (an `info`-severity record — never pins, at any level). Those three readings are defined at `escalation/src/escalation/pins.py::PinReport`. No bucket label survives into the text, so from this line alone you **cannot** tell a live hold from an incidental info record. Two consequences to carry, neither fixable from this prompt and both cheaper than the single over-folded bucket this rule replaces:
+
+- Word the options so they do not PROMISE that resolving a listed id releases the task. Say what is true — resolving it releases the task *if* it is what holds it — and leave the human the check you cannot make.
+- The key is over the whole listed set, so two streaks held by the same real pin but differing in one incidental record will NOT fold together. That is residual fragmentation, accepted knowingly.
+
+The same `detail` names the REAL task id (`Task: <id>`), plus `Veto site:`, `Consecutive IDENTICAL vetoes:` and `Elapsed since the streak began:` — quote those as evidence rather than re-deriving them.
+
+Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>"`. When the line names several, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different id sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
+
+**When the line names nothing.** If the `Pinning escalations:` line is absent, reads `(none recorded)`, or yields no id once the age parentheticals are stripped, there is nothing to key on. This is a reachable branch, not a malformed record — the alarm is generic over veto shapes, and `unmapped_shape` is one that holds a task with nothing open on it. Use the **bare stem** `"recovery-veto-streak-noise-from-pending-l2-pin"`, with no suffix of any kind. One spelling, normatively: a site-suffixed variant offered alongside it would give a single rotation two keys for the same fallback, and the two would not fold.
+
+**Never** interpolate the literal `(none recorded)`, or any empty or punctuation-only fragment, into the key. Run the extraction above on that line unguarded and it mints `"...-pending-l2-pin:(none recorded)"` — stable, wrong, and a NEW over-fold bucket, the same defect wearing a different name. Do not expect the server to catch it for you: that key canonicalises to non-empty, so `promote_to_l2` accepts it. The `canonical_root_cause` guard in `escalation/src/escalation/server.py` rejects only a `root_cause` canonicalising to the EMPTY string — a purely punctuation key — so it is a backstop for that case alone. Here the check is yours.
+
+**The stem is new; nothing folds under it yet.** Unpinned streaks land today under the generic `"risk:<module-or-area-slug>"` key, which is unrelated to this stem under `canonical_root_cause`. So the first rotation after this rule lands may find an already-pending `risk:*` L2 covering them: fold into or supersede that L2 rather than minting a second decision point for the same incident.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<the sentinel veto-streak L1 esc ids being clustered — NOT the listed ids>, ...],
+  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>[+<listed_esc_id>...]",
+  evidence=(
+    "Task <real_task_id> held by the same veto at <site> for <n> consecutive "
+    "sweeps over <span> (reason <reason>); open on it: <listed_esc_ids with their ages>."
+  ),
+  options=[
+    "A: resolve or dismiss <listed_esc_id> if it is stale — that releases task <real_task_id> if it is what holds it",
+    "B: drive <listed_esc_id> to completion; check first whether it is a live hold or an incidental info record",
+    "C: retune or silence the detector via the green-tier recovery_emission knobs",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="risk_identified",
+  # severity omitted — inherited from the members, as in `infra_issue` above.
+)
+```
+
+**The escalations read off that line must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
+
+The options must NAME those escalations, because acting on one of them is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did. Naming them is not the same as vouching for them — per the caveat above, some may not pin at all, so let the option say so rather than assert a release the line cannot support.
+
+**Why key on the listed escalations.** Streaks whose records list the SAME ids fold together, which is the clustering you want; unrelated ones separate. Identical ids rather than identical incident, note — the caveat above is the gap between the two, and it errs toward splitting. The accepted cost either way is more, smaller L2s: that is triage volume, not blocked work, because the sentinel `task_id` is synthetic and pins nothing real, so an open L2 in this class never holds a task.
+
+Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <summary>`
+
 #### `design_concern` / `risk_identified` / `missing_premise`
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
 
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
-- `risk_identified`: `"risk:<module-or-area-slug>"`
+- `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) above and must NOT take this generic key.
 
 ```python
 mcp__escalation__promote_to_l2(
