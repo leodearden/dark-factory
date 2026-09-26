@@ -286,24 +286,33 @@ class TestOrchTabReadsTheCensus:
     def tabs_code(self, tabs_jsx_body):
         return strip_js_comments(tabs_jsx_body)
 
+    @pytest.fixture(scope='class')
+    def census(self, orch_tab_code):
+        """The name OrchTab binds its per-orchestrator census to.
+
+        The probes below follow that binding rather than pin its spelling.
+        """
+        bindings = re.findall(r'\bconst\s+(\w+)\s*=\s*projectCensus\(\s*DF\s*,\s*o\.project\s*\)', orch_tab_code)
+        assert len(bindings) == 1, (
+            f'OrchTab binds projectCensus(DF, o.project) {len(bindings)} times; expected one binding.'
+        )
+        return bindings[0]
+
+    @pytest.mark.parametrize('retired', ['DF_ORCH_SUMMARY', 'DF_TASK_DONE_COUNT'])
+    def test_no_reader_of_a_deleted_interim_module_remains(self, tabs_code, retired):
+        assert retired not in tabs_code, (
+            f'tabs.jsx still reads `{retired}`, the global of an interim guard this '
+            'PRD retires; OrchTab reads the census now.'
+        )
+
     @pytest.mark.parametrize(
         'retired',
-        [
-            'DF_ORCH_SUMMARY',
-            'orchSummary',
-            'hasOrchSummary',
-            'orchTotalDatum',
-            'DF_TASK_DONE_COUNT',
-            'doneCount',
-            'ACTIVE_TASKS',
-            'o.summary',
-            '|| 1',
-        ],
+        ['orchSummary', 'hasOrchSummary', 'orchTotalDatum', 'doneCount', 'ACTIVE_TASKS', 'o.summary', '|| 1'],
     )
-    def test_the_interim_readers_are_gone(self, tabs_code, retired):
-        assert retired not in tabs_code, (
-            f'tabs.jsx still contains `{retired}`. OrchTab reads the census now; '
-            'the interim guards and the ACTIVE_TASKS row count were the two '
+    def test_the_interim_readers_are_gone_from_orch_tab(self, orch_tab_code, retired):
+        assert retired not in orch_tab_code, (
+            f'OrchTab still contains `{retired}`. It reads the census now; the '
+            'interim guards and the ACTIVE_TASKS row count were the two '
             'populations behind "0/1" beside "Active · 33".'
         )
 
@@ -313,27 +322,29 @@ class TestOrchTabReadsTheCensus:
         )
         assert not re.search(r'window\.DF_TASK_SNAPSHOT\s*(\|\||&&|\?\?)', tabs_code)
 
-    def test_binds_one_census_per_orchestrator(self, orch_tab_code):
-        assert re.search(r'\bconst\s+census\s*=\s*projectCensus\(\s*DF\s*,\s*o\.project\s*\)', orch_tab_code), (
-            'OrchTab does not bind `const census = projectCensus(DF, o.project)`.'
+    def test_binds_one_census_per_orchestrator(self, orch_tab_code, census):
+        calls = re.findall(r'\bprojectCensus\(', orch_tab_code)
+        assert len(calls) == 1, (
+            f'OrchTab calls projectCensus {len(calls)} times; every surface of one '
+            f'orchestrator reads the single `{census}` binding.'
         )
 
-    def test_every_pip_reads_the_census_through_a_view_reading(self, orch_tab_code):
+    def test_every_pip_reads_the_census_through_a_view_reading(self, orch_tab_code, census):
         pips = re.findall(r'<Pip\b', orch_tab_code)
         assert len(pips) == 1, f'OrchTab renders {len(pips)} <Pip> sites; expected one, mapped over CENSUS_VIEWS'
         view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<Pip')
-        assert 'datum={census}' in call
+        assert f'datum={{{census}}}' in call
         assert f'format={{{view}.reading}}' in call
 
-    def test_the_progress_header_is_terminal_of_total(self, orch_tab_code):
-        assert re.search(r'<DatumReading\s+datum=\{census\}\s+format=\{terminalOfTotal\}', orch_tab_code), (
-            'the Progress header does not render <DatumReading datum={census} format={terminalOfTotal} />.'
+    def test_the_progress_header_is_terminal_of_total(self, orch_tab_code, census):
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{terminalOfTotal\}}', orch_tab_code), (
+            f'the Progress header does not render <DatumReading datum={{{census}}} format={{terminalOfTotal}} />.'
         )
 
-    def test_the_progress_bar_maps_census_segments(self, orch_tab_code):
-        assert re.search(r'censusSegments\(\s*census\s*\)\.map\(', orch_tab_code)
+    def test_the_progress_bar_maps_census_segments(self, orch_tab_code, census):
+        assert re.search(rf'censusSegments\(\s*{census}\s*\)\.map\(', orch_tab_code)
 
-    def test_the_legend_maps_the_views_through_datum_reading(self, orch_tab_code):
+    def test_the_legend_maps_the_views_through_datum_reading(self, orch_tab_code, census):
         calls = [
             (view, call)
             for view, call in _map_calls(orch_tab_code, 'CENSUS_VIEWS')
@@ -341,19 +352,20 @@ class TestOrchTabReadsTheCensus:
         ]
         assert len(calls) == 1, f'expected one legend map over CENSUS_VIEWS, found {len(calls)}'
         view, call = calls[0]
-        assert re.search(rf'<DatumReading\s+datum=\{{census\}}\s+format=\{{{view}\.reading\}}', call)
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.reading\}}', call)
 
-    def test_the_filter_buttons_are_the_views_with_census_counts(self, orch_tab_code):
+    def test_the_filter_buttons_are_the_views_with_census_counts(self, orch_tab_code, census):
         view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<button')
         assert re.search(rf'flipFilter\(\s*o\.pid\s*,\s*{view}\.key\s*\)', call)
-        assert re.search(rf'<DatumReading\s+datum=\{{census\}}\s+format=\{{{view}\.count\}}', call)
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.count\}}', call)
         assert f'{{{view}.label}}' in call
 
-    def test_the_filter_persists_under_the_view_key(self, orch_tab_code):
-        assert "'df.orch.views'" in orch_tab_code
-        assert 'df.orch.filter' not in orch_tab_code, (
+    def test_the_filter_does_not_persist_under_the_retired_key(self, orch_tab_code):
+        keys = re.findall(r'usePersistedState\(\s*[\'"]([^\'"]+)[\'"]', orch_tab_code)
+        assert len(keys) == 1, f'OrchTab persists {len(keys)} states; expected one, the view filter'
+        assert keys[0] != 'df.orch.filter', (
             'a browser holding the old {active,pending,complete} object would read '
-            'as "nothing selected" under the new keys; the new storage key makes it '
+            'as "nothing selected" under the view keys; a fresh storage key makes it '
             'fall back to the default instead.'
         )
 
