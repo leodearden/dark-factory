@@ -77,8 +77,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
     deferred    INTEGER NOT NULL DEFAULT 0,
     cancelled   INTEGER NOT NULL DEFAULT 0,
     done        INTEGER NOT NULL DEFAULT 0,
-    -- The in_progress zone's live/stranded split (task 3543). Partitions
-    -- in_progress; it does not add to the six zones.
+    -- The in-progress rows' live/stranded split (task 3543). A partition, so
+    -- it never adds to the member counts: of in_progress on a row written
+    -- before task 5591, of in_progress_rows (below) on one written since.
     in_progress_live     INTEGER NOT NULL DEFAULT 0,
     in_progress_stranded INTEGER NOT NULL DEFAULT 0,
     -- max_concurrent_tasks in force AT SNAPSHOT TIME. Nullable on purpose:
