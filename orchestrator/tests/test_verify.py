@@ -2322,12 +2322,16 @@ class TestScopedVerificationAggregatesModuleAttribution:
         async def fake(worktree, config, module_config=None, **kwargs):
             assert module_config is not None
             ids = ids_by_prefix[module_config.prefix]
-            attributed = ids is not None and module_config.prefix not in unattributed
+            by_module = (
+                {module_config.prefix: ids}
+                if ids is not None and module_config.prefix not in unattributed
+                else None
+            )
             return VerifyResult(
                 passed=not ids, test_output='', lint_output='', type_output='',
                 summary='All checks passed' if not ids else 'Failures: tests failed',
                 failing_test_ids=ids,
-                failing_test_ids_by_module={module_config.prefix: ids} if attributed else None,
+                failing_test_ids_by_module=by_module,
             )
 
         return fake
