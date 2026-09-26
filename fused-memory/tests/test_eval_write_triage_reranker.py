@@ -559,3 +559,77 @@ class TestGuardCommittedReport:
 
     def test_a_full_run_at_the_committed_path_is_allowed(self) -> None:
         assert _mod().guard_committed_report(_COMMITTED_REPORT, limit=None) == _COMMITTED_REPORT
+
+
+_PACKAGE = Path(__file__).parent.parent
+
+
+def _factory_of(service):
+    @contextlib.asynccontextmanager
+    async def open_(config):
+        yield service
+
+    return open_
+
+
+def _refusing_factory(config):
+    raise AssertionError('the memory service must not be opened')
+
+
+class _ConstantScorer:
+    def score(self, entry: str, candidate_texts):
+        return _slate(tuple(0.5 for _ in candidate_texts))
+
+    def facts(self):
+        return _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+
+
+class TestCli:
+    def test_the_defaults_are_the_committed_run(self) -> None:
+        args = _mod().build_parser().parse_args([])
+        assert Path(args.fixture) == _PACKAGE / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+        assert Path(args.canonical_aliases) == (
+            _PACKAGE / 'tests' / 'fixtures' / 'write_triage_calibration.canonical_aliases.json'
+        )
+        assert Path(args.report_path) == _COMMITTED_REPORT
+        assert (args.project_id, args.limit) == ('reify', None)
+        assert (args.p95_ceiling_seconds, args.max_arm_spend_usd) == (3.0, 2.0)
+        assert (args.pairwise_concurrency, args.local_batch_size) == (20, 4)
+        assert (args.device, args.vram_cap_gib) == ('auto', 8.0)
+
+    def test_a_limited_run_at_the_committed_path_is_refused_before_the_store_opens(self) -> None:
+        args = _mod().build_parser().parse_args(['--limit', '3'])
+        with pytest.raises(ValueError):
+            _mod().run_cli(args, memory_service_factory=_refusing_factory)
+
+    def test_a_limited_run_records_what_it_measured(self, tmp_path: Path) -> None:
+        from _write_triage_store_fake import FakeMemoryService
+
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.server.write_triage import resolve_candidate_k
+
+        calibrate = load_script_module(SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+        service = FakeMemoryService([_row('x', 0.9), _row('y', 0.5)])
+        spec = _spec(_ConstantScorer(), name='constant')
+        args = _mod().build_parser().parse_args([
+            '--limit', '2', '--report-path', str(tmp_path / 'x.json'),
+        ])
+        assert _mod().run_cli(
+            args, memory_service_factory=_factory_of(service), arms=(spec,),
+        ) == 0
+        report = json.loads((tmp_path / 'x.json').read_text())
+        provenance = report['provenance']
+        assert provenance['fixture_path'] == 'tests/fixtures/write_triage_calibration.jsonl'
+        assert provenance['canonical_aliases_path'] == (
+            'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        )
+        assert provenance['canonical_aliases_count'] == 3
+        assert (provenance['project_id'], provenance['limit']) == ('reify', 2)
+        assert (provenance['record_count'], provenance['case_count']) == (104, 2)
+        assert provenance['candidate_k'] == resolve_candidate_k(
+            types.SimpleNamespace(config=FusedMemoryConfig()),
+        )
+        assert provenance['retrieval_call'] == calibrate.RETRIEVAL_CALLS[
+            calibrate.RETRIEVAL_PRODUCTION
+        ]
+        assert [row['arm'] for row in report['arms']] == ['constant']
