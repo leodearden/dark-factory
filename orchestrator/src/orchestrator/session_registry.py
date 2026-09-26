@@ -427,6 +427,15 @@ class DecisionRecord:
         other queue (task 3528). Defaults to '' (unknown/legacy -- a record
         filed before this field existed, or by a caller that didn't supply
         it), which makes the reaper fall back to project-only scoping.
+    closing_evidence: the evidence that decided a closed record, quoted
+        verbatim. ``docs/escalation-standing-policy.md`` requires the
+        DecisionRecord to quote the deciding evidence, which no field could
+        hold before; packing it into ``text`` (the cockpit's one-line
+        question) would bury a structured fact in prose. Written only by
+        close_decision_with_evidence, which the sitting preparer's apply step
+        drives through the ``close-decision`` verb. Defaults to '' (not
+        closed with evidence, or filed before this field existed). CUSTODY,
+        like ``state``: a watcher's re-file never changes it.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -434,11 +443,13 @@ class DecisionRecord:
     update_decision_state), the C5 cockpit (via set_manual_boost), -- for
     task 3640's back-fill, running against live records while the watchers
     are up -- scripts/backfill_decision_queue_stamp.py (via
-    set_decision_escalations_dir), and the ``write-decision`` verb itself
+    set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
-    an existing open record. That fourth one is the only mutator that may
-    CREATE the record rather than merely mutate an existing one, so it races
-    on a path where nothing exists on disk yet. All four serialize their
+    an existing open record, and -- for task 5376's sitting preparer -- the
+    ``close-decision`` verb (via close_decision_with_evidence). The
+    ``write-decision`` verb is the only mutator that may CREATE the record
+    rather than merely mutate an existing one, so it races on a path where
+    nothing exists on disk yet. All five serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -446,8 +457,8 @@ class DecisionRecord:
     any of the mutations -- each write remains individually atomic AND the
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
-    set_decision_escalations_dir/_run_write_decision for the caller-facing
-    note.
+    set_decision_escalations_dir/_run_write_decision/
+    close_decision_with_evidence for the caller-facing note.
     """
 
     id: str
@@ -462,6 +473,7 @@ class DecisionRecord:
     state: str = field(default=DecisionState.OPEN, kw_only=True)
     severity: str = field(default='', kw_only=True)
     escalations_dir: str = field(default='', kw_only=True)
+    closing_evidence: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -477,6 +489,7 @@ class DecisionRecord:
             'state': str(self.state),
             'severity': self.severity,
             'escalations_dir': self.escalations_dir,
+            'closing_evidence': self.closing_evidence,
         }
 
     @classmethod
@@ -498,6 +511,8 @@ class DecisionRecord:
             # `str` annotation stays honest against a hand-edited record and
             # the reaper's queue guard needs no None-vs-''-vs-missing branch.
             escalations_dir=data.get('escalations_dir') or '',
+            # Same `or ''` idiom as escalations_dir above.
+            closing_evidence=data.get('closing_evidence') or '',
         )
 
     def to_json(self) -> str:
@@ -953,9 +968,9 @@ def _mutate_decision(
     """Lock-serialized, fail-soft read-modify-write of one decision record.
 
     The single implementation of the field-setter body shared by
-    update_decision_state, set_manual_boost and set_decision_escalations_dir
-    (task 3640 amendment). Those three are the public, caller-facing names and
-    keep their own docstrings; this holds the parts that MUST NOT diverge
+    update_decision_state, set_manual_boost, set_decision_escalations_dir
+    (task 3640 amendment) and close_decision_with_evidence (task 5376). Those
+    are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
 
@@ -1079,6 +1094,71 @@ def set_decision_escalations_dir(
 
     return _mutate_decision(
         decision_id, _set, caller='set_decision_escalations_dir', root=root
+    )
+
+
+CLOSING_DECISION_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
+
+
+class DecisionCloseRefused(Exception):
+    """close_decision_with_evidence refused; the record is untouched and the message names why.
+
+    Not a ValueError on purpose: _mutate_decision's fail-soft except-tuple
+    absorbs ValueError, and a refusal must reach its caller rather than read as
+    a missing record.
+    """
+
+
+def close_decision_with_evidence(
+    decision_id: str,
+    state: str,
+    evidence: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Close *decision_id* to *state* and record the deciding *evidence*, in ONE locked read-modify-write.
+
+    Accepted: ``open`` -> ``answered`` | ``dropped``, and attaching evidence to
+    a record ALREADY in *state* whose ``closing_evidence`` is empty. The second
+    is the reap-decisions-got-there-first path: the sitting preparer's apply
+    step resolves the escalation BEFORE recording evidence, so a server-side
+    refusal aborts before the registry claims an answer, which leaves the
+    reaper free to close the record in between.
+
+    Raises DecisionCloseRefused for a target state other than answered or
+    dropped, empty evidence, a move between two different terminal states, or
+    evidence already recorded (never overwritten). The two argument refusals
+    run before the lock, because a lock sidecar is never cleaned up (see
+    decision_id_lock); the two state refusals run inside the locked span.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    Concurrency: serialized per-decision-id via _mutate_decision, see
+    DecisionRecord's docstring.
+    """
+    if state not in CLOSING_DECISION_STATES:
+        raise DecisionCloseRefused(
+            f'{decision_id}: close-decision closes to answered or dropped, not {str(state)!r}'
+        )
+    if not evidence.strip():
+        raise DecisionCloseRefused(
+            f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
+        )
+
+    def _close(record: DecisionRecord) -> None:
+        if record.closing_evidence:
+            raise DecisionCloseRefused(
+                f'{decision_id} already carries closing evidence; refusing to overwrite it'
+            )
+        if record.state not in (DecisionState.OPEN, state):
+            raise DecisionCloseRefused(
+                f'{decision_id} is {str(record.state)!r}; a move between terminal states '
+                f'({str(record.state)!r} -> {str(state)!r}) is refused'
+            )
+        record.state = str(state)
+        record.closing_evidence = evidence
+
+    return _mutate_decision(
+        decision_id, _close, caller='close_decision_with_evidence', root=root
     )
 
 
@@ -1210,10 +1290,11 @@ def merge_decision_enrichment(
 
     - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
       is the whole reason these two records are being merged.
-    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
-      (CUSTODY). A second watcher must not restamp queue age, re-open or
-      close the record (that is update_decision_state's job), or reset an
-      operator's C5 cockpit boost.
+    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` --
+      from *existing* (CUSTODY). A second watcher must not restamp queue age,
+      re-open or close the record (that is update_decision_state's job),
+      reset an operator's C5 cockpit boost, or erase the evidence a close
+      recorded.
     - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
       *existing* where it is non-empty; take *incoming* ONLY to fill a field
       the first filer left empty/None. That fill is what makes this
@@ -1295,9 +1376,11 @@ def merge_same_queue_refile(
       _max_decision_severity) would strand stale prose and a stale severity
       in the cockpit queue forever. This is the whole reason the same-queue
       case is not just routed through merge_decision_enrichment.
-    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
-      (CUSTODY), and it is the SAME set merge_decision_enrichment keeps,
-      because custody does not depend on which queue re-filed. ``filed_at``
+    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` --
+      from *existing* (CUSTODY), and it is the SAME set
+      merge_decision_enrichment keeps, because custody does not depend on
+      which queue re-filed. ``closing_evidence`` travels with ``state``: it
+      is the evidence for the disposition being held. ``filed_at``
       is queue AGE, which drives the cockpit's ordering, and a restart is not
       news about it. ``manual_boost`` is the OPERATOR's C5 field, written by
       set_manual_boost. ``state`` is the operator's / reaper's DISPOSITION,
@@ -1383,6 +1466,7 @@ def merge_same_queue_refile(
         filed_at=existing.filed_at,
         state=existing.state,
         manual_boost=existing.manual_boost,
+        closing_evidence=existing.closing_evidence,
     )
 
 
@@ -4588,6 +4672,26 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         print(f'{reaped.id} {reaped.new_state}')
 
 
+def _run_close_decision(decision_id: str, state: str, evidence: str, root: str | None) -> int:
+    """Run the ``close-decision`` verb; the one decision verb whose failure is a non-zero exit.
+
+    Its caller is an agent executing a pre-built apply payload
+    (``scripts/sitting/payloads.py::close_decision_argv``), not
+    spawn-claude.sh, so a refusal or an unreadable record must be seen rather
+    than read as success. Prints the closed record's id on success.
+    """
+    try:
+        record = close_decision_with_evidence(decision_id, state, evidence, root=root)
+    except DecisionCloseRefused as exc:
+        print(f'close-decision refused: {exc}', file=sys.stderr)
+        return 1
+    if record is None:
+        print(f'close-decision: {decision_id} has no readable record to close (see the ERROR log)', file=sys.stderr)
+        return 1
+    print(record.id)
+    return 0
+
+
 def _run_migrate_decision_projects(dry_run: bool) -> None:
     """Run the ``migrate-decision-projects`` verb (task 3807).
 
@@ -4746,6 +4850,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    close_decision_p = sub.add_parser(
+        'close-decision',
+        help='close a decision to answered|dropped, quoting the deciding evidence (task 5376)',
+    )
+    close_decision_p.add_argument('--id', required=True, help="the decision's id")
+    close_decision_p.add_argument('--state', required=True, help='answered or dropped')
+    close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
+    close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
+
     # NOTE: --escalations-dir is required on BOTH halves of the file/reap
     # pair. reap-decisions has always required it; write-decision joined it
     # in task 3559, so the two are symmetric rather than each inventing a
@@ -4797,6 +4910,10 @@ def main(argv: list[str] | None = None) -> int:
     A runtime refusal (e.g. an explicitly EMPTY stamp, which argparse cannot
     distinguish from a supplied one) stays fail-soft: ERROR log, nothing
     written, nothing printed, rc 0.
+
+    ``close-decision`` is the one exception, and it is dispatched before the
+    swallowing try/except: see _run_close_decision for why its refusals exit
+    non-zero.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -4868,6 +4985,9 @@ def main(argv: list[str] | None = None) -> int:
                 'pid, not this session\'s identity, and lease-heartbeat/lease-release have no '
                 '--pid at all -- only --slug is honoured by all three verbs.'
             )
+
+    if args.verb == 'close-decision':
+        return _run_close_decision(args.id, args.state, args.evidence, args.root)
 
     try:
         if args.verb == 'launching':
