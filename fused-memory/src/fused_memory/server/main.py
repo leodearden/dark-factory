@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -749,6 +750,7 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    topic_cluster_store: TopicClusterStore | None = None
     # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
     # populate recon_report_state before the harness is constructed, threading the
     # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
@@ -995,6 +997,12 @@ async def run_server():
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
 
+    # Machine-derived topic clusters (task 3135). Built in both branches above
+    # and never gated on reconciliation.enabled or the autoseed leaf: both of
+    # its consumers (consolidate_memories and the add_memory guard) run either
+    # way, and the leaf is read live at each of them.
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
+
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
@@ -1003,6 +1011,7 @@ async def run_server():
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
+        topic_cluster_store=topic_cluster_store,
     )
 
     # Both ToolManager.call_tool wrappers, in the ONE order that works. The
@@ -1263,6 +1272,9 @@ async def run_server():
             # so a close hiccup can't mask the original shutdown cause.
             with contextlib.suppress(BaseException):
                 recon_report_state.stop_persistence()
+        if topic_cluster_store is not None:
+            with contextlib.suppress(BaseException):
+                topic_cluster_store.close()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1729,6 +1741,23 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
 
     store = TicketStore(data_dir / 'tickets.db')
     await store.initialize()
+    return store
+
+
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+    """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
+
+    Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the
+    store is. A :class:`~fused_memory.server.topic_cluster_store.TopicClusterStoreError`
+    from a corrupt row propagates on purpose, failing startup the way an
+    invalid config cluster does.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+
+    store = TopicClusterStore(data_dir / 'topic_clusters.db')
+    store.open()
     return store
 
 

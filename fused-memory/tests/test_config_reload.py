@@ -140,6 +140,46 @@ class TestDiffConfig:
         assert d.applied_candidates[path] == {'old': old, 'new': []}
         assert path not in d.restart_required
 
+    def test_topic_cluster_autoseed_leaf_is_green_tier_applied_candidate(self):
+        """The derived-cluster kill switch is green-tier (task 3135): both the
+        seed and the guard merge read it live, so a flip buckets as an
+        applied_candidate, NOT restart_required."""
+        path = 'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled'
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        assert live.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled is True
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_topic_cluster_autoseed_enabled', False
+        )
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': True, 'new': False}
+        assert path not in d.restart_required
+
+    def test_topic_cluster_retired_leaf_is_green_tier_applied_candidate(self):
+        """The per-topic derived-cluster kill switch is green-tier: the seed and
+        the guard merge read it live, so retiring a misfiring cluster is a
+        reload_config, NOT a restart."""
+        path = 'reconciliation.procedural_knowledge_topic_cluster_autoseed_retired'
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        retired = {'dark_factory': ['worktree-stale-base-premise-verification']}
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_topic_cluster_autoseed_retired', retired
+        )
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': {}, 'new': retired}
+        assert path not in d.restart_required
+
 
 class TestDiffConfigOptionalSubmodels:
     """diff_config / apply_reload tolerate an OPTIONAL submodel field toggling

@@ -536,6 +536,7 @@ def build_consolidation_result(
     citation_repoint: dict[str, Any] | None = None,
     tombstones_written: int = 0,
     tombstones_expected: int = 0,
+    topic_cluster_seed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The op's response envelope, and the ONE home of its status rule.
 
@@ -565,17 +566,18 @@ def build_consolidation_result(
     missing.
 
     WHAT THE STATUS RULE DELIBERATELY IGNORES: a tombstone shortfall
-    (``tombstones_written < tombstones_expected``).  The memory operation
-    genuinely completed — the cluster is folded and closed — and only its
-    AUDIT TRAIL did not land, e.g. on a deployment running
-    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0.
-    Reporting the two counts satisfies structured-facts and
-    no-silent-fail-soft without conflating the two failures, which matters
-    because ``'partial'`` is an invitation to RETRY: a caller that re-ran a
-    COMPLETED consolidation would re-write a canonical whose supersedes are
-    already gone, which is precisely the net-+1 ratchet this op exists to
-    end.  An audit gap is fixed by looking at the logs, never by repeating
-    the delete.
+    (``tombstones_written < tombstones_expected``) and the topic-guard seed
+    outcome (``topic_cluster_seed``).  In both the memory operation genuinely
+    completed — the cluster is folded and closed — and only a side effect did
+    not land: the AUDIT TRAIL, e.g. on a deployment running
+    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0, or
+    the derived topic cluster that teaches the write-time guard (task 3135).
+    Reporting them satisfies structured-facts and no-silent-fail-soft without
+    conflating either with a consolidation failure, which matters because
+    ``'partial'`` is an invitation to RETRY: a caller that re-ran a COMPLETED
+    consolidation would re-write a canonical whose supersedes are already
+    gone, which is precisely the net-+1 ratchet this op exists to end.  Such
+    a gap is fixed by looking at the logs, never by repeating the op.
 
     WHAT ``'partial'`` IS NOT: a retry signal.  The lists say which ids keep
     the cluster open, and they are there to be FINISHED BY HAND — never by
@@ -598,13 +600,15 @@ def build_consolidation_result(
 
     Every disposition key is ALWAYS present, empty lists included, so a
     caller can read ``result['survivors']`` without a membership test and a
-    later arm cannot quietly stop reporting by omitting its key.  Three keys
+    later arm cannot quietly stop reporting by omitting its key.  Four keys
     are deliberate exceptions, each present only when the thing it describes
     actually happened: ``citation_repoint`` (an empty map would read as "the
     gate ran and found nothing" on a call where the gate never ran at all),
     ``supersedes_correction`` (absent means the canonical's claim was right
-    as written, not that a correction ran and changed nothing) and ``hint``
-    (recovery guidance on a clean run would be noise).
+    as written, not that a correction ran and changed nothing),
+    ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
+    no seed was attempted) and ``hint`` (recovery guidance on a clean run
+    would be noise).
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -658,6 +662,8 @@ def build_consolidation_result(
         result['citation_repoint'] = citation_repoint
     if supersedes_correction:
         result['supersedes_correction'] = supersedes_correction
+    if topic_cluster_seed is not None:
+        result['topic_cluster_seed'] = topic_cluster_seed
     if open_business:
         # Carried IN the envelope, not just in the docstring: the caller
         # holding a partial result is the one about to re-run the op, and a

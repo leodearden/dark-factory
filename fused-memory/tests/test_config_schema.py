@@ -2399,6 +2399,56 @@ class TestProceduralTopicGuardClustersDefault:
                         )
 
 
+class TestTopicClusterAutoseedEnabledLeaf:
+    """The kill switch for MACHINE-DERIVED topic clusters (task 3135)."""
+
+    def test_defaults_to_true(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_enabled is True
+
+    def test_round_trips_false(self):
+        cfg = ReconciliationConfig(procedural_knowledge_topic_cluster_autoseed_enabled=False)
+        assert cfg.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {'reconciliation': {'procedural_knowledge_topic_cluster_autoseed_enabled': False}}
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+
+class TestTopicClusterAutoseedRetiredLeaf:
+    """The per-topic kill switch for MACHINE-DERIVED topic clusters (task 3135 review)."""
+
+    def test_defaults_to_nothing_retired(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_retired == {}
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {
+                'reconciliation': {
+                    'procedural_knowledge_topic_cluster_autoseed_retired': {
+                        'dark_factory': ['worktree-stale-base-premise-verification'],
+                    }
+                }
+            }
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired == {
+            'dark_factory': ['worktree-stale-base-premise-verification'],
+        }
+
+    def test_a_non_slug_topic_id_fails_loud_naming_it_and_the_rule(self):
+        with pytest.raises(ValidationError) as excinfo:
+            ReconciliationConfig(
+                procedural_knowledge_topic_cluster_autoseed_retired={
+                    'dark_factory': ['good-slug', 'worktree_stale_base'],
+                }
+            )
+        message = str(excinfo.value)
+        assert 'worktree_stale_base' in message
+        assert 'dark_factory' in message
+        assert 'fused_memory.topic_slug' in message
+
+
 class TestPytestXdistSerialOverrideCluster:
     """Topic-guard cluster for the pytest-xdist -n0 serial-override workaround
     (the topic that originally motivated this guard, task 2845; canonical

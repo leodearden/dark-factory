@@ -20,7 +20,9 @@ failure mode is recorded in `tests/test_update_memory_tool.py`.
 from __future__ import annotations
 
 import json
+import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,7 +30,9 @@ import pytest
 import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import DescendantScan
 
 PROJECT_ID = 'dark_factory'
@@ -86,20 +90,20 @@ def _parse_result(result):
 CREATED_AT = '2026-01-01T00:00:00+00:00'
 
 
-def _point_row(memory_id, **metadata):
+def _point_row(memory_id, *, content=None, **metadata):
     """What `get_memory_by_id` returns: `created_at` NESTED in the payload."""
     return {
         'id': memory_id,
-        'content': f'record {memory_id}',
+        'content': f'record {memory_id}' if content is None else content,
         'metadata': {'topic': TOPIC, 'created_at': CREATED_AT, **metadata},
     }
 
 
-def _scroll_row(memory_id, **metadata):
+def _scroll_row(memory_id, *, content=None, **metadata):
     """What `get_memories_by_metadata` returns: `created_at` LIFTED flat."""
     return {
         'id': memory_id,
-        'content': f'record {memory_id}',
+        'content': f'record {memory_id}' if content is None else content,
         'created_at': CREATED_AT,
         'metadata': {'topic': TOPIC, **metadata},
     }
@@ -123,6 +127,7 @@ def make_service(
     child_scan_errors=None,
     recount_errors=None,
     events=None,
+    contents=None,
 ):
     """A MemoryService mock modelling one consolidation cluster.
 
@@ -170,6 +175,9 @@ def make_service(
     *events* is a shared ordered log — the only way to assert the ORDERING
     that is this op's whole contract, since the steps land on different
     mocks (the service, then the task interceptor, then the service again).
+
+    *contents* maps an id to the text BOTH reads return for it; an unmapped
+    id reads as ``record <id>``.
     """
     gone = set(gone)
     children = children or {}
@@ -183,6 +191,7 @@ def make_service(
     corroboration_errors = corroboration_errors or {}
     child_scan_errors = child_scan_errors or {}
     recount_errors = recount_errors or {}
+    contents = contents or {}
     members = SUPERSEDES if topic_members is None else topic_members
     log = events if events is not None else []
 
@@ -228,8 +237,8 @@ def make_service(
         if seen and memory_id in gone:
             return None
         if memory_id in canonical_peers:
-            return _point_row(memory_id, canonical=True)
-        return _point_row(memory_id)
+            return _point_row(memory_id, content=contents.get(memory_id), canonical=True)
+        return _point_row(memory_id, content=contents.get(memory_id))
 
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
 
@@ -275,7 +284,7 @@ def make_service(
     async def _scroll(**kwargs):
         if scroll_error is not None:
             raise scroll_error
-        return [_scroll_row(m) for m in members]
+        return [_scroll_row(m, content=contents.get(m)) for m in members]
 
     svc.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
 
@@ -338,10 +347,13 @@ def make_interceptor(tasks, *, scan_error=None, failing_task_ids=(), events=None
 
 
 async def call_consolidate(
-    svc, *, task_interceptor=None, known_projects=None, **overrides
+    svc, *, task_interceptor=None, known_projects=None, topic_cluster_store=None, **overrides
 ):
     server = create_mcp_server(
-        svc, task_interceptor=task_interceptor, known_projects=known_projects
+        svc,
+        task_interceptor=task_interceptor,
+        known_projects=known_projects,
+        topic_cluster_store=topic_cluster_store,
     )
     args = {
         'canonical_content': CONTENT,
@@ -2146,3 +2158,236 @@ class TestPartialIsNotARetrySignal:
 
         assert result['status'] == 'consolidated'
         assert 'hint' not in result
+
+
+# Near-duplicate texts sharing distinctive vocabulary ('pytest-xdist',
+# '--dist loadgroup', '--max-worker-restart 0') inside different prose, so
+# the derivation has something to characterise. The canonical's own text
+# stays the generic CONTENT, which is what makes each member-text SOURCE
+# below provable on its own.
+_XDIST_1 = (
+    'Run the fused-memory suite under pytest-xdist with --dist loadgroup and '
+    '--max-worker-restart 0 so the serial SQLite tests share one worker.'
+)
+_XDIST_2 = (
+    'Gotcha: pytest-xdist hides worker crashes unless --max-worker-restart 0 is set; '
+    'keep --dist loadgroup for the WAL tests.'
+)
+_XDIST_3 = 'Pin --max-worker-restart 0 and --dist loadgroup whenever pytest-xdist runs the serial suite.'
+_SUPERSEDE_CONTENTS = {S1: _XDIST_1, S2: _XDIST_2, S3: _XDIST_3}
+
+
+@pytest.fixture
+def cluster_store(tmp_path: Path):
+    store = TopicClusterStore(tmp_path / 'topic_clusters.db')
+    store.open()
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+class _UpsertRaisesStore(TopicClusterStore):
+    def upsert(self, *args, **kwargs) -> None:
+        raise sqlite3.OperationalError('disk I/O error')
+
+
+class TestConsolidationSeedsTheTopicGuard:
+    """Every consolidation teaches the write-time topic guard its topic (task 3135, PRD leaf ζ)."""
+
+    @pytest.mark.asyncio
+    async def test_one_cluster_lands_keyed_by_the_canonicals_own_topic(self, cluster_store):
+        svc = make_service(
+            contents={**_SUPERSEDE_CONTENTS, RETAIN_1: _XDIST_1},
+            topic_members=[CANONICAL, RETAIN_1],
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        (cluster,) = cluster_store.list_clusters(PROJECT_ID)
+        written_topic = svc.add_memory.await_args.kwargs['metadata']['topic']
+        assert cluster.topic_id == TOPIC
+        assert cluster.topic_id == written_topic
+        assert CANONICAL in cluster.hint
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed'] == {
+            'outcome': 'seeded',
+            'topic_id': TOPIC,
+            'phrases': cluster.phrases,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_supersede_reads_alone_are_enough_to_seed(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS, topic_members=[CANONICAL, RETAIN_1])
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['topic_cluster_seed']['outcome'] == 'seeded'
+        assert len(cluster_store.list_clusters(PROJECT_ID)) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_closure_scroll_alone_is_enough_to_seed(self, cluster_store):
+        svc = make_service(
+            contents={RETAIN_1: _XDIST_1, RETAIN_2: _XDIST_2},
+            topic_members=[CANONICAL, RETAIN_1, RETAIN_2],
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(
+                svc, topic_cluster_store=cluster_store, supersedes=[], retain=[RETAIN_1, RETAIN_2]
+            )
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed']['outcome'] == 'seeded'
+        assert len(cluster_store.list_clusters(PROJECT_ID)) == 1
+
+    @pytest.mark.asyncio
+    async def test_seeding_costs_no_extra_reads(self, cluster_store):
+        with_store = make_service(contents=_SUPERSEDE_CONTENTS, topic_members=[CANONICAL, RETAIN_1])
+        without_store = make_service(
+            contents=_SUPERSEDE_CONTENTS, topic_members=[CANONICAL, RETAIN_1]
+        )
+
+        with patched_tombstone_writer():
+            await call_consolidate(with_store, topic_cluster_store=cluster_store)
+            await call_consolidate(without_store)
+
+        assert cluster_store.list_clusters(PROJECT_ID)
+        assert (
+            with_store.get_memory_by_id.await_count == without_store.get_memory_by_id.await_count
+        )
+        assert (
+            with_store.get_memories_by_metadata.await_count
+            == without_store.get_memories_by_metadata.await_count
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_seeded_cluster_survives_a_restart(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS, topic_members=[CANONICAL, RETAIN_1])
+
+        with patched_tombstone_writer():
+            await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        (seeded,) = cluster_store.list_clusters(PROJECT_ID)
+        reopened = TopicClusterStore(cluster_store.db_path)
+        reopened.open()
+        try:
+            assert reopened.list_clusters(PROJECT_ID) == [seeded]
+        finally:
+            reopened.close()
+
+
+class TestASeedShortfallIsDisclosedNotFatal:
+    """Teaching the guard is a side effect; its outcome is disclosed and never moves `status`.
+
+    Same class as the tombstone shortfall: `'partial'` invites a retry, and a
+    retry of a COMPLETED consolidation writes a second canonical.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_raising_store_leaves_the_fold_intact(self, tmp_path):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(
+                svc, topic_cluster_store=_UpsertRaisesStore(tmp_path / 'unused.db')
+            )
+
+        assert result['topic_cluster_seed']['outcome'] == 'failed'
+        assert result['topic_cluster_seed']['error_type'] == 'OperationalError'
+        assert result['status'] == 'consolidated'
+        assert result['canonical_id'] == CANONICAL
+        assert result['deleted'] == SUPERSEDES
+        assert result['survivors'] == []
+
+    @pytest.mark.asyncio
+    async def test_generic_members_abstain(self, cluster_store):
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed']['outcome'] == 'skipped'
+        assert cluster_store.list_clusters(PROJECT_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_disables_the_seed(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = False
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed'] == {'outcome': 'disabled'}
+        assert cluster_store.list_clusters(PROJECT_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_a_topic_retired_for_this_project_is_not_seeded(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            PROJECT_ID: [TOPIC]
+        }
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed'] == {'outcome': 'disabled'}
+        assert cluster_store.list_clusters(PROJECT_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_a_topic_retired_for_another_project_is_still_seeded(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            'reify': [TOPIC]
+        }
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['topic_cluster_seed']['outcome'] == 'seeded'
+        assert len(cluster_store.list_clusters(PROJECT_ID)) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_store_wired_means_no_key(self):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert 'topic_cluster_seed' not in result
+
+    @pytest.mark.asyncio
+    async def test_a_partial_run_still_seeds(self, cluster_store):
+        svc = make_service(gone=[S1, S2], contents=_SUPERSEDE_CONTENTS)
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['status'] == 'partial'
+        assert result['survivors'] == [S3]
+        assert result['topic_cluster_seed']['outcome'] == 'seeded'
+
+    def test_a_failed_seed_alone_never_makes_the_result_partial(self):
+        seed = {
+            'outcome': 'failed',
+            'topic_id': TOPIC,
+            'error': 'disk I/O error',
+            'error_type': 'OperationalError',
+        }
+
+        result = build_consolidation_result(
+            canonical_id=CANONICAL,
+            topic=TOPIC,
+            deleted=[],
+            failed_deletes=[],
+            survivors=[],
+            topic_cluster_seed=seed,
+        )
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed'] == seed

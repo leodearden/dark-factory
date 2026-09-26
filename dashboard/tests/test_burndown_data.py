@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -13,15 +14,13 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import httpx
 import pytest
+from shared.task_statuses import ACTIVE, TaskStatus
 
 import dashboard.data.burndown as burndown_module
+import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
-    _INSERT_SNAPSHOT_SQL,
-    _SNAPSHOT_PAGE_SIZE,
     BURNDOWN_SCHEMA,
-    _count_statuses,
-    _count_zones,
     aggregate_burndown_projects,
     aggregate_burndown_series,
     collect_snapshot,
@@ -33,41 +32,153 @@ from dashboard.data.burndown import (
 )
 
 
-def _task_rows(tasks_or_dict):
-    """Coerce a fixture into the ``list[dict]`` shape ``fetch_tasks`` returns.
+def _raw_task(task_id, status, **fields) -> dict:
+    """One raw MCP ``get_tasks`` row, as fused-memory serves it (string id)."""
+    return {'id': str(task_id), 'status': status, 'dependencies': [], 'metadata': {}, **fields}
 
-    The collector reads ``fetch_tasks`` (MCP ``get_tasks``), not
-    ``fetch_statuses``: the live/stranded split needs the claimant columns
-    that the compact ``{id: status}`` map does not carry (task 3543).  A
-    fixture may still be written as that legacy map — it is expanded here into
-    claimant-less rows, which the shared strand predicate reads as stranded
-    when in-progress.  A ``list`` passes through, with an ``id`` filled in so
-    every row is well-formed.
+
+def _task_rows(tasks_or_dict) -> list[dict]:
+    """Coerce a fixture into raw MCP ``get_tasks`` rows.
+
+    A legacy ``{id: status}`` map expands into claimant-less rows, which the
+    shared strand predicate reads as stranded when in-progress.  A ``list``
+    of dicts passes through, with an ``id`` filled in by position when absent.
     """
     if isinstance(tasks_or_dict, dict):
-        return [{'id': i, 'status': status} for i, status in tasks_or_dict.items()]
-    return [{'id': t.get('id', i), **t} for i, t in enumerate(tasks_or_dict)]
+        return [_raw_task(task_id, status) for task_id, status in tasks_or_dict.items()]
+    rows = []
+    for position, task in enumerate(tasks_or_dict):
+        fields = dict(task)
+        rows.append(_raw_task(fields.pop('id', position), **fields))
+    return rows
 
 
 def _root_key(root):
-    """Canonicalised key for fetch_tasks-stub maps."""
+    """Canonicalised key for root-keyed fixture maps."""
     return str(Path(root).resolve())
 
 
-class _AsyncReturn:
-    """Sync callable suitable for ``side_effect=`` on AsyncMock-patched async targets.
+class _CannedStore:
+    """A root-keyed stand-in for the PUBLIC ``dashboard.data.tasks.mcp_tool_call``.
 
-    ``unittest.mock.patch`` upgrades to AsyncMock when the original is detected
-    as a coroutine function; AsyncMock awaits the side_effect's *result*, so the
-    side_effect itself must be sync (returning the value directly), otherwise
-    the AsyncMock returns the coroutine without awaiting it.
+    Modelled on ``dashboard/tests/test_task_snapshot.py::CannedMCP``, keyed by
+    project root so one instance serves a whole collector cycle and the REAL
+    ``task_snapshot.acquire_snapshot`` runs above it:
+
+    * ``get_statuses`` answers the root's ``{id: status}`` map — the SAME rows
+      ``get_tasks`` serves, plus any *census_only* extras — with NO
+      ``pagination`` key, the substrate's spelling of COMPLETE.  Census and
+      rows therefore agree by construction unless a test says otherwise.
+    * ``get_tasks`` applies ``args['statuses']`` as a server-side filter.
+    * A root mapped to an exception INSTANCE raises it on every call, and
+      every call ``fail_when(root, tool)`` accepts raises ``fail_with``.  Both
+      are attributes, so one instance can change behaviour between ticks.
+    * An unmapped root is an ``AssertionError``: a fixture that forgot a root
+      must not read as an empty project.
+
+    Every call is recorded as ``{'root', 'tool', 'args'}``.
     """
 
-    def __init__(self, value):
-        self._value = value
+    def __init__(
+        self,
+        by_root,
+        *,
+        census_only=None,
+        fail_when: Callable[[str, str], bool] = lambda root, tool: False,
+        fail_with: BaseException | None = None,
+    ) -> None:
+        self.by_root = {
+            _root_key(root): tasks if isinstance(tasks, BaseException) else _task_rows(tasks)
+            for root, tasks in by_root.items()
+        }
+        self.census_only = {
+            _root_key(root): {str(task_id): status for task_id, status in extra.items()}
+            for root, extra in (census_only or {}).items()
+        }
+        self.fail_when = fail_when
+        self.fail_with = fail_with or httpx.ReadTimeout('canned read timeout')
+        self.calls: list[dict] = []
 
-    def __call__(self, *args, **kwargs):
-        return self._value
+    def calls_to(self, tool: str, root=None) -> list[dict]:
+        """Every recorded call to *tool* (for *root*, when given), in order."""
+        return [
+            call for call in self.calls
+            if call['tool'] == tool and (root is None or call['root'] == _root_key(root))
+        ]
+
+    async def __call__(self, client, url, tool, args, **kwargs):
+        root = _root_key(args['project_root'])
+        self.calls.append({'root': root, 'tool': tool, 'args': dict(args)})
+        assert root in self.by_root, f'Unmapped project_root: {root}'
+        rows = self.by_root[root]
+        if isinstance(rows, BaseException):
+            raise rows
+        if self.fail_when(root, tool):
+            raise self.fail_with
+        if tool == 'get_statuses':
+            statuses = {str(row['id']): row['status'] for row in rows}
+            statuses.update(self.census_only.get(root, {}))
+            return {'statuses': statuses}
+        if tool == 'get_tasks':
+            wanted = args.get('statuses')
+            return {'tasks': [
+                dict(row) for row in rows if wanted is None or row['status'] in wanted
+            ]}
+        raise AssertionError(f'unexpected tool {tool!r}')
+
+
+def _serve(store: _CannedStore):
+    """Patch the canned substrate in at the public MCP seam."""
+    return patch('dashboard.data.tasks.mcp_tool_call', new=store)
+
+
+async def _rows_by_project(conn) -> dict[str, list]:
+    """Every stored row, grouped by project_id, each group in insert order."""
+    grouped: dict[str, list] = {}
+    async with conn.execute('SELECT * FROM snapshots ORDER BY id') as cur:
+        for row in await cur.fetchall():
+            grouped.setdefault(row['project_id'], []).append(row)
+    return grouped
+
+
+def _assert_one_gap(rows_by_project: dict[str, list], root, *reason_fragments: str):
+    """*root* has exactly one row, a gap whose reason carries every fragment; return it.
+
+    A gap row carries no measurement, so every nullable count column is NULL.
+    """
+    rows = rows_by_project.get(str(Path(root).resolve()), [])
+    assert len(rows) == 1, f'{root}: expected exactly one row, got {len(rows)}'
+    (row,) = rows
+    assert row['state'] == 'gap', f'{root}: expected a gap row, got state={row["state"]!r}'
+    for fragment in reason_fragments:
+        assert fragment in (row['reason'] or ''), (
+            f'{root}: reason {row["reason"]!r} does not carry {fragment!r}'
+        )
+    for column in ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows'):
+        assert row[column] is None, f'{root}: gap row {column} must be NULL, got {row[column]!r}'
+    return row
+
+
+def _assert_one_value(rows_by_project: dict[str, list], root):
+    """*root* has exactly one row, a value row; return it."""
+    rows = rows_by_project.get(str(Path(root).resolve()), [])
+    assert len(rows) == 1, f'{root}: expected exactly one row, got {len(rows)}'
+    (row,) = rows
+    assert row['state'] == 'value', f'{root}: expected a value row, got state={row["state"]!r}'
+    return row
+
+
+@pytest.fixture(autouse=True)
+def _isolate_caches():
+    """Neither the snapshot unit cache nor the fetch_tasks cache may cross a test."""
+    import dashboard.data.task_snapshot as snapshot_mod
+    import dashboard.data.tasks as tasks_mod
+
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+    yield
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,16 +207,28 @@ def _insert_snapshot(
     in_progress_live: int | None = None,
     in_progress_stranded: int = 0,
     concurrency_cap: int | None = None,
+    **more,
 ) -> None:
+    """Insert one fixture row by explicit column names.
+
+    *more* names any further column (``review``, ``state``, ``reason``, ...),
+    so a fixture can write exactly the row shape the test is about.
+    """
     # Default the split to all-live so the conservation invariant
     # (live + stranded == in_progress) holds for fixtures that do not care
     # about it; a NULL cap is the honest "unknown".
     if in_progress_live is None:
         in_progress_live = in_progress - in_progress_stranded
+    row = {
+        'project_id': project_id, 'ts': ts, 'pending': pending,
+        'in_progress': in_progress, 'blocked': blocked, 'deferred': deferred,
+        'cancelled': cancelled, 'done': done, 'in_progress_live': in_progress_live,
+        'in_progress_stranded': in_progress_stranded, 'concurrency_cap': concurrency_cap,
+        **more,
+    }
     conn.execute(
-        _INSERT_SNAPSHOT_SQL,
-        (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done,
-         in_progress_live, in_progress_stranded, concurrency_cap),
+        f'INSERT INTO snapshots ({", ".join(row)}) VALUES ({", ".join("?" for _ in row)})',
+        tuple(row.values()),
     )
 
 
@@ -143,27 +266,6 @@ def _assert_snapshot_counts(
     assert row['done'] == done, (
         f'done: expected {done}, got {row["done"]}'
     )
-
-
-def _fake_load(by_root_map):
-    """Async fetch_tasks fake; *by_root_map* is keyed by project_root (Path or str).
-
-    Each value may be a list of ``{'status': X}`` dicts (auto-converted) or a
-    pre-built ``{id: status}`` dict.  Look-up is canonical-path keyed so that
-    symlinked roots collapse onto the same entry.
-    """
-    canonical = {_root_key(k): v for k, v in by_root_map.items()}
-
-    # **_kwargs absorbs the collector's opt-in `chunk_size=` (task 5018); these
-    # fakes stand in for the whole fetch_tasks seam, so paging is already done
-    # by the time they answer.
-    async def _fake(client, config, project_root, **_kwargs):
-        key = _root_key(project_root)
-        if key not in canonical:
-            raise KeyError(f'Unmapped project_root: {key}')
-        return _task_rows(canonical[key])
-
-    return _fake
 
 
 # ---------------------------------------------------------------------------
@@ -208,218 +310,6 @@ async def burndown_env(burndown_conn_with_config):
     """Yield (db_path, config, conn) with a fresh burndown DB and open connection."""
     async with burndown_conn_with_config() as triple:
         yield triple
-
-
-# ---------------------------------------------------------------------------
-# _count_statuses
-# ---------------------------------------------------------------------------
-
-
-class TestCountStatuses:
-    def test_empty_dict(self):
-        assert _count_statuses({}) == {
-            'pending': 0, 'in_progress': 0, 'blocked': 0,
-            'deferred': 0, 'cancelled': 0, 'done': 0,
-        }
-
-    def test_standard_statuses(self):
-        statuses: dict[int, str | None] = {
-            1: 'pending',
-            2: 'pending',
-            3: 'in-progress',
-            4: 'done',
-            5: 'blocked',
-            6: 'cancelled',
-            7: 'deferred',
-        }
-        result = _count_statuses(statuses)
-        assert result == {
-            'pending': 2, 'in_progress': 1, 'blocked': 1,
-            'deferred': 1, 'cancelled': 1, 'done': 1,
-        }
-
-    def test_review_merges_into_in_progress(self):
-        result = _count_statuses({1: 'review', 2: 'in-progress'})
-        assert result['in_progress'] == 2
-
-    def test_unknown_status_defaults_to_pending(self):
-        result = _count_statuses({1: 'something-weird'})
-        assert result['pending'] == 1
-
-    def test_missing_status_key_defaults_to_pending(self):
-        # In the new API, a missing/None status maps to 'pending'.
-        result = _count_statuses({1: None})
-        assert result['pending'] == 1
-
-
-# ---------------------------------------------------------------------------
-# _count_zones — the live/stranded split (task 3543 / PRD ι, spec S8)
-# ---------------------------------------------------------------------------
-
-_ZONE_NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
-
-
-def _ztask(status='in-progress', **overrides):
-    """A dashboard-shaped task row as ``tasks._shape_task`` emits it."""
-    task = {
-        'id': overrides.pop('id', 1),
-        'status': status,
-        'metadata': {},
-        'claimant_run_id': None,
-        'heartbeat_at': None,
-    }
-    task.update(overrides)
-    return task
-
-
-def _live(**overrides):
-    """An in-progress row with a claimant heartbeating right now."""
-    return _ztask(
-        claimant_run_id='run-1/sess-1/pid=42',
-        heartbeat_at=_ZONE_NOW.isoformat(),
-        **overrides,
-    )
-
-
-class TestCountZones:
-    """``_count_zones(tasks, now)`` — the six display zones plus the split.
-
-    Takes shaped TASK ROWS, not the ``{id: status}`` map: the claimant columns
-    the split needs exist only on ``get_tasks`` rows (see the collector's source
-    switch in ``collect_snapshot``).
-    """
-
-    def test_returns_all_six_zones_plus_the_split(self):
-        result = _count_zones([], _ZONE_NOW)
-
-        assert result == {
-            'pending': 0, 'in_progress': 0, 'blocked': 0,
-            'deferred': 0, 'cancelled': 0, 'done': 0,
-            'in_progress_live': 0, 'in_progress_stranded': 0,
-        }
-
-    def test_conservation_invariant_on_a_mixed_fixture(self):
-        """THE load-bearing assertion: the split always sums to the zone.
-
-        If it ever did not, neither the stacked chart nor the parity alarm
-        derived from it could be trusted.
-        """
-        tasks = [
-            _live(id=1),
-            _ztask(id=2),                                    # in-progress, no claimant
-            _ztask(id=3, status='review'),                   # folds into in_progress
-            _ztask(id=4, status='pending'),
-            _ztask(id=5, status='blocked'),
-            _ztask(id=6, status='done'),
-            _ztask(id=7, status='deferred'),
-            _ztask(id=8, status='cancelled'),
-            _ztask(
-                id=9,
-                claimant_run_id='run-2/sess-2/pid=7',
-                heartbeat_at=(_ZONE_NOW - timedelta(hours=3)).isoformat(),
-            ),                                               # stale heartbeat
-        ]
-
-        result = _count_zones(tasks, _ZONE_NOW)
-
-        assert result['in_progress'] == 4  # 3 in-progress + 1 review
-        assert result['in_progress_live'] + result['in_progress_stranded'] == result['in_progress']
-        assert result['in_progress_stranded'] == 2
-        assert result['in_progress_live'] == 2
-        assert result['pending'] == 1
-        assert result['blocked'] == 1
-        assert result['done'] == 1
-        assert result['deferred'] == 1
-        assert result['cancelled'] == 1
-
-    def test_review_row_is_always_counted_live_even_with_a_null_claimant(self):
-        """A deliberate, documented conservatism — not an accident.
-
-        ``_STATUS_MAP`` folds 'review' into the ``in_progress`` zone, but
-        ``shared.task_claimant.is_stranded`` hard-gates on
-        ``status == 'in-progress'`` and can never fire for 'review'. Since
-        ``live`` is derived by SUBTRACTION (to keep conservation exact), a
-        claimant-less review row lands in ``live``. That under-reports strands
-        and never over-reports them — the correct direction to err for a
-        surface that raises alarms.
-        """
-        result = _count_zones([_ztask(id=1, status='review')], _ZONE_NOW)
-
-        assert result['in_progress'] == 1
-        assert result['in_progress_stranded'] == 0
-        assert result['in_progress_live'] == 1
-
-    def test_missing_claimant_evidence_counts_as_stranded(self):
-        """A pre-migration row has neither column: absence is not liveness."""
-        task = {'id': 1, 'status': 'in-progress', 'metadata': {}}
-
-        result = _count_zones([task], _ZONE_NOW)
-
-        assert result['in_progress_stranded'] == 1
-        assert result['in_progress_live'] == 0
-
-    def test_infra_hold_counts_as_live(self):
-        """The shared predicate's carve-out: a task parked for infra reasons is
-        not a strand, even with no claimant."""
-        task = _ztask(id=1, metadata={'infra_hold': True})
-
-        result = _count_zones([task], _ZONE_NOW)
-
-        assert result['in_progress'] == 1
-        assert result['in_progress_stranded'] == 0
-        assert result['in_progress_live'] == 1
-
-    def test_only_in_progress_rows_can_be_stranded(self):
-        """A claimant-less blocked/pending/done row never inflates the split."""
-        tasks = [
-            _ztask(id=1, status='blocked'),
-            _ztask(id=2, status='pending'),
-            _ztask(id=3, status='done'),
-        ]
-
-        result = _count_zones(tasks, _ZONE_NOW)
-
-        assert result['in_progress'] == 0
-        assert result['in_progress_stranded'] == 0
-        assert result['in_progress_live'] == 0
-
-    def test_unknown_and_missing_status_default_to_pending(self):
-        result = _count_zones(
-            [{'id': 1, 'status': 'something-weird'}, {'id': 2, 'status': None}],
-            _ZONE_NOW,
-        )
-
-        assert result['pending'] == 2
-
-    def test_now_is_threaded_not_read(self):
-        """A heartbeat ancient by the live clock but fresh by the supplied
-        instant must read as live — the verdict derives from *now*."""
-        historical = datetime(2020, 1, 1, tzinfo=UTC)
-        task = _ztask(
-            id=1,
-            claimant_run_id='run-1/sess-1/pid=42',
-            heartbeat_at=historical.isoformat(),
-        )
-
-        result = _count_zones([task], historical + timedelta(seconds=5))
-
-        assert result['in_progress_stranded'] == 0
-        assert result['in_progress_live'] == 1
-
-    def test_agrees_with_count_statuses_on_the_six_zones(self):
-        """``_count_zones`` supersedes ``_count_statuses`` for the collector, so
-        the six shared zones must not drift between them."""
-        tasks = [
-            _ztask(id=1, status='pending'), _ztask(id=2, status='pending'),
-            _ztask(id=3, status='in-progress'), _ztask(id=4, status='review'),
-            _ztask(id=5, status='done'), _ztask(id=6, status='blocked'),
-            _ztask(id=7, status='cancelled'), _ztask(id=8, status='deferred'),
-        ]
-
-        zones = _count_zones(tasks, _ZONE_NOW)
-        legacy = _count_statuses({t['id']: t['status'] for t in tasks})
-
-        assert {k: zones[k] for k in legacy} == legacy
 
 
 # ---------------------------------------------------------------------------
@@ -482,13 +372,83 @@ def _column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
         conn.close()
 
 
+def _column_types(path: Path) -> dict[str, str]:
+    """``{column: declared type}`` from ``PRAGMA table_info(snapshots)``."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[1]: r[2] for r in conn.execute('PRAGMA table_info(snapshots)')}
+    finally:
+        conn.close()
+
+
+# The pre-δ1 DDL (task 5591), verbatim: the 11-column shape every deployed
+# burndown.db is on today — six zones, the NOT NULL DEFAULT 0 split, the
+# nullable cap.  Like _LEGACY_BURNDOWN_SCHEMA, it only reaches the new column
+# set through ensure_snapshot_columns.
+_PRE_DELTA1_BURNDOWN_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT    NOT NULL,
+    ts          TEXT    NOT NULL,
+    pending     INTEGER NOT NULL DEFAULT 0,
+    in_progress INTEGER NOT NULL DEFAULT 0,
+    blocked     INTEGER NOT NULL DEFAULT 0,
+    deferred    INTEGER NOT NULL DEFAULT 0,
+    cancelled   INTEGER NOT NULL DEFAULT 0,
+    done        INTEGER NOT NULL DEFAULT 0,
+    in_progress_live     INTEGER NOT NULL DEFAULT 0,
+    in_progress_stranded INTEGER NOT NULL DEFAULT 0,
+    concurrency_cap      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
+"""
+
+_DELTA1_COLUMNS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows', 'state', 'reason')
+_DELTA1_COUNT_COLUMNS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows')
+_DELTA1_TEXT_COLUMNS = ('state', 'reason')
+
+# The pre-δ1 row's eleven stored values, keyed by column.
+_PRE_DELTA1_ROW = {
+    'project_id': 'pre-delta1',
+    'ts': '2026-01-01T00:00:00+00:00',
+    'pending': 5,
+    'in_progress': 3,
+    'blocked': 1,
+    'deferred': 0,
+    'cancelled': 0,
+    'done': 20,
+    'in_progress_live': 2,
+    'in_progress_stranded': 1,
+    'concurrency_cap': 24,
+}
+
+
+def _pre_delta1_burndown_db(path: Path, **overrides) -> None:
+    """Create a pre-δ1 (11-column) burndown DB carrying ONE measured row.
+
+    *overrides* replace fields of :data:`_PRE_DELTA1_ROW` (e.g. ``ts=`` so a
+    read-side test can place the row inside its window).
+    """
+    row = {**_PRE_DELTA1_ROW, **overrides}
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_PRE_DELTA1_BURNDOWN_SCHEMA)
+    conn.execute(
+        f'INSERT INTO snapshots ({", ".join(row)}) VALUES ({", ".join("?" for _ in row)})',
+        tuple(row.values()),
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestSnapshotSchemaColumns:
     def test_created_table_declares_the_new_column_constraints(self, tmp_path):
-        """The split columns are NOT NULL DEFAULT 0; ``concurrency_cap`` is nullable.
+        """The split columns are NOT NULL DEFAULT 0; ``concurrency_cap`` and the
+        six δ1 columns are nullable with no default.
 
         NULL is the honest "cap unknown" value for the cap — never 0, which
-        would read as a cap of zero and alarm on every snapshot.  The split
-        counts, by contrast, are always known, so they default to 0.
+        would read as a cap of zero and alarm on every snapshot.  The δ1
+        columns take NULL for "not recorded when the row was written": a
+        DEFAULT 0 would fabricate measured zeros across all of history.
         """
         db = tmp_path / 'shape.db'
         _create_burndown_db(db)
@@ -503,11 +463,36 @@ class TestSnapshotSchemaColumns:
         assert 'concurrency_cap' in specs, 'concurrency_cap missing from snapshots'
         assert specs['concurrency_cap'][0] == 0, 'concurrency_cap must stay nullable'
 
+        for col in _DELTA1_COLUMNS:
+            assert col in specs, f'{col} missing from the created snapshots table'
+            assert specs[col] == (0, None), (
+                f'{col} must be nullable with no default, got (notnull, dflt)={specs[col]!r}'
+            )
+
     def test_fresh_db_is_already_at_the_new_shape(self, tmp_path):
         db = tmp_path / 'fresh.db'
         _create_burndown_db(db)
 
         assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_fresh_and_migrated_stores_declare_the_delta1_columns_identically(
+        self, tmp_path,
+    ):
+        """A fresh store (BURNDOWN_SCHEMA) and a migrated pre-δ1 store cannot
+        drift: the six δ1 columns carry the same (notnull, default, type)."""
+        fresh = tmp_path / 'fresh.db'
+        _create_burndown_db(fresh)
+        migrated = tmp_path / 'migrated.db'
+        _pre_delta1_burndown_db(migrated)
+        async with aiosqlite.connect(str(migrated)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        fresh_specs, migrated_specs = _column_specs(fresh), _column_specs(migrated)
+        fresh_types, migrated_types = _column_types(fresh), _column_types(migrated)
+        for col in _DELTA1_COLUMNS:
+            assert fresh_specs[col] == migrated_specs[col] == (0, None), col
+            assert fresh_types[col] == migrated_types[col], col
 
 
 _NEW_SNAPSHOT_COLUMNS_SET = set(_NEW_SNAPSHOT_COLUMNS)
@@ -577,25 +562,119 @@ class TestEnsureSnapshotColumns:
 
         assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
 
-    async def test_widened_insert_succeeds_after_migration(self, tmp_path):
-        db = tmp_path / 'legacy.db'
-        _legacy_burndown_db(db)
+    async def test_adds_the_six_delta1_columns_nullable_with_no_default(self, tmp_path):
+        """The δ1 migration (task 5591) on today's deployed 11-column shape.
+
+        ``DEFAULT 0`` is the thing ruled out: it would stamp a measured zero
+        onto every historical row for statuses nobody counted back then.
+        """
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+        assert not (set(_DELTA1_COLUMNS) & _columns(db))
 
         async with aiosqlite.connect(str(db)) as conn:
             await ensure_snapshot_columns(conn)
-            await conn.execute(
-                _INSERT_SNAPSHOT_SQL,
-                ('p', '2026-08-08T12:00:00+00:00', 1, 4, 2, 0, 0, 9, 3, 1, 24),
-            )
             await conn.commit()
+
+        specs, types = _column_specs(db), _column_types(db)
+        for col in _DELTA1_COLUMNS:
+            assert col in specs, f'{col} not added by the migration'
+            notnull, default = specs[col]
+            assert notnull == 0, f'{col} must be nullable'
+            assert default is None, f'{col} must carry no default, got {default!r}'
+        for col in _DELTA1_COUNT_COLUMNS:
+            assert types[col] == 'INTEGER', f'{col}: {types[col]!r}'
+        for col in _DELTA1_TEXT_COLUMNS:
+            assert types[col] == 'TEXT', f'{col}: {types[col]!r}'
+
+    async def test_pre_delta1_row_reads_null_for_every_added_column(self, tmp_path):
+        """NULL = "not recorded when the row was written" — never 0 — and the
+        row's eleven existing values are untouched."""
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                'SELECT * FROM snapshots WHERE project_id = ?', (_PRE_DELTA1_ROW['project_id'],),
+            )
+            rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        row = rows[0]
+        for col in _DELTA1_COLUMNS:
+            assert row[col] is None, f'{col}: expected NULL, got {row[col]!r}'
+        for col, value in _PRE_DELTA1_ROW.items():
+            assert row[col] == value, f'{col}: expected {value!r}, got {row[col]!r}'
+
+    async def test_delta1_migration_is_idempotent(self, tmp_path):
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            await ensure_snapshot_columns(conn)  # must not raise
+            await conn.commit()
+
+        assert _columns(db) >= set(_DELTA1_COLUMNS)
+
+    async def test_pre_3543_store_reaches_the_full_current_column_set(self, tmp_path):
+        """A store two migrations behind lands on exactly the fresh shape."""
+        legacy = tmp_path / 'legacy.db'
+        _legacy_burndown_db(legacy)
+        fresh = tmp_path / 'fresh.db'
+        _create_burndown_db(fresh)
+
+        async with aiosqlite.connect(str(legacy)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(legacy) == _columns(fresh)
+        assert _columns(legacy) >= _NEW_SNAPSHOT_COLUMNS_SET | set(_DELTA1_COLUMNS)
+
+    async def test_migrated_store_carries_all_nine_member_columns(self, tmp_path):
+        """One column per ``TaskStatus`` member, written out literally here so
+        a renamed member cannot silently rename its column with it."""
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(db) >= {
+            'pending', 'in_progress', 'blocked', 'deferred', 'review',
+            'merge_deferred', 'infra_hold', 'done', 'cancelled',
+        }
+
+    async def test_widened_insert_succeeds_after_migration(self, tmp_path, dummy_client):
+        """``collect_snapshot`` writes its full row into a store migrated in place."""
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+        project_root = tmp_path / 'project'
+        _write_orch_config(project_root, 'max_concurrent_tasks: 24\n')
+        config = DashboardConfig(project_root=project_root)
+        store = _CannedStore({project_root: [_live_now(id=1), _stranded(id=2)]})
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            with (
+                _serve(store),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config, client=dummy_client)
             cur = await conn.execute(
                 'SELECT in_progress, in_progress_live, in_progress_stranded, '
-                'concurrency_cap FROM snapshots WHERE project_id = ?',
-                ('p',),
+                'in_progress_rows, concurrency_cap, state FROM snapshots WHERE project_id = ?',
+                (str(config.project_root),),
             )
             row = await cur.fetchone()
 
-        assert row == (4, 3, 1, 24)
+        assert row == (2, 1, 1, 2, 24, 'value')
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +695,7 @@ class TestCollectSnapshot:
         ]
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn(_task_rows(fake_tasks))),
+            _serve(_CannedStore({config.project_root: fake_tasks})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config, client=dummy_client)
@@ -642,7 +721,7 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+                _serve(_CannedStore({real_dir: []})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
             ):
@@ -670,7 +749,7 @@ class TestCollectSnapshot:
         fake_orchestrators = [{'prd': str(config.project_root / 'prd.md'), 'project_root': str(config.project_root)}]
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+            _serve(_CannedStore({config.project_root: []})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._resolve_project_root', return_value=config.project_root),
         ):
@@ -707,7 +786,7 @@ class TestCollectSnapshot:
         }
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+            _serve(_CannedStore(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config, client=dummy_client)
@@ -744,7 +823,7 @@ class TestCollectSnapshot:
         )
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+            _serve(_CannedStore({base_config.project_root: []})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config, client=dummy_client)
@@ -779,7 +858,7 @@ class TestCollectSnapshot:
         # project_root is the symlink; known_project_roots contains the resolved real path
         async with burndown_conn_with_config(project_root=link, known_project_roots=[real_dir]) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+                _serve(_CannedStore({real_dir: []})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -820,7 +899,7 @@ class TestCollectSnapshot:
         }
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+            _serve(_CannedStore(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -842,7 +921,7 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+                _serve(_CannedStore({real_dir: []})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -873,7 +952,7 @@ class TestCollectSnapshot:
         }
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+            _serve(_CannedStore(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -892,7 +971,8 @@ class TestCollectSnapshot:
 
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, burndown_conn_with_config, dummy_client):
-        """PermissionError on one known root is skipped; other roots are still snapshotted."""
+        """PermissionError on one known root costs that root a gap row; the other
+        roots are still measured, and every root gets exactly one row."""
         root_a = Path('/fake/project/root_a')
         root_b = Path('/fake/project/root_b')
         root_c = Path('/fake/project/root_c')
@@ -901,73 +981,28 @@ class TestCollectSnapshot:
         root_a_tasks = [{'status': 'done'}]
         root_c_tasks = [{'status': 'in-progress'}]
 
-        # Per-root dispatch: asyncio.gather fires fetch_tasks calls
-        # concurrently. The bad root raises PermissionError; return_exceptions=True
-        # isolates the failure.
-        bad_root_str = _root_key(root_b)
-
+        # The bad root's every substrate call raises PermissionError; the other
+        # roots are read concurrently and must be unaffected.
         async with burndown_conn_with_config(known_project_roots=[root_a, root_b, root_c]) as (db_path, config, conn):
-            _tasks_map = {
+            store = _CannedStore({
                 config.project_root: main_tasks,
-                root_a.resolve(): root_a_tasks,
-                root_c.resolve(): root_c_tasks,
-            }
-            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
-
-            async def fake_load(client, config, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == bad_root_str:
-                    raise PermissionError('Permission denied')
-                return _task_rows(_by_key[key])
+                root_a: root_a_tasks,
+                root_b: PermissionError('Permission denied'),
+                root_c: root_c_tasks,
+            })
 
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                _serve(store),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            project_ids = {row['project_id'] for row in rows}
-            # main + root_a + root_c should be present
-            assert len(rows) == 3
-            assert str(config.project_root) in project_ids
-            assert str(root_a.resolve()) in project_ids
-            assert str(root_c.resolve()) in project_ids
-            # root_b should NOT be present
-            assert str(root_b.resolve()) not in project_ids
-
-    @pytest.mark.asyncio
-    async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog, dummy_client):
-        """A WARNING is logged naming the failing root when PermissionError occurs."""
-        bad_root = Path('/fake/project/bad_root')
-        bad_root_str = _root_key(bad_root)
-
-        async with burndown_conn_with_config(known_project_roots=[bad_root]) as (db_path, config, conn):
-            _tasks_map: dict = {config.project_root: []}
-            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
-
-            async def fake_load(client, config, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == bad_root_str:
-                    raise PermissionError('Permission denied')
-                return _task_rows(_by_key[key])
-
-            with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                await collect_snapshot(conn, config, client=dummy_client)
-
-        # At least one WARNING record should name the failing root
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING log record'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert str(bad_root.resolve()) in combined
-        # exc_info must be populated on the warning record
-        assert any(r.exc_info for r in warning_records)
+            assert sum(len(rows) for rows in by_project.values()) == 4, 'one row per root'
+            for healthy in (config.project_root, root_a, root_c):
+                _assert_one_value(by_project, healthy)
+            _assert_one_gap(by_project, root_b, 'Permission denied')
 
     @pytest.mark.asyncio
     async def test_first_root_failure_does_not_block_subsequent_inserts(self, burndown_conn_with_config, dummy_client):
@@ -978,37 +1013,25 @@ class TestCollectSnapshot:
         main_tasks = [{'status': 'pending'}]
         good_tasks = [{'status': 'done'}, {'status': 'done'}]
 
-        bad_root_str = _root_key(bad_root)
-
         async with burndown_conn_with_config(known_project_roots=[bad_root, good_root]) as (db_path, config, conn):
-            _tasks_map = {
+            store = _CannedStore({
                 config.project_root: main_tasks,
-                good_root.resolve(): good_tasks,
-            }
-            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
-
-            async def fake_load(client, config, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == bad_root_str:
-                    raise PermissionError('denied')
-                return _task_rows(_by_key[key])
+                bad_root: PermissionError('denied'),
+                good_root: good_tasks,
+            })
 
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                _serve(store),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            assert len(rows) == 2
-            project_ids = {row['project_id'] for row in rows}
-            assert str(config.project_root) in project_ids       # (a) main project row
-            assert str(good_root.resolve()) in project_ids       # (b) good_root row
-            assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
-
-            good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
+            assert sum(len(rows) for rows in by_project.values()) == 3, 'one row per root'
+            _assert_one_value(by_project, config.project_root)      # (a) main project row
+            good_row = _assert_one_value(by_project, good_root)     # (b) good_root row
+            _assert_one_gap(by_project, bad_root, 'denied')         # (c) bad_root's gap row
             assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
@@ -1039,7 +1062,7 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([])),
+                _serve(_CannedStore({real_dir: []})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 # _resolve_project_root is NOT mocked — it runs for real and falls
                 # back to config.project_root (the symlink) because prd_path has no
@@ -1056,13 +1079,13 @@ class TestCollectSnapshot:
 
     @pytest.mark.asyncio
     async def test_load_task_tree_calls_run_concurrently(self, burndown_conn_with_config, dummy_client):
-        """All load_task_tree calls must run concurrently via asyncio.gather.
+        """Every root's read must run concurrently via asyncio.gather.
 
-        Uses a threading.Barrier(N) to detect concurrency: all N threads must
-        reach the barrier simultaneously. With sequential awaits, only one thread
-        is alive at a time so barrier.wait() times out (BrokenBarrierError).
-        With asyncio.gather, all N threads are live simultaneously and the
-        barrier succeeds.
+        Uses a threading.Barrier(N) to detect concurrency: each root's ONE
+        ``get_tasks`` call must reach the barrier simultaneously. With
+        sequential awaits, only one thread is alive at a time so barrier.wait()
+        times out (BrokenBarrierError). With asyncio.gather, all N threads are
+        live simultaneously and the barrier succeeds.
         """
         import threading
 
@@ -1073,24 +1096,27 @@ class TestCollectSnapshot:
         n_roots = 3
         barrier = threading.Barrier(n_roots, timeout=10.0)
 
-        async def fake_load(client, config, project_root, **_kwargs):
-            await asyncio.to_thread(_wait_or_fail, barrier)
-            return []
-
         def _wait_or_fail(b):
             try:
                 b.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'fetch_tasks calls did not reach the barrier within 10s — '
+                    'get_tasks calls did not reach the barrier within 10s — '
                     'possible causes: (1) sequential awaits (calls not running '
                     'concurrently via asyncio.gather); (2) severe scheduler latency '
                     '(threads starved by contention or a slow CI host)'
                 )
 
         async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
+            store = _CannedStore({config.project_root: [], reify_root: [], autopilot_root: []})
+
+            async def gated(client, url, tool, args, **kwargs):
+                if tool == 'get_tasks':
+                    await asyncio.to_thread(_wait_or_fail, barrier)
+                return await store(client, url, tool, args, **kwargs)
+
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                patch('dashboard.data.tasks.mcp_tool_call', new=gated),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -1101,59 +1127,47 @@ class TestCollectSnapshot:
                 assert row[0] == 3
 
     @pytest.mark.asyncio
-    async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config, dummy_client):
-        """One load_task_tree raises OSError; collect_snapshot skips the failing
-        project and inserts healthy rows for the remaining projects.
+    async def test_gather_partial_failure_writes_a_gap_for_the_bad_project(self, burndown_conn_with_config, dummy_client):
+        """One root's reads raise OSError; that root gets a gap row carrying the
+        failure, and the remaining projects get their measured rows.
 
-        Invariant (post Task 519): asyncio.gather(return_exceptions=True) plus
-        per-project isinstance guard mean collect_snapshot does not raise, the
-        failing project is cleanly excluded from the snapshot, and healthy
-        projects are snapshotted normally.
+        Invariant (post Task 519): collect_snapshot does not raise, and one
+        failing project cannot cost any other project its row.
         """
         reify_root = Path('/nonexistent/known/reify')
         autopilot_root = Path('/nonexistent/known/autopilot')
 
-        # The root that will raise OSError — reify is the failing root.
-        bad_root_str = _root_key(reify_root)
-
         async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
-            # Only map the two healthy roots; the failing root is intentionally absent.
-            _tasks_map = {
+            # reify is the failing root: every substrate call for it raises OSError.
+            store = _CannedStore({
                 config.project_root: [],
-                autopilot_root.resolve(): [{'status': 'done'}],
-            }
-            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
-
-            async def fake_load(client, config, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == bad_root_str:
-                    raise OSError('mock disk error')
-                return _task_rows(_by_key[key])
+                reify_root: OSError('mock disk error'),
+                autopilot_root: [{'status': 'done'}],
+            })
 
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                _serve(store),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            project_ids = {row['project_id'] for row in rows}
-
-            assert len(rows) == 2
-            assert str(reify_root.resolve()) not in project_ids
-            assert str(config.project_root) in project_ids
-            assert str(autopilot_root.resolve()) in project_ids
+            assert sum(len(rows) for rows in by_project.values()) == 3, 'one row per root'
+            _assert_one_gap(by_project, reify_root, 'mock disk error')
+            _assert_one_value(by_project, config.project_root)
+            _assert_one_value(by_project, autopilot_root)
 
     @pytest.mark.asyncio
-    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog, dummy_client):
+    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, dummy_client):
         """OSError on one known root is isolated; healthy projects are still snapshotted.
 
-        Regression anchor for task 519: asyncio.gather(return_exceptions=True) +
-        isinstance(result, BaseException) guard ensure a single unreadable tasks.json
-        cannot drop the remaining snapshots.  The test uses OSError (not PermissionError)
-        to match task 519's 'unreadable tasks.json' wording.
+        Regression anchor for task 519: a single unreadable root cannot drop the
+        remaining snapshots.  The test uses OSError (not PermissionError) to
+        match task 519's 'unreadable tasks.json' wording.  The WARNING-with-
+        exc_info half lives on TestCollectSnapshotWritesGapRows' raising and
+        hung acquisitions: the real snapshot unit absorbs a substrate failure,
+        so this one is a routine gap.
         """
         bad_root = Path('/fake/project/bad_root')
         good_root_1 = Path('/fake/project/good_root_1')
@@ -1163,116 +1177,63 @@ class TestCollectSnapshot:
         good_1_tasks = [{'status': 'done'}, {'status': 'done'}]
         good_2_tasks = [{'status': 'done'}]
 
-        bad_root_str = _root_key(bad_root)
-
         async with burndown_conn_with_config(known_project_roots=[bad_root, good_root_1, good_root_2]) as (db_path, config, conn):
-            _tasks_map = {
+            store = _CannedStore({
                 config.project_root: main_tasks,
-                good_root_1.resolve(): good_1_tasks,
-                good_root_2.resolve(): good_2_tasks,
-            }
-            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
-
-            async def fake_load(client, config, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == bad_root_str:
-                    raise OSError('mock disk error')
-                return _task_rows(_by_key[key])
+                bad_root: OSError('mock disk error'),
+                good_root_1: good_1_tasks,
+                good_root_2: good_2_tasks,
+            })
 
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                _serve(store),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                # Must NOT raise even though bad_root fails — return_exceptions=True absorbs it
+                # Must NOT raise even though bad_root fails.
                 await collect_snapshot(conn, config, client=dummy_client)
 
-            async with conn.execute('SELECT * FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+            by_project = await _rows_by_project(conn)
 
-            # (a) three rows: main + good_root_1 + good_root_2
-            assert len(rows) == 3
+            # (a) four rows: one per discovered root
+            assert sum(len(rows) for rows in by_project.values()) == 4
 
-            by_project = {row['project_id']: row for row in rows}
+            # (b) bad_root has its gap row, carrying the failure
+            _assert_one_gap(by_project, bad_root, 'mock disk error')
 
-            # (b) bad_root must NOT appear
-            assert str(bad_root.resolve()) not in by_project
-
-            # (c) main project and both good roots must appear
-            assert str(config.project_root) in by_project
-            assert str(good_root_1.resolve()) in by_project
-            assert str(good_root_2.resolve()) in by_project
-
-            # (c') main project row must record the correct pending count
-            main_row = by_project[str(config.project_root)]
-            _assert_snapshot_counts(main_row, pending=1)
+            # (c) main project row must record the correct pending count
+            _assert_snapshot_counts(_assert_one_value(by_project, config.project_root), pending=1)
 
             # (d) per-root done counts must reflect the supplied task lists
-            good_1_row = by_project[str(good_root_1.resolve())]
-            _assert_snapshot_counts(good_1_row, done=2)
-
-            good_2_row = by_project[str(good_root_2.resolve())]
-            _assert_snapshot_counts(good_2_row, done=1)
-
-            # (e) at least one WARNING record must name the bad root and carry exc_info
-            warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-            assert warning_records, 'Expected at least one WARNING log record'
-            combined = ' '.join(r.getMessage() for r in warning_records)
-            assert str(bad_root.resolve()) in combined
-            assert any(r.exc_info for r in warning_records)
+            _assert_snapshot_counts(_assert_one_value(by_project, good_root_1), done=2)
+            _assert_snapshot_counts(_assert_one_value(by_project, good_root_2), done=1)
 
     @pytest.mark.asyncio
-    async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog, dummy_client):
-        """PermissionError on the main project's load_task_tree is isolated via return_exceptions=True.
+    async def test_main_project_failure_writes_only_its_gap_row(self, burndown_env, dummy_client):
+        """A failing main project is isolated: collect_snapshot does not raise.
 
-        The main project is always the first entry in roots_to_snapshot. With no orchestrators
-        and no known_project_roots, a failing load_task_tree for the main project must:
+        The main project is always the first entry in roots_to_snapshot. With no
+        orchestrators and no known_project_roots, a main project whose every
+        substrate call raises PermissionError must:
 
-        (a) NOT propagate out of collect_snapshot — return_exceptions=True in Phase 2 absorbs it,
-            and Phase 3's isinstance(tasks, BaseException) guard logs-and-continues.
-        (b) Commit zero rows to the snapshots table — the only root failed, so nothing to insert.
-        (c) Emit a WARNING log record naming the main project with exc_info populated.
-
-        Sibling test to test_continues_when_known_root_unreadable and
-        test_gather_return_exceptions_preserves_healthy_snapshots, covering the
-        previously-untested main-project failure path. Uses path-keyed dispatch so
-        the test does not depend on load_task_tree call ordering.
+        (a) NOT propagate out of collect_snapshot;
+        (b) commit exactly one row — its gap row, carrying the failure;
+        (c) never read any other root.
         """
         db_path, config, conn = burndown_env
-
-        bad_root_str = _root_key(config.project_root)
-
-        unexpected_calls: list = []
-
-        async def fake_load(client, config, project_root, **_kwargs):
-            key = _root_key(project_root)
-            if key == bad_root_str:
-                raise PermissionError('Permission denied')
-            unexpected_calls.append(key)
-            return []
+        store = _CannedStore({config.project_root: PermissionError('Permission denied')})
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+            _serve(store),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
-            # Must NOT raise — return_exceptions=True absorbs the PermissionError.
+            # Must NOT raise.
             await collect_snapshot(conn, config, client=dummy_client)
 
-        assert unexpected_calls == [], f'Unexpected fetch_tasks calls: {unexpected_calls}'
+        assert {call['root'] for call in store.calls} == {_root_key(config.project_root)}
 
-        # (b) zero rows committed — the only root failed, so snapshots is empty.
-        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
-
-        # (c) at least one WARNING record must name the main project and carry exc_info.
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING log record'
-        expected_msg = f'Failed to fetch tasks for {config.project_root}'
-        assert any(expected_msg in r.getMessage() for r in warning_records), f'No warning record matched expected message: {expected_msg!r}'
-        assert any(r.exc_info for r in warning_records)
+        by_project = await _rows_by_project(conn)
+        assert list(by_project) == [str(config.project_root)]
+        _assert_one_gap(by_project, config.project_root, 'Permission denied')
 
     @pytest.mark.parametrize(
         'orchestrator_dict,patch_target,canonical_root',
@@ -1310,7 +1271,7 @@ class TestCollectSnapshot:
         }
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+            _serve(_CannedStore(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[orchestrator_dict]),
             patch(patch_target, return_value=canonical_root),
         ):
@@ -1342,7 +1303,7 @@ class TestCollectSnapshot:
         ]
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load({config.project_root: []})),
+            _serve(_CannedStore({config.project_root: []})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=None),
         ):
@@ -1357,13 +1318,26 @@ class TestCollectSnapshot:
         )
 
 # ---------------------------------------------------------------------------
-# collect_snapshot — task source switch + concurrency cap (task 3543 / PRD ι)
+# collect_snapshot — live/stranded split + concurrency cap (task 3543 / PRD ι)
 # ---------------------------------------------------------------------------
 
 
 def _write_orch_config(root: Path, text: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / 'dark-factory-orchestrator.yaml').write_text(text)
+
+
+def _ztask(status='in-progress', **overrides):
+    """A task row carrying the claimant columns the strand split reads."""
+    task = {
+        'id': overrides.pop('id', 1),
+        'status': status,
+        'metadata': {},
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+    }
+    task.update(overrides)
+    return task
 
 
 def _stranded(**overrides):
@@ -1382,38 +1356,14 @@ def _live_now(**overrides):
 
 
 class TestCollectSnapshotTaskSourceAndCap:
-    """The collector reads ``fetch_tasks`` and stamps the cap on every row.
+    """The collector persists the rows' live/stranded split and stamps the cap.
 
-    ``fetch_statuses`` (MCP ``get_statuses``) returns a bare ``{id: status}``
-    map with NO claimant columns, so the live/stranded split is physically
-    underivable from it; ``fetch_tasks`` (MCP ``get_tasks``) carries them.  The
+    The split needs the claimant columns only ``get_tasks`` rows carry; the
     concurrency cap is read once per root and stored ON the row because
-    ``max_concurrent_tasks`` is green-tier hot-reloadable: resolving it at
-    render time would compare a historical in-progress census against today's
-    cap and mislabel both directions.
+    ``max_concurrent_tasks`` varies across restarts and projects: resolving it
+    at render time would compare a historical in-progress census against
+    today's cap and mislabel both directions.
     """
-
-    @pytest.mark.asyncio
-    async def test_reads_tasks_as_its_single_source(
-        self, burndown_env, dummy_client,
-    ):
-        """``collect_snapshot`` fetches exactly once per discovered root, through
-        ``fetch_tasks`` — the only seam carrying the claimant columns the
-        live/stranded split needs."""
-        db_path, config, conn = burndown_env
-        seen_roots: list[str] = []
-
-        async def fake_tasks(client, cfg, project_root, **_kwargs):
-            seen_roots.append(str(project_root))
-            return []
-
-        with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        assert seen_roots == [str(config.project_root)]
 
     @pytest.mark.asyncio
     async def test_persists_the_live_stranded_split(self, burndown_env, dummy_client):
@@ -1424,16 +1374,16 @@ class TestCollectSnapshotTaskSourceAndCap:
             _live_now(id=1),
             _stranded(id=2),
             _stranded(id=3),
-            # A claimant-less 'review' row maps into the in_progress ZONE but can
-            # never be stranded (is_stranded hard-gates on 'in-progress'), so it
-            # lands in live by construction — a documented under-report.
+            # 'review' is its own census member now, not folded into
+            # in_progress, and — having no in-progress status — it is in
+            # neither half of the split.
             _ztask(status='review', id=4),
             _ztask(status='pending', id=5),
             _ztask(status='done', id=6),
         ]
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn(tasks)),
+            _serve(_CannedStore({config.project_root: tasks})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config, client=dummy_client)
@@ -1443,10 +1393,11 @@ class TestCollectSnapshotTaskSourceAndCap:
 
         assert len(rows) == 1
         row = rows[0]
-        assert row['in_progress'] == 4, 'in-progress + review both map to the zone'
+        assert row['in_progress'] == 3
+        assert row['review'] == 1
         assert row['in_progress_stranded'] == 2
-        assert row['in_progress_live'] == 2
-        assert row['in_progress_live'] + row['in_progress_stranded'] == row['in_progress'], (
+        assert row['in_progress_live'] == 1
+        assert row['in_progress_live'] + row['in_progress_stranded'] == row['in_progress_rows'], (
             'conservation invariant must hold on the persisted row'
         )
         assert row['pending'] == 1
@@ -1460,7 +1411,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 24\n')
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn([_live_now(id=1)])),
+            _serve(_CannedStore({config.project_root: [_live_now(id=1)]})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config, client=dummy_client)
@@ -1481,8 +1432,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         db_path, config, conn = burndown_env
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks',
-                  side_effect=_AsyncReturn([_live_now(id=1), _live_now(id=2)])),
+            _serve(_CannedStore({config.project_root: [_live_now(id=1), _live_now(id=2)]})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
@@ -1516,7 +1466,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         tasks = [_live_now(id=1), _live_now(id=2), _stranded(id=3)]
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn(tasks)),
+            _serve(_CannedStore({config.project_root: tasks})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
@@ -1547,8 +1497,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
 
         with (
-            patch('dashboard.data.burndown.fetch_tasks',
-                  side_effect=_AsyncReturn([_live_now(id=1), _live_now(id=2)])),
+            _serve(_CannedStore({config.project_root: [_live_now(id=1), _live_now(id=2)]})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
@@ -1579,7 +1528,7 @@ class TestCollectSnapshotTaskSourceAndCap:
                 return 24
 
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_AsyncReturn(many)),
+                _serve(_CannedStore({config.project_root: many, root_a: many, root_b: many})),
                 patch('dashboard.data.burndown.read_max_concurrent_tasks', side_effect=fake_cap),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
@@ -1592,139 +1541,342 @@ class TestCollectSnapshotTaskSourceAndCap:
                 str(config.project_root), str(root_a.resolve()), str(root_b.resolve()),
             }
 
-    @pytest.mark.asyncio
-    async def test_snapshot_read_probes_unpaginated_before_paginating(
+
+# ---------------------------------------------------------------------------
+# collect_snapshot — the census through the snapshot unit (task 5591)
+# ---------------------------------------------------------------------------
+
+# One column per TaskStatus member, written out literally: the test's own copy
+# of the naming, so a production mapping that drifted would disagree with it.
+_MEMBER_COLUMN = {
+    'pending': 'pending',
+    'in-progress': 'in_progress',
+    'blocked': 'blocked',
+    'deferred': 'deferred',
+    'review': 'review',
+    'merge-deferred': 'merge_deferred',
+    'infra-hold': 'infra_hold',
+    'done': 'done',
+    'cancelled': 'cancelled',
+}
+
+
+async def _collect(conn, config, client, store: _CannedStore) -> None:
+    """One collector cycle over *store*, with no orchestrators running."""
+    with (
+        _serve(store),
+        patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+    ):
+        await collect_snapshot(conn, config, client=client)
+
+
+async def _snapshot_rows(conn) -> list:
+    """Every stored row, in insert order."""
+    async with conn.execute('SELECT * FROM snapshots ORDER BY id') as cur:
+        return list(await cur.fetchall())
+
+
+class TestCollectSnapshotWritesTheCensus:
+    """The collector writes a VALUE row read through the task snapshot unit.
+
+    The REAL ``task_snapshot.acquire_snapshot`` runs underneath every test, fed
+    by the canned substrate at the public MCP seam: the census gives the nine
+    member columns, the rows give the live/stranded split.
+    """
+
+    async def test_each_of_the_nine_members_lands_in_its_own_column(
         self, burndown_env, dummy_client,
     ):
-        """A tree that fits the envelope costs ONE request, not ceil(N/P).
+        _, config, conn = burndown_env
+        fixture = [
+            _raw_task(task_id, member.value)
+            for task_id, member in enumerate(TaskStatus, start=1)
+        ]
 
-        Pagination is gated behind a size probe (_fetch_snapshot_tasks): the
-        paginated walk is ~496 sequential requests on this repo and must be the
-        exception, not the steady state.  Discriminates: it fails if the
-        collector goes back to passing page_size unconditionally.
-        """
-        db_path, config, conn = burndown_env
-        calls: list[dict] = []
+        await _collect(conn, config, dummy_client, _CannedStore({config.project_root: fixture}))
 
-        async def fake_tasks(client, cfg, project_root, **kwargs):
-            calls.append(kwargs)
-            return [_ztask(status='pending', id=1)]
-
-        with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        assert len(calls) == 1, f'a fitting tree must cost one read, got {calls}'
-        assert 'chunk_size' not in calls[0], (
-            'the probe must be an ordinary unchunked read'
+        rows = await _snapshot_rows(conn)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['state'] == 'value'
+        assert row['reason'] is None
+        columns = [_MEMBER_COLUMN[member] for member in TaskStatus]
+        assert {column: row[column] for column in columns} == dict.fromkeys(columns, 1), (
+            'every member in its OWN column — review is no longer folded into in_progress'
         )
+        assert sum(row[column] for column in columns) == len(fixture) == 9
 
-    @pytest.mark.asyncio
-    async def test_rejected_probe_falls_back_to_the_paginated_walk(
+    async def test_the_split_is_the_rows_and_the_members_are_the_census(
         self, burndown_env, dummy_client,
     ):
-        """An oversize tree still gets its row — via the paginated fallback.
-
-        The probe must not reintroduce the permanent-hole failure it was added
-        on top of: when the unpaginated read is rejected wholesale, the
-        paginated path still runs and the snapshot row is still written.
-        """
-        db_path, config, conn = burndown_env
-        calls: list[dict] = []
-
-        async def fake_tasks(client, cfg, project_root, **kwargs):
-            calls.append(kwargs)
-            # `chunk_size`, not `page_size`: the collector's fallback now asks
-            # for a CHUNKED complete read. Keying this fake off the old spelling
-            # would make the probe and the fallback indistinguishable and the
-            # fallback would never appear to succeed.
-            if 'chunk_size' not in kwargs:
-                return {'offline': True, 'error': 'response too large'}
-            return [_ztask(status='pending', id=1)]
-
-        with (
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        assert [('chunk_size' in c) for c in calls] == [False, True], (
-            f'expected probe-then-chunked-walk, got {calls}'
-        )
-        # The PYTHON kwarg is `chunk_size`; the MCP WIRE argument is still
-        # `page_size` (fused-memory's tool parameter, out of scope here). Two
-        # names at two layers, both asserted — see the wire assertions over
-        # stubbed `mcp_tool_call` calls further down this file.
-        assert calls[1]['chunk_size'] == _SNAPSHOT_PAGE_SIZE
-        async with conn.execute('SELECT pending FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None and row[0] == 1, (
-            'the paginated fallback must still write the row'
+        """Two sources, disclosed: a status-map id with no row moves the census only."""
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_live_now(id=1), _stranded(id=2), _ztask(status='pending', id=3)]},
+            census_only={config.project_root: {4: 'in-progress'}},
         )
 
-    @pytest.mark.asyncio
-    async def test_offline_marker_still_skips_the_project(
-        self, burndown_env, caplog, dummy_client,
+        await _collect(conn, config, dummy_client, store)
+
+        (row,) = await _snapshot_rows(conn)
+        assert row['in_progress'] == 3, 'the census counts the row-less id too'
+        assert row['in_progress_rows'] == 2
+        assert row['in_progress_live'] == 1
+        assert row['in_progress_stranded'] == 1
+        assert row['in_progress_live'] + row['in_progress_stranded'] == row['in_progress_rows']
+        assert row['in_progress'] != row['in_progress_rows']
+        assert row['pending'] == 1
+
+    async def test_one_unit_per_root_and_never_the_whole_tree(
+        self, burndown_conn_with_config, dummy_client,
     ):
-        """``fetch_tasks``' offline marker is still a dict, not a list.
+        other = Path('/fake/project/other')
+        async with burndown_conn_with_config(known_project_roots=[other]) as (_db, config, conn):
+            store = _CannedStore({
+                config.project_root: [_ztask(status='pending', id=1)],
+                other: [_ztask(status='done', id=1)],
+            })
+            await _collect(conn, config, dummy_client, store)
 
-        The Phase-3 guards must check the marker BEFORE the list check, or an
-        outage would be logged as an 'unexpected result' instead of an outage.
-        """
-        db_path, config, conn = burndown_env
-
-        with (
-            patch('dashboard.data.burndown.fetch_tasks',
-                  side_effect=_AsyncReturn({'offline': True, 'error': 'boom'})),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0, 'an offline project must not write a zeroed snapshot'
-        assert not [r for r in caplog.records if r.levelno == logging.WARNING], (
-            'a known offline marker is a DEBUG-level skip, not a WARNING'
+        for root in (config.project_root, other):
+            row_reads = [call['args'].get('statuses') for call in store.calls_to('get_tasks', root)]
+            assert row_reads == [sorted(ACTIVE)], (
+                f'{root}: exactly one status-narrowed row read, got {row_reads}'
+            )
+            assert store.calls_to('get_statuses', root), f'{root}: the census was never read'
+        assert all('statuses' in call['args'] for call in store.calls_to('get_tasks')), (
+            'a get_tasks call without a statuses filter reads the whole tree'
         )
 
-    @pytest.mark.asyncio
-    async def test_unexpected_result_type_warns_and_other_projects_still_land(
+    async def test_an_empty_project_is_a_measured_zero(self, burndown_env, dummy_client):
+        _, config, conn = burndown_env
+
+        await _collect(conn, config, dummy_client, _CannedStore({config.project_root: []}))
+
+        (row,) = await _snapshot_rows(conn)
+        assert row['state'] == 'value'
+        for column in (*_MEMBER_COLUMN.values(), 'in_progress_rows',
+                       'in_progress_live', 'in_progress_stranded'):
+            assert row[column] == 0, f'{column}: expected a measured 0, got {row[column]!r}'
+
+    async def test_a_migrated_pre_delta1_store_keeps_its_old_row_unrecorded(
+        self, tmp_path, dummy_client,
+    ):
+        db = tmp_path / 'pre_delta1.db'
+        _pre_delta1_burndown_db(db)
+        config = DashboardConfig(project_root=tmp_path)
+        store = _CannedStore({config.project_root: [_raw_task(1, 'review'), _raw_task(2, 'done')]})
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            await _collect(conn, config, dummy_client, store)
+            old, new = await _snapshot_rows(conn)
+
+        assert old['project_id'] == _PRE_DELTA1_ROW['project_id']
+        for column in (*_DELTA1_COUNT_COLUMNS, 'state'):
+            assert old[column] is None, f'old row {column}: expected NULL, got {old[column]!r}'
+        assert new['state'] == 'value'
+        assert (new['review'], new['merge_deferred'], new['infra_hold'], new['in_progress_rows']) == (
+            1, 0, 0, 0,
+        )
+        assert new['done'] == 1
+
+
+def _misbehave_for(bad_root, misbehaviour):
+    """Stand in at the collector's public ``acquire_snapshot`` name.
+
+    *misbehaviour* (a no-argument coroutine function) runs for *bad_root*; every
+    other root gets the REAL unit. The real unit is total by contract and never
+    raises or hangs, so only a fake at this name reaches those two branches.
+    """
+    bad_key = _root_key(bad_root)
+
+    async def acquire(client, config, project_root, *, now):
+        if _root_key(project_root) == bad_key:
+            return await misbehaviour()
+        return await task_snapshot.acquire_snapshot(client, config, project_root, now=now)
+
+    return patch('dashboard.data.burndown.acquire_snapshot', new=acquire)
+
+
+def _burndown_warnings_naming(caplog, root) -> list[logging.LogRecord]:
+    """The collector's own WARNING records whose message names *root*."""
+    return [
+        r for r in caplog.records
+        if r.name == 'dashboard.data.burndown'
+        and r.levelno == logging.WARNING
+        and str(Path(root).resolve()) in r.getMessage()
+    ]
+
+
+class TestCollectSnapshotWritesGapRows:
+    """A root the collector could not measure gets a GAP row, never a hole.
+
+    One row per discovered root per tick: a value row, or a gap row whose
+    ``reason`` carries the failure verbatim. A gap carries no measurement, so
+    its nullable count columns stay NULL.
+    """
+
+    async def test_a_failed_census_half_is_a_gap_not_a_value_row_with_a_split(
+        self, burndown_env, dummy_client,
+    ):
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_live_now(id=1)]},
+            fail_when=lambda root, tool: tool == 'get_statuses',
+            fail_with=PermissionError('census denied'),
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        row = _assert_one_gap(await _rows_by_project(conn), config.project_root, 'census denied')
+        assert row['reason'].startswith('census: '), row['reason']
+
+    async def test_a_failed_rows_half_is_a_gap(self, burndown_env, dummy_client):
+        """The split is unknowable and the legacy split columns cannot say so."""
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_live_now(id=1)]},
+            fail_when=lambda root, tool: tool == 'get_tasks',
+            fail_with=PermissionError('rows denied'),
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        row = _assert_one_gap(await _rows_by_project(conn), config.project_root, 'rows denied')
+        assert row['reason'].startswith('rows: '), row['reason']
+
+    async def test_an_off_vocabulary_status_is_a_gap_naming_it(self, burndown_env, dummy_client):
+        """The retired ``.get(..., 'pending')`` absorption cannot come back."""
+        _, config, conn = burndown_env
+        store = _CannedStore(
+            {config.project_root: [_raw_task(1, 'pending')]},
+            census_only={config.project_root: {2: 'something-weird'}},
+        )
+
+        await _collect(conn, config, dummy_client, store)
+
+        _assert_one_gap(await _rows_by_project(conn), config.project_root, 'something-weird')
+
+    async def test_a_stale_unit_is_not_restamped_at_a_later_tick(
+        self, burndown_env, dummy_client, monkeypatch,
+    ):
+        _, config, conn = burndown_env
+        monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 0)
+        store = _CannedStore({config.project_root: [_raw_task(1, 'review'), _raw_task(2, 'pending')]})
+
+        await _collect(conn, config, dummy_client, store)
+        store.fail_when = lambda root, tool: True
+        await _collect(conn, config, dummy_client, store)
+
+        # Precondition: the unit really is serving tick 1's census as STALE.
+        with _serve(store):
+            unit = await task_snapshot.acquire_snapshot(
+                dummy_client, config, config.project_root, now=datetime.now(UTC),
+            )
+        assert unit.census.state == 'stale'
+
+        rows = await _snapshot_rows(conn)
+        assert [row['state'] for row in rows] == ['value', 'gap']
+        assert rows[0]['review'] == 1
+        for column in ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows'):
+            assert rows[1][column] is None, f'gap {column}: {rows[1][column]!r}, not tick 1\'s number'
+
+    async def test_a_raising_acquisition_is_a_gap_and_a_warning(
         self, burndown_conn_with_config, dummy_client, caplog,
     ):
-        """A non-list, non-marker result is a WARNING + skip, isolated per root."""
-        root_a = Path('/fake/project/root_a')
+        exploding = Path('/fake/project/exploding')
+        other = Path('/fake/project/other')
 
-        async with burndown_conn_with_config(known_project_roots=[root_a]) as (
-            db_path, config, conn,
+        async def explode():
+            raise RuntimeError('unit exploded')
+
+        async with burndown_conn_with_config(known_project_roots=[exploding, other]) as (
+            _db, config, conn,
         ):
-            bad_key = _root_key(config.project_root)
-
-            async def fake_tasks(client, cfg, project_root, **_kwargs):
-                if _root_key(project_root) == bad_key:
-                    return 'not a task list'
-                return [_ztask(status='pending', id=1)]
-
+            store = _CannedStore({config.project_root: [], other: [_raw_task(1, 'done')]})
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_tasks),
+                _serve(store),
+                _misbehave_for(exploding, explode),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
+            by_project = await _rows_by_project(conn)
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                project_ids = [r['project_id'] for r in await cur.fetchall()]
+        _assert_one_gap(by_project, exploding, 'RuntimeError', 'unit exploded')
+        _assert_one_value(by_project, config.project_root)
+        _assert_one_value(by_project, other)
+        warnings = _burndown_warnings_naming(caplog, exploding)
+        assert warnings, f'expected a WARNING naming {exploding}'
+        assert all(
+            r.exc_info is not None and isinstance(r.exc_info[1], RuntimeError) for r in warnings
+        )
 
-            assert project_ids == [str(root_a.resolve())], (
-                'the healthy root must still be snapshotted'
+    async def test_a_hung_acquisition_is_a_gap_at_the_backstop(
+        self, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """One root hanging forever costs that root a gap row, not the cycle.
+
+        The hang has NO duration (``asyncio.Event().wait()``, the task 4788
+        idiom), so no choice of budget can make an unbounded collector pass.
+        """
+        hung = Path('/fake/project/hung')
+
+        async def hang():
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+        async with burndown_conn_with_config(known_project_roots=[hung]) as (_db, config, conn):
+            store = _CannedStore({config.project_root: [_raw_task(1, 'pending')]})
+            with (
+                _serve(store),
+                _misbehave_for(hung, hang),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail(
+                        'collect_snapshot did not return within 10s against a root '
+                        'whose acquisition hangs forever — the per-root backstop '
+                        '(_SNAPSHOT_PER_ROOT_BUDGET) is missing.'
+                    )
+            by_project = await _rows_by_project(conn)
+
+        _assert_one_gap(by_project, hung, '0.05')
+        _assert_one_value(by_project, config.project_root)
+        warnings = _burndown_warnings_naming(caplog, hung)
+        assert warnings, f'expected a WARNING naming {hung}'
+        assert all(
+            r.exc_info is not None and isinstance(r.exc_info[1], TimeoutError) for r in warnings
+        )
+
+    async def test_an_offline_root_is_a_routine_gap_without_a_warning(
+        self, burndown_env, caplog, dummy_client,
+    ):
+        """The gap row is the durable record; the collector logs it at DEBUG.
+
+        The substrate's own fan-out reports the outage under its own logger.
+        """
+        db_path, config, conn = burndown_env
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'):
+            await _collect(
+                conn, config, dummy_client,
+                _CannedStore({config.project_root: httpx.ConnectError('boom')}),
             )
-            warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-            assert any(str(config.project_root) in m for m in warnings), (
-                f'the bad root must be named in a WARNING; got: {warnings}'
-            )
+
+        _assert_one_gap(await _rows_by_project(conn), config.project_root, 'boom')
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.burndown'
+        ], 'a known offline root is a DEBUG-level record, not a WARNING'
 
 
 # ---------------------------------------------------------------------------
@@ -1761,7 +1913,7 @@ class TestDownsample:
         _create_burndown_db(db_path)
 
         now = datetime.now(UTC)
-        old_hour = now - timedelta(days=10)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
         sync_conn = sqlite3.connect(str(db_path))
         # Insert 3 snapshots in the same hour, 10 days ago
         for i in range(3):
@@ -1776,6 +1928,35 @@ class TestDownsample:
                 row = await cur.fetchone()
                 assert row is not None
                 assert row[0] == 1  # compacted to one per hour
+
+    async def test_keeps_one_row_per_old_hour_not_one_per_project(self, tmp_path):
+        """Two old hours keep one row EACH.
+
+        The bucket key was once ``strftime('%%Y-%%m-%%dT%%H', ts)`` in a bound
+        (not %-formatted) SQL string, so SQLite read ``%%`` as a literal percent
+        and every row older than 7 days shared ONE bucket per project — the
+        whole 7-90 day history collapsed to a single survivor.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        old_hour = (datetime.now(UTC) - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        sync_conn = sqlite3.connect(str(db_path))
+        for hour in (old_hour, old_hour - timedelta(hours=1)):
+            for minute in (10, 50):
+                _insert_snapshot(sync_conn, 'proj', (hour + timedelta(minutes=minute)).isoformat())
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await downsample(conn)
+            async with conn.execute('SELECT ts FROM snapshots ORDER BY ts') as cur:
+                survivors = [row[0] for row in await cur.fetchall()]
+
+        assert [ts[:16] for ts in survivors] == [
+            (old_hour - timedelta(hours=1) + timedelta(minutes=50)).isoformat()[:16],
+            (old_hour + timedelta(minutes=50)).isoformat()[:16],
+        ], f'expected the last row of each old hour, got {survivors}'
 
     @pytest.mark.asyncio
     async def test_expires_very_old(self, tmp_path):
@@ -1866,11 +2047,12 @@ class TestGetBurndownSeries:
         assert len(result['done']) == 3
         assert len(result['pending']) == 3
         # Exact inventory, so a key can neither vanish nor appear unnoticed.
-        # The last three are task 3543's split + cap; see
-        # tests/test_burndown_parity_alarm.py for their semantics.
+        # The split + cap are task 3543's (see tests/test_burndown_parity_alarm.py
+        # for their semantics); the last four are task 5591's.
         assert set(result.keys()) == {
             'labels', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
             'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+            'review', 'merge_deferred', 'infra_hold', 'in_progress_rows',
         }
 
     @pytest.mark.asyncio
@@ -1919,6 +2101,220 @@ class TestGetBurndownSeries:
 
         # done values should be in timestamp order (oldest first)
         assert result['done'] == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# Read side: measured rows only, and the task 5591 columns (step-7)
+# ---------------------------------------------------------------------------
+
+_READ_NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
+_NEW_SERIES_KEYS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows')
+
+
+def _hours_before_read(hours: int) -> str:
+    return (_READ_NOW - timedelta(hours=hours)).isoformat()
+
+
+def _insert_gap(conn: sqlite3.Connection, project_id: str, ts: str, reason: str = 'rows: offline') -> None:
+    """A gap row exactly as the collector writes one: no count column named."""
+    conn.execute(
+        'INSERT INTO snapshots (project_id, ts, state, reason) VALUES (?, ?, ?, ?)',
+        (project_id, ts, 'gap', reason),
+    )
+
+
+def _insert_value(conn: sqlite3.Connection, project_id: str, ts: str, **counts) -> None:
+    """A post-5591 value row; *counts* override the zero defaults."""
+    fields = {'review': 0, 'merge_deferred': 0, 'infra_hold': 0, **counts}
+    fields.setdefault('in_progress_rows', fields.get('in_progress', 0))
+    _insert_snapshot(conn, project_id, ts, state='value', **fields)
+
+
+def _migrated_pre_delta1_db(path: Path) -> None:
+    """A pre-δ1 store (its one row inside the read window), migrated in place."""
+    _pre_delta1_burndown_db(path, project_id='proj', ts=_hours_before_read(3))
+    conn = sqlite3.connect(str(path))
+    for column, ddl in (('review', 'INTEGER'), ('merge_deferred', 'INTEGER'),
+                        ('infra_hold', 'INTEGER'), ('in_progress_rows', 'INTEGER'),
+                        ('state', 'TEXT'), ('reason', 'TEXT')):
+        conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
+    conn.commit()
+    conn.close()
+
+
+async def _series_of(path: Path, project_id: str = 'proj', **kwargs) -> dict:
+    async with aiosqlite.connect(str(path)) as db:
+        return await get_burndown_series(db, project_id, now=kwargs.pop('now', _READ_NOW), **kwargs)
+
+
+class TestReadSideSeesMeasuredRowsOnly:
+    """A gap row's physically-defaulted zeros must never reach a reader."""
+
+    async def test_series_skips_a_gap_row(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', _hours_before_read(2), done=20, pending=5)
+        _insert_gap(conn, 'proj', _hours_before_read(1))
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(2)]
+        assert series['done'] == [20]
+
+    async def test_series_keeps_a_legacy_null_state_row(self, tmp_path):
+        """Before task 5591 only a successful read wrote a row: NULL state is measured."""
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_snapshot(conn, 'proj', _hours_before_read(2), done=7)
+        _insert_gap(conn, 'proj', _hours_before_read(1))
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(2)]
+        assert series['done'] == [7]
+
+    async def test_projects_omit_a_gap_only_project(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_gap(conn, 'gap-only', _hours_before_read(1))
+        _insert_value(conn, 'measured', _hours_before_read(2), done=1)
+        _insert_gap(conn, 'measured', _hours_before_read(1))
+        _insert_snapshot(conn, 'legacy', _hours_before_read(2), done=1)
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c) == ['legacy', 'measured']
+            assert await aggregate_burndown_projects([c]) == ['legacy', 'measured']
+
+    async def test_series_carries_the_new_columns_null_before_the_migration(self, tmp_path):
+        db = tmp_path / 'migrated.db'
+        _migrated_pre_delta1_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', _hours_before_read(1), in_progress=3, review=2,
+                      merge_deferred=1, infra_hold=4, in_progress_rows=2,
+                      in_progress_live=1, in_progress_stranded=1)
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(3), _hours_before_read(1)]
+        assert series['review'] == [None, 2]
+        assert series['merge_deferred'] == [None, 1]
+        assert series['infra_hold'] == [None, 4]
+        assert series['in_progress_rows'] == [None, 2]
+
+    async def test_empty_series_default_carries_the_new_keys(self):
+        series = await get_burndown_series(None, 'proj')
+        for key in _NEW_SERIES_KEYS:
+            assert series[key] == [], key
+
+    @pytest.mark.parametrize('make_store', [
+        pytest.param(_pre_delta1_burndown_db, id='pre_delta1_unmigrated'),
+        pytest.param(_legacy_burndown_db, id='pre_3543_legacy'),
+    ])
+    async def test_an_unmigrated_peer_store_still_reads(self, tmp_path, make_store):
+        """Other projects' burndown.db files are opened read-only and never
+        migrated: no ``state`` column, so every row is measured by construction."""
+        db = tmp_path / 'peer.db'
+        make_store(db)
+        project_id = 'pre-delta1' if make_store is _pre_delta1_burndown_db else 'legacy'
+        read_now = datetime(2026, 1, 2, tzinfo=UTC)
+
+        series = await _series_of(db, project_id, now=read_now)
+
+        assert series['labels'] == ['2026-01-01T00:00:00+00:00'], (
+            'the rows must come back through the probe-gated path, not the '
+            'except-and-return-empty guard'
+        )
+        assert series['done'] == [20]
+        for key in _NEW_SERIES_KEYS:
+            assert series[key] == [None], key
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c) == [project_id]
+
+    async def test_aggregate_merges_the_new_keys(self, tmp_path):
+        db1, db2 = tmp_path / 'one.db', tmp_path / 'two.db'
+        for path, hours, review in ((db1, 2, 1), (db2, 1, 5)):
+            _create_burndown_db(path)
+            conn = sqlite3.connect(str(path))
+            _insert_value(conn, 'proj', _hours_before_read(hours), review=review,
+                          merge_deferred=review + 1, infra_hold=review + 2,
+                          in_progress=review, in_progress_rows=review)
+            conn.commit()
+            conn.close()
+
+        async with aiosqlite.connect(str(db1)) as c1, aiosqlite.connect(str(db2)) as c2:
+            merged = await aggregate_burndown_series([c1, c2], 'proj', now=_READ_NOW)
+        empty = await aggregate_burndown_series([], 'proj')
+
+        assert merged['review'] == [1, 5]
+        assert merged['merge_deferred'] == [2, 6]
+        assert merged['infra_hold'] == [3, 7]
+        assert merged['in_progress_rows'] == [1, 5]
+        for key in _NEW_SERIES_KEYS:
+            assert empty[key] == [], key
+
+    async def test_downsample_keeps_the_measured_row_of_an_hour(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        now = datetime.now(UTC)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        gap_only_hour = old_hour - timedelta(hours=5)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', (old_hour + timedelta(minutes=10)).isoformat(), done=9)
+        _insert_gap(conn, 'proj', (old_hour + timedelta(minutes=50)).isoformat())
+        _insert_gap(conn, 'proj', (gap_only_hour + timedelta(minutes=10)).isoformat())
+        _insert_gap(conn, 'proj', (gap_only_hour + timedelta(minutes=50)).isoformat())
+        recent = [(now - timedelta(minutes=m)).isoformat() for m in (5, 15)]
+        _insert_value(conn, 'proj', recent[0], done=10)
+        _insert_gap(conn, 'proj', recent[1])
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            await downsample(c)
+            async with c.execute('SELECT ts, state, done FROM snapshots ORDER BY ts') as cur:
+                rows = [tuple(r) for r in await cur.fetchall()]
+
+        old = [r for r in rows if r[0] < (now - timedelta(days=7)).isoformat()]
+        assert [(r[0][:13], r[1]) for r in old] == [
+            (gap_only_hour.isoformat()[:13], 'gap'),
+            (old_hour.isoformat()[:13], 'value'),
+        ], f'measured rows win an old hour; a gap-only hour keeps one gap: {old}'
+        assert [r for r in old if r[1] == 'value'][0][2] == 9
+        assert sorted(r[0] for r in rows if r not in old) == sorted(recent), 'recent rows untouched'
+
+    async def test_the_current_shaper_sees_no_gap_rows(self, tmp_path):
+        """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
+        a gap row contributes nothing — not zeros — to either block."""
+        from dashboard.data.redux_api import shape_burndown
+
+        with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
+        for path in (with_gap, without_gap):
+            _migrated_pre_delta1_db(path)
+            conn = sqlite3.connect(str(path))
+            _insert_value(conn, 'proj', _hours_before_read(2), done=25, pending=4,
+                          in_progress=2, in_progress_live=1, in_progress_stranded=1,
+                          in_progress_rows=2, review=1, concurrency_cap=24)
+            if path is with_gap:
+                _insert_gap(conn, 'proj', _hours_before_read(1))
+            conn.commit()
+            conn.close()
+
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+
+        assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
+        assert shaped['BURNDOWN'] == expected['BURNDOWN']
 
 
 # ---------------------------------------------------------------------------
@@ -2113,7 +2509,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         with contextlib.ExitStack() as stack:
             stack.enter_context(caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'))
             stack.enter_context(
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map))
+                _serve(_CannedStore(_tasks_map))
             )
             stack.enter_context(
                 patch('dashboard.data.burndown.find_running_orchestrators', **find_orch_kwargs)
@@ -2144,49 +2540,31 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
     async def test_oserror_from_post_helper_resolve_emits_specific_warning(
         self, burndown_env, caplog, dummy_client,
     ):
-        """OSError from project_root.resolve() (line 134) after the helper returns
-        must emit a warning specifically mentioning 'resolve', not the generic
-        'processing failed' message, and must not prevent other entries from being
-        snapshotted.
+        """An OSError while resolving one orchestrator's project root must emit
+        the resolution-specific warning, not the generic 'processing failed'
+        one, and must not prevent other entries from being snapshotted.
 
-        This tests the untested gap: the .resolve() call AFTER _resolve_project_root
-        or _read_project_root_from_config returns successfully.
+        The OSError is raised by the resolution helper itself for the bad
+        entry, so it is discovery's own ``except OSError`` branch that must
+        report it. (An earlier form patched ``Path.resolve`` and passed only
+        because a LATER read-failure warning happened to name a root called
+        ``orch_resolve_bad``.)
         """
         db_path, base_config, conn = burndown_env
 
-        good_orch_root = Path('/fake/project/orch_resolve_good')
-        bad_orch_root = Path('/fake/project/orch_resolve_bad')
-
-        # Config must be created BEFORE patching Path.resolve so __post_init__ succeeds
+        good_orch_root = Path('/fake/project/orch_good')
         config = DashboardConfig(
             project_root=base_config.project_root,
             known_project_roots=[],
         )
-
-        main_tasks = [{'status': 'pending'}]
-        good_orch_tasks = [{'status': 'done'}]
-        _tasks_map = {
-            config.project_root: main_tasks,
-            good_orch_root: good_orch_tasks,
-        }
-
-        # Capture bad_prefix BEFORE patching (established pattern from
-        # test_skips_known_root_on_resolve_error)
-        bad_prefix = str(bad_orch_root.resolve())
-
-        original_resolve = Path.resolve
-
-        def selective_bad_resolve(self, *args, **kwargs):
-            if str(self).startswith(bad_prefix):
-                raise OSError('simulated post-helper resolve failure')
-            return original_resolve(self, *args, **kwargs)
+        store = _CannedStore({
+            config.project_root: [{'status': 'pending'}],
+            good_orch_root: [{'status': 'done'}],
+        })
 
         def fake_resolve_project_root(prd_path, fallback):
-            # Return Path directly without calling .resolve() internally.
-            # This simulates the helper succeeding so that line 134's
-            # project_root.resolve() is the source of the OSError.
             if 'bad' in str(prd_path):
-                return bad_orch_root
+                raise OSError('simulated project-root resolution failure')
             return good_orch_root
 
         orchestrator_entries = [
@@ -2196,12 +2574,11 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
 
         with (
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            patch.object(Path, 'resolve', selective_bad_resolve),
-            patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+            _serve(store),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=orchestrator_entries),
             patch('dashboard.data.burndown._resolve_project_root', side_effect=fake_resolve_project_root),
         ):
-            # Must NOT raise despite the injected OSError from project_root.resolve()
+            # Must NOT raise despite the injected OSError.
             await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
@@ -2212,18 +2589,20 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
         assert str(base_config.project_root) in project_ids
         assert str(good_orch_root.resolve()) in project_ids
-        assert bad_prefix not in project_ids
 
-        # Warning contract: message must specifically mention path resolution
-        # (NOT the generic 'processing failed' message), with exc_info set.
-        # Check for 'resolv' to match both 'resolve' and 'resolving'.
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING for post-helper resolve failure'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert 'resolv' in combined.lower(), (
-            f'Expected "resolv" (resolve/resolving) in warning message, got: {combined!r}'
+        # Warning contract: the resolution-specific message (NOT the generic
+        # 'processing failed' one), with exc_info set.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.burndown'
+        ]
+        resolving = [r for r in warning_records if 'resolv' in r.getMessage().lower()]
+        assert resolving, (
+            'Expected a WARNING about resolving the project root, got: '
+            f'{[r.getMessage() for r in warning_records]!r}'
         )
-        assert any(r.exc_info for r in warning_records)
+        assert all(r.exc_info for r in resolving)
+        assert not [r for r in warning_records if 'processing failed' in r.getMessage()]
 
 
 # ---------------------------------------------------------------------------
@@ -2303,7 +2682,7 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+                _serve(_CannedStore(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
@@ -2373,7 +2752,7 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+                _serve(_CannedStore(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
@@ -2440,7 +2819,7 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=_fake_load(_tasks_map)),
+                _serve(_CannedStore(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
@@ -2543,213 +2922,36 @@ class TestCollectSnapshotExplicitRollback:
 # ---------------------------------------------------------------------------
 
 
-# The ~209 s paginated worst case measured for ONE root of this repo's size —
-# ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` sequential round trips at ~0.33-0.35 s each.
-# The measurement and its derivation live on ``burndown._SNAPSHOT_PAGE_SIZE``;
-# this is the test's own copy of the FLOOR it enforces, deliberately spelled
-# as a number rather than derived from ``_SNAPSHOT_PER_ROOT_BUDGET`` (deriving
-# the bound from the value under test would assert nothing).
-_MEASURED_PAGINATED_WORST_CASE = 209.0
-
-
 class TestCollectSnapshotPerRootBudget:
     """``collect_snapshot``'s Phase-2 fan-out is whole-operation bounded per root.
 
-    Before task 4884 this was the LAST unbounded ``fetch_tasks`` caller in the
-    tree: task 4788 gave every route caller a named
-    ``DEFAULT_WHOLE_OPERATION_BUDGET`` wrap and deliberately left the
-    background collector out of scope, so a single hung MCP fan-out could park
-    the collector task forever and silently stop every project's burndown row
-    — the 2026-08-27 19.8h wedge shape, one layer down from the routes.
-
-    The hang stub is ``await asyncio.Event().wait()`` — the 4788 idiom — with
-    NO duration at all, so no choice of budget value can make an unbounded
-    implementation pass these tests.
+    Before task 4884 the collector's read was unbounded, so a single hung MCP
+    fan-out could park the collector task forever and silently stop every
+    project's burndown row. Expiry is now a gap row (see
+    TestCollectSnapshotWritesGapRows' hung-acquisition test); this class pins
+    the VALUE of the bound.
     """
 
-    @pytest.mark.asyncio
-    async def test_hung_root_is_skipped_and_healthy_root_still_snapshots(
-        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
-    ):
-        """(a) One root hanging forever costs that root's row, not the cycle."""
-        healthy_root = tmp_path / 'healthy'
-        healthy_root.mkdir()
-
-        async with burndown_conn_with_config(known_project_roots=[healthy_root]) as (
-            _db_path, config, conn,
-        ):
-            hung_key = _root_key(config.project_root)
-            healthy_key = _root_key(healthy_root)
-
-            async def fake_load(client, cfg, project_root, **_kwargs):
-                key = _root_key(project_root)
-                if key == hung_key:
-                    # No duration: nothing ever sets this Event, so the only
-                    # thing that can end this await is the caller's bound.
-                    await asyncio.Event().wait()
-                assert key == healthy_key, f'Unmapped project_root: {key}'
-                return _task_rows([{'status': 'pending'}, {'status': 'done'}])
-
-            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
-
-            with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                # Hard external cap, mirroring test_healthz_deadline._call_healthz:
-                # a regression to the unbounded gather must fail fast here rather
-                # than wedge the whole suite behind pytest-timeout.
-                try:
-                    await asyncio.wait_for(
-                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
-                    )
-                except TimeoutError:
-                    pytest.fail(
-                        'collect_snapshot did not return within 10s against a root '
-                        'whose fetch hangs forever — the Phase-2 fan-out is still '
-                        'unbounded (expected a per-root _SNAPSHOT_PER_ROOT_BUDGET '
-                        'wrap around _fetch_snapshot_tasks).'
-                    )
-
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
-
-            project_ids = {row['project_id'] for row in rows}
-            assert str(healthy_root.resolve()) in project_ids, (
-                'the healthy root must still get its snapshot row: one hung root '
-                'may not sink the cycle'
-            )
-            assert str(config.project_root) not in project_ids, (
-                'the hung root must be SKIPPED, not written with fabricated zero '
-                'counts — snapshots is an append-only historical record'
-            )
-            assert len(rows) == 1
-
-            warnings = [
-                r for r in caplog.records
-                if r.levelno >= logging.WARNING and str(config.project_root) in r.getMessage()
-            ]
-            assert warnings, (
-                'expected a WARNING naming the hung root; a root that silently '
-                'vanishes from an append-only chart is exactly the invisible '
-                'failure this bound exists to make visible. Saw: '
-                f'{[r.getMessage() for r in caplog.records]}'
-            )
-
-    @pytest.mark.asyncio
-    async def test_expiry_surfaces_through_the_existing_exception_triage(
-        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
-    ):
-        """(b) Task 519's partial-success semantics are preserved verbatim.
-
-        Expiry must arrive at Phase 3 as a per-root ``BaseException`` in the
-        gather's result list — i.e. ``return_exceptions=True`` is still in
-        force — so the EXISTING ``isinstance(result, BaseException)`` branch
-        logs-and-continues.  A bound that instead let the ``TimeoutError``
-        escape the gather would abort the cycle and roll nothing back but
-        write nothing more either.
-        """
-        healthy_root = tmp_path / 'healthy'
-        healthy_root.mkdir()
-        late_root = tmp_path / 'late'
-        late_root.mkdir()
-
-        async with burndown_conn_with_config(
-            known_project_roots=[healthy_root, late_root],
-        ) as (_db_path, config, conn):
-            hung_key = _root_key(healthy_root)
-
-            async def fake_load(client, cfg, project_root, **_kwargs):
-                if _root_key(project_root) == hung_key:
-                    await asyncio.Event().wait()
-                return _task_rows([{'status': 'pending'}])
-
-            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
-
-            with (
-                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            ):
-                try:
-                    await asyncio.wait_for(
-                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
-                    )
-                except TimeoutError:
-                    pytest.fail('collect_snapshot did not return within 10s (see (a))')
-
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                project_ids = {row['project_id'] for row in await cur.fetchall()}
-
-            # The main project commits FIRST (it is roots_to_snapshot[0]) and a
-            # later root's expiry may not roll it back.  The root AFTER the hung
-            # one is still reached, which is what "isolated, not aborted" means.
-            assert str(config.project_root) in project_ids
-            assert str(late_root.resolve()) in project_ids
-            assert str(healthy_root.resolve()) not in project_ids
-
-            triage = [
-                r for r in caplog.records
-                if r.getMessage().startswith('Failed to fetch tasks for')
-                and str(healthy_root.resolve()) in r.getMessage()
-            ]
-            assert triage, (
-                'the timed-out root must reach the EXISTING '
-                "isinstance(result, BaseException) triage branch ('Failed to "
-                "fetch tasks for %s'), proving return_exceptions=True still "
-                'converts its expiry into a handled per-root result. Saw: '
-                f'{[r.getMessage() for r in caplog.records]}'
-            )
-            assert triage[0].exc_info is not None
-            assert issubclass(triage[0].exc_info[0], TimeoutError), (
-                'the exception carried into triage must be the budget expiry '
-                f'itself, not a substitute; got {triage[0].exc_info[0]!r}'
-            )
-
-    def test_budget_is_sized_between_the_route_default_and_one_collector_cycle(self):
-        """(c) The VALUE is derived from the collector's own cycle, not the routes.
-
-        Wrapping at the route convention's 7.0 would be a REGRESSION, not a
-        fix: ``_fetch_snapshot_tasks`` probes unpaginated and, on transport
-        rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call
-        that internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round
-        trips, MEASURED at ~209 s for one root of this repo's size (the
-        measurement and its derivation live on ``_SNAPSHOT_PAGE_SIZE``).  A
-        7.0 s bound would time out every big root on every cycle, and because
-        ``snapshots`` is APPEND-ONLY and no later cycle backfills, that is a
-        permanent unexplained hole in the chart.
-        """
+    def test_budget_sits_between_the_units_own_bounds_and_one_collector_cycle(self):
+        """Floor: the unit's own structural worst case, so the backstop never
+        pre-empts a unit still inside its own bounds. Ceiling: half one
+        collector cycle, so cycle N is done before cycle N+1 starts even when a
+        root spends its whole budget."""
         import dashboard.loops as loops_module
-        from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
 
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
-        one_cycle_half = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
+        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
 
-        # BOTH bounds are the ones the derivation actually names. An earlier
-        # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
-        # and `< _SAMPLE_INTERVAL_SECONDS` (600) — two orders of magnitude
-        # apart from the stated floor at one end and double the stated ceiling
-        # at the other — so a value of 10.0 passed while doing exactly the
-        # permanent-hole damage the docstring describes.
-        assert budget >= _MEASURED_PAGINATED_WORST_CASE, (
-            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the MEASURED '
-            f'~{_MEASURED_PAGINATED_WORST_CASE} s paginated worst case for one '
-            "root of this repo's size (see _SNAPSHOT_PAGE_SIZE). Anything below "
-            'it times out every big root on EVERY cycle, and because snapshots '
-            'is APPEND-ONLY and no later cycle backfills, that is a permanent '
-            'unexplained hole in the chart — not a degraded read. The shared '
-            f'route default ({DEFAULT_WHOLE_OPERATION_BUDGET}) is the value '
-            'this must NOT be confused with: a BACKGROUND root that walks '
-            'ceil(N/P) sequential pages is not a request-path one.'
+        assert budget >= floor, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
+            f'worst case (_SNAPSHOT_UNIT_WORST_CASE_SECONDS = {floor} s): the '
+            'backstop would turn a slow-but-bounded read into a gap row.'
         )
-        assert budget <= one_cycle_half, (
+        assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
-            'finish inside one cycle can never finish at all, and the halving '
-            'is what guarantees cycle N is done before cycle N+1 starts even '
-            'when a root spends its whole budget.'
+            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 
@@ -2870,10 +3072,9 @@ def _make_burndown_db_with_series(
     _create_burndown_db(db_path)
     conn = sqlite3.connect(str(db_path))
     for ts, done, cancelled, blocked, deferred, in_progress, pending in rows:
-        conn.execute(
-            _INSERT_SNAPSHOT_SQL,
-            (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done,
-             in_progress, 0, None),
+        _insert_snapshot(
+            conn, project_id, ts, pending=pending, in_progress=in_progress,
+            blocked=blocked, deferred=deferred, cancelled=cancelled, done=done,
         )
     conn.commit()
     conn.close()
@@ -3209,528 +3410,3 @@ class TestComputeWindowCompletion:
         })
         assert result['completed'] == 0
         assert result['velocity'] == 0.0
-
-
-class TestCollectSnapshotPaginatesTheTaskRead:
-    """The whole-tree read must not be able to open a permanent history hole.
-
-    ``snapshots`` is APPEND-ONLY: one row per cycle, never backfilled.  So a
-    cycle whose ``get_tasks`` response is rejected wholesale for exceeding the
-    MCP transport limit does not merely arrive late — that point in the burndown
-    history is gone for good, and the chart reads as a gap with no explanation
-    on it.
-
-    Neither obvious alternative is available.  There is no field-limited read
-    anywhere in the chain (MCP ``get_tasks`` accepts only ``project_root``/
-    ``tag``/``page_size``/``offset``/``statuses``, and the backend query is
-    ``SELECT *``) even though the collector reads just four keys per task.  And
-    falling back to ``fetch_statuses`` is worse than the disease: BURNDOWN_SCHEMA
-    declares ``in_progress_live``/``in_progress_stranded`` ``INTEGER NOT NULL
-    DEFAULT 0``, so a statuses-only row physically cannot say "split unknown"
-    and would have to write ``stranded=0`` — a confident zero manufactured out
-    of a degraded read.  A visible hole beats an invisible lie.
-
-    That leaves bounding the per-response size.  These tests pin both halves:
-    pagination closes the hole, and a genuinely unreadable tree still writes
-    nothing at all.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _reset_fetch_tasks_cache(self):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
-        yield
-        tasks_mod._fetch_tasks_cache_clear()
-
-    @staticmethod
-    def _raw(tid: int, status: str = 'pending', **extra) -> dict:
-        """A RAW MCP get_tasks row (pre-``_shape_task``)."""
-        row = {
-            'id': str(tid), 'title': f'task {tid}', 'status': status,
-            'description': '', 'details': '', 'dependencies': [], 'metadata': {},
-        }
-        row.update(extra)
-        return row
-
-    def _tree(self) -> list[dict]:
-        """A tree with a known live/stranded split: 2 live, 2 stranded, 3 other."""
-        return [
-            self._raw(1, 'in-progress',
-                      claimant_run_id='run-1/sess-1/pid=42',
-                      heartbeat_at=datetime.now(UTC).isoformat()),
-            self._raw(2, 'in-progress',
-                      claimant_run_id='run-2/sess-2/pid=43',
-                      heartbeat_at=datetime.now(UTC).isoformat()),
-            self._raw(3, 'in-progress'),   # no claimant at all => stranded
-            self._raw(4, 'in-progress'),   # no claimant at all => stranded
-            self._raw(5, 'pending'),
-            self._raw(6, 'done'),
-            self._raw(7, 'blocked'),
-        ]
-
-    @staticmethod
-    def _stub(tasks: list[dict], calls: list[dict], *, oversize_unpaginated: bool):
-        """An ``mcp_tool_call`` stub for the REAL ``fetch_tasks`` to drive.
-
-        Patching at this layer rather than at ``burndown.fetch_tasks`` is the
-        point: what is under test is whether the collector asks for a BOUNDED
-        response, which a stubbed-out fetch_tasks would hide entirely.
-
-        With ``oversize_unpaginated`` the single whole-tree request answers with
-        the tool-level rejection envelope an over-limit response produces.
-        ``fetch_tasks`` turns that into its offline marker and the collector
-        skips the cycle — the permanent hole.
-        """
-
-        async def _call(_client, _url, tool, args, **_kwargs):
-            assert tool == 'get_tasks', tool
-            calls.append(dict(args))
-            page_size = args.get('page_size')
-            if page_size is None:
-                if oversize_unpaginated:
-                    return {'error': 'response exceeds maximum allowed tokens'}
-                return {'tasks': list(tasks)}
-            offset = args.get('offset', 0)
-            page = tasks[offset:offset + page_size]
-            return {
-                'tasks': page,
-                'pagination': {
-                    'total': len(tasks), 'offset': offset,
-                    'page_size': page_size, 'returned': len(page),
-                    'has_more': offset + len(page) < len(tasks),
-                },
-            }
-
-        return _call
-
-    @pytest.mark.asyncio
-    async def test_the_probe_marker_does_not_suppress_the_chunked_fallback(
-        self, burndown_env, dummy_client,
-    ):
-        """NAMED regression pin: `chunk_size` must stay IN the cache key.
-
-        THE HAZARD, stated once at `dashboard/src/dashboard/data/tasks.py::_CompleteRead`:
-        "chunk size selects transport, never the contract" is true of the
-        ANSWER and false of the KEY, and acting on the first half alone
-        suppresses the burndown fallback with the probe's own failure marker.
-        This test is the executable half of that statement.
-
-        NO CACHE CLEAR between the two reads — that is the whole test. The
-        autouse fixture clears around the test, not inside it, so the fallback
-        runs against a cache still holding the probe's fresh marker.
-
-        WHY THIS EXISTS SEPARATELY. `test_a_tree_that_only_fits_in_pages_still
-        _yields_a_row` covers this path INCIDENTALLY. Incidental coverage is
-        what a later edit removes silently: adding a mid-test cache clear, or
-        splitting the probe into its own test, would drop the guard with every
-        test still green. The probe/fallback tests in
-        `TestCollectSnapshotTaskSourceAndCap` cannot catch it at all — they
-        patch `burndown.fetch_tasks` wholesale and never reach the cache.
-        """
-        db_path, config, conn = burndown_env
-        tasks = self._tree()
-        calls: list[dict] = []
-
-        with (
-            patch(
-                'dashboard.data.tasks.mcp_tool_call',
-                new=AsyncMock(side_effect=self._stub(
-                    tasks, calls, oversize_unpaginated=True,
-                )),
-            ),
-            patch(
-                'dashboard.data.burndown.find_running_orchestrators',
-                return_value=[],
-            ),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        assert calls, 'the probe must actually reach the wire'
-        assert calls[0].get('page_size') is None, (
-            f'the probe is the UNPAGINATED read, got {calls[0]}'
-        )
-        assert any(c.get('page_size') == _SNAPSHOT_PAGE_SIZE for c in calls), (
-            'the chunked fallback never reached the server — the probe\'s own '
-            'offline marker suppressed it, which means chunk_size has been '
-            f'dropped from the cache key. Calls: {calls}'
-        )
-
-        async with conn.execute(
-            'SELECT pending, in_progress_live, in_progress_stranded FROM snapshots'
-        ) as cur:
-            row = await cur.fetchone()
-        assert row is not None, (
-            'an oversize tree must still write its snapshot row — a missing '
-            'row here is a PERMANENT hole in an append-only table'
-        )
-        assert row[0] == 1 and row[1] == 2 and row[2] == 2, (
-            f'the fallback must record the whole tree, got {tuple(row)}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_tree_that_only_fits_in_pages_still_yields_a_row(
-        self, burndown_env, dummy_client,
-    ):
-        """A row is written, and its counts equal the single-page delivery's.
-
-        Pagination changes DELIVERY, never the recorded values — so the two
-        rows this collects (paged, then whole) must agree column for column.
-        """
-        import dashboard.data.tasks as tasks_mod
-
-        db_path, config, conn = burndown_env
-        tasks = self._tree()
-        paged_calls: list[dict] = []
-        whole_calls: list[dict] = []
-
-        with (
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=self._stub(
-                      tasks, paged_calls, oversize_unpaginated=True))),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        # Baseline: the same tasks delivered whole, for a value-for-value compare.
-        tasks_mod._fetch_tasks_cache_clear()
-        with (
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=self._stub(
-                      tasks, whole_calls, oversize_unpaginated=False))),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute('SELECT * FROM snapshots ORDER BY rowid') as cur:
-            rows = list(await cur.fetchall())
-
-        assert len(rows) == 2, (
-            'the paginated cycle must write its row, not silently skip; '
-            f'requests issued were {paged_calls!r}'
-        )
-        assert any(c.get('page_size') for c in paged_calls), (
-            f'the collector must ask for a bounded response; got {paged_calls!r}'
-        )
-        paged, whole = rows[0], rows[1]
-        for col in (
-            'pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done',
-            'in_progress_live', 'in_progress_stranded',
-        ):
-            assert paged[col] == whole[col], (
-                f'{col}: pagination changed a recorded value '
-                f'({paged[col]} paged vs {whole[col]} whole)'
-            )
-        assert paged['in_progress'] == 4
-        assert paged['in_progress_stranded'] == 2
-        assert paged['in_progress_live'] == 2
-
-    @pytest.mark.asyncio
-    async def test_an_unreadable_tree_writes_no_row_rather_than_a_zero_split(
-        self, burndown_env, dummy_client,
-    ):
-        """THE anti-fabrication invariant: no row beats a fabricated one.
-
-        When the tree cannot be read at ALL — paginated or not — the existing
-        skip-and-log behaviour is retained.  Emphatically NOT a fallback row
-        carrying ``in_progress_stranded=0``: the NOT NULL split columns cannot
-        represent "split unknown", so any such row asserts, in the permanent
-        record, that nothing was stranded at a moment nobody could see.
-        """
-        db_path, config, conn = burndown_env
-
-        async def _always_fails(_client, _url, _tool, _args, **_kwargs):
-            raise httpx.ConnectError('fused-memory unreachable')
-
-        with (
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=_always_fails)),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-            row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0, 'an unreadable tree must leave a visible hole, not a zero row'
-
-    @pytest.mark.asyncio
-    async def test_a_non_advancing_server_writes_no_row_rather_than_a_zero_split(
-        self, burndown_env, dummy_client,
-    ):
-        """A server that never advances must leave a hole, not a fabricated zero.
-
-        Every paginated request answers ``returned=0`` while claiming 400 rows
-        remain.  Before ``fetch_tasks`` learned to raise on truncation this
-        wrote ONE row of ``(pending=0, in_progress=0, done=0, ...)`` for a tree
-        the server itself reported as holding 400 tasks.
-
-        ``snapshots`` is APPEND-ONLY, so the dropped row is a permanent, visible
-        hole that no later cycle backfills — which is the INTENDED outcome.  A
-        gap in the chart is visible and prompts a question; a fabricated dip is
-        unfalsifiable after the fact.
-        """
-        db_path, config, conn = burndown_env
-        calls: list[dict] = []
-
-        async def _never_advances(_client, _url, tool, args, **_kwargs):
-            assert tool == 'get_tasks', tool
-            calls.append(dict(args))
-            # The size probe (_fetch_snapshot_tasks) issues an ordinary
-            # unpaginated read first; reject it the way an oversize tree is
-            # rejected, because that rejection is the ONLY reason the paginated
-            # path this test is about ever runs.
-            if 'page_size' not in args:
-                return {'error': 'response too large'}
-            return {
-                'tasks': [],
-                'pagination': {
-                    'total': 400, 'offset': args.get('offset', 0),
-                    'page_size': args.get('page_size'), 'returned': 0,
-                    'has_more': True,
-                },
-            }
-
-        with (
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=_never_advances)),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute(
-            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
-            'in_progress_live, in_progress_stranded FROM snapshots',
-        ) as cur:
-            rows = [tuple(r) for r in await cur.fetchall()]
-
-        assert rows == [], (
-            'a non-advancing server must leave a hole, not a row asserting the '
-            f'400-task tree it reported was empty; fabricated {rows!r} from '
-            f'requests {calls!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_partially_readable_tree_writes_no_row(
-        self, burndown_env, dummy_client,
-    ):
-        """Pages 0-1 arrive, then the server stalls → no row at all.
-
-        A PARTIAL count is the more dangerous artefact than an all-zero one: it
-        looks entirely plausible in the chart, so nobody ever goes looking.  The
-        partial rows must not reach ``_count_zones``.
-
-        ``snapshots`` is APPEND-ONLY: the dropped row is a permanent, visible
-        hole no later cycle backfills, which is strictly better than an
-        undercount recorded as fact.
-        """
-        db_path, config, conn = burndown_env
-        tasks = self._tree()
-        calls: list[dict] = []
-
-        async def _stalls_after_two_pages(_client, _url, tool, args, **_kwargs):
-            assert tool == 'get_tasks', tool
-            calls.append(dict(args))
-            # The size probe (_fetch_snapshot_tasks) issues an ordinary
-            # unpaginated read first; reject it the way an oversize tree is
-            # rejected, because that rejection is the ONLY reason the paginated
-            # path this test is about ever runs.
-            if 'page_size' not in args:
-                return {'error': 'response too large'}
-            offset = args.get('offset', 0)
-            page_size = args.get('page_size') or 0
-            page = tasks[offset:offset + page_size] if offset < 4 else []
-            return {
-                'tasks': page,
-                'pagination': {
-                    'total': len(tasks), 'offset': offset,
-                    'page_size': page_size, 'returned': len(page),
-                    'has_more': True,
-                },
-            }
-
-        with (
-            patch('dashboard.data.burndown._SNAPSHOT_PAGE_SIZE', 2),
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=_stalls_after_two_pages)),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        assert 'page_size' not in calls[0], (
-            f'the size probe must come first and be unpaginated; got {calls!r}'
-        )
-        assert [c.get('offset') for c in calls[1:]] == [0, 2, 4], (
-            f'the stub must have served two pages then stalled; got {calls!r}'
-        )
-        async with conn.execute(
-            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
-            'in_progress_live, in_progress_stranded FROM snapshots',
-        ) as cur:
-            rows = [tuple(r) for r in await cur.fetchall()]
-
-        assert rows == [], (
-            'a partial read must leave a hole, not a plausible-looking '
-            f'undercount; fabricated {rows!r} from the 7-task tree'
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_genuinely_empty_tree_still_writes_a_zero_row(
-        self, burndown_env, dummy_client,
-    ):
-        """POSITIVE CONTROL: a truly empty project still gets its all-zero row.
-
-        ``total=0, returned=0`` is a COMPLETE read of an empty project, not a
-        truncation — a true zero, not a manufactured one.  This is the property
-        the empty-tree carve-out in ``fetch_tasks`` exists to protect, and
-        without this control "writes no row" above could pass by having broken
-        pagination outright.
-
-        The probe rejection below is what makes that control real rather than
-        vacuous.  A stub that answers EVERY request — including the unpaginated
-        size probe ``_fetch_snapshot_tasks`` issues first — with a successful
-        empty envelope never enters the paginated path at all, so the carve-out
-        it claims to exercise is never executed.  (Measured: with the probe
-        answered successfully, mutating the carve-out to ``if False:`` left this
-        test green.)  Its three siblings in this class reject the probe for the
-        same reason.
-        """
-        db_path, config, conn = burndown_env
-        calls: list[dict] = []
-
-        async def _empty(_client, _url, tool, args, **_kwargs):
-            assert tool == 'get_tasks', tool
-            calls.append(dict(args))
-            # Reject the unpaginated size probe exactly as an oversize tree is
-            # rejected — that rejection is the ONLY reason the paginated path
-            # this control is about ever runs.
-            if 'page_size' not in args:
-                return {'error': 'response too large'}
-            return {
-                'tasks': [],
-                'pagination': {
-                    'total': 0, 'offset': args.get('offset', 0),
-                    'page_size': args.get('page_size'), 'returned': 0,
-                    'has_more': False,
-                },
-            }
-
-        with (
-            patch('dashboard.data.tasks.mcp_tool_call',
-                  new=AsyncMock(side_effect=_empty)),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-        ):
-            await collect_snapshot(conn, config, client=dummy_client)
-
-        async with conn.execute(
-            'SELECT pending, in_progress, blocked, deferred, cancelled, done, '
-            'in_progress_live, in_progress_stranded FROM snapshots',
-        ) as cur:
-            rows = list(await cur.fetchall())
-
-        # Load-bearing: proves the control actually reached the paginated path
-        # rather than being satisfied by the probe.  Without this the class can
-        # silently go vacuous again the next time the read shape changes.
-        assert any('page_size' in c for c in calls), (
-            f'the carve-out under test lives in the PAGINATED path; this control '
-            f'never reached it, so it proves nothing. Requests were {calls!r}'
-        )
-        assert len(rows) == 1, (
-            f'an empty project is a complete read and must still get its row; '
-            f'requests were {calls!r}'
-        )
-        assert list(rows[0]) == [0] * 8, (
-            f'every zone count must be a true zero; got {tuple(rows[0])!r}'
-        )
-
-
-class TestSnapshotPageSizeIsSizedFromMeasuredDensity:
-    """``_SNAPSHOT_PAGE_SIZE`` must be derived from full-row density.
-
-    The first cut of this constant was 500, a number borrowed by analogy with
-    ``_STATUSES_AUTO_PAGE_LIMIT = 2000`` — but that cap was derived at ~14-23
-    chars per *status* entry, and a full task row is ~200-350x denser.  A page
-    of 500 full rows measured 2.4 MB (random) / 7.6 MB (worst) against a
-    ~62,000-char documented-safe envelope: 40-120x over, i.e. the exact failure
-    pagination was added to prevent still happened on every cycle.
-
-    So the number needs its own derivation and its own guard.  The derivation
-    — measured read-only against this repo's backend, with the full percentile
-    distribution and the cost model — lives in ONE place, the
-    ``_SNAPSHOT_PAGE_SIZE`` comment block in ``burndown.py``; re-measuring
-    updates it there.  Restated here only because the assertion consumes them:
-    the mean row density and the documented-safe envelope, below.
-
-    This asserts on the REAL constant so a future bump cannot silently re-cross
-    the wall.
-    """
-
-    # Measured mean chars per serialised full task row (see class docstring).
-    MEASURED_MEAN_ROW_CHARS = 5_234
-    # Conservative side of the wall: get_statuses failed closed at 80,795 and
-    # 84,638 chars; ~62 KB is the documented-safe envelope from that same
-    # incident record (fused-memory/tests/test_get_statuses_pagination.py).
-    SAFE_ENVELOPE_CHARS = 62_000
-
-    @staticmethod
-    def _row(task_id: int, *, chars: int) -> dict:
-        """A full task row padded to *chars* serialised characters."""
-        row = {
-            'id': task_id,
-            'status': 'in-progress',
-            'title': '',
-            'description': '',
-            'details': '',
-            'claimant_run_id': 'run-0123456789abcdef',
-            'heartbeat_at': '2026-09-01T00:00:00+00:00',
-            'metadata': {'infra_hold': False},
-        }
-        import json
-        pad = chars - len(json.dumps(row))
-        if pad > 0:
-            row['details'] = 'x' * pad
-        return row
-
-    def test_a_typical_page_fits_the_documented_safe_envelope(self):
-        """PAGE_SIZE rows at MEASURED MEAN density must serialise under 62 KB.
-
-        THE guard on this constant, and it is one assertion rather than several
-        because the alternatives all collapse into it.  "Is it
-        status-granularity sized?" (``_STATUSES_AUTO_PAGE_LIMIT`` is 2000 at
-        ~14-23 chars per *status* entry, ~200-350x less dense than a full task
-        row) reduces to exactly the same ``_SNAPSHOT_PAGE_SIZE <= 62,000/5,234
-        ~= 11`` bound this serialisation already enforces, so it cannot fail
-        unless this has: 500 x 5,234 ~= 2.6 MB is what the original cut failed
-        on, and it fails here too.
-
-        What this DELIBERATELY does not assert: that the mitigation is a
-        guarantee.  The row-size tail is not bounded by any page size — the
-        largest real row measured 95,838 chars, over the envelope ALONE — so
-        even a page of one can be rejected.  That fact is a property of the
-        measurement, not of any production symbol, so pinning it here would be
-        a comment written in ``assert`` syntax that can never fail; it lives in
-        the ``_SNAPSHOT_PAGE_SIZE`` comment block instead, and the behaviour it
-        motivates (fail LOUD and all-or-nothing rather than write a partial read
-        as fact) is pinned by the truncation tests in
-        ``TestCollectSnapshotPaginatesTheTaskRead`` and ``test_tasks.py``.
-        """
-        import json
-
-        from dashboard.data.burndown import _SNAPSHOT_PAGE_SIZE
-
-        assert _SNAPSHOT_PAGE_SIZE > 0, (
-            f'_SNAPSHOT_PAGE_SIZE={_SNAPSHOT_PAGE_SIZE} would make the walk '
-            f'request no rows at all.'
-        )
-        page = [
-            self._row(i, chars=self.MEASURED_MEAN_ROW_CHARS)
-            for i in range(_SNAPSHOT_PAGE_SIZE)
-        ]
-        serialised = json.dumps({'tasks': page})
-        assert len(serialised) < self.SAFE_ENVELOPE_CHARS, (
-            f'A typical page of {_SNAPSHOT_PAGE_SIZE} rows at the measured mean '
-            f'density ({self.MEASURED_MEAN_ROW_CHARS} chars/row) serialises to '
-            f'{len(serialised)} chars, at or over the '
-            f'{self.SAFE_ENVELOPE_CHARS}-char documented-safe envelope. Lower '
-            f'_SNAPSHOT_PAGE_SIZE — do NOT relax this bound, and do NOT size it '
-            f'by analogy with any status-granularity cap.'
-        )

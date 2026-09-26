@@ -1960,6 +1960,9 @@ class ReconciliationConfig(BaseModel):
     # reactive procedural_knowledge consolidation, not because the write path runs
     # inside reconciliation. Read live per add_memory write off the shared config
     # object, so it satisfies the reload.py live-read reload-safety rule.
+    # Machine-derived clusters from server/topic_cluster_store.py merge AFTER this
+    # list at read time and, unlike it, ARE project-scoped
+    # (server/near_duplicate_guard.py::resolve_topic_guard_clusters).
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
@@ -1983,6 +1986,75 @@ class ReconciliationConfig(BaseModel):
             'the allow_near_duplicate exemption with the cosine guard.'
         ),
     )
+
+    # Kill switch for MACHINE-DERIVED topic clusters (task 3135, PRD
+    # memory-write-path-convergence §9 leaf ζ). Read live, off the shared config
+    # object, by server/near_duplicate_guard.py::resolve_topic_cluster_autoseed_enabled
+    # at BOTH consumers -- the consolidate_memories seed and the add_memory merge --
+    # and never at store construction, so both directions of a flip take effect
+    # without a restart. Derived clusters are PROJECT-SCOPED at the read, unlike the
+    # config list above, whose cross-project over-match is a measured residual no
+    # narrowing of ProceduralTopicCluster can express.
+    procedural_knowledge_topic_cluster_autoseed_enabled: bool = Field(
+        default=True,
+        description=(
+            'Governs MACHINE-DERIVED topic clusters (server/topic_cluster_store.py). '
+            'True: consolidate_memories derives and persists one cluster per '
+            'consolidated topic, and the add_memory topic check merges the writing '
+            "project's derived clusters after the config seeds above (config wins a "
+            'topic_id collision). False: nothing is seeded and stored rows are ignored '
+            'at read time without being deleted -- the kill switch when a derived '
+            'cluster misfires. procedural_knowledge_near_dup_guard_enabled remains the '
+            'broader kill switch for the whole guard. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live by resolve_topic_cluster_autoseed_enabled '
+            'in server/near_duplicate_guard.py).'
+        ),
+    )
+
+    # The PER-TOPIC kill switch beside the global one above: a misfiring derived
+    # cluster is retired with a config edit, the way a config cluster is, instead of
+    # switching every derived cluster off. Read live at both consumers by
+    # server/near_duplicate_guard.py::resolve_retired_derived_topic_ids.
+    procedural_knowledge_topic_cluster_autoseed_retired: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            'MACHINE-DERIVED topic clusters an operator has retired, as '
+            '{project_id: [topic_id, ...]}. A retired topic is neither seeded by '
+            'consolidate_memories (its topic_cluster_seed reports disabled) nor read by '
+            "the add_memory topic check for that project. Its stored row is kept, so "
+            'deleting the entry restores it. Config clusters are unaffected: retire one '
+            'by editing procedural_knowledge_topic_guard_clusters. Each topic_id must be '
+            'a topic slug (fused_memory.topic_slug), as every derived topic_id is. '
+            'Green-tier hot-reloadable via the reload_config MCP tool (read live by '
+            'resolve_retired_derived_topic_ids in server/near_duplicate_guard.py).'
+        ),
+    )
+
+    @field_validator('procedural_knowledge_topic_cluster_autoseed_retired')
+    @classmethod
+    def _validate_retired_topic_ids_are_slugs(
+        cls, v: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        """Reject a retired ``topic_id`` that is not a topic slug, since it could never match.
+
+        A derived ``topic_id`` is the consolidated ``metadata.topic`` verbatim,
+        so it is always a slug. An entry that is not one would load cleanly and
+        retire nothing: the operator believes a misfiring cluster is off while
+        it keeps blocking writes.
+        """
+        offenders = {
+            project_id: [topic_id for topic_id in topic_ids if not is_valid_topic_slug(topic_id)]
+            for project_id, topic_ids in v.items()
+        }
+        offenders = {project_id: bad for project_id, bad in offenders.items() if bad}
+        if offenders:
+            raise ValueError(
+                f'procedural_knowledge_topic_cluster_autoseed_retired: {offenders!r} '
+                f'are not topic slugs, so they could never match a derived cluster. '
+                f'A topic_id must match {TOPIC_SLUG_RE.pattern} and be at most '
+                f'{TOPIC_SLUG_MAX_LEN} characters (fused_memory.topic_slug).'
+            )
+        return v
 
     # Topic-anchored canonical recall (task 3111): the READ-side counterpart to the
     # write-side duplicate guards above. Consolidating a near-duplicate cluster into
