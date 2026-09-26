@@ -940,3 +940,163 @@ def test_the_connection_factory_refuses_a_write(runs_db_path):
             )
     finally:
         conn.close()
+
+
+# --- until: every scan's HALF-OPEN upper bound, for a reproducible re-run ---
+
+UNTIL = APPLY + timedelta(hours=12)
+
+
+def test_routing_decisions_at_or_after_until_are_excluded_from_both_halves(runs_db):
+    for hours, task_id in ((11, '4600'), (12, '4601'), (13, '4602')):
+        runs_db.seed_event(
+            _at(hours=hours), 'routing_decision', task_id=task_id, role='merger',
+            data=_routing_payload(role='merger', model=FABLE),
+        )
+        runs_db.seed_event(
+            _at(hours=hours), 'routing_decision', task_id=task_id, role='implementer',
+            data=_routing_payload(
+                role='implementer', model='opus', rejected=['config:model-not-in-allowlist'],
+            ),
+        )
+
+    bounded = audit_model_admission.scan_routing_decisions(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_routing_decisions(
+        runs_db, model=FABLE, since=APPLY, until=None,
+    )
+
+    assert [s.task_id for s in bounded.selections] == ['4600']
+    assert [r.task_id for r in bounded.rejections] == ['4600']
+    assert [s.task_id for s in open_ended.selections] == ['4600', '4601', '4602']
+    assert [r.task_id for r in open_ended.rejections] == ['4600', '4601', '4602']
+
+
+def test_a_run_completed_at_or_after_until_is_excluded(runs_db):
+    for hours, task_id in ((11, 'a'), (12, 'b'), (13, 'c')):
+        runs_db.seed_invocation(
+            model=FABLE, role='merger', task_id=task_id,
+            started_at=_at(hours=hours - 1), completed_at=_at(hours=hours),
+        )
+
+    rows = audit_model_admission.scan_invocations(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+
+    assert [r.task_id for r in rows] == ['a']
+
+
+def test_a_merge_finalized_at_or_after_until_is_not_attributed(runs_db):
+    """A re-run on a later day must reproduce the same table: the merge that
+    lands after the window closes is not this window's outcome."""
+    _fable_merger_run(runs_db, task_id='4377')  # completes at +2h02
+    runs_db.seed_event(
+        _at(hours=12), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
+    )
+
+    bounded = audit_model_admission.scan_invocations(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert bounded[0].merge_outcome is None
+    assert open_ended[0].merge_outcome is not None
+    assert open_ended[0].merge_outcome.state == 'done'
+
+
+def test_cap_hits_and_restarts_at_or_after_until_are_excluded(runs_db):
+    for hours, account in ((11, 'max-b'), (12, 'max-c')):
+        runs_db.seed_account_event(
+            account_name=account, event_type='cap_hit', created_at=_at(hours=hours),
+            details={'reason': 'limit', 'scope': FABLE},
+        )
+        runs_db.seed_account_event(
+            account_name=account, event_type='cap_hit', created_at=_at(hours=hours),
+            details={'reason': 'limit'},
+        )
+    runs_db.seed_event(
+        _at(hours=11), 'service_restart',
+        data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
+    )
+    runs_db.seed_event(
+        _at(hours=12), 'service_restart',
+        data={'service': 'dashboard', 'reason': 'post_merge_dashboard_code_change'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY, until=UNTIL)
+
+    assert [h.account_name for h in scan.scoped_hits] == ['max-b']
+    assert scan.unscoped_cap_hit_count == 1
+    assert [r.service for r in scan.restarts] == ['orchestrator']
+
+
+def test_roles_on_model_does_not_count_runs_completed_at_or_after_until(runs_db):
+    for hours, role in ((11, 'merger'), (12, 'steward'), (13, 'implementer')):
+        runs_db.seed_invocation(
+            model=FABLE, role=role, task_id=role, cost_usd=1.0,
+            started_at=_at(hours=hours - 1), completed_at=_at(hours=hours),
+        )
+
+    containment = audit_model_admission.roles_on_model(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL, expected_roles=('merger', 'steward'),
+    )
+
+    assert [(r.role, r.count) for r in containment.by_role] == [('merger', 1), ('steward', 0)]
+    assert containment.unexpected_roles == ()
+
+
+def test_audit_threads_until_into_every_scan(live_shaped_db):
+    """live_shaped_db's steward decision (+1d) and run (+20h) both fall after
+    a +10h bound; its merger decision, run and restart all fall before it."""
+    until = APPLY + timedelta(hours=10)
+    live_shaped_db.seed_account_event(
+        account_name='max-e', event_type='cap_hit', created_at=_at(hours=11),
+        details={'reason': 'limit', 'scope': FABLE},
+    )
+
+    result = _audit(live_shaped_db, until=until)
+
+    assert result.until == until.isoformat()
+    assert [s.role for s in result.routing.selections] == ['merger']
+    assert [r.role for r in result.invocations] == ['merger']
+    assert result.scoped_cap.scoped_hits == ()
+    assert [r.service for r in result.scoped_cap.restarts] == ['orchestrator']
+    assert [(u.role, u.count) for u in result.containment.by_role] == [
+        ('merger', 1), ('steward', 0),
+    ]
+    assert f'until {until.isoformat()}' in audit_model_admission.render_markdown(result)
+
+
+def test_main_until_ends_the_spend_window_and_is_carried_in_meta(
+    runs_db_path, live_shaped_db, capsys
+):
+    until = APPLY + timedelta(hours=10)
+
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--until', until.isoformat(), '--window', '24h',
+        '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['meta']['until'] == until.isoformat()
+    assert payload['spend']['window_end'] == until.isoformat()
+    assert payload['spend']['window_start'] == (until - timedelta(hours=24)).isoformat()
+    assert [r['role'] for r in payload['invocations']] == ['merger']
+
+
+def test_main_without_until_still_ends_the_spend_window_now(
+    runs_db_path, live_shaped_db, capsys
+):
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--window', '24h',
+        '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['meta']['until'] is None
+    latest_seeded = APPLY + timedelta(days=1)  # the steward routing decision
+    assert datetime.fromisoformat(payload['spend']['window_end']) >= latest_seeded
