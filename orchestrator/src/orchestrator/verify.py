@@ -6861,6 +6861,22 @@ async def run_verification(
     return result
 
 
+def _aggregate_failing_ids_by_module(
+    results: list[VerifyResult],
+) -> dict[str, list[str]] | None:
+    """Merge the children's module attribution; None unless every collecting child has one."""
+    collecting = [r for r in results if r.failing_test_ids is not None]
+    if not collecting:
+        return None
+    merged: dict[str, set[str]] = {}
+    for r in collecting:
+        if r.failing_test_ids_by_module is None:
+            return None
+        for prefix, ids in r.failing_test_ids_by_module.items():
+            merged.setdefault(prefix, set()).update(ids)
+    return {prefix: sorted(ids) for prefix, ids in merged.items()}
+
+
 def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     """Merge per-subproject VerifyResults into one."""
     if len(results) == 1:
@@ -6935,6 +6951,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     failing_test_ids = (
         sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
     )
+    # Same None-child rule, but fail closed on an unattributed collecting
+    # child — see VerifyResult.failing_test_ids_by_module.
+    failing_test_ids_by_module = _aggregate_failing_ids_by_module(results)
 
     # Task 3173 review amendment: union the per-leg categories across FAILING
     # children only, order-preserved and de-duplicated (same deterministic
@@ -6972,6 +6991,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
 
