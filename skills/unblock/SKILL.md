@@ -712,8 +712,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   rewritten commits — so its ref keeps the pre-rebase shas, can never become an ancestor of main,
   and `orchestrator/src/orchestrator/git_ops.py::GitOps._delete_branch_if_on_main` **retains** it
   rather than deleting it: that cleanup deletes only a branch carrying no commits beyond main, and
-  `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by **sha** (`git rev-list
-  --count`), not by patch id, so a stale-by-rebase ref counts non-zero. **rc=1 is therefore the
+  `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by **sha** (rev-list's count
+  mode), not by patch id, so a stale-by-rebase ref counts non-zero. **rc=1 is therefore the
   common outcome for a non-tip member and rc=128 the rare one.** Taking either as "not landed"
   would report a successful merge to the human as a failure and leave the task un-flipped.
 
