@@ -2474,6 +2474,8 @@ const SCHEDULER_PATH = '/api/v2/dashboard/scheduler';
 const ESCALATIONS_PATH = '/api/v2/dashboard/escalations';
 const SIMULATED_MINUTE_MS = 60_000;
 const EXPECTED_MAX_POLL_DUTY_CYCLE = 0.5;
+// The failure-backoff ceiling the schedule test above already pins.
+const EXPECTED_BACKOFF_MAX_MS = 60000;
 
 // A virtual event loop: every sleep and every response resolves at a virtual
 // instant, and each endpoint answers after its configured service time. The
@@ -2659,4 +2661,24 @@ test('pacing: requestOnDemand is never paced - a user action is not a poll loop'
   await server.advanceTo(8000);
   assert.equal(await second, api.REFRESH_OUTCOMES.applied, 'a user re-request of a slow listing must be fetched, not skipped');
   assert.equal(server.count(TASKS_PATH), 2);
+});
+
+test('pacing: a service time inflated by a wall-clock jump can never hold an endpoint off beyond BACKOFF_MAX_MS', async () => {
+  // A laptop suspended mid-request: the answer lands ten hours "later" by
+  // Date.now(), still a success, so no staleness banner would ever explain
+  // an unbounded hold.
+  const jumpedServiceMs = 36_000_000;
+  const server = makeVirtualServer({ [CURATOR_PATH]: jumpedServiceMs });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(jumpedServiceMs);
+  assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 0, 'nothing would warn the operator of this hold');
+
+  await server.advanceTo(jumpedServiceMs + EXPECTED_BACKOFF_MAX_MS);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(CURATOR_PATH), 2, 'held off beyond the failure-backoff ceiling');
 });
