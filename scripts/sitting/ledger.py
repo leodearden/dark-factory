@@ -78,7 +78,11 @@ class LedgerEntry:
 
 @dataclass(frozen=True)
 class Ledger:
-    """One sitting's numbering. ``next_number`` is the high-water mark: a number stays retired even when its entry is not carried into a seeded sitting."""
+    """One sitting's numbering.
+
+    ``next_number`` is the high-water mark: a number stays retired even when
+    its entry is not carried into a seeded sitting.
+    """
 
     sitting_id: str
     started_at: str
