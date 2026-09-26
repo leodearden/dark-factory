@@ -261,14 +261,18 @@ def build_glossary(items: Iterable[OpenItem], escalation_index: Mapping[str, Map
     )
 
 
-def age_days(stamp: str, now: datetime) -> float | None:
+def parse_stamp(stamp: str | None) -> datetime | None:
+    """An ISO-8601 stamp as an aware datetime (naive reads as UTC), or None when it does not parse."""
     try:
-        filed = datetime.fromisoformat(stamp)
+        parsed = datetime.fromisoformat(stamp or '')
     except (TypeError, ValueError):
         return None
-    if filed.tzinfo is None:
-        filed = filed.replace(tzinfo=UTC)
-    return (now - filed).total_seconds() / 86400
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def age_days(stamp: str, now: datetime) -> float | None:
+    filed = parse_stamp(stamp)
+    return None if filed is None else (now - filed).total_seconds() / 86400
 
 
 def _oldest_first(item: OpenItem) -> tuple[bool, float, str]:
