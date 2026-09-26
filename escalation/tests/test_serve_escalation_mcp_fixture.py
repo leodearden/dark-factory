@@ -314,50 +314,43 @@ def test_the_fixture_serves_on_the_listener_it_allocated_and_releases_it(
 
 
 # ---------------------------------------------------------------------------
-# A startup failure must NAME itself in the readiness-timeout error.
+# A readiness failure is STRUCTURED, and names whichever side of the wire failed.
 # ---------------------------------------------------------------------------
 
 
-def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
+def test_a_server_that_dies_during_startup_ends_the_wait_and_is_named(
     escalation_conftest: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server that dies during startup must name its cause on timeout.
+    """A server thread that dies during startup ENDS the readiness wait, and
+    the error carries the startup failure as an object.
 
-    A startup failure need not be a ``RuntimeError``: a listener the server
-    cannot serve on is rejected by asyncio's ``create_server`` with a
-    ValueError. A fixture that only captures RuntimeError therefore reports
-    the generic "did not become ready" and DROPS the one fact a reader needs,
-    which is what this test forbids.
+    A dying server thread is the first half of the task-5934 incident, where
+    it was a lost bind. Readiness then kept probing the dead server's port
+    until the deadline, and so ended up talking to whatever listener held that
+    port next. Ending the wait as soon as the thread is gone is what stops
+    that. ``_READY_TIMEOUT_S`` is deliberately NOT shortened: ending early is
+    the subject, so a regression pays the production bound once and then fails
+    on ``server_exited``, which records why the wait ended.
 
-    The CLIENT half of the wire is asserted too: ``_mcp_handshake_ready``
-    swallows every exception and returns False, so unless it records the last
-    one, a failure that is purely client-side (transport/protocol mismatch, a
-    proxy env var, a fastmcp version skew) leaves a healthy server thread, an
-    empty ``serve_error``, and a timeout message that merely restates the
-    timeout. Both halves must be named.
-
-    Driven by monkeypatching the listener allocator to hand back a datagram
-    socket, so the failure is a real startup rejection rather than a simulated
-    one -- and a deterministic one, which a bind conflict no longer is once
-    the fixture holds its port from allocation onward. ``_READY_TIMEOUT_S`` is
-    shortened too: the timeout PATH is the subject here, not its production
-    duration, and paying the full ~10s bound on every suite run to re-measure
-    a constant buys nothing. Both patches land on the injected conftest
-    module, which is also what proves it is the live one the fixture body
-    reads.
+    The failure is a ValueError, not a ``RuntimeError``: asyncio's
+    ``create_server`` rejects the datagram socket patched in as the listener.
+    That makes it a deterministic, real startup failure, and a fixture that
+    captured only RuntimeError would drop it. Whether a handshake attempt ran
+    before the thread died is timing-dependent, so ``last_handshake_error`` is
+    not asserted.
     """
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         udp.bind(('127.0.0.1', 0))
+        udp_port = udp.getsockname()[1]
         monkeypatch.setattr(escalation_conftest, '_bind_escalation_listener', lambda: udp)
-        monkeypatch.setattr(escalation_conftest, '_READY_TIMEOUT_S', 0.5)
 
         gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
         try:
             start = next(gen)
-            with pytest.raises(RuntimeError) as excinfo:
+            with pytest.raises(escalation_conftest.EscalationServerNotReady) as excinfo:
                 start(tmp_path / 'queue')
         finally:
             # Finalize the fixture even on failure, so a RED run does not
@@ -365,27 +358,67 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
             # the suite.
             gen.close()
 
-        message = str(excinfo.value)
-        assert 'did not' in message, (
-            f'expected the readiness-timeout error text, got: {message!r}'
+        not_ready = excinfo.value
+        assert not_ready.server_exited is True, (
+            'the readiness wait must end because the serving thread exited, '
+            f'not run on to the deadline; got {not_ready!r}'
         )
-        _, marker, detail = message.partition('server thread raised: ')
-        assert marker and detail.strip(' )'), (
-            'the readiness-timeout error must name the startup failure that '
-            'actually happened (the rejected listener), not just report that '
-            'the server never became ready; got: ' + repr(message)
+        assert isinstance(not_ready.serve_error, ValueError), (
+            'the startup failure that actually happened must be carried as '
+            f'the object it was; got {not_ready.serve_error!r}'
         )
-        _, handshake_marker, handshake_detail = message.partition(
-            'last handshake error: '
-        )
-        assert handshake_marker and handshake_detail.strip(' )'), (
-            'the readiness-timeout error must also name the last CLIENT-side '
-            'handshake failure -- without it, a timeout whose server thread is '
-            'healthy reports nothing at all about why the handshake never '
-            'completed; got: ' + repr(message)
-        )
+        assert not_ready.port == udp_port
     finally:
         udp.close()
+
+
+def test_a_healthy_server_the_client_cannot_reach_names_the_client_error(
+    escalation_conftest: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the server is healthy and only the CLIENT half fails, the error
+    names the client's failure.
+
+    ``_mcp_handshake_ready`` swallows every exception and returns False, so
+    unless it records the last one, a purely client-side failure (a proxy env
+    var, a transport/protocol mismatch, a fastmcp version skew) leaves a live
+    server thread, no ``serve_error``, and nothing to say about why the
+    handshake never completed.
+
+    Driven by a real client-side failure: the proxy env vars name a port held
+    by ``_bind_escalation_listener``, which refuses connects, and httpx honours
+    them. ``_READY_TIMEOUT_S`` is shortened because this server never exits,
+    so the deadline is the only way the wait can end.
+    """
+    dead_proxy = escalation_conftest._bind_escalation_listener()
+    try:
+        proxy_url = f'http://127.0.0.1:{dead_proxy.getsockname()[1]}'
+        for var in ('HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'):
+            monkeypatch.setenv(var, proxy_url)
+        for var in ('NO_PROXY', 'no_proxy'):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(escalation_conftest, '_READY_TIMEOUT_S', 0.5)
+
+        gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
+        try:
+            start = next(gen)
+            with pytest.raises(escalation_conftest.EscalationServerNotReady) as excinfo:
+                start(tmp_path / 'queue')
+        finally:
+            gen.close()
+
+        not_ready = excinfo.value
+        assert not_ready.server_exited is False, (
+            f'the server thread was healthy; got {not_ready!r}'
+        )
+        assert not_ready.serve_error is None
+        assert not_ready.last_handshake_error is not None, (
+            'a timeout whose server thread is healthy must name the last '
+            'client-side handshake failure'
+        )
+    finally:
+        dead_proxy.close()
 
 
 # ---------------------------------------------------------------------------
