@@ -1913,7 +1913,7 @@ class TestDownsample:
         _create_burndown_db(db_path)
 
         now = datetime.now(UTC)
-        old_hour = now - timedelta(days=10)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
         sync_conn = sqlite3.connect(str(db_path))
         # Insert 3 snapshots in the same hour, 10 days ago
         for i in range(3):
