@@ -1,9 +1,10 @@
 """Behavioural coverage for `producer | grep -q PAT` probes, plus the ONE quiet-grep sweep.
 
 The behavioural sections cover scripts/export-data.sh, scripts/import-data.sh,
-scripts/verify-migration.sh and scripts/run_eval_matrix.sh. The sibling suite test_setup_host_probe_pipelines.py
-does the same job for scripts/setup-host.sh; the two share one slicer, one
-probe scaffold and one detector, all in tests/scripts/shell_sections.py.
+scripts/verify-migration.sh and scripts/run_eval_matrix.sh. The sibling suite
+test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh;
+the two share one slicer, one probe scaffold and one detector, all in
+tests/scripts/shell_sections.py.
 
 The source-level sweep at the bottom, `test_never_pipes_a_producer_into_grep_q`,
 forbids the construct itself in EVERY swept script (`_SWEPT_SCRIPTS`),
