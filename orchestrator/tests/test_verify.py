@@ -2185,6 +2185,113 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
 
+# ---------------------------------------------------------------------------
+# Task 5627: run_verification records WHICH module produced its junit ids —
+# VerifyResult.failing_test_ids_by_module, {module_prefix: failing_test_ids}.
+# It is set where a junit id and its module_prefix meet, so a consumer never
+# has to parse node-id strings to learn which module a red id belongs to.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerificationAttributesFailingIdsToModule:
+    """failing_test_ids_by_module: codec round-trip and run_verification wiring."""
+
+    _junit = TestRunVerificationJunitxmlInjection()
+
+    _PASSING_JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="0" failures="0" tests="1">\n'
+        '<testcase classname="tests.test_sample" name="test_ok" time="0.001">\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def _fake_run_cmd_writing_passing_junit(self):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(self._PASSING_JUNIT_XML)
+            return 0, 'ok', False
+
+        return fake_run_cmd
+
+    async def test_field_defaults_to_none_and_round_trips_both_codecs(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        assert VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='x',
+        ).failing_test_ids_by_module is None
+
+        by_module = {'pkg': ['a::b'], 'other': []}
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+            failing_test_ids=['a::b'], failing_test_ids_by_module=by_module,
+        )
+
+        via_asdict = VerifyResult(**asdict(vr))
+        via_wire = result_from_dict(result_to_dict(vr))
+
+        assert via_asdict.failing_test_ids_by_module == by_module
+        assert via_wire.failing_test_ids_by_module == by_module
+        assert via_asdict == vr
+        assert via_wire == vr
+
+    async def test_module_run_attributes_its_ids_to_its_prefix(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module == {'pkg': ['tests.test_sample::test_fail']}
+
+    async def test_global_command_run_has_no_module_to_attribute_to(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, None, max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_run_that_collected_no_junit_has_no_attribution(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='task',
+            )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_clean_module_run_is_attributed_as_covered_and_clean(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=self._fake_run_cmd_writing_passing_junit(),
+        ):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == []
+        assert result.failing_test_ids_by_module == {'pkg': []}
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
