@@ -109,7 +109,7 @@ Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/sr
 - `query_stale_edge_embeddings` (task 4869). It has no `invalid_at` filter, so it includes superseded edges, which still need re-embedding.
 - `query_edges_by_time_range` (task 4869). It is bounded only by the caller's window, and its consumer (`CleanupManager.find_stale_edges`) feeds `bulk_remove_edges`.
 
-All five apply the shared `_apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`.
+All five apply the shared `apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`.
 
 ### PAGINATED via keyset through graphiti-core
 
@@ -155,12 +155,18 @@ Moved from the task-4340 comment block:
 > written back over real summaries) and WARN-and-return on an EMPIRICAL one
 > (a census disagreement, transient on a continuously-written graph).  The
 > completeness signal itself is a first-class return value on the enumerate_*
-> methods, which never raise.  No consumer ACTS on it yet — the two
-> reconciliation sweeps and cleanup_count_snapshots still call the shims, so
-> they cannot yet distinguish "swept a complete corpus" from "swept what we
-> could fetch".
+> methods, which never raise.
 
-Wiring that signal through to the consumers is the first open ticket under TICKETS.
+### Consumers now act on it (task 4386)
+
+Task 4386 discharged `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH`. All three whole-graph consumers call the `enumerate_*` methods directly and each applies `apply_incompleteness_policy` at its OWN call site — the policy was SHARED, not migrated, so the raise/warn split stays one implementation (see that function's docstring for why). Each then reports what it read:
+
+- `stale_status_snapshot_edge_sweep` and `stale_priority_override_edge_sweep` project it into TRI-STATE per-cycle stats `enumeration_complete` / `enumeration_incomplete_kind`, which `MemoryConsolidator` surfaces on `report.stats` under the `stale_status_snapshot_edges_` and `stale_priority_override_edges_` prefixes. The two key sets are INDEPENDENT: a truncated corpus for one sweep never marks the other.
+- `scripts/cleanup_count_snapshots.py` reports it per project (four keys on each `report['projects'][pid]`) plus a `totals['incomplete_enumerations']` roll-up counting PROJECTS, and renders it as a Corpus column with a warning line on the operator-facing summary table.
+
+So "swept a complete corpus" and "swept what we could fetch" are now distinguishable at THOSE THREE consumers. The ONLY safe predicate is `is True`: `is not False` would admit the UNKNOWN case, letting a cycle that never looked pass as one that looked and found everything.
+
+STILL UNWIRED, and deliberately so — task 4386 scoped itself to the three consumers its ticket named. Two whole-graph consumers remain on the SHIMS and report no completeness at all: `MemoryService.rebuild_entity_summaries` (`services/memory_service.py`) and `detect_stale_with_edges`. Their fail-closed guard is intact (the shims still RAISE on a STRUCTURAL incompleteness), so the gap is the EMPIRICAL half — a census disagreement or short read WARNS and proceeds, and this is the summary WRITE-BACK path this audit keeps naming as the corrupting one, so rebuilt summaries can be missing facts with nothing in the returned result saying the corpus was partial. Closing that residual is `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF` under TICKETS.
 
 ### A third consumer, outside `graphiti_client.py`
 
@@ -170,13 +176,14 @@ Wiring that signal through to the consumers is the first open ticket under TICKE
 
 A materially-short `INCOMPLETE_SHORT_READ` still returns a partial collection. The `force=True` path of `fused-memory/src/fused_memory/services/memory_service.py::MemoryService.rebuild_entity_summaries` will write it back, blanking the summary of any entity whose edges fell in the missing remainder. That path never consults staleness, so it writes to every entity the node read returned.
 
-Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. That is the same code the first ticket below must touch.
+Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. That is the same code the `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF` residual below must touch.
 
 ## TICKETS
 
 Every id below is a TICKET id, not a task id. The curator resolves tickets to tasks asynchronously.
 
-- `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH`: wire the completeness signal (`PagedRead`) through to consumers, moving the incompleteness policy out of `_apply_incompleteness_policy` to where the write is decided. Status: OPEN.
+- `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH`: wire the completeness signal (`PagedRead`) through to consumers. Status: RESOLVED by task 4386 — the policy was SHARED (promoted to public `apply_incompleteness_policy`) rather than moved; the REPORTING of the signal moved to the three consumers.
+- `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF`: wire the completeness signal through the two remaining shim consumers, `MemoryService.rebuild_entity_summaries` and `detect_stale_with_edges` — the summary write-back path. Status: OPEN.
 - `tkt_0RSJP92VQNATQB0FSR20YMXGW8`: re-measure the task-2613 stale-status miss rate against the now-complete corpus. It was computed against a truncated denominator. Status: OPEN.
 - `tkt_0RSJP82N82SNKT2BHRT3HWK3DA`: paginate the four reads the 2026-08-17 audit left AT RISK. Status: RESOLVED by task 4869.
 - `tkt_0RSKFG5RX196H9CJ0RXGJCZF4F`: move this audit out of source into a reference doc. Status: RESOLVED by task 4869 (this file).

@@ -250,6 +250,7 @@ from typing import NamedTuple
 
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     STRICT_CLAUSE_BOUNDARY_RE,
@@ -1910,6 +1911,53 @@ def select_stale_status_snapshot_edges(
 # convention of stamping a stable, identifiable actor.
 _SWEEP_AGENT_ID = 'recon-stage-memory_consolidator'
 
+# The names this sweep's completeness pair carries once MemoryConsolidator has
+# prefixed it onto ``report.stats``.  Exported as symbols rather than left as
+# inline literals at each of producer / consumer / test, matching the
+# :data:`~fused_memory.reconciliation.task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
+# precedent for exactly this stat family — otherwise a rename has to be found
+# by grep across five files, which is how a stat key ends up half-renamed and
+# a consumer starts silently reading `None`.  (amendment,
+# reviewer_comprehensive pattern-consistency finding, task 4386)
+#
+# NOTE the two layers: the sweep's own returned dict uses the SHORT keys
+# ``enumeration_complete`` / ``enumeration_incomplete_kind`` (documented on
+# ``sweep_stale_status_snapshot_edges`` below), and the consolidator projects
+# them onto ``report.stats`` under this module's prefix.  These constants name
+# the ``report.stats`` layer — the one that crosses module boundaries and is
+# read by the ledger, the journal and the judge.  Spelled out as whole
+# literals rather than built by concatenating a prefix, so the shipped key
+# name stays greppable from a log line back to here.
+
+STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_complete'
+)
+"""Key under Stage 1's ``report.stats``: this sweep's TRI-STATE read verdict.
+
+``True`` = the edge enumeration was proven whole, ``False`` = a corpus was
+observed and found incomplete, ``None`` = no corpus was observed. The only
+safe predicate is ``is True``; ``is not False`` would admit the UNKNOWN case,
+letting a cycle that never looked pass as one that looked and found
+everything.
+
+Conditional presence: ABSENT when the sweep itself raised (the stage swallows
+that best-effort and sets NONE of its stats), which is honest in a way
+``False`` would not be — ``False`` claims a corpus was observed. Read via
+``report.stats.get(...)``, never direct indexing.
+"""
+
+STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_incomplete_kind'
+)
+"""Key under Stage 1's ``report.stats``: WHICH WAY the corpus was partial.
+
+Carries the backend's stable ``INCOMPLETE_*`` discriminator (never
+``PagedRead.reason``, whose wording the backend documents as deliberately
+unstable), or ``None`` when there is nothing to discriminate. Conditional
+presence exactly as for
+:data:`STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY` above.
+"""
+
 
 async def sweep_stale_status_snapshot_edges(
     memory_service,
@@ -1924,7 +1972,7 @@ async def sweep_stale_status_snapshot_edges(
     """Enumerate valid status-snapshot edges and invalidate the stale ones.
 
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
-    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    ``memory_service.graphiti.enumerate_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
     each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
@@ -1939,7 +1987,8 @@ async def sweep_stale_status_snapshot_edges(
     retired assertion instead of merely losing it.
 
     Args:
-        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
+        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``
+            and
             ``.update_edge``.
         taskmaster: Object exposing ``.get_statuses``. A falsy value (e.g.
             unavailable backend) short-circuits to all-zero stats.
@@ -1953,7 +2002,7 @@ async def sweep_stale_status_snapshot_edges(
 
     Best-effort (mirrors
     ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
-    backend error enumerating (``get_all_valid_edges``), cross-referencing
+    backend error enumerating (``enumerate_all_valid_edges``), cross-referencing
     (``get_statuses``), or invalidating (``update_edge``) is caught, logged,
     and tallied into ``stats['errors']``. An enumeration or cross-reference
     failure aborts the rest of this cycle's sweep (there is nothing left to
@@ -1995,6 +2044,36 @@ async def sweep_stale_status_snapshot_edges(
         contradicted tasks left without a superseding fact because
         ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` was reached).
 
+        Plus two keys describing the READ that produced ``scanned`` rather
+        than counting anything (task 4386):
+
+        ``enumeration_complete`` (``bool | None``) — TRI-STATE, because three
+        outcomes are genuinely distinct and collapsing any pair loses
+        information the reader needs. ``True`` = the read was PROVEN
+        complete; ``False`` = a corpus was observed and it was INCOMPLETE;
+        ``None`` = NO corpus was observed at all, either because this call
+        short-circuited on a falsy *taskmaster*/*project_root* or because the
+        enumeration itself failed (``errors`` tells those two apart). The
+        ONLY predicate a caller may gate on is ``is True``: an ``is not
+        False`` test would admit both UNKNOWN cases, which would let a cycle
+        that never looked pass as one that looked and found everything.
+
+        ``enumeration_incomplete_kind`` (``str | None``) — the backend's
+        ``INCOMPLETE_*`` constant (``graphiti_client.py::INCOMPLETE_PAGE_CAP``
+        and siblings), which is the documented STABLE discriminator. Callers
+        should branch on membership in
+        ``graphiti_client.py::INCOMPLETE_STRUCTURAL_KINDS`` rather than on a
+        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced: the
+        backend documents its wording as diagnostic prose and an unstable
+        interface, so projecting it into stats would invite consumers to
+        parse it.
+
+        Both keys describe the read, NOT the counted funnel, so they leave
+        the ``invalidated == candidate_edges - errors`` identity below
+        exactly true. An EMPIRICAL incompleteness in particular does not
+        touch ``errors``: the sweep proceeds on what it fetched, and the
+        cycle merely says the corpus was partial.
+
         ``errors`` stays scoped to the enumerate / cross-reference /
         INVALIDATE paths, which is what keeps the identity
         ``invalidated == candidate_edges - errors`` exactly true: every
@@ -2012,18 +2091,56 @@ async def sweep_stale_status_snapshot_edges(
     stats = {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
         'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. Every early return below therefore reports the honest
+        # 'no corpus observed' rather than a fabricated clean read. (task 4386)
+        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
     }
 
     if not taskmaster or not project_root:
         return stats
 
     try:
-        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
+            group_id=project_id,
+        )
+        # Recorded BEFORE the policy is applied, and the ordering is
+        # load-bearing: apply_incompleteness_policy RAISES on a structural
+        # incompleteness, so assigning after it would leave the aborted cycle
+        # reporting errors=1 with no stated reason and the operator
+        # reconstructing the cause from logs — the exact reconstruction this
+        # signal exists to remove. (task 4386)
+        stats['enumeration_complete'] = paged.complete
+        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
+        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
+        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
+        # applied on this sweep's behalf has to be re-applied here, or a
+        # page-capped read is taken for the whole corpus and every edge the
+        # missing pages carry is scanned as absent: a silently clean cycle that
+        # retires nothing. Deliberately INSIDE the same try, so a structural
+        # incompleteness lands in the existing handler below exactly as the
+        # shim's raise did (``IncompleteEnumerationError`` subclasses
+        # ``Exception``, never ``BaseException``, precisely so it is caught
+        # here). An EMPIRICAL incompleteness only warns — through this sweep's
+        # injected ``log``, so the one message about a truncated corpus
+        # surfaces with the rest of the cycle's diagnostics — and the sweep
+        # proceeds on what it did get. (task 4386)
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_all_valid_edges',
+            group_id=project_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not drive a staleness verdict',
+            log=log,
+        )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         log.exception(
-            'stale_status_snapshot_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            'stale_status_snapshot_edge_sweep: enumerate_all_valid_edges failed for '
+            'group_id=%s',
             project_id,
         )
         stats['errors'] += 1
