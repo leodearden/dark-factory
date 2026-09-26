@@ -437,13 +437,18 @@ const MAX_POLL_DUTY_CYCLE = 0.5;
 
 // Unlike recordFailure, a forced attempt still paces: pacing is a pure
 // function of the latest measurement, so clicks cannot inflate it.
+// A success's own deadline (DEFAULT_TIMEOUT_MS) already bounds pacing at
+// BACKOFF_MAX_MS; the cap binds only on a wall-clock jump such as
+// suspend/resume, which would otherwise freeze the endpoint with failures at 0.
 function recordSuccess(st, deps, startedAt, receivedAt) {
   const serviceMs = receivedAt - startedAt;
   const paced = deps.pollIntervalMs !== undefined
     && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
   st.failures = 0;
   st.lastSuccessAt = receivedAt;
-  st.nextAllowedAt = paced ? startedAt + serviceMs / MAX_POLL_DUTY_CYCLE : 0;
+  st.nextAllowedAt = paced
+    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
+    : 0;
 }
 
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
