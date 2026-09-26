@@ -2462,3 +2462,201 @@ test('on-demand retention: a row that declares no retain keeps every param', asy
     assert.ok(win.DF_DATA[`TASKS_TERMINAL:${project}`], `${project} was forgotten`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Slowness pacing (task 5823)
+//
+// A slow-but-successful endpoint is paced by its own measured service time.
+// The rule and its threshold live beside data.js::recordSuccess.
+// ---------------------------------------------------------------------------
+
+const SCHEDULER_PATH = '/api/v2/dashboard/scheduler';
+const ESCALATIONS_PATH = '/api/v2/dashboard/escalations';
+const SIMULATED_MINUTE_MS = 60_000;
+const EXPECTED_MAX_POLL_DUTY_CYCLE = 0.5;
+
+// A virtual event loop: every sleep and every response resolves at a virtual
+// instant, and each endpoint answers after its configured service time. The
+// no-op timer pair keeps refreshOne's 30s deadline from arming a real timer.
+function makeVirtualServer(serviceMsByPath) {
+  let clock = 0;
+  const timers = [];
+  const calls = new Map();
+  const urls = [];
+  const serviceMs = { ...serviceMsByPath };
+
+  const after = ms => new Promise(resolve => { timers.push({ at: clock + ms, fire: resolve }); });
+
+  function fetchImpl(url) {
+    const path = pollKey(url);
+    calls.set(path, (calls.get(path) || 0) + 1);
+    urls.push(url);
+    return after(serviceMs[path] ?? 0).then(() => ({ ok: true, json: async () => ({}) }));
+  }
+
+  async function advanceTo(target) {
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at);
+      if (timers.length === 0 || timers[0].at > target) break;
+      const next = timers.shift();
+      clock = next.at;
+      next.fire();
+      await drain();
+    }
+    clock = target;
+  }
+
+  return {
+    deps: {
+      fetchImpl,
+      now: () => clock,
+      sleep: after,
+      random: () => 0,
+      setTimeoutImpl: () => 0,
+      clearTimeoutImpl: () => {},
+    },
+    serviceMs,
+    urls,
+    count: path => calls.get(path) || 0,
+    advanceTo,
+  };
+}
+
+async function runTicks(api, server, opts, firstTickAt, tickCount) {
+  for (let i = 0; i < tickCount; i += 1) {
+    await server.advanceTo(firstTickAt + i * EXPECTED_POLL_INTERVAL_MS);
+    api.pollTick(opts);
+    await drain();
+  }
+  await server.advanceTo(firstTickAt + tickCount * EXPECTED_POLL_INTERVAL_MS);
+}
+
+test('pacing: a slow-but-successful endpoint is not asked again until twice its service time after the request started', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(3900);
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH].failures, 0, 'a slow answer is a success, not a failure');
+
+  await server.advanceTo(7799);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 1, 'asked again before twice its 3900ms service time had passed');
+
+  await server.advanceTo(7800);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 2, 'still held once twice its service time had passed');
+});
+
+test('pacing: replaying the three endpoints measured 2026-09-23, each is held at or under the duty-cycle cap - fewer requests per minute than the in-flight guard alone admits', async () => {
+  const measuredServiceMs = { [TASKS_PATH]: 3886, [SCHEDULER_PATH]: 2297, [ESCALATIONS_PATH]: 2120 };
+  // What the in-flight guard alone admits in a minute of 3s ticks: /tasks
+  // lands between ticks, so it is re-issued every 2nd tick; the other two are
+  // under 3000ms, so every tick.
+  const unpacedRequestsPerMinute = { [TASKS_PATH]: 10, [SCHEDULER_PATH]: 20, [ESCALATIONS_PATH]: 20 };
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer(measuredServiceMs);
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  for (const [path, serviceMs] of Object.entries(measuredServiceMs)) {
+    const requests = server.count(path);
+    assert.ok(
+      requests < unpacedRequestsPerMinute[path],
+      `${path}: ${requests} requests in a minute, not fewer than the unpaced ${unpacedRequestsPerMinute[path]}`,
+    );
+    const dutyCycle = requests * serviceMs / SIMULATED_MINUTE_MS;
+    assert.ok(
+      dutyCycle <= EXPECTED_MAX_POLL_DUTY_CYCLE,
+      `${path}: busy ${dutyCycle.toFixed(3)} of the minute, over the ${EXPECTED_MAX_POLL_DUTY_CYCLE} cap`,
+    );
+  }
+  const fastPaths = Object.keys(api.endpointsFor('24h')).map(pollKey).filter(p => !(p in measuredServiceMs));
+  for (const path of fastPaths) {
+    assert.equal(server.count(path), tickCount, `${path} is fast and must be fetched on every tick`);
+  }
+});
+
+test('pacing: a fast endpoint is untouched - even when jitter starts its request late in the tick', async () => {
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer({ [SCHEDULER_PATH]: 1400 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: { ...server.deps, random: () => 0.9 } };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  const paths = Object.keys(api.endpointsFor('24h')).map(pollKey);
+  assert.equal(paths.length, EXPECTED_ENDPOINT_COUNT);
+  for (const path of paths) {
+    assert.equal(server.count(path), tickCount, `${path} was paced, though its own service time is under the threshold`);
+  }
+});
+
+test('pacing: relaxes back as the endpoint speeds up', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, 9);
+  assert.equal(server.count(TASKS_PATH), 3, 'a 3900ms endpoint is asked once per 9s, not every 6s');
+
+  server.serviceMs[TASKS_PATH] = 100;
+  await runTicks(api, server, opts, 27_000, 11);
+  assert.equal(server.count(TASKS_PATH), 3 + 11, 'a fast answer must restore the full cadence on the very next tick');
+});
+
+test('pacing: a chip change still forces a paced WINDOWED endpoint, only the windowed ones, and the forced answer paces the timer path by its own measurement', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000, [CURATOR_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(5000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: costs is paced');
+  assert.equal(server.count(CURATOR_PATH), 1, 'precondition: curator is paced');
+
+  const chip = api.refreshDFData('7d', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the chip change must bypass pacing on a windowed endpoint');
+  assert.ok(server.urls.includes(`${COSTS_PATH}?window=7d`), 'the forced request must carry the new window');
+  assert.equal(server.count(CURATOR_PATH), 1, 'the chip has no bearing on curator, so its pacing must hold');
+
+  await server.advanceTo(9000);
+  await chip;
+
+  await server.advanceTo(12_999);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the forced 4000ms answer, started at 5000, must pace the timer path');
+
+  await server.advanceTo(13_000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 3);
+});
+
+test('pacing: requestOnDemand is never paced - a user action is not a poll loop', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const state = api.createPollState();
+
+  const first = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps: server.deps });
+  await drain();
+  await server.advanceTo(4000);
+  assert.equal(await first, api.REFRESH_OUTCOMES.applied);
+
+  const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps: server.deps });
+  await drain();
+  await server.advanceTo(8000);
+  assert.equal(await second, api.REFRESH_OUTCOMES.applied, 'a user re-request of a slow listing must be fetched, not skipped');
+  assert.equal(server.count(TASKS_PATH), 2);
+});
