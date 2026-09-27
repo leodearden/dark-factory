@@ -480,41 +480,39 @@ def _read_direct_children(pid: int) -> set[int] | None:
       NEGATIVE: the caller can skip the expensive walk this tick.
     * ``{pid, ...}`` -- direct children exist; worth confirming with the
       production walker.
-    * ``None``   -- CANNOT probe.  Either the ``children`` files are absent
-      (a kernel built without ``CONFIG_PROC_CHILDREN``) or ``/proc/<pid>``
-      itself is gone (the leader exited mid-poll).  The caller must fall back
-      to the full walk for that tick; conflating this with the cheap negative
-      would make the poll spin to its timeout on such a kernel, and letting
-      the OSError escape would turn a leader exiting mid-poll into an
-      unhandled error inside the timeout diagnostic.
+    * ``None``   -- CANNOT probe: ``/proc/<pid>`` is gone (the leader exited
+      mid-poll), a LIVE thread's ``children`` file cannot be read (a kernel
+      built without ``CONFIG_PROC_CHILDREN``, or fd exhaustion), or no thread
+      was read at all.  The caller must fall back to the full walk for that
+      tick; conflating this with the cheap negative would make the poll spin
+      to its timeout, and letting the OSError escape would turn a leader
+      exiting mid-poll into an unhandled error inside the timeout diagnostic.
 
-    Any OSError anywhere in the read collapses to ``None``.  Distinguishing
-    "no CONFIG_PROC_CHILDREN" from "this thread just exited" would buy
-    nothing: both answers are "don't trust the probe on this tick", and the
-    fallback they select is precisely this helper's pre-4014 behaviour.
-
-    The empty-``task``-listing branch below is DEFENSIVE-ONLY, and therefore
-    deliberately uncovered: a live ``/proc/<pid>/task`` always holds at least
-    one tid, and a dead one makes ``iterdir()`` itself raise OSError, which
-    the handler already maps to ``None``.  It is retained rather than deleted
-    because falling THROUGH it would return the cheap negative ``set()`` --
-    "leader is live and has forked nothing" -- for a listing that in fact told
-    us nothing, and that is the single answer which makes the caller skip its
-    walk every tick and spin to the timeout.
+    A failed ``children`` read is judged PER THREAD, because threads exit
+    routinely in the probed processes -- pytest's own per-test faulthandler /
+    pytest-timeout watchdog threads included (task 5945).  If the tid
+    directory is gone, the thread exited after the listing and is skipped; if
+    it still exists, the probe cannot be trusted and answers ``None``.  A
+    child the kernel re-parents from a skipped thread onto a sibling already
+    read can be missed for one tick, which only defers the caller's walk --
+    the kernel documents ``children`` as best-effort anyway.
     """
-    children: set[int] = set()
     try:
         tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
-        if not tid_dirs:
-            # Defensive only (see docstring): not reachable on a live or a dead
-            # /proc entry, so never trust an empty listing as a cheap negative.
-            return None
-        for tid_dir in tid_dirs:
-            raw = (tid_dir / 'children').read_text()
-            children.update(int(token) for token in raw.split())
     except OSError:
         return None
-    return children
+    children: set[int] = set()
+    any_thread_read = False
+    for tid_dir in tid_dirs:
+        try:
+            raw = (tid_dir / 'children').read_text()
+        except OSError:
+            if tid_dir.exists():
+                return None
+            continue
+        any_thread_read = True
+        children.update(int(token) for token in raw.split())
+    return children if any_thread_read else None
 
 
 def wait_subtree_live(
