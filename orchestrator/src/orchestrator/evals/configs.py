@@ -14,6 +14,7 @@ always loses to an existing ``config.prices`` entry).
 import logging
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from orchestrator.config import default_price_table
 
@@ -710,21 +711,51 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     ]
 
 
-# Best-effort public list rates (USD per 1M tokens) as of filing —
-# operator-tunable; update alongside provider pricing changes. Keyed EXACTLY
+class CostBasis(StrEnum):
+    """How an arm is billed: the closed vocabulary of live-shadow PRD decision 16.
+
+    A member IS the value ``shadow_cells.cost_basis`` stores. Sited here as the
+    vocabulary's first consumer, following ``evals/live_fixture.py::ShadowShape``:
+    when leaf α (task 5382) adds that column it imports this enum rather than
+    restating the two values (heuristic 11). Relocating it down beside α's row
+    record is α's call, with this module importing it back; what must not
+    happen is a second copy of the values.
+    """
+
+    METERED = 'metered'
+    SUBSCRIPTION = 'subscription'
+
+
+@dataclass(frozen=True)
+class CandidateEndpointPrice:
+    """One candidate model's list rates (USD per 1M tokens) and how it is billed."""
+
+    input_per_1m: float
+    output_per_1m: float
+    cost_basis: CostBasis
+
+    @property
+    def imputed(self) -> bool:
+        """The dollar figure is a list price modelled onto a credit-metered arm,
+        not a measured cost."""
+        return self.cost_basis is CostBasis.SUBSCRIPTION
+
+
+# List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY
 # by the *_MODEL constants above so collect_metrics (which keys cost on
 # config.models.implementer == EvalConfig.model) resolves cost_source ==
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
-CANDIDATE_ENDPOINT_PRICES: dict[str, dict[str, float]] = {
+# GLM access is a GLM Coding Plan, so both GLM rows are SUBSCRIPTION: imputed.
+CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
     # deliberately not used.
-    MINIMAX_MODEL: {'input_per_1m': 0.30, 'output_per_1m': 1.20},
-    GLM_MODEL: {'input_per_1m': 1.40, 'output_per_1m': 4.40},
+    MINIMAX_MODEL: CandidateEndpointPrice(0.30, 1.20, CostBasis.METERED),
+    GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
-    GLM_FLASH_MODEL: {'input_per_1m': 0.15, 'output_per_1m': 0.50},
-    DEEPSEEK_MODEL: {'input_per_1m': 0.28, 'output_per_1m': 0.42},
-    KIMI_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.50},
+    GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
+    DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
+    KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
 }
 
 
@@ -738,8 +769,17 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     carries a proxied ``ANTHROPIC_BASE_URL``, so operators no longer need to
     seed it manually — an existing ``config.prices`` entry still wins on
     conflict, so a manual seed remains a valid override.
+
+    Rates only: this projection feeds ``PriceEntry``. The cost-basis tag is
+    carried by ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
     """
-    return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
+    return {
+        **default_price_table(),
+        **{
+            model: {'input_per_1m': p.input_per_1m, 'output_per_1m': p.output_per_1m}
+            for model, p in CANDIDATE_ENDPOINT_PRICES.items()
+        },
+    }
 
 
 # ===== Codex + pi candidate bundles (eval-revival ξ) =====

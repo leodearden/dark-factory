@@ -8,8 +8,9 @@ endpoint (PRD C5: per-role ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``).
 Runtime-behaviour tests only: roster/shape, endpoint+auth env contract,
 price-table coverage + λ's ``resolve_cost_usd`` -> ``'price_table'``,
 ``get_config_by_name`` resolution + ``build_eval_orch_config`` endpoint
-propagation, and a literal pin of the dated slate (task 5384). The env-forwarding wiring itself is already covered by task
-2460's ``test_workflow_e2e.py``, and the μ OFAT/matrix driver by task 2478's
+propagation, and a literal pin of the dated slate (task 5384). The
+env-forwarding wiring itself is already covered by task 2460's
+``test_workflow_e2e.py``, and the μ OFAT/matrix driver by task 2478's
 ``test_eval_driver*.py`` — this module does not re-test either.
 
 Per-test local imports (the ``test_eval_driver_configs.py`` convention) so an
