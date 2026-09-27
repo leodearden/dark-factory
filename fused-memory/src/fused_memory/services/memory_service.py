@@ -1635,7 +1635,10 @@ class ReconcileStats:
     #: text travels through verbatim. Surfaced as a structured WARNING log line
     #: plus these two fields ONLY — ``ReconcileStats`` is explicitly not part of
     #: the durable write-journal schema, so a future consumer must not read
-    #: durability into this seam.
+    #: durability into this seam. Unlike the int fields above, this pair does
+    #: not mirror an int return: ``dependency_direction_flagged`` is always
+    #: ``len(dependency_direction_findings)``, both set at one site from the
+    #: sub-pass's returned record list.
     dependency_direction_flagged: int = 0
     dependency_direction_findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -2469,10 +2472,6 @@ class MemoryService:
         # constructor. Used to resolve an escalation queue's filesystem root
         # from the project_id update_memory carries.
         self._known_projects: dict[str, str] = {}
-        #: Structured records from the most recent
-        #: ``_check_dependency_direction`` run (task 3770), read by
-        #: ``_reconcile_episode_identity`` on its non-raising path only.
-        self._dependency_direction_findings: list[dict] = []
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
         # ReconciliationHarness (built behind `if config.reconciliation ...
@@ -3443,7 +3442,9 @@ class MemoryService:
             )
         return invalidated
 
-    async def _check_dependency_direction(self, result: Any, *, group_id: str) -> int:
+    async def _check_dependency_direction(
+        self, result: Any, *, group_id: str
+    ) -> list[dict]:
         """Flag freshly-extracted facts whose dependency DIRECTION ground truth rejects.
 
         The ninth post-write sub-pass (task 3770). The extraction LLM does not
@@ -3456,7 +3457,7 @@ class MemoryService:
 
         SCOPE GATE FIRST, and it is the whole cost story. Assertions are parsed
         out of the edge facts BEFORE anything else happens; if none parse, this
-        returns 0 having touched no backend at all — the same short-circuit
+        returns ``[]`` having touched no backend at all — the same short-circuit
         shape as ``sweep_stale_status_snapshot_edges``' ``if not candidate_ids:
         return stats``. The overwhelmingly common write therefore costs one
         regex scan per edge and zero I/O, which is what makes a per-write check
@@ -3472,31 +3473,35 @@ class MemoryService:
         readback-verified, which is correct here precisely because this is a
         flag rather than a repair whose persistence a caller must confirm.
 
-        Findings are stashed on ``self._dependency_direction_findings`` for
-        ``_reconcile_episode_identity`` to fold into ``ReconcileStats``, and each
-        is logged at WARNING with its full structured record so the flag is
-        adjudicable from the log alone.
+        The structured record of each edge actually invalidated is RETURNED;
+        the caller derives the flagged count from it, and nothing is held on
+        the instance. The identity lock is per-group_id, so writes for
+        different groups reconcile concurrently on one ``MemoryService``, and
+        instance state would carry one project's records into another's stats.
+        Each finding is also logged at WARNING with its full structured record
+        so the flag is adjudicable from the log alone.
 
         Best-effort throughout, matching the sibling sub-passes: an unresolvable
         project root, an absent taskmaster or a failing ground-truth read all
-        return 0 rather than raising, and a per-edge ``update_edge`` failure is
+        return ``[]`` rather than raising, and a per-edge ``update_edge`` failure is
         logged and skipped so the remaining flagged edges are still attempted.
         ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate on
         every path.
 
         Returns:
-            Number of edges flagged (0 when out of scope or unadjudicable).
+            The structured record (``DependencyDirectionFinding.to_dict()``) of
+            every edge this call invalidated; ``[]`` when out of scope or
+            unadjudicable.
         """
-        self._dependency_direction_findings = []
         if result is None:
-            return 0
+            return []
         edges = (
             getattr(result, 'edges', None)
             or getattr(result, 'entity_edges', None)
             or []
         )
         if not edges:
-            return 0
+            return []
 
         # THE SCOPE GATE. No dependency shorthand anywhere in this episode ->
         # no ground-truth read, no lock time, no cost.
@@ -3504,10 +3509,10 @@ class MemoryService:
             extract_dependency_assertions(getattr(edge, 'fact', '') or '')
             for edge in edges
         ):
-            return 0
+            return []
 
         if self.taskmaster is None:
-            return 0
+            return []
         project_root = (
             self._known_projects.get(group_id) or self._memory_metadata_project_root()
         )
@@ -3517,7 +3522,7 @@ class MemoryService:
                 'resolved from _known_projects or config.taskmaster.project_root',
                 group_id,
             )
-            return 0
+            return []
 
         try:
             edge_map = await self.taskmaster.get_dependency_edges(project_root)
@@ -3531,14 +3536,11 @@ class MemoryService:
                 'skipping this episode',
                 project_root,
             )
-            return 0
+            return []
 
         index = build_dependency_index(edge_map or {})
         findings = check_dependency_direction(edges, index)
-        if not findings:
-            return 0
-
-        flagged = 0
+        records: list[dict] = []
         for finding in findings:
             record = finding.to_dict()
             logger.warning(
@@ -3567,9 +3569,8 @@ class MemoryService:
                     finding.edge_uuid,
                 )
                 continue
-            self._dependency_direction_findings.append(record)
-            flagged += 1
-        return flagged
+            records.append(record)
+        return records
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Canonicalize non-canonical task-entity node names to 'Task N'.
@@ -5016,8 +5017,9 @@ class MemoryService:
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
-        the seven int passes, an empty ``ReferentStats`` for zeta, an empty
-        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        the six int passes, an empty ``ReferentStats`` for zeta, an empty
+        ``ReferentRepairStats`` for eta, and an empty list for the
+        dependency-direction check), and the remaining sub-passes still
         run — a single sub-pass failure must never fail the already-committed
         episode write. That guarantee is worth most at eta, the one pass that
         WRITES: its failure is the likeliest to be real, and it arrives after
@@ -5128,17 +5130,15 @@ class MemoryService:
         # putting it last leaves zeta's and eta's documented load-bearing "runs
         # last" ordering — and eta's `stats.referent_stats` data dependency —
         # entirely undisturbed.
-        stats.dependency_direction_flagged = await _run_pass(
+        dependency_direction_findings = await _run_pass(
             '_check_dependency_direction',
             self._check_dependency_direction(result, group_id=group_id),
-            0,
+            [],
         )
-        if '_check_dependency_direction' not in stats.errors:
-            # Only on the NON-RAISING path. A swallowed failure must not leave
-            # partial findings that a reader would take for a clean result.
-            stats.dependency_direction_findings = list(
-                self._dependency_direction_findings
-            )
+        # `_run_pass` returns its `[]` default exactly when the pass raised, so
+        # a swallowed failure can never leave partial findings behind.
+        stats.dependency_direction_findings = dependency_direction_findings
+        stats.dependency_direction_flagged = len(dependency_direction_findings)
         return stats
 
     def referent_source_counts(self) -> dict[str, int]:
