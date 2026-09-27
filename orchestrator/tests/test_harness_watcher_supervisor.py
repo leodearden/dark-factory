@@ -3153,6 +3153,27 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
 
+    def test_archive_inclusive_read_tool_is_granted(self) -> None:
+        """get_task_escalations must be allowed, and not disallowed.
+
+        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas").
+        Without this entry the drain protocol's archive-inclusive read
+        (task 3999) is permission-denied: a silent no-op.
+        """
+        tool = 'mcp__escalation__get_task_escalations'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the drain can read '
+            "archived L2s' member_ids and keep already-promoted L1s out of "
+            f'work_batch (task 3999); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'silently blind the drain to archived L2s (task 3999); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
