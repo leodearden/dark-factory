@@ -28,7 +28,10 @@ import pytest
 
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
-from fused_memory.services.consolidation_ops import execute_retain_consolidation
+from fused_memory.services.consolidation_ops import (
+    TOPIC_MEMBER_LIMIT,
+    execute_retain_consolidation,
+)
 
 PROJECT_ID = 'dark_factory'
 # On the default allowlist for both mem0_update arms, so no case here can
@@ -77,6 +80,7 @@ def make_service(
     update_errors=None,
     update_raises=None,
     scroll_error=None,
+    closure_scroll_error=None,
     scroll_rows=None,
     minted_ids=(CANONICAL,),
     topic_total=None,
@@ -97,8 +101,13 @@ def make_service(
 
     *minted_ids* is what the canonical write reports back; `()` models a
     write that landed nothing while raising nothing. *scroll_rows*
-    replaces the closure listing wholesale, for the shapes *members*
-    cannot express — a topic naming no canonical, or naming two.
+    replaces the topic's rows wholesale, for the shapes *members* cannot
+    express — a topic naming no canonical, or naming two.
+
+    The scroll honours `filters` and `limit` as the real one does.
+    *scroll_error* fails every scroll; *closure_scroll_error* fails only
+    the topic-wide listing, so a read that also names `canonical` still
+    answers.
     """
     members = [M1, M2] if members is None else members
     canonical_peers = set(canonical_peers)
@@ -148,15 +157,28 @@ def make_service(
 
     svc.update_memory = AsyncMock(side_effect=_update)
 
-    async def _scroll(**kwargs):
+    async def _scroll(*, filters=None, limit=None, **_):
         if scroll_error is not None:
             raise scroll_error
-        if scroll_rows is not None:
-            return list(scroll_rows)
-        return [
-            _scroll_row(m, **({'canonical': True} if m in canonical_peers else {}))
-            for m in members
+        if closure_scroll_error is not None and filters == {'topic': TOPIC}:
+            raise closure_scroll_error
+        rows = (
+            list(scroll_rows)
+            if scroll_rows is not None
+            else [
+                _scroll_row(m, **({'canonical': True} if m in canonical_peers else {}))
+                for m in members
+            ]
+        )
+        matching = [
+            row
+            for row in rows
+            if all(
+                row['metadata'].get(key) == value
+                for key, value in (filters or {}).items()
+            )
         ]
+        return matching if limit is None else matching[:limit]
 
     svc.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
 
@@ -437,6 +459,10 @@ class TestTagOnlyTouchesNothingOnTheIncumbent:
 
     Minting anyway would be the +1-per-pass ratchet the op exists to end,
     reached by the most natural reading of "consolidate this topic".
+
+    Tag-only obeys the rule `TestTheCanonicalIsMinted` states — no metadata
+    patch before a canonical is established — and it establishes one by
+    RESOLVING the incumbent, so a failed resolution leaves nothing touched.
     """
 
     @pytest.mark.asyncio
@@ -537,6 +563,74 @@ class TestTagOnlyTouchesNothingOnTheIncumbent:
 
         assert result['error_type'] == 'TagOnlyIncumbentNotFound'
         assert result['topic'] == TOPIC
+
+    @pytest.mark.asyncio
+    async def test_a_topic_naming_no_canonical_touches_nothing(self):
+        """No peer is read or patched on behalf of a fold with no canonical."""
+        svc = make_service(scroll_rows=[_scroll_row(M1), _scroll_row(M2)])
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['error_type'] == 'TagOnlyIncumbentNotFound'
+        svc.update_memory.assert_not_awaited()
+        svc.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_canonical_touches_nothing(self):
+        svc = make_service(scroll_error=TimeoutError('qdrant timeout'))
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['error_type'] == 'TagOnlyIncumbentNotFound'
+        svc.update_memory.assert_not_awaited()
+        svc.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_nothing_was_tagged(self):
+        """The refusal must not admit to tags it never wrote."""
+        no_canonical = make_service(scroll_rows=[_scroll_row(M1), _scroll_row(M2)])
+        unreadable = make_service(scroll_error=TimeoutError('qdrant timeout'))
+
+        for svc in (no_canonical, unreadable):
+            result = await call_execute(svc, canonical_content=None)
+
+            assert result['error_type'] == 'TagOnlyIncumbentNotFound'
+            assert 'NOT undone' not in result['error']
+
+    @pytest.mark.asyncio
+    async def test_a_closure_that_fails_after_the_tags_still_reports_the_fold(self):
+        """The fold landed, so it is reported in full — the same degradation
+        the mint path takes in
+        `test_an_unreadable_scroll_degrades_to_not_available`."""
+        svc = make_service(
+            members=[INCUMBENT, M1, M2],
+            canonical_peers=[INCUMBENT],
+            closure_scroll_error=TimeoutError('qdrant timeout'),
+        )
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert 'error_type' not in result
+        assert result['canonical_id'] == INCUMBENT
+        assert result['retained'] == [M1, M2]
+        assert result['topic_members_available'] is False
+
+    @pytest.mark.asyncio
+    async def test_the_incumbent_is_found_when_the_closure_listing_is_capped(self):
+        """The capped closure listing can never contain this incumbent, so it
+        must be resolved by a read that is not subject to that cap."""
+        crowd = [
+            _scroll_row(f'{i:08d}-0000-4000-8000-000000000000')
+            for i in range(TOPIC_MEMBER_LIMIT)
+        ]
+        svc = make_service(
+            scroll_rows=[*crowd, _scroll_row(INCUMBENT, canonical=True)],
+            topic_total=TOPIC_MEMBER_LIMIT + 1,
+        )
+
+        result = await call_execute(svc, canonical_content=None, retain_ids=[])
+
+        assert result.get('canonical_id') == INCUMBENT
 
 
 class TestAuthorizationIsFailClosedAndPreWrite:
