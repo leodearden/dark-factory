@@ -6129,12 +6129,16 @@ class TestMemoryConsolidatorBenignSweepDeletionFilter:
             events=[self._deleted_event()] if with_event else [],
         )
 
-        assert deletion_flag in (report.items_flagged or [])
+        survivors = [
+            f for f in report.items_flagged or []
+            if f.get('flag_type') == deletion_flag['flag_type']
+        ]
+        assert len(survivors) == 1, f'the flag must survive; got {report.items_flagged!r}'
         assert report.stats.get('benign_sweep_deletion_flags_dropped') == 0, (
             'the stat must be present (always-present-within-the-block) and 0; '
             f'got stats={report.stats!r}'
         )
-        assert deletion_flag['sweep_deletion_provenance']['decision'] == decision
+        assert survivors[0]['sweep_deletion_provenance']['decision'] == decision
 
 
 # ---------------------------------------------------------------------------

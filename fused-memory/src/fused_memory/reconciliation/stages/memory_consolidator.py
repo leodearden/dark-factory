@@ -93,6 +93,9 @@ from fused_memory.reconciliation.standing_decision_storm_escape import (
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )
+from fused_memory.reconciliation.sweep_deletion_guard import (
+    filter_benign_sweep_deletion_flags,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
@@ -819,6 +822,24 @@ class MemoryConsolidator(BaseStage):
             report.stats['already_recorded_caveat_flags_dropped'] = (
                 _before_already_recorded_caveat_filter - len(report.items_flagged)
             )
+            # ── Benign sweep-deletion guard (task 5271): drop ─────────────────────
+            # evidentiary-anchor deletion-pattern findings whose every swept id
+            # carries a documented recon sweep's tombstone (a designed trim, not
+            # an anomaly).  Reads this cycle's buffered `events` for deletions
+            # that left no tombstone.  Fail-KEEP; rationale in the
+            # sweep_deletion_guard module docstring.  After the _pre_filter_flags
+            # snapshot and before dedup_flags, so a drop writes no
+            # stage1_flag_marker and is acknowledged as resolved below.
+            _before_benign_sweep_deletion_filter = len(report.items_flagged)
+            report.items_flagged = await filter_benign_sweep_deletion_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+                events=events,
+            )
+            report.stats['benign_sweep_deletion_flags_dropped'] = (
+                _before_benign_sweep_deletion_filter - len(report.items_flagged)
+            )
             # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
             # Drop flags already adjudicated by an ACTIVE entity_standing_decision
             # ledger row BEFORE dedup_flags so a suppressed flag never writes a
@@ -947,7 +968,7 @@ class MemoryConsolidator(BaseStage):
             )
 
             # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
-            # Flags DROPPED anywhere in the chain above (terminal task, false-absence,
+            # Flags DROPPED anywhere in the chain above (e.g. terminal task, false-absence,
             # stale-snapshot correction, or already-tracked systemic-pattern) have a
             # moot requested action; reclaim any persisted stage1_flag_marker for them
             # best-effort.  Computed as a
