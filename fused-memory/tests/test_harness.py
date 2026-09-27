@@ -9550,6 +9550,81 @@ async def test_recover_predecessor_runs_does_not_clobber_a_run_its_own_coroutine
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('resume_after_restart', 'interrupted_seconds_ago', 'suppressed_log'),
+    [
+        pytest.param(
+            False, 0, 'reconciliation.interrupted_run_resume_disabled',
+            id='resume-disabled',
+        ),
+        pytest.param(
+            True, 7200, 'reconciliation.interrupted_run_unresumable',
+            id='unresumable',
+        ),
+    ],
+)
+async def test_resume_interrupted_runs_does_not_clobber_a_run_its_own_coroutine_terminalised(
+    journal, event_buffer, mock_memory_service, caplog,
+    resume_after_restart, interrupted_seconds_ago, suppressed_log,
+):
+    """Race A through both failed+restore fallbacks of the startup interrupted
+    pass: the pass read the run as 'interrupted', then the run's own coroutine
+    terminalised it before the fallback wrote. The owner's terminal image
+    survives, and none of the fallback's follow-on effects fire: no drained-event
+    restore, no config-dir GC, no interrupted_run_* log, and no resume-failure
+    storm count or escalation for a run that did not fail to resume.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    harness._record_resume_failure = MagicMock(
+        return_value={'count': 6, 'window_seconds': 3600.0, 'projects': ['test-project']}
+    )
+    harness.run_full_cycle = AsyncMock()
+    harness.config.resume_after_restart = resume_after_restart
+
+    run = await _setup_interrupted_dead_predecessor_run(
+        journal, event_buffer,
+        completed_at=datetime.now(UTC) - timedelta(seconds=interrupted_seconds_ago),
+    )
+    events = await event_buffer.get_drained_events(run.project_id, run.id)
+
+    with caplog.at_level(
+        logging.INFO, logger='fused_memory.reconciliation.harness',
+    ), patch(
+        'fused_memory.reconciliation.harness.read_transcript_records',
+        return_value=[{'sessionId': 'S'}], create=True,
+    ), patch(
+        'fused_memory.reconciliation.harness.gc_run_config_dir',
+    ) as gc_mock:
+        async with _owner_terminalises_after_read(
+            journal, 'get_interrupted_runs', run.id
+        ) as owners:
+            await harness._resume_interrupted_runs()
+
+    owners_run = owners['run']
+    assert owners_run is not None, 'the owner never terminalised the run'
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.completed
+    assert '_error' not in after.stage_reports
+    assert after.stage_reports == owners_run.stage_reports
+    assert after.completed_at == owners_run.completed_at
+
+    assert await _event_statuses(event_buffer, events) == ['drained', 'drained']
+    gc_mock.assert_not_called()
+    harness.run_full_cycle.assert_not_awaited()
+
+    harness_logs = [
+        r.getMessage() for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.harness'
+    ]
+    assert 'reconciliation.stale_run_recovery_refused' in harness_logs
+    assert suppressed_log not in harness_logs
+    harness._record_resume_failure.assert_not_called()
+    harness._escalate.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
     journal, event_buffer, mock_memory_service,
 ):
