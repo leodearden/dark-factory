@@ -1331,6 +1331,41 @@ def test_task_snapshot_js_load_order(
     )
 
 
+# prd_grouping.js builds its PRD tally from the generated vocabulary and its
+# PRD-box count from datum.js::combinedDatum and task_snapshot.js's readings,
+# all destructured at module scope (task 5590). Its edge to tab_tasks.jsx is
+# test_prd_grouping_js_loads_before_tab_tasks.
+_PRD_GROUPING_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
+    (_TASK_VOCAB_PREFIX, 'task_vocab.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
+    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label, why',
+    _PRD_GROUPING_ORDER_CASES,
+    ids=['datum-before-prd-grouping', 'vocab-before-prd-grouping', 'snapshot-before-prd-grouping'],
+)
+def test_prd_grouping_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+    why: str,
+) -> None:
+    """The PRD grouping module loads after every module it reads."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + why.format(before=before_label),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regression guard: datum.js is served and sits between endpoint_staleness.js
 # and its consumers (task 5588, PRD leaf gamma1)
