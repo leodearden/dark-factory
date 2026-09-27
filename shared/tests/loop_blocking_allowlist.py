@@ -257,7 +257,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
-        '1939296ee9cb',
+        '0d761c10e563',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
         'its escalation records on the loop thread -- on_judge_unhalt '
