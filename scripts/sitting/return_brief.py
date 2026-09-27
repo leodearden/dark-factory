@@ -42,6 +42,7 @@ from shared.safe_io import atomic_write_text  # noqa: E402
 from sitting import brief, fleet_state, prepare_sitting  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
 from sitting.fleet_state import (  # noqa: E402
+    AutonomousClose,
     AutonomousCloses,
     Measurement,
     PreparerTrial,
@@ -308,13 +309,23 @@ def _closes_section(measurement: Measurement[AutonomousCloses], heading: str) ->
             lines += ['', 'No autonomous close in the window.']
         for position, close in enumerate(closes.in_window, start=1):
             sample = f' — AUDIT SAMPLE (1 in {brief.AUDIT_SAMPLE_EVERY})' if brief.is_audit_sample(position) else ''
-            lines += [
-                '', f'### Close {position}: decision {close.decision_id}{sample}', '',
-                f'{close.state}; escalation {close.escalation_id or "none"}; project {close.project}; '
-                f'filed {close.filed_at}', '',
-                brief.fence_safe(close.evidence),
-            ]
+            lines += ['', f'### Close {position}: decision {close.decision_id}{sample}', '',
+                      *_close_lines(close, f'closed {close.closed_at}')]
+        if closes.undated:
+            lines += ['', '### Undated closes', '',
+                      'closed_at is missing or unparsable, so these cannot be placed in or out of the window.']
+            for close in closes.undated:
+                lines += ['', f'#### Decision {close.decision_id}', '',
+                          *_close_lines(close, f'closed_at {close.closed_at!r}')]
     return _text([*lines, '', *_shortfall_lines(measurement.shortfalls)])
+
+
+def _close_lines(close: AutonomousClose, closed: str) -> list[str]:
+    return [
+        f'{close.state}; escalation {close.escalation_id or "none"}; project {close.project}; '
+        f'{closed}; filed {close.filed_at}', '',
+        brief.fence_safe(close.evidence),
+    ]
 
 
 def _stamp_line(measurement: Measurement[Any]) -> str:

@@ -159,14 +159,22 @@ class AutonomousClose:
     project: str
     state: str
     filed_at: str
+    closed_at: str
     evidence: str
 
 
 @dataclass(frozen=True)
 class AutonomousCloses:
-    """The window's evidence-carrying closes, and ``lifetime``: the per-50 denominator of the wrong-close kill criterion."""
+    """Evidence-carrying closes as three populations.
+
+    ``in_window``: closed inside the window. ``undated``: no parsable
+    ``closed_at``, so when they closed is unknown and they are shown rather
+    than dropped. ``lifetime``: every evidence-carrying close, dated or not,
+    the per-50 denominator of the wrong-close kill criterion.
+    """
 
     in_window: tuple[AutonomousClose, ...]
+    undated: tuple[AutonomousClose, ...]
     lifetime: int
 
 
@@ -276,19 +284,31 @@ def stuck(
 
 
 def autonomous_closes(decisions_root: Path | str, window: Window, *, now: datetime) -> Measurement[AutonomousCloses]:
-    """Closed decisions carrying ``closing_evidence``, quoted verbatim; windowed on ``filed_at``."""
+    """Closed decisions carrying ``closing_evidence``, quoted verbatim, windowed on ``closed_at``.
+
+    ``closed_at`` is the close instant
+    ``orchestrator/src/orchestrator/session_registry.py::close_decision_with_evidence``
+    stamps; ``filed_at`` would miss a close of a gate filed before the window.
+    A close with no parsable ``closed_at`` is ``undated``: shown, never dropped.
+    """
     stamp = _stamp(now)
     registry = decisions_dir(decisions_root)
     if not registry.is_dir():
         missing = Shortfall('decision_registry', str(registry), 'no such directory')
-        return Measurement(AutonomousCloses((), 0), stamp, str(registry), 'source_missing', (missing,))
+        return Measurement(AutonomousCloses((), (), 0), stamp, str(registry), 'source_missing', (missing,))
     records, shortfalls = inventory.read_decisions(decisions_root)
     closed = [record for record in records if record.state != DecisionState.OPEN and record.closing_evidence]
-    in_window = tuple(
-        _autonomous_close(record) for record in sorted(closed, key=lambda r: (r.filed_at, r.id))
-        if window.holds(inventory.parse_stamp(record.filed_at))
+    dated = [(record, instant) for record in closed if (instant := inventory.parse_stamp(record.closed_at))]
+    in_window = sorted(
+        (_autonomous_close(record) for record, instant in dated if window.holds(instant)),
+        key=lambda close: (close.closed_at, close.decision_id),
     )
-    return Measurement(AutonomousCloses(in_window, len(closed)), stamp, str(registry), 'ok', tuple(shortfalls))
+    undated = sorted(
+        (_autonomous_close(record) for record in closed if inventory.parse_stamp(record.closed_at) is None),
+        key=lambda close: close.decision_id,
+    )
+    closes = AutonomousCloses(tuple(in_window), tuple(undated), len(closed))
+    return Measurement(closes, stamp, str(registry), 'ok', tuple(shortfalls))
 
 
 def standing_policy_rulings(
@@ -428,6 +448,7 @@ def _autonomous_close(record: DecisionRecord) -> AutonomousClose:
         project=normalize_project_token(record.project),
         state=str(record.state),
         filed_at=record.filed_at,
+        closed_at=record.closed_at,
         evidence=record.closing_evidence,
     )
 
