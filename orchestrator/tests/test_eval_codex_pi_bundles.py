@@ -26,6 +26,8 @@ test that needs it, not collection of the file.
 
 from __future__ import annotations
 
+import pytest
+
 # The 2026-09 codex slate as LITERALS (task 5384), deliberately not read from
 # the ``CODEX_*_MODEL`` constants: a pin that reads what it protects guards
 # nothing (INV-10).
@@ -207,6 +209,29 @@ class TestCodexSlatePin:
             assert cfg is not None
             assert cfg.backend == 'codex'
             assert cfg.model == model
+
+    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), [
+        ('gpt-6-astra', 10.00, 50.00),
+        ('gpt-5.6-sol', 4.00, 20.00),
+        ('gpt-5.6-terra', 2.00, 12.00),
+    ])
+    def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
+        """Read through the same ``claude_endpoint_price_table()`` the endpoint
+        slate pin uses — one price path for the whole slate."""
+        from orchestrator.evals.configs import claude_endpoint_price_table
+
+        entry = claude_endpoint_price_table()[model]
+        assert entry['input_per_1m'] == input_per_1m
+        assert entry['output_per_1m'] == output_per_1m
+
+    def test_every_codex_arm_has_a_price_seed(self):
+        """Derived from the roster, so a future arm without a seed reddens."""
+        from orchestrator.evals.configs import claude_endpoint_price_table, codex_pi_candidates
+
+        table = claude_endpoint_price_table()
+        codex_models = {c.model for c in codex_pi_candidates() if c.backend == 'codex'}
+        assert codex_models
+        assert codex_models <= table.keys()
 
     def test_pi_control_is_unchanged(self):
         from orchestrator.evals.configs import (
