@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
+from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator.config import (
     TIER_BASE,
@@ -585,7 +586,9 @@ class TestNormalizeTaskMetadataLoudness:
         )
         assert task['metadata'] == {'foo': 1}
 
-    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    @pytest.mark.parametrize(
+        'task', [{'id': '3', 'metadata': None}, {'id': '4'}, {'id': '6', 'metadata': ''}]
+    )
     def test_absent_or_none_metadata_is_silent(self, task, caplog):
         """Most tasks carry no metadata — warning here would be pure noise."""
         caplog.set_level(logging.WARNING, logger=self.LOGGER)
@@ -609,6 +612,27 @@ class TestNormalizeTaskMetadataLoudness:
         assert len(message) < 1000, (
             f'the discarded repr must be truncated; got a {len(message)}-char message'
         )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
+    )
+    def test_collapse_matches_shared_wire_rule(self, raw, caplog):
+        """The wire-boundary collapse is the shared rule's, with unreadable -> {} made loud."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '77', 'metadata': raw}
+        expected = coerce_task_metadata(raw)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert task['metadata'] == (expected if expected is not None else {})
+        warnings = self._warnings(caplog)
+        assert bool(warnings) == (expected is None), (
+            f'metadata={raw!r}: must warn exactly when the shared rule says unreadable; '
+            f'got {warnings!r}'
+        )
+        if warnings:
+            assert '77' in ' '.join(warnings)
 
 
 # ---------------------------------------------------------------------------
