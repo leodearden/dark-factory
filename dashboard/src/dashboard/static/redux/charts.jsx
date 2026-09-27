@@ -41,11 +41,9 @@ const PALETTE = {
   ok:      'oklch(0.74 0.14 155)',
   warn:    'oklch(0.80 0.14 80)',
   bad:     'oklch(0.68 0.18 25)',
-  // In-progress work with no live claimant. Named rather than inlined so the
-  // burndown stack and its legend cannot drift apart. Magenta because the
-  // band sits between `accent` (live, 230) and `bad` (blocked, 25) in the
-  // status-mix stack: reusing either would make the split unreadable, and a
-  // strand is a different failure from a block, not a worse one.
+  // census.py::TONES' infra-hold tone. Magenta so it reads apart from both
+  // `accent` (in-progress, 230) and `bad` (blocked, 25): work parked on an
+  // infrastructure hold is a different condition from a block, not a worse one.
   stranded: 'oklch(0.66 0.19 330)',
   info:    'oklch(0.62 0.20 305)',
   fg2:     'oklch(0.66 0.012 250)',
