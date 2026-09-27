@@ -3473,6 +3473,19 @@ class MemoryService:
         readback-verified, which is correct here precisely because this is a
         flag rather than a repair whose persistence a caller must confirm.
 
+        PROJECT ROOT resolution is ``self._known_projects[group_id]`` with NO
+        FALLBACK, the same rule as
+        ``services/memory_service.py::MemoryService._escalate_referent_repair_storm``
+        and ``middleware/mem0_update_storm_escalator.py::Mem0UpdateStormEscalator``.
+        The reason is sharper here than for those alarms: task ids overlap
+        across projects, so judging an episode against another project's graph
+        would classify TRUE facts as unsupported or reversed and retire them
+        with ``update_edge``. That is a destructive edge retirement, not a
+        misfiled alarm. An unregistered group means "unknown" and under-flags,
+        the same unknown-means-UNKNOWN-not-WRONG rule
+        ``middleware/dependency_direction_check.py::classify_dependency_assertion``
+        applies to an unknown task id.
+
         The structured record of each edge actually invalidated is RETURNED;
         the caller derives the flagged count from it, and nothing is held on
         the instance. The identity lock is per-group_id, so writes for
@@ -3481,8 +3494,8 @@ class MemoryService:
         Each finding is also logged at WARNING with its full structured record
         so the flag is adjudicable from the log alone.
 
-        Best-effort throughout, matching the sibling sub-passes: an unresolvable
-        project root, an absent taskmaster or a failing ground-truth read all
+        Best-effort throughout, matching the sibling sub-passes: an unregistered
+        group_id, an absent taskmaster or a failing ground-truth read all
         return ``[]`` rather than raising, and a per-edge ``update_edge`` failure is
         logged and skipped so the remaining flagged edges are still attempted.
         ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate on
@@ -3513,14 +3526,17 @@ class MemoryService:
 
         if self.taskmaster is None:
             return []
-        project_root = (
-            self._known_projects.get(group_id) or self._memory_metadata_project_root()
-        )
+        project_root = self._known_projects.get(group_id)
         if not project_root:
+            # A REFUSAL, never a guess at another project's graph.
             logger.warning(
-                'Dependency-direction check skipped for group %s: no project root '
-                'resolved from _known_projects or config.taskmaster.project_root',
-                group_id,
+                'Dependency-direction check SKIPPED for group_id=%r: the group is '
+                'absent from `_known_projects` (%d known project(s)), so its '
+                'Taskmaster graph cannot be resolved. No fallback root is used: '
+                'task ids overlap across projects, and judging this episode '
+                "against another project's graph would retire true facts. "
+                '%d edge(s) in this episode go unchecked.',
+                group_id, len(self._known_projects), len(edges),
             )
             return []
 
