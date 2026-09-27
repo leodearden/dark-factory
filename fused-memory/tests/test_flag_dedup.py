@@ -4,6 +4,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import uuid as _uuid_mod
@@ -13278,6 +13279,316 @@ class TestFilterAccountedClusterGrowthFlags:
         assert not noise, (
             f'no candidate was skipped, so nothing may be logged; got {noise!r}'
         )
+
+
+class TestFilterAlreadyRecordedCaveatFlags:
+    """`filter_already_recorded_caveat_flags` drops a premature-widening-caveat
+    finding once the cited task's LIVE metadata already records every cited
+    caveat-source memory id (task 5271).
+
+    Closes the pump_web_ui run-e8913eb1 / finding-3b15dd73 recurrence: Stage 1
+    re-flagged task 18 for a caveat whose ``metadata.memory_hints`` entry was
+    already there, paraphrased rather than copied, and ending "Full rationale:
+    Mem0 memory 6597957b-...".  The memory UUID is the one token the flag and
+    the live metadata share.
+    """
+
+    _CAVEAT_MEMORY_ID = '6597957b-2269-4913-b4a3-8c5bff0df51d'
+    _OTHER_MEMORY_ID = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+
+    def _make_caveat_flag(
+        self,
+        *,
+        flag_type: str = 'premature_widening_evidence_caveat',
+        memory_ids: list[str] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """The Stage-1 finding 3b15dd73, incident-shaped."""
+        ids = [self._CAVEAT_MEMORY_ID] if memory_ids is None else memory_ids
+        flag: dict[str, Any] = {
+            'task_id': '18',
+            'flag_type': flag_type,
+            'category': 'task_metadata_gap',
+            'description': (
+                "Task 18's metadata.memory_hints still lacks the premature-"
+                'widening evidence caveat recorded in Mem0; append it before the '
+                'widening decision is re-read.'
+            ),
+            'cited_tasks': [{
+                'project_id': 'pump_web_ui',
+                'task_id': '18',
+                'title': 'Widen the pump-curve evidence window',
+            }],
+            'cited_memories': [{'memory_id': m, 'store': 'mem0'} for m in ids],
+        }
+        flag.update(extra)
+        return flag
+
+    def _make_task_record(
+        self,
+        *,
+        hint_queries: list[str] | None = None,
+        description: str = '',
+        details: str = '',
+    ) -> dict[str, Any]:
+        """Task 18 as live get_task returns it: the caveat is paraphrased."""
+        queries = (
+            [
+                'pump curve evidence window widening decision',
+                'task 18 temporal caveat recorded 2026-07-30c: the widening '
+                'rests on one week of readings and must be re-checked. '
+                f'Full rationale: Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+            ]
+            if hint_queries is None
+            else hint_queries
+        )
+        return {
+            'id': 18,
+            'title': 'Widen the pump-curve evidence window',
+            'description': description,
+            'details': details,
+            'metadata': {'memory_hints': {'queries': queries}},
+        }
+
+    def _taskmaster(self, **get_task_kwargs: Any) -> AsyncMock:
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(**get_task_kwargs)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_incident_caveat_already_in_live_metadata_is_dropped(self):
+        """(1) The live metadata names the caveat's source memory -> DROP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [], (
+            "task 18's live metadata.memory_hints already cites the caveat-source "
+            f'memory, so the flag must be DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('18', '/root')
+
+    @pytest.mark.asyncio
+    async def test_metadata_lacking_the_id_keeps_the_flag_unchanged(self):
+        """(2) The caveat is genuinely missing -> KEEP, byte-identical."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        snapshot = copy.deepcopy(flag)
+        taskmaster = self._taskmaster(return_value=self._make_task_record(
+            hint_queries=['pump curve evidence window widening decision'],
+        ))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            f'the caveat is not in the live metadata, so KEEP; got {result!r}'
+        )
+        assert flag == snapshot, 'a kept flag must not be modified'
+
+    @pytest.mark.asyncio
+    async def test_get_task_raising_keeps_the_flag(self):
+        """(3) A lookup error KEEPS the flag -- the pinned fail direction."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(side_effect=Exception('boom'))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'a raised get_task must fail toward KEEP. This is deliberately the '
+            'OPPOSITE of filter_false_absence_flags, which fails closed because '
+            'it guards an irreversible delete_memory; here a wrong DROP would '
+            f'silence a genuinely missing caveat every cycle. Got {result!r}'
+        )
+
+    @pytest.mark.parametrize('bad_result', [
+        None,
+        'oops',
+        123,
+        [],
+        {'error': 'Task 18 not found', 'error_type': 'TaskNotFoundError'},
+        {'id': 18, 'title': 't', 'description': '', 'details': ''},
+        {'id': 18, 'title': 't', 'metadata': None},
+    ])
+    @pytest.mark.asyncio
+    async def test_inconclusive_result_keeps_the_flag(self, bad_result):
+        """(4) Non-dict, error-dict or metadata-less results can never confirm."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=bad_result)
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            f'get_task returning {bad_result!r} carries no metadata to confirm '
+            f'against, so the flag must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_id_only_in_description_or_details_keeps_the_flag(self):
+        """(5) The claim is about metadata, so only metadata can refute it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=self._make_task_record(
+            hint_queries=['pump curve evidence window widening decision'],
+            description=f'See Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+            details=f'Caveat source: {self._CAVEAT_MEMORY_ID}',
+        ))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'the id is in description/details but NOT in metadata; the finding '
+            f'claims metadata lacks the caveat, so KEEP; got {result!r}'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'Evidence-Caveat_premature widening',
+        'caveat_evidence_premature_widening',
+    ])
+    @pytest.mark.asyncio
+    async def test_paraphrased_flag_type_spellings_are_candidates(self, flag_type):
+        """(6) canonical_flag_type_family collapses reworded spellings."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag(flag_type=flag_type)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [], (
+            f'{flag_type!r} is the same family as premature_widening_evidence_'
+            f'caveat and its caveat is recorded, so DROP; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_presence_keeps_the_flag(self):
+        """(7) Two cited ids, only one recorded -> KEEP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag(
+            memory_ids=[self._CAVEAT_MEMORY_ID, self._OTHER_MEMORY_ID],
+        )
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'only one of the two cited ids is in the live metadata, so the '
+            f'second caveat may still be missing: KEEP; got {result!r}'
+        )
+
+    @pytest.mark.parametrize('cited', [
+        None,
+        [],
+        [{'memory_id': 'mem0', 'store': 'mem0'}],
+        [{'memory_id': '3', 'store': 'mem0'}],
+    ])
+    @pytest.mark.asyncio
+    async def test_uncitable_candidate_keeps_the_flag_without_io(self, cited):
+        """(8) Nothing discriminating to look for -> KEEP, no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        flag['cited_memories'] = cited
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'a candidate citing no discriminating memory id cannot be confirmed '
+            f"(the metadata contains 'Mem0' and digits by chance): KEEP; got {result!r}"
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_candidates_pass_through_with_zero_io(self):
+        """(9) Other families are out of scope, even when their ids are recorded."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flags = [
+            {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'},
+            {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'},
+            self._make_caveat_flag(flag_type='procedural_knowledge_cluster_growth'),
+        ]
+        snapshot = copy.deepcopy(flags)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', flags)
+
+        assert result == snapshot, (
+            f'non-caveat flags must pass through byte-identical; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.parametrize(('taskmaster', 'project_root'), [
+        (None, '/root'),
+        (AsyncMock(), ''),
+        (None, ''),
+    ])
+    @pytest.mark.asyncio
+    async def test_falsy_dependencies_degrade_to_a_no_op(self, taskmaster, project_root):
+        """(10) Falsy taskmaster / project_root -> unchanged pass-through."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flags = [self._make_caveat_flag()]
+
+        result = await filter_already_recorded_caveat_flags(
+            taskmaster, project_root, flags,
+        )
+
+        assert result == flags
+        if taskmaster is not None:
+            taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_is_not_mutated_and_survivor_order_is_preserved(self):
+        """(11) A new list, survivors in input order, input list untouched."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        first = {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'}
+        recorded = self._make_caveat_flag()
+        middle = {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'}
+        missing = self._make_caveat_flag(memory_ids=[self._OTHER_MEMORY_ID])
+        flags = [first, recorded, middle, missing]
+        snapshot = copy.deepcopy(flags)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', flags)
+
+        assert result == [first, middle, missing]
+        assert result is not flags
+        assert flags == snapshot, 'the input list must not be mutated'
+
 
 # Entity-standing-decision (Hook A / γ, task 2896) — pure match helpers
 # ---------------------------------------------------------------------------
