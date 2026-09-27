@@ -455,3 +455,67 @@ for arm, (lo, hi) in ARMS.items():
           f'p90={sorted(dwell)[int(.9 * len(dwell))]:.2f}h | exits/day={exits / d:.1f}')
 print('at T', depth_at(T, None), depth_at(T, STALE))
 ```
+
+### 7. Status and hot-apply
+
+- The revert is committed on branch `task/5797` at `b7018eae1e`
+  (`verify_admission_task_slots: 1`, plus a dated paragraph in the yaml block
+  pointing here). It was validated with `orchestrator check-config` (no unknown
+  keys) and `load_config` (resolves to 1), and with
+  `tests/scripts/test_orchestrator_config_duplicate_keys.py`,
+  `tests/scripts/test_orchestrator_restart_config_drift.py` and
+  `orchestrator/tests/test_config_verify_admission_reload.py` (14 + 16
+  passed).
+- **The revert is NOT live when this branch is committed.** It goes live only
+  after (a) `task/5797` merges to main AND (b) `reload_config` runs against
+  the running dark-factory orchestrator, which re-reads
+  `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` (the
+  `config_path` recorded in config_reload 420916). Nothing performs (b)
+  automatically: the yaml is not in `orchestrator_restart_watch_prefixes`,
+  `orchestrator_restart_on_merge_enabled` is false, and nothing auto-reloads
+  config.
+- **Success condition:** the returned `applied.verify_admission_task_slots ==
+  {old: 2, new: 1}` with `restart_required` empty. Judge by those
+  dispositions, not by the top-level `reloaded` flag. It is confirmed
+  afterwards by a new runs.db `config_reload` event carrying that `applied`
+  entry.
+- **No restart is needed or wanted.** The knob is green-tier, and a restart
+  destroys the in-flight work it exists to protect.
+- At measurement time no operator revert existed: main still read 2, and no
+  config_reload after 420916 touched the key. The hot-apply ask is
+  **esc-5797-2**. esc-5797-1 (filed at planning time) offered Leo the earlier
+  direct-to-main route.
+- Out-of-scope follow-ups: fused-memory was unreachable (ECONNREFUSED) when
+  `submit_task` was called, so both were filed through `escalate_info` as the
+  plan's fallback, and no ticket ids exist:
+  - **esc-5797-3** (cleanup_needed): codify this A/B cut as a runnable script
+    once task 5798 lands (suggestion_hash `f0ba647a8e9f59c4`).
+  - **esc-5797-4** (infra_issue): the burndown.db dark-factory snapshot hole,
+    2026-09-21T14:50Z..2026-09-27T11:10Z (suggestion_hash `4dc5cea5d2cb7646`).
+
+### 8. Re-measure when
+
+Take this measurement again when any of the following lands. Each one changes
+either what the right slot count is or how it can be measured:
+
+- **5677**: re-land the AsyncMock drain tracking. The orchestrator full suite
+  goes from ~3000s to ~350–900s, which changes the per-leg cost of a slot.
+- **5097**: the `verify_host_policy` knob, preferring the remote verify host. A
+  second host changes the CPU contention this gate measured.
+- **5349**: the remote-verify integrity layer, which has never emitted an
+  event.
+- **5416**: the remote-verify parity window procedure.
+- **5291**, **5295**, **4196**: further task/merge verify-duration and
+  remote-verify work named in Leo's 2026-09-23 ruling.
+- **5798**: makes the admission gate trackable. It changes the SOURCES, not the
+  answer: `workflow_verify` gains `duration_ms`, and slot-wait events appear.
+  Once it lands, M1 should come from runs.db `workflow_verify` rather than the
+  survivorship-biased summary corpus and the rebase-only `rebase_verify_cost`
+  proxy, and M5 should come from the slot-wait events rather than the
+  phase-event occupancy proxy.
+
+The next measurement appends a dated section to this file. It reuses §6's
+Reproduction commands with new arms, cut at the relevant config_reload
+instant, or it uses the runnable script from esc-5797-3 if that exists by
+then. Use the same pre-registered rule shape: an equal-length pre-arm, the
+×1.15 / +5 pp materiality bars, and M4/M5 as context only.
