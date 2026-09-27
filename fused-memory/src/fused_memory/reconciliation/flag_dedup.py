@@ -1525,26 +1525,28 @@ async def maybe_escalate_suppression_streak(
     updates: list[SuppressionStreakUpdate],
     *,
     threshold: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+    volume_threshold: int = SUPPRESSION_STREAK_VOLUME_THRESHOLD,
 ) -> list[str]:
-    """File (or fold) a storm-escape L1 per standing decision whose suppression
-    streak has reached K.
+    """File (or fold) a storm-escape L1 per standing decision whose streak of at
+    least K cycles suppressed more than N flags across its last K.
 
     The filing half of the storm escape's streak arm (task 2943); the streak
-    itself is advanced by :func:`update_suppression_streaks`, whose
-    ``escalate`` verdict selects which *updates* file.  *threshold* is the K
-    that verdict was measured against, named in the record.  Category, record
-    shape, fold and best-effort contract are those of
-    :func:`maybe_escalate_suppression_storm`; only the finding category
-    (:data:`_STREAK_FINDING_CATEGORY`) differs, so the two escapes never fold
-    into each other.
+    and its window are advanced by :func:`update_suppression_streaks`, whose
+    ``escalate`` verdict selects which *updates* file.  *threshold* and
+    *volume_threshold* are the K and N that verdict was measured against, named
+    in the record.  Category, record shape, fold and best-effort contract are
+    those of :func:`maybe_escalate_suppression_storm`; only the finding
+    category (:data:`_STREAK_FINDING_CATEGORY`) differs, so the two escapes
+    never fold into each other.
 
-    It deliberately keeps firing past K.  Escalating does not reset the streak,
-    so a decision still draining files again on every suppressing cycle and
-    each recurrence folds onto the first record, incrementing its
-    ``dedupe_count``.  Resetting would restart the clock and hide a drain that
-    is still running; the fold is what keeps the recurrence quiet without
-    losing it.  A folded record keeps the PARENT's summary, so the streak
-    length named there is the first filing's.
+    It files on every cycle whose window volume stays above N, and each such
+    filing folds onto the pending parent, incrementing its ``dedupe_count``.  A
+    decision that falls back to its steady-state rate stops filing on the next
+    cycle without any reset.  Escalating still does not reset the streak,
+    because restarting the clock would hide a drain that is still running.  A
+    resolved record therefore re-mints only while such a drain continues, the
+    INV-4 behaviour the per-cycle sibling shares.  A folded record keeps the
+    PARENT's summary, so the volume named there is the first filing's.
 
     Returns the entity_uuids that received a NEW record this cycle.
     """
@@ -1557,8 +1559,9 @@ async def maybe_escalate_suppression_streak(
         if not update.escalate:
             continue
         summary = (
-            f'Standing decision for entity {update.entity_uuid} suppressed recon '
-            f'flag(s) in {update.streak} consecutive cycles (>= {threshold})'
+            f'Standing decision for entity {update.entity_uuid} suppressed '
+            f'{update.window_suppressed} recon flag(s) across its last {threshold} '
+            f'consecutive cycles (> {volume_threshold})'
         )
         detail = '\n'.join([
             f'project_id: {project_id}',
@@ -1567,6 +1570,8 @@ async def maybe_escalate_suppression_streak(
             f'grounds: {update.grounds}',
             f'streak: {update.streak}',
             f'threshold: {threshold}',
+            f'suppressed_in_window: {update.window_suppressed}',
+            f'volume_threshold: {volume_threshold}',
         ])
         if _file_or_fold_storm(
             escalation_queue,
