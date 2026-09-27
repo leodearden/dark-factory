@@ -9611,7 +9611,7 @@ async def test_resume_interrupted_runs_does_not_clobber_a_run_its_own_coroutine_
     assert after.completed_at == owners_run.completed_at
 
     assert await _event_statuses(event_buffer, events) == ['drained', 'drained']
-    gc_mock.assert_not_called()
+    assert gc_mock.call_count == 0
     harness.run_full_cycle.assert_not_awaited()
 
     harness_logs = [
@@ -9620,8 +9620,8 @@ async def test_resume_interrupted_runs_does_not_clobber_a_run_its_own_coroutine_
     ]
     assert 'reconciliation.stale_run_recovery_refused' in harness_logs
     assert suppressed_log not in harness_logs
-    harness._record_resume_failure.assert_not_called()
-    harness._escalate.assert_not_called()
+    assert harness._record_resume_failure.call_count == 0
+    assert harness._escalate.call_count == 0
 
 
 @pytest.mark.asyncio
