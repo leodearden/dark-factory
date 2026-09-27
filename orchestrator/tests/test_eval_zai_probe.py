@@ -41,6 +41,15 @@ def _require(handler, **kwargs):
     return require_zai_coding_endpoint(client=client, **kwargs)
 
 
+def _unavailable(handler, **kwargs):
+    """Run the probe against *handler*, requiring it to raise; return the exception."""
+    from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
+
+    with pytest.raises(ZaiCodingPlanUnavailable) as excinfo:
+        _require(handler, **kwargs)
+    return excinfo.value
+
+
 class TestZaiCodingPlanConstants:
     def test_the_coding_base_url_is_the_openai_protocol_coding_endpoint(self):
         from orchestrator.evals.configs import ZAI_CODING_BASE_URL
@@ -100,3 +109,67 @@ class TestRequireZaiCodingEndpointAnswers:
 
         [request] = recorder.requests
         assert request.headers['Authorization'] == 'Bearer tk-test'
+
+
+class TestRequireZaiCodingEndpointFailsLoudly:
+    @pytest.mark.parametrize('status', [401, 403, 404, 429, 500])
+    def test_a_non_2xx_answer_raises_naming_the_endpoint_and_the_plan_key(self, status: int):
+        from orchestrator.evals.configs import ZAI_CODING_BASE_URL
+
+        exc = _unavailable(_Recorder(status, text='denied'), auth_token='tk-test')
+
+        assert exc.outcome is not None
+        assert exc.outcome.status_code == status
+        assert exc.outcome.ok is False
+        message = str(exc)
+        assert ZAI_CODING_BASE_URL in message
+        assert str(status) in message
+        assert 'ZAI_API_KEY' in message
+        assert 'GLM Coding Plan key' in message
+
+    def test_the_providers_reason_is_surfaced(self):
+        body = {'error': {'code': '1113', 'message': 'Insufficient balance'}}
+
+        exc = _unavailable(_Recorder(429, json=body), auth_token='tk-test')
+
+        assert exc.outcome is not None
+        assert 'Insufficient balance' in exc.outcome.detail
+        assert 'Insufficient balance' in str(exc)
+
+    def test_a_huge_body_is_bounded_in_the_detail(self):
+        exc = _unavailable(_Recorder(500, text='x' * 20_000), auth_token='tk-test')
+
+        assert exc.outcome is not None
+        assert len(exc.outcome.detail) < 1_000
+
+    @pytest.mark.parametrize(('error_type', 'message'), [
+        (httpx.ConnectError, 'boom'),
+        (httpx.ReadTimeout, 'slow'),
+    ])
+    def test_a_transport_failure_raises_with_no_status(self, error_type: type, message: str):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise error_type(message, request=request)
+
+        exc = _unavailable(handler, auth_token='tk-test')
+
+        assert exc.outcome is not None
+        assert exc.outcome.status_code is None
+        assert error_type.__name__ in exc.outcome.detail
+
+    @pytest.mark.parametrize('token_kwargs', [{}, {'auth_token': ''}], ids=['unset', 'empty'])
+    def test_a_missing_key_raises_before_any_request(
+        self, token_kwargs: dict, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv('ZAI_API_KEY', raising=False)
+        recorder = _Recorder(200)
+
+        exc = _unavailable(recorder, **token_kwargs)
+
+        assert exc.outcome is None
+        assert 'ZAI_API_KEY' in str(exc)
+        assert recorder.requests == []
+
+    def test_the_failure_is_a_runtime_error_so_an_unaware_caller_still_crashes(self):
+        from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
+
+        assert issubclass(ZaiCodingPlanUnavailable, RuntimeError)
