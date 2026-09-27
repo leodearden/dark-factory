@@ -7067,3 +7067,111 @@ def test_census_report_sections_withheld_is_gated_and_positioned():
     )
     assert keys.index(mod.SECTION_FILED_TASKS) < keys.index(mod.SECTION_WITHHELD)
     assert keys.index(mod.SECTION_WITHHELD) < keys.index(mod.SECTION_COST)
+
+
+# ---------------------------------------------------------------------------
+# task 5931 step-13: RED — run_census routes a dark-factory-owned fix surface
+# into the harness project, and says where each such ticket went.
+# ---------------------------------------------------------------------------
+
+_DF_TITLE = "fused-memory get_task call times out with no diagnostic detail"
+
+
+def _df_marked_invoke_response(prompt, model):
+    """Every "df-marked" digest codes to the SAME harness-marked candidate;
+    every other prompt (the headroom probe included) is a matches-only reply."""
+    if "df-marked" in prompt:
+        return json.dumps(
+            {
+                "matches": [],
+                "candidates": [
+                    {
+                        "title": _DF_TITLE,
+                        "cause": "A task-store read returns a bare timeout.",
+                        "area": "fused-memory MCP / task-store reads",
+                        "origin_phase": "implement",
+                        "manifested_phase": "implement",
+                        "evidence_quote": "-> The operation timed out.",
+                    }
+                ],
+            }
+        )
+    return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+
+def _hosted_kwargs(tmp_path, *, remediation=None, **overrides):
+    """A census OBSERVING 'hosted_project' at tmp_path, over two sessions that
+    both sight the harness-marked cluster -- fileable by recurrence alone."""
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_df_marked_invoke_response),
+        batch_source=[[
+            _hand_digest("s1-df-marked", "a task-store read timed out"),
+            _hand_digest("s2-df-marked", "a task-store read timed out again"),
+        ]],
+        verify_fn=_make_fake_verify_fn(verified_titles={_DF_TITLE}, remediation=remediation),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+        config=config_mod.LegibilityConfig(
+            project_id="hosted_project",
+            project_root=str(tmp_path),
+            escalation_port=8103,
+            cwd_prefixes=[str(tmp_path)],
+        ),
+        project_id="hosted_project",
+        **overrides,
+    )
+
+
+def test_run_census_files_a_harness_fix_surface_into_the_harness_project(tmp_path):
+    kwargs = _hosted_kwargs(tmp_path, harness_project=_HARNESS)
+
+    outcome = mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["project_root"] == _HARNESS.project_root
+    assert filed["metadata"]["origin_project_id"] == "hosted_project"
+    assert outcome.cross_project_tickets == (
+        mod.CrossProjectTicket(ticket_id="tkt_1", project_root=_HARNESS.project_root),
+    )
+
+
+def test_run_census_report_names_the_project_a_cross_project_ticket_went_to(tmp_path):
+    kwargs = _hosted_kwargs(tmp_path, harness_project=_HARNESS)
+
+    outcome = mod.run_census(**kwargs)
+
+    filed_text = _section_text(
+        _sections(
+            filed_ticket_ids=outcome.filed_ticket_ids,
+            cross_project_tickets=outcome.cross_project_tickets,
+        ),
+        mod.SECTION_FILED_TASKS,
+    )
+    assert any(
+        "tkt_1" in line and _HARNESS.project_root in line for line in filed_text.splitlines()
+    )
+    assert filed_text in kwargs["report_path"].read_text(encoding="utf-8")
+
+
+def test_run_census_without_harness_project_files_into_the_observed_project(tmp_path):
+    kwargs = _hosted_kwargs(tmp_path)
+
+    outcome = mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["project_root"] == str(tmp_path)
+    assert outcome.cross_project_tickets == ()
+
+
+def test_run_census_keeps_a_remediated_harness_marked_cluster_observed(tmp_path):
+    kwargs = _hosted_kwargs(
+        tmp_path, harness_project=_HARNESS, remediation=_IN_TREE_REMEDIATION,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["project_root"] == str(tmp_path)
+    assert outcome.cross_project_tickets == ()
