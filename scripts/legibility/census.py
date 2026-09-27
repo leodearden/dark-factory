@@ -1105,6 +1105,7 @@ SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
 SECTION_FILED_TASKS = "filed-tasks"
+SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
 """Stable machine keys for the blocks :func:`census_report_sections` emits.
 
@@ -1160,6 +1161,7 @@ def census_report_sections(
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
+    withheld: tuple[filing_policy.WithheldCluster, ...] = (),
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -1376,6 +1378,20 @@ def census_report_sections(
         filed_tasks.append("_none filed._")
     emit(SECTION_FILED_TASKS, filed_tasks)
 
+    if withheld:
+        recorded_not_filed = [
+            "",
+            "## Recorded, Not Filed",
+            "",
+            f"- {len(withheld)} verified cluster(s) were promoted into the codebook "
+            f"but not filed: each has fewer than {filing_policy.MIN_UNREMEDIATED_SIGHTINGS} "
+            "sightings and no in-tree remediation from the verifier.",
+        ]
+        recorded_not_filed.extend(
+            f"  - {cluster.title} (sightings: {cluster.sighting_count})" for cluster in withheld
+        )
+        emit(SECTION_WITHHELD, recorded_not_filed)
+
     # The trailing "" is the report's final newline, which the join would
     # otherwise not supply.
     emit(SECTION_COST, ["", "## Cost", "", cost_note, ""])
@@ -1406,6 +1422,7 @@ def render_report(
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
+    withheld: tuple[filing_policy.WithheldCluster, ...] = (),
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1430,6 +1447,7 @@ def render_report(
         dry_run=dry_run,
         dropped_verdicts=dropped_verdicts,
         mass_rejection=mass_rejection,
+        withheld=withheld,
     ))
 
 
@@ -1522,6 +1540,40 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
         if candidate.get("title") == title and candidate.get("disposition") == "pending":
             return candidate.get("id")
     return None
+
+
+def _title_sighting_count(cb: dict, title: str | None) -> int:
+    """How many DISTINCT sessions have sighted *title*, across every entry and
+    candidate carrying it -- the same title key ``_find_pending_candidate_id``
+    resolves by. A promoted entry holds a copy of its candidate's sightings,
+    hence the dedup by session; a standing record from an earlier window
+    counts as recurrence."""
+    records = [*(cb.get("entries") or []), *(cb.get("candidates") or [])]
+    return len({
+        sighting.get("session")
+        for record in records
+        if record.get("title") == title
+        for sighting in record.get("sightings") or []
+        if sighting.get("session")
+    })
+
+
+def _split_fileable(
+    verified: list[dict], cb: dict,
+) -> tuple[list[dict], tuple[filing_policy.WithheldCluster, ...]]:
+    """Partition *verified* by ``filing_policy.is_fileable``, counting each
+    cluster's sightings in the post-merge codebook *cb*."""
+    fileable: list[dict] = []
+    withheld: list[filing_policy.WithheldCluster] = []
+    for cluster in verified:
+        sighting_count = _title_sighting_count(cb, cluster.get("title"))
+        if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
+            fileable.append(cluster)
+        else:
+            withheld.append(filing_policy.WithheldCluster(
+                title=cluster.get("title"), sighting_count=sighting_count,
+            ))
+    return fileable, tuple(withheld)
 
 
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
@@ -1874,6 +1926,11 @@ class CensusOutcome:
     being re-mined and re-verified against a verdict that will never change
     without a hand re-open."""
 
+    withheld: tuple[filing_policy.WithheldCluster, ...] = ()
+    """Verified clusters promoted into the codebook but NOT filed, because
+    ``filing_policy.is_fileable`` found neither an in-tree remediation nor a
+    recurrence (``"done"`` and ``"unlanded"`` runs only)."""
+
 
 def _defer(
     stage: str,
@@ -2073,8 +2130,11 @@ def run_census(
     from *verify_fn* would otherwise fail ``codebook.validate`` deep into
     the pipeline) and ``retire_entry`` for any entry ids *verify_fn*
     reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
-    anything is written, on an invalid merge) -> ``build_task_payloads`` +
-    *submit_fn* per payload, best-effort (a raised exception, or a result
+    anything is written, on an invalid merge) -> the singleton filing gate
+    (``_split_fileable``: a verified cluster files only with an in-tree
+    remediation or a recurrence, counted in the merged codebook; a withheld
+    one stays promoted and is listed in the report) -> ``build_task_payloads``
+    over the fileable clusters + *submit_fn* per payload, best-effort (a raised exception, or a result
     carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
     rather than aborting the run or inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
@@ -2495,7 +2555,15 @@ def run_census(
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook.
-    task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
+    fileable, withheld = _split_fileable(verified, updated_codebook)
+    if withheld:
+        logger.info(
+            "census: %d verified cluster(s) recorded but not filed (no in-tree "
+            "remediation, fewer than %d sightings): %s",
+            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
+            [cluster.title for cluster in withheld],
+        )
+    task_payloads = build_task_payloads(fileable, project_root=project_root, project_id=project_id)
     filed_ticket_ids = []
     dry_run_filing = None
     if dry_run_payloads_path is not None:
@@ -2598,6 +2666,7 @@ def run_census(
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
         mass_rejection=mass_rejection,
+        withheld=withheld,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -2652,6 +2721,7 @@ def run_census(
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
         unresolved_verdicts=len(dropped_verdicts),
+        withheld=withheld,
     )
     commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
     if dry_run_filing is not None:
