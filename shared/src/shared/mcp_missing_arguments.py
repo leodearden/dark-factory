@@ -107,8 +107,7 @@ def _refusal(
     arguments: Mapping[str, Any],
     errors: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    ordered_missing = [name for name in properties if name in missing]
-    ordered_missing += [name for name in missing if name not in properties]
+    ordered_missing = _in_declaration_order(properties, missing)
     return {
         'error': f'{tool} was called without required argument(s): {", ".join(ordered_missing)}',
         'code': MISSING_ARGUMENT_CODE,
@@ -127,17 +126,25 @@ def _refusal(
     }
 
 
+def _in_declaration_order(properties: Mapping[str, Any], names: Sequence[str]) -> list[str]:
+    declared = [name for name in properties if name in names]
+    return declared + [name for name in names if name not in properties]
+
+
 def _example_call(
     tool: str,
     properties: Mapping[str, Any],
     missing: Sequence[str],
     arguments: Mapping[str, Any],
 ) -> str:
-    rendered = []
-    for name, node in properties.items():
-        if name in arguments:
-            rendered.append(f'{name}=<as sent>')
-        elif name in missing:
-            declared_type = node.get('type') if isinstance(node, Mapping) else None
-            rendered.append(f'{name}=<{declared_type if isinstance(declared_type, str) else "value"}>')
+    known_provided = [name for name in arguments if name in properties]
+    rendered = [
+        f'{name}=<as sent>' if name in arguments else f'{name}=<{_placeholder(properties.get(name))}>'
+        for name in _in_declaration_order(properties, [*known_provided, *missing])
+    ]
     return f'{tool}({", ".join(rendered)})'
+
+
+def _placeholder(node: Any) -> str:
+    declared_type = node.get('type') if isinstance(node, Mapping) else None
+    return declared_type if isinstance(declared_type, str) else 'value'

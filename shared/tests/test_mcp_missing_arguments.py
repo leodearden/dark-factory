@@ -12,6 +12,7 @@ from typing import Annotated, Any
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import Tool
 from pydantic import BaseModel, Field
 
 from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE, MissingArgumentMiddleware
@@ -53,6 +54,14 @@ class Harness:
         def explode(task_id: str) -> dict:
             _NeedsField.model_validate({})
             return {'ok': True}
+
+        def lone(alpha: str) -> dict:
+            return {'ok': True}
+
+        # A schema whose `required` names something `properties` never declares.
+        tool = Tool.from_function(lone)
+        required = [*tool.parameters['required'], 'ghost']
+        self.mcp.add_tool(tool.model_copy(update={'parameters': {**tool.parameters, 'required': required}}))
 
     async def call(self, tool: str, arguments: dict[str, Any]):
         async with Client(self.mcp) as client:
@@ -111,6 +120,13 @@ async def test_several_missing_arguments_are_listed_in_declaration_order(harness
     assert payload['missing'][1]['schema']['type'] == 'integer'
     assert 'description' not in payload['missing'][1]['schema']
     assert payload['example_call'] == 'pair(alpha=<string>, beta=<integer>)'
+
+
+async def test_example_call_names_a_required_argument_the_schema_leaves_undeclared(harness):
+    payload = await harness.refusal('lone', {})
+
+    assert [m['name'] for m in payload['missing']] == ['alpha', 'ghost']
+    assert payload['example_call'] == 'lone(alpha=<string>, ghost=<value>)'
 
 
 async def test_a_second_defect_in_the_same_call_is_preserved(harness):
