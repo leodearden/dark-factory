@@ -219,7 +219,7 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
 
-Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
+Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already in the drain's already-promoted set (the `member_ids` of pending L2s plus the archive-inclusive cross-check) _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
 
 ### Declared pins: a close can be REFUSED (`declared_pin_refused`)
 
@@ -283,11 +283,15 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
 2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
    If YES → use L2 promotion paths throughout (steps 4 and 5)
    If NO  → fall back to LEGACY mode (see Graceful Degradation)
-3. Drain and deduplicate pending L1 escalations:
-   a. Fetch candidates: get_pending_escalations(), filter level==1, status==pending → candidate_l1s
-   b. Fetch pending L2s: get_pending_escalations(), filter level==2, status==pending → pending_l2s
-   c. Build already_promoted = {id for L2 in pending_l2s for id in L2.members}
-   d. work_batch = [e for e in candidate_l1s if e.id not in already_promoted]
+3. Drain and deduplicate pending L1 escalations (exact call shapes: Draining pending escalations):
+   a. get_pending_escalations(level=1) → candidate_l1s
+      (FULL shape: the handlers read agent_role and detail)
+   b. get_pending_escalations(level=2, compact=True) → pending_l2s
+   c. already_promoted = ⋃ member_ids over pending_l2s
+      ∪ the ARCHIVE-INCLUSIVE cross-check: ⋃ member_ids over
+        get_task_escalations(task_id=tid, level=2, status=None, compact=True),
+        one call per DISTINCT candidate task_id
+   d. work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
    (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
     and re-promotes the same items, inflating the counter and re-spending RCA budget)
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
@@ -313,15 +317,42 @@ The digest is emitted on rotation-limit exit regardless of mode (promotion or le
 
 On startup and after each watcher fire:
 
-1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations()` → filter `level == 1`, `status == "pending"`
-2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
-3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
+1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations(level=1)` → `candidate_l1s`, in FULL shape
+2. Fetch pending L2s: `mcp__escalation__get_pending_escalations(level=2, compact=True)` → `pending_l2s`
+3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus the `member_ids` of every L2 the **archive-inclusive cross-check** returns — one `mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True)` call per DISTINCT candidate `task_id`
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
 5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule. **Carve-out — never skip a path-guard synthetic-anchor record on triage freshness:** if the item matches the path-guard discriminator (`category == "scope_violation"` AND (`agent_role == "fused-memory/path-guard"` OR id starts with `esc-task-path-guard`)), keep it in `work_batch` **however fresh its `triaged_at` is**. Rationale in the contract below — a stamp cannot end the respawn loop these records cause, so skipping one merely defers the only action that can.
 
+Steps 1–4 as calls, one call per line:
+
+```python
+candidate_l1s = mcp__escalation__get_pending_escalations(level=1)                 # FULL rows: handlers read agent_role/detail
+pending_l2s   = mcp__escalation__get_pending_escalations(level=2, compact=True)   # compact rows expose member_ids, NOT members
+
+already_promoted = {mid for l2 in pending_l2s for mid in l2.get("member_ids", [])}
+
+# ARCHIVE-INCLUSIVE cross-check: status=None scans queue root + archive/<date>/.
+for tid in {e["task_id"] for e in candidate_l1s if e.get("task_id")}:
+    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True):
+        already_promoted |= set(l2.get("member_ids", []))
+
+work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
+```
+
+- **Zero session memory.** Every input comes from the queue, so a fresh rotation computes the identical set (`plans/resume-charter-loss-remediation-prd.md` boundary row B2).
+- **Why the archive read.** `get_pending_escalations` is pending-only BY DESIGN: a resolved or dismissed L2 is archived and invisible to it. Member L1s stay `status == "pending"` at L1 after promotion, and the L2→member resolve cascade is best-effort (a member that fails to resolve is logged and skipped). Without this read, a member a human already dispositioned re-enters `work_batch`. `get_task_escalations` is the archive-inclusive counterpart.
+- **Call shape.**
+  - The lookup is keyed on `task_id` with NO time dimension, so one call per DISTINCT candidate `task_id` is the available shape. A date-windowed archive scan bounds the wrong axis and is not used.
+  - `level=2` narrows to promotion targets. `status=None` is what makes the read archive-inclusive; `status='pending'` would reproduce the blindness.
+  - Every L2 read is `compact=True`, so both unions read one key, `member_ids`.
+  - The L1 candidate read stays FULL: the compact projection drops `agent_role` and `detail`, which step 5's carve-out and the category handlers read.
+  - `get_task_escalation_history` is the wrong tool here: it has no `compact`, and it returns the full `detail` on every row.
+- **`root_cause` is a FOLD HINT over pending L2s only.** When a `work_batch` item's hypothesis matches a pending L2's `root_cause`, pass that identical string to `promote_to_l2`; the server folds on the canonical form. It is NOT a `work_batch` filter, and it is NOT taken from archived L2s: a resolved L2 cannot be folded into.
+- **Residual.** An L2's stored `task_id` is its FIRST member's `task_id`, so a cluster is reached through that member and then contributes ALL its `member_ids`. The one shape this misses is a cluster whose representative L1 is no longer pending while a sibling member filed under a different `task_id` still is, which arises only from a partially-failed cascade.
+
 Handle only the filtered `work_batch` before (re)starting the wait. On first assessment of each surviving item, stamp a triage-ack annotation (below) so later drain cycles can skip it instead of re-deriving its disposition from scratch — **EXCEPT** the path-guard synthetic-anchor records the carve-out above just kept in the batch. Those are never skip-eligible, so a stamp buys nothing and actively harms: it makes the NEXT rotation drop the record at this very filter, before the branch that can actually close it runs. Handle them, never stamp them; see [Triage-ack freshness contract](#triage-ack-freshness-contract).
 
-**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server deduplicates, so no duplicate L2s are created). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily. The triage stamp (step 5) generalizes this same cost-avoidance to L1/L2 items that were already assessed but not promoted or resolved — the disposition itself (not just the promotion fact) is now remembered rotation-to-rotation.
+**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server folds into a still-PENDING L2, so no duplicate is created; once that L2 is resolved or dismissed there is nothing to fold into, and a re-promotion re-files a question a human already answered — step 3's archive-inclusive cross-check is what prevents that). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily. The triage stamp (step 5) generalizes this same cost-avoidance to L1/L2 items that were already assessed but not promoted or resolved — the disposition itself (not just the promotion fact) is now remembered rotation-to-rotation.
 
 ### Triage-ack freshness contract
 
