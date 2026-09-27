@@ -52,7 +52,7 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
-    '/api/v2/dashboard/tasks':                        { 'ACTIVE_TASKS': PLAIN, 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
+    '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -124,15 +124,6 @@ window.DF_DATA = {
   AGENTS: [],
   ORCHESTRATORS: [],
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
-  // ACTIVE_TASKS row shape: {id, project, title, status, agent, started, loops,
-  //   attempts, lane, phase, lane_state, runtime_offline, deps, meta_files,
-  //   train, external_deps, prd, claimant_run_id, heartbeat_at, stranded}.
-  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
-  //   `stranded` (task 3543) is the independent liveness verdict, computed
-  //   server-side from the claim columns via shared.task_claimant.is_stranded.
-  //   Rows carry no description/details: the Task Detail pane fetches those
-  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
-  ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
   // Projects the tasks handler ran out of budget for — state UNKNOWN, not
@@ -154,6 +145,15 @@ window.DF_DATA = {
   //   Seeded EMPTY, so a read before the first fetch finds no entry, which
   //   task_snapshot.js::projectCensus answers as an unknown Datum rather
   //   than a zero.
+  //   Each rows Datum's value is a list of rows shaped {id, project, title,
+  //   status, agent, started, loops, attempts, lane, phase, lane_state,
+  //   runtime_offline, deps, meta_files, train, external_deps, prd,
+  //   claimant_run_id, heartbeat_at, stranded}.
+  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
+  //   `stranded` (task 3543) is the independent liveness verdict, computed
+  //   server-side from the claim columns via shared.task_claimant.is_stranded.
+  //   Rows carry no description/details: the Task Detail pane fetches those
+  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {

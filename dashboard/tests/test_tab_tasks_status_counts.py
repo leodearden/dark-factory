@@ -26,8 +26,12 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import destructure_bindings, extract_function_body, strip_js_comments, walk_balanced
-
+from _dashboard_helpers import (
+    destructure_bindings,
+    extract_function_body,
+    strip_js_comments,
+    walk_balanced,
+)
 from shared.task_statuses import TaskStatus
 
 

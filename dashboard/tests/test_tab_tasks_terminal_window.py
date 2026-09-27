@@ -18,7 +18,12 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, find_function_params, strip_js_comments, walk_balanced
+from _dashboard_helpers import (
+    extract_function_body,
+    find_function_params,
+    strip_js_comments,
+    walk_balanced,
+)
 
 
 @pytest.fixture(scope='module')
