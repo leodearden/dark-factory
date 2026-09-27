@@ -14279,12 +14279,22 @@ class TestUpdateSuppressionStreaks:
         }
 
 
-async def _seed_streak(ledger: ReconLedgerStore, entity_uuid: str, streak: int) -> None:
+async def _seed_streak(
+    ledger: ReconLedgerStore,
+    entity_uuid: str,
+    streak: int,
+    recent_counts: tuple[int, ...] | None = None,
+) -> None:
+    """Seed a streak row. The default window is the steady state the updater
+    itself would have written: one flag in each of the last K cycles."""
+    if recent_counts is None:
+        recent_counts = (1,) * min(streak, SUPPRESSION_STREAK_THRESHOLD_CYCLES)
     await ledger.upsert_suppression_streak(
         project_id=_STREAK_PID,
         entity_uuid=entity_uuid,
         grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
         streak=streak,
+        recent_counts=recent_counts,
         last_run_id='run-seed',
         updated_at=_STREAK_NOW,
         expires_at='2099-01-01T00:00:00+00:00',

@@ -46,6 +46,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_ACTIVE,
     STATE_EXPIRED,
     STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 from fused_memory.server import main as server_main
 from fused_memory.services.memory_service import MemoryService
@@ -1189,6 +1190,7 @@ _STREAK_WRITE = dict(
     entity_uuid='uuid-streak',
     grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     streak=2,
+    recent_counts=(),
     last_run_id='run-2',
     updated_at='2026-07-01T00:00:00+00:00',
     expires_at='2026-09-29T00:00:00+00:00',
@@ -1305,6 +1307,74 @@ async def test_upsert_suppression_streak_rejects_malformed_writes_loudly(
         await store.upsert_suppression_streak(**{**_STREAK_WRITE, field: bad_value})
 
     assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_round_trips_its_per_cycle_window(store):
+    """The row carries the streak's recent per-cycle suppression counts, in
+    order, next to the streak count."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+
+    (row,) = await store.list_suppression_streaks('proj-s')
+    payload = json.loads(row.payload_json)
+    assert payload[STREAK_PAYLOAD_KEY] == 3
+    assert payload[STREAK_WINDOW_PAYLOAD_KEY] == [2, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_accepts_the_reset_shape(store):
+    """A reset is a zero streak with an empty window."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 0, 'recent_counts': ()}
+    )
+
+    (row,) = await store.list_suppression_streaks('proj-s')
+    payload = json.loads(row.payload_json)
+    assert payload[STREAK_PAYLOAD_KEY] == 0
+    assert payload[STREAK_WINDOW_PAYLOAD_KEY] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('streak', 'recent_counts'),
+    [
+        pytest.param(3, (1, 0, 1), id='zero-entry'),
+        pytest.param(3, (1, -2), id='negative-entry'),
+        pytest.param(3, (True,), id='bool-entry'),
+        pytest.param(3, ('1',), id='str-entry'),
+        pytest.param(3, '1', id='str-as-the-sequence'),
+        pytest.param(1, (1, 1), id='longer-than-the-streak'),
+    ],
+)
+async def test_upsert_suppression_streak_rejects_a_malformed_window_loudly(
+    store, streak, recent_counts
+):
+    """INV-1: each window entry is one suppressing cycle's count (a non-bool
+    int >= 1), and the window holds at most one entry per cycle of the streak.
+    Anything else raises ValueError naming recent_counts and writes no row."""
+    with pytest.raises(ValueError, match='recent_counts'):
+        await store.upsert_suppression_streak(
+            **{**_STREAK_WRITE, 'streak': streak, 'recent_counts': recent_counts}
+        )
+
+    assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_replaces_the_stored_window(store):
+    """A second write stores exactly the window it was given; it never merges
+    into the one already on the row."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 4, 'recent_counts': (5,)}
+    )
+
+    (row,) = await store.list_suppression_streaks('proj-s')
+    assert json.loads(row.payload_json)[STREAK_WINDOW_PAYLOAD_KEY] == [5]
 
 
 @pytest.mark.asyncio
