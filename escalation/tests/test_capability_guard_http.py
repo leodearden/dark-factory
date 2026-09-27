@@ -61,27 +61,16 @@ from escalation.queue import EscalationQueue
 # once in ``_serve_escalation_mcp_impl``, with its regression test in
 # ``test_serve_escalation_mcp_fixture.py``.
 #
-# All THREE halves of the harness now live exactly once, none with a second
-# copy (tasks 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes
-# from ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
-# ``_escalation_http.escalation_http_call``; the SEEDING half from
-# ``_escalation_seed.seed_escalation``. The latter two are uniquely-named
-# sibling modules rather than conftest fixtures because a plain function is not
-# a fixture and would be unreachable from the module-level ``async def``
-# partials and ``_seed`` below.
-#
-# Those local adapters survive on purpose: each is a single delegation carrying
-# no header logic, no transport construction, no protocol knowledge and no
-# record construction, so there is nothing left that could drift -- what they
-# still carry is one per-module fact each (the partials' per-tool intent in
-# their docstrings; ``_seed``'s default summary), which a shared module could
-# not state without making one docstring serve two different arguments.
-#
-# For the CALL half the single-source property is asserted, not merely
-# asserted-to: ``test_escalation_http_helper.py`` AST-scans this directory for
-# it. There is deliberately no equivalent scan for the seeding half -- see
-# ``test_escalation_seed_helper.py``'s docstring for why that precedent does
-# not transfer.
+# Every part of the harness is now shared, none with a second copy (tasks
+# 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes from
+# ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
+# ``_escalation_http.escalation_http_call``; record seeding from
+# ``_escalation_seed.seed_escalation``. The ``async def`` partials and ``_seed``
+# below survive on purpose: each is a single delegation carrying one
+# per-module fact (per-tool intent in a docstring, or a default summary), so
+# there is nothing left that could drift. The CALL half's single-source
+# property is asserted, not merely asserted-to:
+# ``test_escalation_http_helper.py`` AST-scans this directory for it.
 # ---------------------------------------------------------------------------
 
 
@@ -142,16 +131,7 @@ def _seed(
     summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level*, labelled for THIS module.
-
-    A one-call delegation to ``_escalation_seed.seed_escalation``. The only
-    thing it still owns is this module's default summary, and that is
-    load-bearing: every test here shares one module-scoped ``EscalationQueue``,
-    so the summary is what names the seeding module when a cross-test
-    interference failure surfaces a record. ``severity``, ``category``,
-    ``agent_role`` and every other ``Escalation`` field are the shared helper's
-    business and can still be overridden via **kw.
-    """
+    """Delegates to ``seed_escalation`` with this module's default summary."""
     if summary is None:
         summary = f'capability-guard test escalation (level={level})'
     return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)

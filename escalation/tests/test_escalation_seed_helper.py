@@ -1,35 +1,10 @@
-"""Contract tests for the shared escalation seeding helper (``_escalation_seed``).
+"""Contract tests for ``_escalation_seed.seed_escalation``.
 
-``_escalation_seed.seed_escalation`` is the single construction site for a
-directly-submitted pending ``Escalation`` in this suite (INV-5; task 4997 folded
-the three near-twin ``_seed`` bodies in ``test_capability_guard_http.py``,
-``test_status_authority_gate.py`` and ``test_server.py`` into it). Roughly 67
-call sites now reach ``queue.submit()`` only through it, so a silent regression
-here would change the premise of the capability-guard scenarios and the
-status-authority C1-C4 cells at once while they all stayed green — hence its own
-pins.
-
-Every assertion reads the record back through ``queue.get(...)``, the escalation
-package's own read path, never through queue internals or a mock — the
-convention ``test_status_authority_gate.py``'s module docstring states
-explicitly. A plain ``tmp_path`` queue is enough for all of it: seeding touches
-no wire, so there is no server, no fixture and no asyncio here.
-
-One property per test, and deliberately no id-FORMAT assertion: the last test
-pins only that repeated seeds under one ``task_id`` get DISTINCT retrievable
-ids, because ``escalation/src/escalation/queue.py::make_id`` documents at length
-that its argument is an id-namespace key which need not equal the record's
-``task_id`` and from which nothing may derive one.
-
-There is deliberately NO AST scan asserting this is the only seeding site, of
-the kind ``test_escalation_http_helper.py`` runs for the capability headers.
-That scan works because its subject is a two-element vocabulary of wire-protocol
-literals with a single legitimate home. Seeding has no such vocabulary: this
-directory legitimately holds ~15 other ``queue.submit()`` helpers with genuinely
-different shapes (``_seed_heavy``, ``_seed_l1``, ``_seed_and_stamp``, ...), so a
-scan broad enough to catch a reintroduced twin would be red on the healthy tree
-and one narrow enough to be green would be matching an arbitrary shape rather
-than the property.
+Every direct-seeding call site in the consumer modules reaches
+``queue.submit()`` through this helper, so a regression here would change their
+premises while they stayed green. Every assertion reads the record back through
+``queue.get(...)``, the escalation package's own read path, never through queue
+internals or a mock.
 """
 
 from __future__ import annotations
@@ -73,7 +48,7 @@ class TestSeedEscalation:
 
     def test_explicit_summary_is_used_verbatim(self, tmp_path: Path) -> None:
         """An explicit summary reaches the record unmodified. This is the one
-        parameter the three consumer wrappers exist to supply."""
+        parameter the consumer wrappers exist to supply."""
         queue = EscalationQueue(tmp_path / 'esc')
 
         esc = seed_escalation(
@@ -87,7 +62,7 @@ class TestSeedEscalation:
     def test_agent_role_defaults_to_implementer_and_is_overridable(
         self, tmp_path: Path,
     ) -> None:
-        """Both cells, since ten capability-guard call sites override the role."""
+        """Both cells, since several capability-guard call sites override the role."""
         queue = EscalationQueue(tmp_path / 'esc')
 
         defaulted = seed_escalation(queue, level=1, task_id='task-role-default')
@@ -121,10 +96,8 @@ class TestSeedEscalation:
         assert reread.members == ['esc-x-1']
 
     def test_repeated_seeds_under_one_task_id_get_distinct_ids(self, tmp_path: Path) -> None:
-        """Two seeds under one task_id are two distinct retrievable records — the
-        ``queue.make_id`` counter behaviour both module-scoped-queue consumers
-        depend on. Asserted WITHOUT pinning an id format, deliberately: see the
-        module docstring and ``queue.py::make_id``."""
+        """Two seeds under one task_id are two distinct retrievable records. No id
+        format is pinned: ``escalation/src/escalation/queue.py::make_id`` owns it."""
         queue = EscalationQueue(tmp_path / 'esc')
 
         first = seed_escalation(queue, level=1, task_id='task-twice')

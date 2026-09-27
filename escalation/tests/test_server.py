@@ -262,13 +262,9 @@ class TestGetPendingLevelFilter:
     """get_pending_escalations(level=N) filters by escalation level."""
 
     def _seed_esc(self, queue: EscalationQueue, task_id: str, level: int) -> Escalation:
-        """Seed a pending escalation at the given level directly via queue.submit().
-
-        A one-call delegation to ``_escalation_seed.seed_escalation``; the only
-        thing it still owns is this class's level-labelled default summary. Kept
-        as a method with this exact positional shape so its eighteen call sites
-        below stay unchanged.
-        """
+        """Delegates to ``seed_escalation`` with this class's default summary,
+        kept as a method with this positional shape so existing call sites stay
+        unchanged."""
         return seed_escalation(
             queue, level=level, task_id=task_id,
             summary=f'level={level} test escalation',

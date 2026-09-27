@@ -72,15 +72,7 @@ def _seed(
     summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level*, labelled for THIS module.
-
-    A one-call delegation to ``_escalation_seed.seed_escalation``. The only
-    thing it still owns is this module's default summary, and that is
-    load-bearing: the C1-C4 tests share one module-scoped ``EscalationQueue``,
-    so the summary is what names the seeding module when a cross-test
-    interference failure surfaces a record. ``severity``, ``category``,
-    ``agent_role`` and every other ``Escalation`` field are the shared helper's
-    business and can still be overridden via **kw."""
+    """Delegates to ``seed_escalation`` with this module's default summary."""
     if summary is None:
         summary = f'status-authority-gate test escalation (level={level})'
     return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
