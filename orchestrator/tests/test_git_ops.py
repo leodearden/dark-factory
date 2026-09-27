@@ -4451,6 +4451,7 @@ async def _body_quote_newer_than_true_merge(repo: Path, marker: str) -> str | No
 
 async def _revert_of_true_merge(repo: Path, marker: str) -> str | None:
     """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
+    assert_isolated_git_repo(repo)
     merge = await _land_branch(repo, '5765', {'landed.txt': 'x\n'})
     rc, _, err = await _run(
         ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
