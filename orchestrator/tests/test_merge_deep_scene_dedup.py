@@ -13,8 +13,8 @@ sweep also forbids a consumer from re-DEFINING any name the scene defines.
 Both checks carry a positive control, because a satisfied check and an inert
 one look the same.
 
-Scope: the deep integration gate, plus the invariant gate's re-definition
-sweep.  test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py
+Scope: the deep integration gate and deep landing modules, plus the invariant
+gate's re-definition sweep.  test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py
 are NOT yet covered; task 5172 owns extending this file to them.
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ import _merge_deep_scene as scene
 import pytest
 
 DEEP_GATE = 'test_merge_queue_deep_integration_gate'
+DEEP_LANDING = 'test_merge_queue_deep_landing'
 INVARIANT_GATE = 'test_merge_queue_invariant_integration_gate'
 
 _TESTS_DIR = Path(__file__).parent
@@ -189,14 +190,21 @@ def test_the_scene_defines_every_name_in_the_shared_layer() -> None:
     )
 
 
-def test_deep_integration_gate_single_sources_the_shared_layer() -> None:
+_EACH_DEEP_CONSUMER = pytest.mark.parametrize(
+    'consumer_name', [DEEP_GATE, DEEP_LANDING], ids=['deep_gate', 'deep_landing'],
+)
+
+
+@_EACH_DEEP_CONSUMER
+def test_the_deep_module_single_sources_the_shared_layer(consumer_name: str) -> None:
     _assert_single_sourced(
-        importlib.import_module(DEEP_GATE), SHARED_SCENE_LAYER
+        importlib.import_module(consumer_name), SHARED_SCENE_LAYER
     )
 
 
-def test_deep_integration_gate_re_defines_no_shared_name() -> None:
-    _assert_no_redefinitions(_module_path(DEEP_GATE), _scene_definitions())
+@_EACH_DEEP_CONSUMER
+def test_the_deep_module_re_defines_no_shared_name(consumer_name: str) -> None:
+    _assert_no_redefinitions(_module_path(consumer_name), _scene_definitions())
 
 
 def test_the_invariant_gate_re_defines_no_shared_name() -> None:
