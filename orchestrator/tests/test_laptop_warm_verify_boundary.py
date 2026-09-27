@@ -2248,6 +2248,8 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 #
 # Deliberate, narrow exceptions to "zero real subprocess" (task 4312,
 # joining test_read_direct_children_sees_a_real_fork_including_off_main_thread
+# and task 5945's
+# test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe
 # below): the two timeout-diagnostic tests spawn a real `proc` because the
 # diagnostic message's CONTENT -- the leader's actual returncode and, where
 # applicable, its stderr tail -- is exactly what is under test.  The poll
@@ -2601,6 +2603,82 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
         if off_main is not None:
             off_main.kill()
             off_main.wait()
+
+
+def test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe():
+    """A sibling thread exiting mid-probe must not make a LIVE process read as "cannot probe".
+
+    The probe lists ``/proc/<pid>/task`` and then reads each tid's
+    ``children``; a thread that exits in between has no ``children`` left to
+    read.  That is routine in any threaded process -- pytest itself brackets
+    every test with faulthandler / pytest-timeout watchdog threads -- and it
+    says nothing about the threads still alive.  Task 5945: the recorded
+    flake of the test above was exactly ``assert None is not None`` on a live
+    xdist worker.
+
+    Two churner threads keep starting and joining no-op threads while this
+    thread probes.  The probe loop is bounded by a CONDITION -- at least
+    ``required_exits`` sibling-thread exits observed while probing -- not by
+    a probe count or a clock, so its power does not depend on scheduler
+    speed.  The ``Event`` waits are handoff barriers, not timing assertions.
+    """
+    required_exits = 200
+    stop = threading.Event()
+    exit_counts = [0, 0]
+    ready = [threading.Event() for _ in exit_counts]
+
+    def churn(slot: int) -> None:
+        while not stop.is_set():
+            sibling = threading.Thread(target=lambda: None)
+            try:
+                sibling.start()
+            except RuntimeError:
+                return  # "can't start new thread" -- fails the exit-count assert
+            sibling.join()
+            exit_counts[slot] += 1
+            ready[slot].set()
+
+    churners = [threading.Thread(target=churn, args=(slot,)) for slot in range(len(exit_counts))]
+    child = subprocess.Popen(_DURABLE_CHILD_ARGV)
+    probes = none_count = missing_count = 0
+    try:
+        for churner in churners:
+            churner.start()
+        for event in ready:
+            assert event.wait(timeout=30.0), 'churner never completed a thread lifecycle'
+        exits_before = sum(exit_counts)
+        while sum(exit_counts) - exits_before < required_exits and any(
+            churner.is_alive() for churner in churners
+        ):
+            probed = _read_direct_children(os.getpid())
+            probes += 1
+            if probed is None:
+                none_count += 1
+            elif child.pid not in probed:
+                missing_count += 1
+        exits_during = sum(exit_counts) - exits_before
+    finally:
+        stop.set()
+        for churner in churners:
+            churner.join(timeout=30.0)
+        child.kill()
+        child.wait()
+
+    assert exits_during >= required_exits, (
+        f'only {exits_during} sibling-thread exits (needed {required_exits}) '
+        f'overlapped {probes} probes -- the churners stopped early, so the churn '
+        f'never overlapped the probes and this test proved nothing'
+    )
+    assert none_count == 0, (
+        f'{none_count} of {probes} probes of this LIVE process reported "cannot '
+        f'probe" across {exits_during} sibling-thread exits -- a thread that exits '
+        f'between the task/ listing and its children read must be skipped, not '
+        f'collapse the whole probe to None'
+    )
+    assert missing_count == 0, (
+        f'{missing_count} of {probes} answered probes missed direct child '
+        f'{child.pid}, forked from this thread -- it must appear in every one'
+    )
 
 
 def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
