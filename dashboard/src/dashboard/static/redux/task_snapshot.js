@@ -279,6 +279,12 @@ function terminalWindowProjects(projectIds, filter, groupedIds) {
   return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
 }
 
+// The projects in `wanted` that were not in `wantedBefore`: the only ones a
+// change to the wanted set owes a request, since the rest already had theirs.
+function terminalWindowEntrants(wantedBefore, wanted) {
+  return wanted.filter(id => !wantedBefore.includes(id));
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced by classic_script_scope.test.mjs.
 const TASK_SNAPSHOT_API = {
@@ -300,6 +306,7 @@ const TASK_SNAPSHOT_API = {
   viewRows,
   unrequestedTerminalRows,
   terminalWindowProjects,
+  terminalWindowEntrants,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -18,6 +18,7 @@ const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
+  terminalWindowEntrants,
   CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
 } = window.DF_TASK_SNAPSHOT;
 
@@ -682,15 +683,18 @@ function TasksTab({ projectFilter, search }) {
   const wanted = terminalWindowProjects(projectIds, filter, grouped);
   const wantedKey = wanted.join('\n');
   const [terminalOutcomes, setTerminalOutcomes] = uS_T({});
+  // No cleanup cancels a pending outcome: a later run does not re-request a
+  // project still in the set, so its outcome arrives only via the run that asked.
+  const wantedBefore = uR_T([]);
   uE_T(() => {
-    let current = true;
-    setTerminalOutcomes(o => ({ ...o, ...Object.fromEntries(wanted.map(project => [project, null])) }));
-    for (const project of wanted) {
+    const entrants = terminalWindowEntrants(wantedBefore.current, wanted);
+    wantedBefore.current = wanted;
+    setTerminalOutcomes(o => ({ ...o, ...Object.fromEntries(entrants.map(project => [project, null])) }));
+    for (const project of entrants) {
       DF_LOADER_T.requestOnDemand('terminal', project).then(outcome => {
-        if (current) setTerminalOutcomes(o => ({ ...o, [project]: outcome }));
+        setTerminalOutcomes(o => ({ ...o, [project]: outcome }));
       });
     }
-    return () => { current = false; };
   }, [wantedKey]);
   const terminalOf = (id) => (wanted.includes(id)
     ? DF_LOADER_T.onDemandDatum('terminal', id, terminalOutcomes[id] ?? null)

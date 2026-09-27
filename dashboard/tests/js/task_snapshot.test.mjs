@@ -40,7 +40,7 @@ const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
 const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
-const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects } = snapshot;
+const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
@@ -59,6 +59,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'unrequestedTerminalRows',
   'snapshotRowsOver',
   'terminalWindowProjects',
+  'terminalWindowEntrants',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -803,4 +804,39 @@ test('terminalWindowProjects: its inputs are not mutated', () => {
   assert.deepEqual(projectIds, PROJECT_IDS);
   assert.deepEqual(filter, { terminal: false });
   assert.deepEqual(grouped, ['hive', 'reify']);
+});
+
+// ── terminalWindowEntrants: which wanted projects a request is owed ────────
+// PRD decision 5's "once as the project enters the wanted set": a change to the
+// set requests only the projects that were not already in it, so grouping one
+// project by PRD does not re-fetch the window of every project already wanted.
+
+test('terminalWindowEntrants: a project already wanted is not requested again', () => {
+  assert.deepEqual(terminalWindowEntrants(['reify'], ['dark-factory', 'reify']), ['dark-factory']);
+  assert.deepEqual(terminalWindowEntrants(PROJECT_IDS, PROJECT_IDS), []);
+});
+
+test('terminalWindowEntrants: the first wanted set is requested whole, in its own order', () => {
+  assert.deepEqual(terminalWindowEntrants([], PROJECT_IDS), PROJECT_IDS);
+});
+
+test('terminalWindowEntrants: a project that left the set is requested again when it re-enters', () => {
+  const before = terminalWindowProjects(PROJECT_IDS, {}, ['hive']);
+  const left = terminalWindowProjects(PROJECT_IDS, {}, []);
+  assert.deepEqual(terminalWindowEntrants(before, left), []);
+  assert.deepEqual(terminalWindowEntrants(left, before), ['hive']);
+});
+
+test('terminalWindowEntrants: toggling the terminal view on requests only the projects not yet grouped', () => {
+  const grouped = terminalWindowProjects(PROJECT_IDS, { terminal: false }, ['reify']);
+  const everything = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify']);
+  assert.deepEqual(terminalWindowEntrants(grouped, everything), ['dark-factory', 'hive']);
+});
+
+test('terminalWindowEntrants: its inputs are not mutated', () => {
+  const before = ['reify'];
+  const wanted = ['dark-factory', 'reify'];
+  terminalWindowEntrants(before, wanted);
+  assert.deepEqual(before, ['reify']);
+  assert.deepEqual(wanted, ['dark-factory', 'reify']);
 });

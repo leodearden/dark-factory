@@ -96,6 +96,36 @@ def test_the_window_is_requested_once_per_entry_into_the_wanted_set(tasks_tab_co
     )
 
 
+def test_a_project_already_in_the_wanted_set_is_not_requested_again(tasks_tab_code, wanted):
+    """Only the entrants are requested; which ids those are executes in task_snapshot.test.mjs."""
+    [effect] = [
+        e for e in (
+            walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
+            for match in re.finditer(r'\buE_T\s*\(', tasks_tab_code)
+        )
+        if "requestOnDemand('terminal'" in e
+    ]
+    entrants = re.search(rf'\bconst\s+(\w+)\s*=\s*terminalWindowEntrants\(\s*(\w+)\.current\s*,\s*{wanted}\s*\)', effect)
+    assert entrants, (
+        f'the effect does not compute terminalWindowEntrants(<ref>.current, {wanted}): every key change '
+        're-requests the window of each project already wanted'
+    )
+    arrived, before = entrants.groups()
+    assert re.search(rf'\bconst\s+{before}\s*=\s*uR_T\(', tasks_tab_code), f'`{before}` is not a ref TasksTab holds'
+    assert re.search(rf'\b{before}\.current\s*=\s*{wanted}\s*;', effect), (
+        f'the effect never records {wanted} as `{before}.current`, so the next run cannot tell who entered'
+    )
+    loop = re.search(r'\bfor\s*\(\s*const\s+(\w+)\s+of\s+(\w+)\s*\)', effect)
+    assert loop and loop.group(2) == arrived, f'the request loop does not iterate `{arrived}`: {effect}'
+    assert re.search(rf"\b{arrived}\.map\(\s*(\w+)\s*=>\s*\[\s*\1\s*,\s*null\s*\]", effect), (
+        f'only the entrants\' outcomes are reset to null; resetting `{wanted}` blanks settled ones'
+    )
+    assert not re.search(r'\breturn\s*\(\s*\)\s*=>', effect), (
+        'a cleanup that drops pending outcomes loses a still-wanted project\'s: the next run '
+        'does not request it again'
+    )
+
+
 def test_a_requesting_project_reads_its_own_outcome_and_the_rest_read_the_unrequested_window(
     tasks_tab_code, tab_tasks_code, wanted,
 ):
