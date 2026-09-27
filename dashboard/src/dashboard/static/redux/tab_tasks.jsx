@@ -1,6 +1,6 @@
 /* Tasks tab: per-project dependency graph + filters + detail panel.
    Least-dependent tasks at top; tasks depending on them stack below. */
-const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
+const { ProjectGroup: PG_T, Segmented: SEG_T, Pip, DatumReading } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 // One namespace alias, never destructured: data.js's top-level consts share this
@@ -11,22 +11,14 @@ const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focus
 const {
   prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, groupTasksByPrd, orderPrdGroups,
 } = window.DF_PRD_GROUPING;
-const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
-// Interim, deleted by leaf γ3 — task_done_count.js's header says why.
-const { doneCount } = window.DF_TASK_DONE_COUNT;
-
-// Dot colour per activity pip. activityPips is pure and owns ORDER and
-// zero-suppression; colour is the caller's concern. Each reuses the hue
-// operators already associate with that status elsewhere in this tab
-// (PALETTE aliases `running` to the same hue as `in-progress`).
-const PIP_DOT_COLOR_T = {
-  running: CP_T.accent,
-  blocked: CP_T.bad,
-  'merge-deferred': 'var(--merge-deferred)',
-};
+// Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
+const {
+  projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
+  CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
+} = window.DF_TASK_SNAPSHOT;
 
 // CSS accent per probe-status tone (runtime_format.js owns which tone each
 // status gets; this only translates a tone into a colour for the banner's
@@ -685,12 +677,14 @@ function TasksTab({ projectFilter, search }) {
     return () => document.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // Filter, default {active, pending} on
-  const [filters, setFilters] = tasksPersistedState('df.tasksFilters',
-    { active: true, pending: true, complete: false, deferred: false, cancelled: false });
-  const flipFilter = (k) => setFilters(f => ({ ...f, [k]: !f[k] }));
+  // The census views, in-flight and backlog on by default. A new key, not
+  // 'df.tasksFilters': an old {active, pending, ...} object would read as
+  // "nothing selected" under the view keys.
+  const [filterMap, setFilterMap] = tasksPersistedState('df.tasks.views', { in_flight: true, backlog: true });
+  const filter = Object.fromEntries(CENSUS_VIEWS_T.map(v => [v.key, !!(filterMap || {})[v.key]]));
+  const flipFilter = (key) => setFilterMap({ ...filter, [key]: !filter[key] });
 
-  const allTasks = DF_T.ACTIVE_TASKS;
+  const allTasks = snapshotRowsOver(DF_T);
   const projects = DF_T.PROJECTS.filter(p =>
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
@@ -724,7 +718,7 @@ function TasksTab({ projectFilter, search }) {
     'count-unknown': 'tasks-count-unknown-banner',
   };
 
-  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // Runtime-probe health, derived frontend-side from the snapshot rows
   // (deliberately not a new top-level payload key — the per-project fact is
   // already fully recoverable from `runtime_status`, so a new key would carry
   // zero extra information). `runtime_status` is produced by
@@ -735,7 +729,7 @@ function TasksTab({ projectFilter, search }) {
   // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
   // answer different questions: tasksBannerNotices reports whether TASK DATA
   // is available, a distinction decided server-side in app.api_tasks, while
-  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // rtProbeSummary is a client-side derivation over the snapshot rows
   // reporting whether we could reach the ORCHESTRATORS. Those are independent
   // — fused-memory being down says nothing about orchestrator reachability —
   // so both banners can show at once, and neither gates the other.
@@ -764,14 +758,6 @@ function TasksTab({ projectFilter, search }) {
   // orchestrators may be healthy — check the dashboard first" shown mid-triage.
   const probeSummary = rtProbeSummary(allTasks);
 
-  function statusMatches(s) {
-    if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
-    if (filters.pending   && s === 'pending')    return true;
-    if (filters.complete  && s === 'done')       return true;
-    if (filters.deferred  && s === 'deferred')   return true;
-    if (filters.cancelled && s === 'cancelled')  return true;
-    return false;
-  }
   function searchMatches(t) {
     if (!search) return true;
     const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
@@ -822,11 +808,9 @@ function TasksTab({ projectFilter, search }) {
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>
         <div className="seg">
-          <button className={filters.active    ? 'on' : ''} onClick={() => flipFilter('active')}>active</button>
-          <button className={filters.pending   ? 'on' : ''} onClick={() => flipFilter('pending')}>pending</button>
-          <button className={filters.complete  ? 'on' : ''} onClick={() => flipFilter('complete')}>complete</button>
-          <button className={filters.deferred  ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
-          <button className={filters.cancelled ? 'on' : ''} onClick={() => flipFilter('cancelled')}>cancelled</button>
+          {CENSUS_VIEWS_T.map(v => (
+            <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(v.key)}>{v.label}</button>
+          ))}
         </div>
         <span className={focusMode && focusAnchorId ? 'focus-chip' : ''}
               style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
@@ -839,37 +823,12 @@ function TasksTab({ projectFilter, search }) {
       <div className="col-span-12" style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 16, minHeight: 0 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {projects.map(p => {
-            const projTasks = allTasks.filter(t => t.project === p.id);
-            const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
-            // One pass for every header tally. running / blocked / mergeDeferred
-            // are reported SEPARATELY rather than merged into one "N active"
-            // number: only `running` is bounded by max_concurrent_tasks — a
-            // blocked or merge-deferred task holds no agent slot — so the merged
-            // number routinely exceeded the cap and read as a cap breach.
-            // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
-            // reify "50 active" against 48; neither was a real breach.
-            const statusCounts = projectStatusCounts(projTasks);
-            // Display keys are picked EXPLICITLY rather than spread in from
-            // statusCounts. Its `done` tallies only the done rows loaded into
-            // ACTIVE_TASKS, and the default render fetches none; spreading it
-            // onto the display object would park it beside the measured
-            // `complete` under a near-synonymous name, and the next
-            // `{counts.done} done` edit would silently render a zero nobody
-            // measured.
-            const counts = {
-              total: statusCounts.total,
-              running: statusCounts.running,
-              blocked: statusCounts.blocked,
-              mergeDeferred: statusCounts.mergeDeferred,
-              pending: statusCounts.pending,
-              // The census's done count, or the placeholder when the census
-              // was not measured. A missing count does NOT mean zero: falling
-              // back to a tally of this tab's rows once rendered a confident
-              // "0 done", because no done row is ever sent. The banner's
-              // 'count-unknown' notice names the projects whose rows are
-              // current but whose census is not.
-              complete: doneCount(DF_T.TASKS_SNAPSHOT[p.id]),
-            };
+            const census = projectCensus(DF_T, p.id);
+            const rows = projectRows(DF_T, p.id);
+            const terminal = unrequestedTerminalRows(DF_T[DF_LOADER_T.ON_DEMAND_KEYS.terminal.key(p.id)]);
+            const listed = viewRows(rows, terminal, filter);
+            const held = viewRows(rows, terminal, EVERY_VIEW_T).rows;
+            const filtered = listed.rows.filter(searchMatches);
             // The ONE focus-narrowing site. Both the header count below and
             // the group body read this single result, so they cannot be fed
             // different arrays — which is exactly what went wrong before
@@ -882,7 +841,7 @@ function TasksTab({ projectFilter, search }) {
             // render paths (a ProjectTaskGraph wrapper, since deleted, and
             // ProjectPrdGroups). For an OPEN group dropping them costs no
             // measured work: both were reference-keyed on `filtered`, which
-            // projTasks.filter(...) above rebuilds as a fresh array on every
+            // listed.rows.filter(...) above rebuilds as a fresh array on every
             // TasksTab render — including the app-wide 1s clock tick — so both
             // already recomputed every render. That is the same hazard
             // ProjectPrdGroups documents for its own signature-keyed memos.
@@ -903,16 +862,9 @@ function TasksTab({ projectFilter, search }) {
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
-                {activityPips(counts).map(pip => (
-                  <span className="pip" key={pip.key}>
-                    <span className="pip-dot" style={{ background: PIP_DOT_COLOR_T[pip.key] }}></span>
-                    {pip.count} {pip.label}
-                  </span>
-                ))}
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
+                {CENSUS_VIEWS_T.map(v => <Pip key={v.key} datum={census} color={CP_T[v.tone]} format={v.reading} />)}
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                  {groupView.shownCount}/{counts.total} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
+                  {groupView.shownCount}/{held.length} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
                 </span>
               </>
             );
@@ -927,10 +879,14 @@ function TasksTab({ projectFilter, search }) {
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
+                {listed.placeholder && <div className="empty" title={listed.placeholder.title}>{listed.placeholder.text}</div>}
+                {listed.notes.map(note => (
+                  <div key={note} className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{note}</div>
+                ))}
                 {groupView.emptiedByFocus
                   ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                   : groupByPrd
-                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={projTasks} selectedId={selectedId}
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} selectedId={selectedId}
                                         onSelect={setSelectedId} onEnterFocus={enterFocus} />
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
                                  onSelect={setSelectedId} onEnterFocus={enterFocus} />}

@@ -228,44 +228,27 @@ test('(c) the verdict is read off the census alone, whatever banner the rows ear
   }
 });
 
-// ── Wiring: no consumer reads DONE_COUNTS, both take the guard ─────────────
+// ── Wiring: no former consumer reads DONE_COUNTS or takes the guard ────────
 
-// tabs.jsx left in task 5589 (gamma2): OrchTab reads the census through
-// task_snapshot.js. tab_tasks.jsx is gamma3's, which deletes this module.
-const CONSUMERS = ['tab_tasks.jsx'];
+// tabs.jsx left in task 5589 (gamma2) and tab_tasks.jsx in task 5590 (gamma3):
+// both read the census through task_snapshot.js, and this module goes with them.
+const FORMER_CONSUMERS = ['tabs.jsx', 'tab_tasks.jsx'];
 
-test('no consumer still reads DONE_COUNTS', () => {
-  for (const name of CONSUMERS) {
+test('no former consumer still reads DONE_COUNTS', () => {
+  for (const name of FORMER_CONSUMERS) {
     const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
     const reads = source.match(/\.DONE_COUNTS\b/g) || [];
-    assert.deepEqual(
-      reads,
-      [],
-      `${name} still reads DONE_COUNTS (${reads.length} site(s)). /tasks no longer ` +
-        'serves it, and data.js no longer seeds it, so the read is undefined and ' +
-        "the site's fallback renders a confident \"0 done\". Read the census " +
-        'through doneCount() from window.DF_TASK_DONE_COUNT instead.',
-    );
+    assert.deepEqual(reads, [], `${name} still reads DONE_COUNTS, which /tasks no longer serves`);
   }
 });
 
-test('every consumer destructures the guard it depends on', () => {
-  for (const name of CONSUMERS) {
+test('no former consumer takes the interim guard', () => {
+  for (const name of FORMER_CONSUMERS) {
     const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
-    assert.ok(
-      /=\s*window\.DF_TASK_DONE_COUNT\s*;/.test(source),
-      `${name} never destructures window.DF_TASK_DONE_COUNT, so its done count ` +
-        'has no guard to go through',
+    assert.equal(
+      /window\.DF_TASK_DONE_COUNT/.test(source),
+      false,
+      `${name} still destructures window.DF_TASK_DONE_COUNT; it reads the census through task_snapshot.js instead`,
     );
   }
-});
-
-test('tabs.jsx no longer takes the interim guard', () => {
-  const source = fs.readFileSync(path.join(REDUX_DIR, 'tabs.jsx'), 'utf8');
-  assert.equal(
-    /window\.DF_TASK_DONE_COUNT/.test(source),
-    false,
-    'tabs.jsx still destructures window.DF_TASK_DONE_COUNT; OrchTab reads the ' +
-      "census's terminal view through task_snapshot.js instead",
-  );
 });
