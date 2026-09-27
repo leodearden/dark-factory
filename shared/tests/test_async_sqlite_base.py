@@ -969,15 +969,16 @@ async def _collide_with_a_pinned_read(
     3. ``foreign`` commits, so the owner's pinned snapshot is now stale.
     4. Only then is the gate released.
     """
-    reader = asyncio.create_task(read())
-    try:
-        await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
-        writer = asyncio.create_task(_sqlite_error_name(write))
-        await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
-        await foreign.commit()
-    finally:
-        gate.release()
-    return await reader, await writer
+    async with asyncio.TaskGroup() as tasks:
+        reader = tasks.create_task(read())
+        try:
+            await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+            writer = tasks.create_task(_sqlite_error_name(write))
+            await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
+            await foreign.commit()
+        finally:
+            gate.release()
+    return reader.result(), writer.result()
 
 
 @pytest.fixture
