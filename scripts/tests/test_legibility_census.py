@@ -6922,6 +6922,15 @@ def test_default_verify_fn_drops_a_remediation_path_outside_the_tree(tmp_path, a
     assert "remediation" not in cluster
 
 
+@pytest.mark.parametrize("path", ["docs/a\x00b.md", "x" * 5000], ids=["nul-byte", "too-long"])
+def test_default_verify_fn_drops_an_unresolvable_remediation_path(tmp_path, path):
+    result = _verify_one(
+        _tree_with_guide(tmp_path), _remediation_verdict({"path": path, "change": "Document X"}),
+    )
+    [cluster] = result["verified"]
+    assert "remediation" not in cluster
+
+
 @pytest.mark.parametrize(
     "reply",
     [

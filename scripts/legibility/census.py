@@ -2820,8 +2820,14 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
         "OBSERVABLE fact about the CURRENT state of that tree -- never a "
         "diagnosis or a guess about root cause you cannot directly "
         "verify.\n\n"
+        "Give a remediation ONLY when a specific EXISTING file or directory "
+        "in this tree produces, teaches, or fails to guard against the "
+        "confusion; otherwise null -- including when the cause lies in "
+        "tooling this tree does not contain.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
-        'exactly this shape: {"verified": true|false, "reason": "..."}.\n\n'
+        'exactly this shape: {"verified": true|false, "reason": "...", '
+        '"remediation": {"path": "<path relative to ' + str(project_root) + '>", '
+        '"change": "<one sentence>"} | null}.\n\n'
         "=== CLUSTER ===\n" + json.dumps(cluster)
     )
 
@@ -2838,6 +2844,40 @@ def _synthesis_prompt(verified: list) -> str:
         "verified.\n\n"
         "=== VERIFIED CLUSTERS ===\n" + json.dumps(verified)
     )
+
+
+def _in_tree_remediation(raw, *, project_root: str) -> dict | None:
+    """The verifier's proposed remediation, normalised to a path relative to
+    *project_root*, or ``None`` unless it names something that EXISTS inside
+    that tree. The verifier is sandboxed to the observed tree, so a
+    remediation is by construction a change the observed project can make."""
+    if filing_policy.proposed_remediation({"remediation": raw}) is None:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        target = (root / raw["path"]).resolve()
+        in_tree = target.is_relative_to(root) and target.exists()
+    except (OSError, ValueError):
+        return None
+    if not in_tree:
+        return None
+    return {"path": target.relative_to(root).as_posix(), "change": raw["change"].strip()}
+
+
+def _with_in_tree_remediation(cluster: dict, raw, *, project_root: str) -> dict:
+    """*cluster*, plus the verifier's remediation when it survives
+    ``_in_tree_remediation``. An offered-but-rejected remediation is logged,
+    never silently dropped."""
+    remediation = _in_tree_remediation(raw, project_root=project_root)
+    if remediation is not None:
+        return {**cluster, "remediation": remediation}
+    if raw is not None:
+        logger.warning(
+            "census: verifier remediation for cluster %r rejected (not an existing "
+            "path inside %s): %r",
+            cluster.get("title"), project_root, raw.get("path") if isinstance(raw, dict) else raw,
+        )
+    return cluster
 
 
 def _build_default_verify_fn(
@@ -3065,7 +3105,14 @@ def _build_default_verify_fn(
                 )
                 rejected.append(cluster)
                 continue
-            (verified if verdict.get("verified") else rejected).append(cluster)
+            if verdict.get("verified"):
+                verified.append(
+                    _with_in_tree_remediation(
+                        cluster, verdict.get("remediation"), project_root=project_root,
+                    )
+                )
+            else:
+                rejected.append(cluster)
 
             # (c) The backstop. Guarded on `remaining > 1` so no probe is
             # spent after the last cluster, where it would guard a stage
