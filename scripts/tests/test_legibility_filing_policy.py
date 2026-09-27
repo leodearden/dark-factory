@@ -310,3 +310,74 @@ def test_escalation_mcp_tool_in_the_title_matches():
 )
 def test_missing_or_none_fields_do_not_raise(cluster):
     assert filing_policy.harness_fix_surface(cluster, harness_root=HARNESS_ROOT) == ()
+
+
+# ---------------------------------------------------------------------------
+# resolve_target — where a verified cluster files
+# ---------------------------------------------------------------------------
+
+OBSERVED = filing_policy.ProjectRef("/home/leo/src/reify", "reify")
+HARNESS = filing_policy.ProjectRef(HARNESS_ROOT, "dark_factory")
+IN_TREE_REMEDIATION = {"path": "docs/x.md", "change": "Add a note on the timeout"}
+
+
+def _resolve(cluster, *, harness=HARNESS):
+    return filing_policy.resolve_target(cluster, observed=OBSERVED, harness=harness)
+
+
+def test_harness_marked_cluster_files_into_the_harness():
+    target = _resolve(REIFY_7895)
+    assert target.project == HARNESS
+    assert target.fix_surface != ()
+
+
+def test_marker_less_cluster_stays_observed():
+    assert _resolve(REIFY_7909) == filing_policy.FilingTarget(project=OBSERVED, fix_surface=())
+
+
+def test_no_harness_keeps_every_cluster_observed():
+    assert _resolve(REIFY_7895, harness=None).project == OBSERVED
+
+
+def test_harness_censusing_itself_is_a_no_op():
+    same_project = filing_policy.ProjectRef(HARNESS_ROOT, "reify")
+    assert _resolve(REIFY_7895, harness=same_project) == filing_policy.FilingTarget(
+        project=OBSERVED, fix_surface=(),
+    )
+
+
+def test_in_tree_remediation_keeps_a_harness_marked_cluster_observed():
+    cluster = {**REIFY_7895, "remediation": IN_TREE_REMEDIATION}
+    assert _resolve(cluster).project == OBSERVED
+
+
+def test_complete_override_pair_wins_over_markers_and_remediation():
+    cluster = {
+        **REIFY_7895,
+        "remediation": IN_TREE_REMEDIATION,
+        "target_project_root": "/srv/elsewhere",
+        "target_project_id": "elsewhere",
+    }
+    assert _resolve(cluster).project == filing_policy.ProjectRef("/srv/elsewhere", "elsewhere")
+
+
+@pytest.mark.parametrize("partial_key", ["target_project_root", "target_project_id"])
+@pytest.mark.parametrize(
+    ("cluster", "expected"),
+    [pytest.param(REIFY_7895, HARNESS, id="marked"), pytest.param(REIFY_7909, OBSERVED, id="unmarked")],
+)
+def test_partial_override_is_warned_and_ignored(caplog, partial_key, cluster, expected):
+    with caplog.at_level("WARNING", logger="legibility.filing_policy"):
+        target = _resolve({**cluster, partial_key: "/srv/elsewhere"})
+    assert target.project == expected
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+@pytest.mark.parametrize("cluster", MISFILED_INTO_REIFY)
+def test_misfiled_reify_clusters_resolve_to_the_harness(cluster):
+    assert _resolve(cluster).project == HARNESS
+
+
+@pytest.mark.parametrize("cluster", REIFY_ACTIONABLE)
+def test_reify_actionable_clusters_resolve_to_the_observed_project(cluster):
+    assert _resolve(cluster).project == OBSERVED
