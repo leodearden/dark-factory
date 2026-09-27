@@ -36,6 +36,19 @@ def hook_command(delegate: Path) -> str:
     return shlex.join([str(Path(__file__).resolve()), str(delegate)])
 
 
+def is_hook_command(command: str, delegate: Path) -> bool:
+    """True for hook_command(delegate) as composed by ANY checkout's copy of this file."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    return (
+        len(argv) == 2
+        and Path(argv[0]).name == Path(__file__).name
+        and argv[1] == str(delegate)
+    )
+
+
 def _command_of(raw: bytes) -> str | None:
     try:
         payload = json.loads(raw)

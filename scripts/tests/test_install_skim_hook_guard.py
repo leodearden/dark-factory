@@ -1,14 +1,15 @@
 """Tests for scripts/install_skim_hook_guard.py: the pure settings transform and its CLI.
 
 The transform must MERGE, never clobber (skills/spawn/hooks/README.md): only the
-command of the bare skim hook entry changes, and re-applying it is a no-op. The
-CLI is exercised on real tmp files, including once under a bare interpreter the
-way scripts/setup-host.sh invokes it.
+command of the skim hook entry changes (bare, or guarded by another checkout),
+and re-applying it is a no-op. The CLI is exercised on real tmp files, including
+once under a bare interpreter the way scripts/setup-host.sh invokes it.
 """
 
 import copy
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -22,6 +23,8 @@ from install_skim_hook_guard import Outcome, guard_skim_hook
 INSTALLER = Path(__file__).resolve().parents[1] / "install_skim_hook_guard.py"
 
 SKIM_HOOK = Path("/home/u/.claude/hooks/skim-rewrite.sh")
+
+REAPED_GUARD = "/gone/.worktrees/42/scripts/skim_hook_guard.py"
 
 
 def _host_settings(skim_hook):
@@ -88,8 +91,13 @@ def _main(settings_path, skim_hook):
     )
 
 
-def test_bare_skim_entry_is_rewired_and_nothing_else_changes():
-    settings = _host_settings(str(SKIM_HOOK))
+@pytest.mark.parametrize(
+    "command",
+    [str(SKIM_HOOK), shlex.join([REAPED_GUARD, str(SKIM_HOOK)])],
+    ids=["bare", "guard-from-a-reaped-checkout"],
+)
+def test_skim_entry_is_rewired_and_nothing_else_changes(command):
+    settings = _host_settings(command)
     before = copy.deepcopy(settings)
 
     result = guard_skim_hook(settings, SKIM_HOOK)
@@ -103,7 +111,7 @@ def test_bare_skim_entry_is_rewired_and_nothing_else_changes():
     }
     assert result.settings["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
     reverted = copy.deepcopy(result.settings)
-    _bash_hook(reverted)["command"] = str(SKIM_HOOK)
+    _bash_hook(reverted)["command"] = command
     assert reverted == before
     assert settings == before
 
@@ -123,8 +131,16 @@ def test_guarding_is_idempotent():
         {"env": {"A": "1"}},
         {"hooks": {"Stop": _host_settings(str(SKIM_HOOK))["hooks"]["Stop"]}},
         _host_settings("/x/some-other-hook.sh"),
+        _host_settings(shlex.join([REAPED_GUARD, "/x/some-other-hook.sh"])),
+        _host_settings(f"{REAPED_GUARD} '{SKIM_HOOK}"),
     ],
-    ids=["no-hooks", "no-pre-tool-use", "bash-entry-runs-another-command"],
+    ids=[
+        "no-hooks",
+        "no-pre-tool-use",
+        "bash-entry-runs-another-command",
+        "guard-in-front-of-another-command",
+        "unparseable-command",
+    ],
 )
 def test_settings_without_the_skim_hook_are_not_wired(settings):
     before = copy.deepcopy(settings)
@@ -192,6 +208,37 @@ def test_cli_fails_when_the_skim_hook_is_not_wired(tmp_path, capsys):
     assert target.read_bytes() == original
     assert _backups(target) == []
     assert str(skim_hook) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{not json",
+        "[]",
+        '{"hooks": []}',
+        '{"hooks": {"PreToolUse": {"matcher": "Bash"}}}',
+        '{"hooks": {"PreToolUse": [["Bash"]]}}',
+        '{"hooks": {"PreToolUse": [{"hooks": ["/x/hook.sh"]}]}}',
+    ],
+    ids=[
+        "invalid-json",
+        "top-level-array",
+        "hooks-not-an-object",
+        "pre-tool-use-not-an-array",
+        "entry-not-an-object",
+        "hook-not-an-object",
+    ],
+)
+def test_cli_names_the_file_when_settings_are_malformed(tmp_path, capsys, text):
+    skim_hook = tmp_path / "hooks" / "skim-rewrite.sh"
+    target = tmp_path / "settings.json"
+    target.write_text(text, encoding="utf-8")
+
+    assert _main(target, skim_hook) == 1
+
+    assert target.read_text(encoding="utf-8") == text
+    assert _backups(target) == []
+    assert f"{target}: unreadable or unexpected shape: " in capsys.readouterr().err
 
 
 def test_cli_fails_when_the_settings_file_is_missing(tmp_path, capsys):
