@@ -5893,6 +5893,145 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
         )
 
 
+async def _run_consolidator_filter_chain(
+    stage: MemoryConsolidator,
+    flags: list[dict],
+    *,
+    events: list | None = None,
+) -> tuple[StageReport, list[list[dict]], AsyncMock]:
+    """Run *stage* over an LLM report carrying *flags*, through the real filter chain.
+
+    Returns the final report, every flag list dedup_flags was handed, and the
+    acknowledge_resolved_flags mock.  filter_false_absence_flags is a
+    passthrough so only the chain under test decides what survives.
+    """
+    base_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=list(flags),
+        stats={},
+        llm_calls=1,
+        tokens_used=100,
+    )
+    dedup_call_args: list[list[dict]] = []
+
+    async def _dedup_spy(**kwargs):
+        dedup_call_args.append(kwargs.get('flags', []))
+        return kwargs.get('flags', [])
+
+    ack_mock = AsyncMock(return_value=1)
+    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    with (
+        patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+        patch(f'{module}.dedup_flags', new=_dedup_spy),
+        patch(
+            f'{module}.filter_false_absence_flags',
+            new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+        ),
+        patch(f'{module}.acknowledge_resolved_flags', new=ack_mock),
+    ):
+        report = await stage.run(
+            events=[] if events is None else events,
+            watermark=Watermark(project_id=stage.project_id),
+            prior_reports=[],
+            run_id='r-test',
+        )
+    return report, dedup_call_args, ack_mock
+
+
+class TestMemoryConsolidatorAlreadyRecordedCaveatFilter:
+    """filter_already_recorded_caveat_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271).
+
+    A premature-widening-caveat flag whose cited caveat-source memory id is
+    already in the task's live metadata is dropped before dedup_flags, counted
+    in already_recorded_caveat_flags_dropped, and reclaimed as RESOLVED via
+    acknowledge_resolved_flags(mode='delete').
+    """
+
+    _CAVEAT_MEMORY_ID = '6597957b-2269-4913-b4a3-8c5bff0df51d'
+
+    def _stage(self, *, hint_queries: list[str]) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('pump_web_ui', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        task_18 = {
+            'id': 18,
+            'title': 'Widen the pump-curve evidence window',
+            'status': 'pending',
+            'description': '',
+            'details': '',
+            'metadata': {'memory_hints': {'queries': hint_queries}},
+        }
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(
+            side_effect=lambda tid, root: task_18 if str(tid) == '18' else {'status': 'pending'}
+        )
+        return stage
+
+    def _caveat_flag(self) -> dict:
+        return {
+            'task_id': '18',
+            'flag_type': 'premature_widening_evidence_caveat',
+            'category': 'task_metadata_gap',
+            'description': (
+                "Task 18's metadata.memory_hints still lacks the premature-widening "
+                'evidence caveat.'
+            ),
+            'cited_tasks': [{'project_id': 'pump_web_ui', 'task_id': '18', 'title': 't'}],
+            'cited_memories': [{'memory_id': self._CAVEAT_MEMORY_ID, 'store': 'mem0'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_recorded_caveat_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(hint_queries=[
+            'task 18 temporal caveat recorded 2026-07-30c. '
+            f'Full rationale: Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+        ])
+        caveat_flag = self._caveat_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [caveat_flag, survivor],
+        )
+
+        assert caveat_flag not in (report.items_flagged or []), (
+            "the caveat is already in task 18's live metadata, so the flag must "
+            'be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert caveat_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        assert survivor in dedup_call_args[0]
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [caveat_flag], (
+            'the drop is a RESOLUTION, so exactly the caveat flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_caveat_survives_with_a_zero_stat(self):
+        stage = self._stage(hint_queries=['pump curve evidence window widening'])
+        caveat_flag = self._caveat_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(stage, [caveat_flag])
+
+        assert caveat_flag in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task 2029 scenario (a) — MemoryConsolidator acknowledges flags dropped by
 # the Stage-1 filter chain via acknowledge_resolved_flags(mode='delete').
