@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -28,6 +29,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
@@ -3172,6 +3174,106 @@ class TestWatcherAllowedTools:
             f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
             'silently blind the drain to archived L2s (task 3999); '
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3999: the drain protocol in the rotation's system prompt
+# ---------------------------------------------------------------------------
+
+_DRAIN_HEADING = '### Draining pending escalations'
+
+
+def _watcher_skill_text() -> str:
+    return load_skill_system_prompt('escalation-watcher-auto')
+
+
+def _fenced_code_blocks(text: str) -> list[str]:
+    return re.findall(r'```.*?\n(.*?)```', text, re.S)
+
+
+def _skill_section(text: str, heading: str) -> str:
+    """The `heading` line up to (not including) the next line starting '### '."""
+    lines = text.splitlines()
+    start = lines.index(heading)
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith('### ')),
+        len(lines),
+    )
+    return '\n'.join(lines[start:end])
+
+
+class TestWatcherSkillDrainProtocol:
+    """The rotation's drain protocol, read as the harness injects it.
+
+    SKILL.md's body IS the rotation's system prompt, and its fenced code
+    blocks are the calls the rotation makes. These tests pin only that API
+    surface: tool names, call shapes and projection keys.
+    """
+
+    def test_every_mcp_tool_the_skill_calls_is_granted(self) -> None:
+        called = {
+            token
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for token in re.findall(r'mcp__[a-z-]+__[a-z0-9_]+', block)
+        }
+        assert called, 'found no MCP tool calls in SKILL.md code blocks'
+        ungranted = sorted(called - set(_WATCHER_ALLOWED_TOOLS))
+        assert not ungranted, (
+            'SKILL.md code blocks call MCP tools missing from '
+            '_WATCHER_ALLOWED_TOOLS; --allowed-tools is an allowlist, so each '
+            f'call is permission-denied (a silent no-op): {ungranted}'
+        )
+
+    def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
+        text = _watcher_skill_text()
+        drain = _skill_section(text, _DRAIN_HEADING)
+        assert 'get_task_escalations' in drain, (
+            'the drain must read L2s archive-inclusively via '
+            'get_task_escalations: get_pending_escalations is pending-only, so '
+            "a resolved L2's members re-enter work_batch "
+            '(delivered_check drain-loop-reads-the-escalation-archive)'
+        )
+        assert 'already_promoted = {id for L2 in pending_l2s' not in text, (
+            'already_promoted must not be built from pending L2s alone '
+            '(delivered_check already-promoted-rebuilt-beyond-pending-l2-members)'
+        )
+        assert 'member_ids' in drain, (
+            'the drain must union member_ids, the compact projection key '
+            '(escalation/src/escalation/server.py::_compact_escalation)'
+        )
+
+    def test_drain_reads_l2s_compact_and_l1_candidates_full(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        lines = [
+            line
+            for block in _fenced_code_blocks(drain)
+            for line in block.splitlines()
+        ]
+        pending_l2_reads = [
+            line for line in lines if 'get_pending_escalations(level=2' in line
+        ]
+        archive_l2_reads = [line for line in lines if 'get_task_escalations(' in line]
+        l1_reads = [line for line in lines if 'get_pending_escalations(level=1' in line]
+        assert pending_l2_reads and archive_l2_reads and l1_reads, (
+            'the drain section must show the pending-L2, archive-L2 and L1 '
+            'candidate reads as one-line calls in a code block; found '
+            f'{pending_l2_reads=} {archive_l2_reads=} {l1_reads=}'
+        )
+        full_l2_reads = [
+            line
+            for line in pending_l2_reads + archive_l2_reads
+            if 'compact=True' not in line
+        ]
+        assert not full_l2_reads, (
+            'every L2 read must pass compact=True: member_ids exists only on '
+            f'compact rows (server.py::_compact_escalation): {full_l2_reads}'
+        )
+        compact_l1_reads = [line for line in l1_reads if 'compact=True' in line]
+        assert not compact_l1_reads, (
+            'the L1 candidate read must stay FULL-shape: the compact projection '
+            'drops agent_role and detail, which the path-guard carve-out and '
+            f'the handlers read: {compact_l1_reads}'
         )
 
 
