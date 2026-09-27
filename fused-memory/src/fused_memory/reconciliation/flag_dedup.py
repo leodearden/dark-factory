@@ -346,6 +346,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
@@ -427,7 +428,7 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
 
     Only the SUPPRESSION row's task_id is ever decomposed by this helper --
     a flag's own task_id is never split (see :func:`filter_suppressed`).
-    :func:`_cluster_growth_candidate_task_ids` (task 3476) is the separate
+    :func:`_flag_candidate_task_ids` (task 3476) is the separate
     splitter that DOES decompose a flag's own composite task_id, for its own
     task-resolution purposes; that claim above stays true of this helper.
 
@@ -5546,7 +5547,7 @@ def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
     return 'cluster' in tokens and 'growth' in tokens
 
 
-def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
+def _flag_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
     """Return the memory ids *flag* structurally cites, in citation order (task 3476).
 
     Reads ONLY ``flag['cited_memories'][].memory_id`` -- the schema-required,
@@ -5554,8 +5555,8 @@ def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
     requires ``memory_id`` + ``store``; the ids are re-resolved by
     ``verify_cited_memories``).  Deliberately NOT a UUID regex over the
     finding's free text: Stage-1 prose routinely embeds NON-memory uuids (run
-    ids, finding ids, causation ids) that will never appear in a gate task's
-    cluster list, so a prose extractor would make the caller's all-present test
+    ids, finding ids, causation ids) that will never appear in the cited
+    task's text, so a prose extractor would make the caller's all-present test
     permanently unsatisfiable and the guard a silent no-op.
 
     Entries whose ``store`` is not ``'mem0'`` are INCLUDED, conservatively: an
@@ -5627,16 +5628,16 @@ def _is_discriminating_memory_id(memory_id: str) -> bool:
     )
 
 
-def _cluster_growth_unconfirmable_reason(
+def _accounting_unconfirmable_reason(
     memory_ids: list[str],
     task_ids: list[str],
 ) -> str | None:
-    """Why a cluster-growth flag cannot be confirmed accounted-for, or ``None``.
+    """Why a flag cannot be confirmed accounted-for in its task's text, or ``None``.
 
     ``None`` means the flag is a CANDIDATE: it cites something discriminating
     to look for and somewhere to look.  Every other result names a reason the
     guard must simply KEEP the flag, and exists to be LOGGED -- each is a way
-    :func:`filter_accounted_cluster_growth_flags` becomes a permanent silent
+    :func:`_drop_flags_accounted_in_task_text` becomes a permanent silent
     no-op that the drift log cannot see, because in all three the ``flag_type``
     matched perfectly well.
 
@@ -5654,7 +5655,7 @@ def _cluster_growth_unconfirmable_reason(
     return None
 
 
-def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
+def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     """Return every task id *flag* points at, in resolution order (task 3476).
 
     Two channels, top-level first:
@@ -5698,6 +5699,179 @@ def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
             if isinstance(entry, dict):
                 _add(entry.get('task_id'))
     return ids
+
+
+@dataclass(frozen=True)
+class _TaskTextAccountingGate:
+    """One flag family whose findings are moot once their task's live text records them.
+
+    Consumed by :func:`_drop_flags_accounted_in_task_text`.  Each field is one
+    way the gates built on it differ: which flags are candidates, which task
+    text is read, and how the gate names itself in its logs.
+    """
+
+    log_prefix: str
+    is_candidate_flag_type: Callable[[Any], bool]
+    drift_token: str
+    known_flag_types: frozenset[str]
+    known_flag_types_name: str
+    task_text: Callable[[dict[str, Any]], str]
+
+
+async def _drop_flags_accounted_in_task_text(
+    gate: _TaskTextAccountingGate,
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop each *gate* candidate that ONE cited task's live text fully accounts for.
+
+    The shared mechanism of :func:`filter_accounted_cluster_growth_flags` and
+    :func:`filter_already_recorded_caveat_flags`; their docstrings own each
+    gate's rationale.  A candidate (family match, at least one cited memory id,
+    every one discriminating, at least one task id) is DROPPED iff some single
+    task's ``gate.task_text`` contains every cited id, case-insensitively.
+    Every other outcome KEEPS it.  Each distinct task id is looked up once per
+    call, and a batch with no candidates does no I/O.
+    """
+    if not taskmaster or not project_root:
+        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
+        # / filter_style_only_authorship_flags.  No text is readable, so nothing
+        # can be positively confirmed accounted for.
+        return list(flags)
+
+    candidate_positions: list[int] = []
+    cited_by_pos: dict[int, list[str]] = {}
+    task_ids_by_pos: dict[int, list[str]] = {}
+    unconfirmable: list[str] = []
+
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if not gate.is_candidate_flag_type(flag_type):
+            continue
+        memory_ids = _flag_cited_memory_ids(flag)
+        task_ids = _flag_candidate_task_ids(flag)
+        reason = _accounting_unconfirmable_reason(memory_ids, task_ids)
+        if reason is not None:
+            unconfirmable.append(
+                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
+            )
+            continue
+        candidate_positions.append(i)
+        cited_by_pos[i] = memory_ids
+        task_ids_by_pos[i] = task_ids
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family (contain gate.drift_token) but that gate.is_candidate_flag_type does
+    # not match.  flag_type has no committed schema entry, so an unrecognised
+    # spelling would silently make the guard a no-op; this log makes that
+    # observable (the filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and gate.drift_token in ft.casefold()
+        and not gate.is_candidate_flag_type(ft)
+    ]
+    if drift_candidates:
+        logger.info(
+            '%s_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update %s if drift confirmed',
+            gate.log_prefix,
+            drift_candidates,
+            sorted(gate.known_flag_types),
+            gate.known_flag_types_name,
+        )
+
+    # The drift log above sees only ONE of the ways this guard goes silently
+    # no-op.  A flag whose flag_type matched perfectly well but that cites
+    # nothing usable is invisible to it, and if the family ever settles into
+    # putting the UUID only in prose (which this module deliberately refuses to
+    # parse) the guard is permanently ineffective with nothing in the logs
+    # saying so.  Same aggregate-per-call shape as the drift log.
+    if unconfirmable:
+        logger.info(
+            '%s_filter_unconfirmable_candidates '
+            'skipped=%s — flag_type matched but the finding carries nothing to '
+            'confirm against; these flags are KEPT',
+            gate.log_prefix,
+            unconfirmable,
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    # Resolve each distinct task id exactly ONCE per call, however many flags
+    # in the batch cite it.
+    wanted_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for i in candidate_positions:
+        for tid in task_ids_by_pos[i]:
+            if tid not in seen_task_ids:
+                seen_task_ids.add(tid)
+                wanted_task_ids.append(tid)
+
+    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
+    # a task whose text is unreadable can neither confirm a drop nor veto one.
+    lookup_results: list[Any] = await asyncio.gather(
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event=f'{gate.log_prefix}_filter_get_task_error',
+            )
+            for tid in wanted_task_ids
+        ]
+    )
+    text_by_task: dict[str, str] = {}
+    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
+        if not isinstance(result, dict):
+            continue
+        text_by_task[tid] = gate.task_text(result).casefold()
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in cited_by_pos:
+            kept.append(flag)
+            continue
+        memory_ids = [m.casefold() for m in cited_by_pos[i]]
+        matched_task_id = next(
+            (
+                tid
+                for tid in task_ids_by_pos[i]
+                if tid in text_by_task
+                and all(uid in text_by_task[tid] for uid in memory_ids)
+            ),
+            None,
+        )
+        if matched_task_id is None:
+            kept.append(flag)
+            continue
+        logger.info(
+            '%s_flag_dropped '
+            'task_id=%s matched_task_id=%s memory_ids=%s',
+            gate.log_prefix, flag.get('task_id'), matched_task_id, cited_by_pos[i],
+        )
+    return kept
+
+
+def _task_body_text(record: dict[str, Any]) -> str:
+    """A task's ``description`` and ``details``, newline-joined."""
+    return f"{record.get('description') or ''}\n{record.get('details') or ''}"
+
+
+_CLUSTER_GROWTH_ACCOUNTING_GATE = _TaskTextAccountingGate(
+    log_prefix='reconciliation.accounted_cluster_growth',
+    is_candidate_flag_type=_is_cluster_growth_flag_type,
+    drift_token='cluster',
+    known_flag_types=CLUSTER_GROWTH_FLAG_TYPES,
+    known_flag_types_name='CLUSTER_GROWTH_FLAG_TYPES',
+    task_text=_task_body_text,
+)
 
 
 async def filter_accounted_cluster_growth_flags(
@@ -5767,124 +5941,83 @@ async def filter_accounted_cluster_growth_flags(
         A new list, in input order, with accounted-for growth flags removed.
         The input list is never mutated and surviving flags are unmodified.
     """
-    if not taskmaster or not project_root:
-        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
-        # / filter_style_only_authorship_flags.  No body is readable, so nothing
-        # can be positively confirmed accounted for.
-        return list(flags)
-
-    candidate_positions: list[int] = []
-    cited_by_pos: dict[int, list[str]] = {}
-    task_ids_by_pos: dict[int, list[str]] = {}
-    unconfirmable: list[str] = []
-
-    for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
-        if not _is_cluster_growth_flag_type(flag_type):
-            continue
-        memory_ids = _cluster_growth_cited_memory_ids(flag)
-        task_ids = _cluster_growth_candidate_task_ids(flag)
-        reason = _cluster_growth_unconfirmable_reason(memory_ids, task_ids)
-        if reason is not None:
-            unconfirmable.append(
-                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
-            )
-            continue
-        candidate_positions.append(i)
-        cited_by_pos[i] = memory_ids
-        task_ids_by_pos[i] = task_ids
-
-    # Detect potential LLM naming drift: flag_type strings that look like this
-    # family (contain 'cluster') but that _is_cluster_growth_flag_type does not
-    # match.  flag_type has no committed schema entry, so an unrecognised
-    # spelling would silently make the guard a no-op; this log makes that
-    # observable (the filter_terminal_metadata_flags drift-log precedent).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and 'cluster' in ft.casefold()
-        and not _is_cluster_growth_flag_type(ft)
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.accounted_cluster_growth_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update CLUSTER_GROWTH_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(CLUSTER_GROWTH_FLAG_TYPES),
-        )
-
-    # The drift log above sees only ONE of the ways this guard goes silently
-    # no-op.  A flag whose flag_type matched perfectly well but that cites
-    # nothing usable is invisible to it, and if the family ever settles into
-    # putting the UUID only in prose (which this module deliberately refuses to
-    # parse) the guard is permanently ineffective with nothing in the logs
-    # saying so.  Same aggregate-per-call shape as the drift log.
-    if unconfirmable:
-        logger.info(
-            'reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates '
-            'skipped=%s — flag_type matched but the finding carries nothing to '
-            'confirm against; these flags are KEPT',
-            unconfirmable,
-        )
-
-    if not candidate_positions:
-        # No candidates at all — skip every lookup, so a normal cycle (in which
-        # this family is rare) does zero I/O.
-        return list(flags)
-
-    # Resolve each distinct task id exactly ONCE per call, however many flags
-    # in the batch cite it.
-    wanted_task_ids: list[str] = []
-    seen_task_ids: set[str] = set()
-    for i in candidate_positions:
-        for tid in task_ids_by_pos[i]:
-            if tid not in seen_task_ids:
-                seen_task_ids.add(tid)
-                wanted_task_ids.append(tid)
-
-    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
-    # a task whose body is unreadable can neither confirm a drop nor veto one.
-    lookup_results: list[Any] = await asyncio.gather(
-        *[
-            _safe_get_task_or_none(
-                taskmaster,
-                tid,
-                project_root,
-                log_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
-            )
-            for tid in wanted_task_ids
-        ]
+    return await _drop_flags_accounted_in_task_text(
+        _CLUSTER_GROWTH_ACCOUNTING_GATE, taskmaster, project_root, flags,
     )
-    body_by_task: dict[str, str] = {}
-    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
-        if not isinstance(result, dict):
-            continue
-        body = f"{result.get('description') or ''}\n{result.get('details') or ''}"
-        body_by_task[tid] = body.casefold()
 
-    kept: list[dict[str, Any]] = []
-    for i, flag in enumerate(flags):
-        if i not in cited_by_pos:
-            kept.append(flag)
-            continue
-        memory_ids = [m.casefold() for m in cited_by_pos[i]]
-        matched_task_id = next(
-            (
-                tid
-                for tid in task_ids_by_pos[i]
-                if tid in body_by_task
-                and all(uid in body_by_task[tid] for uid in memory_ids)
-            ),
-            None,
-        )
-        if matched_task_id is None:
-            kept.append(flag)
-            continue
-        logger.info(
-            'reconciliation.accounted_cluster_growth_flag_dropped '
-            'task_id=%s matched_task_id=%s memory_ids=%s',
-            flag.get('task_id'), matched_task_id, cited_by_pos[i],
-        )
-    return kept
+
+# ---------------------------------------------------------------------------
+# Already-recorded caveat guard (task 5271)
+# ---------------------------------------------------------------------------
+
+#: ``flag_type`` spellings observed on Stage-1 "task N's metadata still lacks
+#: the evidence caveat" findings (pump_web_ui run e8913eb1, finding 3b15dd73).
+PREMATURE_WIDENING_CAVEAT_FLAG_TYPES: frozenset[str] = frozenset({
+    'premature_widening_evidence_caveat',
+})
+
+#: Precomputed canonical-family keys for
+#: :data:`PREMATURE_WIDENING_CAVEAT_FLAG_TYPES` (mirrors
+#: :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
+_PREMATURE_WIDENING_CAVEAT_FAMILIES: frozenset[str] = frozenset(
+    canonical_flag_type_family(ft) for ft in PREMATURE_WIDENING_CAVEAT_FLAG_TYPES
+)
+
+
+def _is_premature_widening_caveat_flag_type(flag_type: Any) -> bool:
+    """True iff *flag_type*'s family is a known premature-widening-caveat spelling."""
+    return (
+        isinstance(flag_type, str)
+        and canonical_flag_type_family(flag_type) in _PREMATURE_WIDENING_CAVEAT_FAMILIES
+    )
+
+
+def _task_metadata_text(record: dict[str, Any]) -> str:
+    """Every ``str`` value under *record*'s ``metadata``, newline-joined (``''`` if none)."""
+    parts: list[str] = []
+    _collect_str_values(record.get('metadata'), parts)
+    return '\n'.join(parts)
+
+
+_ALREADY_RECORDED_CAVEAT_GATE = _TaskTextAccountingGate(
+    log_prefix='reconciliation.already_recorded_caveat',
+    is_candidate_flag_type=_is_premature_widening_caveat_flag_type,
+    drift_token='caveat',
+    known_flag_types=PREMATURE_WIDENING_CAVEAT_FLAG_TYPES,
+    known_flag_types_name='PREMATURE_WIDENING_CAVEAT_FLAG_TYPES',
+    task_text=_task_metadata_text,
+)
+
+
+async def filter_already_recorded_caveat_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop premature-widening-caveat flags whose caveat the task's live metadata records.
+
+    A Mem0 memory's "caveat still needs appending" clause stays true only
+    until the caveat lands, yet Stage 1 kept re-flagging task 18 from it after
+    its ``metadata.memory_hints`` already carried the caveat (pump_web_ui run
+    e8913eb1, finding 3b15dd73).  A flag is DROPPED iff some cited task's
+    CURRENT ``metadata`` (every ``str`` value beneath it) contains EVERY memory
+    id the flag cites, each one discriminating.  The live entry paraphrases
+    its source memory, so the id is matched, not the caveat text.  Only
+    ``metadata`` is scanned, because the finding claims ``metadata`` lacks the
+    caveat.  Task ids resolve in the running *project_root* only, which is safe
+    because a Mem0 UUID is globally unique: a colliding id can only fail the
+    match.
+
+    **Fail direction is KEEP** on any erroring or inconclusive ``get_task``,
+    deliberately the opposite of the fail-closed
+    :func:`filter_false_absence_flags`.  That sibling guards an irreversible
+    ``delete_memory``; here a wrong KEEP costs one extra cycle, while a wrong
+    DROP would silence a genuinely missing caveat on every cycle.
+
+    Shares its drop rule with :func:`filter_accounted_cluster_growth_flags`
+    via :func:`_drop_flags_accounted_in_task_text`.  Returns a new list in
+    input order; the input list and surviving flags are never mutated.
+    """
+    return await _drop_flags_accounted_in_task_text(
+        _ALREADY_RECORDED_CAVEAT_GATE, taskmaster, project_root, flags,
+    )
