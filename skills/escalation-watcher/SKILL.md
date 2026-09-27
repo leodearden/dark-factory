@@ -1249,7 +1249,9 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
   This is the *nightly form*: investigate, then `record` preparations. The render that follows
-  writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)").
+  writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
+  autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
+  undated, not dropped.
 - **On demand**, whenever Leo asks for it.
 - **Unprompted**, at three points: on watcher launch; on every return, meaning a human turn after 2h
   or more of silence, or any status or "what do you need" question; and after each applied ruling
@@ -1311,13 +1313,22 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    record is still pending (see "Sitting markers" below; the REPLACES caution applies).
 3. `resolve_issue(..., resolution_turns=<the value resolve-answers printed>)`.
 4. The `update_task` `x_ruling` payload. Say so when it discloses a value it supersedes.
-5. `close-decision --evidence`, quoting the deciding evidence.
+5. The pre-built `close-decision` payload, quoting the deciding evidence. `close-decision` requires
+   `--project` and `--escalations-dir` naming the record you READ, and refuses any other record, so
+   run the payload rather than hand-typing the verb. A non-zero exit stops that item's apply; report
+   it to Leo.
 6. One `add_memory` as `decisions_and_rationale`, plus a second write carrying the rationale to a
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
 The order is deliberate. The markers go on while the record is still pending, and `resolve_issue`
 runs before `close-decision`, so a server refusal such as `declared_pin_refused` stops the apply
 before the registry records an answer.
+
+An L2 with no DecisionRecord is filed, then closed, under
+`scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
+id>` for the recon queue, never the bare escalation id. Decision ids are fleet-global while
+escalation numbering restarts per project; see "Across *projects*, a shared id is a collision" in
+"Filing Parked Decisions to the Cockpit Registry (C8)".
 
 #### Findings for another task's owner
 
