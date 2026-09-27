@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 from shared.safe_io import load_json_or_warn
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -501,8 +502,10 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Includes the fused-memory server (HTTP or stdio), and optionally
-        the escalation HTTP server if an escalation URL is configured.
+        Always includes the fused-memory server (HTTP or stdio), the
+        jcodemunch stdio server, and the in-process recon-report HTTP server
+        on ``self._recon_report_port``.  The escalation HTTP server is added
+        only if an escalation URL is configured.
         """
         fm_config = _find_fused_memory_server()
 
@@ -525,9 +528,10 @@ class BaseStage:
 
         servers: dict = {
             'fused-memory': fm_entry,
+            # Launch contract: shared/jcodemunch_launch.py::JCODEMUNCH_COMMAND / ::JCODEMUNCH_ENV.
             'jcodemunch': {
-                'command': 'uvx',
-                'args': ['jcodemunch-mcp'],
+                'command': JCODEMUNCH_COMMAND,
+                'env': dict(JCODEMUNCH_ENV),
             },
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate

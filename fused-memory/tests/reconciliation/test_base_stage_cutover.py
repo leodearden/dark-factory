@@ -7,6 +7,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
@@ -420,6 +421,30 @@ class TestBuildMcpConfigReconReport:
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
+
+
+class TestReconJcodemunchLaunchPinned:
+    """The recon-stage jcodemunch entry uses the launch contract in shared/jcodemunch_launch.py."""
+
+    def test_command_matches_shared_constant(self):
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['command'] == JCODEMUNCH_COMMAND
+
+    def test_env_matches_shared_constant(self):
+        """Full dict equality, so a dropped or extra key fails."""
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] == JCODEMUNCH_ENV
+
+    def test_env_is_a_copy_not_the_shared_dict(self):
+        """A caller mutating the returned config must not corrupt the process-wide constant."""
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] is not JCODEMUNCH_ENV
 
 
 class TestStartReportErrorHandling:
