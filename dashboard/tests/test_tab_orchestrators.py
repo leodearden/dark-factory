@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
 @pytest.fixture(scope='module')
@@ -179,8 +179,12 @@ class TestOrchTabHealthState:
     the facts are shaped (``dashboard/tests/test_redux_api.py``), because this
     repo renders no JSX under test — what can be asserted here is that the tab
     reads each field and paints them differently. Nothing has PRODUCED either
-    flag since task 5587 made discovery a read-free ``ps`` scan, so these pins
-    hold two pips that cannot fire until leaf γ2 (task 5589) rewrites OrchTab.
+    flag since task 5587 made discovery a read-free ``ps`` scan. Leaf γ2 (task
+    5589) KEPT the pips rather than deleting them: the PRD Contract keeps
+    ``offline``/``error`` on /orchestrators entries, so deleting the reader
+    while the producer still projects the fields would split one decision
+    across two leaves. Per-project COUNT health reaches OrchTab separately, as
+    the census Datum's state and reason (TestOrchTabReadsTheCensus).
 
     The label and colour assertions are LINE-SCOPED (``[^\n]*``) and therefore
     assume each pip stays a single-line JSX expression, which is how the rest
@@ -240,3 +244,179 @@ class TestOrchTabHealthState:
         """The positive half: the palette entries are the ones intended."""
         assert re.search(r'o\.offline[^\n]*CP\.bad', orch_tab_body)
         assert re.search(r'o\.degraded[^\n]*CP\.warn', orch_tab_body)
+
+
+@pytest.fixture(scope='module')
+def orch_tab_code(tabs_jsx_body):
+    """OrchTab's body with comments stripped, so prose satisfies no probe."""
+    return extract_function_body(strip_js_comments(tabs_jsx_body), 'OrchTab')
+
+
+def _map_calls(code: str, table: str) -> list[tuple[str, str]]:
+    """Every ``<table>.map(p => ...)`` call: (parameter name, balanced call text)."""
+    calls = []
+    for match in re.finditer(rf'\b{table}\.map\(\s*(\w+)\s*=>', code):
+        paren = code.index('(', match.start())
+        calls.append((match.group(1), walk_balanced(code, paren, '(', ')')))
+    return calls
+
+
+def _the_map_rendering(code: str, table: str, marker: str) -> tuple[str, str]:
+    calls = [(p, text) for p, text in _map_calls(code, table) if marker in text]
+    assert len(calls) == 1, (
+        f'OrchTab has {len(calls)} `{table}.map(...)` call(s) rendering `{marker}`; '
+        'expected exactly one.'
+    )
+    return calls[0]
+
+
+class TestOrchTabReadsTheCensus:
+    """OrchTab renders every count from the served census (leaf γ2, task 5589).
+
+    The reported defect: the Progress card read ``orchSummary(o)`` zeros with
+    ``total || 1`` ("0/1") while the filter bar counted ACTIVE_TASKS rows
+    ("Active · 33"). Every count now comes from ONE census Datum per project —
+    ``projectCensus(DF, o.project)`` — through the shared Pip / StatTile /
+    DatumReading with a named reading from task_snapshot.js, whose behaviour
+    over the boundary sketches is executed in dashboard/tests/js/task_snapshot.test.mjs.
+    These pins prove the wiring reaches it.
+    """
+
+    @pytest.fixture(scope='class')
+    def tabs_code(self, tabs_jsx_body):
+        return strip_js_comments(tabs_jsx_body)
+
+    @pytest.fixture(scope='class')
+    def census(self, orch_tab_code):
+        """The name OrchTab binds its per-orchestrator census to.
+
+        The probes below follow that binding rather than pin its spelling.
+        """
+        bindings = re.findall(r'\bconst\s+(\w+)\s*=\s*projectCensus\(\s*DF\s*,\s*o\.project\s*\)', orch_tab_code)
+        assert len(bindings) == 1, (
+            f'OrchTab binds projectCensus(DF, o.project) {len(bindings)} times; expected one binding.'
+        )
+        return bindings[0]
+
+    @pytest.mark.parametrize('retired', ['DF_ORCH_SUMMARY', 'DF_TASK_DONE_COUNT'])
+    def test_no_reader_of_a_deleted_interim_module_remains(self, tabs_code, retired):
+        assert retired not in tabs_code, (
+            f'tabs.jsx still reads `{retired}`, the global of an interim guard this '
+            'PRD retires; OrchTab reads the census now.'
+        )
+
+    @pytest.mark.parametrize(
+        'retired',
+        ['orchSummary', 'hasOrchSummary', 'orchTotalDatum', 'doneCount', 'ACTIVE_TASKS', 'o.summary', '|| 1'],
+    )
+    def test_the_interim_readers_are_gone_from_orch_tab(self, orch_tab_code, retired):
+        assert retired not in orch_tab_code, (
+            f'OrchTab still contains `{retired}`. It reads the census now; the '
+            'interim guards and the ACTIVE_TASKS row count were the two '
+            'populations behind "0/1" beside "Active · 33".'
+        )
+
+    def test_destructures_the_census_reader_without_fallback(self, tabs_code):
+        assert re.search(r'=\s*window\.DF_TASK_SNAPSHOT\s*;', tabs_code), (
+            'tabs.jsx does not destructure window.DF_TASK_SNAPSHOT at module scope.'
+        )
+        assert not re.search(r'window\.DF_TASK_SNAPSHOT\s*(\|\||&&|\?\?)', tabs_code)
+
+    def test_binds_one_census_per_orchestrator(self, orch_tab_code, census):
+        calls = re.findall(r'\bprojectCensus\(', orch_tab_code)
+        assert len(calls) == 1, (
+            f'OrchTab calls projectCensus {len(calls)} times; every surface of one '
+            f'orchestrator reads the single `{census}` binding.'
+        )
+
+    def test_every_pip_reads_the_census_through_a_view_reading(self, orch_tab_code, census):
+        pips = re.findall(r'<Pip\b', orch_tab_code)
+        assert len(pips) == 1, f'OrchTab renders {len(pips)} <Pip> sites; expected one, mapped over CENSUS_VIEWS'
+        view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<Pip')
+        assert f'datum={{{census}}}' in call
+        assert f'format={{{view}.reading}}' in call
+
+    def test_the_progress_header_is_terminal_of_total(self, orch_tab_code, census):
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{terminalOfTotal\}}', orch_tab_code), (
+            f'the Progress header does not render <DatumReading datum={{{census}}} format={{terminalOfTotal}} />.'
+        )
+
+    def test_the_progress_bar_maps_census_segments(self, orch_tab_code, census):
+        assert re.search(rf'censusSegments\(\s*{census}\s*\)\.map\(', orch_tab_code)
+
+    def test_the_legend_maps_the_views_through_datum_reading(self, orch_tab_code, census):
+        calls = [
+            (view, call)
+            for view, call in _map_calls(orch_tab_code, 'CENSUS_VIEWS')
+            if '<DatumReading' in call and '<button' not in call
+        ]
+        assert len(calls) == 1, f'expected one legend map over CENSUS_VIEWS, found {len(calls)}'
+        view, call = calls[0]
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.reading\}}', call)
+
+    def test_the_filter_buttons_are_the_views_with_census_counts(self, orch_tab_code, census):
+        view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<button')
+        assert re.search(rf'flipFilter\(\s*o\.pid\s*,\s*{view}\.key\s*\)', call)
+        assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.count\}}', call)
+        assert f'{{{view}.label}}' in call
+
+    def test_the_filter_does_not_persist_under_the_retired_key(self, orch_tab_code):
+        keys = re.findall(r'usePersistedState\(\s*[\'"]([^\'"]+)[\'"]', orch_tab_code)
+        assert len(keys) == 1, f'OrchTab persists {len(keys)} states; expected one, the view filter'
+        assert keys[0] != 'df.orch.filter', (
+            'a browser holding the old {active,pending,complete} object would read '
+            'as "nothing selected" under the view keys; a fresh storage key makes it '
+            'fall back to the default instead.'
+        )
+
+    @pytest.mark.parametrize('retired', ['>Active', '>Pending ·', '>Complete ·', 'label="active"'])
+    def test_the_active_label_is_retired(self, orch_tab_code, retired):
+        assert retired not in orch_tab_code
+
+    def test_the_task_tiles_are_one_mapped_member_tile(self, orch_tab_code):
+        scope = re.search(r'\bconst\s+(\w+)\s*=\s*censusOver\(\s*DF\s*,', orch_tab_code)
+        assert scope, 'OrchTab does not bind a scope census from censusOver(DF, ...)'
+        tile, call = _the_map_rendering(orch_tab_code, 'CENSUS_TILES', '<ST')
+        assert f'datum={{{scope.group(1)}}}' in call
+        assert f'format={{{tile}.reading}}' in call
+        assert 'history={censusHistory(' in call
+        assert len(re.findall(r'<ST\b', orch_tab_code)) == 2, (
+            'OrchTab keeps the Orchestrators tile plus ONE tile mapped over CENSUS_TILES'
+        )
+
+    def test_the_rows_come_from_the_snapshot_by_view(self, orch_tab_code):
+        assert re.search(
+            r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
+            r'unrequestedTerminalRows\(\s*DF\[\s*ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
+            orch_tab_code,
+        ), (
+            'OrchTab rows do not come from viewRows(projectRows(DF, o.project), '
+            'unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
+            'OrchTab never requests the terminal window, so an absent one must say so '
+            'rather than datumFor\'s "not yet fetched".'
+        )
+        assert 'requestOnDemand' not in orch_tab_code, (
+            'OrchTab reads the terminal window when one has landed; it does not request it.'
+        )
+        assert 'datumFor(' not in orch_tab_code, (
+            'datumFor answers an absent window with "not yet fetched", a fetch OrchTab never makes.'
+        )
+
+    def test_the_placeholder_row_renders_the_reasoned_hole(self, orch_tab_code):
+        assert re.search(r'title=\{\s*placeholder\.title\s*\}', orch_tab_code)
+        assert re.search(r'\{\s*placeholder\.text\s*\}', orch_tab_code)
+
+    def test_a_partial_listing_renders_its_disclosure(self, orch_tab_code):
+        """viewRows' notes say why listed rows are not the whole, current set.
+
+        The terminal window is always lower_bound (the newest N only) and an aged
+        snapshot is still listed; task_snapshot.test.mjs executes which sources
+        are disclosed. This pins that OrchTab renders what viewRows returns.
+        """
+        destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*viewRows\(', orch_tab_code)
+        assert destructure and re.search(r'\bnotes\b', destructure.group(1)), (
+            'OrchTab does not take `notes` from viewRows(...)'
+        )
+        assert re.search(r'\bnotes\.map\(\s*(\w+)\s*=>[^;]*<td\b[^>]*>\s*\{\s*\1\s*\}', orch_tab_code), (
+            'OrchTab does not render each viewRows note in a table cell'
+        )

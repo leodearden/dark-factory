@@ -64,7 +64,6 @@ const EXPECTED_WINDOW_GLOBALS = {
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
   'orch_filter.js': 'DF_ORCH_FILTER',
-  'orch_summary.js': 'DF_ORCH_SUMMARY',
   'task_done_count.js': 'DF_TASK_DONE_COUNT',
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
   'spark_path.js': 'DF_SPARK_PATH',
@@ -75,6 +74,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
+  'task_snapshot.js': 'DF_TASK_SNAPSHOT',
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
 };
 

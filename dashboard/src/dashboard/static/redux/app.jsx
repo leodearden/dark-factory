@@ -1,6 +1,6 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
@@ -8,8 +8,7 @@ const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
-// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
-const { orchSummary } = window.DF_ORCH_SUMMARY;
+const { censusOver, runningOfInFlight, inFlightCount } = window.DF_TASK_SNAPSHOT;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -106,23 +105,24 @@ function App() {
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
+  // ONE census binding feeds both the topbar pill and the rail badge, so the
+  // two cannot show different in-flight numbers.
+  const tasksCensus = censusOver(DD, null);
+
   // Topbar status summary — all derived from real data.  `spend24h` is the
   // current-day total from COSTS.summary.today (server-computed from the
   // cost trend tail).  Falls back to 0 if cost data hasn't loaded yet.
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
-    tasksActive: DD.ORCHESTRATORS.reduce((n, o) => {
-      const s = orchSummary(o);
-      return n + s.in_progress + s.blocked;
-    }, 0),
+    tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
     queue: DD.MEMORY_STATUS.queue.counts.pending,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
   const railCounts = {
     orch: summary.orchRunning,
-    tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
+    tasks: <DatumReading datum={tasksCensus} format={inFlightCount} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
     // visible from the rail and not only from the tab. 'interrupted' is

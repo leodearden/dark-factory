@@ -1,6 +1,6 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
 const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick } = window.DF_CHARTS;
-const { Glyph: GL, ProjectGroup, Pip, Segmented, ChipGroup } = window.DF_SHELL;
+const { Glyph: GL, ProjectGroup, Pip, DatumReading, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 // Unguarded, like the DF_* destructures above: index.html loads
@@ -22,12 +22,13 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, unknownDatum, EM_DASH } = window.DF_DATUM;
+const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
-// Interim, deleted by task 5589 (γ2) — orch_summary.js's and task_done_count.js's headers say why.
-const { hasOrchSummary, orchSummary, orchSummaryTotal, ORCH_SUMMARY_ABSENT_REASON } = window.DF_ORCH_SUMMARY;
-const { doneCount } = window.DF_TASK_DONE_COUNT;
+// Every OrchTab count is a named reading over the served census — task_snapshot.js.
+const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS, CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
+// data.js's one copy of the on-demand terminal window's key.
+const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -44,7 +45,6 @@ const EP = Object.freeze({
   costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
   scheduler:     '/api/v2/dashboard/scheduler',
 });
-const orchTotalDatum = (orchs, key) => derivedDatum(orchSummaryTotal(orchs, key), EP.orchestrators, ORCH_SUMMARY_ABSENT_REASON);
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
 // actually MEASURED — plainDatum answers the absent case itself — so none
@@ -253,17 +253,20 @@ function LocksCell({ task, datum }) {
 // ── Orchestrators ──
 function OrchTab({ projectFilter, search }) {
   const matches = DF.ORCHESTRATORS.filter(o => projectFilter.length === 0 || projectFilter.includes(o.project));
-  const tasks = DF.ACTIVE_TASKS.filter(t => (projectFilter.length === 0 || projectFilter.includes(t.project))
-    && (!search || (t.title + t.id).toLowerCase().includes(search.toLowerCase())));
+  // The tiles' census and their sparks count one population: task roots.
+  const scope = projectFilter.length === 0 ? null : projectFilter;
+  const scopeCensus = censusOver(DF, scope);
+  const matchesSearch = t => !search || (t.title + t.id).toLowerCase().includes(search.toLowerCase());
   const orchIds = matches.map(o => o.pid);
   const [openMap, toggle, setAll] = useOpenSet(orchIds.map(String), true, 'df.open.orch');
   const allOpen = orchIds.every(p => openMap[String(p)]);
-  const [filterMap, setFilterMap] = usePersistedState('df.orch.filter', {}); // { [pid]: { active, pending, complete } }
-  const DEFAULT_FILTER = { active: true, pending: false, complete: false };
+  // A new key, not 'df.orch.filter': an old {active,pending,complete} object
+  // would read as "nothing selected" under the view keys.
+  const [filterMap, setFilterMap] = usePersistedState('df.orch.views', {}); // { [pid]: { in_flight, backlog, terminal } }
+  const DEFAULT_FILTER = { in_flight: true };
   const getFilter = (pid) => {
-    const f = filterMap[pid];
-    if (!f || typeof f !== 'object') return { ...DEFAULT_FILTER }; // back-compat: ignore old string values
-    return { active: !!f.active, pending: !!f.pending, complete: !!f.complete };
+    const f = filterMap[pid] && typeof filterMap[pid] === 'object' ? filterMap[pid] : DEFAULT_FILTER;
+    return Object.fromEntries(CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
   };
   const flipFilter = (pid, key) => {
     const cur = getFilter(pid);
@@ -274,44 +277,29 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" datum={orchTotalDatum(matches, 'in_progress')} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" datum={orchTotalDatum(matches, 'blocked')} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" datum={orchTotalDatum(matches, 'pending')} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        {CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {matches.map(o => {
-        const orchCounts = orchSummary(o);
-        const total = orchCounts.total || 1;
-        const projTasks = tasks.filter(t => t.project === o.project);
+        const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        // partition by filter (multi-select)
-        const filtered = projTasks.filter(t => {
-          if (filter.active   && (t.status === 'in-progress' || t.status === 'blocked')) return true;
-          if (filter.pending  && t.status === 'pending') return true;
-          if (filter.complete && t.status === 'done')    return true;
-          return false;
-        });
-        const counts = {
-          active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
-          pending:  projTasks.filter(t => t.status === 'pending').length,
-          complete: doneCount(DF.TASKS_SNAPSHOT[o.project]),
-        };
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const filtered = rows.filter(matchesSearch);
 
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
             {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
                 them sends an operator to restart a healthy service. Neither fires since task 5587:
-                discovery attempts no read, so nothing sets either flag (handed to γ2, task 5589).
+                discovery attempts no read, so nothing sets either flag. γ2 (task 5589) kept both
+                because /orchestrators still projects them; count health travels on the census.
                 The !o.offline guard states the precedence here rather than trusting the
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            <Pip datum={orchTotalDatum([o], 'done')} color={CP.ok} format={done => `${done}/${total}`} />
-            {orchCounts.in_progress > 0 && <Pip datum={orchTotalDatum([o], 'in_progress')} color={CP.accent} label="active" />}
-            {orchCounts.blocked > 0 && <Pip datum={orchTotalDatum([o], 'blocked')} color={CP.bad} label="blocked" />}
+            {CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -323,9 +311,7 @@ function OrchTab({ projectFilter, search }) {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
                     <div className="seg" role="group" aria-label="Task filter">
-                      <button className={filter.active   ? 'on' : ''} onClick={() => flipFilter(o.pid, 'active')}>Active · {counts.active}</button>
-                      <button className={filter.pending  ? 'on' : ''} onClick={() => flipFilter(o.pid, 'pending')}>Pending · {counts.pending}</button>
-                      <button className={filter.complete ? 'on' : ''} onClick={() => flipFilter(o.pid, 'complete')}>Complete · {counts.complete}</button>
+                      {CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
                     </div>
                   </div>
 
@@ -353,7 +339,8 @@ function OrchTab({ projectFilter, search }) {
                       <th>Status</th>
                     </tr></thead>
                     <tbody>
-                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
+                      {placeholder && <tr><td colSpan={12} className="empty" style={{ padding: 20 }} title={placeholder.title}>{placeholder.text}</td></tr>}
+                      {!placeholder && filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
                       {filtered.map(t => {
                         const isDone = t.status === 'done';
                         const isPending = t.status === 'pending';
@@ -397,6 +384,7 @@ function OrchTab({ projectFilter, search }) {
                           </tr>
                         );
                       })}
+                      {notes.map(note => <tr key={note}><td colSpan={12} className="empty" style={{ padding: 8 }}>{note}</td></tr>)}
                     </tbody>
                   </table>
                 </div>
@@ -405,19 +393,13 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>
                       <span>Progress</span>
-                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : EM_DASH}</span>
+                      <span className="mono" style={{ color: 'var(--fg-1)' }}><DatumReading datum={census} format={terminalOfTotal} /></span>
                     </div>
                     <div className="stack-bar" style={{ height: 12 }}>
-                      <span style={{ width: `${orchCounts.done/total*100}%`, background: CP.ok }} />
-                      <span style={{ width: `${orchCounts.in_progress/total*100}%`, background: CP.accent }} />
-                      <span style={{ width: `${orchCounts.blocked/total*100}%`, background: CP.bad }} />
-                      <span style={{ width: `${orchCounts.pending/total*100}%`, background: CP.warn }} />
+                      {censusSegments(census).map(s => <span key={s.key} style={{ width: `${s.share}%`, background: CP[s.tone] }} />)}
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      <span style={{ color: CP.ok }}>{orchCounts.done} done</span>
-                      <span style={{ color: CP.accent }}>{orchCounts.in_progress} active</span>
-                      <span style={{ color: CP.bad }}>{orchCounts.blocked} blocked</span>
-                      <span style={{ color: CP.warn }}>{orchCounts.pending} pending</span>
+                      {CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
                     </div>
                   </div>
                   <div>

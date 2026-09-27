@@ -65,8 +65,10 @@ def shape_orchestrators(
     caller may still supply them. ``offline`` and ``degraded`` are projected
     as an unconditional PAIR, an absent key shaping to ``False`` so that no
     consumer branches on presence, and one is never collapsed into the other.
-    Whether the fields and the OrchTab pips that read them should go is handed
-    to leaf γ2 (task 5589), which rewrites OrchTab.
+    Leaf γ2 (task 5589) kept the fields and the OrchTab status pips that read
+    them, since the PRD contract keeps ``offline`` and ``error`` here. Those
+    pips no longer tell the counts' health: each count surface reads it off
+    its project's census Datum, whose state and reason travel with the count.
     """
     orchestrators = list(orchestrators)
     out_orchs: list[dict] = []
