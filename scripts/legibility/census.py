@@ -2800,6 +2800,13 @@ inventory.enumerate_sessions scans -- distinct from a censused project's
 OWN project_root (which only ever holds that project's docs/legibility/
 state, not any transcripts)."""
 
+DEFAULT_HARNESS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "legibility" / "legibility.yaml"
+)
+"""legibility.yaml of the checkout that ships this census: the harness whose
+own components can be a confusion's fix surface. Its project_root names the
+MAIN checkout even when the census runs from a worktree."""
+
 _DEFAULT_CENSUS_LOOKBACK_DAYS = 30
 """Fallback mining-window length (days) when a project has never been
 censused before (no last_census_at anchor to start the window from) -- a
@@ -3517,7 +3524,10 @@ def main(argv: list[str] | None = None) -> int:
     a stratified-random ``batch_source`` over the mining window, a
     scoped git-commit helper, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
-    ``run_census``.
+    ``run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
+    names the project whose task tree receives harness-owned fix surfaces,
+    and is loaded before the trigger gate so an unloadable one fails loud
+    rather than quietly filing them into the censused project.
 
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
     each defaulting to today's unbounded behavior so a flagless
@@ -3580,6 +3590,13 @@ def main(argv: list[str] | None = None) -> int:
         "--config", default=None,
         help="Path to the project's legibility.yaml "
         "(default: <project-root>/docs/legibility/legibility.yaml).",
+    )
+    parser.add_argument(
+        "--harness-config", default=None,
+        help="Path to the legibility.yaml of the project that owns tooling fix "
+        "surfaces (dark-factory): a verified cluster whose fix surface is that "
+        "project's files into its task tree (default: this census checkout's "
+        "own docs/legibility/legibility.yaml).",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -3663,6 +3680,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: {mismatch}", file=sys.stderr)
         return 1
 
+    harness_config_path = (
+        Path(args.harness_config) if args.harness_config else DEFAULT_HARNESS_CONFIG_PATH
+    )
+    try:
+        harness_cfg = config.load_config(harness_config_path)
+    except Exception as exc:  # noqa: BLE001 - an unloadable harness config fails loud at CLI startup
+        print(
+            f"census: failed to load harness config at {harness_config_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    harness_project = filing_policy.ProjectRef(
+        project_root=harness_cfg.project_root, project_id=harness_cfg.project_id,
+    )
+
     now = datetime.now(UTC)
     date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
     status_fetcher = census_trigger.default_status_fetcher(project_root)
@@ -3745,6 +3777,7 @@ def main(argv: list[str] | None = None) -> int:
             max_batches=args.max_batches,
             max_verify_clusters=args.max_verify_clusters,
             dry_run_payloads_path=dry_run_payloads_path,
+            harness_project=harness_project,
         )
     except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
         print(f"census: FAILED -- {exc}", file=sys.stderr)
