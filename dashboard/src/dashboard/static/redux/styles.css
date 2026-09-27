@@ -20,6 +20,7 @@
   --warn: oklch(0.80 0.14 80);
   --bad:  oklch(0.68 0.18 25);
   --info: oklch(0.62 0.20 305);
+  --stranded: oklch(0.66 0.19 330);
   --merge-deferred:        oklch(0.74 0.15 60);
   --merge-deferred-bg:     oklch(0.74 0.15 60 / 0.10);
   --merge-deferred-border: oklch(0.74 0.15 60 / 0.4);
@@ -535,10 +536,9 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-review.selected            { --sel-color: var(--info); }
 .taskgraph .node.s-review.in-tree             { --sel-color: var(--info); }
 .taskgraph .node.s-review          .status-pip { background: var(--info); }
-/* charts.jsx PALETTE.stranded, which has no CSS var. */
-.taskgraph .node.s-infra-hold.selected        { --sel-color: oklch(0.66 0.19 330); }
-.taskgraph .node.s-infra-hold.in-tree         { --sel-color: oklch(0.66 0.19 330); }
-.taskgraph .node.s-infra-hold      .status-pip { background: oklch(0.66 0.19 330); }
+.taskgraph .node.s-infra-hold.selected        { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold.in-tree         { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold      .status-pip { background: var(--stranded); }
 .taskgraph .empty-tier { color: var(--fg-3); font-size: 10px; font-family: var(--mono); padding: 4px; }
 /* Component-block: one weakly-connected component's stacked tier rows, set
    off from neighboring components by a left accent bar + bottom margin. */
