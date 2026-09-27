@@ -2511,6 +2511,175 @@ class TestHarnessInjectedTurnFilter:
 
 
 # ---------------------------------------------------------------------------
+# Non-human-origin records (task 5956). Claude Code stamps a queued prompt
+# with a structured top-level ``origin`` dict, and a background task's
+# completion or failure arrives as an ordinary user record with isMeta ABSENT
+# and origin={'kind': 'task-notification'} -- so no text rule saw it, and it
+# rendered as a gold "User Correction". Census sighting: reify session
+# 50e12d17's only gold turn was record 196, a sub-agent's weekly-limit
+# failure notification (_TASK_NOTIFICATION_TEXT, verbatim).
+# ---------------------------------------------------------------------------
+
+_TASK_NOTIFICATION_TEXT = (
+    '<task-notification>\n'
+    '<task-id>a1ab810a169bbb353</task-id>\n'
+    '<tool-use-id>toolu_019A8emLVkosytrg3s2up7AD</tool-use-id>\n'
+    '<output-file>/tmp/claude-1000/-home-leo-src-warm-lanes-worktrees--lane-20/'
+    '50e12d17-9e73-4686-a364-7ae08109140c/tasks/a1ab810a169bbb353.output</output-file>\n'
+    '<status>failed</status>\n'
+    '<summary>Agent "Find .ri fixture test harness patterns" failed: Agent terminated'
+    " early due to an API error: You've hit your weekly limit · resets Aug 26, 11am"
+    ' (Europe/London)</summary>\n'
+    '<note>A task-notification fires each time this agent stops with no live background'
+    ' children of its own. The user can send it another message and resume it, so the'
+    ' same task-id may notify more than once.</note>\n'
+    '<result>Now the harness and builtin tests.</result>\n'
+    '</task-notification>'
+)
+
+_GENUINE_CORRECTION = 'This is wrong, please redo it.'
+
+_UNKNOWN_PROVENANCE_TEXT = 'please redo the merge'
+
+
+def _with_origin(rec, kind):
+    """Return a copy of *rec* stamped with Claude Code's structured
+    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
+    a real origin-stamped record carries isMeta absent, not False."""
+    out = dict(rec)
+    out.pop('isMeta', None)
+    out['origin'] = {'kind': kind}
+    return out
+
+
+def _task_notification(text=_TASK_NOTIFICATION_TEXT):
+    """A background-task notification record, shaped like census record 196."""
+    return _with_origin(_user_text(text), 'task-notification')
+
+
+class TestNonHumanOriginFilter:
+    def test_census_task_notification_is_excluded_from_iter_user_turns(self):
+        assert mod.iter_user_turns([_task_notification()]) == []
+
+    @pytest.mark.parametrize(
+        ('kind', 'text'),
+        [
+            ('task-notification', _TASK_NOTIFICATION_TEXT),
+            (
+                'auto-continuation',
+                'Implement the following plan:\n\n# Fix: the laptop verify host is benched'
+                '\n\n## Objective\n\nMake the sync find uv on the remote host.',
+            ),
+            (
+                'auto-continuation',
+                'Your claude.ai usage limit has reset. Continue the task you were working on'
+                ' when the limit was reached; do not repeat work that is already complete.',
+            ),
+            (
+                'coordinator',
+                'The coordinator sent a message while you were working:\n'
+                'Task 5878 has landed; stop now and make no further changes.',
+            ),
+            (
+                'peer',
+                'Another Claude session sent a message:\n'
+                '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock"'
+                ' from-name="dark-factory-19">\nplease pick up the dedup scope\n'
+                '</cross-session-message>',
+            ),
+            ('a-future-kind', _UNKNOWN_PROVENANCE_TEXT),
+        ],
+        ids=[
+            'task_notification', 'auto_continuation_plan',
+            'auto_continuation_usage_limit_reset', 'coordinator', 'peer',
+            'unseen_future_kind',
+        ],
+    )
+    def test_every_non_human_origin_kind_is_excluded(self, kind, text):
+        # The text alone is ordinary dialogue to the content classifier, so
+        # only the record's provenance can exclude it -- and the rule is
+        # "anything but human", never an allowlist of known machine kinds.
+        rec = _with_origin(_user_text(text), kind)
+
+        assert mod.is_reingested_content(text) is False
+        assert mod.has_non_human_origin(rec) is True
+        assert mod.iter_user_turns([rec]) == []
+
+    def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
+        text = 'why did the <task-notification> for the lint run say failed? please look again'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert mod.has_non_human_origin(rec) is False
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    def test_human_origin_record_opening_with_a_pasted_notification_is_kept(self):
+        # PROVENANCE decides, not text: there is no '<task-notification>'
+        # prefix fallback, so a human who pastes one to ask about it stays gold.
+        text = _TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            _user_text(_UNKNOWN_PROVENANCE_TEXT),
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+        ],
+        ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
+    )
+    def test_unknown_provenance_falls_through_to_text_rules(self, record):
+        assert mod.has_non_human_origin(record) is False
+        assert [t['text'] for t in mod.iter_user_turns([record])] == [
+            _UNKNOWN_PROVENANCE_TEXT,
+        ]
+
+    def test_genuine_turn_between_notifications_keeps_its_record_index(self):
+        records = [
+            _task_notification(),
+            _with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
+            _task_notification(),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, _GENUINE_CORRECTION)]
+
+    def test_render_digest_notification_only_session_has_no_gold_section(self):
+        # The census 50e12d17 shape at render level.
+        records = [_with_session_meta(_task_notification())]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
+        assert '<task-notification>' not in body
+
+    def test_render_digest_keeps_only_the_genuine_correction_beside_notifications(self):
+        records = [
+            _with_session_meta(_task_notification()),
+            _with_session_meta(_with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
+            _with_session_meta(_task_notification()),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
+        assert meta['n_user_turns'] == 1
+
+
+# ---------------------------------------------------------------------------
 # is_coder_judgment_payload -- the re-ingestion content classifier's
 # machine-answer half (task 5685). A prior trickle-coder answer re-enters a
 # transcript as ONE carrier holding the coder's whole {"matches",
