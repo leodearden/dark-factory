@@ -21,7 +21,14 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
@@ -6030,6 +6037,104 @@ class TestMemoryConsolidatorAlreadyRecordedCaveatFilter:
             'the stat must be present (always-present-within-the-block) and 0; '
             f'got stats={report.stats!r}'
         )
+
+
+class TestMemoryConsolidatorBenignSweepDeletionFilter:
+    """filter_benign_sweep_deletion_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271), over the events run() was handed.
+
+    A deletion-pattern flag whose swept id a documented sweep tombstoned is
+    dropped before dedup_flags, counted in benign_sweep_deletion_flags_dropped,
+    and reclaimed as RESOLVED via acknowledge_resolved_flags(mode='delete').
+    """
+
+    _SWEPT = '445c97ac-14d7-4956-9e46-e4475eecff16'
+
+    def _stage(self, *, tombstoned: bool) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+        trim = {'deleter': 'stage1_cycle_summary_trim', 'deleting_run_id': 'run-trim'}
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=lambda pid, mid: trim if tombstoned and mid == self._SWEPT else None
+        )
+        return stage
+
+    def _deletion_flag(self) -> dict:
+        return {
+            'task_id': '165',
+            'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+            'description': (
+                f'Evidentiary-anchor deletion recurs: mem0 {self._SWEPT} deleted '
+                '+0.065s after the ledger-stamp write.'
+            ),
+        }
+
+    def _deleted_event(self) -> ReconciliationEvent:
+        return ReconciliationEvent(
+            id='evt-deleted',
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id='p',
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': self._SWEPT},
+        )
+
+    @pytest.mark.asyncio
+    async def test_benign_sweep_flag_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(tombstoned=True)
+        deletion_flag = self._deletion_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [deletion_flag, survivor], events=[self._deleted_event()],
+        )
+
+        assert deletion_flag not in (report.items_flagged or []), (
+            'the only swept id carries a documented trim tombstone, so the flag '
+            'describes a designed sweep and must be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert deletion_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [deletion_flag], (
+            'the drop is a RESOLUTION, so exactly the deletion flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.parametrize(('with_event', 'decision'), [
+        (True, 'kept_unexplained_deletion'),
+        (False, 'kept_no_swept_ids'),
+    ])
+    @pytest.mark.asyncio
+    async def test_gate_reads_the_events_run_was_given(self, with_event, decision):
+        """Untombstoned, the id is swept only if run()'s events deleted it."""
+        stage = self._stage(tombstoned=False)
+        deletion_flag = self._deletion_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(
+            stage,
+            [deletion_flag],
+            events=[self._deleted_event()] if with_event else [],
+        )
+
+        assert deletion_flag in (report.items_flagged or [])
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+        assert deletion_flag['sweep_deletion_provenance']['decision'] == decision
 
 
 # ---------------------------------------------------------------------------
