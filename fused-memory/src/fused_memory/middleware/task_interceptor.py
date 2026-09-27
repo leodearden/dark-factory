@@ -32,6 +32,7 @@ except ImportError:
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
@@ -158,47 +159,25 @@ _DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify')
 
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Best-effort parse of *metadata* into a raw dict.
+    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
 
-    Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
-    resolved to a JSON object at all — *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis
-    (``direction='read'``). Returns ``(None, [])`` for ``None`` and for an
-    empty string (both benign-absent — mirrors the pre-collapse
-    ``isinstance(raw, str) and raw`` guard so a blank string is never a
-    discard), and ``(dict, [])`` for anything already resolvable to a dict.
+    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
+    readable metadata, and ``(None, warnings)`` for present-but-unreadable
+    metadata. *warnings* then carries
+    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
+    its ``unparseable_json`` / ``not_an_object`` codes cover every value
+    ``coerce_task_metadata`` rejects, so the list is never empty.
 
-    The returned dict — when not ``None`` — is always independently
-    re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
-    so unknown/curator-internal keys round-trip byte-for-value (I1) instead
-    of gaining ``TaskMetadata``'s typed-field defaults.
-
-    A string is parsed with a local ``json.loads`` first; ``parse_metadata``
-    is only invoked on the failure path to obtain its diagnosis. The two
-    discard codes this function surfaces (``unparseable_json`` /
-    ``not_an_object``) are fully determined by that same
-    loads-then-isinstance check, so a string that already parses to a dict
-    never pays for ``parse_metadata``'s ``apply_migrations`` /
-    submodel-validation / ``TaskMetadata`` construction — none of that
-    output is used here.
+    ``parse_metadata`` runs only on that failure path, for its diagnosis.
+    The returned dict is never ``parse_metadata(...).model_dump()``, so
+    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
+    gaining ``TaskMetadata``'s typed-field defaults.
     """
-    if metadata is None:
-        return None, []
-    if isinstance(metadata, dict):
-        return metadata, []
-    if isinstance(metadata, str):
-        if not metadata:
-            return None, []
-        try:
-            parsed = json.loads(metadata)
-        except ValueError:
-            _, warnings = parse_metadata(metadata, direction='read')
-            return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-        if isinstance(parsed, dict):
-            return parsed, []
-        _, warnings = parse_metadata(metadata, direction='read')
-        return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-    return None, []
+    meta = coerce_task_metadata(metadata)
+    if meta is not None:
+        return meta, []
+    _, warnings = parse_metadata(metadata, direction='read')
+    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
 
 
 def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
@@ -1849,28 +1828,21 @@ class TaskInterceptor:
     def _parse_metadata(kwargs: dict[str, Any]) -> dict:
         """Parse and normalise ``kwargs['metadata']`` to a plain dict.
 
-        Accepts a pre-parsed dict, a JSON string, or missing / non-dict values.
-        Always returns a dict (empty on failure or missing input) so callers
-        can read keys without additional guarding.
+        Always returns a dict (empty for absent or unreadable input) so
+        callers such as :meth:`_extract_meta_files` and
+        :meth:`_build_candidate` can read keys without additional guarding.
 
-        Single source of truth for the get / json.loads / isinstance-dict
-        dance shared by :meth:`_extract_meta_files` and :meth:`_build_candidate`.
-
-        Delegates the malformed-string-policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a
-        non-empty string is a genuine whole-metadata discard (unparseable
-        JSON / non-object) — I4: this replaces a silent ``{}`` coercion.
+        The absent/readable/unreadable rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`. Unreadable metadata emits a
+        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
+        — I4: this replaces a silent ``{}`` coercion.
         """
-        meta = kwargs.get('metadata') or {}
-        if isinstance(meta, str):
-            parsed, warnings = _parse_metadata_value(meta)
-            if warnings:
-                _warn_metadata_discard('TaskInterceptor._parse_metadata', meta, warnings)
-            meta = parsed if parsed is not None else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return meta
+        metadata = kwargs.get('metadata')
+        parsed, warnings = _parse_metadata_value(metadata)
+        if warnings:
+            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
+        return parsed if parsed is not None else {}
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -3159,13 +3131,13 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_metadata_dict(metadata) -> dict | None:
-        """Best-effort parse of ``metadata`` into a dict, or None.
+        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
 
-        Delegates the malformed-string policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a non-None
-        *metadata* cannot be resolved to a dict — I4: this replaces a silent
-        ``None`` coercion.
+        None means present-but-unreadable, and in that case the
+        ``task_metadata.schema_warning`` census WARNING has already been
+        emitted — I4: this replaces a silent ``None`` coercion. The rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`.
         """
         parsed, warnings = _parse_metadata_value(metadata)
         if warnings:
@@ -3205,11 +3177,10 @@ class TaskInterceptor:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
         Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the key, so the result is always a
-        plain dict ready for JSON serialisation.
+        shape (absent or unreadable → fresh dict) before writing the key, so
+        the result is always a plain dict ready for JSON serialisation.
 
-        **Data loss note**: when *metadata* is non-None but cannot be parsed
+        **Data loss note**: when *metadata* is present but cannot be parsed
         as a JSON-object (e.g. a bare list, an unparseable string), the
         original value is discarded and a fresh dict is used.  A WARNING is
         emitted in that case so the loss is visible in logs and greppable.
@@ -3219,13 +3190,12 @@ class TaskInterceptor:
         """
         meta = TaskInterceptor._extract_metadata_dict(metadata)
         if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'routing-override: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
+            logger.warning(
+                'routing-override: non-dict metadata discarded (type=%s); '
+                'using fresh dict. Original value: %r',
+                type(metadata).__name__,
+                metadata,
+            )
             meta = {}
         else:
             meta = dict(meta)  # shallow copy — don't mutate the caller's dict
@@ -3237,10 +3207,9 @@ class TaskInterceptor:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
         Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the keys, so the result is always a
-        plain dict ready for JSON serialisation — mirrors
-        :meth:`_inject_routing_override`.
+        shape (absent or unreadable → fresh dict) before writing the keys, so
+        the result is always a plain dict ready for JSON serialisation —
+        mirrors :meth:`_inject_routing_override`.
 
         Unconditionally sets ``task_kind='deterministic'`` and
         ``always_escalates=True``, and DELETES any ``before_done`` key so the
@@ -3252,20 +3221,19 @@ class TaskInterceptor:
         """
         meta = TaskInterceptor._extract_metadata_dict(metadata)
         if meta is None:
-            if metadata is not None:
-                # NOTE: _extract_metadata_dict() already emitted a WARNING
-                # (via _warn_metadata_discard) when it failed to parse this
-                # non-None metadata. This second WARNING is intentional, not
-                # a duplicate bug — it names *this* call site
-                # (deterministic-pure-gate stamping) so the discard is
-                # greppable by caller, mirroring the identical double-log in
-                # _inject_routing_override above. Two log lines, one failure.
-                logger.warning(
-                    'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
+            # NOTE: _extract_metadata_dict() already emitted a WARNING
+            # (via _warn_metadata_discard) when it failed to parse this
+            # unreadable metadata. This second WARNING is intentional, not
+            # a duplicate bug — it names *this* call site
+            # (deterministic-pure-gate stamping) so the discard is
+            # greppable by caller, mirroring the identical double-log in
+            # _inject_routing_override above. Two log lines, one failure.
+            logger.warning(
+                'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
+                'using fresh dict. Original value: %r',
+                type(metadata).__name__,
+                metadata,
+            )
             meta = {}
         else:
             meta = dict(meta)  # shallow copy — don't mutate the caller's dict
@@ -3284,11 +3252,11 @@ class TaskInterceptor:
         """Attach a ``possible_scope_mismatch`` advisory marker to ``kwargs['metadata']``.
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
-        — normalises the existing ``kwargs['metadata']`` (None / JSON-string /
-        dict / unparseable, via :meth:`_extract_metadata_dict`; malformed input
-        is discarded with a WARNING, same as the override path) into a plain
-        dict, sets ``possible_scope_mismatch``, and writes the result back into
-        ``kwargs['metadata']`` in place.
+        — normalises the existing ``kwargs['metadata']`` (via
+        :meth:`_extract_metadata_dict`: absent or unreadable → fresh dict,
+        unreadable input discarded with a WARNING, same as the override path)
+        into a plain dict, sets ``possible_scope_mismatch``, and writes the
+        result back into ``kwargs['metadata']`` in place.
 
         Called from :meth:`_path_guard_or_skip`, which runs BEFORE
         ``submit_task`` pops ``kwargs['metadata']`` and serialises it into the
@@ -3313,13 +3281,12 @@ class TaskInterceptor:
         metadata = kwargs.get('metadata')
         meta = TaskInterceptor._extract_metadata_dict(metadata)
         if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'scope-mismatch-advisory: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
+            logger.warning(
+                'scope-mismatch-advisory: non-dict metadata discarded (type=%s); '
+                'using fresh dict. Original value: %r',
+                type(metadata).__name__,
+                metadata,
+            )
             meta = {}
         else:
             meta = dict(meta)  # shallow copy — don't mutate the caller's dict
@@ -3339,9 +3306,9 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (None / JSON-string / dict / unparseable via
-        :meth:`_extract_metadata_dict`; malformed input discarded with a
-        WARNING) and, like it, runs inside :meth:`_path_guard_or_skip` BEFORE
+        normalisation (via :meth:`_extract_metadata_dict`: absent or unreadable
+        → fresh dict, unreadable input discarded with a WARNING) and, like
+        it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
         so the in-place write carries the marker with no new plumbing.
 
@@ -3353,13 +3320,12 @@ class TaskInterceptor:
         metadata = kwargs.get('metadata')
         meta = TaskInterceptor._extract_metadata_dict(metadata)
         if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'cross-repo-marker: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
+            logger.warning(
+                'cross-repo-marker: non-dict metadata discarded (type=%s); '
+                'using fresh dict. Original value: %r',
+                type(metadata).__name__,
+                metadata,
+            )
             meta = {}
         else:
             meta = dict(meta)  # shallow copy — don't mutate the caller's dict
