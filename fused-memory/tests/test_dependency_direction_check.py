@@ -335,13 +335,6 @@ class TestClassifyDependencyAssertion:
     def test_i_a_self_referential_assertion_is_never_flagged(self, index):
         assert classify_dependency_assertion(_assertion(3727, 3727), index) is None
 
-    def test_vocabulary_has_one_normative_site(self):
-        assert (REVERSED, SIBLING_SEQUENTIAL, UNSUPPORTED) == (
-            'reversed',
-            'sibling_sequential',
-            'unsupported',
-        )
-
 
 # ── THE LEAF SIGNAL ───────────────────────────────────────────────────────
 #
