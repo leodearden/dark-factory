@@ -91,9 +91,10 @@ def test_suppression_streak_record_kind_is_distinct_and_not_a_marker_kind():
 
 
 def test_suppression_streak_threshold_is_three_cycles():
-    """K is an int >= 2 (a one-cycle "streak" would fire the streak escape on
-    every single suppressing cycle) and is decided at 3, matching ζ's
-    GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open Question 4)."""
+    """K is an int >= 2 (a one-cycle "streak" would measure a burst, which the
+    per-cycle escape already owns, rather than persistence) and is decided at
+    3, matching ζ's GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open Question
+    4)."""
     assert isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, int)
     assert not isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, bool)
     assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES >= 2
@@ -108,3 +109,47 @@ def test_streak_payload_key_is_distinct_from_done_suppressions_key():
     assert isinstance(sdc.STREAK_PAYLOAD_KEY, str)
     assert sdc.STREAK_PAYLOAD_KEY
     assert sdc.STREAK_PAYLOAD_KEY != _DONE_SUPPRESSIONS_PAYLOAD_KEY
+
+
+def test_streak_window_payload_key_is_distinct_from_every_streak_row_key():
+    """The per-cycle window's payload key is a non-empty str that collides with
+    none of the other keys the ledger writes on a streak row, nor with
+    flag_dedup's done-suppression counter key."""
+    from fused_memory.reconciliation.flag_dedup import _DONE_SUPPRESSIONS_PAYLOAD_KEY
+
+    assert isinstance(sdc.STREAK_WINDOW_PAYLOAD_KEY, str)
+    assert sdc.STREAK_WINDOW_PAYLOAD_KEY
+    other_keys = {
+        sdc.STREAK_PAYLOAD_KEY,
+        'last_run_id',
+        'grounds',
+        'updated_at',
+        _DONE_SUPPRESSIONS_PAYLOAD_KEY,
+    }
+    assert sdc.STREAK_WINDOW_PAYLOAD_KEY not in other_keys
+
+
+def test_streak_volume_threshold_is_the_per_cycle_n():
+    """The PRD's single N governs both "more than N flags in one cycle" and
+    "across a streak of cycles", so the streak's volume threshold is the
+    per-cycle threshold, a non-bool int."""
+    assert isinstance(sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD, int)
+    assert not isinstance(sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD, bool)
+    assert (
+        sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD
+        == sdc.SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
+    )
+
+
+def test_a_decision_working_as_intended_never_trips_the_streak_escape():
+    """A decision that works suppresses its re-derived complaint about once per
+    cycle, indefinitely (PRD §Goal): Hook A drops the flag only after Stage 1
+    has emitted it. The streak escape sums the last K cycles, so that steady
+    state totals K·1. If K ever exceeded N, every healthy decision would page
+    the storm escape once its streak reached K, which is the review-round-1
+    defect this invariant keeps closed when either number is tuned."""
+    steady_state_flags_per_cycle = 1
+    assert (
+        sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES * steady_state_flags_per_cycle
+        <= sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD
+    )
