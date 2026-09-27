@@ -400,6 +400,11 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     return sr.DecisionRecord(**fields)
 
 
+def _identity_of(record: sr.DecisionRecord) -> dict[str, str]:
+    """close_decision_with_evidence's compare-and-swap expectations for *record*, as it was filed."""
+    return {'expected_project': record.project, 'expected_escalations_dir': record.escalations_dir}
+
+
 def _names_the_destination_token(message: str) -> bool:
     """True when *message* names ``solar_challenge`` as a token in its OWN
     right -- not merely as the tail of ``my_solar_challenge``.
@@ -1495,7 +1500,9 @@ class TestDecisionHelpersAdoptLock:
 
         monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
 
-        sr.close_decision_with_evidence('dec-spy-6', sr.DecisionState.ANSWERED, 'gate evidence', root=tmp_path)
+        sr.close_decision_with_evidence(
+            'dec-spy-6', sr.DecisionState.ANSWERED, 'gate evidence', root=tmp_path, **_identity_of(rec)
+        )
 
         assert 'dec-spy-6' in acquired, f'Expected lock acquisition for dec-spy-6; got {acquired}'
 
@@ -9941,7 +9948,9 @@ class TestClosingEvidence:
         return sr.decision_path_for_id('dec-close', root=root)
 
     def _close(self, root: Path, state: str = sr.DecisionState.ANSWERED, evidence: str = _EVIDENCE):
-        return sr.close_decision_with_evidence('dec-close', state, evidence, root=root)
+        return sr.close_decision_with_evidence(
+            'dec-close', state, evidence, root=root, **_identity_of(_make_decision())
+        )
 
     def test_defaults_to_empty(self) -> None:
         d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
@@ -10061,7 +10070,8 @@ class TestClosingEvidence:
 
         with caplog.at_level(logging.ERROR):
             assert sr.close_decision_with_evidence(
-                'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=blocker / 'fleet'
+                'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=blocker / 'fleet',
+                **_identity_of(_make_decision()),
             ) is None
 
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
@@ -10104,14 +10114,20 @@ class TestClosingEvidence:
 
 class TestCloseDecisionVerb:
     def _argv(self, root: Path, *, state: str = 'answered', evidence: str = _EVIDENCE) -> list[str]:
-        return ['close-decision', '--id', 'dec-close', '--state', state, '--evidence', evidence, '--root', str(root)]
+        seeded = _make_decision()
+        return [
+            'close-decision', '--id', 'dec-close', '--state', state, '--evidence', evidence,
+            '--project', seeded.project, '--escalations-dir', seeded.escalations_dir, '--root', str(root),
+        ]
 
     def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
         args = sr._build_parser().parse_args(self._argv(tmp_path))
+        seeded = _make_decision()
 
         assert (args.verb, args.id, args.state, args.evidence, args.root) == (
             'close-decision', 'dec-close', 'answered', _EVIDENCE, str(tmp_path),
         )
+        assert (args.project, args.escalations_dir) == (seeded.project, seeded.escalations_dir)
 
     def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
@@ -10136,3 +10152,132 @@ class TestCloseDecisionVerb:
 
         assert rc != 0
         assert 'dec-close' in capsys.readouterr().err
+
+
+class TestCloseDecisionIdentity:
+    """A close lands only on the record the caller names: decision ids are fleet-global, esc numbering is per project."""
+
+    _A_PROJECT = 'know_live'
+    _A_QUEUE = '/a/data/escalations'
+    _B_PROJECT = 'reify'
+    _B_QUEUE = '/b/data/escalations'
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        fields = {'id': 'esc-42-1', 'project': self._A_PROJECT, 'escalations_dir': self._A_QUEUE,
+                  'state': sr.DecisionState.OPEN, 'closing_evidence': '', **overrides}
+        sr.write_decision(_make_decision(**fields), root=root)
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    def _close(self, root: Path, project: str, queue: str) -> sr.DecisionRecord | None:
+        return sr.close_decision_with_evidence(
+            'esc-42-1', sr.DecisionState.ANSWERED, _EVIDENCE, root=root,
+            expected_project=project, expected_escalations_dir=queue,
+        )
+
+    @pytest.mark.parametrize(('project', 'queue'), [
+        (_A_PROJECT, _B_QUEUE),
+        (_B_PROJECT, _A_QUEUE),
+        (_B_PROJECT, _B_QUEUE),
+    ], ids=['queue-only', 'project-only', 'both'])
+    def test_another_projects_record_at_the_same_id_is_refused_and_untouched(
+        self, tmp_path: Path, project: str, queue: str
+    ) -> None:
+        """The reviewer's scenario: project B's close payload names an id project A already holds OPEN."""
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, project, queue)
+
+        message = str(refused.value)
+        for named in ('esc-42-1', self._A_PROJECT, self._A_QUEUE, project, queue):
+            assert named in message
+        assert path.read_bytes() == before
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.OPEN, '')
+
+    @pytest.mark.parametrize('queue', ['/q/data/escalations/', '/q/./data/escalations'], ids=['slash', 'dot'])
+    def test_both_sides_are_folded_before_the_compare(self, tmp_path: Path, queue: str) -> None:
+        self._seed(tmp_path, project='df', escalations_dir=sr.normalize_escalations_dir('/q/data/escalations'))
+
+        updated = self._close(tmp_path, 'dark_factory', queue)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize('stamp', ['', sr.UNKNOWN_QUEUE], ids=['legacy', 'unknown'])
+    def test_a_sentinel_stamp_closes_under_the_same_sentinel(self, tmp_path: Path, stamp: str) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+
+        updated = self._close(tmp_path, self._A_PROJECT, stamp)
+
+        assert updated is not None
+        assert updated.closing_evidence == _EVIDENCE
+
+    @pytest.mark.parametrize(('stamp', 'queue'), [
+        ('', '/q/data/escalations'),
+        (sr.UNKNOWN_QUEUE, ''),
+        (sr.UNKNOWN_QUEUE, '/q/data/escalations'),
+    ], ids=['legacy-vs-real', 'unknown-vs-legacy', 'unknown-vs-real'])
+    def test_a_sentinel_stamp_is_refused_under_any_other_expectation(
+        self, tmp_path: Path, stamp: str, queue: str
+    ) -> None:
+        path = self._seed(tmp_path, escalations_dir=stamp)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match='esc-42-1'):
+            self._close(tmp_path, self._A_PROJECT, queue)
+
+        assert path.read_bytes() == before
+
+    def test_the_identity_check_runs_before_the_overwrite_check(self, tmp_path: Path) -> None:
+        path = self._seed(tmp_path, state=sr.DecisionState.ANSWERED, closing_evidence='project A evidence')
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, self._B_PROJECT, self._B_QUEUE)
+
+        assert self._B_PROJECT in str(refused.value)
+        assert 'overwrite' not in str(refused.value)
+        assert path.read_bytes() == before
+
+    def _argv(self, root: Path, *, project: str, queue: str) -> list[str]:
+        return [
+            'close-decision', '--id', 'esc-42-1', '--state', 'answered', '--evidence', _EVIDENCE,
+            '--project', project, '--escalations-dir', queue, '--root', str(root),
+        ]
+
+    @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
+    def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
+        argv = self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE)
+        at = argv.index(dropped)
+        del argv[at:at + 2]
+
+        with pytest.raises(SystemExit) as exited:
+            sr.main(argv)
+
+        assert exited.value.code == 2
+
+    def test_the_verb_exits_nonzero_on_a_mismatch_and_leaves_the_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        rc = sr.main(self._argv(tmp_path, project=self._B_PROJECT, queue=self._B_QUEUE))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'close-decision refused' in err
+        assert self._B_PROJECT in err
+        assert path.read_bytes() == before
+
+    def test_the_verb_closes_the_record_it_names(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed(tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'esc-42-1'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
