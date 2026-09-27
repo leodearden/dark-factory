@@ -890,6 +890,16 @@ if command -v skim &>/dev/null && command -v claude &>/dev/null; then
     ok "skim hook installed for Claude Code"
   fi
 
+  # Re-applied on every run: `skim init` replaces a guarded hook entry with its
+  # bare one. See scripts/install_skim_hook_guard.py.
+  _skim_guard_installer="$REPO_ROOT/scripts/install_skim_hook_guard.py"
+  if python3 "$_skim_guard_installer"; then
+    ok "skim hook runs behind scripts/skim_hook_guard.py (multi-line commands pass through unrewritten)"
+  else
+    fail "skim hook is NOT guarded — multi-line Bash commands will be flattened"
+    warn "  Fix: python3 $_skim_guard_installer  (re-run after any 'skim init')"
+  fi
+
   # The hook rewrites commands to bare `skim`, which must be on PATH for all
   # shell types (login, interactive, non-interactive bash -c).  ~/.cargo/bin
   # is only added by profile/bashrc sourcing — symlink into /usr/local/bin
