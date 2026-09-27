@@ -1148,6 +1148,19 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 3
 
+    def test_frontmatter_names_a_generation_that_excludes_non_human_origin_turns(self):
+        """Generation 4 is the first whose gold section and user-text signal
+        carriers exclude non-human-origin records, so a census can tell a
+        pre-fix task-notification "User Correction" from a live regression.
+        A floor, not a freeze, exactly like the generation-3 test above."""
+        digest = mod.render_digest(
+            [_with_session_meta(_task_notification())], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 4
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
