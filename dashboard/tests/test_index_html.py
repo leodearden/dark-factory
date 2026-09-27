@@ -504,6 +504,22 @@ _ORCH_SUMMARY_PREFIX = '/static/redux/orch_summary.js'
 _REDUX_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
 
+def _served_redux_readers(client, global_name: str) -> list[str]:
+    """Every .js/.jsx under static/redux whose served, comment-stripped body names *global_name*.
+
+    The files are discovered rather than listed, so a later file is covered
+    without enrolment, and prose naming the global neither satisfies nor
+    breaks a retirement guard.
+    """
+    readers = []
+    for source in sorted(_REDUX_DIR.glob('*.js*')):
+        resp = client.get(f'/static/redux/{source.name}')
+        assert resp.status_code == 200, f'{source.name} is on disk but not served'
+        if global_name in strip_js_comments(resp.text):
+            readers.append(source.name)
+    return readers
+
+
 def test_orch_summary_js_is_retired(client, index_html_body: str) -> None:
     """index.html loads no orch_summary.js, and no served asset reads its global.
 
@@ -513,83 +529,48 @@ def test_orch_summary_js_is_retired(client, index_html_body: str) -> None:
     now read the served census through task_snapshot.js. A tag left behind
     would ship a dead module; a surviving ``window.DF_ORCH_SUMMARY`` read
     would throw at load once the module is gone.
-
-    Every .js/.jsx under static/redux is discovered rather than listed, and
-    read as SERVED with comments stripped, so a later file is covered without
-    enrolment and prose naming the global neither satisfies nor breaks it.
     """
     assert _ORCH_SUMMARY_PREFIX not in index_html_body, (
         'index.html still loads orch_summary.js; its consumers read the census now.'
     )
-    readers = []
-    for source in sorted(_REDUX_DIR.glob('*.js*')):
-        resp = client.get(f'/static/redux/{source.name}')
-        assert resp.status_code == 200, f'{source.name} is on disk but not served'
-        if 'DF_ORCH_SUMMARY' in strip_js_comments(resp.text):
-            readers.append(source.name)
+    readers = _served_redux_readers(client, 'DF_ORCH_SUMMARY')
     assert readers == [], f'{readers} still read window.DF_ORCH_SUMMARY'
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: task_done_count.js is served, and loads after datum.js and
-# before its consumer (task 5587)
+# Retirement guard: the two client status counters are gone (task 5590)
 # ---------------------------------------------------------------------------
 
-_TASK_DONE_COUNT_PREFIX = '/static/redux/task_done_count.js'
-
-
-def test_task_done_count_js_is_served(client) -> None:
-    """GET /static/redux/task_done_count.js returns 200.
-
-    tab_tasks.jsx destructures ``window.DF_TASK_DONE_COUNT`` at module top
-    level with no fallback, so a 404 here throws at load and blanks the Tasks
-    tab. The load-order guard below only reads tag positions, which a file
-    present in git but not served would still pass.
-    """
-    resp = client.get(_TASK_DONE_COUNT_PREFIX)
-    assert resp.status_code == 200, (
-        f'expected 200 for {_TASK_DONE_COUNT_PREFIX}, got {resp.status_code} — '
-        'the module is registered in index.html but not reachable at runtime.'
-    )
-
-
-_TASK_DONE_COUNT_ORDER_CASES = [
-    (_DATUM_PREFIX, 'datum.js', _TASK_DONE_COUNT_PREFIX, 'task_done_count.js'),
-    (_TASK_DONE_COUNT_PREFIX, 'task_done_count.js', _TAB_TASKS_PREFIX, 'tab_tasks.jsx'),
+_RETIRED_CLIENT_COUNTERS = [
+    ('/static/redux/task_status_counts.js', 'DF_TASK_STATUS_COUNTS'),
+    ('/static/redux/task_done_count.js', 'DF_TASK_DONE_COUNT'),
 ]
 
 
 @pytest.mark.parametrize(
-    'before_prefix, before_label, after_prefix, after_label',
-    _TASK_DONE_COUNT_ORDER_CASES,
-    ids=['datum-before-guard', 'guard-before-tab-tasks'],
+    'retired_src, retired_global',
+    _RETIRED_CLIENT_COUNTERS,
+    ids=['task_status_counts', 'task_done_count'],
 )
-def test_task_done_count_js_load_order(
-    index_html_body: str,
-    before_prefix: str,
-    before_label: str,
-    after_prefix: str,
-    after_label: str,
+def test_retired_client_counter_is_gone(
+    client, index_html_body: str, retired_src: str, retired_global: str,
 ) -> None:
-    """The guard sits between the placeholder it borrows and the tabs that read it.
+    """index.html loads neither client counter, neither is on disk, and nothing reads them.
 
-    task_done_count.js destructures ``EM_DASH`` from ``window.DF_DATUM`` at
-    module scope, so datum.js must run first. tab_tasks.jsx then destructures
-    ``window.DF_TASK_DONE_COUNT`` at module scope, so the guard must run before
-    it. Every edge is its own case, as in
-    ``_DATUM_ORDER_CASES``, because each one breaks a different surface.
+    Both bucketed task statuses in the browser for the Tasks tab header. That
+    header now reads the served census through task_snapshot.js, whose views
+    come from the generated vocabulary (PRD dashboard-one-datum-one-path
+    decision 16). A tag left behind would ship a dead module; a surviving
+    global read would throw at load once the module is gone.
     """
-    assert_script_loads_before(
-        index_html_body,
-        before_prefix,
-        after_prefix,
-        before_label=before_label,
-        after_label=after_label,
-        consumer_note=(
-            f'{after_label} destructures the global {before_label} defines at '
-            'module scope with no fallback; the definition must run first.'
-        ),
+    assert retired_src not in index_html_body, (
+        f'index.html still loads {retired_src}; the Tasks tab reads the census now.'
     )
+    assert not (_REDUX_DIR / Path(retired_src).name).exists(), (
+        f'{retired_src} is still on disk under static/redux.'
+    )
+    readers = _served_redux_readers(client, retired_global)
+    assert readers == [], f'{readers} still read window.{retired_global}'
 
 
 # ---------------------------------------------------------------------------
@@ -636,56 +617,6 @@ def test_spark_path_js_loads_before_charts(index_html_body: str) -> None:
         consumer_note=(
             'charts.jsx (Sparkline/StepSpark) destructures window.DF_SPARK_PATH '
             'at top level; spark_path.js must define it first.'
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Regression guard: task_status_counts.js must load BEFORE tab_tasks.jsx
-# (task 3516)
-# ---------------------------------------------------------------------------
-
-_TASK_STATUS_COUNTS_PREFIX = '/static/redux/task_status_counts.js'
-
-
-def test_task_status_counts_js_is_served(client) -> None:
-    """GET /static/redux/task_status_counts.js returns 200.
-
-    The load-order guard below only inspects the <script> tag's position in
-    index.html, so a file that exists in git but is not actually served (a
-    packaging or StaticFiles-mount regression) would keep CI green while
-    tab_tasks.jsx dies in the browser. tab_tasks.jsx destructures
-    window.DF_TASK_STATUS_COUNTS with no fallback, so a 404 here throws at
-    load and blanks the whole Tasks tab.
-    """
-    resp = client.get(_TASK_STATUS_COUNTS_PREFIX)
-    assert resp.status_code == 200, (
-        f'expected 200 for {_TASK_STATUS_COUNTS_PREFIX}, got {resp.status_code} '
-        '— the module is registered in index.html but not reachable at runtime.'
-    )
-
-
-def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> None:
-    """task_status_counts.js must load as a classic synchronous script BEFORE
-    tab_tasks.jsx.
-
-    tab_tasks.jsx destructures {projectStatusCounts, activityPips} from
-    window.DF_TASK_STATUS_COUNTS at top-level execution time, with no `|| {}`
-    fallback — a later (or missing) tag therefore makes tab_tasks.jsx throw at
-    load, so the per-project header (and the whole Tasks tab) never renders.
-    The destructure is deliberate (loud-over-silent degradation); this
-    ordering guard is what keeps that loudness from ever reaching a browser.
-    """
-    assert_script_loads_before(
-        index_html_body,
-        _TASK_STATUS_COUNTS_PREFIX,
-        _TAB_TASKS_PREFIX,
-        before_label='task_status_counts.js',
-        after_label='tab_tasks.jsx',
-        consumer_note=(
-            'tab_tasks.jsx (TasksTab per-project header) destructures '
-            'window.DF_TASK_STATUS_COUNTS at top level; task_status_counts.js '
-            'must define it first.'
         ),
     )
 
@@ -1085,7 +1016,7 @@ def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
     """endpoint_staleness.js is present among the VERSIONED redux assets.
 
     The presence half of what `test_redux_cache_buster_bumped` asserts for its
-    eight top-level-destructured siblings: a tag added without a `?v=` misses
+    top-level-destructured siblings: a tag added without a `?v=` misses
     every already-open browser, and a tag deleted outright takes app.jsx down
     with it (that destructure has no fallback). The uniformity half is already
     covered for this asset with no edit at all — `redux_cache_buster_versions`
@@ -1096,7 +1027,7 @@ def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
     for task 4884 put it. That function is called with SYNTHETIC bodies by
     `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, built from
     its own `_REQUIRED_ASSETS` roster — a second mirror of the asset list, in
-    a file outside this task's scope. Adding a ninth presence assertion there
+    a file outside this task's scope. Adding another presence assertion there
     would have failed those synthetic-body callers until that roster was
     edited too. Asserting over the `index_html_body` fixture instead keeps the
     protection identical (it runs against the REAL index.html, which is the
@@ -1163,7 +1094,7 @@ def test_task_vocab_js_has_cache_buster(index_html_body: str) -> None:
     server computed, which is the class of mismatch the generator exists to
     make impossible.
 
-    Deliberately its OWN test rather than a ninth assertion inside
+    Deliberately its OWN test rather than one more assertion inside
     `test_redux_cache_buster_bumped`, following the endpoint_staleness.js
     precedent next door: that function is also driven with SYNTHETIC bodies
     from `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, whose
@@ -1484,7 +1415,7 @@ def test_datum_js_load_order(
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     """All /static/redux/*?v= cache-busters must share ONE version, and the
-    eight assets destructured at module top level must be among them.
+    assets destructured at module top level must be among them.
 
     This is the sole home of the UNIFORMITY check ("all versions are the
     same").  Every other module asserts only its own absolute floor over the
@@ -1523,13 +1454,6 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     assert re.search(r'/static/redux/prd_grouping\.js\?v=\d+', index_html_body), (
         'prd_grouping.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
-    )
-    assert re.search(r'/static/redux/task_status_counts\.js\?v=\d+', index_html_body), (
-        'task_status_counts.js is not present among the versioned '
-        '/static/redux/* assets in index.html — tab_tasks.jsx destructures '
-        'window.DF_TASK_STATUS_COUNTS at top level with no fallback, so a '
-        'missing tag blanks the Tasks tab; a tag added without a cache-buster '
-        'misses already-open browsers. Bump all /static/redux/* ?v= uniformly.'
     )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
         'runtime_format.js is not present among the versioned /static/redux/* '
