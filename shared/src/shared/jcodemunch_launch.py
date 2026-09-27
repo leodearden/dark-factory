@@ -1,13 +1,27 @@
 """jcodemunch-mcp stdio launch contract — JCODEMUNCH_COMMAND / JCODEMUNCH_ENV.
 
 The one definition every site that launches the jcodemunch MCP server
-imports.  It lives in ``shared`` because those sites span orchestrator and
-fused_memory, and fused_memory does not depend on orchestrator.
+consumes, plus its rendering as an MCP server config.  It lives in ``shared``
+because those sites span orchestrator, fused_memory and scripts/setup-host.sh,
+and fused_memory does not depend on orchestrator.
+
+Python sites call :func:`jcodemunch_server_config`.  Shell sites run
+``PYTHONPATH=<repo>/shared/src python3 -m shared.jcodemunch_launch`` and read
+the same config as one line of JSON; the module is stdlib-only so that works
+outside the workspace venv.
 """
 
 from __future__ import annotations
 
-__all__ = ['JCODEMUNCH_COMMAND', 'JCODEMUNCH_ENV']
+import json
+from typing import TypedDict
+
+__all__ = [
+    'JCODEMUNCH_COMMAND',
+    'JCODEMUNCH_ENV',
+    'JcodemunchServerConfig',
+    'jcodemunch_server_config',
+]
 
 # Prebuilt, version-pinned launcher on PATH (installed via
 # `uv tool install --python 3.13 jcodemunch-mcp==<pin>`; see
@@ -62,3 +76,17 @@ JCODEMUNCH_ENV: dict[str, str] = {
     'JCODEMUNCH_NO_VERSION_HINT': '1',
     'JCODEMUNCH_GIT_ROOT_IDENTITY': '0',
 }
+
+
+class JcodemunchServerConfig(TypedDict):
+    command: str
+    env: dict[str, str]
+
+
+def jcodemunch_server_config() -> JcodemunchServerConfig:
+    """The stdio MCP server entry for jcodemunch, with its own copy of the env."""
+    return {'command': JCODEMUNCH_COMMAND, 'env': dict(JCODEMUNCH_ENV)}
+
+
+if __name__ == '__main__':
+    print(json.dumps(jcodemunch_server_config()))
