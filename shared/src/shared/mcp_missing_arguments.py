@@ -17,7 +17,6 @@ so ``import shared`` does not pull in fastmcp.
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,7 +26,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.base import ToolResult
 from pydantic import ValidationError
 
-logger = logging.getLogger(__name__)
+from shared.mcp_tool_schema import live_tool_parameters
 
 MISSING_ARGUMENT_CODE: str = 'missing_required_argument'
 
@@ -50,7 +49,7 @@ class MissingArgumentMiddleware(Middleware):
         try:
             return await call_next(context)
         except ValidationError as exc:
-            parameters = await self._live_parameters(context)
+            parameters = await live_tool_parameters(context, context.message.name)
             if parameters is None:
                 raise
             arguments = context.message.arguments or {}
@@ -65,35 +64,6 @@ class MissingArgumentMiddleware(Middleware):
                 exc.errors(include_input=False, include_url=False),
             )
             raise ToolError(json.dumps(refusal)) from exc
-
-    @staticmethod
-    async def _live_parameters(
-        context: MiddlewareContext[mt.CallToolRequestParams],
-    ) -> Mapping[str, Any] | None:
-        name = context.message.name
-        fastmcp_context = context.fastmcp_context
-        tool = None
-        try:
-            if fastmcp_context is not None:
-                tool = await fastmcp_context.fastmcp.get_tool(name)
-        except Exception:
-            logger.warning(
-                'missing-argument guard could not resolve the schema for %r; '
-                'passing the original validation error through',
-                name,
-                exc_info=True,
-            )
-            return None
-        parameters = tool.parameters if tool is not None else None
-        if not isinstance(parameters, dict):
-            logger.warning(
-                'missing-argument guard found no usable schema for %r (got %s); '
-                'passing the original validation error through',
-                name,
-                type(parameters).__name__,
-            )
-            return None
-        return parameters
 
 
 def _missing_required(required: Sequence[str], arguments: Mapping[str, Any]) -> list[str]:
