@@ -328,6 +328,7 @@ _NO_STAT_TILE_FILES = (
 _PIP_SITES = {
     'tabs.jsx': 11,
     'tab_escalations.jsx': 4,
+    'tab_tasks.jsx': 1,
 }
 
 # The pips that legitimately remain hand-built `className="pip"` spans, and the
@@ -336,12 +337,11 @@ _PIP_SITES = {
 # an envelope whose contract is value + as_of + state would be a category error;
 # PRD leaves gamma2/theta own those surfaces.
 #
-# tab_tasks.jsx is deliberately absent from both tables.  Its pips are fed by
-# task_status_counts.js::activityPips, which PRD leaf gamma3 DELETES — migrating
-# them here would be work gamma3 has to undo.
+# tab_tasks.jsx joins now that its header reads the census (task 5590).
 _HAND_BUILT_PIPS = {
     'tabs.jsx': ('running', 'offline', 'state unknown'),
     'tab_escalations.jsx': (),
+    'tab_tasks.jsx': (),
 }
 
 _STAT_TILE_TAG_RE = re.compile(r'<(?:C\.)?(?:ST|StatTile)(?=[\s/>])')

@@ -968,7 +968,7 @@ def find_function_params(
 
     The search regex is deliberately NOT line-anchored, so a declaration NESTED
     inside another function is found (the real instance is
-    ``function statusMatches(s) {`` indented inside ``TasksTab`` in
+    ``function searchMatches(t) {`` indented inside ``TasksTab`` in
     tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally load-bearing in the
     other direction: without it a prefix sibling declared earlier would shadow
     the target — ``function TaskGraphEdges(`` at tab_tasks.jsx:33 precedes
@@ -1039,7 +1039,7 @@ def extract_function_body(source: str, func_name: str) -> str:
 
     The search regex is deliberately NOT line-anchored, so a declaration
     NESTED inside another function is found and scoped to its own body (the
-    real instance is ``function statusMatches(s) {`` indented inside
+    real instance is ``function searchMatches(t) {`` indented inside
     ``TasksTab`` in tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally
     load-bearing in the other direction: without it a prefix sibling declared
     earlier would shadow the target — ``function TaskGraphEdges(`` at

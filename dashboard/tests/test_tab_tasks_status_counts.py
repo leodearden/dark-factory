@@ -1,27 +1,24 @@
-"""Wiring tests for the Tasks-tab per-project header counts in tab_tasks.jsx
-(task 3516).
+"""Wiring tests for the Tasks tab's per-project header and view filter in
+tab_tasks.jsx.
 
-The header used to render ONE merged "N active" pip over
-{in-progress, blocked, merge-deferred}. Only the in-progress component is
-bounded by max_concurrent_tasks, so the merged number routinely exceeded the
-configured cap and read as a cap breach (2026-07-30: dark-factory showed
-"43 active" against a cap of 24; reify "50 active" against 48).
+Task 3516 split the header's merged "N active" pip, because only its running
+part is bounded by max_concurrent_tasks and the merged number read as a cap
+breach. The census meets that goal directly now: the in-flight pip reads
+"N running of M in-flight", the capped sub-view shown WITH its superset rather
+than merged into it (PRD decision 3, plans/dashboard-one-datum-one-path-prd.md).
 
-The counting itself is pure and lives in task_status_counts.js, covered
-executably by dashboard/tests/js/task_status_counts.test.mjs. What THAT suite
-cannot see is the JSX wiring — whether tab_tasks.jsx actually calls it, and
-whether the header still renders the merged pip alongside. That is what this
-module asserts.
+Every header count comes from ONE census Datum per project,
+``projectCensus(DF_T, p.id)``, rendered through the shared ``<Pip>`` with a
+named reading from task_snapshot.js, and the rows come from the same snapshot
+by view (``viewRows``). The readings and the row selection execute in
+dashboard/tests/js/task_snapshot.test.mjs. What that suite cannot see is the
+JSX wiring, which these pins assert on comment-stripped source: this repo has
+no DOM harness (see pins_recovery.js's CANONICAL header).
 
-Deliberately a NEW module rather than an extension of test_tab_tasks_runtime.py,
-whose docstring scopes it to TaskDetail's runtime fields (task 2637, PRD
-Open-Q3): header counts do not belong there, and a sibling display-defect task
-edits the same JSX file, so keeping this surface separate leaves only
-tab_tasks.jsx itself as the shared merge surface.
-
-Tests parse JSX source as text and assert structural contracts.
-Follows the idiom established in test_tab_tasks_runtime.py /
-test_tab_orchestrators.py / test_index_html.py.
+Two guards ride along because the census wiring created their hazard: every
+TaskStatus member now reaches the graph, so each needs a node style; and the
+module-scope destructures this wiring added must not collide with a classic
+script's top-level declaration (esc-5590-1).
 """
 
 from __future__ import annotations
@@ -29,281 +26,221 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _dashboard_helpers import destructure_bindings, extract_function_body, strip_js_comments, walk_balanced
+
+from shared.task_statuses import TaskStatus
 
 
 @pytest.fixture(scope='module')
-def tasks_tab_body(tab_tasks_jsx_body):
-    """TasksTab's brace-delimited body, signature excluded.
-
-    Scoped away from the other component functions (TaskGraph, PrdBox,
-    TaskDetail, ...) in the same 780-line file so an assertion cannot be
-    satisfied by an unrelated component.
-    """
-    return extract_function_body(tab_tasks_jsx_body, 'TasksTab')
+def tab_tasks_code(tab_tasks_jsx_body):
+    return strip_js_comments(tab_tasks_jsx_body)
 
 
 @pytest.fixture(scope='module')
-def tasks_tab_code(tasks_tab_body):
-    """TasksTab's body with comments blanked — what the assertions run on.
+def tasks_tab_code(tab_tasks_code):
+    """TasksTab's body with comments blanked, so prose satisfies no probe."""
+    return extract_function_body(tab_tasks_code, 'TasksTab')
 
-    Every structural assertion below runs against the stripped text, because a
-    comment can satisfy or falsify one either way: an absence assertion
-    ("``counts.done`` must not appear") is broken by the very comment that
-    explains why it must not appear, and a presence assertion can be met by
-    prose mentioning the token instead of by code doing it.
+
+@pytest.fixture(scope='module')
+def snapshot_names(tab_tasks_code):
+    """canonical -> local for tab_tasks.jsx's destructure of DF_TASK_SNAPSHOT.
+
+    The probes follow these bindings rather than pin their spelling.
     """
-    return strip_js_comments(tasks_tab_body)
+    match = re.search(r'^const\s*\{([^{}]*)\}\s*=\s*window\.DF_TASK_SNAPSHOT\s*;', tab_tasks_code, re.M)
+    assert match, 'tab_tasks.jsx does not destructure window.DF_TASK_SNAPSHOT at module scope'
+    return dict(destructure_bindings(match.group(1)))
 
 
-class TestHeaderCountsWiring:
-    """The per-project header must source its counts from
-    task_status_counts.js and render the three in-flight numbers separately."""
+@pytest.fixture(scope='module')
+def census(tasks_tab_code):
+    bindings = re.findall(r'\bconst\s+(\w+)\s*=\s*projectCensus\(\s*DF_T\s*,\s*p\.id\s*\)', tasks_tab_code)
+    assert len(bindings) == 1, (
+        f'TasksTab binds projectCensus(DF_T, p.id) {len(bindings)} times; expected one binding '
+        'that every header pip of the project reads.'
+    )
+    return bindings[0]
 
-    def test_tab_tasks_jsx_served(self, _client):
-        resp = _client.get('/static/redux/tab_tasks.jsx')
-        assert resp.status_code == 200
 
-    def test_destructures_task_status_counts_at_top_level(self, tab_tasks_jsx_body):
-        """tab_tasks.jsx must destructure window.DF_TASK_STATUS_COUNTS.
+def _map_calls(code: str, table: str) -> list[tuple[str, str]]:
+    """Every ``<table>.map(p => ...)`` call: (parameter name, balanced call text)."""
+    calls = []
+    for match in re.finditer(rf'\b{re.escape(table)}\.map\(\s*(\w+)\s*=>', code):
+        paren = code.index('(', match.start())
+        calls.append((match.group(1), walk_balanced(code, paren, '(', ')')))
+    return calls
 
-        Whole-file scope on purpose: top-level destructures sit outside every
-        component function, so scoping this to TasksTab would never match.
-        Both names are required — projectStatusCounts does the counting,
-        activityPips fixes the render order and the zero-suppression rule.
-        """
-        match = re.search(
-            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_TASK_STATUS_COUNTS\s*;',
-            tab_tasks_jsx_body,
-        )
-        assert match is not None, (
-            'tab_tasks.jsx does not destructure window.DF_TASK_STATUS_COUNTS at '
-            'top level — the header counting module is registered in index.html '
-            'but unused.'
-        )
-        names = {n.strip() for n in match.group(1).split(',') if n.strip()}
-        assert 'projectStatusCounts' in names
-        assert 'activityPips' in names
 
-    def test_merged_active_pip_is_gone(self, tasks_tab_code):
-        """The single merged "N active" pip must no longer be rendered.
+def _the_map_rendering(code: str, table: str, marker: str) -> tuple[str, str]:
+    calls = [(p, text) for p, text in _map_calls(code, table) if marker in text]
+    assert len(calls) == 1, (
+        f'TasksTab has {len(calls)} `{table}.map(...)` call(s) rendering `{marker}`; expected exactly one.'
+    )
+    return calls[0]
 
-        This is the defect itself: one number over
-        {in-progress, blocked, merge-deferred}, compared by operators against
-        a cap that only bounds the in-progress part of it.
-        """
-        assert 'counts.active' not in tasks_tab_code, (
-            'TasksTab still references counts.active — the merged pip that '
-            'reads as a max_concurrent_tasks breach must be split into '
-            'separate running / blocked / merge-deferred counts.'
-        )
-        assert not re.search(r'\}\s*active\s*<', tasks_tab_code), (
-            'TasksTab still renders a merged "... active" pip label.'
-        )
 
-    def test_header_counts_come_from_the_pure_module(self, tasks_tab_code):
-        """TasksTab must call projectStatusCounts/activityPips rather than
-        re-inlining status filters in the component.
+def _view_rows_bindings(tasks_tab_code: str) -> list[tuple[str, str, str]]:
+    """Every ``const X = viewRows(...)``: (name, argument text, suffix after the call)."""
+    bindings = []
+    for match in re.finditer(r'\bconst\s+(\w+)\s*=\s*viewRows\(', tasks_tab_code):
+        call = walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
+        after = tasks_tab_code[match.end() - 1 + len(call):]
+        suffix = re.match(r'\s*(\.\w+)?', after).group(1) or ''
+        bindings.append((match.group(1), call[1:-1], suffix))
+    return bindings
 
-        Re-inlined `t.status === ...` passes in the header are exactly what
-        the node suite cannot cover, so they could drift back to a merged
-        tally without a single test going red.
-        """
-        # Deliberately `\w+` and not the literal local names `projTasks` /
-        # `counts`: what must hold is that the module is CALLED, not that a
-        # particular local identifier survives. Pinning the identifier would
-        # turn a zero-behaviour rename red with a message claiming the header
-        # counts no longer come from the pure module.
-        assert re.search(r'projectStatusCounts\(\s*\w+\s*\)', tasks_tab_code), (
-            'TasksTab does not call projectStatusCounts(...) — the header '
-            'counts must come from the executably-tested pure module.'
-        )
-        assert re.search(r'activityPips\(\s*\w+\s*\)', tasks_tab_code), (
-            'TasksTab does not call activityPips(...) — pip order and '
-            'zero-suppression must come from the pure module, not a JSX ternary.'
-        )
-        # The header's own counting passes must be gone. `filtered` (which
-        # uses statusMatches/searchMatches, not a bare status comparison) is
-        # unaffected; this pins that no hand-rolled status tally remains
-        # beside the module call.
-        inflight_filters = re.findall(
-            r"t\.status\s*===\s*'(?:in-progress|blocked|merge-deferred|pending|done)'",
-            tasks_tab_code,
-        )
-        assert inflight_filters == [], (
-            'TasksTab still hand-rolls status filters for the header counts: '
-            f'{inflight_filters} — these belong in projectStatusCounts.'
-        )
 
-    def test_renders_the_three_counts_separately(self, tasks_tab_code):
-        """The header must render one pip per activityPips entry.
-
-        Mapping over the returned entries (rather than three hardcoded pips)
-        is what makes the zero-suppression rule — and the never-empty
-        "0 running" fallback — actually reach the browser.
-        """
-        assert re.search(r'activityPips\(\s*\w+\s*\)\s*\.map\(', tasks_tab_code), (
-            'TasksTab does not map over activityPips(...) to render one pip '
-            'per in-flight status.'
-        )
-        assert re.search(r'key=\{\s*\w+\.key\s*\}', tasks_tab_code), (
-            'The rendered activity pips are not keyed by their entry key.'
-        )
-
-    def test_every_activity_pip_key_has_a_dot_colour(self, tab_tasks_jsx_body):
-        """The module/caller seam: activityPips owns the pip KEYS, the JSX owns
-        the dot COLOUR per key. Nothing else asserts the two agree.
-
-        That split is deliberate (the pure module must stay free of DOM and
-        colour concerns), but it means a fourth pip added to activityPips — or
-        a key renamed to match the counts spelling, e.g. 'merge-deferred' ->
-        'mergeDeferred' — renders `background: undefined`: an invisible dot
-        beside a number, with both suites still green. The node suite only
-        sees the pure module; every other test here only sees the JSX.
-
-        Source of truth for this key set is the `all` list in
-        task_status_counts.js's activityPips, pinned there by
-        dashboard/tests/js/task_status_counts.test.mjs.
-        """
-        match = re.search(
-            r'const\s+PIP_DOT_COLOR_T\s*=\s*\{(.*?)\}\s*;',
-            tab_tasks_jsx_body,
-            re.DOTALL,
-        )
-        assert match is not None, (
-            'tab_tasks.jsx no longer declares a PIP_DOT_COLOR_T map — the '
-            'activity pips have no per-key dot colour.'
-        )
-        keys = set(re.findall(r"^\s*'?([\w-]+)'?\s*:", match.group(1), re.MULTILINE))
-        assert keys == {'running', 'blocked', 'merge-deferred'}, (
-            f'PIP_DOT_COLOR_T covers {sorted(keys)}, but activityPips emits '
-            "keys {'running', 'blocked', 'merge-deferred'}. A key activityPips "
-            'can emit with no entry here renders style={{background: undefined}} '
-            '— an invisible dot next to a number. Keep the two in step (see the '
-            "`all` list in task_status_counts.js's activityPips)."
+class TestTheRetiredCountersAreGone:
+    @pytest.mark.parametrize(
+        'retired',
+        [
+            'DF_TASK_STATUS_COUNTS', 'DF_TASK_DONE_COUNT', 'projectStatusCounts', 'activityPips',
+            'doneCount', 'PIP_DOT_COLOR_T', 'ACTIVE_TASKS', 'DONE_COUNTS', '_fallbackDone', 'statusMatches',
+        ],
+    )
+    def test_no_client_bucketer_remains(self, tab_tasks_code, retired):
+        assert not re.search(rf'\b{re.escape(retired)}\b', tab_tasks_code), (
+            f'tab_tasks.jsx still contains `{retired}`. The header reads the served census '
+            'and the rows come from the snapshot by view; no client module re-counts '
+            'or re-buckets a status any more.'
         )
 
 
-class TestUnchangedHeaderElements:
-    """Everything else about the header is out of scope and must survive."""
+class TestHeaderReadsTheCensus:
+    def test_destructures_the_census_reader_without_fallback(self, tab_tasks_code, snapshot_names):
+        assert not re.search(r'window\.DF_TASK_SNAPSHOT\s*(\|\||&&|\?\?)', tab_tasks_code)
+        for name in ('projectCensus', 'projectRows', 'viewRows', 'CENSUS_VIEWS', 'EVERY_VIEW'):
+            assert name in snapshot_names, f'tab_tasks.jsx does not take {name} from window.DF_TASK_SNAPSHOT'
 
-    def test_pending_and_done_pips_still_rendered(self, tasks_tab_code):
-        assert re.search(r'\{\s*counts\.pending\s*\}\s*pending', tasks_tab_code), (
-            'the pending pip is no longer rendered'
-        )
-        assert re.search(r'\{\s*counts\.complete\s*\}\s*done', tasks_tab_code), (
-            'the done pip is no longer rendered'
-        )
-
-    def test_shown_count_label_still_rendered(self, tasks_tab_code):
-        """The "n/m shown" mono label and its `counts.total` denominator survive.
-
-        The NUMERATOR is deliberately UNPINNED here (`\\{[^}]*\\}`). This class
-        guards label SURVIVAL, not numerator provenance; the original spelling
-        `{filtered.length}` was pinned incidentally, and task 4137 changed it to
-        `{groupView.shownCount}` precisely because `filtered.length` counted an
-        array the group did not render (an "N/N shown" header over an empty
-        focus-mode graph).
-
-        Do NOT re-tighten this to a literal expression: that re-pins a stale
-        spelling and makes this task-3516 guard fail for a defect fix it has no
-        opinion about. The numerator's provenance is owned, more precisely, by
-        dashboard/tests/test_tab_tasks_focus_header.py — see
-        `test_header_no_longer_counts_the_pre_focus_array` there.
-        """
-        assert re.search(
-            r'\{[^}]*\}\s*/\s*\{\s*counts\.total\s*\}\s*shown',
-            tasks_tab_code,
-        ), 'the "n/m shown" mono label is no longer rendered'
-
-    def test_server_authoritative_done_count_preserved(self, tasks_tab_code):
-        """The done pip shows a server-MEASURED count or an explicit unknown.
-
-        Never a bounded tally shown as though it were the real number. The
-        measured count is ``TASKS_SNAPSHOT[p].census`` now that ``DONE_COUNTS``
-        is gone, and ``doneCount`` (task_done_count.js, executed by
-        ``dashboard/tests/js/task_done_count.test.mjs``) is what turns an entry
-        into the count or datum.js's placeholder. So the header must hand the
-        entry to that guard and render its answer, with nothing else in the
-        expression.
-
-        The ``_fallbackDone`` / ``'50+'`` branch is gone rather than kept as a
-        second route to the pip. It tallied the done rows in ``ACTIVE_TASKS``,
-        and the default render fetches none, so it could only ever produce the
-        confident "0 done" this guard exists to stop.
-        """
-        counts_literal = re.search(
-            r'const\s+counts\s*=\s*\{(.*?)\};', tasks_tab_code, re.DOTALL,
-        )
-        assert counts_literal is not None, 'TasksTab no longer builds a `counts` object'
-        complete = re.search(r'\bcomplete\s*:\s*([^,}]*)', counts_literal.group(1))
-        assert complete is not None, 'the display object has no `complete` count'
-        assert re.fullmatch(
-            r'doneCount\(\s*DF_T\.TASKS_SNAPSHOT\s*\[\s*p\.id\s*\]\s*\)',
-            complete.group(1).strip(),
-        ), (
-            'counts.complete must be exactly the guard reading this project\'s '
-            f'TASKS_SNAPSHOT entry, got: {complete.group(1).strip()!r}'
-        )
-        assert 'DONE_COUNTS' not in tasks_tab_code, (
-            'TasksTab still reads DONE_COUNTS, which /tasks no longer serves'
-        )
-        assert '_fallbackDone' not in tasks_tab_code, (
-            'the bounded done fallback is back: it counts done rows the default '
-            'render never fetches, so it can only render a fabricated zero'
-        )
-        assert not re.search(r"'\d+\+'", tasks_tab_code), (
-            "an 'N+' marker is back, and it only ever decorated that fallback"
+    def test_binds_one_census_per_project(self, tasks_tab_code, census):
+        calls = re.findall(r'\bprojectCensus\(', tasks_tab_code)
+        assert len(calls) == 1, (
+            f'TasksTab calls projectCensus {len(calls)} times; every pip of one project reads '
+            f'the single `{census}` binding.'
         )
 
-    def test_bounded_done_tally_is_not_on_the_display_object(self, tasks_tab_code):
-        """`counts` must not carry the module's raw `done` alongside `complete`.
-
-        `statusCounts.done` counts only the done rows actually loaded, which the
-        default render no longer fetches at all; `counts.complete` is the
-        server-measured count, or datum.js's placeholder when there is none.
-        Spreading the raw tally onto the display object parks two
-        near-synonymous done keys of different trust levels side by side, and
-        the next `{counts.done} done` edit silently renders a zero nobody
-        measured.
-        """
-        assert not re.search(r'\.\.\.\s*statusCounts', tasks_tab_code), (
-            'TasksTab spreads statusCounts into the display object — pick the '
-            'display keys explicitly so the bounded `done` tally never lands '
-            'on `counts` beside the authoritative `complete`.'
+    def test_the_header_is_one_pip_mapped_over_the_views(self, tasks_tab_code, snapshot_names, census):
+        pips = re.findall(r'<Pip\b', tasks_tab_code)
+        assert len(pips) == 1, f'TasksTab renders {len(pips)} <Pip> sites; expected one, mapped over CENSUS_VIEWS'
+        view, call = _the_map_rendering(tasks_tab_code, snapshot_names['CENSUS_VIEWS'], '<Pip')
+        assert f'datum={{{census}}}' in call, f'the header pip does not read the census binding: {call}'
+        assert f'format={{{view}.reading}}' in call, f'the header pip does not use the view reading: {call}'
+        assert re.search(rf'color=\{{\s*CP_T\[\s*{view}\.tone\s*\]\s*\}}', call), (
+            f'the header pip is not coloured by its view tone through PALETTE: {call}'
         )
-        assert 'counts.done' not in tasks_tab_code, (
-            'TasksTab references counts.done — that is the BOUNDED tally, not '
-            'the authoritative count; render counts.complete instead.'
+
+    def test_no_status_is_hand_bucketed(self, tasks_tab_code):
+        assert not re.search(r'\.status\s*[!=]==', tasks_tab_code), (
+            'TasksTab compares a status by hand. The header and the filter read the '
+            'generated views; a hand-written status list drifts from them.'
         )
 
 
-class TestActiveFilterStillMerged:
-    """OUT-OF-SCOPE GUARD. Splitting the `active` FILTER toggle is a separate
-    UX decision the task explicitly excludes. Without a positive guard, the
-    next reader sees a split display next to an unsplit filter, reads it as an
-    oversight, and "finishes the job"."""
-
-    def test_status_matches_keeps_the_three_status_disjunction(self, tasks_tab_code):
-        # statusMatches is declared INSIDE TasksTab, so the retired
-        # top-level-slice extractor could not isolate it and this assertion was
-        # scoped to the `filters.active && (...)` condition by an ad-hoc regex
-        # instead. `extract_function_body` scopes to the nested declaration
-        # directly (task 3549), which is narrower still and says what it means
-        # — and raises loudly if statusMatches is ever renamed, where the regex
-        # would have needed its own not-None guard to avoid going quiet.
-        status_matches_body = extract_function_body(tasks_tab_code, 'statusMatches')
-        for status in ('in-progress', 'blocked', 'merge-deferred'):
-            assert f"'{status}'" in status_matches_body, (
-                f'statusMatches no longer treats {status!r} as active — the '
-                'filter toggle deliberately keeps its merged three-status '
-                'meaning (task 3516 splits the DISPLAY only). The node suite '
-                "pins that the split display's three counts still sum to this "
-                'same population.'
+class TestRowsComeFromTheSnapshotByView:
+    def test_the_rows_are_the_projects_snapshot_rows_selected_by_view(self, tasks_tab_code):
+        rows = re.findall(r'\bconst\s+(\w+)\s*=\s*projectRows\(\s*DF_T\s*,\s*p\.id\s*\)', tasks_tab_code)
+        assert len(rows) == 1, 'TasksTab does not bind the project rows from projectRows(DF_T, p.id)'
+        bindings = _view_rows_bindings(tasks_tab_code)
+        assert bindings, 'TasksTab selects no rows through viewRows(...)'
+        for name, args, _ in bindings:
+            assert re.match(rf'\s*{rows[0]}\s*,\s*\w+\s*,\s*\w+\s*$', args), (
+                f'`{name}` is not viewRows({rows[0]}, <terminal>, <filter>): viewRows({args})'
             )
 
-    def test_active_filter_button_still_present(self, tasks_tab_code):
-        assert re.search(r"flipFilter\(\s*'active'\s*\)", tasks_tab_code), (
-            'the `active` filter button is gone — the filter split is out of '
-            'scope for task 3516.'
+    def test_the_filter_bar_is_the_census_views(self, tasks_tab_code, snapshot_names):
+        view, call = _the_map_rendering(tasks_tab_code, snapshot_names['CENSUS_VIEWS'], '<button')
+        assert len(re.findall(r'<button\b', call)) == 1
+        assert re.search(rf'flipFilter\(\s*{view}\.key\s*\)', call), f'the view button does not flip its view: {call}'
+        assert f'{{{view}.label}}' in call, f'the view button does not show the view label: {call}'
+        assert not re.search(r"flipFilter\(\s*['\"]", tasks_tab_code), (
+            'a filter button still flips a hand-named status key'
         )
+
+    def test_the_filter_does_not_persist_under_the_retired_key(self, tasks_tab_code):
+        setter = re.search(r'\bconst\s+flipFilter\s*=\s*\(?\s*\w+\s*\)?\s*=>\s*(\w+)\(', tasks_tab_code)
+        assert setter, 'TasksTab has no `const flipFilter = key => setX(...)`'
+        state = re.search(
+            rf'\bconst\s*\[\s*\w+\s*,\s*{setter.group(1)}\s*\]\s*=\s*tasksPersistedState\(\s*[\'"]([^\'"]+)[\'"]',
+            tasks_tab_code,
+        )
+        assert state, f'the filter setter {setter.group(1)} is not a tasksPersistedState'
+        assert state.group(1) != 'df.tasksFilters', (
+            'a browser holding the old {active, pending, ...} object would read as "nothing '
+            'selected" under the view keys; a fresh storage key makes it fall back to the default.'
+        )
+
+    def test_the_shown_label_counts_the_held_rows(self, tasks_tab_code, snapshot_names):
+        """ "n/m shown": m is every row the tab holds for the project, not a census number.
+
+        The numerator's provenance is test_tab_tasks_focus_header.py's.
+        """
+        every = snapshot_names['EVERY_VIEW']
+        held = [name for name, args, suffix in _view_rows_bindings(tasks_tab_code)
+                if re.search(rf',\s*{every}\s*$', args) and suffix == '.rows']
+        assert len(held) == 1, f'TasksTab does not bind viewRows(..., {every}).rows once'
+        assert re.search(rf'\.shownCount\s*\}}\s*/\s*\{{\s*{held[0]}\.length\s*\}}\s*shown', tasks_tab_code), (
+            f'the "n/m shown" label does not read {held[0]}.length as its denominator'
+        )
+
+    def test_a_hole_and_a_partial_listing_render_their_reasons(self, tasks_tab_code):
+        listed = [name for name, _, suffix in _view_rows_bindings(tasks_tab_code) if not suffix]
+        assert len(listed) == 1, 'TasksTab does not bind the listed viewRows(...) result once'
+        assert re.search(rf'title=\{{\s*{listed[0]}\.placeholder\.title\s*\}}', tasks_tab_code), (
+            'the viewRows placeholder does not carry its reason as a title'
+        )
+        assert re.search(rf'\{{\s*{listed[0]}\.placeholder\.text\s*\}}', tasks_tab_code)
+        assert re.search(rf'\b{listed[0]}\.notes\.map\(', tasks_tab_code), (
+            'the viewRows notes (why listed rows are not the whole, current set) are not rendered'
+        )
+
+
+def test_every_status_member_has_a_node_style(_client):
+    """Every TaskStatus member reaches the graph now, so each must be drawable.
+
+    The status filter used to drop review and infra-hold rows; the views list
+    them, and a node with no rule renders its status pip in no colour at all.
+    """
+    css = _client.get('/static/redux/styles.css').text
+    for member in TaskStatus:
+        assert re.search(
+            rf'\.taskgraph\s+\.node\.s-{re.escape(member.value)}\s+\.status-pip\s*\{{[^}}]*\bbackground\s*:',
+            css,
+        ), f'styles.css has no `.taskgraph .node.s-{member.value} .status-pip` background rule'
+
+
+_TOP_LEVEL_BINDING_RE = re.compile(r'^(?:const|let|var|function|class)\s+(\w+)', re.M)
+_TOP_LEVEL_DESTRUCTURE_RE = re.compile(r'^(?:const|let|var)\s*\{([^{}]*)\}\s*=', re.M)
+_CLASSIC_LEXICAL_RE = re.compile(r'^(?:const|let|class)\s+(\w+)', re.M)
+_CLASSIC_DESTRUCTURE_RE = re.compile(r'^(?:const|let)\s*\{([^{}]*)\}\s*=', re.M)
+
+
+def _destructured_locals(code: str, pattern: re.Pattern[str]) -> set[str]:
+    return {local for body in pattern.findall(code) for _, local in destructure_bindings(body)}
+
+
+def test_no_top_level_binding_collides_with_a_classic_script(_client, index_html_body, tab_tasks_code):
+    """Babel turns tab_tasks.jsx's top-level bindings into globals; none may shadow a classic lexical one.
+
+    A same-named top-level `const`/`let`/`class` in a classic script makes the
+    whole of tab_tasks.jsx fail to load, so window.DF_TASKS stays undefined and
+    the Tasks tab renders nothing (esc-5590-1). The mechanism is stated at
+    test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM. A classic `function` is
+    safe to rebind, which is why tab_tasks.jsx binds function exports under
+    their own names and renames every const export it takes.
+    """
+    jsx_names = set(_TOP_LEVEL_BINDING_RE.findall(tab_tasks_code))
+    jsx_names |= _destructured_locals(tab_tasks_code, _TOP_LEVEL_DESTRUCTURE_RE)
+
+    classic_scripts = re.findall(r'<script\s+src="/static/redux/([\w-]+\.js)\?v=\d+"', index_html_body)
+    assert 'task_snapshot.js' in classic_scripts, 'the classic-script discovery found nothing to compare against'
+    collisions = {}
+    for script in classic_scripts:
+        code = strip_js_comments(_client.get(f'/static/redux/{script}').text)
+        lexical = set(_CLASSIC_LEXICAL_RE.findall(code)) | _destructured_locals(code, _CLASSIC_DESTRUCTURE_RE)
+        for name in sorted(jsx_names & lexical):
+            collisions[name] = script
+    assert not collisions, (
+        f'tab_tasks.jsx binds {collisions} at top level, which the named classic scripts '
+        'declare as const/let/class. Rename the binding in the destructure (`{ X: X_T }`).'
+    )
