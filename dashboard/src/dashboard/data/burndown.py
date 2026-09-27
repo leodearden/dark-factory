@@ -75,6 +75,11 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 # in dashboard/tests/test_burndown_data.py.
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
+# The age past which a burndown sample is no longer fresh: two sample
+# intervals of dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS (not imported —
+# loops imports this module). Pinned through the wire by test_redux_api.py.
+SAMPLE_FRESHNESS_BOUND_SECONDS = 1200
+
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -651,19 +656,17 @@ async def aggregate_burndown_series(
 
 
 async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
-    """Return distinct project IDs that have at least one MEASURED snapshot row.
+    """Return distinct project IDs that have any snapshot row, gap rows included.
 
-    A project whose only rows are gaps stays off this list: how a gap renders
-    is for the shaper to decide (task 5592), not for this read to imply.
+    A project whose only rows are gaps is listed so the shaper renders it
+    unknown rather than leaving it out; its series still carries no row
+    (:func:`get_burndown_series` reads measured rows only).
     """
     if db is None:
         return []
     try:
-        measured = _measured_rows(await _snapshot_columns(db))
         async with db.execute(
-            f'SELECT DISTINCT project_id FROM snapshots WHERE {measured.sql} '
-            'ORDER BY project_id',
-            measured.params,
+            'SELECT DISTINCT project_id FROM snapshots ORDER BY project_id',
         ) as cur:
             rows = await cur.fetchall()
         return [row[0] for row in rows]
