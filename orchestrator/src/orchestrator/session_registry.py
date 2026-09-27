@@ -1114,6 +1114,9 @@ def close_decision_with_evidence(
     state: str,
     evidence: str,
     root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
 ) -> DecisionRecord | None:
     """Close *decision_id* to *state* and record the deciding *evidence*, in ONE locked read-modify-write.
 
@@ -1124,11 +1127,19 @@ def close_decision_with_evidence(
     refusal aborts before the registry claims an answer, which leaves the
     reaper free to close the record in between.
 
+    Decision ids are fleet-global while ``esc-<task>-<n>`` numbering restarts
+    per project, so the caller names the record it means by the project and
+    queue stamp it READ (compared folded, through normalize_project_token and
+    normalize_escalations_dir), and any other record at that id is refused.
+    That is the close-side twin of _run_write_decision's collision rule.
+
     Raises DecisionCloseRefused for a target state other than answered or
-    dropped, empty evidence, a move between two different terminal states, or
-    evidence already recorded (never overwritten). The two argument refusals
-    run before the lock, because a lock sidecar is never cleaned up (see
-    decision_id_lock); the two state refusals run inside the locked span.
+    dropped, empty evidence, a record whose project or queue stamp is not the
+    expected one, a move between two different terminal states, or evidence
+    already recorded (never overwritten). The two argument refusals run before
+    the lock, because a lock sidecar is never cleaned up (see
+    decision_id_lock); the three record refusals run inside the locked span,
+    identity first.
 
     Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
     missing file, a corrupt body, a lock fault or a write failure.
@@ -1144,7 +1155,16 @@ def close_decision_with_evidence(
             f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
         )
 
+    wanted = (normalize_project_token(expected_project), normalize_escalations_dir(expected_escalations_dir))
+
     def _close(record: DecisionRecord) -> None:
+        found = (normalize_project_token(record.project), normalize_escalations_dir(record.escalations_dir))
+        if found != wanted:
+            raise DecisionCloseRefused(
+                f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
+                f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
+                'fleet-global, so another project\'s or queue\'s record is never closed'
+            )
         if record.closing_evidence:
             raise DecisionCloseRefused(
                 f'{decision_id} already carries closing evidence; refusing to overwrite it'
@@ -4672,7 +4692,15 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         print(f'{reaped.id} {reaped.new_state}')
 
 
-def _run_close_decision(decision_id: str, state: str, evidence: str, root: str | None) -> int:
+def _run_close_decision(
+    decision_id: str,
+    state: str,
+    evidence: str,
+    root: str | None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str,
+) -> int:
     """Run the ``close-decision`` verb; the one decision verb whose failure is a non-zero exit.
 
     Its caller is an agent executing a pre-built apply payload
@@ -4681,7 +4709,14 @@ def _run_close_decision(decision_id: str, state: str, evidence: str, root: str |
     than read as success. Prints the closed record's id on success.
     """
     try:
-        record = close_decision_with_evidence(decision_id, state, evidence, root=root)
+        record = close_decision_with_evidence(
+            decision_id,
+            state,
+            evidence,
+            root=root,
+            expected_project=expected_project,
+            expected_escalations_dir=expected_escalations_dir,
+        )
     except DecisionCloseRefused as exc:
         print(f'close-decision refused: {exc}', file=sys.stderr)
         return 1
@@ -4857,6 +4892,23 @@ def _build_parser() -> argparse.ArgumentParser:
     close_decision_p.add_argument('--id', required=True, help="the decision's id")
     close_decision_p.add_argument('--state', required=True, help='answered or dropped')
     close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
+    close_decision_p.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
+            "like write-decision's: a record at --id whose folded project differs is refused"
+        ),
+    )
+    close_decision_p.add_argument(
+        '--escalations-dir',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
+            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
+            'a record at --id whose normalized stamp differs is refused'
+        ),
+    )
     close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
 
     # NOTE: --escalations-dir is required on BOTH halves of the file/reap
@@ -4987,7 +5039,14 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.verb == 'close-decision':
-        return _run_close_decision(args.id, args.state, args.evidence, args.root)
+        return _run_close_decision(
+            args.id,
+            args.state,
+            args.evidence,
+            args.root,
+            expected_project=args.project,
+            expected_escalations_dir=args.escalations_dir,
+        )
 
     try:
         if args.verb == 'launching':
