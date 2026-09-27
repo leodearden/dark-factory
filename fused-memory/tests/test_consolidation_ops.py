@@ -661,12 +661,10 @@ class TestTagOnlyTouchesNothingOnTheIncumbent:
 class TestAuthorizationIsFailClosedAndPreWrite:
     """The arm authorizes ITSELF, above every read and every write.
 
-    The tool in front of it already runs the same gate, so on that path it
-    runs twice — which costs nothing measurable, the resolver being pure,
-    synchronous and three `getattr` hops. The duplication is the point: the
-    auto-consolidation executor calls this function with NO tool boundary
-    in front of it, and a service-level write primitive that trusts its
-    caller to have authorized is exactly the shape that leaks.
+    The tool in front of it runs the same gate; this one is for the
+    auto-consolidation executor, which calls this function with NO tool
+    boundary in front of it. A service-level write primitive that trusts
+    its caller to have authorized is exactly the shape that leaks.
 
     An unauthorized caller is turned away before anything is done on its
     behalf and before it learns anything about the system.

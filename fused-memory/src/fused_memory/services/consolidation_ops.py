@@ -121,28 +121,6 @@ class RetainArmRefused:
     response: dict[str, Any]
 
 
-# ONE call-and-classify block for EVERY metadata patch this op makes:
-# the retain-arm tag, the child reparent, and the canonical's
-# supersedes correction. Extracted rather than copied because the
-# contract it encodes is non-obvious and identical at all three sites
-# (INV-5: two copies would have to stay in lockstep, and a drift
-# between them would be silent, since both halves would still
-# "work").
-#
-# THE CONTRACT, in one place: `update_memory` reports MemoryNotFound
-# and its authorization refusals by RETURNING {'error_type': ...},
-# while every OTHER failure goes through `_journaled_backend_call`,
-# which logs and RE-RAISES. Code that guarded only exceptions would
-# record a refusal as a success; code that guarded only the returned
-# shape would let one Qdrant timeout escape to `@mcp_tool_errors`,
-# which flattens the whole envelope to {'error', 'error_type'} —
-# destroying the per-id dispositions of records that are ALREADY
-# IRREVERSIBLY DELETED and skipping their tombstone write. So both
-# shapes are handled, and they collapse to the same per-id verdict.
-#
-# Returns None on success, or the normalized {'error', 'error_type'}
-# failure dict each arm decorates with its own keys (`id`, or
-# `child_id`/`from`/`to`).
 async def patch_memory_metadata(
     memory_service: MemoryService,
     *,
@@ -154,6 +132,18 @@ async def patch_memory_metadata(
     causation_id: str | None,
     source: str,
 ) -> dict[str, Any] | None:
+    """Merge *patch* into one record's metadata; ``None`` on success.
+
+    The one home of ``update_memory``'s split contract for every metadata
+    patch a consolidation makes — the retain tag, the child reparent, the
+    supersedes narrowing. MemoryNotFound and authorization refusals are
+    RETURNED as ``{'error_type': ...}``; every other failure is RAISED
+    through ``_journaled_backend_call``. Both collapse to one normalized
+    ``{'error', 'error_type'}`` dict, which each caller decorates with its
+    own keys. Guarding only one shape would record a refusal as a success,
+    or let one Qdrant timeout flatten an envelope describing records that
+    are already irreversibly deleted.
+    """
     try:
         outcome = await memory_service.update_memory(
             memory_id=memory_id,
@@ -364,14 +354,8 @@ async def apply_retain_arm(
     # wider metadata bar a back door into a silent-rewrite primitive — the
     # one thing the resolver's two-arm split exists to prevent.
     #
-    # DUPLICATED with the tool's own gate, deliberately. The tool's call is
-    # unconditional because it also covers the child reparent and the
-    # supersedes narrowing, which are not this arm's patches; this one
-    # exists because the auto-consolidation executor has no tool boundary
-    # in front of it. Running it twice on the tool path costs nothing
-    # measurable — the resolver is pure, synchronous and three `getattr`
-    # hops — and the refusal shape is identical, so a caller reads one
-    # vocabulary whichever gate turned it away.
+    # The tool runs this gate too; this one is for a caller with no tool
+    # boundary in front of it, such as the auto-consolidation executor.
     #
     # The LIVE `memory_service` goes in, positionally. Binding
     # `memory_service.config` or any leaf of it to a local would make the
