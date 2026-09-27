@@ -586,10 +586,6 @@ table { border-collapse: collapse; width: 100%; }
    width set inline (data-driven) by the JSX; color comes from the class. */
 .prd-bar { height: 4px; background: var(--bg-2); display: flex; overflow: hidden; }
 .prd-bar-seg { display: block; height: 100%; }
-.prd-bar-seg.s-done        { background: var(--ok); }
-.prd-bar-seg.s-in-progress { background: var(--accent); }
-.prd-bar-seg.s-blocked     { background: var(--bad); }
-.prd-bar-seg.s-pending     { background: var(--warn); }
 
 .prd-box-body { padding-top: 2px; } /* the nested .taskgraph supplies its own 12px padding */
 

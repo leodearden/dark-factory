@@ -8,7 +8,9 @@ const DF_T = window.DF_DATA;
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
-const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
+const {
+  prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, groupTasksByPrd, orderPrdGroups,
+} = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
@@ -299,15 +301,15 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
     `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
     `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
   ).join('|'), [graphTasks]);
-  // fullMembersByPrd (below) only feeds aggregatePrdStatus/summarizePrdMembers,
-  // which look at nothing but id/status/prd — a narrower, cheaper signature.
+  // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
+  // nothing but id/status/prd — a narrower, cheaper signature.
   const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
 
   const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
   const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
 
-  // "n/m done", the outline/pip aggregate status, and the stacked status bar
-  // all read from each PRD's FULL member set (every task with that prd,
+  // The "n/m terminal" count, the outline/pip aggregate status, and the
+  // member bar all read from each PRD's FULL member set (every task with that prd,
   // regardless of the active status display filter or focus narrowing) —
   // per the plan's truthful-burndown requirement. Keyed by prd (null for
   // the "no PRD" bucket) for O(1) lookup per rendered box below. Rendered
@@ -336,19 +338,19 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
 
 // One PRD box's chrome: title (basename via prdTitle, full path as a
 // tooltip), a status-colored outline + title pip (aggregatePrdStatus over
-// the FULL member set, driving an `s-<status>` class exactly like the
+// the FULL member set's tally, driving an `s-<status>` class exactly like the
 // `.taskgraph .node.s-*` idiom — see graph_layout-era node rendering above),
-// "n/m done" + a thin stacked status bar (summarizePrdMembers over the same
-// full member set), and a collapse control that hides the box body while
-// leaving the title bar + bar visible. All-done PRDs default to collapsed.
+// "n/m terminal" + a thin bar with one segment per member (prdBarSegments
+// over the same tally), and a collapse control that hides the box body while
+// leaving the title bar + bar visible. Finished PRDs default to collapsed.
 //
 // Kept as its own component (not inlined in ProjectPrdGroups' .map() above)
 // so each box's `collapsed` state is an independent useState — Rules of
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
 function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nodeRefs }) {
-  const agg = aggregatePrdStatus(fullMembers);
-  const stats = summarizePrdMembers(fullMembers);
+  const summary = summarizePrdMembers(fullMembers);
+  const agg = aggregatePrdStatus(summary);
 
   // active_tasks.py only exempts a PRD's done/cancelled members from its
   // project-wide terminal-task cap while the PRD still has an active-status
@@ -367,7 +369,7 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
   // renders (e.g. a member finishing while the box is open) must not yank a
   // manually-reopened box shut again, so the argument is only consulted by
   // React on the box's first mount.
-  const [collapsed, setCollapsed] = uS_T(agg === 'done');
+  const [collapsed, setCollapsed] = uS_T(() => prdIsFinished(summary));
   const title = g.noPrd ? 'No PRD' : prdTitle(g.prd);
   const headRef = uR_T(null);
 
@@ -376,7 +378,7 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
   // with el=null). The hoisted TaskGraphEdges overlay above silently skips
   // any edge whose endpoint ref is missing — so without this, a cross-box
   // dependency edge into or out of a collapsed box's tasks would vanish
-  // entirely. Since all-done PRDs collapse by default, that would routinely
+  // entirely. Since finished PRDs collapse by default, that would routinely
   // hide real upstream/downstream relationships on first paint. Fix: while
   // collapsed, proxy every member task id to the (always-mounted) header
   // element instead, so those edges anchor to the box's title bar rather
@@ -408,18 +410,6 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
     };
   }, [collapsed, g.tasks, nodeRefs]);
 
-  // Stacked bar segments: only the four buckets the plan calls out
-  // (done/in-progress/blocked/pending). Cancelled (and any other status)
-  // still counts toward stats.total — and therefore toward "n/m done" — but
-  // is not drawn as its own segment, leaving the bar's track color to show
-  // through for that share, same as the plan's explicit segment list.
-  const segs = [
-    { cls: 's-done', n: stats.done },
-    { cls: 's-in-progress', n: stats.inProgress },
-    { cls: 's-blocked', n: stats.blocked },
-    { cls: 's-pending', n: stats.pending },
-  ].filter(s => s.n > 0);
-
   return (
     <div className={`prd-box s-${agg}`}>
       <div className="prd-box-head" ref={headRef} data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
@@ -434,12 +424,12 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
               title={countMayUndercount
                 ? 'No active members in this PRD, so it wasn\'t exempt from the dashboard\'s done/cancelled-task cap — this count may undercount the true total.'
                 : undefined}>
-          {stats.done}/{stats.total} done
+          {summary.views.terminal}/{summary.total} terminal
         </span>
       </div>
       <div className="prd-bar">
-        {segs.map(s => (
-          <span key={s.cls} className={`prd-bar-seg ${s.cls}`} style={{ width: `${(s.n / stats.total) * 100}%` }} />
+        {prdBarSegments(summary).map(seg => (
+          <span key={seg.member} className="prd-bar-seg" style={{ width: `${seg.share}%`, background: CP_T[seg.tone] }} />
         ))}
       </div>
       {!collapsed && (
