@@ -30,10 +30,9 @@ from typing import Any
 
 import aiosqlite
 import httpx
-from shared.task_statuses import TaskStatus
 
 from dashboard.config import DashboardConfig
-from dashboard.data.census import TaskCensus
+from dashboard.data.census import SERIES_KEYS, TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
@@ -149,18 +148,6 @@ class SnapshotState(enum.StrEnum):
     GAP = 'gap'
 
 
-MEMBER_COLUMNS: Mapping[TaskStatus, str] = MappingProxyType(
-    {member: member.value.replace('-', '_') for member in TaskStatus}
-)
-"""The ``snapshots`` column holding each ``TaskStatus`` member's census count.
-
-ONE naming rule over the closed enum, in ``TaskStatus`` order, so the columns
-follow the vocabulary rather than restating it. A tenth member maps to a
-column that does not exist, and its INSERT fails loudly instead of the count
-being absorbed into another member.
-"""
-
-
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     """Bring an existing ``snapshots`` table up to the current column set.
 
@@ -242,7 +229,7 @@ def _value_row(
         state=SnapshotState.VALUE,
         reason=None,
         measured=MappingProxyType({
-            **{column: counts[member] for member, column in MEMBER_COLUMNS.items()},
+            **{column: counts[member] for member, column in SERIES_KEYS.items()},
             'in_progress_live': live,
             'in_progress_stranded': stranded,
             # The unit's own partition of the rows, whole. Not a recount of
