@@ -774,3 +774,66 @@ has no writer in the live system, so an injection must not inherit
 contested-ness from the claim it re-emits. The `topic` key is written
 into record metadata only under the `stamped` mode — the `unstamped`
 mode, which models reality today, carries no `topic` key at all.
+
+---
+
+## `curator_transcripts/`
+
+Three **redacted structural copies** of real TaskCurator CLI transcripts:
+the Exhibit A for each branch of the curator's timeout classification (task
+3995). Consumed by `fused-memory/tests/test_task_curator_timeout_evidence.py`,
+which materializes each file at
+`<curator config dir>/projects/<slug>/<session_id>.jsonl` and drives
+`TaskCurator._call_llm` against it, and which also feeds the records straight
+to `shared.cli_invoke.transcript_evidence`.
+
+The source files live in the operator's home under random neutral-cwd slugs
+and are subject to CLI retention, so a test reading them would skip on every
+other machine. These copies make the classification reproducible in CI.
+
+### Provenance
+
+All three sources were read on 2026-09-27. Turn counts and tool sequences
+were re-measured at extraction and match the counts cited in the task.
+
+| fixture | source (`~/.claude/projects/…`) | session id | assistant records | tool_use sequence | evidences |
+|---|---|---|---|---|---|
+| `esc_curator_33_salvageable.jsonl` | `-tmp-fm-neutral-classifier-cwd-wgm-f3h8/` | `d9b60a7a-a675-40cb-964d-eb5a2e20ff1e` | 2 | `StructuredOutput` | esc-curator-33: the verdict was COMPLETED in the transcript but never reached stdout |
+| `esc_curator_2_tool_wandering.jsonl` | `-tmp-fm-neutral-classifier-cwd-ds70bqzs/` | `91c4bcfd-d262-4f77-8df8-09a60321cc4c` | 6 | `ToolSearch` → `TaskGet` → `ToolSearch` | esc-curator-2: a "pure classifier" loading and running deferred tools, no verdict |
+| `esc_curator_4_pre_turn_stall.jsonl` | `-tmp-fm-neutral-classifier-cwd-3zgf473k/` | `42efe70b-26b4-426b-8adc-682b8544175e` | 0 | none | esc-curator-4: the only genuine pre-turn stall of the three |
+
+### What is preserved, and what is redacted
+
+Preserved exactly, because classification depends on it:
+- every record's `type`, in the original ORDER, including the interleaved
+  `queue-operation` / `attachment` / `last-prompt` / `user` records a parser
+  must skip;
+- the `record['message']['content']` nesting, plus `message.role`,
+  `message.model` and `message.stop_reason` on assistant records;
+- every `tool_use` block's `name`, and the KEY SET of each `input`;
+- `timestamp`, which carries the latency evidence (for example, the
+  salvageable run's first assistant record arrived ~102s after its prompt);
+- the `tool_reference` lists a `ToolSearch` returned, which show which
+  deferred tools the model loaded.
+
+Redacted to the placeholder `"redacted"`: all prose (prompts, `thinking`
+text and signatures, justification strings, `ToolSearch` queries, `TaskGet`
+ids, and string tool results). `tool_use` ids are renumbered
+`toolu_fixture_NN`, consistently across a file, so each `tool_use` still
+pairs with its `tool_result`. Every other record key (`cwd`, `uuid`,
+`sessionId`, `version`, attachment bodies, …) is dropped.
+
+**One value is deliberately changed.** The real esc-curator-33 verdict was
+`action: "create"` with a null `target_id`. The fixture's `StructuredOutput`
+input (and the matching `structured_output` attachment's `data`) is
+`action: "drop"`, `target_id: "9001"`. The curator's failure path degrades
+to `create`, so a `create` verdict could not show whether it was salvaged or
+defaulted, while a salvaged `drop` can only come from the transcript. A test
+using it must put a pool entry with id `9001` in the pool.
+
+### Regenerating
+
+These are hand-checkable plain JSONL (< 4 KB each). Edit them directly. A
+change to a record type, its order, a tool name or the `StructuredOutput`
+key set changes what the fixture is evidence of: re-measure it against the
+source, and update the table above in the same commit.
