@@ -46,11 +46,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.topic_anchor import select_canonical_payload
+
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +114,7 @@ class TopicClosure:
 # failure dict each arm decorates with its own keys (`id`, or
 # `child_id`/`from`/`to`).
 async def patch_memory_metadata(
-    memory_service: Any,
+    memory_service: MemoryService,
     *,
     memory_id: str,
     project_id: str,
@@ -150,7 +153,7 @@ async def patch_memory_metadata(
 
 
 async def read_topic_closure(
-    memory_service: Any,
+    memory_service: MemoryService,
     *,
     project_id: str,
     topic: str,
@@ -213,7 +216,7 @@ async def read_topic_closure(
 
 
 async def _resolve_incumbent_canonical(
-    memory_service: Any, *, project_id: str, topic: str
+    memory_service: MemoryService, *, project_id: str, topic: str
 ) -> str | None:
     """The id of *topic*'s existing canonical, or ``None`` if it names none.
 
@@ -234,7 +237,7 @@ async def _resolve_incumbent_canonical(
 
 
 async def execute_retain_consolidation(
-    memory_service: Any,
+    memory_service: MemoryService,
     *,
     project_id: str,
     topic: str,
