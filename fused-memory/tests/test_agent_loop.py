@@ -1636,8 +1636,8 @@ async def test_call_claude_cli_scopes_mcp_to_no_servers():
     """_call_claude_cli strict-scopes its run to ZERO MCP servers.
 
     ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
-    under an ``output_schema`` cli_invoke expands the wildcard into a
-    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    under an ``output_schema`` cli_invoke turns the wildcard into
+    ``--tools ''``, a registry filter that does not cover MCP tools, and ``cwd`` is
     ``explore_codebase_root`` (the project root, task 1989), which holds a live
     ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
     that is unreviewed access to tools like ``halt_scheduler`` /
