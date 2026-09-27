@@ -27,7 +27,10 @@ discovery/assertion split:
 
 * ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
   descendant set ``wait_subtree_live`` RETURNS still come only from the
-  production walkers ``collect_descendants``/``read_ppid_map``.
+  production walkers ``collect_descendants``/``read_ppid_map``.  A kill
+  verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
+  ``/proc/<pid>/stat`` read, task 5903), but the pids themselves are still
+  discovered only by those walkers.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -59,6 +62,7 @@ import math
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -147,15 +151,33 @@ def write_verify_config(
 # ---------------------------------------------------------------------------
 
 
-def sleeper_spec(sleep_secs: float = 300.0, *, marker: str = 'target/warm.marker') -> MergeVerifySpec:
+def sleeper_spec(
+    sleep_secs: float = 300.0,
+    *,
+    marker: str = 'target/warm.marker',
+    build_pgid_file: Path | None = None,
+) -> MergeVerifySpec:
     """MergeVerifySpec whose scoped test command touches *marker* then blocks.
 
     Reproduces the real cargo/rustc start_new_session escape (verify.py
     ``_run_cmd``) with trivial /bin/bash -- see module docstring.
+
+    With *build_pgid_file*, the build shell atomically writes its own pid
+    there (which is also its pgid, since ``_run_cmd`` starts a new session)
+    and then execs into the sleeper: the published pid IS the process that
+    blocks, and nothing forks after it is published.
     """
+    blocker = f'sleep {sleep_secs}'
+    if build_pgid_file is not None:
+        tmp = build_pgid_file.parent / (build_pgid_file.name + '.tmp')
+        blocker = (
+            f'echo $$ > {shlex.quote(str(tmp))} && '
+            f'mv {shlex.quote(str(tmp))} {shlex.quote(str(build_pgid_file))} && '
+            f'exec {blocker}'
+        )
     return MergeVerifySpec(
         verify_commands=(
-            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && sleep {sleep_secs}'),
+            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && {blocker}'),
         ),
         unscoped_typecheck=UnscopedTypecheckSpec(
             commands=(VerifyCommand('mod', type_check_command='true'),),
@@ -415,7 +437,10 @@ class HeartbeatWriter:
 
 
 def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
-    """Poll for a pgid file (written by verify-merge --request-id) and return its int value.
+    """Poll for a pgid file and return its int value.
+
+    Written by ``verify-merge --request-id`` or by a :func:`sleeper_spec`
+    build with *build_pgid_file*.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -534,8 +559,7 @@ def wait_subtree_live(
     It's optional so no existing call site is forced to change semantics.
     *proc_label* names *proc* in the failure message (default ``"leader"``);
     pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
-    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
-    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    rather than the leader itself, so a reader doesn't apply the rc taxonomy
     below to the wrong process.  When *proc* is given, a timeout failure
     names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
     specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
@@ -1050,7 +1074,7 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
     'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: Ceiling for the rows' child.wait()/wait_subtree_gone()/wait_pids_exited() polls: the full
 #: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
 #: rows assert THAT the tree was killed, never how fast), so on the success
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
@@ -1067,7 +1091,8 @@ ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
-#: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
+#: watchdog is even armed -- wait_for_pgid_file, then wait_subtree_live (Row
+#: 1: a second wait_for_pgid_file, on the build's own pgid file).  Rows
 #: 1/2/3 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
@@ -2666,6 +2691,41 @@ def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
     assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {
         7: ProcState('S', 4242)
     }
+
+
+def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path):
+    """The build pgid file names the build shell's own session, and that pid BECOMES the sleeper.
+
+    Runs the command exactly as verify.py::_run_cmd does on its default
+    (non-cgroup) path: ``/bin/bash -c`` in a new session.  Because the reported
+    pid itself execs into the blocker, nothing forks after the handle is
+    published, so a snapshot taken once the file exists cannot miss the sleeper.
+    """
+    build_pgf = tmp_path / 'build.pgid'
+    cmd = sleeper_spec(30.0, build_pgid_file=build_pgf).verify_commands[0].test_command
+    assert cmd is not None
+    cwd = tmp_path / 'build'
+    cwd.mkdir()
+    proc = subprocess.Popen(['/bin/bash', '-c', cmd], cwd=cwd, start_new_session=True)
+    try:
+        build_pgid = wait_for_pgid_file(build_pgf, timeout=10.0)
+        assert build_pgid == proc.pid, (
+            f'the file must hold the build shell pid {proc.pid}; got {build_pgid}'
+        )
+        assert os.getpgid(proc.pid) == proc.pid, 'the build shell must lead its own pgid'
+
+        comm_path = Path(f'/proc/{build_pgid}/comm')
+        deadline = time.monotonic() + 10.0
+        comm = comm_path.read_text().strip()
+        while comm != 'sleep' and time.monotonic() < deadline:
+            time.sleep(0.02)
+            comm = comm_path.read_text().strip()
+        assert comm == 'sleep', (
+            f'pid {build_pgid} must exec into the blocking sleeper; comm is {comm!r}'
+        )
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -4357,8 +4417,11 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     Models "the orchestrator holding the ssh child died": spawns a SEPARATE
     dispatcher process running the REAL ``_default_ssh_heartbeat_run`` against
     a local ``verify-merge --request-id`` argv (small heartbeat_interval so
-    real heartbeats flow while the dispatcher is alive).  Waits for the
-    sleeper subtree to appear, then SIGKILLs the dispatcher process itself --
+    real heartbeats flow while the dispatcher is alive).  Waits for the BUILD
+    itself to publish its session pgid (:func:`sleeper_spec`'s
+    *build_pgid_file* -- not merely any descendant, which is often a
+    transient ``git worktree add``), snapshots the leader's tree while the
+    leader is provably alive, then SIGKILLs the dispatcher process itself --
     when the OS reclaims its file descriptors, ITS end of the child's stdin
     pipe closes, giving the grandchild a clean EOF on fd 0.
 
@@ -4371,8 +4434,11 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
     materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
 
-    Asserts within a bounded T: the full descendant subtree (including the
-    start_new_session sleeper escape) AND the pgid leader are gone.
+    Asserts within a bounded T that every snapshotted pid -- the leader and
+    the start_new_session build escape -- has EXITED.  A zombie awaiting its
+    subreaper counts as exited (see :func:`wait_pids_exited`); a pgid walk
+    from the leader could not judge this, since it goes blind to the escaped
+    build the moment the leader dies.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -4381,36 +4447,52 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 
     REQUEST_ID = 'row1-orchestrator-killed'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row1-build.pgid'
 
     argv = verify_merge_argv(
-        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
     )
     dispatcher = spawn_ssh_heartbeat_dispatcher(
         argv=argv,
         heartbeat_interval=0.2,
         extra_env=ROW_WATCHDOG_ENV,
     )
+    tree: set[int] = set()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        # Row 1 owns the DISPATCHER process, not the leader -- the leader's
-        # own stdout/stderr aren't piped to this test, so pass the dispatcher.
-        wait_subtree_live(
-            pgid_val, proc=dispatcher, proc_label='dispatcher',
-            timeout=row_discovery_ceiling_secs(),
+        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        try:
+            build_pgid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
+        except AssertionError as exc:
+            # Row 1 owns the DISPATCHER process, not the leader, so the
+            # dispatcher's rc is the exit status this row can report.
+            pytest.fail(f'{exc}; dispatcher rc={dispatcher.poll()}')
+        tree = {leader} | collect_descendants(leader, read_ppid_map())
+        assert build_pgid in tree, (
+            f'harness failure, not a seam defect: build pgid {build_pgid} is not in '
+            f'leader {leader}\'s subtree {sorted(tree)}'
         )
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after the '
-            f'dispatcher was killed (EOF-triggered watchdog tree-kill did '
-            f'not fire)'
+        survivors = wait_pids_exited(tree, timeout=ROW_TREE_KILL_CEILING_SECS)
+        rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
+        assert not survivors, (
+            f'leader={leader} build={build_pgid}: {rendered} (pid: (state, ppid)) '
+            f'still running {ROW_TREE_KILL_CEILING_SECS}s after the dispatcher was '
+            f'killed (EOF-triggered watchdog tree-kill did not finish). S/T means '
+            f'SIGKILL never reached it; R/D means signalled but not yet run to exit'
         )
     finally:
         if dispatcher.poll() is None:
             dispatcher.kill()
             dispatcher.wait(timeout=5)
+        for pid in wait_pids_exited(tree, timeout=0):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------

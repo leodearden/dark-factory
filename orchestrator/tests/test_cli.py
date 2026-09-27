@@ -7,12 +7,13 @@ import subprocess
 import threading
 import time
 import traceback as traceback_module
+from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import (
@@ -1166,6 +1167,70 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Shared arrange for a knob-off verify-merge run with no real git/build work
+# ---------------------------------------------------------------------------
+
+_VERIFY_MERGE_SHA = 'abc1234567890abc1234567890abc1234567890ab'
+_VERIFY_MERGE_PGID = 55555
+_VERIFY_MERGE_RESULT_JSON = '{"passed": true, "results": []}'
+
+
+def _patched_verify_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    acquire: AsyncMock | None = None,
+) -> Callable[..., Result]:
+    """Fake every verify-merge collaborator that does real work; return the invoker.
+
+    Faked: GitOps (worktree_base is ``tmp_path/.worktrees``), load_config,
+    start_own_process_group (returns _VERIFY_MERGE_PGID), start_stdin_watchdog
+    (inert, so it never reads this process's real fd 0), and the verify_runner
+    trio (stdout carries _VERIFY_MERGE_RESULT_JSON). A test re-patches the seam
+    it is about. ``acquire`` stands in for acquire_host_verify_worktree, which
+    otherwise returns a real directory. The invoker appends its arguments to
+    ``verify-merge --sha _VERIFY_MERGE_SHA --spec {} --config <file>``.
+    """
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = tmp_path / '.worktrees'
+    mock_git_ops.acquire_host_verify_worktree = (
+        AsyncMock(return_value=fake_wt) if acquire is None else acquire
+    )
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: _VERIFY_MERGE_PGID)
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', lambda pgid, *a, **kw: MagicMock())
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.result_to_json', lambda r: _VERIFY_MERGE_RESULT_JSON,
+    )
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    def invoke(*extra_args: str) -> Result:
+        return CliRunner().invoke(main, [
+            'verify-merge',
+            '--sha', _VERIFY_MERGE_SHA,
+            '--spec', '{}',
+            '--config', str(cfg_file),
+            *extra_args,
+        ])
+
+    return invoke
+
+
+# ---------------------------------------------------------------------------
 # Task 1732 step-9 — verify-merge --request-id pgid lifecycle + back-compat
 # ---------------------------------------------------------------------------
 
@@ -1177,74 +1242,32 @@ def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
     work happens. Checks file existence mid-run via the mocked
     run_merge_verify_on_worktree coroutine.
     """
-    from unittest.mock import AsyncMock, MagicMock
-
     from orchestrator.verify_cancel import pgid_file
 
-    FAKE_PGID = 77777
     FAKE_REQUEST_ID = 'test-req-1732'
-    known_json = '{"passed": true, "results": []}'
+    invoke = _patched_verify_merge(tmp_path, monkeypatch)
 
-    # worktree_base that GitOps would compute
-    fake_worktree_base = tmp_path / '.worktrees'
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group ---
     sopg_calls = []
 
     def fake_sopg():
         sopg_calls.append(True)
-        return FAKE_PGID
+        return _VERIFY_MERGE_PGID
 
     monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
 
-    # --- Prevent the real stdin watchdog thread (task 2308 gamma) from
-    # arming: unmocked, it reads this test process's own real fd 0 (not a
-    # simulated ssh channel), which the pgid-lifecycle assertions below don't
-    # exercise -- same isolation used by the watchdog-spawn tests further
-    # down this file.
-    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', lambda pgid, *a, **kw: MagicMock())
-
-    # --- Mock verify_runner helpers; capture pgid file existence mid-run ---
-    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+    pgf = pgid_file(tmp_path / '.worktrees', FAKE_REQUEST_ID)
     file_existed_mid_run = []
 
     async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
         file_existed_mid_run.append(pgf.exists())
-        result = MagicMock()
-        return result
+        return MagicMock()
 
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
     monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
 
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-        '--request-id', FAKE_REQUEST_ID,
-    ])
+    r = invoke('--request-id', FAKE_REQUEST_ID)
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
+    assert _VERIFY_MERGE_RESULT_JSON in r.output
 
     # start_own_process_group must have been called once
     assert len(sopg_calls) == 1, 'start_own_process_group must be called once with --request-id'
@@ -1263,49 +1286,17 @@ def test_verify_merge_no_request_id_back_compat(tmp_path, monkeypatch):
 
     Verifies today's exact behavior is unchanged (back-compat).
     """
-    from unittest.mock import AsyncMock, MagicMock
+    invoke = _patched_verify_merge(tmp_path, monkeypatch)
 
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group to ensure it is NOT called ---
     sopg_calls = []
 
     def fake_sopg():
         sopg_calls.append(True)
-        return 99999
+        return _VERIFY_MERGE_PGID
 
     monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
 
-    # --- Mock verify_runner helpers ---
-    known_json = '{"passed": false, "results": []}'
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
+    r = invoke()
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
 
@@ -2528,39 +2519,13 @@ def test_wait_for_pgid_file_or_report_crash_reports_timeout_for_live_child(tmp_p
 def test_verify_merge_spawns_watchdog_when_request_id_set(tmp_path, monkeypatch):
     """--request-id set: verify-merge spawns the stdin watchdog with the pgid.
 
-    Mirrors task 1732's pgid-lifecycle scaffolding (mocked GitOps/config/
-    verify_runner helpers, no real git/build work). Spies on
-    start_own_process_group (known pgid) and monkeypatches
-    orchestrator.cli.start_stdin_watchdog to a recorder. Asserts the
-    recorder is called exactly once with the SAME pgid written to the
-    pgid file.
+    Over the shared _patched_verify_merge arrange (known pgid, no real
+    git/build work), monkeypatches orchestrator.cli.start_stdin_watchdog to a
+    recorder. Asserts the recorder is called exactly once with the SAME pgid
+    written to the pgid file.
     """
-    from unittest.mock import AsyncMock, MagicMock
+    invoke = _patched_verify_merge(tmp_path, monkeypatch)
 
-    FAKE_PGID = 55555
-    FAKE_REQUEST_ID = 'test-req-2308'
-    known_json = '{"passed": true, "results": []}'
-
-    fake_worktree_base = tmp_path / '.worktrees'
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group (known pgid) ---
-    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
-
-    # --- Recorder for start_stdin_watchdog ---
     watchdog_calls = []
 
     def fake_start_stdin_watchdog(pgid, *args, **kwargs):
@@ -2569,51 +2534,19 @@ def test_verify_merge_spawns_watchdog_when_request_id_set(tmp_path, monkeypatch)
 
     monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
 
-    # --- Mock verify_runner helpers ---
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-        '--request-id', FAKE_REQUEST_ID,
-    ])
+    r = invoke('--request-id', 'test-req-2308')
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert watchdog_calls == [FAKE_PGID], (
-        f'start_stdin_watchdog must be called exactly once with pgid={FAKE_PGID}; '
+    assert watchdog_calls == [_VERIFY_MERGE_PGID], (
+        f'start_stdin_watchdog must be called exactly once with pgid={_VERIFY_MERGE_PGID}; '
         f'got {watchdog_calls!r}'
     )
 
 
 def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
     """Without --request-id, start_stdin_watchdog is NOT spawned (back-compat)."""
-    from unittest.mock import AsyncMock, MagicMock
+    invoke = _patched_verify_merge(tmp_path, monkeypatch)
 
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Recorder for start_stdin_watchdog ---
     watchdog_calls = []
 
     def fake_start_stdin_watchdog(pgid, *args, **kwargs):
@@ -2622,25 +2555,7 @@ def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
 
-    # --- Mock verify_runner helpers ---
-    known_json = '{"passed": false, "results": []}'
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
+    r = invoke()
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
     assert watchdog_calls == [], (
@@ -2663,24 +2578,9 @@ def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypa
     the comment above the callback in cli.py) and threading a new argument
     through must not reorder it. Both are asserted from one ordered log.
     """
-    from unittest.mock import AsyncMock, MagicMock
-
     from orchestrator.verify_cancel import WatchdogTrigger
 
-    FAKE_PGID = 55556
-    known_json = '{"passed": true, "results": []}'
-
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = tmp_path / '.worktrees'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
+    invoke = _patched_verify_merge(tmp_path, monkeypatch)
 
     # One ordered log shared by both seams, so the happens-before is read off
     # the log rather than inferred from two independent recorders.
@@ -2709,24 +2609,7 @@ def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypa
 
     monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
 
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-        '--request-id', 'test-req-4194',
-    ])
+    r = invoke('--request-id', 'test-req-4194')
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
     assert len(captured_fire) == 1, f'expected one fire= callback; got {captured_fire!r}'
@@ -2738,5 +2621,60 @@ def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypa
     assert ordered == ['watchdog_fired.set', 'fire_watchdog_kill']
     assert len(kill_calls) == 1
     pgid, kwargs = kill_calls[0]
-    assert pgid == FAKE_PGID
+    assert pgid == _VERIFY_MERGE_PGID
     assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION
+
+
+# ---------------------------------------------------------------------------
+# Task 5904 — a fired watchdog owns the exit on every path out of _run()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('setup_raises', [True, False], ids=['setup_raises', 'returns'])
+def test_verify_merge_hands_exit_to_a_fired_watchdog_on_every_path(
+    tmp_path, monkeypatch, setup_raises,
+):
+    """A raise out of _run() hands the exit to a fired watchdog, exactly like a return.
+
+    The watchdog's own SIGTERM routinely makes _run() RAISE (it kills
+    ``git worktree add``, rc=-15). If that path exits without joining the
+    watchdog, interpreter shutdown tears the daemon watchdog thread down
+    mid-grace and its SIGKILL escalation never runs. See
+    cli.py::verify_merge.
+    """
+    from orchestrator.verify_cancel import WatchdogTrigger
+
+    acquire = (
+        AsyncMock(side_effect=RuntimeError('git worktree add failed rc=-15'))
+        if setup_raises else None
+    )
+    invoke = _patched_verify_merge(tmp_path, monkeypatch, acquire=acquire)
+
+    log = []
+
+    def fake_fire_watchdog_kill(pgid, **kwargs):
+        log.append('escalation_started')
+
+    monkeypatch.setattr(cli_module, 'fire_watchdog_kill', fake_fire_watchdog_kill)
+
+    class _FakeWatchdogThread:
+        def join(self, timeout=None):
+            log.append('watchdog_joined')
+
+    def fake_start_stdin_watchdog(pgid, *, fire, **kwargs):
+        fire(WatchdogTrigger.EOF)
+        return _FakeWatchdogThread()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    r = invoke('--request-id', 'test-req-5904')
+
+    assert log == ['escalation_started', 'watchdog_joined'], (
+        f'a fired watchdog must own the exit: expected the main thread to block on '
+        f'the watchdog after the escalation began; got log={log!r}, '
+        f'exit_code={r.exit_code}, output={r.output!r}'
+    )
+    assert r.exit_code == 1, f'expected exit_code 1, got {r.exit_code}; output={r.output!r}'
+    assert _VERIFY_MERGE_RESULT_JSON not in r.stdout, (
+        f'never print a VerifyResult for a build the watchdog killed; stdout={r.stdout!r}'
+    )
