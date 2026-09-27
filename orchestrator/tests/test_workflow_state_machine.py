@@ -197,6 +197,30 @@ class TestNeverAFourthTable:
             assert machine.state == frm
 
 
+
+class TestExitContractCoversEveryOutcome:
+    """The genuine cross-layer guard ``shared/src/shared/task_transitions.py``
+    cannot host: ``_OUTCOME_ALLOWED``'s keys are a hand-kept mirror of the
+    REAL ``WorkflowOutcome`` enum, checked here against that enum itself."""
+
+    @pytest.mark.parametrize('outcome', list(WorkflowOutcome))
+    def test_every_outcome_has_a_contract_row(self, outcome):
+        shared_outcome_allows_status(outcome, TaskStatus.BLOCKED)
+
+    def test_planned_admits_no_status(self):
+        assert not any(
+            shared_outcome_allows_status(WorkflowOutcome.PLANNED, status)
+            for status in TaskStatus
+        )
+
+    @pytest.mark.parametrize(
+        'outcome', [o for o in WorkflowOutcome if o is not WorkflowOutcome.PLANNED],
+    )
+    def test_every_run_exit_outcome_admits_some_status(self, outcome):
+        assert any(
+            shared_outcome_allows_status(outcome, status) for status in TaskStatus
+        )
+
 class TestStateToStatusProjection:
     """Pins each ``STATE_TO_STATUS`` entry independently of ``WorkflowStateMachine``
     behavior and of ``TestNeverAFourthTable`` (which imports the same table it is

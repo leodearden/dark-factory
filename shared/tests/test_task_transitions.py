@@ -397,46 +397,62 @@ _WORKFLOW_OUTCOME_VALUES = {
 }
 
 
+# Spec docs/task-escalation-state-spec.md §5 (the outcome contract),
+# transcribed BY HAND — deliberately not derived from _OUTCOME_ALLOWED, so the
+# grid below is an independent oracle for the table (task 3542, boundary #16).
+_SPEC_EXIT_CONTRACT: dict[str, frozenset[str]] = {
+    'done': frozenset({'done'}),
+    'planned': frozenset(),  # internal-only; never a run() exit
+    'blocked': frozenset({'blocked', 'infra-hold', 'cancelled', 'deferred', 'merge-deferred'}),
+    'escalated': frozenset({'blocked'}),
+    'requeued': frozenset({'pending'}),
+    'cancelled': frozenset({'cancelled'}),
+    'merge-deferred': frozenset({'merge-deferred'}),
+    'soft-cancelled': frozenset({'in-progress', 'blocked', 'pending', 'merge-deferred'}),
+}
+
+
 class TestOutcomeAllowsStatus:
+    def test_spec_transcription_covers_every_outcome(self):
+        assert set(_SPEC_EXIT_CONTRACT) == _WORKFLOW_OUTCOME_VALUES
+
+    @pytest.mark.parametrize('outcome', sorted(_SPEC_EXIT_CONTRACT))
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_every_pair_matches_the_spec(self, outcome, status):
+        expected = status.value in _SPEC_EXIT_CONTRACT[outcome]
+        assert outcome_allows_status(outcome, status) is expected
+
     def test_done_outcome(self):
         assert outcome_allows_status('done', TaskStatus.DONE) is True
         assert outcome_allows_status('done', 'done') is True
         assert outcome_allows_status('done', 'blocked') is False
 
     def test_blocked_outcome(self):
-        assert outcome_allows_status('blocked', 'blocked') is True
-        # Fix 1 (orchestrator/workflow.py ~2057): a steward-resolved L0 that
-        # preserves cancelled/deferred/merge-deferred also exits BLOCKED.
-        assert outcome_allows_status('blocked', 'cancelled') is True
-        assert outcome_allows_status('blocked', 'deferred') is True
-        assert outcome_allows_status('blocked', 'merge-deferred') is True
-        # BLOCKED paths that deliberately PRESERVE the mid-flight row rather
-        # than parking it: spec §5's steward terminal-decision carve-out (the
-        # steward already adjudicated the row, so _mark_blocked returns BLOCKED
-        # without rewriting it), and the merge-gating bail. NOT the merge-halt
-        # trio — as of task 3537 those route through _mark_blocked and DO write
-        # the row (spec §7.9 / §8-E3, INV-6). See _OUTCOME_ALLOWED['blocked']:
-        # the member is retained on the remaining justifications; narrowing it
-        # is divergence E10's scope.
-        assert outcome_allows_status('blocked', 'in-progress') is True
-        # 'done'/'pending' are NOT legitimate BLOCKED exits — 'done' has its
-        # own dedicated branch (never falls through to BLOCKED), and nothing
-        # returns BLOCKED before an initial 'pending'->'in-progress' claim.
+        # Every BLOCKED exit writes 'blocked' / 'infra-hold' through
+        # _mark_blocked, or preserves a steward terminal decision
+        # (WORKFLOW_PRESERVE minus done) via
+        # TaskWorkflow._honour_steward_terminal_decision.
+        for status in ('blocked', 'infra-hold', 'cancelled', 'deferred', 'merge-deferred'):
+            assert outcome_allows_status('blocked', status) is True
+        # Spec §5: no BLOCKED exit leaves 'in-progress'.
+        assert outcome_allows_status('blocked', 'in-progress') is False
         assert outcome_allows_status('blocked', 'done') is False
         assert outcome_allows_status('blocked', 'pending') is False
 
     def test_escalated_outcome(self):
-        # Dominant _mark_blocked+open-L1 path, and the merge-gating bail
-        # that preserves in-progress.
+        # Boundary #16: an ESCALATED exit is _mark_blocked's
+        # StewardReescalatedL1 branch, which writes the 'blocked' row first;
+        # the sole block_status='infra-hold' caller always exits BLOCKED.
         assert outcome_allows_status('escalated', 'blocked') is True
-        assert outcome_allows_status('escalated', 'in-progress') is True
+        assert outcome_allows_status('escalated', TaskStatus.IN_PROGRESS) is False
+        assert outcome_allows_status('escalated', 'infra-hold') is False
 
     def test_requeued_outcome(self):
-        # Self-repend / deferred-to-stranded-sweep window / requeue-cap
-        # exhausted -> blocked.
+        # Every slot-exiting REQUEUED writes 'pending' first (spec §5: no
+        # deferred-to-stranded-sweep window).
         assert outcome_allows_status('requeued', 'pending') is True
-        assert outcome_allows_status('requeued', 'in-progress') is True
-        assert outcome_allows_status('requeued', 'blocked') is True
+        assert outcome_allows_status('requeued', 'in-progress') is False
+        assert outcome_allows_status('requeued', 'blocked') is False
         assert outcome_allows_status('requeued', 'done') is False
 
     def test_cancelled_outcome(self):
@@ -445,21 +461,25 @@ class TestOutcomeAllowsStatus:
     def test_merge_deferred_outcome(self):
         assert outcome_allows_status('merge-deferred', 'merge-deferred') is True
 
-    def test_planned_outcome(self):
-        # Internal-only sub-phase — the task stays claimed (in-progress).
-        assert outcome_allows_status('planned', 'in-progress') is True
-        assert outcome_allows_status('planned', 'done') is False
+    def test_planned_outcome_admits_no_status_but_stays_recognized(self):
+        # Internal sub-phase consumed inside _drive, never a run() exit: the
+        # key stays (no ValueError) so a PLANNED exit is a named violation.
+        for status in TaskStatus:
+            assert outcome_allows_status('planned', status) is False
+
+    def test_observed_terminal_is_reported_as_that_terminal(self):
+        # Relaxation 1 is producer-side: a cancelled row is reported
+        # CANCELLED, never DONE.
+        assert outcome_allows_status('done', 'cancelled') is False
+        assert outcome_allows_status('cancelled', 'cancelled') is True
 
     def test_soft_cancelled_outcome(self):
-        # preserved / release_workflow park->blocked / stranded-sweep->pending.
-        assert outcome_allows_status('soft-cancelled', 'in-progress') is True
-        assert outcome_allows_status('soft-cancelled', 'blocked') is True
-        assert outcome_allows_status('soft-cancelled', 'pending') is True
-        # W9-θ: a soft-cancel of a train member parked in merge-deferred exits
-        # with SOFT_CANCELLED while the last-persisted row is still
-        # merge-deferred (release_workflow parks it to blocked only after
-        # run() returns) — the same "preserved" case as in-progress.
-        assert outcome_allows_status('soft-cancelled', 'merge-deferred') is True
+        # release_workflow parks 'in-progress' -> 'blocked' only after the
+        # slot clears, so the live row is still 'in-progress' at run() exit;
+        # the Table B park / restart teardowns write 'blocked' / 'pending'
+        # before the kill; a parked train member stays 'merge-deferred'.
+        for status in ('in-progress', 'blocked', 'pending', 'merge-deferred'):
+            assert outcome_allows_status('soft-cancelled', status) is True
 
     def test_normalizes_value_attribute(self):
         # W9 may pass a real WorkflowOutcome instance rather than a plain
