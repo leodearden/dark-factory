@@ -52,6 +52,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_ACTIVE,
     STATE_EXPIRED,
     STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -793,6 +794,7 @@ class ReconLedgerStore:
         entity_uuid: str,
         grounds: str,
         streak: int,
+        recent_counts: Sequence[int],
         last_run_id: str,
         updated_at: str,
         expires_at: str,
@@ -800,6 +802,10 @@ class ReconLedgerStore:
         """Write (last-write-wins) one suppression-streak row: the number of
         consecutive full cycles in which the standing decision on
         ``(entity_uuid, grounds)`` suppressed at least one flag (task 2943).
+
+        The row also carries ``recent_counts``, the per-cycle suppression counts
+        of the streak's most recent cycles, oldest first. Capping that window at
+        K is the caller's job, so the ledger stays threshold-agnostic.
 
         The PK slots deliberately mirror
         :meth:`upsert_entity_standing_decision` — ``task_id=''``,
@@ -816,8 +822,10 @@ class ReconLedgerStore:
 
         Validation is loud (INV-1), as in :meth:`upsert_entity_standing_decision`:
         an empty ``entity_uuid``, a ``streak`` that is not a non-negative int, a
-        ``grounds`` outside ``GROUNDS_ENUM``, or a ``None`` ``expires_at`` raises
-        ``ValueError`` naming the field, and nothing is written.
+        ``recent_counts`` that is not a list or tuple of non-bool ints >= 1 no
+        longer than ``streak``, a ``grounds`` outside ``GROUNDS_ENUM``, or a
+        ``None`` ``expires_at`` raises ``ValueError`` naming the field, and
+        nothing is written.
         """
         if not entity_uuid:
             raise ValueError(
@@ -828,6 +836,25 @@ class ReconLedgerStore:
             raise ValueError(
                 'upsert_suppression_streak: streak must be a non-negative int '
                 f'(got {streak!r})'
+            )
+        if not isinstance(recent_counts, (list, tuple)):
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts must be a list or tuple '
+                f'of per-cycle counts (got {recent_counts!r})'
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for count in recent_counts
+        ):
+            raise ValueError(
+                'upsert_suppression_streak: every recent_counts entry must be an '
+                f'int >= 1, one suppressing cycle\'s count (got {recent_counts!r})'
+            )
+        if len(recent_counts) > streak:
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts may hold at most one '
+                f'entry per cycle of the streak (got {len(recent_counts)} entries '
+                f'for streak={streak})'
             )
         if grounds not in GROUNDS_ENUM:
             raise ValueError(
@@ -841,6 +868,7 @@ class ReconLedgerStore:
             )
         payload = {
             STREAK_PAYLOAD_KEY: streak,
+            STREAK_WINDOW_PAYLOAD_KEY: list(recent_counts),
             'last_run_id': last_run_id,
             'grounds': grounds,
             'updated_at': updated_at,

@@ -1452,6 +1452,7 @@ async def update_suppression_streaks(
                 entity_uuid=entity_uuid,
                 grounds=grounds,
                 streak=streak,
+                recent_counts=(),
                 last_run_id=run_id,
                 updated_at=now_dt.isoformat(),
                 expires_at=expires_at,
