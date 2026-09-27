@@ -195,14 +195,14 @@ class TestMergePhaseBlockedWritesParkStatus:
             f'merge_phase={merge_phase}: block_status must be honoured by the '
             f'merge-aware park write; got {_statuses(workflow)!r}'
         )
-        # ...and the row it writes must SURVIVE run()'s SM-2 check.  Writing a
-        # status the outcome<->status table forbids would raise AssertionError
-        # straight out of run(), so pin the pairing rather than assuming it:
+        # ...and the row it writes must SATISFY run()'s exit contract.  Writing
+        # a status the outcome<->status table forbids would record a violation
+        # on every such exit, so pin the pairing rather than assuming it:
         # 'infra-hold' is a legitimate BLOCKED exit row (PRD C7/D3), just on
         # the status is_infra_held keys on.
         assert outcome_allows_status(outcome.value, 'infra-hold') is True, (
             "_OUTCOME_ALLOWED['blocked'] must admit INFRA_HOLD — otherwise "
-            'this very write makes SM-2 raise out of run()'
+            "this very write is an exit-contract violation"
         )
 
     @pytest.mark.asyncio
@@ -244,10 +244,10 @@ class TestMergePhaseBlockedWritesParkStatus:
         A different outcome, the same obligation.  ``_run_merge_phase`` exits
         the slot on ANY non-DONE/non-REQUEUED outcome (``return
         merge_outcome``), so an unwritten row here strands exactly the same
-        unclaimed ``in-progress`` shape a BLOCKED return would — and SM-2
-        cannot catch it, because ``outcome_allows_status('escalated',
-        'in-progress')`` is True (asserted below so the blind spot is on the
-        record, not assumed).
+        unclaimed ``in-progress`` shape a BLOCKED return would.  Since task
+        3542 the exit contract flags that shape
+        (``outcome_allows_status('escalated', 'in-progress')`` is False,
+        asserted below), but only the park write makes the exit truthful.
         """
         workflow = _make_workflow(tmp_path, with_queue=True)
         workflow._enter_phase(WorkflowState.MERGE)
@@ -258,9 +258,9 @@ class TestMergePhaseBlockedWritesParkStatus:
         )
 
         assert outcome == WorkflowOutcome.ESCALATED
-        assert outcome_allows_status(outcome.value, 'in-progress') is True, (
-            'SM-2 is blind to an in-progress row on an ESCALATED exit, which '
-            'is precisely why this park write has to be unconditional'
+        assert outcome_allows_status(outcome.value, 'in-progress') is False, (
+            'θ: the exit contract now flags an in-progress row on an ESCALATED '
+            'exit; the park write is still what makes the exit truthful (INV-6)'
         )
         assert _statuses(workflow)[-1:] == ['blocked'], (
             f'merge_phase={merge_phase}: the steward handed off to a human and '
@@ -305,8 +305,9 @@ class TestMergePhaseFencePreserved:
     """GREEN both before and after: these two returns keep the suppression.
 
     Deleting the ``if not merge_phase:`` ENTRY gate (the naive fix) would break
-    the fence in the other direction — an INV-6 violation SM-2 cannot catch,
-    because ``outcome_allows_status('requeued', BLOCKED)`` is True.
+    the fence in the other direction — an INV-6 violation the exit contract
+    cannot catch, because the in-place retry never leaves the slot (even though
+    ``outcome_allows_status('requeued', BLOCKED)`` is now False).
     """
 
     @pytest.mark.asyncio

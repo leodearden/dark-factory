@@ -266,82 +266,57 @@ def is_legal_transition(
 # orchestrator.workflow.WorkflowOutcome enum, so that assertion catches
 # module-vs-test drift between the two copies, NOT drift from the actual
 # source of truth (shared/ cannot import orchestrator to check that
-# directly). A genuine cross-layer guard would need to live in
-# orchestrator/tests, asserting against the real WorkflowOutcome enum.
+# directly). The genuine cross-layer guard lives in orchestrator/tests:
+# orchestrator/tests/test_workflow_state_machine.py::TestExitContractCoversEveryOutcome.
 #
-# Several rows are intentionally loose sets rather than a single dominant
-# status: W9's SM-2 invariant checks outcome_allows_status(report.outcome,
-# last_status_row) holds at EVERY run() exit, and the traced code shows each
-# of these outcomes can legitimately coexist with more than one status row
-# at exit.
+# Each row is exactly the spec §5 exit contract
+# (docs/task-escalation-state-spec.md): the status rows the outcome's proven
+# producers leave at a run() exit (task 3542, divergence E10). Producers named
+# bare below are methods of
+# orchestrator/src/orchestrator/workflow.py::TaskWorkflow. Relaxation 1 (a
+# row already terminal is reported AS that terminal) is producer-side, in
+# TaskWorkflow._observed_terminal_outcome. Relaxation 2 (the exit's own status
+# write failed) is applied by the consumer,
+# orchestrator/src/orchestrator/exit_contract.py::judge_exit, not by this
+# pure table.
 # ---------------------------------------------------------------------------
 
 _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     'done': frozenset({TaskStatus.DONE}),
-    # Internal-only sub-phase — the task stays claimed (in-progress).
-    'planned': frozenset({TaskStatus.IN_PROGRESS}),
-    # BLOCKED is TaskWorkflow's own dominant exit for _mark_blocked, but the
-    # post-escalation resume guard ("Fix 1", orchestrator/workflow.py ~2057)
-    # also returns BLOCKED when a steward resolves an L0 by setting the task
-    # to another WORKFLOW_PRESERVE_STATUSES member (cancelled / deferred /
-    # merge-deferred) — an intentional steward terminal decision the
-    # orchestrator must not overwrite. 'done' is excluded: that status is
-    # handled by a dedicated branch that returns WorkflowOutcome.DONE, never
-    # BLOCKED. IN_PROGRESS is also included, for the BLOCKED paths that
-    # deliberately PRESERVE the mid-flight row rather than parking it:
-    #   - spec §5's steward terminal-decision preserve carve-out — the steward
-    #     already adjudicated the row (e.g. 'deferred'), and _mark_blocked
-    #     returns BLOCKED without rewriting it;
-    #   - the merge-gating bail's documented in-progress-preserving shape (the
-    #     same shape already noted below for 'escalated').
-    # NOT the merge-halt trio: as of task 3537 _handle_stash_failed /
-    # _handle_unmerged_state / _handle_wip_recovery_no_advance all route their
-    # BLOCKED exit through _mark_blocked and DO write the row (spec §7.9 /
-    # §8-E3, INV-6) — that justification is retired, not the member.
-    # The frozenset is deliberately NOT narrowed here: removing IN_PROGRESS is
-    # divergence E10's scope, and doing it in isolation would turn every
-    # still-legitimate preserve path above into a hard AssertionError from
-    # run()'s SM-2 check.
-    # INFRA_HOLD is the infra-hold PARK ROW: _mark_blocked(block_status=
-    # 'infra-hold') writes the first-class infra-hold status (PRD C7/D3) and
-    # then returns BLOCKED, so 'infra-hold' is a legitimate BLOCKED exit row —
-    # exactly like BLOCKED, just on the status the harness HOLD guard and
-    # RESUME cascade key on (is_infra_held).  Omitting it made SM-2 raise
-    # AssertionError out of run() on a row the writer had deliberately parked;
-    # task 3537 added the same block_status pass-through to the merge-phase
-    # park write, which would have widened that trap to a second path.
+    # An internal sub-phase outcome consumed inside _drive, never a run()
+    # exit. The key stays so a PLANNED exit is a named violation rather than
+    # an unknown outcome.
+    'planned': frozenset(),
+    # _mark_blocked writes 'blocked' / 'infra-hold', or a steward terminal
+    # decision (WORKFLOW_PRESERVE minus done) is preserved through
+    # _honour_steward_terminal_decision and _mark_blocked's
+    # StewardTerminalDecision branch.
     'blocked': frozenset(
         {
             TaskStatus.BLOCKED,
+            TaskStatus.INFRA_HOLD,
             TaskStatus.CANCELLED,
             TaskStatus.DEFERRED,
             TaskStatus.MERGE_DEFERRED,
-            TaskStatus.IN_PROGRESS,
-            TaskStatus.INFRA_HOLD,
         }
     ),
-    # Self-repend / deferred-to-stranded-sweep window / requeue-cap
-    # exhausted -> blocked.
-    'requeued': frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
-    # Dominant _mark_blocked + open L1 / merge-gating bail preserves
-    # in-progress.  INFRA_HOLD for the same reason as in 'blocked' above: the
-    # infra-hold park row is written by _mark_blocked's ENTRY gate, BEFORE the
-    # branch that picks BLOCKED vs ESCALATED, so the same row can reach either
-    # exit and the two keys must agree about it.
-    'escalated': frozenset(
-        {TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS, TaskStatus.INFRA_HOLD}
-    ),
+    # _mark_blocked writes the row (its entry gate, or _park_merge_phase_row)
+    # before its StewardReescalatedL1 exit. The sole block_status='infra-hold'
+    # caller passes escalate_to_human=True, so it always exits BLOCKED.
+    'escalated': frozenset({TaskStatus.BLOCKED}),
+    # Every slot-exiting writer re-pends first: _repend_for_requeue (for the
+    # WarmLaneRequeue clause, _handle_soft_cancel's fallback and
+    # _requeue_on_server_error), _mark_blocked's _requeue, _plan,
+    # _handle_blocking_dep_report, and
+    # orchestrator/src/orchestrator/scheduler.py::Scheduler.handle_blast_radius_expansion.
+    'requeued': frozenset({TaskStatus.PENDING}),
     'cancelled': frozenset({TaskStatus.CANCELLED}),
     'merge-deferred': frozenset({TaskStatus.MERGE_DEFERRED}),
-    # preserved / release_workflow park->blocked / stranded-sweep->pending.
-    # MERGE_DEFERRED is included for the W9-θ soft-cancel-of-a-parked-train-
-    # member path: _await_cancellable(future) inside _maybe_enqueue_group_merge
-    # (workflow.py:1320) is reached AFTER set_task_status('merge-deferred') has
-    # persisted the merge-deferred row, so a soft _cancel_event there makes
-    # _handle_soft_cancel return SOFT_CANCELLED while the last-persisted status
-    # is still 'merge-deferred' (release_workflow parks it to blocked only
-    # after run() returns). This is the same "preserved — row left wherever it
-    # was" case as the IN_PROGRESS entry, not a new terminal write.
+    # escalation/src/escalation/server.py::release_workflow parks
+    # 'in-progress' -> 'blocked' only after the slot clears;
+    # orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status
+    # writes the park / restart row before the kill; a parked train member
+    # stays 'merge-deferred'.
     'soft-cancelled': frozenset(
         {
             TaskStatus.IN_PROGRESS,

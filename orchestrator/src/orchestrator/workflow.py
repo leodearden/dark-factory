@@ -15886,8 +15886,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         whole of the dependency; it is NOT a licence for a slot-exiting BLOCKED
         return to leave the row ``in-progress`` with no claimant.  Deleting
         this gate outright (writing at ENTRY) would break the fence in the
-        other direction, and SM-2 would not catch it because
-        ``outcome_allows_status('requeued', BLOCKED)`` is True.  The
+        other direction: the in-slot retry would then run under a ``blocked``
+        row with a live claimant, and the exit contract never sees it because
+        the retry does not leave the slot.  The
         ``StewardTerminalDecision`` non-DONE return is likewise excluded — see
         the §5 preserve carve-out comment at that return.
         *escalate_to_human* (Fix C) skips the steward entirely and submits
@@ -16210,9 +16211,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # merge_outcome` — so under merge_phase=True the entry
                     # gate's suppression would leave an `in-progress` row with
                     # no live claimant and an open L1: exactly the unclaimed
-                    # strand this task exists to eliminate, and invisible to
-                    # SM-2 because outcome_allows_status('escalated',
-                    # IN_PROGRESS) is True.  Same _park_merge_phase_row target
+                    # strand this task exists to eliminate, and one run()'s
+                    # exit contract records as a violation
+                    # (outcome_allows_status('escalated', IN_PROGRESS) is
+                    # False, task 3542).  Same _park_merge_phase_row target
                     # as the two BLOCKED slot exits (no-op when merge_phase is
                     # False, where the entry gate already wrote the row) —
                     # which is what makes run()'s ESCALATED-branch comment
@@ -16402,8 +16404,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ESCALATED hand-off, and the final BLOCKED fall-through.  (The outcome
         differs; the obligation does not.  ``_run_merge_phase`` exits the slot
         on any non-DONE/non-REQUEUED outcome, so ESCALATED strands an
-        unclaimed row just as BLOCKED would, and SM-2 cannot see it because
-        ``outcome_allows_status('escalated', IN_PROGRESS)`` is True.)
+        unclaimed row just as BLOCKED would; ``run()``'s exit contract records
+        that as a violation, since ``outcome_allows_status('escalated',
+        IN_PROGRESS)`` is False.)
 
         No-op when *merge_phase* is False: that call already wrote
         ``block_status`` at :meth:`_mark_blocked`'s entry gate, and re-writing
