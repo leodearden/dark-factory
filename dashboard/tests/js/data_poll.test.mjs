@@ -62,7 +62,7 @@ const EXPECTED_FUNCTION_NAMES = [
 // before fetch completes cannot crash any component reading DF_DATA.*.
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
-  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
   'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
@@ -105,7 +105,7 @@ const DATUM_SPEC = { kind: 'datum' };
 // because deriving it from endpointsFor would be deriving the expectation from
 // the thing under test.
 const EXPECTED_ENDPOINT_KEYS = [
-  'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
+  'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
   'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
   'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
@@ -1574,6 +1574,17 @@ test('registry: the reshape drops no key — the union is exactly today\'s set',
   assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
 });
 
+test('registry: ACTIVE_TASKS is retired from the seed and the /tasks row', () => {
+  // EXPECTED_DF_DATA_KEYS is a containment check, so it cannot see a leftover
+  // seed. The rows travel only as TASKS_SNAPSHOT[p].rows now.
+  const { api, window: win } = loadDataJs();
+  assert.ok(!Object.prototype.hasOwnProperty.call(win.DF_DATA, 'ACTIVE_TASKS'), 'DF_DATA still seeds ACTIVE_TASKS');
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(api.endpointsFor('24h')['/api/v2/dashboard/tasks'], 'ACTIVE_TASKS'),
+    'the /tasks registry row still names ACTIVE_TASKS',
+  );
+});
+
 test('registry: every polled key is plain, because beta nests its Datums inside TASKS_SNAPSHOT', () => {
   // Not an aspiration — a description. Beta does serve Datums, but each one
   // sits inside a TASKS_SNAPSHOT entry (census, rows), and TASKS_SNAPSHOT
@@ -1972,13 +1983,14 @@ test('on-demand: a poll of /tasks still runs while a terminal request is in flig
   assert.equal(state.get(TERMINAL_STATE_KEY).inFlight, true, 'the held request should be in flight');
   assert.notEqual(state.get(TASKS_PATH)?.inFlight, true, 'the POLLED tasks endpoint was marked in flight');
 
-  await api.refreshOne(TASKS_PATH, { ACTIVE_TASKS: PLAIN_SPEC }, state, {
-    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ ACTIVE_TASKS: [{ id: '1' }] }) }); },
+  const polledSnapshot = { [TERMINAL_PROJECT]: {} };
+  await api.refreshOne(TASKS_PATH, { TASKS_SNAPSHOT: PLAIN_SPEC }, state, {
+    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ TASKS_SNAPSHOT: polledSnapshot }) }); },
     now: () => 101,
   });
 
   assert.deepEqual(polledUrls, [TASKS_PATH], 'the polled tasks fetch was skipped while the terminal request ran');
-  assert.deepEqual(win.DF_DATA.ACTIVE_TASKS, [{ id: '1' }]);
+  assert.deepEqual(win.DF_DATA.TASKS_SNAPSHOT, polledSnapshot);
 
   releaseTerminal();
   await pending;
@@ -2188,7 +2200,7 @@ test('outcomes: the poll loop ignores them — refreshDFData still resolves to u
 // ---------------------------------------------------------------------------
 // taskProse — the Task Detail pane's description/details, fetched per selection
 //
-// The ACTIVE_TASKS rows no longer carry either field (task 5815); the pane asks
+// The snapshot rows no longer carry either field (task 5815); the pane asks
 // for the ONE selected task through the same on-demand seam the terminal row
 // uses. The row is addressed by the row's own uid (`<project>/T-<id>`), whose
 // segments are encoded one by one so the '/' between them stays a path

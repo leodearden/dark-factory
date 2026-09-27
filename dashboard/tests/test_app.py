@@ -180,17 +180,19 @@ def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
 
 
 _TASKS_KEYS = {
-    'ACTIVE_TASKS', 'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+    'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
     'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
     'TASKS_PROJECT_COUNT', 'served_at',
 }
-"""The default render's whole payload. DONE_COUNTS is gone, and its ABSENCE is
-asserted rather than an empty dict: ``data.js::applyKey`` returns early on a
-missing key, so the client keeps its seeded default, while ``{}`` would read as
-a measured "no project has any done tasks"."""
+"""The default render's whole payload. DONE_COUNTS and ACTIVE_TASKS are gone,
+and their ABSENCE is asserted rather than an empty value. Both were top-level
+keys, and ``data.js::applyKey`` returns early on a missing key, so the client
+keeps its seeded default and nothing reads it; ``{}`` would instead read as a
+measured "no project has any done tasks". The rows travel only as
+``TASKS_SNAPSHOT[p].rows``."""
 
 
-def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
+def test_tasks_endpoint_carries_no_flat_row_list(client):
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], {})),
@@ -201,7 +203,7 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
     assert 'DONE_COUNTS' not in body
-    assert isinstance(body['ACTIVE_TASKS'], list)
+    assert 'ACTIVE_TASKS' not in body
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
     assert body['TASKS_SNAPSHOT'] == {}
@@ -565,14 +567,14 @@ _RAW_ONLY_KEYS = frozenset({
 
 
 def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
-    """``TASKS_SNAPSHOT[p].rows`` carries the rows ``ACTIVE_TASKS`` carries, not raw MCP rows.
+    """``TASKS_SNAPSHOT[p].rows`` carries the shaped task rows, not raw MCP rows.
 
     ``Datum.to_wire()`` renders ``value`` verbatim. So the unit's RAW rows used
     to ship beside the shaped ones: every active row twice per render, the
     second copy with the whole ``metadata`` blob, on the endpoint this leaf
     exists to shrink. That also broke the PRD's declared
-    ``Datum[list[TaskRow]]``. With one configured root, ``ACTIVE_TASKS`` is
-    exactly that root's rows, so the two exposures must be equal.
+    ``Datum[list[TaskRow]]``. The snapshot is now the rows' only exposure, so
+    each one must carry exactly the shaped fields.
     """
     from test_task_snapshot import CannedMCP, _raw_row
 
@@ -596,7 +598,6 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     for row in wire_rows:
         assert set(row) == _TASK_ROW_KEYS, sorted(set(row) ^ _TASK_ROW_KEYS)
         assert not set(row) & _RAW_ONLY_KEYS
-    assert body['ACTIVE_TASKS'] == wire_rows
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
@@ -617,21 +618,30 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
 
 def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(client):
     """api_tasks must call collect_tasks_with_counts with resolve_external=True
-    and forward the external_deps field in ACTIVE_TASKS rows unchanged.
+    and forward the external_deps field in the snapshot rows unchanged.
 
     Asserts:
     (a) collect_tasks_with_counts is called with resolve_external=True
-    (b) ACTIVE_TASKS[0]['external_deps'] contains the resolved dep
+    (b) TASKS_SNAPSHOT[label]['rows']['value'][0]['external_deps'] contains
+        the resolved dep
     (c) Top-level key set is unchanged (non-breaking)
     """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    label = 'dark-factory'
     mock_row = {
         'id': 'dark-factory/T-5',
-        'project': 'dark-factory',
+        'project': label,
         'title': 'waits on upstream',
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], {}))
+    rows = Datum([mock_row], datetime.now(UTC), DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
+    mock = AsyncMock(return_value=([mock_row], {label: replace(_snapshot(), rows=rows)}))
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -646,7 +656,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     )
 
     # (b) external_deps passes through unmodified
-    assert body['ACTIVE_TASKS'][0]['external_deps'] == [
+    assert body['TASKS_SNAPSHOT'][label]['rows']['value'][0]['external_deps'] == [
         {'id': 'dark_factory:13', 'status': 'done'}
     ]
 
@@ -2272,10 +2282,10 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
 def test_last_good_rows_do_not_veto_the_outage_flag(client):
     """Rows served from a root's last good were not measured this render.
 
-    An offline root still puts its last good rows, aged, into ACTIVE_TASKS.
-    The flag asks whether THIS render measured any root. So when every root
-    is offline, the banner stands over those rows, and each root's ``rows``
-    Datum says how old they are.
+    An offline root still serves its last good rows, aged, in its ``rows``
+    Datum. The flag asks whether THIS render measured any root. So when every
+    root is offline, the banner stands over those rows, and each root's
+    ``rows`` Datum says how old they are.
     """
     from dataclasses import replace
     from datetime import UTC, datetime, timedelta
@@ -2299,7 +2309,7 @@ def test_last_good_rows_do_not_veto_the_outage_flag(client):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body['ACTIVE_TASKS'] == [row]
+    assert body['TASKS_SNAPSHOT']['p0']['rows']['value'] == [row]
     assert body['TASKS_SNAPSHOT']['p0']['rows']['state'] == 'stale'
     assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
     assert body['TASKS_OFFLINE'] is True
