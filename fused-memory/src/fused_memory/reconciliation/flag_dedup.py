@@ -361,8 +361,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
     STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+    SUPPRESSION_STREAK_VOLUME_THRESHOLD,
 )
 from fused_memory.utils.async_utils import gather_collect
 
@@ -1284,8 +1286,8 @@ async def maybe_escalate_suppression_storm(
     ``dedupe_count`` and the fold INFO log.
 
     Its cross-cycle sibling, :func:`maybe_escalate_suppression_streak`, files
-    the same category for a decision that suppresses in K consecutive cycles,
-    each under N.
+    the same category for a decision whose streak has reached K and that
+    suppressed more than N flags in total across its last K cycles.
     """
     config = _storm_dedupe_config()
     if config is None:
@@ -1327,12 +1329,16 @@ class SuppressionStreakUpdate:
 
     ``streak`` counts the consecutive full cycles, ending with this one, in
     which the decision on ``(entity_uuid, grounds)`` suppressed at least one
-    flag; 0 records a reset.  ``escalate`` is ``streak >= threshold``.
+    flag; 0 records a reset.  ``window_suppressed`` is the number of flags it
+    suppressed across the last K cycles of that streak, counting only cycles
+    at or under the per-cycle N.  ``escalate`` is ``streak >= threshold and
+    window_suppressed > volume_threshold``.
     """
 
     entity_uuid: str
     grounds: str
     streak: int
+    window_suppressed: int
     escalate: bool
 
 
@@ -1349,25 +1355,37 @@ def _next_suppression_streaks(
     stored: dict[tuple[str, str], dict[str, Any]],
     result: EntityStandingSuppressionResult,
     run_id: str,
-) -> dict[tuple[str, str], int]:
-    """The ``(entity_uuid, grounds) -> streak`` rows this cycle must write.
+    window_cycles: int,
+) -> dict[tuple[str, str], tuple[int, tuple[int, ...]]]:
+    """The ``(entity_uuid, grounds) -> (streak, window)`` rows this cycle must write.
 
-    A suppressing decision extends its stored streak by one, or holds it when
-    the stored ``last_run_id`` is this *run_id* (a replayed cycle).  A stored
-    non-zero streak whose decision suppressed nothing resets to 0; a stored 0
-    needs no write.  Pure, sync, no I/O.
+    A suppressing decision extends its stored streak by one and appends this
+    cycle's suppression count to its stored window, keeping the last
+    *window_cycles* counts.  When the stored ``last_run_id`` is this *run_id*
+    (a replayed cycle) both are held as stored.  A stored non-zero streak whose
+    decision suppressed nothing resets to ``(0, ())``; a stored 0 needs no
+    write.
+
+    A stored window longer than its stored streak reads as empty, like any
+    other malformed window.  That covers a window left on a zero-streak row, so
+    a leftover never carries across a reset.  Pure, sync, no I/O.
     """
-    next_streaks: dict[tuple[str, str], int] = {}
-    for entity_uuid in result.suppressed_by_decision:
+    next_rows: dict[tuple[str, str], tuple[int, tuple[int, ...]]] = {}
+    for entity_uuid, count in result.suppressed_by_decision.items():
         key = (entity_uuid, result.grounds_by_decision.get(entity_uuid, ''))
         prior = stored.get(key, {})
         prior_streak = _nonnegative_int_from_payload(prior, STREAK_PAYLOAD_KEY)
-        replayed = bool(run_id) and prior.get('last_run_id') == run_id
-        next_streaks[key] = prior_streak if replayed else prior_streak + 1
+        prior_window = _positive_int_tuple_from_payload(prior, STREAK_WINDOW_PAYLOAD_KEY)
+        if len(prior_window) > prior_streak:
+            prior_window = ()
+        if run_id and prior.get('last_run_id') == run_id:
+            next_rows[key] = (prior_streak, prior_window)
+        else:
+            next_rows[key] = (prior_streak + 1, (*prior_window, count)[-window_cycles:])
     for key, payload in stored.items():
-        if key not in next_streaks and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
-            next_streaks[key] = 0
-    return next_streaks
+        if key not in next_rows and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
+            next_rows[key] = (0, ())
+    return next_rows
 
 
 async def update_suppression_streaks(
@@ -1378,15 +1396,28 @@ async def update_suppression_streaks(
     *,
     now: str | None = None,
     threshold: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+    volume_threshold: int = SUPPRESSION_STREAK_VOLUME_THRESHOLD,
 ) -> list[SuppressionStreakUpdate]:
     """Advance every standing decision's cross-cycle suppression streak by one cycle.
 
     The persistence half of the storm escape's streak arm; filing is
     :func:`maybe_escalate_suppression_streak`.  Each decision in
-    ``result.suppressed_by_decision`` extends its streak by one, and every
-    stored non-zero streak whose decision suppressed nothing this cycle resets
-    to 0.  A row already at 0 is left alone, so a decision that has gone quiet
-    is written once and then ages out through ``gc()``'s ``expires_at`` arm.
+    ``result.suppressed_by_decision`` extends its streak by one and records
+    this cycle's suppression count in a window of its last *threshold* cycles.
+    Every stored non-zero streak whose decision suppressed nothing this cycle
+    resets to 0 with an empty window.  A row already at 0 is left alone, so a
+    decision that has gone quiet is written once and then ages out through
+    ``gc()``'s ``expires_at`` arm.
+
+    A decision escalates when its streak has reached *threshold* (K) and the
+    flags it suppressed across that window total more than *volume_threshold*
+    (N).  The window is bounded because a decision that works suppresses its
+    re-derived complaint about once per cycle: its window then totals K <= N,
+    so it never files however long its streak runs.  A cycle over the
+    per-cycle N stays in the window but is left out of the total: the per-cycle
+    escape already reported it, and one flood must not page both escapes in
+    the same cycle.  The verdict is re-evaluated every cycle, so a decision
+    that drops back to its steady-state rate stops escalating without a reset.
 
     Replaying a cycle is idempotent: a row whose stored ``last_run_id`` equals
     *run_id* is re-written without incrementing, so a re-entered stage cannot
@@ -1401,7 +1432,10 @@ async def update_suppression_streaks(
     would clobber an established streak.  A failed write costs that one
     entity its update (logged WARNING, excluded from the return), not the
     cycle.  Stored payloads are never trusted for shape: anything but a
-    non-negative int reads as streak 0.
+    non-negative int reads as streak 0, and anything but a list of positive
+    ints no longer than the stored streak reads as an empty window.  A lost
+    window can only under-count, so it may delay a filing by up to K cycles
+    but never cause one.
 
     Every write refreshes ``expires_at`` to *now* plus
     ``STANDING_DECISION_TTL_DAYS``, spelled as ``isoformat()`` like the
@@ -1443,8 +1477,8 @@ async def update_suppression_streaks(
     now_dt = datetime.now(UTC) if now is None else datetime.fromisoformat(now)
     expires_at = (now_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
     updates: list[SuppressionStreakUpdate] = []
-    for (entity_uuid, grounds), streak in sorted(
-        _next_suppression_streaks(stored, result, run_id).items()
+    for (entity_uuid, grounds), (streak, window) in sorted(
+        _next_suppression_streaks(stored, result, run_id, window_cycles=threshold).items()
     ):
         try:
             await ledger.upsert_suppression_streak(
@@ -1452,7 +1486,7 @@ async def update_suppression_streaks(
                 entity_uuid=entity_uuid,
                 grounds=grounds,
                 streak=streak,
-                recent_counts=(),
+                recent_counts=window,
                 last_run_id=run_id,
                 updated_at=now_dt.isoformat(),
                 expires_at=expires_at,
@@ -1469,12 +1503,16 @@ async def update_suppression_streaks(
                 exc_info=True,
             )
             continue
+        window_suppressed = sum(
+            count for count in window if count <= SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
+        )
         updates.append(
             SuppressionStreakUpdate(
                 entity_uuid=entity_uuid,
                 grounds=grounds,
                 streak=streak,
-                escalate=streak >= threshold,
+                window_suppressed=window_suppressed,
+                escalate=streak >= threshold and window_suppressed > volume_threshold,
             )
         )
     return updates
@@ -1770,6 +1808,25 @@ def _nonnegative_int_from_payload(payload: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
+
+
+def _positive_int_tuple_from_payload(payload: Any, key: str) -> tuple[int, ...]:
+    """Read the list of positive ``int`` counts stored under *key* in a ledger payload.
+
+    Returns ``()`` for anything but a list whose every entry is an ``int`` >= 1
+    and not a bool; one malformed entry discards the whole list.  Free-form
+    JSON off a ledger row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return ()
+    value = payload.get(key)
+    if not isinstance(value, list) or any(
+        isinstance(entry, bool) or not isinstance(entry, int) or entry < 1 for entry in value
+    ):
+        return ()
+    return tuple(value)
 
 
 def _prior_done_suppression_count(prior_payload: Any) -> int:
