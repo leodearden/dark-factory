@@ -152,7 +152,8 @@ window.DF_DATA = {
   // TASKS_SNAPSHOT: {project: {census, rows, in_progress_live,
   //   in_progress_stranded, skew_seconds}}, census and rows each a Datum.
   //   Seeded EMPTY, so a read before the first fetch finds no entry, which
-  //   task_done_count.js answers with the placeholder rather than a zero.
+  //   task_snapshot.js::projectCensus answers as an unknown Datum rather
+  //   than a zero.
   TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {

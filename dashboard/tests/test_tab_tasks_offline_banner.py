@@ -62,7 +62,7 @@ def test_index_html_loads_the_banner_module_with_the_sibling_cache_buster(
 
     siblings = [
         s for s in srcs
-        if s.startswith('/static/redux/task_status_counts.js')
+        if s.startswith('/static/redux/task_snapshot.js')
         or s.startswith('/static/redux/prd_grouping.js')
         or s.startswith('/static/redux/runtime_format.js')
     ]
