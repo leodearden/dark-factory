@@ -794,6 +794,15 @@ def _flag_text_blob(flag: dict[str, Any]) -> str:
     return ' '.join(parts)
 
 
+def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
+    """Every UUID *flag* names in any ``str`` value, lowercased.
+
+    Structured and free-text fields alike, at any nesting depth; non-``str``
+    values are ignored.  Pure, sync, no I/O.
+    """
+    return _extract_uuids(_flag_text_blob(flag))
+
+
 def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     """Return True iff *flag_type* belongs to *grounds*' bound token family.
 
@@ -902,7 +911,7 @@ def _match_entity_standing_decision(
         if row is not None and flag.get('grounds') == row.flag_type:
             return key
 
-    uuids = _extract_uuids(_flag_text_blob(flag))
+    uuids = extract_flag_uuids(flag)
     if len(uuids) == 1:
         sole = next(iter(uuids))
         row = active_by_uuid.get(sole)
