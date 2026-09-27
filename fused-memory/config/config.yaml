@@ -238,6 +238,14 @@ task_status:
 
 reconciliation:
   enabled: true
+  # Leo 2026-09-27 (esc-3135-8, A′): ζ's autoseed stays on; the three derived
+  # clusters with the most off-topic matches in the 2026-09-26 replay are retired
+  # (docs/prds/memory-write-path-convergence.md §10: 39 + 33 + 27 of 267).
+  procedural_knowledge_topic_cluster_autoseed_retired:
+    dark_factory:
+      - worktree-stale-base-premise-verification
+      - orchestrator-full-suite-runtime-budget
+      - wip-requeue-plan-step-attribution
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
   require_done_provenance: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
