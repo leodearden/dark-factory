@@ -298,6 +298,7 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
     'count_transcript_turns',
@@ -314,6 +315,8 @@ __all__ = [
     'read_transcript_records',
     'require_non_blank_prompt',
     'resumable_progress_for_session',
+    'transcript_evidence',
+    'transcript_evidence_for_session',
     'transcript_exists',
 ]
 
@@ -1187,6 +1190,67 @@ def ended_awaiting_background_for_session(
     if records is None:
         return False
     return detect_ended_awaiting_background(records)
+
+
+@dataclass(frozen=True)
+class TranscriptEvidence:
+    """What a run did, as recorded in its transcript.
+
+    - ``assistant_turns``: records with ``type == 'assistant'``.
+    - ``schema_payload``: the ``input`` of the last ``StructuredOutput``
+      tool_use whose input is a dict, else None. It is never a partial payload.
+    - ``other_tool_uses``: every other tool_use name in transcript order,
+      duplicates kept.
+    """
+
+    assistant_turns: int
+    schema_payload: dict | None
+    other_tool_uses: tuple[str, ...]
+
+
+def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
+    """Summarise transcript *records* as :class:`TranscriptEvidence`.
+
+    Recovers evidence from a run whose stdout never arrived (a killed
+    process), so it complements ``_parse_claude_output``'s stdout-based
+    ``schema_salvaged`` path rather than duplicating it. Pure: whether to trust
+    a recovered payload is the caller's decision. Only assistant records
+    count, and malformed records and blocks are skipped without raising.
+    """
+    assistant_turns = 0
+    schema_payload: dict | None = None
+    other_tool_uses: list[str] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get('type') != 'assistant':
+            continue
+        assistant_turns += 1
+        for block in _content_blocks(record):
+            if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                continue
+            name = block.get('name')
+            if not isinstance(name, str):
+                continue
+            if name != _SCHEMA_OUTPUT_TOOL:
+                other_tool_uses.append(name)
+            elif isinstance(block.get('input'), dict):
+                schema_payload = block['input']
+    return TranscriptEvidence(assistant_turns, schema_payload, tuple(other_tool_uses))
+
+
+def transcript_evidence_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> TranscriptEvidence | None:
+    """Return :func:`transcript_evidence` for *session_id*'s on-disk transcript.
+
+    Delegates all I/O to ``read_transcript_records``. Returns None when no
+    transcript can be read, so a missing transcript is never reported as
+    empty evidence. Never raises.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return transcript_evidence(records)
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
