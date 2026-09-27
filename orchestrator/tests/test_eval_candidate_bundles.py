@@ -1,14 +1,14 @@
 """Tests for ν's Claude-format-endpoint candidate bundles (task 2479).
 
-Non-incumbent (MiniMax M2.5, GLM-5.2, DeepSeek V4, Kimi) + native-cloud
-incumbent (Opus/Sonnet) bundles, each a (harness, model) ``EvalConfig``
+Non-incumbent (MiniMax M3, GLM-5.3, GLM-5.3-Flash, DeepSeek V4, Kimi) +
+native-cloud incumbent (Opus/Sonnet) bundles, each a (harness, model) ``EvalConfig``
 dispatched via Claude Code against a provider's official Anthropic-format
 endpoint (PRD C5: per-role ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``).
 
 Runtime-behaviour tests only: roster/shape, endpoint+auth env contract,
-price-table coverage + λ's ``resolve_cost_usd`` -> ``'price_table'``, and
+price-table coverage + λ's ``resolve_cost_usd`` -> ``'price_table'``,
 ``get_config_by_name`` resolution + ``build_eval_orch_config`` endpoint
-propagation. The env-forwarding wiring itself is already covered by task
+propagation, and a literal pin of the dated slate (task 5384). The env-forwarding wiring itself is already covered by task
 2460's ``test_workflow_e2e.py``, and the μ OFAT/matrix driver by task 2478's
 ``test_eval_driver*.py`` — this module does not re-test either.
 
@@ -17,6 +17,8 @@ absent symbol fails the one test that needs it, not collection of the file.
 """
 
 from __future__ import annotations
+
+import pytest
 
 
 class TestClaudeEndpointCandidatesRoster:
@@ -54,22 +56,26 @@ class TestClaudeEndpointCandidatesRoster:
         matrix, are explicitly out of scope for this task."""
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
             claude_endpoint_candidates,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         non_incumbents = [
             c for c in claude_endpoint_candidates() if c.model in non_incumbent_models
         ]
         assert non_incumbents
         assert all(c.role == 'implementer' for c in non_incumbents)
 
-    def test_includes_the_four_non_incumbent_models(self):
+    def test_includes_the_five_non_incumbent_models(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -79,6 +85,7 @@ class TestClaudeEndpointCandidatesRoster:
         models = {c.model for c in claude_endpoint_candidates()}
         assert MINIMAX_MODEL in models
         assert GLM_MODEL in models
+        assert GLM_FLASH_MODEL in models
         assert DEEPSEEK_MODEL in models
         assert KIMI_MODEL in models
 
@@ -102,13 +109,16 @@ class TestEndpointAuthEnvContract:
     def _non_incumbents(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
             claude_endpoint_candidates,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         return [c for c in claude_endpoint_candidates() if c.model in non_incumbent_models]
 
     def test_non_incumbents_carry_claude_backend_and_env_contract(self):
@@ -122,6 +132,7 @@ class TestEndpointAuthEnvContract:
     def test_non_incumbent_base_urls_carry_the_provider_domain(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -130,6 +141,7 @@ class TestEndpointAuthEnvContract:
         expected_domain = {
             MINIMAX_MODEL: 'minimax',
             GLM_MODEL: 'z.ai',
+            GLM_FLASH_MODEL: 'z.ai',
             DEEPSEEK_MODEL: 'deepseek',
             KIMI_MODEL: 'moonshot',
         }
@@ -199,6 +211,7 @@ class TestClaudeEndpointPriceTable:
     def test_has_a_valid_entry_for_every_non_incumbent_candidate_model(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -206,7 +219,9 @@ class TestClaudeEndpointPriceTable:
             claude_endpoint_price_table,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         candidate_models = {
             c.model for c in claude_endpoint_candidates() if c.model in non_incumbent_models
         }
@@ -251,7 +266,7 @@ class TestGetConfigByNameAndPropagation:
     def test_get_config_by_name_resolves_a_non_incumbent_bundle(self):
         from orchestrator.evals.configs import GLM_MODEL, get_config_by_name
 
-        cfg = get_config_by_name('glm-5.2-endpoint')
+        cfg = get_config_by_name('glm-5.3-endpoint')
         assert cfg is not None
         assert cfg.model == GLM_MODEL
 
@@ -267,10 +282,82 @@ class TestGetConfigByNameAndPropagation:
         cfg_path.write_text(f'project_root: {tmp_path}\n')
         base = load_config(cfg_path)
 
-        bundle = get_config_by_name('glm-5.2-endpoint')
+        bundle = get_config_by_name('glm-5.3-endpoint')
         assert bundle is not None
 
         orch_config = build_eval_orch_config(bundle, {}, base)
 
         assert orch_config.env_overrides.get('ANTHROPIC_BASE_URL') == GLM_BASE_URL
         assert orch_config.models.implementer == bundle.model
+
+
+_SLATE_MODELS_BY_NAME = {
+    'minimax-m3-endpoint': 'MiniMax-M3',
+    'glm-5.3-endpoint': 'glm-5.3',
+    'glm-5.3-flash-endpoint': 'glm-5.3-flash',
+    'deepseek-v4-endpoint': 'deepseek-v4',
+    'kimi-endpoint': 'kimi-latest',
+}
+
+
+class TestEndpointSlatePin:
+    """The 2026-09 endpoint slate, pinned by LITERAL ids and list prices.
+
+    Every other test in this module reads the ``*_MODEL`` constants, so it
+    stays green whatever those constants hold — a guard that reads the thing
+    it protects (INV-10). This class restates the slate as literals so a
+    stale or placeholder id, an unnoticed addition or removal, or a drifted
+    price fails loudly (task 5384).
+    """
+
+    def test_roster_is_exactly_the_incumbents_plus_the_2026_09_slate(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        assert set(by_name) == {
+            'claude-opus-high',
+            'claude-opus-max',
+            'claude-sonnet-max',
+            *_SLATE_MODELS_BY_NAME,
+        }
+
+    def test_bundles_carry_the_literal_provider_model_ids(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        for name, model in _SLATE_MODELS_BY_NAME.items():
+            assert by_name[name].model == model
+
+    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), [
+        ('MiniMax-M3', 0.30, 1.20),
+        ('glm-5.3', 1.40, 4.40),
+        ('glm-5.3-flash', 0.15, 0.50),
+        ('deepseek-v4', 0.28, 0.42),
+        ('kimi-latest', 0.60, 2.50),
+    ])
+    def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
+        from orchestrator.evals.configs import claude_endpoint_price_table
+
+        entry = claude_endpoint_price_table()[model]
+        assert entry['input_per_1m'] == input_per_1m
+        assert entry['output_per_1m'] == output_per_1m
+
+    def test_base_urls_are_pinned(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        expected_base_url = {
+            'glm-5.3-endpoint': 'https://api.z.ai/api/anthropic',
+            'glm-5.3-flash-endpoint': 'https://api.z.ai/api/anthropic',
+            'minimax-m3-endpoint': 'https://api.minimax.io/anthropic',
+        }
+        for name, base_url in expected_base_url.items():
+            assert by_name[name].env_overrides['ANTHROPIC_BASE_URL'] == base_url
+
+    def test_get_config_by_name_resolves_the_refreshed_bundles(self):
+        from orchestrator.evals.configs import get_config_by_name
+
+        for name in ('minimax-m3-endpoint', 'glm-5.3-endpoint', 'glm-5.3-flash-endpoint'):
+            cfg = get_config_by_name(name)
+            assert cfg is not None
+            assert cfg.model == _SLATE_MODELS_BY_NAME[name]
