@@ -297,14 +297,23 @@ class TestSpendAndCapHits:
 
 
 class TestAutonomousCloses:
+    """Windowed on when a close HAPPENED (``closed_at``), never on when its decision was filed."""
+
     @pytest.fixture
     def fleet(self, tmp_path) -> Path:
         fleet = tmp_path / 'fleet'
         evidence = 'Leo 2026-09-25: "take option A"\nquoted from esc-5580-4'
-        _write_decision(fleet, id='answered-in', state='answered', escalation_id='esc-1-1', closing_evidence=evidence)
-        _write_decision(fleet, id='dropped-in', state='dropped', closing_evidence='superseded by task 7')
-        _write_decision(fleet, id='answered-old', state='answered', filed_at=BEFORE_WINDOW,
-                        closing_evidence='an older close')
+        _write_decision(fleet, id='answered-in', state='answered', escalation_id='esc-1-1', closing_evidence=evidence,
+                        closed_at='2026-09-25T20:00:00+00:00')
+        _write_decision(fleet, id='dropped-in', state='dropped', closing_evidence='superseded by task 7',
+                        closed_at='2026-09-25T19:00:00+00:00')
+        _write_decision(fleet, id='filed-before-closed-in', state='answered', filed_at=BEFORE_WINDOW,
+                        closing_evidence='a long-open gate closed last night', closed_at='2026-09-25T21:00:00+00:00')
+        _write_decision(fleet, id='closed-before', state='answered', filed_at=BEFORE_WINDOW,
+                        closing_evidence='an older close', closed_at='2026-09-21T00:00:00+00:00')
+        _write_decision(fleet, id='evidence-undated', state='answered', closing_evidence='closed before closed_at')
+        _write_decision(fleet, id='evidence-bad-stamp', state='dropped', closing_evidence='hand-edited',
+                        closed_at='last tuesday')
         _write_decision(fleet, id='answered-bare', state='answered')
         _write_decision(fleet, id='open-with-evidence', closing_evidence='never closed')
         return fleet
@@ -314,10 +323,28 @@ class TestAutonomousCloses:
 
         assert measurement.status == 'ok'
         closes = {close.decision_id: close for close in measurement.value.in_window}
-        assert set(closes) == {'answered-in', 'dropped-in'}
         assert closes['answered-in'].evidence == 'Leo 2026-09-25: "take option A"\nquoted from esc-5580-4'
         assert (closes['answered-in'].state, closes['answered-in'].escalation_id) == ('answered', 'esc-1-1')
-        assert measurement.value.lifetime == 3
+        assert measurement.value.lifetime == 6
+
+    def test_a_close_filed_before_the_window_counts_when_it_closed_inside_it(self, fleet):
+        closes = mod.autonomous_closes(fleet, WINDOW, now=NOW).value
+
+        assert [close.decision_id for close in closes.in_window] == [
+            'dropped-in', 'answered-in', 'filed-before-closed-in',
+        ]
+        late = closes.in_window[-1]
+        assert (late.filed_at, late.closed_at) == (BEFORE_WINDOW, '2026-09-25T21:00:00+00:00')
+
+    def test_an_undated_close_is_shown_never_dropped(self, fleet):
+        closes = mod.autonomous_closes(fleet, WINDOW, now=NOW).value
+
+        assert [(close.decision_id, close.closed_at) for close in closes.undated] == [
+            ('evidence-bad-stamp', 'last tuesday'), ('evidence-undated', ''),
+        ]
+        assert not {'evidence-bad-stamp', 'evidence-undated', 'closed-before'} & {
+            close.decision_id for close in closes.in_window
+        }
 
     def test_an_unreadable_record_is_a_shortfall_not_a_silent_skip(self, fleet):
         (fleet / 'decisions' / 'corrupt.json').write_text('{not json')
@@ -331,7 +358,7 @@ class TestAutonomousCloses:
         measurement = mod.autonomous_closes(tmp_path / 'no-fleet', WINDOW, now=NOW)
 
         assert measurement.status == 'source_missing'
-        assert (measurement.value.in_window, measurement.value.lifetime) == ((), 0)
+        assert (measurement.value.in_window, measurement.value.undated, measurement.value.lifetime) == ((), (), 0)
 
 
 def _shadow(ruling_class: str, action: str) -> str:

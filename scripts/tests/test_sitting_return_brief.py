@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 NOW_ISO = NOW.isoformat()
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
+BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
+CLOSED_IN_WINDOW = '2026-09-25T20:00:00+00:00'
 TITLES = (
     '1. Decisions needed',
     '2. Rulings made under standing policy',
@@ -83,6 +85,17 @@ class Env:
             window=fleet_state.Window.trailing(NOW, days=1),
             now=NOW,
         )
+
+
+def _closed_decision(fleet: Path, decision_id: str, *, closed_at: str, **fields) -> DecisionRecord:
+    """An evidence-carrying close of a decision filed BEFORE the window."""
+    fields.setdefault('closing_evidence', f'the evidence for {decision_id}')
+    record = DecisionRecord(id=decision_id, project='dark_factory', text=f'close {decision_id}?',
+                            filed_at=BEFORE_WINDOW, state='answered', closed_at=closed_at, **fields)
+    decisions = fleet / 'decisions'
+    decisions.mkdir(parents=True, exist_ok=True)
+    (decisions / f'{decision_id}.json').write_text(record.to_json())
+    return record
 
 
 def _esc(queue: Path, **fields) -> Escalation:
@@ -147,11 +160,8 @@ def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
          triage_note=_trial_note(), resolution_turns=1)
     e.sessions.mkdir(parents=True)
     e.handover.write_text('# handover\n\nnothing relevant here\n')
-    decisions = e.fleet / 'decisions'
-    closed = DecisionRecord(id='dec-close-1', project='dark_factory', text='close esc-104-9?', filed_at=IN_WINDOW,
-                            state='answered', escalation_id='esc-104-9', closing_evidence=EVIDENCE)
-    decisions.mkdir(parents=True)
-    (decisions / 'dec-close-1.json').write_text(closed.to_json())
+    _closed_decision(e.fleet, 'dec-close-1', closed_at=CLOSED_IN_WINDOW, escalation_id='esc-104-9',
+                     closing_evidence=EVIDENCE)
     prep_mod.record(e.preparation, [{
         'item': ['esc', normalize_escalations_dir(e.queue), 'esc-101-1'],
         'question': 'Close esc-101-1 as ruled?',
@@ -237,6 +247,48 @@ class TestSections:
         assert 'claude-opus' in sections[TITLES[4]] and '$2.50' in sections[TITLES[4]]
         assert EVIDENCE in sections[TITLES[5]] and 'dec-close-1' in sections[TITLES[5]]
         assert 'lifetime: 1' in sections[TITLES[5]]
+
+
+class TestAutonomousClosesSection:
+    def test_a_close_filed_before_the_window_renders_with_its_close_stamp(self, env):
+        section = _sections(mod.render(env.build()))[TITLES[5]]
+
+        assert f'closed {CLOSED_IN_WINDOW}; filed {BEFORE_WINDOW}' in section
+        assert 'No autonomous close in the window.' not in section
+        assert 'Undated closes' not in section
+
+    def test_an_undated_close_is_listed_stating_closed_at_is_missing(self, env):
+        _closed_decision(env.fleet, 'dec-undated', closed_at='')
+
+        section = _sections(mod.render(env.build()))[TITLES[5]]
+
+        undated = section.split('Undated closes', 1)[1]
+        assert 'dec-undated' in undated and 'closed_at' in undated
+        assert 'dec-close-1' not in undated
+        assert 'lifetime: 2' in section
+
+    def test_with_nothing_closed_in_the_window_the_undated_are_still_listed(self, env):
+        _closed_decision(env.fleet, 'dec-close-1', closed_at=BEFORE_WINDOW, closing_evidence=EVIDENCE)
+        _closed_decision(env.fleet, 'dec-undated', closed_at='')
+
+        section = _sections(mod.render(env.build()))[TITLES[5]]
+
+        assert 'No autonomous close in the window.' in section
+        assert 'dec-undated' in section.split('Undated closes', 1)[1]
+
+    def test_the_audit_sample_is_drawn_from_window_closes_only(self, env):
+        for n in range(2, brief.AUDIT_SAMPLE_EVERY):
+            _closed_decision(env.fleet, f'dec-close-{n}', closed_at=f'2026-09-25T21:{10 * n:02d}:00+00:00')
+        for n in range(3):
+            _closed_decision(env.fleet, f'dec-undated-{n}', closed_at='')
+
+        short = _sections(mod.render(env.build()))[TITLES[5]]
+        _closed_decision(env.fleet, 'dec-close-z', closed_at='2026-09-26T05:00:00+00:00')
+        full = _sections(mod.render(env.build()))[TITLES[5]]
+
+        assert 'AUDIT SAMPLE' not in short
+        assert full.count('AUDIT SAMPLE') == 1
+        assert f'### Close {brief.AUDIT_SAMPLE_EVERY}: decision dec-close-z — AUDIT SAMPLE' in full
 
 
 class TestHeader:
