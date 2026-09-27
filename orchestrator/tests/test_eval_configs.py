@@ -155,6 +155,23 @@ class TestDroppedQwen25Regression:
             )
 
 
+class TestRetiredMarchCloudBaselines:
+    """Regression guard: the retired codex/gemini cloud baselines must not reappear."""
+
+    def test_march_dated_codex_and_gemini_entries_are_absent(self):
+        """Added 2026-03-19 (d3b14de8107), retired by task 5384 — do not restore."""
+        retired_models = {
+            'gpt-5.4', 'gpt-5.4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
+        }
+        retired_names = {
+            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
+            'gemini-31-pro-high', 'gemini-3-flash-high',
+        }
+        assert [c.name for c in EVAL_CONFIGS if c.backend == 'gemini'] == []
+        assert {c.model for c in EVAL_CONFIGS} & retired_models == set()
+        assert {c.name for c in EVAL_CONFIGS} & retired_names == set()
+
+
 class TestEnforceEagerOnQwen3:
     """Regression guard: qwen3-coder-next-fp8-new must set ENFORCE_EAGER=1.
 
@@ -199,7 +216,7 @@ class TestNoNameCollisions:
 class TestEvalConfigsIncludesVllm:
     """EVAL_CONFIGS must be the canonical list that includes vLLM configs."""
 
-    _CLOUD_BASELINE_COUNT = 7
+    _CLOUD_BASELINE_COUNT = 3
     _VLLM_COUNT = 15
 
     def test_eval_configs_includes_all_vllm_configs(self):
@@ -210,7 +227,7 @@ class TestEvalConfigsIncludesVllm:
         )
 
     def test_eval_configs_total_count(self):
-        """EVAL_CONFIGS must have 7 cloud baselines + 15 vLLM = 22 total entries."""
+        """EVAL_CONFIGS must have 3 cloud baselines + 15 vLLM = 18 total entries."""
         expected = self._CLOUD_BASELINE_COUNT + self._VLLM_COUNT
         assert len(EVAL_CONFIGS) == expected, (
             f'Expected {expected} configs, got {len(EVAL_CONFIGS)}: '
@@ -220,11 +237,7 @@ class TestEvalConfigsIncludesVllm:
     def test_cloud_baselines_equal_eval_minus_vllm(self):
         """Cloud baselines derived by set-difference must equal the known literal set."""
         derived = {cfg.name for cfg in EVAL_CONFIGS} - VLLM_NAMES
-        expected = {
-            'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
-            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
-            'gemini-31-pro-high', 'gemini-3-flash-high',
-        }
+        expected = {'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max'}
         assert derived == expected, (
             f'Derived cloud baselines do not match expected set.\n'
             f'  Extra:   {derived - expected}\n'
