@@ -72,9 +72,9 @@ function endpointsFor(win) {
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
-// `terminal`, the mechanism PRD leaf gamma3 fetches `?terminal=<project>`
-// through, and `taskProse`, the Task Detail pane's description/details for the
-// selected task, addressed by the row's own uid (`<project>/T-<id>`).
+// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
+// `taskProse`, the Task Detail pane's description/details for the selected
+// task, addressed by the row's own uid (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -540,10 +540,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: the gamma3
-// UI that opens a terminal has to tell "here are the rows" from "the server
-// said no" from "we did not even ask", and datumFor(key) reports the same
-// pre-request unknown Datum in all three cases.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
+// which requests a project's terminal window, has to tell "here are the rows"
+// from "the server said no" from "we did not even ask", and datumFor(key)
+// reports the same pre-request unknown Datum in all three cases, so it reads
+// onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
@@ -567,6 +568,25 @@ function onDemandView(value, outcome) {
   if (value !== undefined && value !== null) return ON_DEMAND_VIEWS.ready;
   if (outcome === null || outcome === REFRESH_OUTCOMES.skippedInFlight) return ON_DEMAND_VIEWS.loading;
   return ON_DEMAND_VIEWS.unavailable;
+}
+
+const ON_DEMAND_HOLE_REASONS = Object.freeze({
+  [ON_DEMAND_VIEWS.loading]: 'requested; waiting for the response',
+  [ON_DEMAND_VIEWS.unavailable]: 'the request for it did not succeed',
+});
+
+// onDemandView's answer as the Datum a REQUESTING caller renders: the stored,
+// receipt-stamped Datum once one has landed, else a hole naming what its own
+// request is doing — never datumFor's 'not yet fetched'. A PLAIN row has no
+// Datum to answer with, so asking for one is refused.
+function onDemandDatum(name, param, outcome) {
+  const row = onDemandRow(name);
+  if (row.spec !== DATUM) {
+    throw new Error(`DF_DATA: on-demand key '${name}' is not datum-kinded, so it has no Datum to answer with`);
+  }
+  const value = window.DF_DATA[row.key(param)];
+  const view = onDemandView(value, outcome);
+  return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
 }
 
 // `stateKey` names the flow-control, staleness and receipt entry this request
@@ -756,10 +776,7 @@ async function refreshDFData(win, opts) {
 // abandoned (the Task Detail pane re-selecting a task) would wait forever on a
 // request that failed.
 async function requestOnDemand(name, param, opts) {
-  const row = ON_DEMAND_KEYS[name];
-  if (!row) {
-    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
-  }
+  const row = onDemandRow(name);
   const o = opts || {};
   const state = o.state || DF_POLL_STATE;
   const ledger = onDemandLedger(state, name);
@@ -769,6 +786,14 @@ async function requestOnDemand(name, param, opts) {
   ledger.set(param, request);
   trimOnDemand(name, ledger, row.retain ?? Infinity, state);
   return request;
+}
+
+function onDemandRow(name) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row) {
+    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
+  }
+  return row;
 }
 
 function startOnDemand(name, param, state, depsOverrides, ledger) {
@@ -885,6 +910,7 @@ const DF_DATA_LOADER_API = {
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
+  onDemandDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
