@@ -837,6 +837,7 @@ function TasksTab({ projectFilter, search }) {
             const listed = viewRows(rows, terminal, filter);
             const held = viewRows(rows, terminal, EVERY_VIEW_T).rows;
             const filtered = listed.rows.filter(searchMatches);
+            const onlyThePlaceholder = listed.placeholder && filtered.length === 0;
             // The ONE focus-narrowing site. Both the header count below and
             // the group body read this single result, so they cannot be fed
             // different arrays — which is exactly what went wrong before
@@ -891,14 +892,14 @@ function TasksTab({ projectFilter, search }) {
                 {listed.notes.map(note => (
                   <div key={note} className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{note}</div>
                 ))}
-                {groupView.emptiedByFocus
+                {!onlyThePlaceholder && (groupView.emptiedByFocus
                   ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                   : groupByPrd
                     ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} progress={prdProgress(rows, terminal)}
                                         selectedId={selectedId}
                                         onSelect={setSelectedId} onEnterFocus={enterFocus} />
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
-                                 onSelect={setSelectedId} onEnterFocus={enterFocus} />}
+                                 onSelect={setSelectedId} onEnterFocus={enterFocus} />)}
               </PG_T>
             );
           })}

@@ -194,6 +194,25 @@ class TestRowsComeFromTheSnapshotByView:
             'the viewRows notes (why listed rows are not the whole, current set) are not rendered'
         )
 
+    def test_a_hole_with_nothing_listed_does_not_also_say_nothing_matches(self, tasks_tab_code):
+        """OrchTab's ``!placeholder && filtered.length === 0`` precedent (esc-5590-2).
+
+        Under a hole the placeholder is the whole answer; the graph's "no tasks
+        match the current filter" would pass the outage off as an empty filter.
+        Listed rows still draw: the gate closes only when nothing is listed.
+        """
+        listed = next(name for name, _, suffix in _view_rows_bindings(tasks_tab_code) if not suffix)
+        filtered = re.search(rf'\bconst\s+(\w+)\s*=\s*{listed}\.rows\.filter\(', tasks_tab_code).group(1)
+        gate = re.search(
+            rf'\bconst\s+(\w+)\s*=\s*{listed}\.placeholder\s*&&\s*{filtered}\.length\s*===\s*0\s*;', tasks_tab_code,
+        )
+        body = gate and re.search(rf'\{{\s*!\s*{gate.group(1)}\s*&&\s*\(', tasks_tab_code)
+        drawn = body and walk_balanced(tasks_tab_code, body.end() - 1, '(', ')')
+        assert drawn and '<TaskGraph' in drawn and '<ProjectPrdGroups' in drawn, (
+            f'TasksTab does not bind `const X = {listed}.placeholder && {filtered}.length === 0;` '
+            'and gate both graph bodies behind `{!X && (...)}`'
+        )
+
 
 def test_every_status_member_has_a_node_style(_client):
     """Every TaskStatus member reaches the graph now, so each must be drawable.
