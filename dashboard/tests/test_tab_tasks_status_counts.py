@@ -90,7 +90,8 @@ def _view_rows_bindings(tasks_tab_code: str) -> list[tuple[str, str, str]]:
     for match in re.finditer(r'\bconst\s+(\w+)\s*=\s*viewRows\(', tasks_tab_code):
         call = walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
         after = tasks_tab_code[match.end() - 1 + len(call):]
-        suffix = re.match(r'\s*(\.\w+)?', after).group(1) or ''
+        suffix_match = re.match(r'\s*(\.\w+)', after)
+        suffix = suffix_match.group(1) if suffix_match else ''
         bindings.append((match.group(1), call[1:-1], suffix))
     return bindings
 
@@ -206,7 +207,9 @@ class TestRowsComeFromTheSnapshotByView:
         Listed rows still draw: the gate closes only when nothing is listed.
         """
         listed = next(name for name, _, suffix in _view_rows_bindings(tasks_tab_code) if not suffix)
-        filtered = re.search(rf'\bconst\s+(\w+)\s*=\s*{listed}\.rows\.filter\(', tasks_tab_code).group(1)
+        filtered_binding = re.search(rf'\bconst\s+(\w+)\s*=\s*{listed}\.rows\.filter\(', tasks_tab_code)
+        assert filtered_binding, f'TasksTab binds no `const X = {listed}.rows.filter(...)`'
+        filtered = filtered_binding.group(1)
         gate = re.search(
             rf'\bconst\s+(\w+)\s*=\s*{listed}\.placeholder\s*&&\s*{filtered}\.length\s*===\s*0\s*;', tasks_tab_code,
         )
