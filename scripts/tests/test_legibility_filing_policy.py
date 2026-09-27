@@ -381,3 +381,49 @@ def test_misfiled_reify_clusters_resolve_to_the_harness(cluster):
 @pytest.mark.parametrize("cluster", REIFY_ACTIONABLE)
 def test_reify_actionable_clusters_resolve_to_the_observed_project(cluster):
     assert _resolve(cluster).project == OBSERVED
+
+
+# ---------------------------------------------------------------------------
+# is_fileable — the singleton filing gate
+# ---------------------------------------------------------------------------
+
+def test_min_unremediated_sightings_is_two():
+    assert filing_policy.MIN_UNREMEDIATED_SIGHTINGS == 2
+
+
+def test_unremediated_singleton_is_not_fileable():
+    assert filing_policy.is_fileable(REIFY_7909, sighting_count=1) is False
+
+
+def test_unremediated_recurrence_is_fileable():
+    assert filing_policy.is_fileable(REIFY_7909, sighting_count=2) is True
+
+
+def test_remediated_singleton_is_fileable():
+    cluster = {**REIFY_7909, "remediation": IN_TREE_REMEDIATION}
+    assert filing_policy.is_fileable(cluster, sighting_count=1) is True
+
+
+@pytest.mark.parametrize(
+    "remediation",
+    [
+        pytest.param("docs/x.md: add a note", id="non-dict"),
+        pytest.param({"path": "docs/x.md"}, id="missing-change"),
+        pytest.param({"path": "", "change": "Add a note"}, id="empty-path"),
+        pytest.param({"path": 7, "change": "Add a note"}, id="non-str-path"),
+    ],
+)
+def test_malformed_remediation_counts_as_absent(remediation):
+    cluster = {**REIFY_7909, "remediation": remediation}
+    assert filing_policy.is_fileable(cluster, sighting_count=1) is False
+
+
+def test_zero_sightings_without_remediation_is_not_fileable():
+    assert filing_policy.is_fileable(REIFY_7909, sighting_count=0) is False
+
+
+def test_withheld_cluster_is_a_frozen_record():
+    withheld = filing_policy.WithheldCluster(title="t", sighting_count=1)
+    assert withheld == filing_policy.WithheldCluster(title="t", sighting_count=1)
+    with pytest.raises(AttributeError):
+        withheld.sighting_count = 2  # pyright: ignore[reportAttributeAccessIssue]
