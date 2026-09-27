@@ -2552,6 +2552,17 @@ def _with_origin(rec, kind):
     return out
 
 
+_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
+    '<task-notification>\n'
+    '<task-id>b2bc921b279ccc464</task-id>\n'
+    '<status>completed</status>\n'
+    '<summary>Background command "merge the branch" completed (exit code 1)</summary>\n'
+    '<result>BLOCKED: merge gate refused the branch\n'
+    '[Request interrupted by user for tool use]</result>\n'
+    '</task-notification>'
+)
+
+
 def _task_notification(text=_TASK_NOTIFICATION_TEXT):
     """A background-task notification record, shaped like census record 196."""
     return _with_origin(_user_text(text), 'task-notification')
@@ -2677,6 +2688,36 @@ class TestNonHumanOriginFilter:
         correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
         assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
         assert meta['n_user_turns'] == 1
+
+    def test_df_guard_and_interrupt_ignore_a_task_notification_carrier(self):
+        records = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)]
+
+        assert mod.iter_df_guards(records) == []
+        assert mod.iter_interrupts(records) == []
+
+    def test_same_literals_under_human_origin_still_fire(self):
+        # The carrier filter keys on provenance, not on the text.
+        records = [_with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
+
+        assert len(mod.iter_df_guards(records)) == 1
+        assert len(mod.iter_interrupts(records)) == 1
+
+    def test_signal_counts_unaffected_by_a_task_notification_turn(self):
+        base = _all_signals_records()
+        with_notification = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)] + base
+
+        assert mod.signal_counts(with_notification) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_reads_markers_inside_a_notification(self):
+        # classify_agent_class reads the RAW carriers, which stay unfiltered.
+        text = (
+            _TASK_NOTIFICATION_TEXT
+            + 'Task ID: 5956\nWorktree: /home/leo/src/dark-factory/.worktrees/5956\n'
+        )
+        records = [_task_notification(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------
