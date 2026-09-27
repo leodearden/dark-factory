@@ -1,12 +1,13 @@
 // Module-contract tests for task_snapshot.js, the CLIENT reader of the /tasks
 // snapshot unit whose server half is dashboard/src/dashboard/data/task_snapshot.py.
 // Every census surface — the OrchTab pips, tiles, filter bar and Progress card,
-// the Overview tile and pipeline, the topbar pill and the rail badge — reads
-// its number through this module, so the decisions it makes are asserted here,
-// where node can execute them. The .jsx files are `type="text/babel"` behind
-// CDN Babel and cannot run under node; their WIRING to this module is pinned
-// structurally in Python (test_tab_orchestrators.py, test_tab_overview.py,
-// test_app_chrome_census.py).
+// the Overview tile and pipeline, the topbar pill, the rail badge and the Tasks
+// header pips — reads its number through this module, so the decisions it makes
+// are asserted here, where node can execute them. The .jsx files are
+// `type="text/babel"` behind CDN Babel and cannot run under node; their WIRING
+// to this module is pinned structurally in Python (test_tab_orchestrators.py,
+// test_tab_overview.py, test_app_chrome_census.py,
+// test_tab_tasks_status_counts.py, test_tab_tasks_terminal_window.py).
 //
 // Run via `node --test` (dashboard/tests/test_graph_layout_js.py's
 // `**/*.test.mjs` glob auto-discovers this file).
@@ -15,7 +16,7 @@
 // destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope with no
 // fallback, and datum.js in turn destructures window.DF_ENDPOINT_STALENESS. So
 // the shim goes in first and the chain is required through it —
-// task_done_count.test.mjs::loadGuard has the same shape.
+// prd_grouping.test.mjs::loadPrdGrouping has the same shape.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -39,8 +40,9 @@ const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
 const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
+const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
-const { VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
+const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
 const EXPECTED_FUNCTION_NAMES = [
   'projectCensus',
@@ -55,8 +57,16 @@ const EXPECTED_FUNCTION_NAMES = [
   'projectRows',
   'viewRows',
   'unrequestedTerminalRows',
+  'snapshotRowsOver',
+  'terminalWindowProjects',
 ];
-const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'TASKS_ENDPOINT', 'CENSUS_VIEWS', 'CENSUS_TILES'];
+const EXPECTED_EXPORT_NAMES = [
+  ...EXPECTED_FUNCTION_NAMES,
+  'TASKS_ENDPOINT',
+  'CENSUS_VIEWS',
+  'CENSUS_TILES',
+  'EVERY_VIEW',
+];
 
 // ── Fixtures: boundary sketch #1 ────────────────────────────────────────────
 //
@@ -361,6 +371,7 @@ const SURFACES = [
   ['Overview Orchestrators table Terminal cell', perProject, () => terminalOfTotal, '4106/5459'],
   ['topbar pill', fleet, () => runningOfInFlight, '25 running of 43 in-flight'],
   ['rail badge', fleet, () => inFlightCount, '43'],
+  ...CENSUS_VIEWS.map(v => [`Tasks header pip (${v.key})`, perProject, () => v.reading, VIEW_READING_TEXT[v.key]]),
 ];
 
 function oneProjectData(census, rows) {
@@ -686,4 +697,110 @@ test('unrequestedTerminalRows: an absent window says it is fetched on request �
 test('unrequestedTerminalRows: a window another surface requested is read exactly as served', () => {
   const served = terminalWindow(TERMINAL_ROWS);
   assert.equal(unrequestedTerminalRows(served), served);
+});
+
+// ── The Tasks tab's readers ─────────────────────────────────────────────────
+//
+// The Tasks tab probes and looks tasks up over every row the snapshot holds,
+// lists rows by view, and requests the terminal window only for the projects
+// that need it (PRD decision 5).
+
+test('snapshotRowsOver: every entry\'s rows, concatenated in entry order', () => {
+  // The list the retired ACTIVE_TASKS key carried: api/tasks.py served it as
+  // exactly this concatenation.
+  const data = sketchData({
+    TASKS_SNAPSHOT: {
+      'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), rowsDatum(SNAPSHOT_ROWS.slice(0, 3))),
+      reify: entryWith(datumIn('fresh', REIFY_CENSUS_VALUE), rowsDatum(SNAPSHOT_ROWS.slice(3))),
+    },
+  });
+  assert.deepEqual(ids(snapshotRowsOver(data)), ids(SNAPSHOT_ROWS));
+});
+
+test('snapshotRowsOver: stale rows still contribute — an aged row is still a row', () => {
+  const data = sketchData({
+    TASKS_SNAPSHOT: { 'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), datumIn('stale', SNAPSHOT_ROWS)) },
+  });
+  assert.deepEqual(ids(snapshotRowsOver(data)), ids(SNAPSHOT_ROWS));
+});
+
+test('snapshotRowsOver: an entry without rows contributes none, and never throws', () => {
+  const data = sketchData({
+    TASKS_SNAPSHOT: {
+      unknownRows: entryWith(datumIn('fresh', DF_CENSUS_VALUE), datumIn('unknown')),
+      noRows: { census: datumIn('fresh', DF_CENSUS_VALUE) },
+      nullEntry: null,
+      'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), rowsDatum(TERMINAL_ROWS)),
+    },
+  });
+  let rows;
+  assert.doesNotThrow(() => {
+    rows = snapshotRowsOver(data);
+  });
+  assert.deepEqual(ids(rows), ids(TERMINAL_ROWS));
+});
+
+test('snapshotRowsOver: before the first /tasks payload there are no rows', () => {
+  assert.deepEqual(snapshotRowsOver({ TASKS_SNAPSHOT: {}, __receipt: {} }), []);
+});
+
+test('snapshotRowsOver: the wire objects are not mutated', () => {
+  const data = sketchData();
+  const pristine = structuredClone(data);
+  snapshotRowsOver(data);
+  assert.deepEqual(data, pristine);
+});
+
+test('EVERY_VIEW: a frozen selection of every census view', () => {
+  assert.ok(Object.isFrozen(EVERY_VIEW));
+  assert.deepEqual(Object.keys(EVERY_VIEW), CENSUS_VIEWS.map(v => v.key));
+  for (const { key } of CENSUS_VIEWS) assert.equal(EVERY_VIEW[key], true, key);
+});
+
+test('EVERY_VIEW: one row per status member is listed — review and infra-hold included', () => {
+  const listed = viewRows(rowsDatum(SNAPSHOT_ROWS), terminalWindow(TERMINAL_ROWS), EVERY_VIEW).rows;
+  assert.equal(listed.length, MEMBERS.length);
+  assert.deepEqual(listed.map(r => r.status).sort(), MEMBERS.slice().sort());
+  assert.ok(listed.some(r => r.status === 'review'));
+  assert.ok(listed.some(r => r.status === 'infra-hold'));
+});
+
+// ── terminalWindowProjects: which projects request ?terminal= ───────────────
+
+const PROJECT_IDS = ['dark-factory', 'reify', 'hive'];
+
+test('terminalWindowProjects: the terminal view requests every project, in project order', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, []), PROJECT_IDS);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['hive']), PROJECT_IDS);
+});
+
+test('terminalWindowProjects: without the terminal view, only PRD-grouped projects request it', () => {
+  const filter = { in_flight: true, backlog: true, terminal: false };
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, filter, ['hive', 'dark-factory']), ['dark-factory', 'hive']);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify']), ['reify']);
+});
+
+test('terminalWindowProjects: a grouped id that is not a visible project is ignored', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['elsewhere', 'reify']), ['reify']);
+});
+
+test('terminalWindowProjects: nothing selected and nothing grouped requests nothing', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, []), []);
+  assert.deepEqual(terminalWindowProjects([], { terminal: true }, ['reify']), []);
+});
+
+test('terminalWindowProjects: each project is requested once', () => {
+  const wanted = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify', 'reify']);
+  assert.deepEqual(wanted, PROJECT_IDS);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify', 'reify']), ['reify']);
+});
+
+test('terminalWindowProjects: its inputs are not mutated', () => {
+  const projectIds = PROJECT_IDS.slice();
+  const filter = { terminal: false };
+  const grouped = ['hive', 'reify'];
+  terminalWindowProjects(projectIds, filter, grouped);
+  assert.deepEqual(projectIds, PROJECT_IDS);
+  assert.deepEqual(filter, { terminal: false });
+  assert.deepEqual(grouped, ['hive', 'reify']);
 });
