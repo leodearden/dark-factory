@@ -9,6 +9,7 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1538,7 +1539,7 @@ def test_burndown_returns_aggregate_and_per_project(client):
     resp = client.get('/api/v2/dashboard/burndown?window=30d')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
+    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'served_at'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
 
@@ -1582,6 +1583,27 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     assert all(n == nows[0] for n in nows), (
         f'expected all per-project aggregates to share one reference now, got {nows!r}'
     )
+
+
+def test_burndown_route_serves_its_datums_at_the_window_instant(client):
+    """The one captured instant is the window cutoff AND the instant every
+    burndown Datum is judged at, and it crosses the wire as ``served_at`` —
+    which data.js::refreshOne reads into the receipt datum.js ages against."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        body = client.get('/api/v2/dashboard/burndown?window=30d').json()
+
+    assert isinstance(body['served_at'], str)
+    (call,) = mock_series.await_args_list
+    assert datetime.fromisoformat(body['served_at']) == call.kwargs['now']
+    assert set(body['BURNDOWN']['latest']) == {
+        'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds',
+    }
 
 
 # ---------------------------------------------------------------------------
