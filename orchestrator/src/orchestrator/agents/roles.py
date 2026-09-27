@@ -594,10 +594,99 @@ NEVER — each of these cost a real session a turn or an entire wait
 """
 
 
-# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# Third member of the wait block: reading the exit code a wait returned (task
+# 5519, legibility census).  Founding sighting: `uv run python -m pytest
+# fused-memory/tests/ ... 2>&1 | tail -6` under a 2400000 ms Bash timeout came
+# back `[exit 137]` with NO output, far short of that budget, and the agent
+# had no way to tell "my timeout fired" from "something external killed it".
+#
+# MEASURED 2026-09-27 from dispatched sessions on this host -- do NOT
+# re-derive:
+#   * pipefail is OFF in the agent shell (`set -o`; `(exit 3) | cat` gives 0),
+#     so the sighting's `| tail -6` reported tail's status, not pytest's.
+#   * `/usr/bin/time -v` on a SIGKILLed child prints "Command terminated by
+#     signal 9", the elapsed wall clock and the max RSS, and still returns 137.
+#     Its max RSS is the LARGEST single descendant, not a sum over xdist
+#     workers -- hence the caveat in the prose.
+#   * cgroup v2: `/proc/self/cgroup` is one `0::` line, and the orchestrator
+#     service's `memory.events` is readable and carries `oom_kill`.  Every
+#     cgroup ancestor reads memory.max=max, so an OOM here is host pressure,
+#     not a hidden per-service cap.
+#   * `dmesg` fails with EPERM.  `journalctl -k` was unavailable in the
+#     architect's session but readable in the implementer's (uid in the `adm`
+#     group), and too slow to be a recipe there: a 14-day window did not
+#     finish in 60s.  Host-dependent, so the prose does not route through it.
+#
+# ELAPSED-VERSUS-BUDGET IS THE PRIMARY READING, deliberately.  The stronger
+# claim "the Bash tool never produces 137" is unfalsifiable from this repo and
+# false if the harness escalates SIGTERM to SIGKILL after a grace, as this
+# repo's own agents/invoke.py::_run_agent_subprocess does.  "It died far short
+# of the budget I set" holds whatever the harness does.
+#
+# THE SESSION WATCHDOG IS EXCLUDED AS A CAUSE, and the prose says so: its kill
+# takes the whole session, so an agent reading a 137 was by that fact not
+# reaped by it.  An earlier plan revision said "suspect the watchdog", which
+# sends the agent after an impossible cause.
+#
+# Composed INTO BACKGROUND_WAIT_GUIDANCE rather than appended to
+# _BASH_CAPABLE_ROLE_PREAMBLE's tail: it is the same concern as waiting (its
+# 143 and 124 readings point at sentences in WAIT_PATTERN_GUIDANCE), and the
+# Bash-capable carrier set comes with the composition.  Constraint (b) above
+# binds it too.  Same no-literal-braces rule as the two members above.
+EXTERNAL_KILL_GUIDANCE = """
+## Reading an exit code: your own timeout, or an external kill?
+
+Read the code against the CLOCK: a command that died far short of the
+`timeout` you set was not timed out, whatever the code says. The three codes:
+- 143 = 128 + 15, SIGTERM: your own Bash `timeout` (120000 ms when omitted).
+- 124: a GNU `timeout N` prefix YOU wrote into the command, as above.
+- 137 = 128 + 9, SIGKILL. Well short of your budget, that is an EXTERNAL
+  killer: the Linux OOM killer, or an operator or sweep `kill -9`. It is NOT
+  the session watchdog: that kill takes your whole session, so if you are
+  reading the code, it was not the watchdog. Raising `timeout` cannot fix an
+  external kill, and re-running the identical command usually reproduces it.
+
+A killed run says NOTHING about the code under test: it is neither failing nor
+hanging. Never report it as a test failure or a hang. Say it was killed
+externally, and quote the raw code. Same rule, machine-side:
+`orchestrator/src/orchestrator/verify_classify.py::_EXTERNAL_KILL_SIGNALS`.
+
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
+without `pipefail`, so a pipeline reports its LAST stage's status and the real
+exit code is thrown away. A kill that takes the process group also takes
+whatever was buffered in the pipe, leaving a code and no output. Redirect to a
+file and `Read` the file: a killed run then still leaves its partial output
+on disk.
+
+To diagnose a 137, re-run it once, on ONE line:
+
+    /usr/bin/time -v <cmd> > <log> 2>&1; echo "rc=$?"
+
+Make the log path unique (carry your task id): /tmp is shared by every agent
+on the host. `Read` the END of the log: "Command terminated by signal 9", the
+elapsed wall clock, and the max RSS (the largest single process; xdist workers
+are not summed). Before and after that run, read the `oom_kill` line of
+`/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.events`. A rise is
+strong evidence of OOM, not proof: other agents share that cgroup.
+
+Then, in order:
+- Elapsed close to your budget: it was your timeout. Re-size it, or
+  background it per the rules above.
+- Short of budget with `oom_kill` risen or a large max RSS: shrink the run.
+  Shard by directory, cut xdist workers (`-n 4`, not `-n auto`, which starts
+  one per core), or run the heaviest subset alone.
+- Neither: `escalate_blocker` with `category='infra_issue'`, quoting the raw
+  code, elapsed time, max RSS and `oom_kill` before and after, rather than
+  guessing a cause.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never any member on its
 # own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
-# composition so the two rules cannot drift apart.
-BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+# composition so the three rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = (
+    BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE + EXTERNAL_KILL_GUIDANCE
+)
 
 
 # Pointer form for a TURN prompt whose role system_prompt already carries the
@@ -607,11 +696,12 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~11% of the block's bytes.
+# that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
+# BACKGROUND_WAIT_GUIDANCE 9180 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2470),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9180 = 8.3%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -1423,9 +1513,9 @@ The server runs the same checks as a backstop, in this order:
 # shared across every project this orchestrator dispatches for, so an
 # unconditional enforcement promise would be false on a host or project that
 # runs unsandboxed (task 4370 review, suggestion 1). Composed the same way
-# BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE compose
-# BACKGROUND_WAIT_GUIDANCE above: each half is self-contained with its own
-# leading/trailing blank line, plain `+` concatenation.
+# BACKGROUND_WAIT_GUIDANCE above is composed from its members: each half is
+# self-contained with its own leading/trailing blank line, plain `+`
+# concatenation.
 #
 # SCOPE_BOUNDARY_GUIDANCE / SCOPE_BOUNDARY_GUIDANCE_SIMPLE remain the public
 # splice units, spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the
