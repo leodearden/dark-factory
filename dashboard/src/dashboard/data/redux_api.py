@@ -9,13 +9,21 @@ through the matching ``shape_*`` function before serialising as JSON.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
 
+from dashboard.data import census
+from dashboard.data.burndown import (
+    aggregate_forecast_confidence,
+    aggregate_window_completion,
+    compute_forecast_confidence,
+    compute_parity_alarm,
+    compute_window_completion,
+)
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
@@ -863,12 +871,13 @@ def shape_performance(
 # ---------------------------------------------------------------------------
 
 
-# ``concurrency_cap`` is deliberately NOT here: it is a per-project scalar
-# series, not an additive count.  Summing caps across projects invents a
-# denominator no single orchestrator ever enforced — the parity alarm is
-# aggregated by OR-ing per-project verdicts instead (see below).
+# The nine census members plus the rows' in-progress split. ``concurrency_cap``
+# is deliberately NOT here: it is a per-project scalar series, not an additive
+# count.  Summing caps across projects invents a denominator no single
+# orchestrator ever enforced — the parity alarm is aggregated by OR-ing
+# per-project verdicts instead (see below).
 _BURNDOWN_KEYS = (
-    'done', 'in_progress', 'in_progress_live', 'in_progress_stranded', 'blocked', 'pending',
+    *census.SERIES_KEYS.values(), 'in_progress_live', 'in_progress_stranded', 'in_progress_rows',
 )
 
 
@@ -895,19 +904,22 @@ def shape_burndown(
 ) -> dict[str, Any]:
     """Build ``{BURNDOWN, BURNDOWN_BY_PROJECT}`` from per-project series.
 
-    ``BURNDOWN`` is the sum across projects, aligned by label.
-    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks
-    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history),
-    the ``in_progress_live`` / ``in_progress_stranded`` split, and a parity
-    block from :func:`dashboard.data.burndown.compute_parity_alarm`.
+    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks carry
+    one series per :data:`_BURNDOWN_KEYS` key (the nine census members and
+    the rows' in-progress split), ``forecast_low`` / ``forecast_high`` (None
+    when <7 days history), and a parity block.
 
     Consumer contract — the two label rows are NOT interchangeable:
 
     * ``BURNDOWN['labels']`` is the sorted UNION of every project's snapshot
-      timestamps, and the four aggregate series are densified onto it by
-      ``index_map`` below, so each is always ``len(labels)``.
+      timestamps.  At each union label every project contributes its last
+      measured row at or before it, carried whole, and the aggregate is their
+      sum (:func:`_carry_last_sum`).  A project contributes from its first
+      measured row in the window on; a value missing or None in a
+      contributing row is a hole, and a hole anywhere is a hole (None) in the
+      total, never a 0.  Each aggregate series is always ``len(labels)``.
     * Each ``BURNDOWN_BY_PROJECT[p]`` block carries that project's OWN
-      snapshot row, generally SHORTER than the union row.  Its four series are
+      measured rows, generally SHORTER than the union row.  Its series are
       copied verbatim, so they are co-length with that row exactly as far as
       the caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
       appends one value per key per snapshot row, which is what establishes
@@ -921,10 +933,18 @@ def shape_burndown(
     per-project status-mix chart in ``static/redux/tabs.jsx``.
 
     Per-project rows are deliberately not densified onto the union row: a
-    0-fill would assert a measurement that was never taken, and a null-fill
-    would first require every downstream consumer (``deriveVelocitySeries``,
-    the summary-table last-value reads, ``compute_window_completion``) to be
-    made hole-aware.
+    0-fill would assert a measurement that was never taken, and a carried or
+    null fill would first require every downstream consumer
+    (``deriveVelocitySeries``, the summary-table last-value reads,
+    ``compute_window_completion``) to tell a carried value from a measured one.
+
+    Forecast, completion and parity are folds over the per-project MEASURED
+    series (:func:`~dashboard.data.burndown.aggregate_forecast_confidence`,
+    :func:`~dashboard.data.burndown.aggregate_window_completion`,
+    :func:`_aggregate_parity`), never readings of the carried aggregate: a
+    carried copy is not evaluated a second time, and a gap row never reaches
+    this function at all (``burndown.py::_measured_rows``).  Parity reads each
+    project's RAW series, never ``_with_split``'s census fill.
 
     The aggregate parity block is an **OR over per-project alarms**, never a
     comparison of summed in-progress against summed caps.  Summing hides a
@@ -937,15 +957,6 @@ def shape_burndown(
     ``parity_projects`` names the breaching projects so an operator reading the
     aggregate banner is not left hunting for which one.
     """
-    # Local import avoids circular import: burndown.py imports stats and
-    # this module imports config/no-burndown.
-    from dashboard.data.burndown import (
-        aggregate_window_completion,
-        compute_forecast_confidence,
-        compute_parity_alarm,
-        compute_window_completion,
-    )
-
     by_project: dict[str, dict] = {}
     filled_by_project: list[dict[str, Any]] = []
     label_set: set[str] = set()
@@ -966,20 +977,45 @@ def shape_burndown(
         }
 
     sorted_labels = sorted(label_set)
-    aggregate: dict[str, Any] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
-    index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
-    for filled in filled_by_project:
-        labels = list(filled.get('labels') or [])
-        for k in _BURNDOWN_KEYS:
-            for lbl, val in zip(labels, filled.get(k) or [], strict=False):
-                if lbl in index_map:
-                    aggregate[k][index_map[lbl]] += int(val or 0)
-
-    aggregate.update(compute_forecast_confidence(aggregate))
+    aggregate: dict[str, Any] = {
+        'labels': sorted_labels,
+        **_carry_last_sum(filled_by_project, sorted_labels),
+    }
+    aggregate.update(aggregate_forecast_confidence(filled_by_project))
     aggregate.update(aggregate_window_completion(by_project, sorted_labels))
     aggregate.update(_aggregate_parity(by_project))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
+
+
+def _carry_last_sum(
+    series_list: Iterable[Mapping[str, Any]], union_labels: Sequence[str],
+) -> dict[str, list[int | None]]:
+    """Sum, at every union label, each project's last measured row at or before it.
+
+    Rows travel whole: one index names one observation, so its columns are
+    never mixed with another row's.  One forward walk per project over the
+    sorted union.  A project with no row yet contributes nothing; a value
+    missing from, or None in, a contributing row makes that key's total None
+    at that label.
+    """
+    totals: dict[str, list[int | None]] = {key: [0] * len(union_labels) for key in _BURNDOWN_KEYS}
+    for series in series_list:
+        labels = list(series.get('labels') or [])
+        columns = {key: list(series.get(key) or []) for key in _BURNDOWN_KEYS}
+        rows = sorted(range(len(labels)), key=labels.__getitem__)
+        carried = -1
+        for at, union_label in enumerate(union_labels):
+            while carried + 1 < len(rows) and labels[rows[carried + 1]] <= union_label:
+                carried += 1
+            if carried < 0:
+                continue
+            row = rows[carried]
+            for key, values in columns.items():
+                value = values[row] if row < len(values) else None
+                total = totals[key][at]
+                totals[key][at] = None if value is None or total is None else total + value
+    return totals
 
 
 def _aggregate_parity(by_project: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
