@@ -1097,6 +1097,16 @@ class DryRunFiling:
     payload_count: int
 
 
+@dataclass(frozen=True)
+class CrossProjectTicket:
+    """A curator ticket this run filed into a project OTHER than the one it
+    observed (``filing_policy.resolve_target``). ``resolve_ticket`` must be
+    pointed at *project_root* to learn its task id."""
+
+    ticket_id: str
+    project_root: str
+
+
 SECTION_HEADER = "header"
 SECTION_FORCE_MARKER = "force-marker"
 SECTION_SATURATION = "saturation"
@@ -1162,6 +1172,7 @@ def census_report_sections(
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -1374,6 +1385,18 @@ def census_report_sections(
         )
         filed_tasks.append("")
         filed_tasks.extend(f"- {ticket_id}" for ticket_id in filed_ticket_ids)
+        if cross_project_tickets:
+            filed_tasks.append("")
+            filed_tasks.append(
+                f"_{len(cross_project_tickets)} of these ticket(s) were filed into "
+                "another project's task tree, so resolve_ticket needs that "
+                "project_root:_"
+            )
+            filed_tasks.append("")
+            filed_tasks.extend(
+                f"- {ticket.ticket_id} -> {ticket.project_root}"
+                for ticket in cross_project_tickets
+            )
     else:
         filed_tasks.append("_none filed._")
     emit(SECTION_FILED_TASKS, filed_tasks)
@@ -1423,6 +1446,7 @@ def render_report(
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1448,6 +1472,7 @@ def render_report(
         dropped_verdicts=dropped_verdicts,
         mass_rejection=mass_rejection,
         withheld=withheld,
+        cross_project_tickets=cross_project_tickets,
     ))
 
 
@@ -1931,6 +1956,10 @@ class CensusOutcome:
     ``filing_policy.is_fileable`` found neither an in-tree remediation nor a
     recurrence (``"done"`` and ``"unlanded"`` runs only)."""
 
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
+    """The subset of ``filed_ticket_ids`` filed into a project other than the
+    observed one, each naming the project_root ``resolve_ticket`` needs."""
+
 
 def _defer(
     stage: str,
@@ -2087,6 +2116,7 @@ def run_census(
     max_batches: int | None = None,
     max_verify_clusters: int | None = None,
     dry_run_payloads_path: str | Path | None = None,
+    harness_project: filing_policy.ProjectRef | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -2134,9 +2164,10 @@ def run_census(
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
     one stays promoted and is listed in the report) -> ``build_task_payloads``
-    over the fileable clusters + *submit_fn* per payload, best-effort (a raised exception, or a result
-    carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
-    rather than aborting the run or inflating the filed count) ->
+    over the fileable clusters + *submit_fn* per payload, best-effort (a
+    raised exception, or a result carrying no ticket id, is logged and
+    excluded from ``filed_ticket_ids`` rather than aborting the run or
+    inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
     ``codebook.dump`` -> ``advance_census_state`` (done-count from
     *status_fetcher*) -> *commit* of report + codebook + state. A *commit*
@@ -2145,6 +2176,12 @@ def run_census(
     restores them to HEAD -- census-state included, so ``last_census_at``
     is not advanced by a census that did not land -- and the run returns
     status ``"unlanded"`` (see ``_unlanded``).
+
+    A cluster whose fix surface belongs to *harness_project*
+    (``filing_policy.resolve_target``) files into that project's task tree,
+    where the curator dedups it against the harness's own tasks. The report
+    and ``CensusOutcome.cross_project_tickets`` name the project_root each
+    such ticket went to, which is where ``resolve_ticket`` must look.
 
     The report write, ``codebook.dump``, and ``advance_census_state`` run
     in that fixed order, with nothing else in between the latter two, to
@@ -2563,8 +2600,11 @@ def run_census(
             len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
             [cluster.title for cluster in withheld],
         )
-    task_payloads = build_task_payloads(fileable, project_root=project_root, project_id=project_id)
+    task_payloads = build_task_payloads(
+        fileable, project_root=project_root, project_id=project_id, harness=harness_project,
+    )
     filed_ticket_ids = []
+    cross_project_tickets: list[CrossProjectTicket] = []
     dry_run_filing = None
     if dry_run_payloads_path is not None:
         # --dry-run-filing: write the payloads for human review and file
@@ -2625,6 +2665,10 @@ def run_census(
                 )
                 continue
             filed_ticket_ids.append(ticket_id)
+            if payload["project_root"] != project_root:
+                cross_project_tickets.append(
+                    CrossProjectTicket(ticket_id=ticket_id, project_root=payload["project_root"]),
+                )
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -2667,6 +2711,7 @@ def run_census(
         dropped_verdicts=tuple(dropped_verdicts),
         mass_rejection=mass_rejection,
         withheld=withheld,
+        cross_project_tickets=tuple(cross_project_tickets),
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -2722,6 +2767,7 @@ def run_census(
         dropped_verdicts=tuple(dropped_verdicts),
         unresolved_verdicts=len(dropped_verdicts),
         withheld=withheld,
+        cross_project_tickets=tuple(cross_project_tickets),
     )
     commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
     if dry_run_filing is not None:
