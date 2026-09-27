@@ -253,9 +253,11 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    split and a new `in_progress_rows` column come from the rows and carry the rows'
    `as_of`, so `_SPLIT_KEYS`' invariant is restated as `live + stranded ==
    in_progress_rows`, not `== in_progress`. `running` everywhere is the census's
-   in-progress; the task-3543 parity alarm compares the rows-derived
-   `in_progress_live` against the cap, as it does today, and the two numbers sit in
-   one row with their skew visible. `redux_api.py::shape_burndown` builds the aggregate by
+   in-progress; the task-3543 parity alarm and the sampler's cap-breach WARNING
+   compare the rows-derived `in_progress_live` against the cap (a stranded row holds
+   no scheduler slot, so counting it would alarm on a strand pile-up rather than
+   over-dispatch), and the two numbers sit in one row with their skew visible.
+   `redux_api.py::shape_burndown` builds the aggregate by
    carrying each project's last **measured** row forward with its age, and emits
    per-project `as_of`, `state`. `burndown.py::compute_parity_alarm`,
    `redux_api.py::_aggregate_parity` and `compute_forecast_confidence` evaluate
