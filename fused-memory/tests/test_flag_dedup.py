@@ -13756,6 +13756,28 @@ class TestEntityStandingMatchHelpers:
         ) is True
 
 
+class TestExtractFlagUuids:
+    """`extract_flag_uuids` is the public seam other modules read a flag's
+    named UUIDs through (task 5271)."""
+
+    def test_collects_lowercased_uuids_from_every_nested_str_value(self):
+        flag = {
+            'description': f'deleted {_ESD_U1_UPPER}',
+            'evidence': [f'see {_ESD_U2}', {'note': f'and {_ESD_U3}'}],
+            'cited_memories': [{'memory_id': _ESD_U1, 'store': 'mem0'}],
+        }
+
+        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U1, _ESD_U2, _ESD_U3}
+
+    def test_non_str_values_are_ignored(self):
+        flag = {'task_id': 165, 'score': 0.5, 'ok': True, 'none': None, 'd': f'{_ESD_U2}'}
+
+        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U2}
+
+    def test_empty_flag_yields_empty_set(self):
+        assert flag_dedup.extract_flag_uuids({}) == set()
+
+
 # ---------------------------------------------------------------------------
 # filter_entity_standing_decisions (Hook A / γ, task 2896) — step-3/5
 # ---------------------------------------------------------------------------
