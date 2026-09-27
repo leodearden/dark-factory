@@ -2090,21 +2090,37 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 # step-19: RED — run_census() HAPPY path, full seam wiring + static routing
 # ---------------------------------------------------------------------------
 
-def _make_fake_verify_fn(*, verified_titles=(), rejected_titles=(), fixed_entry_ids=()):
+_IN_TREE_REMEDIATION = {"path": "docs/fixture.md", "change": "fixture remediation"}
+
+
+def _make_fake_verify_fn(
+    *, verified_titles=(), rejected_titles=(), fixed_entry_ids=(),
+    remediation=_IN_TREE_REMEDIATION,
+):
     """Fake Sonnet `verify_fn(clusters, *, model)` seam. Splits the input
     clusters by title into verified/rejected per the given title sets;
     `fixed_entry_ids` is returned verbatim so a test can exercise the
     retire_entry path independently of any particular cluster. Records
-    every call's (clusters, model) in `.calls`."""
+    every call's (clusters, model, result) in `.calls`.
+
+    Each VERIFIED cluster comes back as a new dict carrying *remediation*,
+    as the real verifier's in-tree proposal would: run_census files a
+    single-sighting cluster only when it has one (filing_policy.is_fileable),
+    so without it every "was it filed" assertion here would be vacuous.
+    Pass remediation=None to model an unremediated verdict."""
     calls = []
 
     def fake_verify_fn(clusters, *, model):
-        calls.append({"clusters": clusters, "model": model})
-        return {
-            "verified": [c for c in clusters if c.get("title") in verified_titles],
+        verified = [c for c in clusters if c.get("title") in verified_titles]
+        if remediation is not None:
+            verified = [{**c, "remediation": remediation} for c in verified]
+        result = {
+            "verified": verified,
             "rejected": [c for c in clusters if c.get("title") in rejected_titles],
             "fixed": list(fixed_entry_ids),
         }
+        calls.append({"clusters": clusters, "model": model, "result": result})
+        return result
 
     fake_verify_fn.calls = calls
     return fake_verify_fn
@@ -4084,7 +4100,7 @@ def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, 
     # build_task_payloads' own shape
     assert sibling_path.exists()
     verified = [
-        c for c in fake_verify_fn.calls[0]["clusters"]
+        c for c in fake_verify_fn.calls[0]["result"]["verified"]
         if c.get("title") == "Silent no-op subagent contract"
     ]
     expected = mod.build_task_payloads(
@@ -5311,22 +5327,24 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
 # escalations claiming the account is capped.
 # ---------------------------------------------------------------------------
 
-def _cap_themed_verdict(marker, *, verified=True):
+def _cap_themed_verdict(marker, *, verified=True, remediation=None):
     """A WELL-FORMED verdict whose `reason` quotes a cap-themed cluster.
 
     This is ordinary healthy verifier output, not a banner: the model is
     adjudicating a confusion cluster that happens to be ABOUT usage limits.
+    *remediation*, when given, is the verdict's in-tree remediation proposal.
     """
-    return json.dumps(
-        {
-            "verified": verified,
-            "reason": (
-                "Confirmed against main: the watcher rotation was interrupted "
-                f"by a {marker}; the 'continue where you left off' resume "
-                "prompt appears at turns 17/27."
-            ),
-        }
-    )
+    verdict = {
+        "verified": verified,
+        "reason": (
+            "Confirmed against main: the watcher rotation was interrupted "
+            f"by a {marker}; the 'continue where you left off' resume "
+            "prompt appears at turns 17/27."
+        ),
+    }
+    if remediation is not None:
+        verdict["remediation"] = remediation
+    return json.dumps(verdict)
 
 
 @pytest.mark.parametrize("marker", BLOCKING_BANNER_MARKERS)
@@ -5389,7 +5407,9 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     write, last_census_at is untouched, and the next run re-mines the same
     window, re-hits the same cluster and aborts again, forever.
     """
-    verdict = _cap_themed_verdict("usage limit")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    verdict = _cap_themed_verdict("usage limit", remediation=_IN_TREE_REMEDIATION)
 
     def response_fn(prompt, model):
         if prompt == mod._HEADROOM_PROBE_PROMPT:
@@ -6962,3 +6982,88 @@ def test_verify_prompt_requests_the_remediation_key(tmp_path):
     fake_invoke = _make_fake_invoke(default=_verdict())
     mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     assert '"remediation"' in fake_invoke.calls[0]["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# task 5931 step-11: RED — run_census files a verified cluster only when it
+# carries an in-tree remediation or has recurred (filing_policy.is_fileable);
+# a withheld cluster is still RECORDED (promoted), and reported.
+# ---------------------------------------------------------------------------
+
+_GATED_TITLE = "Silent no-op subagent contract"
+
+
+def _gate_kwargs(tmp_path, *, sessions=("s1",), remediation=None, **overrides):
+    """One `_happy_invoke_response` novel-verified digest per session id, all
+    coding to the SAME candidate title, verified with *remediation*."""
+    batch = [
+        _hand_digest(f"{session}-novel-verified", "a genuinely new confusion shape")
+        for session in sessions
+    ]
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(verified_titles={_GATED_TITLE}, remediation=remediation),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+        **overrides,
+    )
+
+
+def test_run_census_withholds_an_unremediated_singleton_but_records_it(tmp_path):
+    kwargs = _gate_kwargs(tmp_path)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert any(entry["title"] == _GATED_TITLE for entry in persisted["entries"]), (
+        "a withheld cluster is recorded, never lost"
+    )
+    assert outcome.withheld == (filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),)
+    withheld_text = _section_text(_sections(withheld=outcome.withheld), mod.SECTION_WITHHELD)
+    assert _GATED_TITLE in withheld_text
+    assert withheld_text in kwargs["report_path"].read_text(encoding="utf-8")
+
+
+def test_run_census_files_an_unremediated_cluster_seen_in_two_sessions(tmp_path):
+    kwargs = _gate_kwargs(tmp_path, sessions=("s1", "s2"))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert len(kwargs["submit_fn"].calls) == 1
+    assert outcome.withheld == ()
+
+
+def test_run_census_files_a_remediated_singleton(tmp_path):
+    kwargs = _gate_kwargs(tmp_path, remediation=_IN_TREE_REMEDIATION)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert len(kwargs["submit_fn"].calls) == 1
+    assert outcome.withheld == ()
+
+
+def test_run_census_dry_run_excludes_withheld_clusters_from_the_payloads(tmp_path):
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    kwargs = _gate_kwargs(tmp_path, dry_run_payloads_path=payloads_path)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert json.loads(payloads_path.read_text(encoding="utf-8")) == []
+    assert outcome.dry_run is not None
+    assert outcome.dry_run.payload_count == 0
+
+
+def test_census_report_sections_withheld_is_gated_and_positioned():
+    assert mod.SECTION_WITHHELD not in _section_keys()
+    assert mod.SECTION_WITHHELD not in _section_keys(withheld=())
+
+    keys = _section_keys(
+        withheld=(filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),),
+    )
+    assert keys.index(mod.SECTION_FILED_TASKS) < keys.index(mod.SECTION_WITHHELD)
+    assert keys.index(mod.SECTION_WITHHELD) < keys.index(mod.SECTION_COST)
