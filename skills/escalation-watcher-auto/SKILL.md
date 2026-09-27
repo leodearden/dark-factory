@@ -597,9 +597,12 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
        for e in candidate_l1s
    ) or any(
        # L2 cluster escalations: match by representative task_id OR member-escalation-id
-       # prefix (members holds L1 esc ids of form esc-<task_id>-<seq>, per models.py:51/76;
-       # trailing hyphen prevents numeric-prefix collisions, e.g. task 16 vs 162)
-       (e["task_id"] == task_id or any(m.startswith(f"esc-{task_id}-") for m in e.get("members", [])))
+       # prefix. pending_l2s rows are compact (see Draining pending escalations), and
+       # compact rows expose member_ids — renamed from the model's members by
+       # escalation/src/escalation/server.py::_compact_escalation — holding L1 esc ids of
+       # form esc-<task_id>-<seq>. The trailing hyphen prevents numeric-prefix collisions,
+       # e.g. task 16 vs 162.
+       (e["task_id"] == task_id or any(m.startswith(f"esc-{task_id}-") for m in e.get("member_ids", [])))
        for e in pending_l2s
    )
    predicate_holds = (
