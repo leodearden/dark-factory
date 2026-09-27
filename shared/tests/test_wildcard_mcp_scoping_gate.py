@@ -548,10 +548,11 @@ class TestNeutralCwdExemption:
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
 
-#: Every matching call site in the first-party tree, measured at HEAD
-#: 89e37fd6fb on 2026-09-22: 5 matched, 0 violations. Three are protected by
-#: running at ``neutral_cli_cwd()``, two by ``no_mcp_servers_config()`` +
-#: ``strict_mcp_config=True``. Kept as an exact SET, not a count: a new
+#: Every matching call site in the first-party tree, measured on 2026-09-27
+#: (task 3995): 5 matched, 0 violations. Four are protected by
+#: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``; only
+#: ``PathScopeAdjudicator.adjudicate`` relies on running at
+#: ``neutral_cli_cwd()``. Kept as an exact SET, not a count: a new
 #: matching caller anywhere in the tree must be looked at even when it is
 #: correctly scoped, and none of these five may silently vanish.
 _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({

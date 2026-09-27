@@ -43,6 +43,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
@@ -2856,7 +2857,11 @@ class TaskCurator:
             # headroom for harder combine-vs-create decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
-            disallowed_tools=['*'],  # no tool access — this is a pure classifier
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
+            disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
@@ -2952,7 +2957,11 @@ class TaskCurator:
             model=self._config.curator.model,
             max_turns=max_turns,
             max_budget_usd=budget,
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
             disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
