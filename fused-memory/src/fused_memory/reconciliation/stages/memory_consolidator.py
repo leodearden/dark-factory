@@ -41,9 +41,6 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_stale_count_snapshot_corrections,
     filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
-    maybe_escalate_suppression_storm,
-    maybe_escalate_suppression_streak,
-    update_suppression_streaks,
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
@@ -83,6 +80,11 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
     STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     sweep_stale_status_snapshot_edges,
+)
+from fused_memory.reconciliation.standing_decision_storm_escape import (
+    maybe_escalate_suppression_storm,
+    maybe_escalate_suppression_streak,
+    update_suppression_streaks,
 )
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
