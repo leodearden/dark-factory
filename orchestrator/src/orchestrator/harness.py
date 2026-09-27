@@ -505,6 +505,13 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
+    # Archive-inclusive read for the drain protocol (task 3999):
+    # get_pending_escalations is PENDING-ONLY by design, so without this
+    # counterpart a resolved or dismissed L2's member_ids are invisible and
+    # its members re-enter work_batch. Covered by
+    # TestWatcherAllowedTools.test_archive_inclusive_read_tool_is_granted —
+    # keep in lockstep with that test if this entry ever moves or is removed.
+    'mcp__escalation__get_task_escalations',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__promote_to_l2',
     # Triage-ack annotation, ungated by level — lets the watcher stamp a
