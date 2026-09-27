@@ -435,11 +435,7 @@ def _bucket(standing: Standing | None, verdict: Verdict, facts: CarveoutFacts) -
 
 def _close_payloads(item: OpenItem, verdict: Verdict) -> tuple[ApplyPayload, ...]:
     """``resolve_issue`` first, so a server refusal aborts before the registry records an answer."""
-    decision_id = item.decision_id or item.escalation_id or ''
-    close = payloads.close_decision_argv(
-        decision_id, DecisionState.ANSWERED, gates.closing_evidence(verdict),
-        create=None if item.decision_id else item,
-    )
+    close = payloads.close_decision_argv(item, DecisionState.ANSWERED, gates.closing_evidence(verdict))
     if not item.escalation_id:
         return (close,)
     resolution = (

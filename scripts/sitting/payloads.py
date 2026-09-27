@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from orchestrator.session_registry import UNKNOWN_QUEUE, DecisionState
-from sitting.inventory import OpenItem
+from sitting.inventory import OpenItem, queue_tag
 
 from orchestrator import session_registry
 
@@ -184,17 +184,38 @@ def route_finding_to_owner(owner_task_id: str, owner_status: str, finding: Findi
     )
 
 
-def close_decision_argv(decision_id: str, state: str, evidence: str, *, create: OpenItem | None) -> ApplyPayload:
-    """``close-decision`` for *decision_id*, preceded by a ``write-decision`` when *create* names an unfiled L2."""
+def sitting_decision_id(item: OpenItem) -> str:
+    """The decision id an unrecorded L2 is filed under: ``<project>[-<queue tag>]-<escalation id>``."""
+    if not item.escalation_id:
+        raise ValueError(f'{item.key}: only an escalation item has a sitting decision id')
+    return '-'.join(part for part in (item.project, queue_tag(item.queue_dir), item.escalation_id) if part)
+
+
+def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPayload:
+    """``close-decision`` for *item*'s record, preceded by a ``write-decision`` when *item* has none.
+
+    Decision ids are fleet-global while escalation numbering restarts per
+    project, so two defences keep a close off another project's record. The
+    derived id (``sitting_decision_id``) makes a cross-project or cross-queue
+    collision improbable. The close's compare-and-swap, ``--project`` and
+    ``--escalations-dir`` naming the record as read, makes any residual
+    collision a loud non-zero exit rather than a silent close of another
+    project's gate; it is needed because ``write-decision`` refuses a collision
+    fail-soft with exit 0, so the close that follows it still runs.
+    """
     if state not in CLOSING_STATES:
         raise ValueError(f'close-decision closes to one of {sorted(CLOSING_STATES)}, not {state!r}')
     if not evidence.strip():
         raise ValueError('close-decision needs the deciding evidence verbatim')
     registry = ['python3', str(Path(session_registry.__file__).resolve())]
-    close = [*registry, 'close-decision', '--id', decision_id, '--state', str(state), '--evidence', evidence]
-    if create is None:
-        return ApplyPayload(SESSION_REGISTRY_TOOL, [close])
-    return ApplyPayload(SESSION_REGISTRY_TOOL, [[*registry, *_write_decision_args(decision_id, create)], close])
+    if item.decision_id is not None:
+        decision_id, expected_project, filing = item.decision_id, item.decision_project, []
+    else:
+        decision_id, expected_project = sitting_decision_id(item), item.project
+        filing = [[*registry, *_write_decision_args(decision_id, item)]]
+    close = [*registry, 'close-decision', '--id', decision_id, '--state', str(state), '--evidence', evidence,
+             '--project', expected_project, '--escalations-dir', item.queue_dir]
+    return ApplyPayload(SESSION_REGISTRY_TOOL, [*filing, close])
 
 
 def render_prepared_marker(marker: PreparedMarker) -> str:
