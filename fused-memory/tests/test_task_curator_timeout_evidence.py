@@ -6,26 +6,29 @@ the curator helpers are imported from it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import shutil
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, TranscriptEvidence
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.usage_gate import UsageGate
-from test_task_curator import _agent_result, _make_config
+from test_task_curator import _agent_result, _make_config, _pool_with_ids
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
     CandidateTask,
+    CuratorDecision,
     CuratorFailureError,
+    PoolWithheld,
     TaskCurator,
+    _PoolEntry,
 )
 
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
@@ -217,31 +220,66 @@ _DRIVES = [
 ]
 
 
-def _killed_run_invoker(
-    fixture: str | None, *, subtype: str, transcript_turns: int | None,
-) -> AsyncMock:
-    """Plant *fixture* as the call's own transcript, then report a killed run.
+def _fixture_lines(name: str) -> list[str]:
+    return (_TRANSCRIPTS / name).read_text().splitlines()
 
-    The result is the shape ``_parse_claude_output`` mints when stdout never
-    arrived: ``turns`` and ``cost_usd`` are empty-stdout defaults, and only
+
+def _structured_output_lines(payload: Any) -> list[str]:
+    """A two-turn transcript whose second turn completed StructuredOutput(*payload*)."""
+    records = [
+        {'type': 'user', 'message': {'role': 'user', 'content': 'prompt'}},
+        {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+            {'type': 'thinking', 'thinking': 'redacted'},
+        ]}},
+        {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+            {'type': 'tool_use', 'id': 'toolu_1', 'name': 'StructuredOutput', 'input': payload},
+        ]}},
+    ]
+    return [json.dumps(record) for record in records]
+
+
+def _killed_run(subtype: str, transcript_turns: int | None) -> AgentResult:
+    """The shape ``_parse_claude_output`` mints when stdout never arrived.
+
+    ``turns`` and ``cost_usd`` are empty-stdout defaults; only
     ``transcript_turns`` (the watchdog's own read) is an observation.
     """
+    return AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype=subtype,
+        timed_out=True,
+        duration_ms=181966,
+        turns=0,
+        cost_usd=0.0,
+        transcript_turns=transcript_turns,
+    )
+
+
+def _plant_transcript(invoke_kwargs: Mapping[str, Any], lines: list[str]) -> None:
+    project_dir = invoke_kwargs['config_dir'].path / 'projects' / 'neutral-cwd'
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript = project_dir / f"{invoke_kwargs['session_id']}.jsonl"
+    transcript.write_text('\n'.join(lines) + '\n')
+
+
+def _scripted_invoker(*outcomes: tuple[list[str] | None, AgentResult]) -> AsyncMock:
+    """Per call: plant the next transcript (if any) for the call's own session id,
+    then return the next result."""
+    remaining = iter(outcomes)
+
     async def invoke(**kwargs: Any) -> AgentResult:
-        if fixture is not None:
-            project_dir = kwargs['config_dir'].path / 'projects' / 'neutral-cwd'
-            project_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy(_TRANSCRIPTS / fixture, project_dir / f"{kwargs['session_id']}.jsonl")
-        return AgentResult(
-            success=False,
-            output='Agent produced no output',
-            subtype=subtype,
-            timed_out=True,
-            duration_ms=181966,
-            turns=0,
-            cost_usd=0.0,
-            transcript_turns=transcript_turns,
-        )
+        lines, result = next(remaining)
+        if lines is not None:
+            _plant_transcript(kwargs, lines)
+        return result
     return AsyncMock(side_effect=invoke)
+
+
+def _killed_run_invoker(
+    transcript_lines: list[str] | None, *, subtype: str, transcript_turns: int | None,
+) -> AsyncMock:
+    return _scripted_invoker((transcript_lines, _killed_run(subtype, transcript_turns)))
 
 
 async def _failure_of(drive: CallSite, curator: TaskCurator, invoke: AsyncMock) -> CuratorFailureError:
@@ -271,7 +309,7 @@ class TestCuratorFailureEvidence:
     async def test_tool_wandering_run_reports_its_tools(self, drive, tmp_path, caplog):
         curator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(
-            'esc_curator_2_tool_wandering.jsonl',
+            _fixture_lines('esc_curator_2_tool_wandering.jsonl'),
             subtype='error_timeout_killed_with_progress',
             transcript_turns=6,
         )
@@ -292,7 +330,7 @@ class TestCuratorFailureEvidence:
     async def test_pre_turn_stall_is_a_zero_output_timeout(self, tmp_path, caplog):
         curator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(
-            'esc_curator_4_pre_turn_stall.jsonl',
+            _fixture_lines('esc_curator_4_pre_turn_stall.jsonl'),
             subtype='error_empty_output',
             transcript_turns=0,
         )
@@ -349,3 +387,189 @@ class TestCuratorFailureEvidence:
         assert err.transcript_turns == 6
         assert err.tools_used is None
         assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+_SALVAGEABLE_DROP = {
+    'action': 'drop',
+    'target_id': '9001',
+    'justification': 'j',
+    'target_fingerprint': None,
+    'rewritten_task': None,
+}
+
+
+async def _decide_single(
+    curator: TaskCurator, invoke: AsyncMock, pool: list[_PoolEntry],
+) -> CuratorDecision:
+    with patch(_INVOKE, new=invoke):
+        return await curator._call_llm(
+            CandidateTask(title='T'),
+            pool=pool,
+            pool_sizes=_EMPTY_POOL_SIZES,
+            start=0.0,
+            project_id='p',
+            project_root='/p',
+        )
+
+
+async def _decide_batch(
+    curator: TaskCurator, invoke: AsyncMock, pools: list[list[_PoolEntry]],
+) -> list[CuratorDecision]:
+    with patch(_INVOKE, new=invoke):
+        return await curator._call_llm_batch(
+            [CandidateTask(title=f'T{i}') for i in range(len(pools))],
+            pools=pools,
+            pool_sizes_list=[_EMPTY_POOL_SIZES for _ in pools],
+            start=0.0,
+            project_id='p',
+            project_root='/p',
+        )
+
+
+async def _curate(curator: TaskCurator, invoke: AsyncMock, title: str) -> CuratorDecision:
+    async def corpus(*_args: Any, **_kwargs: Any):
+        return _pool_with_ids(('9001', 'pending')), _EMPTY_POOL_SIZES, PoolWithheld()
+
+    with patch.object(curator, '_build_corpus', side_effect=corpus), patch(_INVOKE, new=invoke):
+        return await curator.curate(CandidateTask(title=title), project_id='p', project_root='/p')
+
+
+def _breaker_config(threshold: int) -> FusedMemoryConfig:
+    config = _make_config()
+    config.curator.zero_output_breaker_threshold = threshold
+    config.curator.zero_output_breaker_cooldown_seconds = 600.0
+    return config
+
+
+_ZOT = (None, _killed_run('error_empty_output', transcript_turns=0))
+_SALVAGEABLE_KILL = _killed_run('error_timeout_killed_with_progress', transcript_turns=2)
+_HEALTHY = (None, _agent_result(_SINGLE_OK))
+
+_NO_COMPLETED_VERDICT = [
+    pytest.param(
+        _fixture_lines('esc_curator_2_tool_wandering.jsonl'), id='tools-but-no-structured-output',
+    ),
+    pytest.param(_fixture_lines('esc_curator_4_pre_turn_stall.jsonl'), id='no-assistant-turns'),
+    pytest.param(_structured_output_lines('not a dict'), id='non-dict-structured-output'),
+    pytest.param(None, id='no-transcript'),
+]
+
+
+class TestCuratorTranscriptSalvage:
+    """A killed call whose transcript holds a completed StructuredOutput verdict
+    returns that verdict instead of raising.
+
+    This is the transcript route, for a run whose stdout never arrived; the
+    stdout route is ``TestCurateFallbacks::test_call_llm_salvages_schema_payload``.
+    A salvaged verdict is held to exactly the validation a returned one is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_verdict_is_salvaged(self, tmp_path, caplog):
+        curator = _gated_curator(tmp_path)
+        invoke = _scripted_invoker((_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            decision = await _decide_single(curator, invoke, _pool_with_ids(('9001', 'pending')))
+
+        assert decision.action == 'drop'
+        assert decision.target_id == '9001'
+        [salvage] = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING and 'salvag' in record.getMessage().lower()
+        ]
+        assert 'transcript_turns=2' in salvage
+        assert 'drop' in salvage
+
+    @pytest.mark.asyncio
+    async def test_salvaged_verdict_meets_the_normal_validation(self, tmp_path):
+        pool = _pool_with_ids(('42', 'pending'))
+        returned = await _decide_single(
+            _gated_curator(tmp_path / 'returned'),
+            _scripted_invoker((None, _agent_result(_SALVAGEABLE_DROP))),
+            pool,
+        )
+
+        salvaged = await _decide_single(
+            _gated_curator(tmp_path / 'salvaged'),
+            _scripted_invoker((_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL)),
+            pool,
+        )
+
+        assert salvaged.action == 'create'
+        assert (salvaged.action, salvaged.target_id, salvaged.justification) == (
+            returned.action, returned.target_id, returned.justification,
+        )
+
+    @pytest.mark.asyncio
+    async def test_salvaged_verdict_resets_the_breaker(self, tmp_path):
+        """ZOT, salvage, ZOT: had the salvage not reset the count, the second ZOT
+        would reach the threshold of two and short-circuit the fourth call."""
+        curator = _gated_curator(tmp_path, _breaker_config(threshold=2))
+        invoke = _scripted_invoker(
+            _ZOT,
+            (_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL),
+            _ZOT,
+            _HEALTHY,
+        )
+
+        decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
+
+        assert decisions[1].action == 'drop'
+        assert invoke.await_count == 4
+        assert 'zero-output-breaker' not in decisions[3].justification
+
+    @pytest.mark.asyncio
+    async def test_batch_verdict_is_salvaged(self, tmp_path):
+        curator = _gated_curator(tmp_path)
+        verdict = {'decisions': [
+            {'candidate_index': 0, 'action': 'create', 'justification': 'j0'},
+            {**_SALVAGEABLE_DROP, 'candidate_index': 1},
+        ]}
+        invoke = _scripted_invoker((_structured_output_lines(verdict), _SALVAGEABLE_KILL))
+
+        decisions = await _decide_batch(curator, invoke, [[], _pool_with_ids(('9001', 'pending'))])
+
+        assert [d.action for d in decisions] == ['create', 'drop']
+        assert decisions[1].target_id == '9001'
+
+    @pytest.mark.asyncio
+    async def test_batch_salvage_closes_an_open_breaker(self, tmp_path):
+        curator = _gated_curator(tmp_path, _breaker_config(threshold=1))
+        verdict = {'decisions': [
+            {'candidate_index': 0, 'action': 'create', 'justification': 'j0'},
+            {'candidate_index': 1, 'action': 'create', 'justification': 'j1'},
+        ]}
+        invoke = _scripted_invoker(
+            _ZOT,
+            (_structured_output_lines(verdict), _SALVAGEABLE_KILL),
+            _HEALTHY,
+        )
+
+        await _curate(curator, invoke, 'opens-the-breaker')
+        await _decide_batch(curator, invoke, [[], []])
+        after = await _curate(curator, invoke, 'after-salvage')
+
+        assert invoke.await_count == 3
+        assert 'zero-output-breaker' not in after.justification
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('transcript_lines', _NO_COMPLETED_VERDICT)
+    async def test_no_completed_verdict_still_raises(self, transcript_lines, tmp_path):
+        curator = _gated_curator(tmp_path)
+        invoke = _scripted_invoker((transcript_lines, _SALVAGEABLE_KILL))
+
+        with pytest.raises(CuratorFailureError):
+            await _decide_single(curator, invoke, _pool_with_ids(('9001', 'pending')))
+
+    @pytest.mark.asyncio
+    async def test_gate_less_curator_never_salvages(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None, usage_gate=None)
+        invoke = _scripted_invoker((None, _SALVAGEABLE_KILL))
+        salvageable = TranscriptEvidence(
+            assistant_turns=2, schema_payload=_SALVAGEABLE_DROP, other_tool_uses=(),
+        )
+
+        with patch(_EVIDENCE_READ, return_value=salvageable), pytest.raises(CuratorFailureError):
+            await _decide_single(curator, invoke, _pool_with_ids(('9001', 'pending')))
