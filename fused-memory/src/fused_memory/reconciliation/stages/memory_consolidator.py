@@ -34,6 +34,7 @@ from fused_memory.reconciliation.flag_dedup import (
     compute_flag_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
+    filter_already_recorded_caveat_flags,
     filter_already_tracked_systemic_patterns,
     filter_entity_standing_decisions,
     filter_false_absence_flags,
@@ -801,6 +802,22 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['accounted_cluster_growth_flags_dropped'] = (
                 _before_accounted_cluster_growth_filter - len(report.items_flagged)
+            )
+            # ── Already-recorded caveat guard (task 5271): drop ──────────────────
+            # "task N's metadata still lacks the caveat" findings whose cited
+            # caveat-source memory id the task's LIVE metadata already records.
+            # Fail-KEEP; rationale in filter_already_recorded_caveat_flags'
+            # docstring.  After the _pre_filter_flags snapshot and before
+            # dedup_flags, so a drop writes no stage1_flag_marker and is
+            # acknowledged as resolved by the task-2029 diff below.
+            _before_already_recorded_caveat_filter = len(report.items_flagged)
+            report.items_flagged = await filter_already_recorded_caveat_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
+            report.stats['already_recorded_caveat_flags_dropped'] = (
+                _before_already_recorded_caveat_filter - len(report.items_flagged)
             )
             # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
             # Drop flags already adjudicated by an ACTIVE entity_standing_decision
