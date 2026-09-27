@@ -78,6 +78,7 @@ PURE_STDLIB_LEAVES = (
     'reify_checkout',
     'safe_io',
     'task_claimant',
+    'task_metadata_wire',
     'task_statuses',
     'task_transitions',
     'testing_reify_layout',
