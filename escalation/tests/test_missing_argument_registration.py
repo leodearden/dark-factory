@@ -18,6 +18,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE, MissingArgumentMiddleware
+from shared.toolcall_markup import INVOKE_CLOSER, closer_for
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -120,6 +121,29 @@ async def test_a_complete_merge_request_is_still_queued(wired):
 
     assert result.data['status'] == 'queued'
     assert wired.mq.qsize() == 1
+
+
+def _description_that_swallowed(worktree: str) -> str:
+    # '\x3c' spells '<': an envelope literal typed verbatim here would have to
+    # cross the authoring agent's own tool call (shared/src/shared/toolcall_markup.py).
+    return (
+        SIGHTING_CALL['description']
+        + closer_for('description')
+        + '\n\x3cworktree>'
+        + worktree
+        + closer_for('worktree')
+        + INVOKE_CLOSER
+    )
+
+
+async def test_a_worktree_swallowed_by_leaked_markup_is_repaired_not_refused(wired):
+    worktree = str(wired.tmp_path / 'wt')
+    leaked_call = {**SIGHTING_CALL, 'description': _description_that_swallowed(worktree)}
+
+    result = await asyncio.wait_for(wired.call('merge_request', leaked_call), timeout=5.0)
+
+    assert result.data['status'] == 'queued'
+    assert wired.mq.get_nowait().worktree == Path(worktree)
 
 
 async def test_coverage_is_server_wide(wired):
