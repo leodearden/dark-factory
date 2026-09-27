@@ -18,7 +18,7 @@ const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
-  terminalWindowEntrants,
+  terminalWindowEntrants, sameDatum,
   CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
 } = window.DF_TASK_SNAPSHOT;
 
@@ -242,6 +242,14 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   );
 }
 
+// The Datum this component already holds while a fresh stamped copy is the
+// same Datum, so a memo keyed on it reruns when a poll lands, not per render.
+function useHeldDatum(datum) {
+  const held = uR_T(datum);
+  if (!sameDatum(held.current, datum)) held.current = datum;
+  return held.current;
+}
+
 // Per-project "group by PRD" render: buckets the project's filtered tasks
 // into PRD boxes (groupTasksByPrd), orders the boxes via orderPrdGroups (a
 // PRD consuming another PRD's tasks renders below it; "no PRD" trails), and
@@ -265,7 +273,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
 // renderEdges={false} (skip its own overlay) and handed the SAME shared
 // nodeRefs map (via the nodeRefs prop) so its nodes register into the map
 // the hoisted overlay reads from.
-function ProjectPrdGroups({ graphTasks, allProjectTasks, progress, selectedId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
@@ -314,6 +322,10 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, progress, selectedId, o
     return m;
   }, [allSig]);
 
+  const heldRows = useHeldDatum(rows);
+  const heldTerminal = useHeldDatum(terminal);
+  const progress = uM_T(() => prdProgress(heldRows, heldTerminal), [heldRows, heldTerminal]);
+
   return (
     <div className="prd-groups" ref={containerRef}>
       <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={graphTasks}
@@ -344,7 +356,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, progress, selectedId, o
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
 function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
-  const summary = summarizePrdMembers(fullMembers);
+  const summary = uM_T(() => summarizePrdMembers(fullMembers), [fullMembers]);
   const agg = aggregatePrdStatus(summary);
 
   // Lazy-init only: this is a *default*, not an enforced state — later
@@ -899,7 +911,7 @@ function TasksTab({ projectFilter, search }) {
                 {!onlyThePlaceholder && (groupView.emptiedByFocus
                   ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                   : groupByPrd
-                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} progress={prdProgress(rows, terminal)}
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} rows={rows} terminal={terminal}
                                         selectedId={selectedId}
                                         onSelect={setSelectedId} onEnterFocus={enterFocus} />
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}

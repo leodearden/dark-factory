@@ -148,14 +148,56 @@ def test_the_flat_view_the_grouped_view_and_the_prd_count_read_one_terminal_datu
     rows, terminal = {call[0] for call in calls}, {call[1] for call in calls}
     assert len(rows) == 1 and len(terminal) == 1, f'the two viewRows calls read different Datums: {calls}'
     [rows], [terminal] = rows, terminal
-    assert re.search(rf'\bprdProgress\(\s*{rows}\s*,\s*{terminal}\s*\)', tasks_tab_code), (
-        f'the PRD count is not prdProgress({rows}, {terminal}), the Datums the rows are listed from'
-    )
+    grouped = re.search(r'<ProjectPrdGroups\b(.*?)/>', tasks_tab_code, re.DOTALL)
+    assert grouped, 'TasksTab renders no <ProjectPrdGroups ... />'
+    for prop, datum in (('rows', rows), ('terminal', terminal)):
+        assert re.search(rf'\b{prop}=\{{\s*{datum}\s*\}}', grouped.group(1)), (
+            f'<ProjectPrdGroups> is not handed {prop}={{{datum}}}, the Datum the rows are listed from'
+        )
     source = re.search(rf'\bconst\s+{terminal}\s*=\s*(\w+)\(\s*p\.id\s*\)', tasks_tab_code)
     assert source, f'`{terminal}` is not read per project through one helper'
     assert 'onDemandDatum(' in _binding(tasks_tab_code, source.group(1)), (
         f'`{source.group(1)}` does not route a wanted project to onDemandDatum'
     )
+
+
+class TestThePrdCountIsMemoised:
+    """The count is rebuilt when a poll lands, not on the app's 1 s clock tick.
+
+    projectRows and the terminal readers stamp a fresh copy on every call, so a
+    memo cannot key on their identity; useHeldDatum keeps the copy it already
+    holds while task_snapshot.js::sameDatum says the new one is the same Datum.
+    Which copies are the same executes in task_snapshot.test.mjs.
+    """
+
+    @pytest.fixture(scope='class')
+    def project_prd_groups_code(self, tab_tasks_code):
+        return extract_function_body(tab_tasks_code, 'ProjectPrdGroups')
+
+    def test_tasks_tab_does_not_rebuild_the_count_per_render(self, tasks_tab_code):
+        assert 'prdProgress(' not in tasks_tab_code, (
+            'TasksTab calls prdProgress inline, so every render regroups the whole project'
+        )
+
+    def test_the_count_is_a_memo_over_the_held_rows_and_terminal_datums(self, project_prd_groups_code):
+        held = {}
+        for prop in ('rows', 'terminal'):
+            match = re.search(rf'\bconst\s+(\w+)\s*=\s*useHeldDatum\(\s*{prop}\s*\)', project_prd_groups_code)
+            assert match, f'ProjectPrdGroups does not hold its `{prop}` prop through useHeldDatum'
+            held[prop] = match.group(1)
+        rows, terminal = held['rows'], held['terminal']
+        assert re.search(
+            rf'\buM_T\(\s*\(\)\s*=>\s*prdProgress\(\s*{rows}\s*,\s*{terminal}\s*\)\s*,\s*\[\s*{rows}\s*,\s*{terminal}\s*\]\s*\)',
+            project_prd_groups_code,
+        ), f'the PRD count is not uM_T(() => prdProgress({rows}, {terminal}), [{rows}, {terminal}])'
+
+    def test_a_held_datum_is_replaced_only_when_it_is_not_the_same_datum(self, tab_tasks_code):
+        hook = extract_function_body(tab_tasks_code, 'useHeldDatum')
+        ref = re.search(r'\bconst\s+(\w+)\s*=\s*uR_T\(', hook)
+        assert ref, 'useHeldDatum keeps no ref'
+        assert re.search(rf'\bif\s*\(\s*!\s*sameDatum\(\s*{ref.group(1)}\.current\s*,', hook), (
+            'useHeldDatum does not compare the held Datum with task_snapshot.js::sameDatum'
+        )
 
 
 class TestThePrdBoxCount:

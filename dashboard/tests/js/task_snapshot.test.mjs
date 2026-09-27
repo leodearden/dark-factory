@@ -41,6 +41,7 @@ const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
+const { sameDatum } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
@@ -60,6 +61,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'snapshotRowsOver',
   'terminalWindowProjects',
   'terminalWindowEntrants',
+  'sameDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -568,6 +570,46 @@ test('projectRows: an absent project or rows half is a reasoned hole', () => {
   const noRows = projectRows(sketchData({ TASKS_SNAPSHOT: { 'dark-factory': { census: FRESH_ROWS } } }), 'dark-factory');
   assert.equal(noRows.state, 'unknown');
   assert.ok(noRows.reason);
+});
+
+// ── sameDatum: a fresh stamped copy against the Datum a caller holds ───────
+// projectRows stamps a new object on every call, so a render-to-render memo
+// cannot key on its identity. sameDatum says whether the copy would render
+// exactly as the held one: every field identical, the value by reference.
+
+test('sameDatum: two reads of one payload are distinct objects that are the same Datum', () => {
+  const data = sketchData();
+  const first = projectRows(data, 'dark-factory');
+  const second = projectRows(data, 'dark-factory');
+  assert.notEqual(first, second);
+  assert.equal(sameDatum(first, second), true);
+});
+
+test('sameDatum: a new payload is a different Datum, even with equal rows', () => {
+  const before = projectRows(sketchData(), 'dark-factory');
+  const reshipped = sketchData({
+    TASKS_SNAPSHOT: { 'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), structuredClone(FRESH_ROWS)) },
+  });
+  assert.equal(sameDatum(before, projectRows(reshipped, 'dark-factory')), false);
+});
+
+test('sameDatum: a new receipt over the same rows is a different Datum, so its age is re-read', () => {
+  const before = projectRows(sketchData(), 'dark-factory');
+  const later = sketchData({ __receipt: { [TASKS_ENDPOINT]: { servedAt: SERVED_AT, receivedAt: RECEIVED_AT + 3_000 } } });
+  assert.equal(sameDatum(before, projectRows(later, 'dark-factory')), false);
+});
+
+test('sameDatum: holes are the same while their reason is', () => {
+  const hole = () => projectRows(sketchData(), 'hive');
+  assert.equal(sameDatum(hole(), hole()), true);
+  assert.equal(sameDatum(hole(), unrequestedTerminalRows(undefined)), false);
+  assert.equal(sameDatum(unrequestedTerminalRows(undefined), unrequestedTerminalRows(undefined)), true);
+});
+
+test('sameDatum: a stamped copy is not the same Datum as its unstamped wire original', () => {
+  const data = sketchData();
+  assert.equal(sameDatum(data.TASKS_SNAPSHOT['dark-factory'].rows, projectRows(data, 'dark-factory')), false);
+  assert.equal(sameDatum(projectRows(data, 'dark-factory'), data.TASKS_SNAPSHOT['dark-factory'].rows), false);
 });
 
 // One row per non-terminal member — including the three the old filter bar

@@ -89,6 +89,16 @@ function snapshotRowsOver(data) {
   );
 }
 
+// Whether a fresh read renders exactly as the Datum a caller already holds:
+// the same fields, the value compared by reference. projectRows and the
+// terminal readers stamp a new object per call, so identity cannot say it; a
+// new payload or a new receipt makes it false, and so re-reads the age.
+function sameDatum(held, fresh) {
+  const keys = Object.keys(held);
+  return keys.length === Object.keys(fresh).length
+    && keys.every(key => Object.prototype.hasOwnProperty.call(fresh, key) && Object.is(held[key], fresh[key]));
+}
+
 // ── A census over several projects ──
 // `projects` null means every project the snapshot carries: task ROOTS, not
 // ORCHESTRATORS entries, so a tile's headline and its burndown history count
@@ -307,6 +317,7 @@ const TASK_SNAPSHOT_API = {
   unrequestedTerminalRows,
   terminalWindowProjects,
   terminalWindowEntrants,
+  sameDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
