@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
 ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER')
+TIMEOUT_SECS = '3'
+"""Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
 
 APPLY_VERBS = (
     'mcp__escalation__resolve_issue',
@@ -214,7 +216,7 @@ def test_the_child_runs_in_this_checkout(tmp_path):
     [
         ({'exit_code': 0}, ()),
         ({'exit_code': 3, 'stderr': 'boom'}, ()),
-        ({'sleep': 30.0}, ('--timeout-secs', '0.5')),
+        ({'sleep': 30.0}, ('--timeout-secs', TIMEOUT_SECS)),
     ],
     ids=['success', 'failure', 'timeout'],
 )
@@ -340,7 +342,7 @@ def test_a_non_zero_exit_fails_with_both_stream_tails_labelled(tmp_path, capsys)
 def test_a_timeout_fails_with_both_stream_tails_labelled(tmp_path, capsys):
     fake = _fake_claude(tmp_path, stdout='mid-run-out-4K', stderr='mid-run-err-2J', sleep=30.0)
 
-    assert _main(fake, '--timeout-secs', '0.5') == mod.EXIT_FAILED
+    assert _main(fake, '--timeout-secs', TIMEOUT_SECS) == mod.EXIT_FAILED
 
     err = capsys.readouterr().err
     line = next(line for line in err.splitlines() if 'timed out' in line)
