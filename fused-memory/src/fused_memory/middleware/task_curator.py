@@ -42,9 +42,11 @@ from typing import TYPE_CHECKING, Any, Literal
 from shared.cli_invoke import (
     AgentResult,
     AllAccountsCappedException,
+    TranscriptEvidence,
     invoke_with_cap_retry,
     is_zero_output_timeout,
     no_mcp_servers_config,
+    transcript_evidence_for_session,
 )
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
@@ -96,6 +98,10 @@ class CuratorFailureError(RuntimeError):
     ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
     break, not a flaky candidate).  When set, :class:`CuratorEscalator` raises a
     distinct, un-suppressed escalation so the deny-list gets fixed promptly.
+
+    On a killed run ``turns`` and ``cost_usd`` are empty-stdout defaults, so
+    ``transcript_turns`` is the observation, and ``tools_used`` lists the
+    non-schema tools the call's transcript recorded (None when it was not read).
     """
 
     def __init__(
@@ -110,6 +116,8 @@ class CuratorFailureError(RuntimeError):
         proc_tree: str = '',
         account_name: str = '',
         cost_usd: float | None = None,
+        transcript_turns: int | None = None,
+        tools_used: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
@@ -120,6 +128,8 @@ class CuratorFailureError(RuntimeError):
         self.proc_tree = proc_tree
         self.account_name = account_name
         self.cost_usd = cost_usd
+        self.transcript_turns = transcript_turns
+        self.tools_used = tools_used
 
 
 # 'drop', 'combine' and 'create' are the only actions the LLM may request — see
@@ -2869,6 +2879,36 @@ class TaskCurator:
             'startup_grace_secs': timeout_seconds,
         }
 
+    def _read_failure_evidence(
+        self, transcript_scope: Mapping[str, Any],
+    ) -> TranscriptEvidence | None:
+        """What a failed call's own transcript recorded, or None when unknown.
+
+        Reads once per failed call and never raises: a transcript fault must not
+        replace the LLM failure on the synchronous add_task path.
+        """
+        config_dir = transcript_scope.get('config_dir')
+        if config_dir is None:
+            return None
+        session_id = transcript_scope['session_id']
+        try:
+            evidence = transcript_evidence_for_session(config_dir.path, session_id)
+        except Exception:
+            logger.warning(
+                'TaskCurator: could not read the transcript of failed session %s; '
+                'reporting the failure without it', session_id, exc_info=True,
+            )
+            return None
+        if evidence is not None and evidence.other_tool_uses:
+            logger.warning(
+                'TaskCurator: pure-classifier contract violated: failed session %s '
+                'used tools %s over %d assistant turn(s), but its registry should '
+                "hold only StructuredOutput. Check the schema + '*' -> --tools '' "
+                'substitution in shared.cli_invoke.build_claude_argv.',
+                session_id, list(evidence.other_tool_uses), evidence.assistant_turns,
+            )
+        return evidence
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
@@ -2938,9 +2978,11 @@ class TaskCurator:
 
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
+            evidence = self._read_failure_evidence(transcript_scope)
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2953,6 +2995,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         return _parse_decision(
@@ -3040,10 +3084,12 @@ class TaskCurator:
 
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
+            evidence = self._read_failure_evidence(transcript_scope)
             raise CuratorFailureError(
                 f'curator batch LLM call failed: batch_size={n} '
                 f'output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -3056,6 +3102,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         # Success: a real LLM round-trip completed, so the service is not
