@@ -173,3 +173,21 @@ def resolve_target(
     if fix_surface:
         return FilingTarget(harness, fix_surface)
     return FilingTarget(observed)
+
+
+MIN_UNREMEDIATED_SIGHTINGS = 2
+
+
+@dataclass(frozen=True)
+class WithheldCluster:
+    title: str | None
+    sighting_count: int
+
+
+def is_fileable(cluster: dict, *, sighting_count: int) -> bool:
+    """A verified cluster files when the verifier proposed an in-tree
+    remediation, or when it has recurred; a bare singleton is only recorded."""
+    return (
+        proposed_remediation(cluster) is not None
+        or sighting_count >= MIN_UNREMEDIATED_SIGHTINGS
+    )
