@@ -15,6 +15,12 @@ docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
 to ``action="create"`` so task creation is never blocked.
 
+A timed-out LLM call is classified from its own transcript when the curator is gated
+(task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
+escalation that folds into one record per project; a run killed with progress returns
+its completed StructuredOutput verdict if the transcript holds one, else escalates with
+its real turn count and tool sequence; any non-schema tool use logs a loud WARNING.
+
 Batch API (task 924)
 --------------------
 :meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:

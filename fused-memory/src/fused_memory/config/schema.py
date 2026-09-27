@@ -2167,6 +2167,9 @@ class CuratorConfig(BaseModel):
     # 180s bounds a silent Anthropic-API hang for the curator's best-effort
     # contract while still giving ~20% headroom over the slowest legitimate
     # single-item decision observed in production (~150s); see esc-task-curator-20.
+    # Time to the FIRST assistant record alone has a long tail (p99 117.3s, max
+    # 203.3s over 5,484 curator transcripts, task 3995), so a gated curator sets
+    # startup_grace_secs equal to this timeout rather than the 120s default.
     timeout_seconds: float = Field(default=180.0)
     # Durable flat $2.00 per-call ceiling (task 1980 / esc-task-curator-194).
     # A prior scale-by-batch-size attempt (reify task 2254) was cancelled and
@@ -2323,8 +2326,10 @@ class CuratorConfig(BaseModel):
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
-    # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1743). Each hang burns the full
+    # ZOTs are an accepted, recurring transient pre-turn hang on the curator's
+    # sonnet+json-schema call shape (ACCEPT-AND-RETUNE ruling on
+    # esc-task-curator-17); for a gated curator the classification is
+    # transcript-authoritative (0 assistant turns). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
