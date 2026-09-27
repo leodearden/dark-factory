@@ -3477,6 +3477,254 @@ class TestPromoteToL2Cascade:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2SentinelIdentity — task 4541 RC#3
+# ---------------------------------------------------------------------------
+
+_STREAK_SENTINEL_5469 = '__recovery_veto_streak__5469'
+_STREAK_SENTINEL_7000 = '__recovery_veto_streak__7000'
+
+
+def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
+    """Seed a pending recovery-veto-streak alarm L1, filed the way the orchestrator files it."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=sentinel,
+        agent_role='orchestrator-recovery-veto-streak',
+        severity='blocking',
+        category='risk_identified',
+        summary='recovery veto streak alarm',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+class TestPromoteToL2SentinelIdentity:
+    """A cluster of sentinel-bound records is minted under a member's own sentinel id.
+
+    esc-5469-11: the auto-watcher wrapped a streak alarm filed under
+    ``__recovery_veto_streak__5469`` in an L2 minted under the REAL id
+    ``'5469'``.  Every veto predicate reads that id, so the alarm about the hold
+    became part of the hold.  The server refuses such a create
+    (``code: 'sentinel_task_id_required'``), judged over RESOLVED members' agent
+    roles only, and never constrains the fold path, where nothing is minted
+    under the caller's task_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sentinel_only_cluster_under_real_id_mints_nothing(self, tmp_path: Path):
+        """(a) ACCEPTANCE — the esc-5469-11 shape is refused and leaves no trace."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        member_before = queue.get('esc-streak-5469-1')
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert 'error' in result
+        assert _STREAK_SENTINEL_5469 in result['error']
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469]
+        assert queue.get_by_task('5469', status='pending') == []
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+        assert queue.get('esc-streak-5469-1') == member_before
+
+    @pytest.mark.asyncio
+    async def test_sentinel_only_cluster_under_its_sentinel_id_is_created(self, tmp_path: Path):
+        """(b) The SKILL.md template's exact call mints the L2 under the sentinel."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _STREAK_SENTINEL_5469,
+                'member_ids': ['esc-streak-5469-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == _STREAK_SENTINEL_5469
+        assert minted.level == 2
+
+    @pytest.mark.asyncio
+    async def test_cross_task_cluster_under_real_id_names_every_sentinel(self, tmp_path: Path):
+        """(c) Members from two sentinels: the refusal names both, sorted."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-7000-1', 'esc-streak-5469-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469, _STREAK_SENTINEL_7000]
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('chosen', [_STREAK_SENTINEL_5469, _STREAK_SENTINEL_7000])
+    async def test_cross_task_cluster_accepts_either_sentinel(
+        self, tmp_path: Path, chosen: str,
+    ):
+        """(c cont.) Any member's own sentinel id is an acceptable mint target."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': chosen,
+                'member_ids': ['esc-streak-5469-1', 'esc-streak-7000-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == chosen
+
+    @pytest.mark.asyncio
+    async def test_mixed_cluster_under_real_id_is_created(self, tmp_path: Path):
+        """(d) An ordinary member justifies a real-task filing, so the guard stands aside."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_l1(queue, 'esc-5469-3', '5469')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-5469-3'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == '5469'
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_members_are_unconstrained(self, tmp_path: Path):
+        """(e) FAIL-OPEN — an unreadable id proves nothing and never blocks a promote."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-ghost-1']},
+        )
+
+        assert result.get('status') == 'created', result
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_sibling_does_not_unbind_a_sentinel_member(
+        self, tmp_path: Path,
+    ):
+        """(e cont.) The judgement ranges over RESOLVED members only."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-ghost-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469]
+
+    @pytest.mark.asyncio
+    async def test_fold_into_existing_l2_ignores_the_callers_task_id(self, tmp_path: Path):
+        """(f) FOLD UNTOUCHED — nothing is minted under the caller's task_id on a fold."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_streak_alarm(queue, 'esc-streak-5469-2', _STREAK_SENTINEL_5469)
+        root_cause = 'recovery-veto-streak-noise-from-pending-l2-pin:esc-5469-9'
+        first = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _STREAK_SENTINEL_5469,
+                'member_ids': ['esc-streak-5469-1'],
+                'root_cause': root_cause,
+            },
+        )
+        assert first.get('status') == 'created', first
+
+        second = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-2'],
+                'root_cause': root_cause,
+            },
+        )
+
+        assert second.get('status') == 'updated', second
+        assert second['id'] == first['id']
+        assert queue.get_by_task('5469', status='pending') == []
+
+    @pytest.mark.asyncio
+    async def test_identity_gate_still_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(g) GATE ORDER — a disallowed identity is denied before this guard runs."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        monkeypatch.setattr(
+            escalation_server,
+            'get_http_headers',
+            lambda: {'x-escalation-identity': 'not-a-promote-identity'},
+        )
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
+        )
+
+        assert result.get('code') == 'level_forbidden', result
+
+    @pytest.mark.asyncio
+    async def test_empty_member_ids_error_still_wins(self, tmp_path: Path):
+        """(g cont.) Cheap validation is still reported before this guard."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': []},
+        )
+
+        assert 'error' in result, result
+        assert result.get('code') != 'sentinel_task_id_required', result
+
+
+# ---------------------------------------------------------------------------
 # TestMergeRequestDedup — step-11: merge_request de-dup wiring (server-level)
 # ---------------------------------------------------------------------------
 

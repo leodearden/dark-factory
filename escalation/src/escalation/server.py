@@ -35,7 +35,12 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from escalation import git_authority
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
-from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
+from escalation.authority import (
+    PROMOTE_ALLOWED,
+    PROMOTE_SENTINEL_BOUND_ROLES,
+    ROLE_LEVEL_ALLOWLIST,
+    l2_auto_close_class,
+)
 from escalation.canonical import canonical_root_cause
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
@@ -95,7 +100,21 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
-def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | None:
+def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
+    """Read each DISTINCT member id once — ``None`` for an id that does not resolve.
+
+    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`
+    and :func:`_sentinel_bound_task_ids` both consume it.  Through
+    ``queue.get()`` rather than the queue root directly, so a member already
+    resolved and archived between the watcher's drain and its promote still
+    contributes (``get`` falls back to the archive), and repeated lookups of a
+    genuinely nonexistent id are negative-cached rather than re-scanning the
+    archive each time.
+    """
+    return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
+
+
+def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     """Return max(member severities) for a promoted L2, or None if none is usable.
 
     This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
@@ -104,11 +123,8 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     non-deterministically, since the outcome hinged on whether the LLM caller
     happened to type the argument at all.
 
-    Members are read through ``queue.get()`` rather than the queue root
-    directly, so a member already resolved and archived between the watcher's
-    drain and its promote still contributes its true severity (``get`` falls
-    back to the archive), and repeated lookups of a genuinely nonexistent id
-    are negative-cached rather than re-scanning the archive each time.
+    *members* is :func:`_read_members`' answer, so an archived member still
+    contributes its true severity.
 
     **The fold ranges over ``KNOWN_SEVERITIES`` ONLY.**  A member is USABLE
     only if it resolves AND its ``severity`` is in the vocabulary.  Nothing
@@ -149,8 +165,7 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     """
     resolved: list[str] = []
     unusable: list[str] = []
-    for mid in member_ids:
-        member = queue.get(mid)
+    for mid, member in members.items():
         if member is None:
             unusable.append(mid)
         elif member.severity not in KNOWN_SEVERITIES:
@@ -168,7 +183,7 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
         logger.warning(
             'promote_to_l2: no member escalation yielded a usable severity for %s '
             '— cannot derive an L2 severity from members. Unusable ids: %s',
-            member_ids, ', '.join(unusable) or '(none)',
+            list(members), ', '.join(unusable) or '(none)',
         )
         return None
 
@@ -176,13 +191,34 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
         logger.warning(
             'promote_to_l2: %d of %d member escalation(s) yielded no usable '
             'severity; deriving from the usable subset only. Unusable ids: %s',
-            len(unusable), len(member_ids), ', '.join(unusable),
+            len(unusable), len(members), ', '.join(unusable),
         )
 
     derived = resolved[0]
     for sev in resolved[1:]:
         derived = max_severity(derived, sev)
     return derived
+
+
+def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
+    """Return the task ids a promote of *members* must be minted under, or empty if unconstrained.
+
+    Non-empty only when at least one member resolves AND every RESOLVED
+    member was filed under a role in ``authority.PROMOTE_SENTINEL_BOUND_ROLES``;
+    the result is then those members' own (sentinel) task ids.  A mixed
+    cluster is unconstrained: an ordinary member already pins its real task,
+    so a real-id filing deepens nothing.  Unresolvable ids are ignored, the
+    fail-open direction — an unreadable id proves nothing and must never
+    block a human-escalation path.  *members* is :func:`_read_members`' answer.
+    """
+    bound_task_ids: set[str] = set()
+    for member in members.values():
+        if member is None:
+            continue
+        if member.agent_role not in PROMOTE_SENTINEL_BOUND_ROLES:
+            return frozenset()
+        bound_task_ids.add(member.task_id)
+    return frozenset(bound_task_ids)
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -2874,6 +2910,19 @@ def create_server(
         (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
         header-less connection (no identity asserted) is always allowed.
 
+        **Sentinel-bound members** (task 4541): when at least one member
+        resolves and EVERY resolved member was filed under a role in
+        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
+        recovery-veto-streak alarm), a new L2 must be minted under one of
+        those members' own task ids.  Any other *task_id* is refused with
+        ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
+        re-issue with one of them — and nothing is minted, for header-less
+        callers too.  Why: see
+        ``orchestrator/src/orchestrator/recovery_emission.py::RECOVERY_VETO_STREAK_SENTINEL_PREFIX``.
+        Unresolvable member ids are ignored (fail-open), a cluster with any
+        ordinary member is unconstrained, and a fold into an existing L2 is
+        never refused, since nothing is minted under the caller's *task_id*.
+
         Parameters
         ----------
         task_id:
@@ -2981,6 +3030,11 @@ def create_server(
         Error::
 
             {'error': '<reason>'}
+
+        Sentinel-bound refusal (see **Sentinel-bound members**)::
+
+            {'error': '<reason>', 'code': 'sentinel_task_id_required',
+             'required_task_ids': [<sorted sentinel task ids>]}
         """
         # Identity gate (PRD task-status-authority C8/D7 row C4) — checked
         # FIRST, before any validation or queue mutation, so a disallowed
@@ -3036,9 +3090,10 @@ def create_server(
         # more clarity than it buys.
         async with _promote_lock:
             # Validate FIRST, derive second — an invalid explicit severity must mint
-            # nothing and must never be reachable past the derive branch.  Derived
-            # from the RAW member_ids: the fold is order-independent by
-            # construction, and deduplicating the id list is a storage concern.
+            # nothing and must never be reachable past the derive branch.  Members
+            # are read ONCE, per distinct id, and that one read feeds both the
+            # severity fold and the sentinel-identity check; a duplicate id could
+            # never change a max() fold anyway.
             #
             # `derived is None` means the members said nothing usable (no id
             # resolved, or every resolved member carried an out-of-vocabulary
@@ -3048,17 +3103,22 @@ def create_server(
             # ONE hop for BOTH reads: they are adjacent with only pure-memory
             # severity resolution between them, so a single to_thread introduces
             # ONE yield point where two would introduce two — the same loop relief
-            # for fewer interleavings to reason about.  _derive_l2_severity's
+            # for fewer interleavings to reason about.  _read_members'
             # per-member queue.get() can itself trigger a targeted archive rglob
             # via _locate_path, so it is a scan worth hopping rather than a cheap
             # read to leave behind.
             def _read_for_promote():
-                derived = (
-                    None if severity is not None else _derive_l2_severity(queue, member_ids)
+                members = _read_members(queue, member_ids)
+                derived = None if severity is not None else _derive_l2_severity(members)
+                return (
+                    derived,
+                    queue.find_pending_l2_by_root_cause(root_cause),
+                    _sentinel_bound_task_ids(members),
                 )
-                return derived, queue.find_pending_l2_by_root_cause(root_cause)
 
-            derived, existing_id = await asyncio.to_thread(_read_for_promote)
+            derived, existing_id, required_task_ids = await asyncio.to_thread(
+                _read_for_promote,
+            )
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3146,6 +3206,30 @@ def create_server(
                     'creating a new L2 for root_cause=%r',
                     existing_id, root_cause,
                 )
+
+            # Sentinel identity (task 4541): judged here, on the CREATE path only
+            # — covering both the plain create and the fold-race fall-through —
+            # because the invariant concerns what is MINTED; a fold keeps the
+            # existing L2's own task_id and discards the caller's.
+            if required_task_ids and task_id not in required_task_ids:
+                required = sorted(required_task_ids)
+                logger.info(
+                    'promote_to_l2: refused task_id=%r for sentinel-bound members %s; '
+                    'required one of %s',
+                    task_id, member_ids, required,
+                )
+                return {
+                    'error': (
+                        f'every resolvable member of {member_ids} is a sentinel-class '
+                        f'record, so the L2 must be minted under one of their own task '
+                        f'ids {required}, not {task_id!r}: an L2 minted under the real '
+                        'task id is read by every veto predicate on that task, so the '
+                        'alarm about a hold would become part of the hold. Re-issue '
+                        'with task_id set to one of required_task_ids.'
+                    ),
+                    'code': 'sentinel_task_id_required',
+                    'required_task_ids': required,
+                }
 
             # Create path: build a fresh L2 and submit it.
             # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input

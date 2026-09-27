@@ -61,7 +61,18 @@ from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ['PinClass', 'PinRecord', 'PinReport', 'classify_pins']
+__all__ = [
+    'HUMAN_PARKED_MIN_LEVEL',
+    'PinClass',
+    'PinRecord',
+    'PinReport',
+    'classify_pins',
+    'pinned_only_by_human_parked',
+]
+
+#: The escalation level at which a record is in front of a HUMAN (L2) — see
+#: :func:`pinned_only_by_human_parked`.
+HUMAN_PARKED_MIN_LEVEL: int = 2
 
 
 class PinClass(enum.StrEnum):
@@ -417,4 +428,48 @@ def classify_pins(
         tuple(buckets[PinClass.QUEUE_HANDOFF]),
         tuple(buckets[PinClass.NON_PINNING]),
         task_id=task_id,
+    )
+
+
+def pinned_only_by_human_parked(
+    report: PinReport,
+    records: Sequence[PinRecord] | None,
+) -> bool:
+    """Is everything that PINS this task already in front of a human?
+
+    **This docstring is the canonical statement of the predicate; other sites
+    point here.**  True iff the read succeeded, something pins the task, and
+    every record in the ``queue_handoff`` bucket — the bucket
+    :attr:`PinReport.pins` reads — sits at ``level >= HUMAN_PARKED_MIN_LEVEL``.
+    *report* is what :func:`classify_pins` returned for these same *records*,
+    taken rather than recomputed so a caller that already classified them does
+    not classify twice; the info, unknown-severity, dead-L0 and
+    store-unavailable rules are therefore the chain's own.  Records that do not
+    pin (see :attr:`PinReport.pins`) cannot spoil the answer, and a store that
+    could not be read never counts as parked.
+
+    Every uncertain input answers False — no records, an unreadable store, an
+    L1 nobody has promoted, a level that is missing or not an int (never
+    coerced: ``'3'``, ``2.9`` and ``True`` are not levels), a handoff id the
+    records do not carry — because a false True silences an alarm for a
+    genuinely stranded task, while a false False costs one quick triage.
+
+    The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
+    records the promotion to a human, whereas a critical/urgent record still at
+    level 0 is the contradictory state link 3b fails safe to pinning, not proof
+    that anyone human holds the task.
+
+    Pure: no I/O, and neither argument is mutated.
+    """
+    if report.store_unavailable or records is None or not report.queue_handoff:
+        return False
+    levels = {record.id: record.level for record in records}
+    return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+
+
+def _is_human_level(level: object) -> bool:
+    return (
+        isinstance(level, int)
+        and not isinstance(level, bool)
+        and level >= HUMAN_PARKED_MIN_LEVEL
     )

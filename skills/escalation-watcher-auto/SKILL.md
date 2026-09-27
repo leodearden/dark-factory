@@ -838,6 +838,8 @@ mcp__escalation__promote_to_l2(
 )
 ```
 
+The server ENFORCES the verbatim-sentinel `task_id`: a real task id is refused with `code: 'sentinel_task_id_required'` and nothing is minted, so re-issue the same call with `task_id` set to one of the response's `required_task_ids`.
+
 **The escalations read off that line must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
 
 The options must NAME those escalations, because acting on one of them is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did. Naming them is not the same as vouching for them — per the caveat above, some may not pin at all, so let the option say so rather than assert a release the line cannot support.
