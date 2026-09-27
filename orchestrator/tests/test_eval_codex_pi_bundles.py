@@ -1,13 +1,14 @@
 """Tests for ξ's codex + pi candidate bundles (task 2480).
 
-Two additive Phase-4 candidate bundles, resolved by name by μ's OFAT/matrix
+Additive Phase-4 candidate bundles, resolved by name by μ's OFAT/matrix
 driver via ``get_config_by_name`` (mirrors ν's ``claude_endpoint_candidates()``
 pattern, PRD §ξ):
 
-  - codex + GPT-5.6 "Sol" (Rust implementer): evaluate-only, no architect
-    variant, no production wiring (RUST CAUTION, PRD decision 14 — Claude
-    leads the only Rust-bearing public benchmarks; open-model Rust evidence
-    is thin).
+  - a three-arm codex slate, a price/capability ladder with effort held at
+    'xhigh' so only the model varies: GPT-6 "Astra", GPT-5.6 "Sol" (the
+    Rust implementer: evaluate-only, no architect variant, no production
+    wiring — RUST CAUTION, PRD decision 14) and GPT-5.6 "Terra" (mid-price
+    control).
   - pi + Sonnet harness-isolating control: same model+effort as the
     claude-sonnet-max incumbent, backend swapped to 'pi' only — isolates
     harness effect from model effect.
@@ -25,9 +26,18 @@ test that needs it, not collection of the file.
 
 from __future__ import annotations
 
+# The 2026-09 codex slate as LITERALS (task 5384), deliberately not read from
+# the ``CODEX_*_MODEL`` constants: a pin that reads what it protects guards
+# nothing (INV-10).
+_CODEX_SLATE_MODELS_BY_NAME = {
+    'codex-gpt6-astra': 'gpt-6-astra',
+    'codex-gpt5.6-sol': 'gpt-5.6-sol',
+    'codex-gpt5.6-terra': 'gpt-5.6-terra',
+}
+
 
 class TestCodexPiCandidatesRoster:
-    """Shape of ``codex_pi_candidates()``: the two ξ bundles."""
+    """Shape of ``codex_pi_candidates()``: the codex slate + the pi control."""
 
     def test_returns_non_empty_list_with_unique_names(self):
         from orchestrator.evals.configs import codex_pi_candidates
@@ -38,16 +48,26 @@ class TestCodexPiCandidatesRoster:
         assert len(names) == len(set(names))
 
     def test_codex_bundle_contract(self):
-        """Exactly one codex bundle: the GPT-5.6 "Sol" Rust implementer,
-        effort 'xhigh' (matching the existing codex-gpt54-xhigh precedent)."""
-        from orchestrator.evals.configs import CODEX_RUST_MODEL, codex_pi_candidates
+        """Three codex implementer arms, all at effort 'xhigh' so the model
+        is the only axis that varies across them."""
+        from orchestrator.evals.configs import (
+            CODEX_ASTRA_MODEL,
+            CODEX_SOL_MODEL,
+            CODEX_TERRA_MODEL,
+            codex_pi_candidates,
+        )
 
         codex_bundles = [c for c in codex_pi_candidates() if c.backend == 'codex']
-        assert len(codex_bundles) == 1
-        bundle = codex_bundles[0]
-        assert bundle.model == CODEX_RUST_MODEL
-        assert bundle.role == 'implementer'
-        assert bundle.effort == 'xhigh'
+        assert len(codex_bundles) == 3
+        expected_model = {
+            'codex-gpt6-astra': CODEX_ASTRA_MODEL,
+            'codex-gpt5.6-sol': CODEX_SOL_MODEL,
+            'codex-gpt5.6-terra': CODEX_TERRA_MODEL,
+        }
+        for bundle in codex_bundles:
+            assert bundle.model == expected_model[bundle.name]
+            assert bundle.role == 'implementer'
+            assert bundle.effort == 'xhigh'
 
     def test_bundles_are_additive_not_in_eval_configs(self):
         """The ξ bundles are opt-in Phase-4 candidates, resolved by name via
@@ -102,12 +122,22 @@ class TestGetConfigByNameAndPropagation:
     subprocess — that is μ's runtime driver behaviour, out of scope here."""
 
     def test_get_config_by_name_resolves_codex_bundle(self):
-        from orchestrator.evals.configs import CODEX_RUST_MODEL, get_config_by_name
+        from orchestrator.evals.configs import (
+            CODEX_ASTRA_MODEL,
+            CODEX_SOL_MODEL,
+            CODEX_TERRA_MODEL,
+            get_config_by_name,
+        )
 
-        cfg = get_config_by_name('codex-gpt5.6-sol')
-        assert cfg is not None
-        assert cfg.backend == 'codex'
-        assert cfg.model == CODEX_RUST_MODEL
+        for name, model in (
+            ('codex-gpt6-astra', CODEX_ASTRA_MODEL),
+            ('codex-gpt5.6-sol', CODEX_SOL_MODEL),
+            ('codex-gpt5.6-terra', CODEX_TERRA_MODEL),
+        ):
+            cfg = get_config_by_name(name)
+            assert cfg is not None
+            assert cfg.backend == 'codex'
+            assert cfg.model == model
 
     def test_get_config_by_name_resolves_pi_bundle(self):
         from orchestrator.evals.configs import PI_CONTROL_MODEL, get_config_by_name
@@ -117,7 +147,7 @@ class TestGetConfigByNameAndPropagation:
         assert cfg.backend == 'pi'
         assert cfg.model == PI_CONTROL_MODEL
 
-    def test_build_eval_orch_config_propagates_backend_and_model_for_both_bundles(
+    def test_build_eval_orch_config_propagates_backend_and_model_for_every_bundle(
         self, tmp_path,
     ):
         # Mirrors test_eval_candidate_bundles.py's
@@ -132,7 +162,7 @@ class TestGetConfigByNameAndPropagation:
         cfg_path.write_text(f'project_root: {tmp_path}\n')
         base = load_config(cfg_path)
 
-        for name in ('codex-gpt5.6-sol', 'pi-sonnet-control'):
+        for name in (*_CODEX_SLATE_MODELS_BY_NAME, 'pi-sonnet-control'):
             bundle = get_config_by_name(name)
             assert bundle is not None, f'{name} did not resolve via get_config_by_name'
 
@@ -140,3 +170,52 @@ class TestGetConfigByNameAndPropagation:
 
             assert orch_config.backends.implementer == bundle.backend
             assert orch_config.models.implementer == bundle.model
+
+
+class TestCodexSlatePin:
+    """The 2026-09 codex slate, pinned by LITERAL ids (task 5384).
+
+    Every other test in this module reads the ``CODEX_*_MODEL`` constants, so
+    it stays green whatever they hold (INV-10). This class restates the
+    roster and ids as literals so a stale id, or an unnoticed addition or
+    removal, fails loudly.
+    """
+
+    def test_roster_is_exactly_the_codex_slate_plus_the_pi_control(self):
+        from orchestrator.evals.configs import codex_pi_candidates
+
+        assert {c.name for c in codex_pi_candidates()} == {
+            *_CODEX_SLATE_MODELS_BY_NAME, 'pi-sonnet-control',
+        }
+
+    def test_codex_arms_carry_the_literal_model_ids(self):
+        from orchestrator.evals.configs import codex_pi_candidates
+
+        by_name = {c.name: c for c in codex_pi_candidates()}
+        for name, model in _CODEX_SLATE_MODELS_BY_NAME.items():
+            arm = by_name[name]
+            assert arm.model == model
+            assert arm.backend == 'codex'
+            assert arm.role == 'implementer'
+            assert arm.effort == 'xhigh'
+
+    def test_get_config_by_name_resolves_each_codex_arm(self):
+        from orchestrator.evals.configs import get_config_by_name
+
+        for name, model in _CODEX_SLATE_MODELS_BY_NAME.items():
+            cfg = get_config_by_name(name)
+            assert cfg is not None
+            assert cfg.backend == 'codex'
+            assert cfg.model == model
+
+    def test_pi_control_is_unchanged(self):
+        from orchestrator.evals.configs import (
+            PI_CONTROL_MODEL,
+            EvalConfig,
+            codex_pi_candidates,
+        )
+
+        by_name = {c.name: c for c in codex_pi_candidates()}
+        assert by_name['pi-sonnet-control'] == EvalConfig(
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
+        )
