@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 # deployments could lack the package. Mirror that pattern here so the
 # curator still functions (without escalation routing) in minimal envs.
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
@@ -64,12 +70,19 @@ _DEFAULT_COOLDOWN_SECS = 3600.0
 _LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
 _QUEUE_DIRNAME = 'data/escalations'
 
-# Short dedup window for zero-output-timeout escalations. A batch of N
+# Short in-process dedup window for zero-output-timeout reports. A batch of N
 # candidates that all hit ZOT bisects to N concurrent size-1 curate() calls,
-# each of which calls report_failure independently. Without dedup, a single
-# outage event on a batch of N can enqueue up to N un-suppressed escalations.
-# Submissions within this window after the first are logged and dropped.
+# each of which calls report_failure independently. This window bounds ONE such
+# outage event to ONE recurrence count on the folded record below; reports
+# within it after the first are logged and dropped.
 _ZOT_DEDUP_WINDOW_SECS = 60.0
+
+# The class Leo ruled on in esc-task-curator-17 (2026-08-27, ACCEPT-AND-RETUNE):
+# an accepted, recurring, transient pre-turn empty-output hang on the curator
+# call shape. Its dedupe fingerprint is derived from this pinned key, so every
+# recurrence folds into one pending record instead of minting a new L1.
+_ZOT_CATEGORY = 'curator_zero_output_hang'
+_ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
 
 
 def _transcript_evidence_lines(
@@ -356,11 +369,10 @@ class CuratorEscalator:
             return
 
         if zero_output_timeout:
-            # Transient Anthropic-backend INFRA hang on the curator's
-            # sonnet+json-schema call shape (task 1743). Two hangs hours apart
-            # each read as "failure 1 of 3" under the normal burst window —
-            # the outage was invisible. Always surface, bypassing burst
-            # suppression (don't touch _failure_log).
+            # The accepted recurring class ruled on in esc-task-curator-17.
+            # Two hangs hours apart each read as "failure 1 of 3" under the
+            # normal burst window, so this bypasses burst suppression (and
+            # leaves _failure_log alone); recurrences fold into one record.
             await self._submit_zero_output_timeout(
                 project_root=project_root,
                 project_id=project_id,
@@ -558,26 +570,23 @@ class CuratorEscalator:
         transcript_turns: int | None,
         tools_used: tuple[str, ...] | None,
     ) -> None:
-        """Submit a distinct, un-suppressed escalation for a zero-output/full-timeout
-        curator INFRA hang.
+        """File a zero-output/full-timeout curator hang, folding recurrences.
 
-        Deliberately bypasses the rolling-window burst suppression (and does not
-        touch ``_failure_log``): two hangs hours apart each read as "failure 1 of 3"
-        under the normal window — the outage is invisible. Each ZOT must surface
-        so operators can see a pattern across occurrences. The summary is unmistakable
-        vs the generic "curator LLM failing" escalation, and the detail includes
-        forensic evidence (account_name, proc_tree, duration_ms) so the next
-        occurrence is diagnosable without re-reading logs.
+        This is the accepted recurring class ruled on in esc-task-curator-17
+        (ACCEPT-AND-RETUNE). The escalation carries the pinned ``_ZOT_ROOT_CAUSE``
+        and a fingerprint derived from it and the project, and is filed through
+        ``submit_or_dedupe`` with an unbounded window: a recurrence folds into
+        the pending record, whose ``dedupe_count`` is the recurrence counter.
+        Once that record is resolved it leaves the pending set, so the next
+        recurrence is a new incident.
 
-        A short dedup window (_ZOT_DEDUP_WINDOW_SECS) prevents escalation floods
-        from a single batch outage (bisect produces N concurrent size-1 curate()
-        calls which each call report_failure independently).
+        Bypasses the rolling-window burst suppression (and does not touch
+        ``_failure_log``). The detail carries forensic evidence (account_name,
+        proc_tree, duration_ms, transcript turns and tools).
+
+        The in-process ``_ZOT_DEDUP_WINDOW_SECS`` window makes one batch bisect
+        (N concurrent size-1 curate() calls) count as one recurrence, not N.
         """
-        # Dedup: a batch bisect of N candidates all hitting ZOT can call this
-        # concurrently N times for the same project. Only the first submission
-        # within _ZOT_DEDUP_WINDOW_SECS actually enqueues; the rest are logged
-        # and dropped so the operator sees a pattern across outage events but
-        # not a per-candidate flood within a single event.
         now_mono = time.monotonic()
         last = self._zot_last_submitted.get(project_id)
         if last is not None and (now_mono - last) < _ZOT_DEDUP_WINDOW_SECS:
@@ -611,13 +620,15 @@ class CuratorEscalator:
         detail_lines.append(f'justification={justification}')
         detail_lines.append('')
         detail_lines.append(
-            'NOTE: this bypasses the 1-hour burst-suppression window because '
-            'zero-output/full-timeout hangs hours apart otherwise each read as '
-            '"failure 1 of 3" and never cross the escalate threshold — the outage '
-            'is invisible. Root cause: transient Anthropic-backend degradation on '
-            'the curator\'s sonnet+json-schema call shape (task 1743). Dedupe '
-            'degraded to create for this candidate. The circuit-breaker watchdog '
-            'will short-circuit further curator LLM calls if this recurs.',
+            'NOTE: ruled ACCEPT-AND-RETUNE on esc-task-curator-17 (2026-08-27): an '
+            'accepted, recurring, transient pre-turn empty-output hang on the '
+            f"curator's sonnet + json-schema call shape, pinned as root_cause "
+            f'{_ZOT_ROOT_CAUSE!r}. Recurrences fold into this record, so its '
+            'dedupe_count is the recurrence counter (one burst of concurrent hangs '
+            'counts once). transcript_turns=0 is a transcript-confirmed pre-turn '
+            'stall; unknown means the transcript was not read. Dedupe degraded to '
+            'create for this candidate; the circuit breaker short-circuits further '
+            'curator LLM calls if hangs come back to back.',
         )
         detail = '\n'.join(detail_lines)
 
@@ -627,17 +638,30 @@ class CuratorEscalator:
             task_id='task-curator',
             agent_role='fused-memory/task-curator',
             severity='blocking',
-            category='curator_zero_output_hang',
+            category=_ZOT_CATEGORY,
             summary=(
-                'curator zero-output/full-timeout INFRA hang — dedupe degraded to '
-                'create; NOT a flaky candidate. Transient Anthropic-backend hang on '
-                'sonnet+json-schema call shape.'
+                'curator zero-output/full-timeout hang (accepted recurring class, '
+                'esc-task-curator-17) — dedupe degraded to create; recurrences fold '
+                'here and dedupe_count counts them.'
             ),
             detail=detail,
             level=1,
+            root_cause=_ZOT_ROOT_CAUSE,
+            dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+                _ZOT_CATEGORY, _ZOT_ROOT_CAUSE, affected_ids=[f'project:{project_id}'],
+            ),
+        )
+        config = DedupeConfig(  # type: ignore[possibly-unbound]
+            infra_dedupe_enabled=True,
+            # UNBOUNDED, on the dead_letter_escalator precedent: these recur
+            # days and weeks apart, and a resolved parent leaves the pending
+            # set, so a recurrence after resolution still mints a new record.
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=(_ZOT_CATEGORY,),
+            key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
         )
         try:
-            queue.submit(escalation)
+            response = submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
         except Exception:
             logger.exception(
                 'curator_escalator: failed to submit zero-output-timeout '
@@ -648,8 +672,15 @@ class CuratorEscalator:
             # failing add_task just because queue I/O broke.
             return
 
+        if response['status'] == 'dedup_skipped':
+            logger.warning(
+                'curator_escalator: zero-output-timeout recurrence for project %s '
+                'folded into %s — account=%s duration_ms=%s; dedupe degraded to create',
+                project_id, response['parent_id'], account_name, duration_ms,
+            )
+            return
         logger.error(
             'curator_escalator: queued zero-output-timeout L1 escalation %s for '
             'project %s — account=%s duration_ms=%s; dedupe degraded to create',
-            escalation.id, project_id, account_name, duration_ms,
+            response['id'], project_id, account_name, duration_ms,
         )
