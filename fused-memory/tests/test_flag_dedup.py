@@ -13884,11 +13884,13 @@ class TestEntityStandingSuppressionEvaluated:
         'flag_type': 'oversized_entity',
     }
 
-    def test_defaults_to_evaluated(self):
-        result = flag_dedup.EntityStandingSuppressionResult(
-            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
-        )
-        assert result.suppression_evaluated is True
+    def test_every_construction_must_state_whether_it_evaluated(self):
+        """A fail-open return that forgot the field would otherwise read as an
+        evaluated quiet cycle and reset every established streak."""
+        with pytest.raises(TypeError, match='suppression_evaluated'):
+            flag_dedup.EntityStandingSuppressionResult(  # type: ignore[call-arg]
+                kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
+            )
 
     @pytest.mark.asyncio
     async def test_suppressing_path_is_evaluated(self, ledger_memory_service):
@@ -13969,6 +13971,7 @@ def _storm_result(
         kept_flags=[],
         suppressed_by_decision=counts,
         grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in counts},
+        suppression_evaluated=True,
     )
 
 
@@ -14140,6 +14143,7 @@ def _suppressing_counts(counts: dict[str, int]) -> flag_dedup.EntityStandingSupp
         kept_flags=[],
         suppressed_by_decision=dict(counts),
         grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in counts},
+        suppression_evaluated=True,
     )
 
 

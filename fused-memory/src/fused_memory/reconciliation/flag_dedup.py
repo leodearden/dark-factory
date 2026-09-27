@@ -878,17 +878,24 @@ class EntityStandingSuppressionResult:
       nor reset on it, because an unread ledger is not evidence that a
       decision went quiet. An empty flag batch stays True: a cycle with
       nothing to suppress is a cycle in which no decision drained anything.
+      It has no default, so a new fail-open return cannot forget it and pass
+      as an evaluated quiet cycle that wipes every established streak.
     """
 
     kept_flags: list[dict[str, Any]]
     suppressed_by_decision: dict[str, int]
     grounds_by_decision: dict[str, str]
-    suppression_evaluated: bool = True
+    suppression_evaluated: bool
 
     @classmethod
     def empty_batch(cls) -> EntityStandingSuppressionResult:
         """The evaluated, nothing-suppressed outcome of an empty flag batch."""
-        return cls(kept_flags=[], suppressed_by_decision={}, grounds_by_decision={})
+        return cls(
+            kept_flags=[],
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
+        )
 
 
 def _match_entity_standing_decision(
@@ -1090,7 +1097,10 @@ async def filter_entity_standing_decisions(
     )
     if not active_by_uuid:
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
         )
 
     kept: list[dict[str, Any]] = []
@@ -1117,6 +1127,7 @@ async def filter_entity_standing_decisions(
         kept_flags=kept,
         suppressed_by_decision=suppressed_by_decision,
         grounds_by_decision=grounds_by_decision,
+        suppression_evaluated=True,
     )
 
 
