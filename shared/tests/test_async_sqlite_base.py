@@ -898,6 +898,8 @@ _GATE_HANG_GUARD_SECS = 30.0
 # scanned; the FIRST row parks.
 _GATED_SCAN = "SELECT id, v FROM items WHERE scan_gate(flag) = 'live'"
 
+_COLLIDING_UPDATE = "UPDATE items SET v = 'owner' WHERE id = 'live'"
+
 
 class _ScanGate:
     """The ``scan_gate(value)`` SQL function: parks the first row until released.
@@ -947,6 +949,12 @@ async def _sqlite_error_name(op: Callable[[], Awaitable[None]]) -> str | None:
     except sqlite3.OperationalError as exc:
         return exc.sqlite_errorname
     return None
+
+
+async def _raw_colliding_write(conn: aiosqlite.Connection) -> None:
+    """The colliding write, issued straight on ``conn`` past any lock."""
+    await conn.execute(_COLLIDING_UPDATE)
+    await conn.commit()
 
 
 async def _collide_with_a_pinned_read(
@@ -1064,13 +1072,15 @@ class TestAtomicConnectionSnapshotPin:
 
         The read is parked mid-step with its snapshot pinned, a foreign
         connection commits, and a write unit is issued into that window.
+        This pins the production pairing, the lock and the single hop
+        together: either one alone keeps it green.
         """
         owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
         access = AtomicConnection(owner)
 
         async def unit_write() -> None:
             async with access.write() as db:
-                await db.execute("UPDATE items SET v = 'owner' WHERE id = 'live'")
+                await db.execute(_COLLIDING_UPDATE)
 
         rows, error = await _collide_with_a_pinned_read(
             foreign, gate, read=lambda: access.read_all(_GATED_SCAN), write=unit_write
@@ -1082,12 +1092,37 @@ class TestAtomicConnectionSnapshotPin:
         assert landed is not None
         assert landed['v'] == 'owner'
 
+    async def test_read_all_single_hop_survives_a_write_that_bypasses_the_lock(
+        self, tmp_path, open_conn
+    ):
+        """The single hop alone closes the window: a raw write past the lock lands too.
+
+        It issues the control's exact write, so the two arms differ only in
+        the read's shape.  This is the arm that goes red if ``read_all``
+        regresses to execute + fetch.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
+        access = AtomicConnection(owner)
+
+        rows, error = await _collide_with_a_pinned_read(
+            foreign,
+            gate,
+            read=lambda: access.read_all(_GATED_SCAN),
+            write=lambda: _raw_colliding_write(owner),
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
+
     async def test_legacy_multi_hop_read_still_loses_the_race(self, tmp_path, open_conn):
         """CONTROL: the replaced shape raises SQLITE_BUSY_SNAPSHOT in the same collision.
 
-        The positive arm survives this exact constructed collision, so the
-        replaced shape losing it is what proves that arm discriminates rather
-        than passing vacuously.
+        The single-hop arm survives this exact collision, with the same raw
+        write and only the read differing, so the replaced shape losing it
+        proves that arm discriminates rather than passing vacuously.
         """
         owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
 
@@ -1095,12 +1130,8 @@ class TestAtomicConnectionSnapshotPin:
             async with owner.execute(_GATED_SCAN) as cur:
                 return list(await cur.fetchall())
 
-        async def legacy_write() -> None:
-            await owner.execute("UPDATE items SET v = 'owner' WHERE id = 'live'")
-            await owner.commit()
-
         rows, error = await _collide_with_a_pinned_read(
-            foreign, gate, read=legacy_read, write=legacy_write
+            foreign, gate, read=legacy_read, write=lambda: _raw_colliding_write(owner)
         )
 
         assert error == 'SQLITE_BUSY_SNAPSHOT'
