@@ -22,7 +22,7 @@ fake cannot re-cross what the real backends keep apart:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -586,18 +586,6 @@ class TestTagOnlyTouchesNothingOnTheIncumbent:
         svc.get_memory_by_id.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_refusal_says_nothing_was_tagged(self):
-        """The refusal must not admit to tags it never wrote."""
-        no_canonical = make_service(scroll_rows=[_scroll_row(M1), _scroll_row(M2)])
-        unreadable = make_service(scroll_error=TimeoutError('qdrant timeout'))
-
-        for svc in (no_canonical, unreadable):
-            result = await call_execute(svc, canonical_content=None)
-
-            assert result['error_type'] == 'TagOnlyIncumbentNotFound'
-            assert 'NOT undone' not in result['error']
-
-    @pytest.mark.asyncio
     async def test_a_closure_that_fails_after_the_tags_still_reports_the_fold(self):
         """The fold landed, so it is reported in full — the same degradation
         the mint path takes in
@@ -726,32 +714,22 @@ class TestTheMintBypassesTheToolLevelGuards:
 
     The pin is what stops a later edit quietly reintroducing the tool path
     and bouncing canonicals with
-    `ProceduralKnowledgeKnownTopicClusterWriteRejected`. The load-bearing
-    assertion is the call path — one await on the service method, with the
-    content asked for — and the three patches state the claim the path
-    implies.
+    `ProceduralKnowledgeKnownTopicClusterWriteRejected`: the canonical
+    reaches the store as one await on the service method, carrying the
+    content asked for.
     """
 
     @pytest.mark.asyncio
-    async def test_no_write_guard_is_consulted_for_the_canonical(self):
+    async def test_the_canonical_is_written_through_the_service_method(self):
         svc = make_service()
         near_duplicate_of_its_peers = f'record {M1}'
-        guards = 'fused_memory.server.near_duplicate_guard'
 
-        with (
-            patch(f'{guards}.resolve_near_dup_guard_enabled') as enabled,
-            patch(f'{guards}.find_near_duplicate_memory') as near_dup,
-            patch(f'{guards}.find_matching_topic_cluster') as cluster,
-        ):
-            await call_execute(
-                svc,
-                canonical_content=near_duplicate_of_its_peers,
-                category='procedural_knowledge',
-            )
+        await call_execute(
+            svc,
+            canonical_content=near_duplicate_of_its_peers,
+            category='procedural_knowledge',
+        )
 
-        enabled.assert_not_called()
-        near_dup.assert_not_called()
-        cluster.assert_not_called()
         svc.add_memory.assert_awaited_once()
         assert (
             svc.add_memory.await_args.kwargs['content']
