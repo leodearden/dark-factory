@@ -51,7 +51,8 @@ Design decisions (captured in plan.json):
 
 - The classifier is compared against EACH RECORD'S OWN project's task store,
   resolved through ``BaseStage.known_projects``.  A record whose
-  ``project_id`` cannot be parsed, or that names a project absent from that
+  ``project_id`` cannot be resolved — from the stamped field or, failing that,
+  from the detail-block prose — or that names a project absent from that
   map, is counted ``unresolvable`` and is NEVER called an orphan — classifying
   a foreign record against the querying project's census would tell the sole
   closer to resolve a record whose subject may still be legitimately
@@ -81,7 +82,8 @@ logger = logging.getLogger(__name__)
 
 # The two recon stale families this reaper covers.  Both are pending L1
 # records filed per-subject-task by Stage 1 whose premise a terminal subject
-# genuinely moots, both write ``project_id:`` as their first detail line, and
+# genuinely moots, both stamp ``Escalation.project_id`` and also write
+# ``project_id:`` as their first detail line (the source legacy records have), and
 # ``skills/recon-escalation-watcher/SKILL.md`` already treats their playbook
 # rows identically ("Same aging/park shape as reconciliation_stale_gate_backlog
 # above").  ``reconciliation_stale_human_operator`` has ZERO pending records
@@ -115,48 +117,67 @@ ORPHANED_ESCALATION_FLAG_TYPE = 'orphaned_recon_escalation'
 # category.
 ORPHANED_ESCALATION_FLAG_CATEGORY = 'cross_store_inconsistency'
 
-# The detail-block key both producers write.  Compared case-sensitively and
-# anchored to the start of a stripped line so a ``project_id`` mention inside
-# a free-text ``description:`` line cannot be mistaken for the field.
+# The detail-block key both producers write, read only as the FALLBACK source
+# for records carrying no stamped ``Escalation.project_id``.  Compared
+# case-sensitively and anchored to the start of a stripped line so a
+# ``project_id`` mention inside a free-text ``description:`` line cannot be
+# mistaken for the key.
 _PROJECT_ID_DETAIL_KEY = 'project_id:'
 
 
 def escalation_project_id(esc):
-    """Return the subject ``project_id`` parsed out of *esc*'s detail block.
+    """Return *esc*'s subject ``project_id``, preferring the structured field.
 
-    DELIBERATE INV-2 EXCEPTION.  ``escalation.models.Escalation`` has no
-    ``project_id`` field (verified: zero occurrences in
-    ``escalation/src/escalation/models.py``), so there is no structured fact
-    to read and the value must be recovered from prose.  Adding the field
-    would help only FUTURE records; the entire population this reaper exists
-    to clear is the records already on disk, which would still need parsing.
-    This function is therefore the SINGLE owner of that parse — the in-cycle
-    sweep and ``scripts/derive_orphaned_recon_escalations.py`` both call it,
-    so the rule cannot drift into two copies that disagree.
-
-    The line is written by both producers as the FIRST entry of their
-    ``detail_parts`` list —
+    FIELD FIRST.  ``escalation.models.Escalation`` carries a ``project_id``
+    field (task 4951), stamped by both producers —
     ``stage1_stall_detector.py::maybe_escalate_stalled_gate_backlog`` and
-    ``stage1_stall_detector.py::maybe_escalate_stalled_tasks`` — but position
-    is not relied upon here: the first line whose stripped form starts with
-    ``project_id:`` wins.  Empirical basis for treating the parse as total: 0
-    of 124 live pending records fail it, across both observed detail vintages
-    (``age_hours_at_filing:`` and the older ``age_hours:`` shape still carried
-    by ``esc-5943-1``).
+    ``::maybe_escalate_stalled_tasks`` — from the same value they render into
+    ``detail``.  Reading the structured fact rather than re-deriving it from a
+    rendered string is the INV-2 shape.  This function is the SINGLE owner of
+    the derivation: the in-cycle sweep and
+    ``scripts/derive_orphaned_recon_escalations.py`` both call it, so the two
+    channels cannot drift into disagreeing about which project a record names.
 
-    Splits on the FIRST colon only, so a value that itself contains a colon is
-    returned whole rather than silently truncated (a truncated id would miss
-    ``known_projects`` and be counted ``unresolvable`` — fail-safe, but an
-    avoidable recall loss).
+    The field is read with ``getattr``, not attribute access, and only a
+    non-empty ``str`` is accepted; anything else falls through to the prose
+    parse below.  ``None`` on the field means UNSTAMPED, never "no project".
 
-    Returns ``None`` when *esc* has no readable ``detail``, or its detail
-    carries no ``project_id:`` line, or the parsed value is empty.  NEVER
-    raises: detail is deserialised from JSON on disk, so a malformed record
-    must degrade to ``unresolvable`` rather than abort the sweep for every
-    other record.
+    WHY THE PROSE FALLBACK IS RETAINED, and why it is not transitional.  A
+    ``reconciliation_stale_gate_backlog`` refiling normally FOLDS into an
+    existing pending parent: on ``escalation/dedupe.py``'s ``dedup_skipped``
+    branch the child ``Escalation`` is never written to disk at all, and
+    ``attach_dedupe_child`` bumps only ``dedupe_count`` / ``dedupe_children``
+    / ``severity`` / ``updated_at`` — it backfills no parent field.  So the
+    records already pending will NEVER gain the field no matter how many
+    cycles run; the field populates only for records minted fresh.  This
+    fallback's population therefore shrinks only as individual legacy parents
+    are resolved, not on its own, and deleting it would also blind every
+    folded child.  Re-anchoring live parents in place is deliberately left to
+    a separately reviewable operator action, matching the precedent
+    ``dedupe.py::gate_backlog_fingerprint_key`` already set.
+
+    The parse: both producers write ``project_id:`` as the FIRST entry of
+    their ``detail_parts`` list, but position is not relied upon — the first
+    line whose stripped form starts with the key wins.  Measured 2026-09-02:
+    0 of 124 live pending records failed it, across both observed detail
+    vintages (``age_hours_at_filing:`` and the older ``age_hours:`` shape
+    still carried by ``esc-5943-1``).  Splits on the FIRST colon only, so a
+    value that itself contains a colon is returned whole rather than silently
+    truncated (a truncated id would miss ``known_projects`` and be counted
+    ``unresolvable`` — fail-safe, but an avoidable recall loss).
+
+    Returns ``None`` when neither source yields a value: no usable field, and
+    no readable ``detail``, or a detail with no ``project_id:`` line, or an
+    empty parsed value.  NEVER raises — both the field and detail are
+    deserialised from JSON on disk, so a malformed record must degrade to
+    ``unresolvable`` rather than abort the sweep for every other record.
 
     Pure: no I/O, no side effects.
     """
+    field_value = getattr(esc, 'project_id', None)
+    if isinstance(field_value, str) and field_value:
+        return field_value
+
     detail = getattr(esc, 'detail', None)
     if not isinstance(detail, str):
         return None

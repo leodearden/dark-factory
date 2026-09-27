@@ -162,10 +162,12 @@ def content_fingerprint_key(esc: Escalation) -> str | None:
     return esc.dedupe_fingerprint
 
 
-# The one recovery site for a legacy gate-backlog record's project_id: the
+# The one recovery site for a LEGACY gate-backlog record's project_id: the
 # emitter (stage1_stall_detector.maybe_escalate_stalled_gate_backlog) writes
 # ``detail_parts[0] = f'project_id: {project_id}'``.  Kept as a module constant
-# so the coupling to that emitter is named rather than inlined.
+# so the coupling to that emitter is named rather than inlined.  Records filed
+# since task 4951 also carry a structured ``Escalation.project_id``; see
+# ``gate_backlog_fingerprint_key`` for why this helper still does not read it.
 _GATE_BACKLOG_DETAIL_PROJECT_PREFIX = 'project_id: '
 
 
@@ -197,16 +199,23 @@ def gate_backlog_fingerprint_key(esc: Escalation) -> str | None:
     hold 78 distinct task_ids, but that is a property of the current backlog,
     not an invariant.
 
-    ``project_id`` is NOT a persisted field on ``Escalation`` — it appears
-    nowhere in the on-disk record's key set — so ``detail``'s first line is the
-    only recovery site.  That couples this helper to the emitter's format: a
-    change to ``detail_parts[0]`` in ``stage1_stall_detector`` must update this
-    parser.  Because the parse fails CLOSED, the blast radius of such a drift is
-    duplicate records (visible, self-correcting once the new stamped record
-    becomes the parent), never wrong folds (which silently destroy an
-    escalation).  The same asymmetry drives taking the line remainder VERBATIM
-    rather than via ``\\S+``: truncating ``my project`` to ``my`` would turn a
-    parse ambiguity into a different, possibly colliding key.
+    ``Escalation`` DOES carry a persisted ``project_id`` field (task 4951), and
+    this helper deliberately does not consult it.  The prose path below is
+    reached only when ``dedupe_fingerprint`` is falsy, and the one producer
+    that stamps ``project_id`` onto a gate-backlog record
+    (``stage1_stall_detector::maybe_escalate_stalled_gate_backlog``) stamps the
+    fingerprint on that same filing — so a field-preferring branch here would
+    be unreachable code, a control-flow fork with no caller.  And on the LEGACY
+    records this adapter exists to rescue the field is ``None`` regardless,
+    leaving ``detail``'s first line their only recovery site.  That couples
+    this helper to the emitter's format: a change to ``detail_parts[0]`` in
+    ``stage1_stall_detector`` must update this parser.  Because the parse fails
+    CLOSED, the blast radius of such a drift is duplicate records (visible,
+    self-correcting once the new stamped record becomes the parent), never wrong
+    folds (which silently destroy an escalation).  The same asymmetry drives
+    taking the line remainder VERBATIM rather than via ``\\S+``: truncating
+    ``my project`` to ``my`` would turn a parse ambiguity into a different,
+    possibly colliding key.
 
     The literal token ``None`` is deliberately not special-cased: the emitter
     writes ``f'project_id: {project_id}'`` and stamps children as

@@ -446,6 +446,7 @@ async def maybe_escalate_stalled_tasks(
                 summary=summary,
                 detail=detail,
                 level=1,
+                project_id=project_id,
             )
             escalation_queue.submit(esc)
             escalated.append(task_id)
@@ -613,6 +614,7 @@ async def maybe_escalate_stalled_gate_backlog(
                 detail=detail,
                 level=1,
                 dedupe_fingerprint=fingerprint,
+                project_id=project_id,
             )
             result = submit_or_dedupe(
                 escalation_queue, esc, DedupeConfig.for_gate_backlog()
