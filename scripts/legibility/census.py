@@ -105,6 +105,7 @@ from legibility import census_trigger, unlanded  # noqa: E402
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+from shared.toolcall_markup import escape_envelope_literals  # noqa: E402
 
 import config  # noqa: E402
 
@@ -827,6 +828,11 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
     *project_id*. The two overrides move together -- see
     ``_resolve_target_project``.
 
+    ``title`` and ``description`` pass through
+    ``shared.toolcall_markup::escape_envelope_literals`` because cluster
+    evidence may QUOTE tool-call envelope literals, which the boundary
+    markup guard refuses (task 5907).
+
     Pure function -- returns payloads only; the actual ``submit_fn`` call
     happens in ``run_census``.
     """
@@ -839,8 +845,10 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
         payloads.append(
             {
                 "project_root": target_project_root,
-                "title": f"[legibility census] {title}",
-                "description": _cluster_description(cluster, project_id=target_project_id),
+                "title": escape_envelope_literals(f"[legibility census] {title}"),
+                "description": escape_envelope_literals(
+                    _cluster_description(cluster, project_id=target_project_id)
+                ),
                 "task_kind": "normal",
                 "priority": cluster.get("priority", "medium"),
                 "metadata": {
