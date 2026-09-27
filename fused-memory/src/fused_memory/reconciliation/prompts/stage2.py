@@ -21,6 +21,7 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_entity_standing_decision_write_section,
@@ -321,6 +322,8 @@ MUST treat X as already-implemented and must NOT re-derive or re-synthesize that
 conclusion as a novel finding to capture. The decision was made first, then implemented; \
 re-capturing the outcome inverts the record and fabricates a "finding" that was never \
 new information.
+
+{REFERENT_DECLARATION_GUIDANCE}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \

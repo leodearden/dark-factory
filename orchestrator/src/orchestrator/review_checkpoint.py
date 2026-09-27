@@ -30,6 +30,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def render_reflection_instructions(*, project_id: str, review_id: str) -> str:
+    """Step 4 of the deep-review prompt: preserve the review's insights as memories.
+
+    Public because ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its ``add_memory`` example through the live entities_gate.
+    """
+    return f"""\
+4. **Reflect on your findings** — write separate memories for each insight worth preserving:
+   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
+     (`category="observations_and_summaries"`)
+   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
+     (`category="preferences_and_norms"`)
+   - **Architectural insights** — structural observations about how modules interact, where
+     coupling is tight or loose, where the design is fragile
+     (`category="decisions_and_rationale"`)
+   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`,
+     adding `entities` to declare the task(s) the insight is about, for example:
+     `add_memory(content="Task 3127's retry loop swallows the timeout error", category="observations_and_summaries", project_id="{project_id}", agent_id="claude-review-{review_id}", entities=[{{'kind': 'task', 'id': 3127}}])`
+   - Declare only the referents the insight is about, and pass `[]` when none apply. Omitting
+     `entities` always succeeds; a declaration that your own content contradicts is rejected
+   - Write each insight as its own memory — don't batch into one blob
+   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
+
+
 @dataclass
 class ReviewReport:
     review_id: str
@@ -413,6 +437,9 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
+        reflection_block = render_reflection_instructions(
+            project_id=project_id, review_id=review_id
+        )
         submit_resolve_block = submit_only_instructions(
             f'{{"source": "review-cycle", "review_id": "{review_id}", '
             f'"files": ["path/to/file-or-directory", ...], '
@@ -510,17 +537,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
-4. **Reflect on your findings** — write separate memories for each insight worth preserving:
-   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
-     (`category="observations_and_summaries"`)
-   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
-     (`category="preferences_and_norms"`)
-   - **Architectural insights** — structural observations about how modules interact, where
-     coupling is tight or loose, where the design is fragile
-     (`category="decisions_and_rationale"`)
-   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
-   - Write each insight as its own memory — don't batch into one blob
-   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover
+{reflection_block}
 
 5. **Output** structured JSON at the end of your response:
 

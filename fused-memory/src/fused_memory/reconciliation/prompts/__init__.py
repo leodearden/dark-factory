@@ -6,6 +6,7 @@ import logging
 from collections.abc import Mapping
 
 from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
+from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,12 @@ lookup or write.
 On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
 `"status"`, so `status` is safe to branch on.\
 """
+
+# ---------------------------------------------------------------------------
+# Shared referent-declaration guidance (task 3675)
+# ---------------------------------------------------------------------------
+# Scope pinned by test_referent_guidance_prompt_drift.py.
+REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 
 # ---------------------------------------------------------------------------
 # Stage-2-only entity-standing-decision writer listing (task 4395)

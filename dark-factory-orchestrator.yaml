@@ -392,7 +392,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # 'skills/**/test_*.py' 'skills/**/*_test.py'` is empty), but the inference
 # drawn from it is FALSE. An honest test_command is not a tests/scripts/
 # pointer: the tests that actually READ or EXECUTE real paths under skills/ at
-# runtime span THREE uv projects. Enumerated first-hand, not copied forward:
+# runtime span the orchestrator, shared and fused-memory uv projects.
+# Enumerated first-hand, not copied forward:
 #   orchestrator/tests/test_skill_prompt.py       — exercises
 #       orchestrator.agents.skill_prompt.load_skill_system_prompt, which walks
 #       up from its own __file__ to the IN-REPO skills/<name>/SKILL.md (not
@@ -418,6 +419,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
+#   fused-memory/tests/test_referent_declaration_examples.py — reads
+#       skills/reflect/SKILL.md to execute its `entities=` examples against
+#       the live entities_gate (task 3675).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
