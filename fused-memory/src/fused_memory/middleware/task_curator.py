@@ -2909,6 +2909,47 @@ class TaskCurator:
             )
         return evidence
 
+    def _resolve_failed_result(
+        self, agent_result: AgentResult, transcript_scope: Mapping[str, Any],
+    ) -> tuple[AgentResult, TranscriptEvidence | None]:
+        """Salvage a failed call's completed verdict from its own transcript.
+
+        Returns ``(result, evidence)``. A successful result comes back unchanged
+        and unread. A failed one gets ONE evidence read; when stdout delivered no
+        structured output but the transcript holds a completed StructuredOutput,
+        the result becomes a success carrying that payload, so the verdict meets
+        exactly the parsing and validation a returned one does.
+
+        Known limitation: when ``invoke_with_cap_retry`` re-mints the session id
+        for a fresh retry (after a cap hit or a pre-turn rejection,
+        ``_reset_for_fresh_retry``), the curator's session id names an EARLIER
+        attempt. Evidence is then absent or stale. That can only cause a missed
+        salvage, never a false one, since a capped or rejected attempt has no
+        completed StructuredOutput.
+        """
+        if agent_result.success:
+            return agent_result, None
+        evidence = self._read_failure_evidence(transcript_scope)
+        if (
+            evidence is None
+            or evidence.schema_payload is None
+            or agent_result.structured_output is not None
+        ):
+            return agent_result, evidence
+        logger.warning(
+            'TaskCurator: salvaged a completed verdict from the transcript of failed '
+            'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
+            transcript_scope.get('session_id'), agent_result.subtype,
+            agent_result.transcript_turns, json.dumps(evidence.schema_payload, default=str),
+        )
+        salvaged = replace(
+            agent_result,
+            success=True,
+            structured_output=evidence.schema_payload,
+            schema_salvaged=True,
+        )
+        return salvaged, evidence
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
@@ -2976,9 +3017,9 @@ class TaskCurator:
             **transcript_scope,
         )
 
+        agent_result, evidence = self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
-            evidence = self._read_failure_evidence(transcript_scope)
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
@@ -3082,9 +3123,9 @@ class TaskCurator:
             **transcript_scope,
         )
 
+        agent_result, evidence = self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
-            evidence = self._read_failure_evidence(transcript_scope)
             raise CuratorFailureError(
                 f'curator batch LLM call failed: batch_size={n} '
                 f'output={agent_result.output[:200]!r} '
