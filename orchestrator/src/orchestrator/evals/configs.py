@@ -603,15 +603,24 @@ def matrix_pairs(
 # to the one role under test (runner.py's run_eval / run_architect_eval), so
 # no runner.py change is needed here.
 
-# Official Anthropic-format base URLs (public; safe to commit). Z.AI/GLM and
-# DeepSeek match the literal already load-bearing in task 2460's
-# test_workflow_e2e.py / this PRD's reuse notes; MiniMax and Moonshot/Kimi are
-# this module's own best-effort literal (operator-adjustable, like the
-# GPU/quantization choices in VLLM_EVAL_CONFIGS above).
-GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+# Official Anthropic-format base URLs (public; safe to commit). DeepSeek
+# matches the literal already load-bearing in task 2460's test_workflow_e2e.py
+# / this PRD's reuse notes; MiniMax and Moonshot/Kimi are this module's own
+# best-effort literal (operator-adjustable, like the GPU/quantization choices
+# in VLLM_EVAL_CONFIGS above).
 DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic'
 MINIMAX_BASE_URL = 'https://api.minimax.io/anthropic'
 KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
+
+# Z.ai GLM access is a GLM Coding Plan (Leo, 2026-09-11), and a Coding Plan key
+# answers ONLY on the Plan's two coding endpoints: GLM_BASE_URL, the Anthropic
+# protocol the claude-harness bundles drive, and ZAI_CODING_BASE_URL, the
+# OpenAI protocol asserted at startup by
+# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint
+# and used by the ZCode arm (task 5399). The general /api/paas/v4 errors with
+# a Coding Plan key, so it is deliberately not a constant.
+GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
 
 # Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
 # literal in source — the value itself is read from the operator's
