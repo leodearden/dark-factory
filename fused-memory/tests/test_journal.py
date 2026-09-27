@@ -1113,3 +1113,127 @@ class TestCompareAndSetRunStageReports:
         )
         reloaded = await journal.get_run(run_id)
         assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+
+class TestCompleteRunIfStatus:
+    """One-statement terminalisation for a caller acting on a row image it read
+    earlier: the write applies only if the row still holds the status that read
+    observed, so a run whose own coroutine terminalised it in between is left
+    exactly as its owner wrote it.
+    """
+
+    @staticmethod
+    async def _seed(journal, status: RunStatus = RunStatus.running) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                    stats={'created': 1},
+                )
+            },
+        )
+        if status != RunStatus.running:
+            await journal.complete_run(run_id, status)
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_matching_status_terminalises_reports_status_and_completed_at_together(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+        reports = dict(stale.stage_reports)
+        reports['_error'] = {'error_type': 'stale_run', 'message': 'reaped'}
+
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status=RunStatus.failed,
+            stage_reports=reports,
+        )
+
+        assert applied is True
+        after = await journal.get_run(run_id)
+        assert after.status == RunStatus.failed
+        assert after.completed_at is not None
+        assert after.stage_reports == reports
+
+    @pytest.mark.asyncio
+    async def test_mismatched_status_refuses_and_leaves_the_row_byte_identical(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+
+        # The run's own coroutine terminalises it.
+        owners = dict(stale.stage_reports)
+        owners['owner_marker'] = {'written_by': 'owner'}
+        await journal.update_run_stage_reports(run_id, owners)
+        await journal.complete_run(run_id, 'completed')
+        _, owners_text = await journal.get_run_with_stage_reports_text(run_id)
+        owners_row = await journal.get_run(run_id)
+
+        reaper_reports = dict(stale.stage_reports)
+        reaper_reports['_error'] = {'error_type': 'stale_run'}
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status='failed',
+            stage_reports=reaper_reports,
+        )
+
+        assert applied is False
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == owners_text
+        assert after.status == owners_row.status == RunStatus.completed
+        assert after.completed_at == owners_row.completed_at
+
+    @pytest.mark.asyncio
+    async def test_interrupted_expected_status_is_honoured(self, journal):
+        refused_id = await self._seed(journal, RunStatus.interrupted)
+        applied_id = await self._seed(journal, RunStatus.interrupted)
+
+        refused = await journal.complete_run_if_status(
+            refused_id,
+            expected_status=RunStatus.running,
+            status=RunStatus.failed,
+            stage_reports={},
+        )
+        applied = await journal.complete_run_if_status(
+            applied_id,
+            expected_status=RunStatus.interrupted,
+            status=RunStatus.failed,
+            stage_reports={},
+        )
+
+        assert refused is False
+        assert (await journal.get_run(refused_id)).status == RunStatus.interrupted
+        assert applied is True
+        assert (await journal.get_run(applied_id)).status == RunStatus.failed
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.complete_run_if_status(
+                'nonexistent-id',
+                expected_status=RunStatus.running,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+            is False
+        )
