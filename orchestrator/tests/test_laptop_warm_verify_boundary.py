@@ -480,22 +480,27 @@ def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[
       NEGATIVE: the caller can skip the expensive walk this tick.
     * ``{pid, ...}`` -- direct children exist; worth confirming with the
       production walker.
-    * ``None``   -- CANNOT probe: ``/proc/<pid>`` is gone (the leader exited
-      mid-poll), a LIVE thread's ``children`` file cannot be read (a kernel
+    * ``None``   -- CANNOT probe: ``/proc/<pid>`` is gone (the leader has
+      exited), a LIVE thread's ``children`` file cannot be read (a kernel
       built without ``CONFIG_PROC_CHILDREN``, or fd exhaustion), or no thread
-      was read at all.  The caller must fall back to the full walk for that
-      tick; conflating this with the cheap negative would make the poll spin
-      to its timeout, and letting the OSError escape would turn a leader
-      exiting mid-poll into an unhandled error inside the timeout diagnostic.
+      was read at all (the leader exited before its first thread was read).
+      The caller must fall back to the full walk for that tick; conflating
+      this with the cheap negative would make the poll spin to its timeout,
+      and letting the OSError escape would turn a leader exiting mid-poll
+      into an unhandled error inside the timeout diagnostic.
 
     A failed ``children`` read is judged PER THREAD, because threads exit
     routinely in the probed processes -- pytest's own per-test faulthandler /
     pytest-timeout watchdog threads included (task 5945).  If the tid
     directory is gone, the thread exited after the listing and is skipped; if
-    it still exists, the probe cannot be trusted and answers ``None``.  A
-    child the kernel re-parents from a skipped thread onto a sibling already
-    read can be missed for one tick, which only defers the caller's walk --
-    the kernel documents ``children`` as best-effort anyway.
+    it still exists, the probe cannot be trusted and answers ``None``.  So one
+    tick can under-report: a child the kernel re-parents from a skipped thread
+    onto a sibling already read is missed, and a leader that exits after some
+    of its threads were read answers the partial set those threads gave
+    (possibly ``set()``), not ``None``.  Either only defers the caller's walk
+    by one poll interval -- the next tick sees the re-parented child, or finds
+    ``/proc/<pid>`` gone and answers ``None`` -- and the kernel documents
+    ``children`` as best-effort anyway.
 
     *_proc_root* is a private injectable seam (defaulting to the real
     ``/proc``) so the tri-state can be covered against a fake task listing in
@@ -2624,6 +2629,13 @@ def test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe():
     ``required_exits`` sibling-thread exits observed while probing -- not by
     a probe count or a clock, so its power does not depend on scheduler
     speed.  The ``Event`` waits are handoff barriers, not timing assertions.
+
+    No single exit is guaranteed to land between the listing and a
+    ``children`` read, so this catches the pre-fix collapse only
+    probabilistically; the deterministic regression guard is
+    :func:`test_read_direct_children_tri_state_over_a_fake_task_listing`.  This
+    test confirms, on the real kernel, the behaviour that fake listing models:
+    an exited thread's tid directory is gone, so its failed read is skipped.
     """
     required_exits = 200
     stop = threading.Event()
