@@ -627,8 +627,9 @@ KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
 # stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
-MINIMAX_MODEL = 'MiniMax-M2.5'
-GLM_MODEL = 'glm-5.2'
+MINIMAX_MODEL = 'MiniMax-M3'
+GLM_MODEL = 'glm-5.3'
+GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
 KIMI_MODEL = 'kimi-latest'
 
@@ -668,17 +669,18 @@ def _claude_endpoint_config(
 
 
 def claude_endpoint_candidates() -> list[EvalConfig]:
-    """Incumbents (native cloud Opus/Sonnet) + the four non-incumbent bundles.
+    """Incumbents (native cloud Opus/Sonnet) + the five non-incumbent bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi via their official
-    Anthropic-format endpoint (PRD C5). ADDITIVE to :func:`ofat_candidates`:
+    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi via
+    their official Anthropic-format endpoint (PRD C5). ADDITIVE to
+    :func:`ofat_candidates`:
     the non-incumbent bundles are NOT added there, since its implementer
     subset asserts every cloud incumbent carries no proxy ``env_overrides``
     (test_eval_driver_configs.py) — this is a separate, additive selector for
     Phase-4 candidate screening.
 
-    A function, not a module-level list: the four non-incumbent bundles are
+    A function, not a module-level list: the non-incumbent bundles are
     (re)built on every call via :func:`_claude_endpoint_config`, so each reads
     its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
     value from import time.
@@ -686,11 +688,15 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
-            'minimax-m2.5-endpoint', MINIMAX_MODEL,
+            'minimax-m3-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
-            'glm-5.2-endpoint', GLM_MODEL,
+            'glm-5.3-endpoint', GLM_MODEL,
+            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
@@ -710,8 +716,13 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
 # config.models.implementer == EvalConfig.model) resolves cost_source ==
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
 CANDIDATE_ENDPOINT_PRICES: dict[str, dict[str, float]] = {
+    # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
+    # deliberately not used.
     MINIMAX_MODEL: {'input_per_1m': 0.30, 'output_per_1m': 1.20},
-    GLM_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.20},
+    GLM_MODEL: {'input_per_1m': 1.40, 'output_per_1m': 4.40},
+    # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
+    # aggregator pages still quote it.
+    GLM_FLASH_MODEL: {'input_per_1m': 0.15, 'output_per_1m': 0.50},
     DEEPSEEK_MODEL: {'input_per_1m': 0.28, 'output_per_1m': 0.42},
     KIMI_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.50},
 }
