@@ -1,5 +1,7 @@
 """Tests for reconciliation journal (SQLite persistence)."""
 
+import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -1237,3 +1239,152 @@ class TestCompleteRunIfStatus:
             )
             is False
         )
+
+
+class TestUpdateRunStageReportsPreservesCitationRepairs:
+    """The run owner's wholesale rewrite never erases a citation repair a
+    compare-and-set writer persisted: the owner's copy predates the repair, so
+    writing it back verbatim would silently undo an audit write that was
+    already reported ``repaired``.
+    """
+
+    @staticmethod
+    def _citation(memory_id: str) -> dict:
+        return {'memory_id': memory_id, 'store': 'mem0'}
+
+    @staticmethod
+    def _repair_record(memory_id: str, replacement: str) -> dict:
+        return {
+            'memory_id': memory_id,
+            'replacement_memory_id': replacement,
+            'store': 'mem0',
+            'reason': 'memory_not_found',
+            'justification': None,
+            'repaired_by': 'run:test',
+            'repaired_at': datetime.now(UTC).isoformat(),
+        }
+
+    async def _seed_completed(self, journal) -> tuple[str, StageReport]:
+        """A completed run whose integrity_check report flags f-1 (citing A)
+        and f-2 (citing B). Returns the run id and the owner's own copy of
+        that report, as the owner held it before any repair."""
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=now,
+            completed_at=now,
+            items_flagged=[
+                {'finding_id': 'f-1', 'cited_memories': [self._citation('A')]},
+                {'finding_id': 'f-2', 'cited_memories': [self._citation('B')]},
+            ],
+            stats={'flagged': 2},
+        )
+        await journal.update_run_stage_reports(run_id, {'integrity_check': report})
+        await journal.complete_run(run_id, 'completed')
+        return run_id, report.model_copy(deep=True)
+
+    async def _repaired_copy(self, journal, run_id: str) -> tuple[dict, str | None, dict]:
+        """Read (run, token) and re-point f-1 from A to C with one provenance
+        record, as citation_repair does. Returns the repaired stage_reports,
+        the token they were read under, and the record."""
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        record = self._repair_record('A', 'C')
+        f1 = run.stage_reports['integrity_check'].items_flagged[0]
+        f1['cited_memories'] = [self._citation('C')]
+        f1['citation_repairs'] = [record]
+        return run.stage_reports, token, record
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_carries_a_persisted_repair_forward(self, journal):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'written after the repair'
+
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1, f2 = after.items_flagged
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert f2 == owner_copy.items_flagged[1]
+        assert after.stats['owner_marker'] == 'written after the repair'
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_without_persisted_repairs_is_a_plain_wholesale_write(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'plain rewrite'
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert stored_text == json.dumps(
+            {'integrity_check': owner_copy.model_dump(mode='json')}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_repair_landing_between_the_owner_read_and_write_survives(
+        self, journal
+    ):
+        """With the owner first in ``gather``, the owner's read takes the
+        AtomicConnection lock without suspending and then suspends on the
+        aiosqlite hop. The competitor queues on the lock and wins it FIFO
+        before the owner's compare-and-set, so the owner's first CAS is refused
+        and its retry must carry the repair forward. Whatever the interleaving,
+        the asserted end state is the property.
+        """
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'raced the repair'
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+
+        _, competitor_applied = await asyncio.gather(
+            journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy}),
+            journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            ),
+        )
+
+        assert competitor_applied is True
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1 = after.items_flagged[0]
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert after.stats['owner_marker'] == 'raced the repair'
+
+    @pytest.mark.asyncio
+    async def test_a_finding_the_owner_copy_no_longer_carries_is_left_alone(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        repaired, token, _ = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+        owner_copy.items_flagged = [owner_copy.items_flagged[1]]
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        assert after.items_flagged == owner_copy.items_flagged
