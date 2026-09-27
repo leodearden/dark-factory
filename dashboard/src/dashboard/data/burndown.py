@@ -33,7 +33,7 @@ import httpx
 from shared.task_statuses import TaskStatus
 
 from dashboard.config import DashboardConfig
-from dashboard.data.census import TaskCensus, TaskView
+from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
@@ -318,13 +318,12 @@ def _row_for_root(
     # per-project scalar stored on the row because max_concurrent_tasks varies
     # across restarts and across projects — see BURNDOWN_SCHEMA.
     cap = read_max_concurrent_tasks(root)
-    # The `running` sub-view is the one number an operator compares against
-    # max_concurrent_tasks (PRD decision 3).
-    running = measurement.census.sub_views[TaskView.RUNNING]
-    if cap is not None and running > cap:
+    # The same live-vs-cap comparison compute_parity_alarm makes (PRD decision 9).
+    live = measurement.in_progress_live
+    if cap is not None and live > cap:
         logger.warning(
-            'Concurrency cap breached for %s: %d in-progress vs cap %d (%d stranded)',
-            root, running, cap, measurement.in_progress_stranded,
+            'Concurrency cap breached for %s: %d live in-progress vs cap %d (%d stranded)',
+            root, live, cap, measurement.in_progress_stranded,
         )
     return _value_row(root, ts, measurement, cap)
 
