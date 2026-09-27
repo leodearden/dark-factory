@@ -4436,23 +4436,25 @@ async def _quote_marker_in_body(repo: Path, marker: str) -> None:
     )
 
 
-async def _body_quote_only(repo: Path, marker: str) -> str | None:
+async def _body_quote_only(repo: Path, task_id: str, marker: str) -> str | None:
     """Task 4104 shape: e79f9b1094 quotes a marker in prose; nothing landed."""
     await _quote_marker_in_body(repo, marker)
     return None
 
 
-async def _body_quote_newer_than_true_merge(repo: Path, marker: str) -> str | None:
+async def _body_quote_newer_than_true_merge(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
     """Task 4181 shape: d0d67f0c53 quotes the marker after the real merge landed."""
-    merge = await _land_branch(repo, '5765', {'landed.txt': 'x\n'})
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
     await _quote_marker_in_body(repo, marker)
     return merge
 
 
-async def _revert_of_true_merge(repo: Path, marker: str) -> str | None:
+async def _revert_of_true_merge(repo: Path, task_id: str, marker: str) -> str | None:
     """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
     assert_isolated_git_repo(repo)
-    merge = await _land_branch(repo, '5765', {'landed.txt': 'x\n'})
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
     rc, _, err = await _run(
         ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
     )
@@ -4460,18 +4462,20 @@ async def _revert_of_true_merge(repo: Path, marker: str) -> str | None:
     return merge
 
 
-async def _suffixed_subject(repo: Path, marker: str) -> str | None:
+async def _suffixed_subject(repo: Path, task_id: str, marker: str) -> str | None:
     """ce78ad8546 shape: '<marker>: extra words' is a longer subject."""
     await _seed_on_main(repo, {'suffixed.txt': 'x\n'}, f'{marker}: extra words')
     return None
 
 
-async def _single_parent_exact_subject(repo: Path, marker: str) -> str | None:
+async def _single_parent_exact_subject(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
     """task/176 shape: ba1bba2611 is a real marker with a single parent."""
     return await _seed_on_main(repo, {'single.txt': 'x\n'}, marker)
 
 
-async def _wrapped_first_paragraph(repo: Path, marker: str) -> str | None:
+async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str | None:
     """git's %s joins a wrapped first paragraph back into the marker."""
     wrapped = marker.replace(' into ', '\ninto ', 1)
     return await _seed_on_main(repo, {'wrapped.txt': 'x\n'}, wrapped)
@@ -4503,13 +4507,14 @@ class TestMergeMarkerIsExactSubject:
     async def test_marker_is_the_commit_whose_subject_is_exactly_the_merge_subject(
         self,
         git_ops: GitOps,
-        build: Callable[[Path, str], Awaitable[str | None]],
+        build: Callable[[Path, str, str], Awaitable[str | None]],
     ):
         repo = git_ops.project_root
-        branch = 'task/5765'
+        task_id = '5765'
+        branch = f'task/{task_id}'
         marker = _merge_subject(branch, git_ops.config.main_branch)
 
-        expected = await build(repo, marker)
+        expected = await build(repo, task_id, marker)
 
         assert await git_ops.find_merge_marker(branch, gate_on_existing_ref=False) == expected
         assert await git_ops._scan_merge_marker(branch) == expected
