@@ -6859,3 +6859,97 @@ def test_main_done_line_names_unresolved_verdicts_when_nonzero(
         "census: done -- report=plans/confusion-census-2026-07-30.md "
         "filed_tickets=1 stop_reason=exhausted\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5931 step-9: RED — the default verifier proposes an IN-TREE
+# remediation, validated against the observed tree before it is attached.
+# ---------------------------------------------------------------------------
+
+_REMEDIATED_TITLE = "Docs omit the X convention"
+
+
+def _tree_with_guide(tmp_path):
+    """An observed tree holding docs/guide.md, with room OUTSIDE it (tmp_path
+    itself) for a path that escapes the tree."""
+    root = tmp_path / "tree"
+    (root / "docs").mkdir(parents=True)
+    (root / "docs" / "guide.md").write_text("guide\n", encoding="utf-8")
+    return root
+
+
+def _remediation_verdict(remediation, *, verified=True):
+    return json.dumps({"verified": verified, "reason": "r", "remediation": remediation})
+
+
+def _verify_one(root, reply, *, cluster=None):
+    verify_fn = mod._build_default_verify_fn(str(root), lambda prompt, model: reply)
+    return verify_fn([cluster or {"title": _REMEDIATED_TITLE}], model="sonnet")
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_default_verify_fn_attaches_an_in_tree_remediation(tmp_path, absolute):
+    root = _tree_with_guide(tmp_path)
+    path = str(root / "docs" / "guide.md") if absolute else "docs/guide.md"
+    result = _verify_one(root, _remediation_verdict({"path": path, "change": "Document X"}))
+    [cluster] = result["verified"]
+    assert cluster["remediation"] == {"path": "docs/guide.md", "change": "Document X"}
+
+
+def test_default_verify_fn_drops_a_nonexistent_remediation_path_loudly(tmp_path, caplog):
+    root = _tree_with_guide(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        result = _verify_one(
+            root, _remediation_verdict({"path": "docs/missing.md", "change": "Document X"}),
+        )
+    [cluster] = result["verified"]
+    assert "remediation" not in cluster
+    assert any(
+        _REMEDIATED_TITLE in record.getMessage() and "docs/missing.md" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["dot-dot", "absolute"])
+def test_default_verify_fn_drops_a_remediation_path_outside_the_tree(tmp_path, absolute):
+    root = _tree_with_guide(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+    path = str(outside) if absolute else "../outside.md"
+    result = _verify_one(root, _remediation_verdict({"path": path, "change": "Document X"}))
+    [cluster] = result["verified"]
+    assert "remediation" not in cluster
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(_remediation_verdict(None), id="null"),
+        pytest.param(json.dumps({"verified": True, "reason": "r"}), id="absent"),
+    ],
+)
+def test_default_verify_fn_without_remediation_still_verifies(tmp_path, reply):
+    [cluster] = _verify_one(_tree_with_guide(tmp_path), reply)["verified"]
+    assert "remediation" not in cluster
+
+
+def test_default_verify_fn_never_attaches_a_remediation_to_a_rejection(tmp_path):
+    reply = _remediation_verdict({"path": "docs/guide.md", "change": "Document X"}, verified=False)
+    result = _verify_one(_tree_with_guide(tmp_path), reply)
+    assert result["verified"] == []
+    [cluster] = result["rejected"]
+    assert "remediation" not in cluster
+
+
+def test_default_verify_fn_does_not_mutate_the_input_cluster(tmp_path):
+    cluster = {"title": _REMEDIATED_TITLE}
+    reply = _remediation_verdict({"path": "docs/guide.md", "change": "Document X"})
+    _verify_one(_tree_with_guide(tmp_path), reply, cluster=cluster)
+    assert cluster == {"title": _REMEDIATED_TITLE}
+
+
+def test_verify_prompt_requests_the_remediation_key(tmp_path):
+    fake_invoke = _make_fake_invoke(default=_verdict())
+    mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
+    assert '"remediation"' in fake_invoke.calls[0]["prompt"]
