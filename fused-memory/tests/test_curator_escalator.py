@@ -19,7 +19,9 @@ import json
 from typing import IO, Any, Literal, overload
 
 import pytest
+from escalation.queue import EscalationQueue
 
+from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import CuratorFailureError
 
@@ -441,6 +443,113 @@ class TestZeroOutputTimeoutEscalation:
             )
         finally:
             handle.close()
+
+    # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
+    # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
+    # "hours apart / across a restart" without touching the 60s in-process
+    # dedup or its clock.
+
+    @pytest.mark.asyncio
+    async def test_recurrence_folds_under_the_pinned_root_cause(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['root_cause'] == curator_escalator._ZOT_ROOT_CAUSE
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 1
+            assert parent['dedupe_children'] == ['esc-curator-2']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_recurrence_after_resolution_is_a_new_incident(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            [parent] = _pending_records(tmp_path)
+            EscalationQueue(tmp_path / 'data' / 'escalations').resolve(
+                parent['id'], 'backend recovered', resolved_by='test',
+            )
+
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [fresh] = _pending_records(tmp_path)
+            assert fresh['id'] != parent['id']
+            assert fresh['root_cause'] == curator_escalator._ZOT_ROOT_CAUSE
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_is_scoped_to_the_project(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-a'))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-b'))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert all(r['dedupe_fingerprint'] for r in records)
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_stays_within_the_zot_category(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-fold',
+                justification='ordinary', candidate_title='T',
+            )
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-fold',
+                justification='denied', candidate_title='T', schema_tool_denied=True,
+            )
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            records = _pending_records(tmp_path)
+            by_category = {r['category']: r for r in records}
+            assert len(records) == 3
+            assert by_category['curator_zero_output_hang']['dedupe_count'] == 1
+            assert by_category['curator_failure']['dedupe_count'] == 0
+            assert by_category['curator_schema_tool_denied']['dedupe_count'] == 0
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_detail_cites_the_ruling_not_a_diagnosis(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'Root cause: transient Anthropic-backend degradation' not in detail
+            assert 'esc-task-curator-17' in detail
+            assert curator_escalator._ZOT_ROOT_CAUSE in detail
+            assert 'dedupe_count' in detail
+        finally:
+            handle.close()
+
+
+def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id=project_id,
+        justification='ZOT', candidate_title='T',
+        zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+        transcript_turns=0, tools_used=(),
+    )
+
+
+def _pending_records(root) -> list[dict[str, Any]]:
+    return [
+        json.loads(path.read_text())
+        for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    ]
 
 
 def _only_escalation_detail(root) -> str:
