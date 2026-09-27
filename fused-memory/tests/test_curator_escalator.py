@@ -15,6 +15,7 @@ that suppresses spam from a stuck curator.
 from __future__ import annotations
 
 import fcntl
+import json
 from typing import IO, Any, Literal, overload
 
 import pytest
@@ -438,6 +439,81 @@ class TestZeroOutputTimeoutEscalation:
             assert len(files) == 1, (
                 f'Expected 1 escalation (dedup), got {len(files)}'
             )
+        finally:
+            handle.close()
+
+
+def _only_escalation_detail(root) -> str:
+    [path] = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    return json.loads(path.read_text())['detail']
+
+
+class TestTranscriptEvidenceInDetail:
+    """The escalation detail says what the failed run did, from its transcript.
+
+    An absent measurement is spelled out as unknown and never reads as zero:
+    ``transcript_turns=0`` is a transcript-confirmed pre-turn stall.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generic_detail_renders_turns_and_tools(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='killed with progress', candidate_title='T',
+                timed_out=True, transcript_turns=6,
+                tools_used=('ToolSearch', 'TaskGet', 'ToolSearch'),
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=6' in detail
+            assert 'tools_used=ToolSearch,TaskGet,ToolSearch' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_generic_detail_spells_out_an_unread_transcript(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='failed', candidate_title='T',
+                transcript_turns=None, tools_used=None,
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=unknown (transcript unreadable)' in detail
+            assert 'tools_used=unknown' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_detail_renders_a_confirmed_pre_turn_stall(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='ZOT', candidate_title='T',
+                zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+                transcript_turns=0, tools_used=(),
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=0' in detail
+            assert 'tools_used=(none)' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_detail_spells_out_an_unread_transcript(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='ZOT', candidate_title='T',
+                zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=unknown (transcript unreadable)' in detail
+            assert 'tools_used=unknown' in detail
         finally:
             handle.close()
 

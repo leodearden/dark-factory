@@ -1103,6 +1103,34 @@ class TestCurateFallbacks:
         assert kwargs['cost_usd'] == pytest.approx(0.30574)
         assert kwargs['pool_sizes'] == known_pool_sizes
 
+    @pytest.mark.asyncio
+    async def test_curate_threads_transcript_evidence_to_report_failure(self):
+        """curate() passes transcript_turns and tools_used from CuratorFailureError
+        into report_failure so the escalation detail says what the run did."""
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=_make_config(), taskmaster=None, escalator=escalator)
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
+
+        wandered = CuratorFailureError(
+            'killed with progress',
+            timed_out=True,
+            subtype='error_timeout_killed_with_progress',
+            transcript_turns=6,
+            tools_used=('ToolSearch', 'TaskGet', 'ToolSearch'),
+        )
+        with (
+            patch.object(curator, '_build_corpus', side_effect=empty_corpus),
+            patch.object(curator, '_call_llm', side_effect=wandered),
+        ):
+            await curator.curate(CandidateTask(title='T'), project_id='p', project_root='/x')
+
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['transcript_turns'] == 6
+        assert kwargs['tools_used'] == ('ToolSearch', 'TaskGet', 'ToolSearch')
+
 
 class TestCallLlmNeutralCwd:
     """Task 1989: the CLI cwd forwarded for the pure prompt-contained classifier
