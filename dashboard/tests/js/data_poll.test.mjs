@@ -55,6 +55,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'datumFor',
   'requestOnDemand',
   'onDemandView',
+  'onDemandDatum',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
@@ -2301,6 +2302,99 @@ test('onDemandView: with no value, a settled request that brought none is unavai
       );
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// onDemandDatum — the Datum a caller that REQUESTED an on-demand row shows
+//
+// datumFor answers 'not yet fetched' for every absent key, which is a promise
+// only a requesting caller can keep. A caller holding its own request's outcome
+// knows more: the request is on its way, or it did not succeed. onDemandView
+// already decides which; this turns its answer into the Datum a surface renders.
+// ---------------------------------------------------------------------------
+
+test('onDemandDatum: nothing stored and a request on its way is an unknown saying so', () => {
+  const { api, window: win } = loadDataJs();
+  const reasons = [null, api.REFRESH_OUTCOMES.skippedInFlight].map(outcome => {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(win.DF_DATUM.isDatum(d), true, `outcome ${outcome}`);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}: the hole must say why`);
+    assert.notEqual(d.reason, 'not yet fetched', "datumFor's reason promises nothing about this request");
+    return d.reason;
+  });
+  assert.equal(reasons[0], reasons[1], 'both mean the same thing to the caller: wait');
+});
+
+test('onDemandDatum: nothing stored and a request that did not succeed says it failed', () => {
+  const { api } = loadDataJs();
+  const waiting = api.onDemandDatum('terminal', TERMINAL_PROJECT, null).reason;
+  for (const outcome of [api.REFRESH_OUTCOMES.failed, api.REFRESH_OUTCOMES.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}`);
+    assert.notEqual(d.reason, waiting, `outcome ${outcome} must not read as still on its way`);
+    assert.notEqual(d.reason, 'not yet fetched', `outcome ${outcome}`);
+  }
+});
+
+test('onDemandDatum: a landed Datum is returned as stored, whatever outcome is passed', async () => {
+  const { api, window: win } = loadDataJs();
+  const O = api.REFRESH_OUTCOMES;
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 55 },
+  });
+  const stored = win.DF_DATA[api.ON_DEMAND_KEYS.terminal.key(TERMINAL_PROJECT)];
+  assert.ok(stored, 'the request should have landed a Datum');
+
+  for (const outcome of [null, O.applied, O.failed, O.skippedInFlight, O.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.deepEqual(d, stored, `outcome ${outcome}`);
+    assert.equal(d._received_at, 55, `outcome ${outcome}: the receipt stamp must survive`);
+  }
+});
+
+test('onDemandDatum: a failed refresh after a good one still shows the earlier Datum', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 300 },
+  });
+  const good = win.DF_DATA[TERMINAL_KEY];
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  let outcome;
+  try {
+    outcome = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 900, ignoreBackoff: true },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
+  assert.deepEqual(api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome), good);
+});
+
+test('onDemandDatum: an undeclared name is refused loudly, as requestOnDemand refuses it', async () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), /termnial/);
+  let requestMessage;
+  await api.requestOnDemand('termnial', TERMINAL_PROJECT, { state: api.createPollState() }).catch(e => {
+    requestMessage = e.message;
+  });
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), { message: requestMessage });
+});
+
+test('onDemandDatum: a PLAIN row is refused — it has no Datum to answer with', () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('taskProse', PROSE_UID, null), /taskProse/);
 });
 
 // ---------------------------------------------------------------------------
