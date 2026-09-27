@@ -456,7 +456,7 @@ def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: fl
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def _read_direct_children(pid: int) -> set[int] | None:
+def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[int] | None:
     """Cheap probe: the DIRECT children of *pid*, from ``/proc/<pid>/task/*/children``.
 
     A ~2700x cheaper stand-in for a full ``read_ppid_map()`` rescan, used ONLY
@@ -496,9 +496,14 @@ def _read_direct_children(pid: int) -> set[int] | None:
     child the kernel re-parents from a skipped thread onto a sibling already
     read can be missed for one tick, which only defers the caller's walk --
     the kernel documents ``children`` as best-effort anyway.
+
+    *_proc_root* is a private injectable seam (defaulting to the real
+    ``/proc``) so the tri-state can be covered against a fake task listing in
+    ``tmp_path``, for the branches (no ``CONFIG_PROC_CHILDREN``, every thread
+    vanished) that this kernel cannot produce on demand.
     """
     try:
-        tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
+        tid_dirs = list((_proc_root / str(pid) / 'task').iterdir())
     except OSError:
         return None
     children: set[int] = set()
