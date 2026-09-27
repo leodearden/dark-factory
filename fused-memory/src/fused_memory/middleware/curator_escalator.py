@@ -72,6 +72,19 @@ _QUEUE_DIRNAME = 'data/escalations'
 _ZOT_DEDUP_WINDOW_SECS = 60.0
 
 
+def _transcript_evidence_lines(
+    transcript_turns: int | None, tools_used: tuple[str, ...] | None,
+) -> list[str]:
+    """Detail lines for what the failed run's transcript recorded.
+
+    An absent measurement is spelled out, never rendered as zero:
+    ``transcript_turns=0`` means a transcript-confirmed pre-turn stall.
+    """
+    turns = 'unknown (transcript unreadable)' if transcript_turns is None else str(transcript_turns)
+    tools = 'unknown' if tools_used is None else (','.join(tools_used) or '(none)')
+    return [f'transcript_turns={turns}', f'tools_used={tools}']
+
+
 class CuratorEscalator:
     """Route :class:`CuratorFailureError` to the orchestrator or back to the caller."""
 
@@ -288,6 +301,8 @@ class CuratorEscalator:
         subtype: str | None = None,
         cost_usd: float | None = None,
         pool_sizes: dict[str, int] | None = None,
+        transcript_turns: int | None = None,
+        tools_used: tuple[str, ...] | None = None,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
@@ -355,6 +370,8 @@ class CuratorEscalator:
                 duration_ms=duration_ms,
                 account_name=account_name,
                 proc_tree=proc_tree,
+                transcript_turns=transcript_turns,
+                tools_used=tools_used,
             )
             return
 
@@ -397,6 +414,7 @@ class CuratorEscalator:
             detail_lines.append(f'cost_usd={cost_usd}')
         if pool_sizes is not None:
             detail_lines.append(f'pool_sizes={pool_sizes}')
+        detail_lines.extend(_transcript_evidence_lines(transcript_turns, tools_used))
         detail_lines.append(f'justification={justification}')
 
         if count == self._ESCALATE_FIRST_N:
@@ -537,6 +555,8 @@ class CuratorEscalator:
         duration_ms: int | None,
         account_name: str | None,
         proc_tree: str | None,
+        transcript_turns: int | None,
+        tools_used: tuple[str, ...] | None,
     ) -> None:
         """Submit a distinct, un-suppressed escalation for a zero-output/full-timeout
         curator INFRA hang.
@@ -583,6 +603,7 @@ class CuratorEscalator:
             detail_lines.append(f'duration_ms={duration_ms}')
         if account_name is not None:
             detail_lines.append(f'account_name={account_name!r}')
+        detail_lines.extend(_transcript_evidence_lines(transcript_turns, tools_used))
         if proc_tree:
             # Truncate to avoid overwhelming the escalation body.
             snippet = proc_tree[:1500]

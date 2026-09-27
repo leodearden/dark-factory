@@ -1724,6 +1724,8 @@ class TaskCurator:
                     subtype=exc.subtype,
                     cost_usd=exc.cost_usd,
                     pool_sizes=pool_sizes,
+                    transcript_turns=exc.transcript_turns,
+                    tools_used=exc.tools_used,
                 )
             else:
                 logger.warning(
