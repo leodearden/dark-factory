@@ -1118,7 +1118,7 @@ def test_shape_burndown_per_project_carries_parity_block():
     """Every per-project block carries compute_parity_alarm's four fields."""
     labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
     series = {
-        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
     body = redux_api.shape_burndown(series)
@@ -1145,7 +1145,7 @@ def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
     """
     labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
     series = {
-        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
     agg = redux_api.shape_burndown(series)['BURNDOWN']
@@ -1157,6 +1157,31 @@ def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
     # from one project beside a cap from another explains nothing.
     assert agg['parity_peak'] == 33
     assert agg['parity_cap'] == 24
+
+
+def test_shape_burndown_parity_ignores_a_series_with_no_split():
+    """The alarm reads the RAW series, never ``_with_split``'s census-filled copy.
+
+    The display block still fills the missing split with the census so the
+    stacked chart conserves, but that fill is not a live measurement and must
+    not be compared against the cap.
+    """
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'legacy': {
+            'labels': labels,
+            'done': [0, 0], 'blocked': [0, 0], 'pending': [0, 0],
+            'in_progress': [30, 30],
+            'concurrency_cap': [24, 24],
+        },
+    }
+    body = redux_api.shape_burndown(series)
+
+    legacy = body['BURNDOWN_BY_PROJECT']['legacy']
+    assert legacy['parity_alarm'] is False
+    assert legacy['parity_peak'] is None
+    assert legacy['in_progress_live'] == [30, 30]
+    assert body['BURNDOWN']['parity_alarm'] is False
 
 
 def test_shape_burndown_aggregate_parity_ignores_capless_projects():
