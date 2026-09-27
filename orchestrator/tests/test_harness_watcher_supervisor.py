@@ -3276,6 +3276,29 @@ class TestWatcherSkillDrainProtocol:
             f'the handlers read: {compact_l1_reads}'
         )
 
+    def test_skill_never_reads_members_off_an_escalation_row(self) -> None:
+        """No code block reads the model field `members` off an escalation row.
+
+        Every L2 read in this skill is compact (pinned by
+        test_drain_reads_l2s_compact_and_l1_candidates_full), and
+        server.py::_compact_escalation emits the projection key `member_ids`;
+        the model field `members` exists only in the FULL shape. Reading
+        `members` off an L2 row therefore silently yields nothing — in the
+        stranded_blocked guard that fails OPEN and re-resumes a task a
+        sibling escalation is already handling.
+
+        Out of scope: promote_to_l2's own `member_ids=[...]` argument, and its
+        RESPONSE key `members` (a genuine key of that tool's result, which is
+        why the forbidden spellings are scoped to escalation-row names).
+        """
+        code = '\n'.join(_fenced_code_blocks(_watcher_skill_text()))
+        forbidden = ('.get("members"', 'L2.members', 'e["members"]', 'l2["members"]')
+        found = [spelling for spelling in forbidden if spelling in code]
+        assert not found, (
+            'SKILL.md reads `members` off an escalation row; compact rows carry '
+            f'only `member_ids`, so the read silently yields nothing: {found}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
