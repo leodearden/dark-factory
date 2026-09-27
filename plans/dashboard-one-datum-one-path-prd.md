@@ -133,9 +133,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 3. **Named views.** The partition of `TaskStatus` is three views: `in_flight` =
    in-progress + blocked + merge-deferred + review + infra-hold; `backlog` = pending
    + deferred; `terminal` = done + cancelled. `running` = in-progress is a **sub-view**
-   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight"),
-   and is the only number an operator compares against `max_concurrent_tasks`. A
-   test asserts the three views partition `TaskStatus` and `running ⊆ in_flight`.
+   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight").
+   `max_concurrent_tasks` is compared against the rows' live count, not `running`
+   (decision 9). A test asserts the three views partition `TaskStatus` and
+   `running ⊆ in_flight`.
    **Amendment vs the first draft**: `infra-hold` moved from `backlog` to `in_flight`
    on the reviewer's evidence — it is entered from in-progress via
    `orchestrator/src/orchestrator/workflow.py::_mark_blocked(block_status='infra-hold')`
