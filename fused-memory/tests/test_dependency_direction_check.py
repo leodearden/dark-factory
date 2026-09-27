@@ -521,7 +521,7 @@ class TestMemoryServiceSubPass:
         svc = _service(mock_config)
         result = _result({'e1': 'Task 3727 and task 3619 were both filed today'})
 
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == 0
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == []
 
         # The restriction to compact dependency shorthand is what keeps a
         # blanket check off every write. Pinned so it cannot silently erode.
@@ -533,7 +533,15 @@ class TestMemoryServiceSubPass:
         svc = _service(mock_config)
         result = _result({**BAD_FACTS, **CORRECT_FACTS})
 
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == 3
+        records = await svc._check_dependency_direction(result, group_id=GROUP)
+
+        assert {r['edge_uuid'] for r in records} == set(BAD_FACTS)
+        for record in records:
+            assert record['fact'] == BAD_FACTS[record['edge_uuid']]
+            assert isinstance(record['dependent'], int)
+            assert isinstance(record['dependency'], int)
+            assert record['classification'] in (REVERSED, SIBLING_SEQUENTIAL)
+            assert 'ground_truth' in record
 
         calls = _ue(svc).await_args_list
         assert {c.args[0] for c in calls} == set(BAD_FACTS)
@@ -586,24 +594,24 @@ class TestMemoryServiceSubPass:
         # Unresolvable -> 0, and no taskmaster call at all.
         _tm(svc).get_dependency_edges.reset_mock()
         svc._memory_metadata_project_root = MagicMock(return_value='')
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == 0
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == []
         _tm(svc).get_dependency_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_f_no_taskmaster_returns_zero_without_raising(self, mock_config):
+    async def test_f_no_taskmaster_returns_no_records_without_raising(self, mock_config):
         svc = _service(mock_config)
         svc.taskmaster = None
         assert await svc._check_dependency_direction(
             _result(BAD_FACTS), group_id=GROUP
-        ) == 0
+        ) == []
 
     @pytest.mark.asyncio
-    async def test_g_ground_truth_read_failure_returns_zero(self, mock_config):
+    async def test_g_ground_truth_read_failure_returns_no_records(self, mock_config):
         svc = _service(mock_config)
         _tm(svc).get_dependency_edges = AsyncMock(side_effect=RuntimeError('db'))
         assert await svc._check_dependency_direction(
             _result(BAD_FACTS), group_id=GROUP
-        ) == 0
+        ) == []
         _ue(svc).assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -613,8 +621,16 @@ class TestMemoryServiceSubPass:
             side_effect=[RuntimeError('boom'), {}, {}]
         )
         # The remaining flagged edges are still attempted.
-        await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+        records = await svc._check_dependency_direction(
+            _result(BAD_FACTS), group_id=GROUP
+        )
         assert svc.update_edge.await_count == 3
+
+        # A record means the edge was really invalidated, never that
+        # invalidation was merely attempted.
+        failed_uuid = svc.update_edge.await_args_list[0].args[0]
+        assert len(records) == 2
+        assert failed_uuid not in {r['edge_uuid'] for r in records}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
@@ -634,7 +650,8 @@ class TestMemoryServiceSubPass:
     async def test_h_both_result_edge_fields_are_honoured(self, mock_config, field):
         svc = _service(mock_config)
         result = _result(BAD_FACTS, field=field)
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == 3
+        records = await svc._check_dependency_direction(result, group_id=GROUP)
+        assert len(records) == 3
 
 
 class TestReconcileEpisodeIdentityWiring:
@@ -712,6 +729,46 @@ class TestReconcileEpisodeIdentityWiring:
         monkeypatch.setattr(svc, '_check_dependency_direction', _cancel)
         with pytest.raises(asyncio.CancelledError):
             await svc._reconcile_episode_identity(_result(BAD_FACTS), group_id=GROUP)
+
+    @pytest.mark.asyncio
+    async def test_findings_never_leak_between_concurrently_reconciling_groups(
+        self, mock_config
+    ):
+        # The identity lock in `_execute_graphiti_write` is per-group_id, so
+        # writes for DIFFERENT groups reconcile concurrently on one service.
+        # Group A is held inside its ground-truth read while group B runs a
+        # whole reconcile; neither may see the other's records.
+        svc = _service(mock_config)
+        svc.set_known_projects({'proj_a': '/srv/a', 'proj_b': '/srv/b'})
+        a_reading = asyncio.Event()
+        release_a = asyncio.Event()
+
+        async def _edges(project_root: str) -> dict[int, list[int]]:
+            if project_root == '/srv/a':
+                a_reading.set()
+                await release_a.wait()
+            return LIVE_SHAPE_EDGES
+
+        _tm(svc).get_dependency_edges = AsyncMock(side_effect=_edges)
+        result_a = _result({f'a-{k}': v for k, v in BAD_FACTS.items()})
+        result_b = _result({f'b-{k}': v for k, v in BAD_FACTS.items()})
+
+        task_a = asyncio.create_task(
+            svc._reconcile_episode_identity(result_a, group_id='proj_a')
+        )
+        await asyncio.wait_for(a_reading.wait(), 5)
+        stats_b = await svc._reconcile_episode_identity(result_b, group_id='proj_b')
+        release_a.set()
+        stats_a = await asyncio.wait_for(task_a, 5)
+
+        assert {r['edge_uuid'] for r in stats_a.dependency_direction_findings} == {
+            f'a-{k}' for k in BAD_FACTS
+        }
+        assert {r['edge_uuid'] for r in stats_b.dependency_direction_findings} == {
+            f'b-{k}' for k in BAD_FACTS
+        }
+        assert stats_a.dependency_direction_flagged == 3
+        assert stats_b.dependency_direction_flagged == 3
 
     @pytest.mark.asyncio
     async def test_an_out_of_scope_episode_leaves_both_fields_at_defaults(
