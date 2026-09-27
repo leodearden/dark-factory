@@ -15,6 +15,7 @@ by filename (the id) and read only when a citation asks for it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -39,7 +40,11 @@ from orchestrator.session_registry import (
     normalize_project_token,
 )
 
-QUEUE_SUBDIRS: tuple[Path, ...] = (Path('data', 'escalations'), Path('data', 'reconciliation', 'escalations'))
+QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
+    Path('data', 'escalations'): '',
+    Path('data', 'reconciliation', 'escalations'): 'recon',
+})
+QUEUE_SUBDIRS: tuple[Path, ...] = tuple(QUEUE_TAGS)
 
 ESC_ID_RE = re.compile(r'\besc-(?:[A-Za-z0-9_]+-)+\d+\b')
 TASK_CITATION_RE = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
@@ -62,10 +67,18 @@ class Shortfall:
 
 @dataclass(frozen=True)
 class OpenItem:
-    """One question awaiting a human. ``key`` is its identity; see ``escalation_key`` / ``decision_key``."""
+    """One question awaiting a human. ``key`` is its identity; see ``escalation_key`` / ``decision_key``.
+
+    ``decision_project`` is the canonical project of the DecisionRecord named by
+    ``decision_id``, as read: the compare-and-swap expectation a close payload
+    sends. It is not ``project``, which is derived from the queue for an
+    escalation item, and dark-factory's recon queue carries other projects'
+    gates, so the two legitimately differ.
+    """
 
     key: ItemKey
     decision_id: str | None = None
+    decision_project: str = ''
     escalation_id: str | None = None
     queue_dir: str = ''
     project: str = ''
@@ -79,6 +92,10 @@ class OpenItem:
     triage_note: str = ''
     filed_at: str = ''
     age_days: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.decision_id is None and self.decision_project:
+            raise ValueError(f'{self.key}: decision_project {self.decision_project!r} names no decision_id')
 
     @property
     def kind(self) -> str:
@@ -125,13 +142,27 @@ def parse_key(text: str) -> ItemKey:
     return tuple(parts)
 
 
-def queue_project_root(queue_dir: str) -> Path | None:
-    path = Path(queue_dir)
+def _known_queue_subdir(path: Path) -> Path | None:
     for subdir in QUEUE_SUBDIRS:
         depth = len(subdir.parts)
         if path.parts[-depth:] == subdir.parts and len(path.parts) > depth:
-            return path.parents[depth - 1]
+            return subdir
     return None
+
+
+def queue_project_root(queue_dir: str) -> Path | None:
+    path = Path(queue_dir)
+    subdir = _known_queue_subdir(path)
+    return path.parents[len(subdir.parts) - 1] if subdir is not None else None
+
+
+def queue_tag(queue_dir: str) -> str:
+    """A decision-id-safe tag naming *queue_dir*'s shape: its ``QUEUE_TAGS`` entry, else a digest of its path."""
+    normalized = normalize_escalations_dir(queue_dir)
+    subdir = _known_queue_subdir(Path(normalized))
+    if subdir is not None:
+        return QUEUE_TAGS[subdir]
+    return 'q' + hashlib.sha256(normalized.encode()).hexdigest()[:10]
 
 
 def queue_project(queue_dir: str) -> str:
@@ -193,7 +224,9 @@ def collect_open_items(
         host_key = escalation_key(queue_dir, record.escalation_id) if record.escalation_id else None
         host = items.get(host_key) if host_key is not None else None
         if host_key is not None and host is not None and host.decision_id is None:
-            items[host_key] = replace(host, decision_id=record.id)
+            items[host_key] = replace(
+                host, decision_id=record.id, decision_project=normalize_project_token(record.project)
+            )
         else:
             item = _decision_item(record, queue_dir, now)
             items[item.key] = item
@@ -353,6 +386,7 @@ def _decision_item(record: DecisionRecord, queue_dir: str, now: datetime) -> Ope
     return OpenItem(
         key=decision_key(record.id),
         decision_id=record.id,
+        decision_project=normalize_project_token(record.project),
         escalation_id=record.escalation_id,
         queue_dir=queue_dir,
         project=normalize_project_token(record.project),
