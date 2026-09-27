@@ -186,7 +186,6 @@ def test_unrunnable_delegate_is_loud_but_never_blocking(tmp_path):
 
     proc = _run_guard([missing], _hook_input("git status"))
 
-    assert proc.returncode != 2
     assert proc.returncode == 1
     assert proc.stdout == b""
     assert str(missing) in proc.stderr.decode()
@@ -198,7 +197,6 @@ def test_bad_invocation_never_blocks(tmp_path, argc):
 
     proc = _run_guard([delegate] * argc, _hook_input("git status"))
 
-    assert proc.returncode != 2
     assert proc.returncode == 1
     assert proc.stdout == b""
 
