@@ -436,6 +436,15 @@ class DecisionRecord:
         drives through the ``close-decision`` verb. Defaults to '' (not
         closed with evidence, or filed before this field existed). CUSTODY,
         like ``state``: a watcher's re-file never changes it.
+    closed_at: the ISO-8601 UTC instant close_decision_with_evidence recorded
+        the close -- on the reap-decisions-got-there-first path, when the
+        evidence was attached. Written only by close_decision_with_evidence,
+        in the same write as ``closing_evidence``, and CUSTODY like it. It
+        exists because the return brief windows its autonomous-closes section
+        on when a close happened, and ``filed_at`` is the wrong clock for
+        that: a carve-out close targets an L2 that has been open a while.
+        Defaults to '' (not closed with evidence, or closed before this field
+        existed).
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -474,6 +483,7 @@ class DecisionRecord:
     severity: str = field(default='', kw_only=True)
     escalations_dir: str = field(default='', kw_only=True)
     closing_evidence: str = field(default='', kw_only=True)
+    closed_at: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -490,6 +500,7 @@ class DecisionRecord:
             'severity': self.severity,
             'escalations_dir': self.escalations_dir,
             'closing_evidence': self.closing_evidence,
+            'closed_at': self.closed_at,
         }
 
     @classmethod
@@ -511,8 +522,9 @@ class DecisionRecord:
             # `str` annotation stays honest against a hand-edited record and
             # the reaper's queue guard needs no None-vs-''-vs-missing branch.
             escalations_dir=data.get('escalations_dir') or '',
-            # Same `or ''` idiom as escalations_dir above.
+            # Same `or ''` idiom as escalations_dir above, for both custody fields.
             closing_evidence=data.get('closing_evidence') or '',
+            closed_at=data.get('closed_at') or '',
         )
 
     def to_json(self) -> str:
@@ -1176,6 +1188,7 @@ def close_decision_with_evidence(
             )
         record.state = str(state)
         record.closing_evidence = evidence
+        record.closed_at = datetime.now(UTC).isoformat()
 
     return _mutate_decision(
         decision_id, _close, caller='close_decision_with_evidence', root=root
@@ -1310,11 +1323,11 @@ def merge_decision_enrichment(
 
     - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
       is the whole reason these two records are being merged.
-    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` --
-      from *existing* (CUSTODY). A second watcher must not restamp queue age,
-      re-open or close the record (that is update_decision_state's job),
-      reset an operator's C5 cockpit boost, or erase the evidence a close
-      recorded.
+    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
+      ``closed_at`` -- from *existing* (CUSTODY). A second watcher must not
+      restamp queue age, re-open or close the record (that is
+      update_decision_state's job), reset an operator's C5 cockpit boost, or
+      erase the evidence a close recorded or when it recorded it.
     - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
       *existing* where it is non-empty; take *incoming* ONLY to fill a field
       the first filer left empty/None. That fill is what makes this
@@ -1396,11 +1409,12 @@ def merge_same_queue_refile(
       _max_decision_severity) would strand stale prose and a stale severity
       in the cockpit queue forever. This is the whole reason the same-queue
       case is not just routed through merge_decision_enrichment.
-    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` --
-      from *existing* (CUSTODY), and it is the SAME set
+    - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
+      ``closed_at`` -- from *existing* (CUSTODY), and it is the SAME set
       merge_decision_enrichment keeps, because custody does not depend on
-      which queue re-filed. ``closing_evidence`` travels with ``state``: it
-      is the evidence for the disposition being held. ``filed_at``
+      which queue re-filed. ``closing_evidence`` and ``closed_at`` travel
+      with ``state``: they are the evidence for the disposition being held
+      and when it was recorded. ``filed_at``
       is queue AGE, which drives the cockpit's ordering, and a restart is not
       news about it. ``manual_boost`` is the OPERATOR's C5 field, written by
       set_manual_boost. ``state`` is the operator's / reaper's DISPOSITION,
@@ -1487,6 +1501,7 @@ def merge_same_queue_refile(
         state=existing.state,
         manual_boost=existing.manual_boost,
         closing_evidence=existing.closing_evidence,
+        closed_at=existing.closed_at,
     )
 
 
