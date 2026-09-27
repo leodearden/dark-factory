@@ -14655,12 +14655,17 @@ def _streak_update(
     streak: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES + 1,
     window_suppressed: int = SUPPRESSION_STREAK_VOLUME_THRESHOLD + 1,
 ) -> flag_dedup.SuppressionStreakUpdate:
+    """An update whose verdict follows update_suppression_streaks' rule, so a
+    fixture cannot claim a verdict the updater would never produce."""
     return flag_dedup.SuppressionStreakUpdate(
         entity_uuid=entity_uuid,
         grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
         streak=streak,
         window_suppressed=window_suppressed,
-        escalate=streak >= SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+        escalate=(
+            streak >= SUPPRESSION_STREAK_THRESHOLD_CYCLES
+            and window_suppressed > SUPPRESSION_STREAK_VOLUME_THRESHOLD
+        ),
     )
 
 
@@ -14703,6 +14708,40 @@ class TestMaybeEscalateSuppressionStreak:
         assert GROUNDS_STRUCTURAL_SIZE_CONFLATION in blob
         assert f'streak: {update.streak}' in esc.detail
         assert f'threshold: {SUPPRESSION_STREAK_THRESHOLD_CYCLES}' in esc.detail
+        assert f'suppressed_in_window: {update.window_suppressed}' in esc.detail
+        assert f'volume_threshold: {SUPPRESSION_STREAK_VOLUME_THRESHOLD}' in esc.detail
+        assert f'suppressed {update.window_suppressed} recon flag(s)' in esc.summary
+        assert (
+            f'last {SUPPRESSION_STREAK_THRESHOLD_CYCLES} consecutive cycles' in esc.summary
+        )
+        assert f'(> {SUPPRESSION_STREAK_VOLUME_THRESHOLD})' in esc.summary
+
+    @pytest.mark.asyncio
+    async def test_long_steady_state_streak_files_nothing(self, queue):
+        """The filer keys off the verdict, never off the streak length alone:
+        a decision suppressing one flag per cycle for ten cycles is working."""
+        steady = _streak_update(streak=10, window_suppressed=SUPPRESSION_STREAK_THRESHOLD_CYCLES)
+        assert steady.escalate is False
+
+        escalated = await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [steady]
+        )
+
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_record_names_the_volume_threshold_it_was_given(self, queue):
+        custom_n = SUPPRESSION_STREAK_VOLUME_THRESHOLD + 2
+        update = _streak_update(window_suppressed=custom_n + 1)
+
+        await flag_dedup.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [update], volume_threshold=custom_n
+        )
+
+        (esc,) = self._pending(queue)
+        assert f'volume_threshold: {custom_n}' in esc.detail
+        assert f'(> {custom_n})' in esc.summary
 
     @pytest.mark.asyncio
     async def test_update_below_threshold_files_nothing(self, queue):
