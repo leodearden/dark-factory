@@ -77,16 +77,11 @@ from fused_memory.models.reconciliation import RunStatus, StageReport
 # ``citation_verifier._CANONICAL_UUID_RE`` already exist, and a third copy of the
 # same gate is exactly the lockstep duplication INV-5 forbids.
 from fused_memory.reconciliation.citation_verifier import is_concrete_memory_id
+from fused_memory.reconciliation.journal import CITATION_REPAIRS_KEY
 
 logger = logging.getLogger(__name__)
 
 __all__ = ['build_citation_repair_record', 'repair_memory_citation']
-
-# The provenance key appended to a repaired finding. Deliberate sibling of the
-# ``citation_failures`` key ``verify_cited_memories`` writes: a reader of any
-# finding sees both "this claim lost its backing" and "this claim's backing was
-# re-pointed", in the same shape.
-CITATION_REPAIRS_KEY = 'citation_repairs'
 
 # The only store this path can corroborate against. ``get_memory_by_id`` is a
 # Mem0/Qdrant point read, so a graphiti id would resolve to None and be
