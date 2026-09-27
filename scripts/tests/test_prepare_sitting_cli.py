@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -14,6 +17,7 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
     normalize_escalations_dir,
+    normalize_project_token,
 )
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
@@ -296,8 +300,10 @@ class TestRecommendOnly:
         assert close['tool'] == 'cli:session_registry'
         argv = close['args'][-1]
         assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
-            '--id', 'esc-400-1', '--state', 'answered',
+            '--id', f'{normalize_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
         ]
+        assert argv[argv.index('--project') + 1] == closeable['esc-400-1']['project']
+        assert argv[argv.index('--escalations-dir') + 1] == normalize_escalations_dir(env.queue)
         assert 'gate 6 sideways_check_ran: held' in argv[argv.index('--evidence') + 1]
 
     def test_apply_closes_alone_closes_nothing_without_recorded_agent_facts(self, env, capsys):
@@ -308,6 +314,66 @@ class TestRecommendOnly:
         assert data['closeable'] == []
         assert set(_rows(data, 'report_only')) == {'esc-400-1'}
         assert 'ruling_is_leos_own' in _rows(data, 'report_only')['esc-400-1']['missed_gates']
+
+
+class TestCloseCollision:
+    """The reviewer's regression, EXECUTED: a close payload never lands on another project's record at a shared id."""
+
+    def _seed_other_project(self, env: Env, decision_id: str) -> Path:
+        other_queue = env.tmp / 'src' / 'know-live' / 'data' / 'escalations'
+        record = DecisionRecord(id=decision_id, project='know_live', text="know_live's own unrelated gate",
+                                filed_at='2026-09-19T09:00:00+00:00', escalation_id='esc-400-1',
+                                escalations_dir=normalize_escalations_dir(other_queue))
+        path = env.fleet / 'decisions' / f'{decision_id}.json'
+        path.write_text(record.to_json())
+        return path
+
+    def _decision_files(self, env: Env) -> dict[str, bytes]:
+        return {p.name: p.read_bytes() for p in (env.fleet / 'decisions').iterdir() if not p.name.endswith('.lock')}
+
+    def _apply_the_close(self, env: Env, capsys) -> list[subprocess.CompletedProcess[str]]:
+        """Run the closeable esc-400-1's registry argvs in order, stopping at the first non-zero exit as apply does."""
+        data = _classify(capsys, env, '--apply-closes')
+        (row,) = [r for r in data['closeable'] if r['escalation_id'] == 'esc-400-1']
+        (payload,) = [p for p in row['payloads'] if p['tool'] == 'cli:session_registry']
+        fleet_env = {**os.environ, 'CLAUDE_FLEET_ROOT': str(env.fleet)}
+        runs: list[subprocess.CompletedProcess[str]] = []
+        for argv in payload['args']:
+            runs.append(subprocess.run(argv, env=fleet_env, capture_output=True, text=True, timeout=60, check=False))
+            if runs[-1].returncode != 0:
+                break
+        return runs
+
+    def test_a_bare_id_collision_leaves_the_other_record_and_files_under_the_derived_id(self, env, capsys):
+        self._seed_other_project(env, 'esc-400-1')
+        before = self._decision_files(env)
+        project = normalize_project_token(env.df.name)
+        derived = f'{project}-esc-400-1'
+
+        runs = self._apply_the_close(env, capsys)
+
+        assert [run.returncode for run in runs] == [0, 0], [run.stderr for run in runs]
+        after = self._decision_files(env)
+        closed = DecisionRecord.from_json(after.pop(f'{derived}.json'))
+        assert after == before
+        assert closed.state == 'answered'
+        assert closed.closing_evidence
+        assert datetime.fromisoformat(closed.closed_at).tzinfo is not None
+        assert (closed.project, closed.escalations_dir) == (project, normalize_escalations_dir(env.queue))
+
+    def test_a_forced_derived_id_collision_is_refused_loudly(self, env, capsys):
+        other = self._seed_other_project(env, f'{normalize_project_token(env.df.name)}-esc-400-1')
+        before = self._decision_files(env)
+
+        write, close = self._apply_the_close(env, capsys)
+
+        assert write.returncode == 0
+        assert close.returncode != 0
+        assert 'close-decision refused' in close.stderr
+        assert 'know_live' in close.stderr
+        assert self._decision_files(env) == before
+        untouched = DecisionRecord.from_json(other.read_text())
+        assert (untouched.state, untouched.closing_evidence, untouched.closed_at) == ('open', '', '')
 
 
 def _snapshot(*roots: Path) -> dict[Path, tuple[bytes, int]]:
