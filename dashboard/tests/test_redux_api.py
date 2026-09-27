@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dashboard.data import redux_api
+from dashboard.data import burndown, census, redux_api
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -944,12 +944,12 @@ def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
 
 
 def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
-    """Aggregate series are densified onto the union row by label, not position.
+    """Aggregate series are a label-indexed carry-last sum over the union row.
 
-    Passes against current server code — a regression pin.  The spot-check on
-    2026-05-21 (reported only by p2) is what distinguishes label-indexed
-    densification from a positional sum, which would fold p1's 05-22 values
-    into the 05-21 slot.
+    At every union label each project contributes its last measured row at or
+    before that label — neither a positional sum (which would fold p1's 05-22
+    values into the 05-21 slot) nor a zero-fill (which would read p1 as
+    having nothing at 05-21, only because its collector ticked elsewhere).
     """
     body = redux_api.shape_burndown(_DIVERGENT_SERIES)
     agg = body['BURNDOWN']
@@ -959,9 +959,9 @@ def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
         assert len(agg[key]) == n, f'aggregate {key} has {len(agg[key])} values for {n} labels'
 
     mid = agg['labels'].index('2026-05-21T00:00:00')
-    # Only p2 reported this timestamp, so the aggregate is p2's value alone.
-    assert agg['done'][mid] == 200
-    assert agg['pending'][mid] == 40
+    # Only p2 measured this timestamp; p1 is carried from its 05-20 row.
+    assert agg['done'][mid] == 203      # 200 + 3
+    assert agg['pending'][mid] == 50    # 40 + 10
     # Timestamps both projects reported sum across them.
     assert agg['done'][agg['labels'].index('2026-05-20T00:00:00')] == 103   # 3 + 100
     assert agg['done'][agg['labels'].index('2026-05-22T00:00:00')] == 307   # 7 + 300
@@ -982,9 +982,8 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
         get_burndown_series upstream, NOT from this function;
       * completed / velocity / window_days are zeroed and the forecast is None,
         because both helpers bail out on the mismatch;
-      * the aggregate densification, which zips labels against values with
-        strict=False, silently reads the missing tail as 0 — indistinguishable
-        from a genuine 0 measurement.
+      * the aggregate reads the missing tail as a HOLE (None), never 0: a
+        value missing from a measured row is not a measured zero.
 
     If a future change makes shape_burndown normalize (pad/truncate) or raise
     on ragged input, that is a deliberate contract change and this test should
@@ -1014,10 +1013,97 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
     assert agg['labels'] == [
         '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
     ]
-    # The unreported third slot reads as 0, not as a hole.
-    assert agg['done'] == [3, 7, 0]
+    # The unreported third slot is a hole, not a 0.
+    assert agg['done'] == [3, 7, None]
     assert agg['in_progress'] == [1, 2, 3]
     assert agg['completed'] == 0            # sum of per-project completeds
+
+
+def test_shape_burndown_aggregate_endpoint_is_the_sum_of_each_projects_last_measured_row():
+    """Sketch #6: the newest point sums A's t3 row with B's t2 row, never A alone.
+
+    A measured t1 and t3; B measured only t2. Before B's first row B has
+    nothing to carry, so t1 is A alone.
+    """
+    t1, t2, t3 = '2026-05-20T00:00:00', '2026-05-20T00:10:00', '2026-05-20T00:20:00'
+    a = {'labels': [t1, t3], 'done': [3, 5], 'in_progress': [2, 4],
+         'blocked': [1, 0], 'pending': [9, 7]}
+    b = {'labels': [t2], 'done': [50], 'in_progress': [6], 'blocked': [2], 'pending': [30]}
+
+    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+
+    assert agg['labels'] == [t1, t2, t3]
+    for key in ('in_progress', 'blocked', 'pending', 'done'):
+        assert agg[key][0] == a[key][0], key
+        assert agg[key][1] == a[key][0] + b[key][0], key
+        assert agg[key][-1] == a[key][1] + b[key][0], key
+
+
+def test_shape_burndown_aggregate_carries_a_hole_where_the_project_contributes():
+    """B's one row predates review (NULL): every label B contributes to is a hole.
+
+    Members both projects measured still sum; at t1, before B's first row,
+    A's review stands alone.
+    """
+    labels = ['2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00']
+    a = {'labels': labels, 'done': [1, 2, 3], 'pending': [9, 8, 7], 'review': [1, 2, 3]}
+    b = {'labels': [labels[1]], 'done': [5], 'pending': [4], 'review': [None]}
+
+    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+
+    assert agg['review'] == [1, None, None]
+    assert agg['done'] == [1, 7, 8]
+    assert agg['pending'] == [9, 12, 11]
+
+
+_SPLIT_SERIES_KEYS = ('in_progress_live', 'in_progress_stranded', 'in_progress_rows')
+
+
+def _nine_member_series(labels: list[str], base: int) -> dict:
+    """A series carrying every census member plus the in-progress split."""
+    n = len(labels)
+    series: dict = {'labels': labels}
+    for offset, key in enumerate(census.SERIES_KEYS.values()):
+        series[key] = [base + offset * 10 + i for i in range(n)]
+    for offset, key in enumerate(_SPLIT_SERIES_KEYS):
+        series[key] = [base + 100 + offset * 10 + i for i in range(n)]
+    return series
+
+
+def test_shape_burndown_carries_all_nine_members_and_the_split_to_the_wire():
+    """Cancelled, deferred and delta-1's three members are no longer dropped at the seam."""
+    labels = ['2026-05-20T00:00:00', '2026-05-21T00:00:00']
+    a = _nine_member_series(labels, base=1)
+    b = _nine_member_series(labels, base=1000)
+
+    body = redux_api.shape_burndown({'A': a, 'B': b})
+
+    for key in (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS):
+        for pid, fixture in (('A', a), ('B', b)):
+            assert body['BURNDOWN_BY_PROJECT'][pid][key] == fixture[key], (pid, key)
+        assert body['BURNDOWN'][key] == [x + y for x, y in zip(a[key], b[key], strict=True)], key
+    assert body['BURNDOWN_BY_PROJECT']['A']['cancelled'] == a['cancelled']
+    assert body['BURNDOWN_BY_PROJECT']['A']['deferred'] == a['deferred']
+
+
+def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
+    """B entering on day 6 with done 4000 is where B starts, not 4000 completions.
+
+    A forecast over the summed ``done`` series would read that entry as a jump
+    and forecast ~0 days; the fold over per-project measured series does not.
+    """
+    labels = [f'2026-04-{d:02d}T00:00:00' for d in range(1, 11)]
+    a = {'labels': labels, 'done': list(range(10)), 'pending': [20] * 10}
+    b = {'labels': labels[5:], 'done': [4000] * 5, 'pending': [5] * 5}
+
+    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+
+    assert burndown.aggregate_forecast_confidence([a, b]) == {
+        'forecast_low': 27.8,
+        'forecast_high': 29.2,
+    }
+    assert agg['forecast_low'] == 27.8
+    assert agg['forecast_high'] == 29.2
 
 
 # ---------------------------------------------------------------------------
