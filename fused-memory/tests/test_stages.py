@@ -65,6 +65,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     STREAK_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    SUPPRESSION_STREAK_THRESHOLD_CYCLES,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -17012,9 +17013,12 @@ class TestMemoryConsolidatorEntityStandingDecision:
 #   • every full cycle advances each standing decision's suppression streak,
 #     including a zero-flag cycle, which never enters the filter chain yet is a
 #     quiet cycle that must reset the streak;
-#   • a decision suppressing in K consecutive cycles, each under the per-cycle
-#     N, files a storm-category L1 when an escalation queue is wired, while the
-#     streak state accrues with or without one;
+#   • a decision whose streak has reached K and that suppressed more than N
+#     flags in total across its last K cycles files a storm-category L1 when an
+#     escalation queue is wired, while the streak state accrues with or without
+#     one;
+#   • one flag per cycle, which is how a decision that works behaves, never
+#     files, however long its streak;
 #   • a remediation pass neither increments nor resets.
 # ---------------------------------------------------------------------------
 
@@ -17081,10 +17085,18 @@ class TestMemoryConsolidatorSuppressionStreak:
         streaks = {r.entity_uuid: json.loads(r.payload_json)[STREAK_PAYLOAD_KEY] for r in rows}
         return streaks.get(self._U)
 
+    def _pending_storms(self, queue) -> list:
+        return [
+            esc
+            for esc in queue.get_by_task(self._U, status='pending', level=1)
+            if esc.category == CATEGORY_STANDING_DECISION_STORM
+        ]
+
     @pytest.mark.asyncio
-    async def test_three_consecutive_cycles_reach_k_and_file_one_escalation(
-        self, stage, tmp_path
-    ):
+    async def test_one_flag_per_cycle_never_files(self, stage, tmp_path):
+        """The review-round-1 regression, end to end. A decision that works
+        suppresses its re-derived complaint about once per cycle; K+1 such
+        cycles carry its streak past K and file nothing."""
         from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path / 'escalations')
@@ -17092,21 +17104,40 @@ class TestMemoryConsolidatorSuppressionStreak:
         ledger = await self._ledger_with_active_decision(tmp_path)
         stage.memory.recon_ledger = ledger
 
-        def _pending_storms():
-            return [
-                esc
-                for esc in queue.get_by_task(self._U, status='pending', level=1)
-                if esc.category == CATEGORY_STANDING_DECISION_STORM
-            ]
+        observed = []
+        try:
+            for n in range(1, SUPPRESSION_STREAK_THRESHOLD_CYCLES + 2):
+                report = await self._suppressing_cycle(stage, f'r-steady-{n}')
+                assert report.stats['entity_standing_decision_suppressed'] == 1
+                observed.append((report.stats[self._STAT], len(self._pending_storms(queue))))
+        finally:
+            await ledger.close()
+
+        assert observed == [(1, 0), (2, 0), (3, 0), (4, 0)]
+
+    @pytest.mark.asyncio
+    async def test_sustained_volume_files_on_the_kth_cycle(self, stage, tmp_path):
+        """Two flags per cycle stay under the per-cycle N, yet total more than
+        N across K consecutive cycles, so the streak escape files on the Kth."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
 
         observed = []
         try:
             for n in range(1, 4):
-                report = await self._suppressing_cycle(stage, f'r-streak-{n}')
-                assert report.stats['entity_standing_decision_suppressed'] == 1
+                flags = [
+                    self._strong_flag('oversized_entity'),
+                    self._strong_flag('topic_conflation'),
+                ]
+                report = await self._run_cycle(stage, f'r-volume-{n}', flags)
+                assert report.stats['entity_standing_decision_suppressed'] == 2
                 observed.append(
                     (report.stats[self._STAT], await self._stored_streak(ledger),
-                     len(_pending_storms()))
+                     len(self._pending_storms(queue)))
                 )
         finally:
             await ledger.close()

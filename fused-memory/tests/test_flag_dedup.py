@@ -24,8 +24,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     RECORD_KIND_ENTITY_STANDING_DECISION,
     RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     SUPPRESSION_STREAK_THRESHOLD_CYCLES,
+    SUPPRESSION_STREAK_VOLUME_THRESHOLD,
 )
 
 
@@ -14132,22 +14134,53 @@ _STREAK_PID = 'p'
 _STREAK_NOW = '2026-06-01T00:00:00+00:00'
 
 
-def _suppressing(*entity_uuids: str) -> flag_dedup.EntityStandingSuppressionResult:
-    """A fully evaluated cycle in which each named decision suppressed one flag."""
+def _suppressing_counts(counts: dict[str, int]) -> flag_dedup.EntityStandingSuppressionResult:
+    """A fully evaluated cycle in which each named decision suppressed its count of flags."""
     return flag_dedup.EntityStandingSuppressionResult(
         kept_flags=[],
-        suppressed_by_decision={u: 1 for u in entity_uuids},
-        grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in entity_uuids},
+        suppressed_by_decision=dict(counts),
+        grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in counts},
     )
 
 
-async def _stored_streaks(ledger: ReconLedgerStore) -> dict[str, int]:
+def _suppressing(*entity_uuids: str) -> flag_dedup.EntityStandingSuppressionResult:
+    """A fully evaluated cycle in which each named decision suppressed one flag."""
+    return _suppressing_counts({u: 1 for u in entity_uuids})
+
+
+async def _stored_payload_values(ledger: ReconLedgerStore, key: str) -> dict[str, Any]:
     rows = await ledger.list_suppression_streaks(_STREAK_PID)
-    streaks: dict[str, int] = {}
+    values: dict[str, Any] = {}
     for row in rows:
         assert row.entity_uuid is not None, 'a suppression-streak row always carries its entity_uuid'
-        streaks[row.entity_uuid] = json.loads(row.payload_json)[STREAK_PAYLOAD_KEY]
-    return streaks
+        values[row.entity_uuid] = json.loads(row.payload_json)[key]
+    return values
+
+
+async def _stored_streaks(ledger: ReconLedgerStore) -> dict[str, int]:
+    return await _stored_payload_values(ledger, STREAK_PAYLOAD_KEY)
+
+
+async def _stored_windows(ledger: ReconLedgerStore) -> dict[str, list]:
+    return await _stored_payload_values(ledger, STREAK_WINDOW_PAYLOAD_KEY)
+
+
+async def _seed_raw_streak_payload(ledger: ReconLedgerStore, payload: dict[str, Any]) -> None:
+    """Write a streak row for _ESD_U1 past the ledger's validation, as a
+    hand-edited or older-shaped row would arrive."""
+    await ledger.upsert(
+        ReconLedgerRecord(
+            project_id=_STREAK_PID,
+            record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+            payload_json=json.dumps(payload),
+            state='active',
+            created_at=_STREAK_NOW,
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id=_ESD_U1,
+            entity_uuid=_ESD_U1,
+            expires_at='2099-01-01T00:00:00+00:00',
+        )
+    )
 
 
 async def _run_cycle(
@@ -14162,6 +14195,20 @@ async def _run_cycle(
     )
 
 
+async def _run_consecutive_cycles(
+    memory_service: Any, counts: list[int] | tuple[int, ...]
+) -> list[flag_dedup.SuppressionStreakUpdate]:
+    """One cycle per entry of *counts*, runs run-1, run-2, ..., in which _ESD_U1's
+    decision suppresses that many flags; returns its update from each cycle."""
+    updates = []
+    for n, count in enumerate(counts, start=1):
+        (update,) = await _run_cycle(
+            memory_service, f'run-{n}', _suppressing_counts({_ESD_U1: count})
+        )
+        updates.append(update)
+    return updates
+
+
 class TestUpdateSuppressionStreaks:
     """Increment, reset and replay rules of the streak state (task 2943 step-7)."""
 
@@ -14174,6 +14221,7 @@ class TestUpdateSuppressionStreaks:
                 entity_uuid=_ESD_U1,
                 grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
                 streak=1,
+                window_suppressed=1,
                 escalate=False,
             )
         ]
@@ -14190,16 +14238,17 @@ class TestUpdateSuppressionStreaks:
     async def test_escalates_from_the_kth_consecutive_cycle_and_keeps_counting(
         self, ledger_memory_service
     ):
-        """Inclusive >= K, and escalating does not reset the counter."""
+        """At two flags per cycle the window exceeds N from the Kth cycle
+        (inclusive >= K), and escalating does not reset the counter."""
         assert SUPPRESSION_STREAK_THRESHOLD_CYCLES == 3
-        seen = []
-        for n in range(1, 5):
-            (update,) = await _run_cycle(
-                ledger_memory_service, f'run-{n}', _suppressing(_ESD_U1)
-            )
-            seen.append((update.streak, update.escalate))
+        updates = await _run_consecutive_cycles(ledger_memory_service, [2] * 4)
 
-        assert seen == [(1, False), (2, False), (3, True), (4, True)]
+        assert [(u.streak, u.escalate) for u in updates] == [
+            (1, False),
+            (2, False),
+            (3, True),
+            (4, True),
+        ]
         assert await _stored_streaks(ledger_memory_service.recon_ledger) == {_ESD_U1: 4}
 
     @pytest.mark.asyncio
@@ -14253,21 +14302,21 @@ class TestUpdateSuppressionStreaks:
 
     @pytest.mark.asyncio
     async def test_replayed_run_id_does_not_increment(self, ledger_memory_service):
-        for n in range(1, 4):
-            await _run_cycle(ledger_memory_service, f'run-{n}', _suppressing(_ESD_U1))
+        await _run_consecutive_cycles(ledger_memory_service, [2, 2, 2])
 
-        (replayed,) = await _run_cycle(ledger_memory_service, 'run-3', _suppressing(_ESD_U1))
+        (replayed,) = await _run_cycle(
+            ledger_memory_service, 'run-3', _suppressing_counts({_ESD_U1: 2})
+        )
 
         assert (replayed.streak, replayed.escalate) == (3, True)
         assert await _stored_streaks(ledger_memory_service.recon_ledger) == {_ESD_U1: 3}
 
     @pytest.mark.asyncio
     async def test_two_entities_accumulate_independent_streaks(self, ledger_memory_service):
-        await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
-        await _run_cycle(ledger_memory_service, 'run-2', _suppressing(_ESD_U1, _ESD_U2))
-        updates = await _run_cycle(
-            ledger_memory_service, 'run-3', _suppressing(_ESD_U1, _ESD_U2)
-        )
+        both = {_ESD_U1: 2, _ESD_U2: 2}
+        await _run_cycle(ledger_memory_service, 'run-1', _suppressing_counts({_ESD_U1: 2}))
+        await _run_cycle(ledger_memory_service, 'run-2', _suppressing_counts(both))
+        updates = await _run_cycle(ledger_memory_service, 'run-3', _suppressing_counts(both))
 
         assert {u.entity_uuid: (u.streak, u.escalate) for u in updates} == {
             _ESD_U1: (3, True),
@@ -14277,6 +14326,172 @@ class TestUpdateSuppressionStreaks:
             _ESD_U1: 3,
             _ESD_U2: 2,
         }
+
+    @pytest.mark.asyncio
+    async def test_one_flag_per_cycle_never_escalates_however_long_the_streak(
+        self, ledger_memory_service
+    ):
+        """The review-round-1 regression. A decision that works suppresses its
+        re-derived complaint about once per cycle, indefinitely (PRD §Goal).
+        Its window of the last K cycles sums to K <= N, so it never files."""
+        updates = await _run_consecutive_cycles(ledger_memory_service, [1] * 6)
+
+        assert [(u.streak, u.window_suppressed, u.escalate) for u in updates] == [
+            (1, 1, False),
+            (2, 2, False),
+            (3, 3, False),
+            (4, 3, False),
+            (5, 3, False),
+            (6, 3, False),
+        ]
+        assert await _stored_windows(ledger_memory_service.recon_ledger) == {
+            _ESD_U1: [1, 1, 1]
+        }
+
+    @pytest.mark.asyncio
+    async def test_sustained_volume_escalates_on_the_kth_cycle(self, ledger_memory_service):
+        updates = await _run_consecutive_cycles(ledger_memory_service, [2, 2, 2])
+
+        assert [(u.streak, u.window_suppressed, u.escalate) for u in updates] == [
+            (1, 2, False),
+            (2, 4, False),
+            (3, 6, True),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('counts', 'escalate'),
+        [
+            pytest.param((2, 2, 1), False, id='total-equal-to-n'),
+            pytest.param((2, 2, 2), True, id='total-over-n'),
+        ],
+    )
+    async def test_window_volume_must_strictly_exceed_n(
+        self, ledger_memory_service, counts, escalate
+    ):
+        assert SUPPRESSION_STREAK_VOLUME_THRESHOLD == 5
+        *_, last = await _run_consecutive_cycles(ledger_memory_service, counts)
+
+        assert (last.window_suppressed, last.escalate) == (sum(counts), escalate)
+
+    @pytest.mark.asyncio
+    async def test_window_slides_back_under_n_without_a_reset(self, ledger_memory_service):
+        """A decision that drops back toward its steady-state rate stops
+        escalating on the next cycle, while its streak keeps counting."""
+        updates = await _run_consecutive_cycles(ledger_memory_service, [2, 2, 2, 1])
+
+        assert [(u.streak, u.window_suppressed, u.escalate) for u in updates[2:]] == [
+            (3, 6, True),
+            (4, 5, False),
+        ]
+        assert await _stored_windows(ledger_memory_service.recon_ledger) == {
+            _ESD_U1: [2, 2, 1]
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('counts', 'window_suppressed', 'escalate'),
+        [
+            pytest.param((1, 1, 6), 2, False, id='flood-owned-by-the-per-cycle-escape'),
+            pytest.param((6, 5, 5), 10, True, id='the-sub-n-cycles-are-a-drain-themselves'),
+        ],
+    )
+    async def test_a_cycle_over_the_per_cycle_n_is_left_out_of_the_window_total(
+        self, ledger_memory_service, counts, window_suppressed, escalate
+    ):
+        """One flood must not page both escapes in the same cycle, so a cycle
+        the per-cycle escape already reported is not counted. The stored window
+        still keeps that cycle's raw count."""
+        assert SUPPRESSION_STORM_THRESHOLD_PER_CYCLE == 5
+        *_, last = await _run_consecutive_cycles(ledger_memory_service, counts)
+
+        assert (last.window_suppressed, last.escalate) == (window_suppressed, escalate)
+        assert await _stored_windows(ledger_memory_service.recon_ledger) == {
+            _ESD_U1: list(counts)
+        }
+
+    @pytest.mark.asyncio
+    async def test_quiet_cycle_resets_the_window_with_the_streak(self, ledger_memory_service):
+        ledger = ledger_memory_service.recon_ledger
+        await _run_consecutive_cycles(ledger_memory_service, [2, 2])
+
+        await _run_cycle(
+            ledger_memory_service, 'run-3', flag_dedup.EntityStandingSuppressionResult.empty_batch()
+        )
+        assert await _stored_windows(ledger) == {_ESD_U1: []}
+
+        (restart,) = await _run_cycle(
+            ledger_memory_service, 'run-4', _suppressing_counts({_ESD_U1: 3})
+        )
+        assert (restart.streak, restart.window_suppressed) == (1, 3)
+        assert await _stored_windows(ledger) == {_ESD_U1: [3]}
+
+    @pytest.mark.asyncio
+    async def test_replayed_run_id_holds_the_window(self, ledger_memory_service):
+        """A replay neither re-appends nor replaces: the stored window, and so
+        the verdict, are the ones the original run wrote."""
+        await _run_consecutive_cycles(ledger_memory_service, [2, 2, 2])
+
+        (replayed,) = await _run_cycle(
+            ledger_memory_service, 'run-3', _suppressing_counts({_ESD_U1: 1})
+        )
+
+        assert (replayed.streak, replayed.window_suppressed, replayed.escalate) == (3, 6, True)
+        assert await _stored_windows(ledger_memory_service.recon_ledger) == {
+            _ESD_U1: [2, 2, 2]
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'stored_window',
+        [
+            pytest.param('2,2', id='str'),
+            pytest.param({'0': 2}, id='object'),
+            pytest.param(4, id='int'),
+            pytest.param([True, 2], id='bool-entry'),
+            pytest.param([2, 0], id='zero-entry'),
+            pytest.param([2, -1], id='negative-entry'),
+            pytest.param([2, '2'], id='str-entry'),
+        ],
+    )
+    async def test_malformed_stored_window_reads_as_empty(
+        self, ledger_memory_service, stored_window
+    ):
+        """A lost window can only under-count: it may delay a filing, never cause one."""
+        await _seed_raw_streak_payload(
+            ledger_memory_service.recon_ledger,
+            {
+                STREAK_PAYLOAD_KEY: 2,
+                'last_run_id': 'run-seed',
+                STREAK_WINDOW_PAYLOAD_KEY: stored_window,
+            },
+        )
+
+        (update,) = await _run_cycle(
+            ledger_memory_service, 'run-1', _suppressing_counts({_ESD_U1: 2})
+        )
+
+        assert (update.streak, update.window_suppressed) == (3, 2)
+
+    @pytest.mark.asyncio
+    async def test_window_on_a_zero_streak_row_is_ignored(self, ledger_memory_service):
+        """A leftover window never carries across a reset."""
+        ledger = ledger_memory_service.recon_ledger
+        await _seed_raw_streak_payload(
+            ledger,
+            {
+                STREAK_PAYLOAD_KEY: 0,
+                'last_run_id': 'run-seed',
+                STREAK_WINDOW_PAYLOAD_KEY: [5, 5, 5],
+            },
+        )
+
+        (update,) = await _run_cycle(
+            ledger_memory_service, 'run-1', _suppressing_counts({_ESD_U1: 1})
+        )
+
+        assert (update.streak, update.window_suppressed, update.escalate) == (1, 1, False)
+        assert await _stored_windows(ledger) == {_ESD_U1: [1]}
 
 
 async def _seed_streak(
@@ -14436,12 +14651,15 @@ class TestUpdateSuppressionStreaksFailSafe:
 
 
 def _streak_update(
-    entity_uuid: str = _ESD_U1, streak: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES + 1
+    entity_uuid: str = _ESD_U1,
+    streak: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES + 1,
+    window_suppressed: int = SUPPRESSION_STREAK_VOLUME_THRESHOLD + 1,
 ) -> flag_dedup.SuppressionStreakUpdate:
     return flag_dedup.SuppressionStreakUpdate(
         entity_uuid=entity_uuid,
         grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
         streak=streak,
+        window_suppressed=window_suppressed,
         escalate=streak >= SUPPRESSION_STREAK_THRESHOLD_CYCLES,
     )
 
