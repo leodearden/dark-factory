@@ -4,9 +4,9 @@ The invariant
 -------------
 ``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward a
 ``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
-present.  It substitutes ``_REAL_BUILTIN_TOOLS_DENYLIST`` — a list of BUILT-INS
-ONLY, carrying no MCP tool pattern — so the schema's synthetic
-``StructuredOutput`` tool survives.  MCP tools are therefore still REACHABLE at
+present.  It emits ``--tools ''`` instead, so the schema's synthetic
+``StructuredOutput`` tool survives.  That registry filter removes built-in and
+deferred tools but does NOT filter MCP, so MCP tools are still REACHABLE at
 such a call, even though the call reads as "deny everything".
 
 The CLI ambient-merges the ``.mcp.json`` found at ``cwd``, and this repo's root
@@ -626,10 +626,10 @@ class TestWholeTreeGate:
             f'\n'
             f"THE SUBTLETY: that call reads as \"deny every tool\", and it is not. "
             f"shared/src/shared/cli_invoke.py::build_claude_argv silently replaces "
-            f"the '*' with _REAL_BUILTIN_TOOLS_DENYLIST whenever an output_schema "
-            f'is present, because the schema rides on a synthetic StructuredOutput '
-            f'tool a wildcard would block. That list is BUILT-INS ONLY and carries '
-            f'no MCP pattern, so MCP tools stay REACHABLE — and the CLI '
+            f"the '*' with --tools '' whenever an output_schema is present, "
+            f'because the schema rides on a synthetic StructuredOutput tool a '
+            f"wildcard would block. --tools '' removes built-in and deferred tools "
+            f'but does NOT filter MCP, so MCP tools stay REACHABLE — and the CLI '
             f'ambient-merges the .mcp.json at cwd. Under bypassPermissions, which '
             f'every one of these callers uses, that is unreviewed MCP WRITE access; '
             f'halt_scheduler and delete_memory are in the blast radius.\n'

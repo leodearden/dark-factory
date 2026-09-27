@@ -72,7 +72,6 @@ from _workflow_helpers import (
 )
 from escalation.models import Escalation
 from shared.cli_invoke import (
-    _REAL_BUILTIN_TOOLS_DENYLIST,
     _SCHEMA_OUTPUT_TOOL,
     AgentResult,
     _SubprocessResult,
@@ -933,8 +932,8 @@ class TestSharedMachineryIntact:
     async def test_recon_like_output_schema_path_still_functions(self, tmp_path: Path) -> None:
         """A recon/curator-like invocation (non-trivial output_schema +
         disallowed_tools=['*']) still: (a) renders --json-schema with the
-        schema JSON; (b) expands '*' to _REAL_BUILTIN_TOOLS_DENYLIST, sparing
-        the synthetic StructuredOutput tool; (c) parses a StructuredOutput
+        schema JSON; (b) replaces '*' with the ``--tools ''`` registry filter,
+        sparing the synthetic StructuredOutput tool; (c) parses a StructuredOutput
         subprocess payload back into AgentResult.structured_output.
         """
         captured: list[list[str]] = []
@@ -975,10 +974,11 @@ class TestSharedMachineryIntact:
         assert '--json-schema' in argv
         assert argv[argv.index('--json-schema') + 1] == json.dumps(schema)
 
-        d_idx = argv.index('--disallowed-tools')
-        js_idx = argv.index('--json-schema', d_idx)
-        deny_values = argv[d_idx + 1:js_idx]
-        assert deny_values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {deny_values!r}'
+        # allowed_tools=['Read'] is a permission list, not a registry entry, so
+        # it is inert under the empty registry that --tools '' leaves.
+        assert argv[argv.index('--tools') + 1] == ''
+        assert '--disallowed-tools' not in argv
+        assert '*' not in argv
         assert _SCHEMA_OUTPUT_TOOL not in argv
 
         assert isinstance(result, AgentResult)

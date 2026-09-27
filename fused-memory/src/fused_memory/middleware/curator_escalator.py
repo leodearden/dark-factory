@@ -328,7 +328,7 @@ class CuratorEscalator:
         if schema_tool_denied:
             # Systemic break (CLI tool-exclusion semantics changed): always
             # surface, never suppress, with a distinct summary + concrete fix
-            # location. A human/code fix is required (update the deny-list), so
+            # location. A human/code fix is required (in build_claude_argv), so
             # this should reach attention rather than be auto-watcher-resolved.
             await self._submit_schema_tool_denied(
                 project_root=project_root,
@@ -462,7 +462,7 @@ class CuratorEscalator:
         schema-tool-denied break.
 
         Deliberately bypasses the rolling-window burst suppression (and does not
-        touch ``_failure_log``): a systemic deny-list break must surface on every
+        touch ``_failure_log``): a systemic tool-scoping break must surface on every
         occurrence. The summary is unmistakable vs the generic "curator LLM
         failing" escalation, and the detail names the concrete fix location so
         whoever picks it up can act without re-diagnosing.
@@ -478,13 +478,15 @@ class CuratorEscalator:
         detail_lines.append(f'justification={justification}')
         detail_lines.append('')
         detail_lines.append(
-            'FIX: the CLI tool-exclusion semantics changed again — the deny-list '
-            'in shared/src/shared/cli_invoke.py (_REAL_BUILTIN_TOOLS_DENYLIST and '
-            "the '*'-expansion in _invoke_claude) no longer permits the synthetic "
-            'StructuredOutput schema tool, so every structured-output curator/recon '
-            'call is permission-denied. Update that deny-list so StructuredOutput '
-            'is NOT blocked, then restart fused-memory.service. Task dedupe is '
-            'DISABLED for this project until the deny-list is fixed.',
+            "FIX: the CLI tool-exclusion semantics changed again — the '*' -> "
+            "--tools '' substitution in "
+            'shared/src/shared/cli_invoke.py::build_claude_argv no longer leaves '
+            'the synthetic StructuredOutput schema tool in the registry, so every '
+            'structured-output curator/recon call is permission-denied. Fix that '
+            'substitution so StructuredOutput is NOT blocked (the live check is '
+            'shared/tests/test_wildcard_deny_live_inventory.py, -m integration), '
+            'then restart fused-memory.service. Task dedupe is DISABLED for this '
+            'project until it is fixed.',
         )
         detail = '\n'.join(detail_lines)
 
@@ -497,9 +499,9 @@ class CuratorEscalator:
             category='curator_schema_tool_denied',
             summary=(
                 'CRITICAL: schema StructuredOutput tool DENIED — CLI '
-                'tool-exclusion semantics changed; the cli_invoke deny-list no '
-                'longer permits the schema tool. Dedupe disabled until the '
-                'deny-list is fixed.'
+                "tool-exclusion semantics changed; cli_invoke's --tools '' "
+                'substitution no longer permits the schema tool. Dedupe disabled '
+                'until it is fixed.'
             ),
             detail=detail,
             level=1,
@@ -519,7 +521,7 @@ class CuratorEscalator:
 
         logger.error(
             'curator_escalator: queued schema-tool-denied L1 escalation %s for '
-            'project %s — StructuredOutput tool blocked by cli_invoke deny-list; '
+            "project %s — StructuredOutput tool blocked despite cli_invoke's --tools ''; "
             'dedupe disabled until fixed',
             escalation.id, project_id,
         )

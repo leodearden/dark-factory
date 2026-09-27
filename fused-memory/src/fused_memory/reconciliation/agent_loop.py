@@ -423,7 +423,7 @@ class AgentLoop:
                 output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
                 disallowed_tools=['*'],
                 # Closes MCP separately from the wildcard deny above, which the
-                # schema expands into a BUILT-INS-ONLY list. Must stay truthy, or
+                # schema turns into --tools '' (no MCP filter). Must stay truthy, or
                 # --strict-mcp-config is never emitted (build_claude_argv gates it
                 # on `if mcp_config:`).
                 mcp_config=no_mcp_servers_config(),
@@ -469,9 +469,9 @@ class AgentLoop:
                 # This cwd is a project root and may hold a live .mcp.json, which
                 # bypassPermissions would otherwise let the CLI ambient-merge and
                 # expose unreviewed. disallowed_tools=['*'] above does NOT cover
-                # that: with output_schema set, cli_invoke expands the wildcard
-                # into _REAL_BUILTIN_TOOLS_DENYLIST, a BUILT-INS-ONLY list that
-                # carries no MCP tool pattern. MCP tools are closed SEPARATELY,
+                # that: with output_schema set, cli_invoke turns the wildcard
+                # into --tools '', which removes built-in and deferred tools but
+                # does not filter MCP. MCP tools are closed SEPARATELY,
                 # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
                 # pair above — which must stay truthy, since --strict-mcp-config is
                 # emitted only inside build_claude_argv's `if mcp_config:` block.

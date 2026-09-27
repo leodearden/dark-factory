@@ -1930,11 +1930,9 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
 
     - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
     - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
-      VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
-      real-builtins deny-list is cli_invoke's job (its wildcard→real-builtins
-      expansion over ``_REAL_BUILTIN_TOOLS_DENYLIST``), not the caller's, so the
-      judge inherits future central fixes instead of pinning a stale copy of the
-      CLI's built-in list.
+      VERBATIM.  Replacing it with the ``StructuredOutput``-preserving
+      ``--tools ''`` registry filter is cli_invoke's job, not the caller's, so
+      the judge inherits future central fixes.
     - ``max_turns >= 3`` — a cap of 1 leaves no room for the prose turn the
       model emits before calling ``StructuredOutput`` (see
       ``_JUDGE_CLI_MAX_TURNS``); 3 is the floor both migrated siblings use.
@@ -2203,8 +2201,9 @@ async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
     """The judge strict-scopes its run to ZERO MCP servers.
 
     ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
-    under an ``output_schema`` cli_invoke expands the wildcard into a
-    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    under an ``output_schema`` cli_invoke turns the wildcard into
+    ``--tools ''``, which removes built-in and deferred tools but does not
+    filter MCP, and ``cwd`` is
     ``explore_codebase_root`` (the project root, task 1989), which holds a live
     ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
     that is unreviewed access to tools like ``halt_scheduler`` /
@@ -2531,11 +2530,11 @@ class TestCallJudgeCliTaxonomy:
         """(f) A blocked ``StructuredOutput`` tool is a systemic config break with
         its own machine-readable code, not an anonymous UNKNOWN failure.
 
-        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, which
-        cli_invoke's wildcard expansion deliberately omits from
-        ``_REAL_BUILTIN_TOOLS_DENYLIST``.  If a future CLI change starts denying
-        it, EVERY judge run is starved of its verdict — the deny-list needs
-        fixing, and the log has to say so.  cli_invoke can only ever set
+        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, the one
+        tool cli_invoke's ``'*'`` -> ``--tools ''`` substitution keeps in the
+        registry.  If a future CLI change starts denying it, EVERY judge run is
+        starved of its verdict — that substitution needs fixing, and the log has
+        to say so.  cli_invoke can only ever set
         ``schema_tool_denied`` on a NON-success result (cli_invoke.py:1807 guards
         on ``not is_success``), so the detection has to live on this branch;
         checking it on the success branch is dead code.

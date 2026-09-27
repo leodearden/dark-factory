@@ -343,71 +343,39 @@ class AllAccountsCappedException(Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# StructuredOutput schema-tool deny-list (CLI 2.1.168 regression guard)
+# Pure-classifier tool scoping: ``'*'`` + ``--json-schema`` → ``--tools ''``
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI 2.1.168 delivers ``--json-schema`` structured output through a *synthetic
-# tool* named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard — used
-# by pure-classifier callers (curator single/batch, recon agent_loop) that want
-# no real tool access — now ALSO matches and denies that schema tool, so every
-# structured answer is permission-denied → ``error_max_structured_output_retries``
-# (or ``error_max_budget_usd``) with no salvageable payload.
+# ``--json-schema`` output rides on a synthetic ``StructuredOutput`` tool, which
+# a ``'*'`` deny would also block (CLI 2.1.168).  So when a caller passes
+# ``disallowed_tools=['*']`` WITH an ``output_schema``, ``build_claude_argv``
+# drops the ``'*'`` and emits ``--tools ''`` instead.  That is the CLI's
+# registry filter: it leaves only ``StructuredOutput`` in the registry
+# (measured on CLI 2.1.283 from the ``system/init`` inventory).  Without a
+# schema, the bare ``'*'`` deny already empties the registry and is kept as-is.
 #
-# Fix (central, in ``_invoke_claude``): when an ``output_schema`` is requested AND
-# ``'*'`` is in ``disallowed_tools``, expand the ``'*'`` into this explicit
-# deny-list of real built-in tools — which deliberately OMITS ``StructuredOutput``
-# — preserving the "no real (file/bash/web/MCP) tool access" guarantee while
-# letting the schema tool through.  Whitelisting ``StructuredOutput`` while keeping
-# ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
-# removed entirely (confirmed against live CLI 2.1.168).
+# Do not replace this with an enumerated deny list.  The live registry is
+# account-dependent and churns, so a list cannot be complete, and ToolSearch
+# will load and run any deferred tool the list misses (it ran CronList under
+# the old one).
 #
-# A deliberately OVER-WIDE deny set, and the honest statement of its upkeep: it
-# is NOT in sync with the CLI's built-in tool names and does not need to be.  A
-# stale entry is harmless (``BashOutput``, ``KillShell`` and ``KillBash`` below
-# are measured absent from the registry — task 5332; see the citation on
-# ``_BACKGROUND_REAP_TOOLS`` below — and denying a tool that does not exist
-# denies nothing), whereas a MISSING entry is the real
-# hole: a *future new* built-in would not be auto-denied.  Accepted because
-# (a) these prompts forbid tool use, and (b) a future change to the CLI's
-# tool-exclusion semantics is caught loudly by the ``schema_tool_denied``
-# detection below rather than degrading silently.
+# SCOPE: ``--tools`` does NOT filter MCP tools.  An account-scoped claude.ai
+# connector stayed reachable even at an empty neutral cwd.  A wildcard-deny
+# caller must ALSO pass ``mcp_config=no_mcp_servers_config()`` with
+# ``strict_mcp_config=True``.
 #
-# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
-# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
-# is invisible only while no MCP server is in play; the CLI ambient-merges the
-# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
-# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
-# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
-# ALSO pass ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``
-# to keep MCP tools out of reach; denying built-ins alone does not do it.
+# Two checks guard this.  The live inventory test is
+# shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
+# CLI change ever denies the schema tool itself, ``_parse_claude_output``
+# reports ``schema_tool_denied``.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
-_REAL_BUILTIN_TOOLS_DENYLIST = [
-    'Bash',
-    'BashOutput',
-    'KillShell',
-    'KillBash',
-    'Read',
-    'Edit',
-    'Write',
-    'MultiEdit',
-    'NotebookEdit',
-    'Glob',
-    'Grep',
-    'Task',
-    'Agent',
-    'WebFetch',
-    'WebSearch',
-    'TodoWrite',
-    'ExitPlanMode',
-    'SlashCommand',
-]
 
 
 def no_mcp_servers_config() -> dict[str, Any]:
     """Build a FRESH scoping ``mcp_config`` carrying ZERO MCP servers.
 
     For callers that pass ``disallowed_tools=['*']`` and must keep MCP tools
-    unreachable even when an ``output_schema`` forces the wildcard expansion
-    above (which denies built-ins ONLY).  Paired with
+    unreachable even when an ``output_schema`` turns the wildcard into
+    ``--tools ''`` (which does not filter MCP; see above).  Paired with
     ``strict_mcp_config=True`` this emits ``--mcp-config <file>
     --strict-mcp-config``, scoping the invocation to the file's server set —
     i.e. nothing — instead of ambient-merging the ``.mcp.json`` at the
@@ -464,9 +432,9 @@ class AgentResult:
     - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
       structured payload AND a ``StructuredOutput`` permission denial — i.e. the
       schema tool itself was blocked.  This is a systemic config break (the
-      cli_invoke deny-list no longer permits the schema tool), NOT a flaky
-      candidate.  ``success`` stays False (NOT salvaged); callers should raise a
-      loud, un-suppressed escalation so the deny-list gets fixed.
+      ``--tools ''`` substitution no longer permits the schema tool), NOT a
+      flaky candidate.  ``success`` stays False (NOT salvaged); callers should
+      raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
       backgrounded Bash command was still pending — launched via
       ``run_in_background`` and never subsequently REAPED, where a reap is a
@@ -3076,19 +3044,12 @@ def build_claude_argv(
 
         if allowed_tools:
             cmd.extend(['--allowed-tools', *allowed_tools])
+        if output_schema and disallowed_tools and '*' in disallowed_tools:
+            # The '*' would also deny the schema's StructuredOutput tool; the
+            # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
+            cmd.extend(['--tools', ''])
+            disallowed_tools = [t for t in disallowed_tools if t != '*']
         if disallowed_tools:
-            # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
-            # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
-            # failing every structured-output call.  When a schema IS requested,
-            # expand the wildcard into an explicit real-builtins deny-list that omits
-            # ``StructuredOutput`` — keeping "no real tool access" while letting the
-            # schema tool through.  A caller that passes no output_schema keeps
-            # ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
-            # constant above for the keep-in-sync caveat.
-            if output_schema and '*' in disallowed_tools:
-                disallowed_tools = [
-                    t for t in disallowed_tools if t != '*'
-                ] + _REAL_BUILTIN_TOOLS_DENYLIST
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
@@ -3381,7 +3342,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     # synthetic schema tool itself was blocked — a systemic config break, not a
     # flaky candidate.  We deliberately do NOT salvage to success: ``success``
     # stays False and ``schema_tool_denied`` is flagged so callers raise a loud,
-    # un-suppressed escalation to get the cli_invoke deny-list fixed.  Priority is
+    # un-suppressed escalation to get build_claude_argv's tool scoping fixed.  Priority is
     # "get it fixed"; silent recovery is exactly the trap that hid the outage.
     schema_tool_denied = False
     if not is_success and not isinstance(structured, dict):

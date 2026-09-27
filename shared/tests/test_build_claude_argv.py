@@ -436,8 +436,8 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
     """no_mcp_servers_config() is a TRUTHY zero-server scoping config, so a
     wildcard-deny caller under an output_schema still gets --strict-mcp-config.
 
-    The wildcard expansion above (``output_schema and '*' in disallowed_tools``)
-    substitutes a BUILT-INS-ONLY deny-list, which contains no MCP tool pattern.
+    The wildcard substitution above (``output_schema and '*' in
+    disallowed_tools``) emits ``--tools ''``, which does not filter MCP.
     A caller whose cwd carries an ambient ``.mcp.json`` therefore keeps MCP
     tools reachable unless it ALSO strict-scopes its MCP servers — and the
     ``--strict-mcp-config`` emit is gated on ``if mcp_config:``, so a bare
@@ -496,8 +496,8 @@ def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
     that block into the ``elif session_id:`` branch would silently drop both
     --mcp-config and --strict-mcp-config from every turn >= 2 — reinstating the
     ambient ``.mcp.json`` merge under ``bypassPermissions``, where the wildcard
-    deny is no protection because an ``output_schema`` expands it into a
-    BUILT-INS-ONLY list carrying no MCP pattern — while the whole existing
+    deny is no protection because an ``output_schema`` turns it into
+    ``--tools ''``, which does not filter MCP — while the whole existing
     suite stayed green.
     """
     cmd, temp_files = build_claude_argv(

@@ -3681,7 +3681,7 @@ class TestCuratorFailureErrorSchemaToolDenied:
     """CLI 2.1.168 guard — ``CuratorFailureError`` carries the underlying agent
     result's ``schema_tool_denied`` from both LLM call sites so the curate()
     handler can route a LOUD, un-suppressed escalation when the synthetic
-    ``StructuredOutput`` schema tool is blocked by the deny-list."""
+    ``StructuredOutput`` schema tool is blocked despite the ``--tools ''`` filter."""
 
     @pytest.mark.asyncio
     async def test_schema_tool_denied_propagated_from_call_llm_single(self):

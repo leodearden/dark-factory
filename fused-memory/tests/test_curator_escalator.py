@@ -288,8 +288,8 @@ class TestReportFailure:
 
 class TestSchemaToolDeniedEscalation:
     """CLI-semantics-break guard (CLI 2.1.168): a ``schema_tool_denied`` failure
-    is a systemic config break (the cli_invoke deny-list no longer permits the
-    ``StructuredOutput`` schema tool), NOT a flaky candidate.  It must ALWAYS
+    is a systemic config break (cli_invoke's ``--tools ''`` substitution no
+    longer permits the ``StructuredOutput`` schema tool), NOT a flaky candidate.  It must ALWAYS
     surface — bypassing the first-3/hr burst suppression — with a distinct,
     self-describing summary that names the concrete fix location.
     """
