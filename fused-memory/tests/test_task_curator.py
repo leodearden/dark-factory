@@ -1037,7 +1037,11 @@ class TestCurateFallbacks:
 
     @pytest.mark.asyncio
     async def test_call_llm_passes_max_turns_three(self):
-        """R1: max_turns=1 was incompatible with --json-schema; must be >= 3."""
+        """R1: max_turns must be >= 3; 1 is broken with --json-schema.
+
+        A cap of 1 leaves no room for the prose turn the model emits before
+        calling StructuredOutput (see agent_loop._AGENT_CLI_MAX_TURNS).
+        """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 

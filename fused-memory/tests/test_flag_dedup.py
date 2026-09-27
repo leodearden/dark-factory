@@ -19,10 +19,8 @@ from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
-    CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
-    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 
 
@@ -13862,171 +13860,88 @@ class TestFilterEntityStandingDecisionsExpiry:
 
 
 # ---------------------------------------------------------------------------
-# maybe_escalate_suppression_storm (Hook A storm escape / γ, task 2896) — step-7
+# EntityStandingSuppressionResult.suppression_evaluated / empty_batch (task 2943)
 # ---------------------------------------------------------------------------
-# (SUPPRESSION_STORM_THRESHOLD_PER_CYCLE imported at module top.)
+# Cross-cycle streak accounting resets a decision's streak on a cycle where it
+# suppressed nothing.  That is only sound when the cycle actually consulted the
+# active-decision index, so the result says whether it did.
 
 
-def _storm_result(
-    *, entity_uuid: str = _ESD_U1, count: int | None = None, extra: dict | None = None
-) -> flag_dedup.EntityStandingSuppressionResult:
-    """An EntityStandingSuppressionResult carrying *count* suppressions for one
-    (or, via *extra*, several) decision(s).  Defaults to one over the threshold."""
-    counts = {entity_uuid: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1 if count is None else count}
-    counts.update(extra or {})
-    return flag_dedup.EntityStandingSuppressionResult(
-        kept_flags=[],
-        suppressed_by_decision=counts,
-        grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in counts},
-    )
-
-
-class TestMaybeEscalateSuppressionStorm:
-    """Per-cycle, per-decision storm escape escalation (task 2896 step-7).
-
-    Driven against a REAL ``EscalationQueue`` on tmp_path rather than a
-    MagicMock: the filing path folds through ``submit_or_dedupe``, whose whole
-    contract is what the queue does on the SECOND cycle, and a mock that answers
-    every lookup with a mock cannot witness a fold, a dedupe_count, or the
-    agreement between the key written and the key read back.
-    """
+class TestEntityStandingSuppressionEvaluated:
+    """Which Hook A outcomes are genuine observations (task 2943 step-5)."""
 
     _PID = 'p'
-    _RUN = 'run-1'
+    _FLAG = {
+        'entity_uuid': _ESD_U1,
+        'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        'flag_type': 'oversized_entity',
+    }
 
-    @pytest.fixture
-    def queue(self, tmp_path):
-        from escalation.queue import EscalationQueue
-
-        return EscalationQueue(tmp_path / 'escalations')
-
-    @staticmethod
-    def _pending(queue, entity_uuid: str = _ESD_U1) -> list:
-        return queue.get_by_task(entity_uuid, status='pending', level=1)
-
-    @pytest.mark.asyncio
-    async def test_over_threshold_files_one_escalation(self, queue):
-        """(a) count > threshold → exactly one L1 storm escalation for that uuid."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result()
-        )
-        assert escalated == [_ESD_U1]
-
-        pending = self._pending(queue)
-        assert len(pending) == 1
-        esc = pending[0]
-        assert esc.level == 1
-        assert esc.severity == 'blocking'
-        assert esc.category == CATEGORY_STANDING_DECISION_STORM
-        assert esc.agent_role == 'reconciliation-stage1'
-        # The entity is the record's subject: task_id is the key get_by_task /
-        # has_open_l1 read a storm record back by, so a filing that left it ''
-        # would be unfindable per entity.  Pinned explicitly, not merely implied
-        # by the get_by_task lookup above, so the field cannot be repurposed
-        # silently (reviewer finding test-coverage, amendment pass).
-        assert esc.task_id == _ESD_U1
-        blob = f'{esc.summary}\n{esc.detail}'
-        assert _ESD_U1 in blob
-        assert GROUNDS_STRUCTURAL_SIZE_CONFLATION in blob
-        assert str(SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1) in blob
-
-    @pytest.mark.asyncio
-    async def test_at_threshold_does_not_escalate(self, queue):
-        """(b) count == threshold (strict >) → nothing filed, returns []."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN,
-            _storm_result(count=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE),
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_below_threshold_does_not_escalate(self, queue):
-        """(b') count well below threshold → nothing filed, returns []."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result(count=1)
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_two_entities_over_threshold_each_file_once(self, queue):
-        """Two decisions storming in ONE cycle each get their own record.
-
-        The fold key is per-entity, so a second storming entity must not be
-        mistaken for a recurrence of the first.
-        """
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN,
-            _storm_result(extra={_ESD_U2: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 3}),
-        )
-        assert sorted(escalated) == sorted([_ESD_U1, _ESD_U2])
-        assert len(self._pending(queue, _ESD_U1)) == 1
-        assert len(self._pending(queue, _ESD_U2)) == 1
-        first, second = self._pending(queue, _ESD_U1)[0], self._pending(queue, _ESD_U2)[0]
-        assert first.dedupe_fingerprint != second.dedupe_fingerprint
-
-    @pytest.mark.asyncio
-    async def test_escalation_unavailable_returns_empty(self, queue, monkeypatch):
-        """(d) Escalation package unavailable (None) → returns [], no raise, nothing filed."""
-        monkeypatch.setattr(flag_dedup, 'Escalation', None, raising=False)
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result()
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_submit_failure_logs_warning_and_excludes_entity(self, tmp_path, caplog):
-        """A queue whose submit raises costs the entity its filing, not the cycle.
-
-        The helper is best-effort by contract: the failure is logged WARNING
-        naming the entity, the entity is absent from the returned list, and the
-        exception never escapes into the Stage-1 run.
-        """
-        from escalation.queue import EscalationQueue
-
-        class _BrokenQueue(EscalationQueue):
-            def submit(self, escalation):
-                raise RuntimeError('boom')
-
-        queue = _BrokenQueue(tmp_path / 'escalations')
-        with caplog.at_level(
-            logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'
-        ):
-            escalated = await flag_dedup.maybe_escalate_suppression_storm(
-                queue, self._PID, self._RUN, _storm_result()
+    def test_every_construction_must_state_whether_it_evaluated(self):
+        """A fail-open return that forgot the field would otherwise read as an
+        evaluated quiet cycle and reset every established streak."""
+        with pytest.raises(TypeError, match='suppression_evaluated'):
+            flag_dedup.EntityStandingSuppressionResult(  # type: ignore[call-arg]
+                kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
             )
-        assert escalated == []
-        assert any(
-            rec.levelno == logging.WARNING and _ESD_U1 in rec.getMessage()
-            for rec in caplog.records
-        ), 'a WARNING naming the entity must be logged'
 
     @pytest.mark.asyncio
-    async def test_recurring_storm_folds_into_one_parent(self, queue):
-        """REGRESSION: a decision that keeps storming folds, it is not re-filed.
-
-        Two things are pinned here, and only a real queue can pin either.  (1)
-        The record is written under the key the reader queries — an earlier
-        revision wrote ``task_id=''`` while looking up by entity_uuid, which made
-        the guard a permanent no-op.  (2) Recurrence FOLDS rather than being
-        silently skipped (task 3522): the second cycle mints no second record and
-        increments ``dedupe_count`` on the first, which is the steward's
-        triage-order signal.  A ``has_open_l1`` skip would leave that count
-        pinned at 0 forever, making one storm indistinguishable from forty.
-        """
-        result = _storm_result()
-        assert await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, result
-        ) == [_ESD_U1]
-        assert queue.has_open_l1(_ESD_U1, category=CATEGORY_STANDING_DECISION_STORM)
-
-        second = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, 'run-2', result
+    async def test_suppressing_path_is_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
         )
-        assert second == [], 'a folded recurrence is not a new filing'
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        assert result.suppression_evaluated is True
 
-        pending = self._pending(queue)
-        assert len(pending) == 1, f'expected one storm escalation, got {len(pending)}'
-        assert pending[0].dedupe_count == 1, 'the recurrence must be counted on the parent'
+    @pytest.mark.asyncio
+    async def test_empty_flags_is_evaluated(self, ledger_memory_service):
+        """A cycle with nothing to suppress is one in which no decision drained anything."""
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_active_decisions_is_evaluated(self, ledger_memory_service):
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_is_not_evaluated(self, ledger_memory_service):
+        ledger_memory_service.recon_ledger = None
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_ledger_read_failure_is_not_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        ledger_memory_service.recon_ledger.list_entity_standing_decisions = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_matches_the_filters_empty_flags_result(
+        self, ledger_memory_service
+    ):
+        """The consolidator's zero-flag cycle and the filter's empty-flags
+        return must be the same observation, so they must not drift."""
+        empty = flag_dedup.EntityStandingSuppressionResult.empty_batch()
+        assert empty.kept_flags == []
+        assert empty.suppressed_by_decision == {}
+        assert empty.grounds_by_decision == {}
+        assert empty.suppression_evaluated is True
+        assert empty == await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )

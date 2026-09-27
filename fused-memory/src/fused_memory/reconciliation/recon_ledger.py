@@ -48,8 +48,11 @@ from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_ENUM,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STATE_ACTIVE,
     STATE_EXPIRED,
+    STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -189,6 +192,94 @@ def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
         created_at=row['created_at'],
         expires_at=row['expires_at'],
         entity_uuid=row['entity_uuid'],
+    )
+
+
+def nonnegative_int_from_payload(payload: object, key: str) -> int:
+    """Read the non-negative ``int`` counter stored under *key* in a ledger payload.
+
+    Returns 0 for anything else — a payload that is not a dict, an absent key,
+    ``None``, a bool (``True`` is an ``int`` in Python and must not be read as
+    the count 1), a string, or a negative value.  Free-form JSON off a ledger
+    row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _positive_int_tuple_from_payload(payload: object, key: str) -> tuple[int, ...]:
+    """Read the list of positive ``int`` counts stored under *key* in a ledger payload.
+
+    Returns ``()`` for anything but a list whose every entry is an ``int`` >= 1
+    and not a bool; one malformed entry discards the whole list.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return ()
+    value = payload.get(key)
+    if not isinstance(value, list) or any(
+        isinstance(entry, bool) or not isinstance(entry, int) or entry < 1 for entry in value
+    ):
+        return ()
+    return tuple(value)
+
+
+#: The streak row's payload key for the run that last wrote it.  Private
+#: because only this module writes and reads it: consumers get it as
+#: :attr:`SuppressionStreakRow.last_run_id`.
+_STREAK_LAST_RUN_ID_KEY = 'last_run_id'
+
+
+@dataclass(frozen=True)
+class SuppressionStreakRow:
+    """One decoded suppression-streak row (task 2943), as
+    :meth:`ReconLedgerStore.list_suppression_streaks` returns it.
+
+    ``streak`` is the number of consecutive full cycles in which the standing
+    decision on ``(entity_uuid, grounds)`` suppressed a flag.
+    ``recent_counts`` holds the suppression counts of the streak's most recent
+    cycles, oldest first, never more entries than ``streak``.
+    ``last_run_id`` is the run that last wrote the row.
+    """
+
+    entity_uuid: str
+    grounds: str
+    streak: int
+    recent_counts: tuple[int, ...]
+    last_run_id: str
+
+
+def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
+    """Decode a suppression-streak record without trusting its payload's shape.
+
+    Anything :meth:`ReconLedgerStore.upsert_suppression_streak` would have
+    rejected reads as the smaller value: a payload that is not a JSON object
+    reads as empty, a malformed streak as 0, a malformed window as ``()``, a
+    window longer than its streak (as one left on a zero streak is) as
+    ``()``, and a non-string run id as ``''``.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    streak = nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY)
+    recent_counts = _positive_int_tuple_from_payload(payload, STREAK_WINDOW_PAYLOAD_KEY)
+    last_run_id = payload.get(_STREAK_LAST_RUN_ID_KEY)
+    return SuppressionStreakRow(
+        entity_uuid=record.entity_uuid or record.run_id,
+        grounds=record.flag_type,
+        streak=streak,
+        recent_counts=recent_counts if len(recent_counts) <= streak else (),
+        last_run_id=last_run_id if isinstance(last_run_id, str) else '',
     )
 
 
@@ -783,6 +874,123 @@ class ReconLedgerStore:
                 'explicit grounds argument before growing GROUNDS_ENUM past one value.'
             )
         return _record_from_row(rows[0])
+
+    async def upsert_suppression_streak(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        streak: int,
+        recent_counts: Sequence[int],
+        last_run_id: str,
+        updated_at: str,
+        expires_at: str,
+    ) -> None:
+        """Write (last-write-wins) one suppression-streak row: the streak count
+        of the standing decision on ``(entity_uuid, grounds)`` plus its recent
+        per-cycle window (task 2943).  The streak counts the consecutive full
+        cycles in which the decision suppressed a flag; ``recent_counts`` holds
+        the suppression counts of the streak's most recent cycles, oldest first.
+        Capping that window at K is the caller's job, so the ledger stays
+        threshold-agnostic.
+
+        The PK slots deliberately mirror
+        :meth:`upsert_entity_standing_decision` — ``task_id=''``,
+        ``flag_type=grounds``, ``run_id=entity_uuid``, plus the indexed
+        ``entity_uuid`` column — so a streak row and its decision row share an
+        identity a reader can join on, while the distinct record kind
+        (:data:`~fused_memory.reconciliation.standing_decision_constants.RECORD_KIND_ENTITY_SUPPRESSION_STREAK`)
+        keeps this write from touching the decision row's payload.
+
+        Unlike the decision row, a streak row is HARD-DELETED by :meth:`gc` once
+        ``expires_at`` passes rather than TTL-flipped: recurrence history for a
+        derived counter is not worth preserving, and the delete is what bounds
+        row growth.
+
+        Validation is loud (INV-1), as in :meth:`upsert_entity_standing_decision`:
+        an empty ``entity_uuid``, a ``streak`` that is not a non-negative int, a
+        ``recent_counts`` that is not a list or tuple of non-bool ints >= 1 no
+        longer than ``streak``, a ``grounds`` outside ``GROUNDS_ENUM``, or a
+        ``None`` ``expires_at`` raises ``ValueError`` naming the field, and
+        nothing is written.
+        """
+        if not entity_uuid:
+            raise ValueError(
+                'upsert_suppression_streak: entity_uuid must be a non-empty '
+                f'string (got {entity_uuid!r})'
+            )
+        if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
+            raise ValueError(
+                'upsert_suppression_streak: streak must be a non-negative int '
+                f'(got {streak!r})'
+            )
+        if not isinstance(recent_counts, (list, tuple)):
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts must be a list or tuple '
+                f'of per-cycle counts (got {recent_counts!r})'
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for count in recent_counts
+        ):
+            raise ValueError(
+                'upsert_suppression_streak: every recent_counts entry must be an '
+                f'int >= 1, one suppressing cycle\'s count (got {recent_counts!r})'
+            )
+        if len(recent_counts) > streak:
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts may hold at most one '
+                f'entry per cycle of the streak (got {len(recent_counts)} entries '
+                f'for streak={streak})'
+            )
+        if grounds not in GROUNDS_ENUM:
+            raise ValueError(
+                'upsert_suppression_streak: grounds must be a member of '
+                f'GROUNDS_ENUM {sorted(GROUNDS_ENUM)} (got {grounds!r})'
+            )
+        if expires_at is None:
+            raise ValueError(
+                'upsert_suppression_streak: expires_at must not be None '
+                '(an unexpiring streak row would never be reaped by gc())'
+            )
+        payload = {
+            STREAK_PAYLOAD_KEY: streak,
+            STREAK_WINDOW_PAYLOAD_KEY: list(recent_counts),
+            _STREAK_LAST_RUN_ID_KEY: last_run_id,
+            'grounds': grounds,
+            'updated_at': updated_at,
+        }
+        await self.upsert(
+            ReconLedgerRecord(
+                project_id=project_id,
+                record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+                task_id='',
+                flag_type=grounds,
+                run_id=entity_uuid,
+                entity_uuid=entity_uuid,
+                payload_json=json.dumps(payload),
+                state=STATE_ACTIVE,
+                created_at=updated_at,
+                expires_at=expires_at,
+            )
+        )
+
+    async def list_suppression_streaks(self, project_id: str) -> list[SuppressionStreakRow]:
+        """Return every suppression-streak row for a project, decoded.
+
+        Stored payloads are never trusted for shape (see
+        :func:`_streak_row_from_record`), so a hand-edited or older-shaped row
+        can lose its streak or window but can never read as a larger one.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ?
+            """,
+            (project_id, RECORD_KIND_ENTITY_SUPPRESSION_STREAK),
+        )
+        return [_streak_row_from_record(_record_from_row(row)) for row in rows]
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.

@@ -354,41 +354,15 @@ from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.internal_writers import is_internal_writer
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import (
+    ReconLedgerRecord,
+    nonnegative_int_from_payload,
+)
 from fused_memory.reconciliation.standing_decision_constants import (
-    CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
-    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 from fused_memory.utils.async_utils import gather_collect
-
-# Optional escalation dependency (mirrors stage1_stall_detector's pattern): the
-# reconciliation package must import cleanly even where the escalation package
-# is not installed. maybe_escalate_suppression_storm no-ops when Escalation is
-# None.
-#
-# ONE combined block, deliberately (same reasoning as stage1_stall_detector's):
-# all four names bind or fail together, so any ONE identity check suffices at
-# RUNTIME. Every name is still listed in that guard because only an identity
-# check on the name itself narrows an optionally-imported symbol for the type
-# checker.
-try:
-    from escalation.dedupe import (  # type: ignore[import-untyped]
-        DedupeConfig,
-        compute_content_fingerprint,
-        content_fingerprint_key,
-        submit_or_dedupe,
-    )
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    _HAS_ESCALATION = True
-except ImportError:
-    Escalation = None  # type: ignore[assignment,misc]
-    DedupeConfig = None  # type: ignore[assignment,misc]
-    compute_content_fingerprint = None  # type: ignore[assignment]
-    content_fingerprint_key = None  # type: ignore[assignment]
-    submit_or_dedupe = None  # type: ignore[assignment]
-    _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -861,15 +835,38 @@ class EntityStandingSuppressionResult:
     - ``suppressed_by_decision`` — ``{entity_uuid(lower): count}`` of flags
       suppressed, attributed per active standing decision; its ``values()`` sum
       is the ``entity_standing_decision_suppressed`` per-cycle stat, and it
-      drives the storm escalation (:func:`maybe_escalate_suppression_storm`).
+      drives the storm escalation
+      (``standing_decision_storm_escape.py::maybe_escalate_suppression_storm``).
     - ``grounds_by_decision`` — ``{entity_uuid(lower): grounds}`` for each
       decision that suppressed at least one flag (observability + escalation
       detail).
+    - ``suppression_evaluated`` — True when the active-decision index was
+      consulted and every flag was evaluated against it, so a decision absent
+      from ``suppressed_by_decision`` really did go quiet this cycle. False
+      marks a fail-open cycle that observed nothing; cross-cycle streak
+      accounting
+      (``standing_decision_storm_escape.py::update_suppression_streaks``)
+      must neither increment nor reset on it, because an unread ledger is not evidence that a
+      decision went quiet. An empty flag batch stays True: a cycle with
+      nothing to suppress is a cycle in which no decision drained anything.
+      It has no default, so a new fail-open return cannot forget it and pass
+      as an evaluated quiet cycle that wipes every established streak.
     """
 
     kept_flags: list[dict[str, Any]]
     suppressed_by_decision: dict[str, int]
     grounds_by_decision: dict[str, str]
+    suppression_evaluated: bool
+
+    @classmethod
+    def empty_batch(cls) -> EntityStandingSuppressionResult:
+        """The evaluated, nothing-suppressed outcome of an empty flag batch."""
+        return cls(
+            kept_flags=[],
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
+        )
 
 
 def _match_entity_standing_decision(
@@ -1010,7 +1007,9 @@ async def filter_entity_standing_decisions(
     *flags* is empty, or ``memory_service.recon_ledger`` is unset/``None``, or
     the ledger read raises, NO suppression is applied this cycle (all flags
     kept) — a ledger read failure must never hide a finding. The ledger-None
-    path logs DEBUG; the read-exception path logs WARNING.
+    path logs DEBUG; the read-exception path logs WARNING. Those two ledger
+    fail-open returns carry ``suppression_evaluated=False``; the empty-flags
+    return does not (see :class:`EntityStandingSuppressionResult`).
 
     A read row is not automatically a licence to suppress: rows whose TTL has
     lapsed and entities carrying more than one active row are dropped from the
@@ -1027,9 +1026,7 @@ async def filter_entity_standing_decisions(
     recurrence history is preserved (see the consolidator wiring).
     """
     if not flags:
-        return EntityStandingSuppressionResult(
-            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
-        )
+        return EntityStandingSuppressionResult.empty_batch()
 
     ledger = getattr(memory_service, 'recon_ledger', None)
     if ledger is None:
@@ -1040,7 +1037,10 @@ async def filter_entity_standing_decisions(
             len(flags),
         )
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
         )
 
     try:
@@ -1057,7 +1057,10 @@ async def filter_entity_standing_decisions(
             exc_info=True,
         )
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
         )
 
     active_by_uuid = _index_active_standing_decisions(
@@ -1065,7 +1068,10 @@ async def filter_entity_standing_decisions(
     )
     if not active_by_uuid:
         return EntityStandingSuppressionResult(
-            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
         )
 
     kept: list[dict[str, Any]] = []
@@ -1092,157 +1098,8 @@ async def filter_entity_standing_decisions(
         kept_flags=kept,
         suppressed_by_decision=suppressed_by_decision,
         grounds_by_decision=grounds_by_decision,
+        suppression_evaluated=True,
     )
-
-
-#: Finding-category component of the storm escalation's dedupe fingerprint —
-#: the second axis of ``compute_content_fingerprint``, distinguishing this
-#: finding from any other that might one day share the storm category.
-_STORM_FINDING_CATEGORY: str = 'entity_standing_decision_suppression_storm'
-
-
-async def maybe_escalate_suppression_storm(
-    escalation_queue: Any,
-    project_id: str,
-    run_id: str,
-    result: EntityStandingSuppressionResult,
-    *,
-    threshold: int = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-) -> list[str]:
-    """File (or fold) a "storm escape" L1 escalation per over-active standing decision.
-
-    For each ``(entity_uuid, count)`` in ``result.suppressed_by_decision`` whose
-    *count* exceeds *threshold* (strict ``>``), submit one
-    ``Escalation(level=1, severity='blocking',
-    category=CATEGORY_STANDING_DECISION_STORM,
-    agent_role='reconciliation-stage1', ...)`` naming the entity, its grounds,
-    and the per-cycle count. An active decision hiding a flood of flags in one
-    cycle is a signal it may be over-broad or the entity's situation changed —
-    worth a human look.
-
-    **Filed through** :func:`escalation.dedupe.submit_or_dedupe`, NOT gated on
-    ``has_open_l1`` (task 3522). Stage 1 re-evaluates every cycle, so a decision
-    that storms once tends to storm every cycle — exactly the recurring-detector
-    shape for which the sibling gate-backlog path retired the ``has_open_l1``
-    skip: that skip suppressed every cycle after the first, so ``dedupe_count``
-    stayed pinned at 0 and the operator saw no difference between one storm and
-    forty. Folding instead keeps ONE pending record per entity and increments
-    ``dedupe_count`` on it, which is the steward's recurrence / triage-order
-    signal. The fold key is the ``(category, finding_category, project:entity)``
-    content fingerprint stamped below — deliberately NOT the count or run_id,
-    which drift every cycle and would mint a fresh record per breach. The window
-    is UNBOUNDED so a decision storming for days still folds into its original
-    parent. Accepted cost, as on the gate-backlog path: a folded record keeps the
-    PARENT's summary, so the count named there is the FIRST breach's, while
-    ``dedupe_count`` carries how often it has recurred since.
-
-    Best-effort throughout: returns ``[]`` immediately when the ``escalation``
-    package is unavailable; any per-decision fingerprint/id-gen/construction/
-    submit/fold failure logs WARNING and excludes that entity from the returned
-    list. Returns the entity_uuids that received a NEW record this cycle — folds
-    are excluded, so the list means "new filings", with recurrence carried by
-    ``dedupe_count`` and the fold INFO log.
-
-    (The PRD's parenthetical cross-cycle-streak variant needs persistent
-    per-decision state and is deferred; this is the self-contained per-cycle N.)
-    """
-    # Any ONE identity check suffices at runtime (all five names bind or fail
-    # together in the module's single import block); each is named so the type
-    # checker narrows it at the use sites below.
-    if (
-        Escalation is None
-        or DedupeConfig is None
-        or compute_content_fingerprint is None
-        or content_fingerprint_key is None
-        or submit_or_dedupe is None
-    ):
-        return []
-
-    config = DedupeConfig(
-        infra_dedupe_enabled=True,
-        infra_dedupe_window_secs=float('inf'),
-        infra_dedupe_categories=(CATEGORY_STANDING_DECISION_STORM,),
-        key_fn=content_fingerprint_key,
-    )
-
-    escalated: list[str] = []
-    for entity_uuid, count in result.suppressed_by_decision.items():
-        if count <= threshold:
-            continue
-
-        grounds = result.grounds_by_decision.get(entity_uuid, 'unknown')
-        summary = (
-            f'Standing decision for entity {entity_uuid} suppressed {count} recon '
-            f'flag(s) in a single cycle (> {threshold})'
-        )
-        detail = '\n'.join([
-            f'project_id: {project_id}',
-            f'run_id: {run_id}',
-            f'entity_uuid: {entity_uuid}',
-            f'grounds: {grounds}',
-            f'suppressed_this_cycle: {count}',
-            f'threshold: {threshold}',
-        ])
-
-        try:
-            # Everything that can fail is inside the try, so a fingerprint,
-            # id-gen, constructor, submit or fold failure is logged rather than
-            # aborting the remaining decisions.
-            fingerprint = compute_content_fingerprint(
-                CATEGORY_STANDING_DECISION_STORM,
-                _STORM_FINDING_CATEGORY,
-                [f'{project_id}:{entity_uuid}'],
-            )
-            # Fail closed rather than file with a falsy key: find_dedupe_parent
-            # short-circuits on one, so the record would silently become a second
-            # visible pending record for this entity every cycle. Unreachable via
-            # today's sha256 callee — this guards a future change to it.
-            if not fingerprint:
-                raise ValueError(
-                    f'empty dedupe_fingerprint for storm entity_uuid={entity_uuid}'
-                )
-            esc = Escalation(
-                id=escalation_queue.make_id(entity_uuid),
-                # The entity is the subject, so it occupies task_id: that is the
-                # key get_by_task/has_open_l1 read a storm record back by, and it
-                # is what makes the record greppable per entity. It is NOT the
-                # fold key — dedupe_fingerprint below is — so the two cannot
-                # drift apart the way a task_id-keyed guard once did.
-                task_id=entity_uuid,
-                agent_role='reconciliation-stage1',
-                severity='blocking',
-                category=CATEGORY_STANDING_DECISION_STORM,
-                summary=summary,
-                detail=detail,
-                level=1,
-                dedupe_fingerprint=fingerprint,
-            )
-            outcome = submit_or_dedupe(escalation_queue, esc, config)
-            if outcome.get('status') == 'dedup_skipped':
-                # Loud-over-silent: the recurrence is visible in the log stream,
-                # not only as a counter on disk.
-                logger.info(
-                    'maybe_escalate_suppression_storm: entity_uuid=%s folded into '
-                    'parent_id=%s (child_id=%s) — the storm is recurring',
-                    entity_uuid,
-                    outcome.get('parent_id'),
-                    outcome.get('child_id'),
-                    extra={'project_id': project_id},
-                )
-            else:
-                # Tested with != rather than == 'queued' so observed_submit_response's
-                # auto-resolved/dismissed branch (a record WAS minted) still counts.
-                escalated.append(entity_uuid)
-        except Exception as exc:
-            logger.warning(
-                'maybe_escalate_suppression_storm: failed to escalate entity_uuid=%s '
-                '(fingerprint, id-gen, construction, submit, or fold): %s',
-                entity_uuid,
-                exc,
-                extra={'project_id': project_id},
-            )
-
-    return escalated
 
 
 # --------------------------------------------------------------------------- #
@@ -1457,21 +1314,10 @@ _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
 
 
 def _prior_done_suppression_count(prior_payload: Any) -> int:
-    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload.
-
-    Returns 0 for anything that is not a positive ``int`` — an absent key (every
-    marker written before the task 4381 amendment), ``None``, a bool (``True``
-    is an ``int`` in Python and must not be read as the count 1), a string, or a
-    negative value.  Free-form JSON off a ledger row is never trusted for shape.
-
-    Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(prior_payload, dict):
-        return 0
-    value = prior_payload.get(_DONE_SUPPRESSIONS_PAYLOAD_KEY)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return 0
-    return value
+    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload;
+    0 when absent (every marker written before the task 4381 amendment) or
+    malformed."""
+    return nonnegative_int_from_payload(prior_payload, _DONE_SUPPRESSIONS_PAYLOAD_KEY)
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
