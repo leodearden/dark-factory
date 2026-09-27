@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from _orch_helpers import ExitContractViolationCollector
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -335,6 +336,41 @@ class TestRecordExitVerdict:
         _record(_store_unavailable(), enforce=enforce, event_store=None, escalation_queue=None)
         assert len(_contract_records(caplog, 'violation')) == 1
         assert len(_contract_records(caplog, 'store_unavailable')) == 1
+
+
+@pytest.fixture
+def collector():
+    collector = ExitContractViolationCollector()
+    logger = logging.getLogger(_LOGGER)
+    logger.addHandler(collector)
+    try:
+        yield collector
+    finally:
+        logger.removeHandler(collector)
+
+
+class TestExitContractViolationCollector:
+    """Pins the REAL recorder's structured log output against what the
+    suite-wide ``_no_unexpected_exit_contract_violation`` guard keys on: the
+    ``exit_contract_verdict`` attribute, never the message text."""
+
+    def test_collects_exactly_the_violation_verdicts(self, collector, caplog, queue):
+        caplog.set_level(logging.DEBUG, logger=_LOGGER)
+        _record(_violation(), enforce=False)
+        _record(_violation(), enforce=True, escalation_queue=queue)
+        _record(_store_unavailable())
+
+        assert len(_contract_records(caplog, 'violation')) == 2
+        assert len(_contract_records(caplog, 'store_unavailable')) == 1
+        assert len(collector.violations) == 2
+        assert [r.levelno for r in collector.violations] == [logging.WARNING, logging.ERROR]
+        assert {getattr(r, 'exit_contract_verdict', None) for r in collector.violations} == {
+            'violation',
+        }
+
+    def test_ignores_a_record_without_the_verdict_attribute(self, collector):
+        logging.getLogger(_LOGGER).warning('run()-exit contract would-violate: prose only')
+        assert collector.violations == []
 
 
 def test_enforce_flag_ships_dark():
