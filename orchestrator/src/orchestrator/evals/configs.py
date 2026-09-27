@@ -784,26 +784,29 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 
 # ===== Codex + pi candidate bundles (eval-revival ξ) =====
 #
-# Two additive Phase-4 candidates, resolved by name via get_config_by_name —
+# Additive Phase-4 candidates, resolved by name via get_config_by_name —
 # mirrors ν's claude_endpoint_candidates() pattern above: NOT injected into
 # EVAL_CONFIGS/ofat_candidates (opt-in candidates; injecting them would
 # dispatch an evaluate-only backend in every default `--matrix` run and
 # perturb the OFAT incumbent floor).
 #
-#   - codex + GPT-5.6 "Sol": Rust implementer, evaluate-only (RUST CAUTION,
-#     PRD decision 14 — Claude leads the only Rust-bearing public
-#     benchmarks and open-model Rust evidence is thin, so no architect-role
-#     variant and no production wiring).
+#   - codex: a three-arm price/capability ladder (Astra / Sol / Terra), effort
+#     held at 'xhigh' on every arm so only the model varies.
 #   - pi + Sonnet: harness-isolating control — same model+effort as the
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Operator-adjustable best-effort literal (the GPT-5.6 "Sol" snapshot
-# codename), matching this file's MINIMAX_MODEL/GPU-literal convention: the
-# exact codex `--model` string is environment-specific and unverifiable from
-# this repo, so tests assert against this named constant rather than a
-# brittle inline string.
-CODEX_RUST_MODEL = 'gpt-5.6'
+# Codex model ids from the 2026-09-10 live market check (task 5384); list
+# prices live in config.py::_DEFAULT_PRICES.
+#   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
+#   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
+#     14 — Claude leads the only Rust-bearing public benchmarks and open-model
+#     Rust evidence is thin, so no architect-role variant and no production
+#     wiring). Its rate is promotional through at least 2026-11-21.
+#   - Terra is the mid-price control.
+CODEX_ASTRA_MODEL = 'gpt-6-astra'
+CODEX_SOL_MODEL = 'gpt-5.6-sol'
+CODEX_TERRA_MODEL = 'gpt-5.6-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
 # vs claude delta attributes cleanly to harness effect rather than a model
@@ -814,14 +817,20 @@ PI_CONTROL_MODEL = 'sonnet'
 
 
 def codex_pi_candidates() -> list[EvalConfig]:
-    """The two ξ candidate bundles: codex Rust implementer + pi Sonnet control.
+    """The ξ candidate bundles: the three-arm codex slate + the pi Sonnet control.
 
     ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
     via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
     """
     return [
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_RUST_MODEL, 'xhigh', role='implementer',
+            'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role='implementer',
+        ),
+        EvalConfig(
+            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role='implementer',
+        ),
+        EvalConfig(
+            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role='implementer',
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend
