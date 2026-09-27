@@ -67,7 +67,7 @@ async def _successful_call_kwargs(
 ) -> dict[str, Any]:
     invoke = AsyncMock(return_value=_agent_result(structured))
     await drive(curator, invoke)
-    return invoke.call_args.kwargs
+    return dict(invoke.call_args.kwargs)
 
 
 class TestCuratorMcpScoping:

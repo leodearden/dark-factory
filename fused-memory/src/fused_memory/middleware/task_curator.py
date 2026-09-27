@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid as uuid_mod
 from collections.abc import Callable, Iterable, Mapping
@@ -44,6 +45,12 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     is_zero_output_timeout,
     no_mcp_servers_config,
+)
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
@@ -145,6 +152,28 @@ if DEFAULT_PRIORITY not in _PRIORITY_RANK:
 # best-effort path — a real behavioural regression — so we override with a short
 # minutes-scale bound that preserves the fast-fail/defer contract.
 _CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+
+# Stem of a gated curator's per-process CLAUDE_CONFIG_DIR. The dead-PID sweep
+# builds its prefix from the same constant, so the two cannot drift apart.
+_CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
+
+
+def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
+    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+    prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
+    sweep_stale_pid_dirs_once(
+        prefix,
+        sweep=sweep_stale_pid_dirs,
+        on_reclaimed=lambda reclaimed: logger.info(
+            'TaskCurator: reclaimed %d stale config dir(s) under %s (dead-PID sweep)',
+            reclaimed, prefix,
+        ),
+        on_failure=lambda _exc: logger.warning(
+            'TaskCurator: dead-PID sweep of %s failed; continuing without it',
+            prefix, exc_info=True,
+        ),
+        base_dir=base_dir,
+    )
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
@@ -774,6 +803,7 @@ class TaskCurator:
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,
         prompt_store: PromptArtifactStore | None = None,
+        config_dir_base: Path | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
@@ -781,6 +811,9 @@ class TaskCurator:
         self._cwd = cwd
         self._escalator = escalator
         self._prompt_store = prompt_store
+        # Parent of the per-process config dir; None means the system tempdir.
+        self._config_dir_base = config_dir_base
+        self._config_dir: TaskConfigDir | None = None  # lazy, gated only
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
@@ -2803,6 +2836,39 @@ class TaskCurator:
     # LLM call
     # ------------------------------------------------------------------
 
+    def _transcript_config_dir(self) -> TaskConfigDir | None:
+        """This process's curator config dir, or None when there is no UsageGate.
+
+        Gate-less, ``invoke_with_cap_retry`` writes no credentials into a config
+        dir, so an isolated one would leave the CLI logged out.
+        """
+        if self._usage_gate is None:
+            return None
+        if self._config_dir is None:
+            _sweep_stale_curator_config_dirs_once(self._config_dir_base)
+            self._config_dir = TaskConfigDir(
+                f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
+            )
+        return self._config_dir
+
+    def _transcript_scope(self, timeout_seconds: float) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that locate this call's transcript.
+
+        config_dir and session_id are set together or not at all: together they
+        make ``transcript_turns`` stampable, which is what makes
+        ``is_zero_output_timeout`` transcript-authoritative. The startup grace
+        equals the call's own timeout because the curator's measured first-turn
+        latency tail exceeds the 120s default (task 3995 plan).
+        """
+        config_dir = self._transcript_config_dir()
+        if config_dir is None:
+            return {'config_dir': None}
+        return {
+            'config_dir': config_dir,
+            'session_id': str(uuid_mod.uuid4()),
+            'startup_grace_secs': timeout_seconds,
+        }
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
@@ -2837,6 +2903,7 @@ class TaskCurator:
             self._config.curator.single_call_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+        transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2866,6 +2933,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **transcript_scope,
         )
 
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -2946,6 +3014,7 @@ class TaskCurator:
             self._config.curator.batch_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
+        transcript_scope = self._transcript_scope(timeout)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2966,6 +3035,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **transcript_scope,
         )
 
         latency_ms = int((time.monotonic() - start) * 1000)
