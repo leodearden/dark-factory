@@ -517,6 +517,53 @@ class TestUpdateSuppressionStreaks:
         }
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('per_cycle_threshold', 'window_suppressed', 'escalate'),
+        [
+            pytest.param(SUPPRESSION_STORM_THRESHOLD_PER_CYCLE, 12, True, id='default-n'),
+            pytest.param(3, 0, False, id='tuned-n-owns-every-cycle'),
+        ],
+    )
+    async def test_the_per_cycle_cutoff_is_the_one_it_is_given(
+        self, ledger_memory_service, per_cycle_threshold, window_suppressed, escalate
+    ):
+        """The cutoff must be the N the per-cycle escape actually runs with; a
+        fixed cutoff would let one flood page both escapes once N is tuned."""
+        for n in (1, 2, 3):
+            (last,) = await storm_escape.update_suppression_streaks(
+                ledger_memory_service,
+                _STREAK_PID,
+                f'run-{n}',
+                _suppressing_counts({_ESD_U1: 4}),
+                now=_STREAK_NOW,
+                per_cycle_threshold=per_cycle_threshold,
+            )
+
+        assert (last.streak, last.window_suppressed, last.escalate) == (
+            3,
+            window_suppressed,
+            escalate,
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_offset_now_is_written_in_utc(self, ledger_memory_service):
+        """gc() compares expires_at as TEXT against a UTC now, so every stored
+        timestamp is UTC whatever offset the caller's now carried."""
+        await _run_cycle(
+            ledger_memory_service,
+            'run-1',
+            _suppressing(_ESD_U1),
+            now='2026-06-01T02:00:00+02:00',
+        )
+
+        record = await _stored_streak_record(ledger_memory_service.recon_ledger)
+        assert record is not None
+        assert (record.created_at, record.expires_at) == (
+            '2026-06-01T00:00:00+00:00',
+            '2026-08-30T00:00:00+00:00',
+        )
+
+    @pytest.mark.asyncio
     async def test_quiet_cycle_resets_the_window_with_the_streak(self, ledger_memory_service):
         ledger = ledger_memory_service.recon_ledger
         await _run_consecutive_cycles(ledger_memory_service, [2, 2])
@@ -675,6 +722,25 @@ class TestUpdateSuppressionStreaksFailSafe:
         (update,) = await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
 
         assert update.streak == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'now',
+        [
+            pytest.param('2026-06-01T00:00:00', id='naive'),
+            pytest.param('not a timestamp', id='malformed'),
+        ],
+    )
+    async def test_a_now_without_a_utc_offset_raises_before_anything_is_written(
+        self, ledger_memory_service, now
+    ):
+        """A caller-supplied now is a programmer's input, not a transient
+        condition, so the best-effort contract does not cover it: an expires_at
+        without an offset would silently break gc()'s TEXT comparison."""
+        with pytest.raises(ValueError, match='now'):
+            await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1), now=now)
+
+        assert await _stored_streaks(ledger_memory_service.recon_ledger) == {}
 
     @pytest.mark.asyncio
     async def test_one_entitys_write_failure_does_not_abort_the_others(

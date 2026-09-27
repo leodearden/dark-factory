@@ -326,6 +326,23 @@ def _next_suppression_streaks(
     return next_rows
 
 
+def _utc_now(now: str | None) -> datetime:
+    """*now* as a UTC ``datetime``, or the current time when it is ``None``.
+
+    Raises ``ValueError`` naming *now* when it is not ISO-8601 or carries no
+    UTC offset.
+    """
+    if now is None:
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(now)
+    except ValueError as exc:
+        raise ValueError(f'now must be an ISO-8601 timestamp (got {now!r})') from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f'now must carry a UTC offset (got {now!r})')
+    return parsed.astimezone(UTC)
+
+
 async def update_suppression_streaks(
     memory_service: Any,
     project_id: str,
@@ -335,6 +352,7 @@ async def update_suppression_streaks(
     now: str | None = None,
     threshold: int = SUPPRESSION_STREAK_THRESHOLD_CYCLES,
     volume_threshold: int = SUPPRESSION_STREAK_VOLUME_THRESHOLD,
+    per_cycle_threshold: int = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 ) -> list[SuppressionStreakUpdate]:
     """Advance every standing decision's cross-cycle suppression streak by one cycle.
 
@@ -351,11 +369,14 @@ async def update_suppression_streaks(
     flags it suppressed across that window total more than *volume_threshold*
     (N).  The window is bounded because a decision that works suppresses its
     re-derived complaint about once per cycle: its window then totals K <= N,
-    so it never files however long its streak runs.  A cycle over the
-    per-cycle N stays in the window but is left out of the total: the per-cycle
-    escape already reported it, and one flood must not page both escapes in
-    the same cycle.  The verdict is re-evaluated every cycle, so a decision
-    that drops back to its steady-state rate stops escalating without a reset.
+    so it never files however long its streak runs.  A cycle over
+    *per_cycle_threshold* stays in the window but is left out of the total:
+    the per-cycle escape already reported it, and one flood must not page both
+    escapes in the same cycle.  That only holds while *per_cycle_threshold* is
+    the *threshold* :func:`maybe_escalate_suppression_storm` runs with, so a
+    caller tuning one passes the same value to both.  The verdict is
+    re-evaluated every cycle, so a decision that drops back to its
+    steady-state rate stops escalating without a reset.
 
     Replaying a cycle is idempotent: a row whose stored ``last_run_id`` equals
     *run_id* is re-written without incrementing, so a re-entered stage cannot
@@ -375,13 +396,17 @@ async def update_suppression_streaks(
     cause one.
 
     Every write refreshes ``expires_at`` to *now* plus
-    ``STANDING_DECISION_TTL_DAYS``, spelled as ``isoformat()`` like the
-    standing-decision writer so ``gc()``'s TEXT comparison stays valid.
-    *now* is an ISO-8601 string defaulting to the current UTC time.
+    ``STANDING_DECISION_TTL_DAYS``, stored in UTC and spelled as
+    ``isoformat()`` like the standing-decision writer, so ``gc()``'s TEXT
+    comparison stays valid.  *now* is a timezone-aware ISO-8601 string and
+    defaults to the current time.  A malformed or offset-less *now* raises
+    ``ValueError`` before any I/O: it is a caller's programming error, which
+    the best-effort contract does not cover.
 
     Returns one :class:`SuppressionStreakUpdate` per row written, sorted by
     ``(entity_uuid, grounds)``.
     """
+    now_dt = _utc_now(now)
     if not result.suppression_evaluated:
         return []
 
@@ -408,7 +433,6 @@ async def update_suppression_streaks(
         return []
     stored = {(row.entity_uuid.lower(), row.grounds): row for row in rows}
 
-    now_dt = datetime.now(UTC) if now is None else datetime.fromisoformat(now)
     expires_at = (now_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
     updates: list[SuppressionStreakUpdate] = []
     for (entity_uuid, grounds), (streak, window) in sorted(
@@ -437,9 +461,7 @@ async def update_suppression_streaks(
                 exc_info=True,
             )
             continue
-        window_suppressed = sum(
-            count for count in window if count <= SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
-        )
+        window_suppressed = sum(count for count in window if count <= per_cycle_threshold)
         updates.append(
             SuppressionStreakUpdate(
                 entity_uuid=entity_uuid,

@@ -81,6 +81,9 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     sweep_stale_status_snapshot_edges,
 )
+from fused_memory.reconciliation.standing_decision_constants import (
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+)
 from fused_memory.reconciliation.standing_decision_storm_escape import (
     maybe_escalate_suppression_storm,
     maybe_escalate_suppression_streak,
@@ -840,6 +843,7 @@ class MemoryConsolidator(BaseStage):
                     project_id=self.project_id,
                     run_id=run_id,
                     result=_esd_result,
+                    threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
                 )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
@@ -1368,13 +1372,16 @@ class MemoryConsolidator(BaseStage):
 
         The state update sits outside the escalation-queue gate so the streak is
         already real when a queue is wired; only the filing needs the queue.
-        Both callees are best-effort and never raise.
+        Both callees are best-effort and never raise.  The updater's per-cycle
+        cutoff is the N run() hands the per-cycle escape, so a cycle that
+        escape reported is never counted a second time.
         """
         updates = await update_suppression_streaks(
             memory_service=self.memory,
             project_id=self.project_id,
             run_id=run_id,
             result=esd_result,
+            per_cycle_threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
         )
         report.stats['entity_standing_decision_max_suppression_streak'] = max(
             (update.streak for update in updates), default=0
