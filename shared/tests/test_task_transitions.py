@@ -240,18 +240,33 @@ class TestIsLegalTransitionCore:
 
 
 # Core enumerated (from, to) pairs, grouped by kind, each with its call-site
-# anchor — verified verbatim against the working tree on 2026-07-06. This
+# anchor — first verified against the working tree on 2026-07-06, re-verified
+# and re-cited as path::symbol by task 3542 (a bare file name is under
+# orchestrator/src/orchestrator/; recon's targeted.py is
+# fused-memory/src/fused_memory/reconciliation/targeted.py). This
 # documents the DERIVATION (not the full union: forward-compat infra-hold
 # edges and soak-validated review/deferred edges live in the implementation
 # but are not re-derived here) and pins that every one of these pairs is
 # legal for an unrestricted actor (HUMAN gets the full union, D5 safe-open).
 _CORE_UNION_PAIRS = [
     # dispatch
-    (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, 'dispatch: workflow.py:1510'),
+    (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, 'dispatch: workflow.py::TaskWorkflow._setup_worktree_and_artifacts'),
     # completion
-    (TaskStatus.IN_PROGRESS, TaskStatus.DONE, 'completion: merged workflow.py:1380, found_on_main workflow.py:3809/7396/harness.py:3623'),
-    (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE, 'completion: workflow.py:1015/6424, harness.py:619/646'),
-    (TaskStatus.BLOCKED, TaskStatus.DONE, 'completion: train attribution workflow.py:6424'),
+    (
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.DONE,
+        'completion: merged workflow.py::TaskWorkflow._finalise_merged_done, already-merged recovery '
+        'workflow.py::TaskWorkflow._finalise_recovery_done, found_on_main '
+        'workflow.py::TaskWorkflow._handle_already_done_report / _on_architect_merge_done, '
+        'harness.py::Harness._mark_in_progress_done',
+    ),
+    (
+        TaskStatus.MERGE_DEFERRED,
+        TaskStatus.DONE,
+        'completion: train workflow.py::TaskWorkflow._maybe_enqueue_group_merge / _attribute_train_failure, '
+        'harness.py::build_train_callback_factory (mark_member_done / redrive_member)',
+    ),
+    (TaskStatus.BLOCKED, TaskStatus.DONE, 'completion: train attribution workflow.py::TaskWorkflow._attribute_train_failure'),
     (
         TaskStatus.PENDING,
         TaskStatus.DONE,
@@ -264,42 +279,56 @@ _CORE_UNION_PAIRS = [
         '(planning-mode/merge-vehicle via merge queue), manual write, no enumerated call site',
     ),
     # park
-    (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py:867/896'),
+    (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py::TaskWorkflow._enter_merge_deferred / _handle_superseded'),
     # requeue
     (
         TaskStatus.IN_PROGRESS,
         TaskStatus.PENDING,
-        'requeue: workflow.py:2464/3755, blast-radius scheduler.py:4484, stranded-revert harness.py:3487/3567',
+        'requeue: workflow.py::TaskWorkflow._repend_for_requeue / _plan / _handle_blocking_dep_report, '
+        'blast-radius scheduler.py::Scheduler.handle_blast_radius_expansion, '
+        'stranded-revert harness.py::Harness._revert_in_progress_if_no_live_claimant, '
+        'Table B restart harness.py::Harness._action_teardown_and_set_status',
     ),
     (
         TaskStatus.BLOCKED,
         TaskStatus.PENDING,
-        'requeue: steward re-pend workflow.py:8007, escalation resume harness.py:8739',
+        'requeue: steward re-pend workflow.py::TaskWorkflow._mark_blocked, '
+        'escalation resume harness.py::Harness._cascade_unblock_member, '
+        'stranded-blocked redispatch scheduler.py::Scheduler._phase_redispatch_stranded_blocked, '
+        'recon targeted.py::TargetedReconciler._unblock_dependent',
     ),
-    (TaskStatus.MERGE_DEFERRED, TaskStatus.PENDING, 'requeue: re-drive harness.py:682'),
-    (TaskStatus.DEFERRED, TaskStatus.PENDING, 'requeue: deferred resumption, stage2 commit_planning'),
+    (
+        TaskStatus.MERGE_DEFERRED,
+        TaskStatus.PENDING,
+        'requeue: train re-drive harness.py::build_train_callback_factory, '
+        'workflow.py::TaskWorkflow._revert_withheld_member',
+    ),
+    (TaskStatus.DEFERRED, TaskStatus.PENDING, 'requeue: planning-mode commit fused-memory/src/fused_memory/server/tools.py::create_mcp_server.commit_planning'),
     # block
     (
         TaskStatus.IN_PROGRESS,
         TaskStatus.BLOCKED,
-        '_mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905',
+        'block: workflow.py::TaskWorkflow._mark_blocked, CONVERT_TO_BLOCKED harness.py::Harness._reconcile_one_stranded, '
+        'Table B park harness.py::Harness._action_teardown_and_set_status / escalation/src/escalation/server.py::release_workflow',
     ),
-    (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED, 'block: train failer workflow.py:6464'),
-    (TaskStatus.DEFERRED, TaskStatus.BLOCKED, 'block: recon targeted.py:1041'),
+    (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED, 'block: train failer workflow.py::TaskWorkflow._attribute_train_failure'),
+    (TaskStatus.DEFERRED, TaskStatus.BLOCKED, 'block: recon targeted.py::TargetedReconciler._sweep_block_orphan'),
     (
         TaskStatus.PENDING,
         TaskStatus.BLOCKED,
-        'block: deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; '
+        'block: born-at-L2 deterministic_runner.py::DeterministicRunner *_and_block helpers; dispatch gates '
+        'harness.py::Harness._block_and_escalate_*; retry-cap scheduler.py::Scheduler.trigger_retry_cap_exhausted; '
         'human block of a pending task is an out-of-band manual write, no enumerated call site',
     ),
     # cancel
-    (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py:8417'),
-    (TaskStatus.BLOCKED, TaskStatus.CANCELLED, 'cancel: harness.py:8417'),
-    (TaskStatus.DEFERRED, TaskStatus.CANCELLED, 'cancel: recon targeted.py:1001'),
+    (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py::Harness._action_teardown_and_set_status'),
+    (TaskStatus.BLOCKED, TaskStatus.CANCELLED, 'cancel: abandon harness.py::Harness._action_teardown_and_set_status'),
+    (TaskStatus.DEFERRED, TaskStatus.CANCELLED, 'cancel: recon targeted.py::TargetedReconciler._sweep_cancel_orphan'),
     (
         TaskStatus.MERGE_DEFERRED,
         TaskStatus.CANCELLED,
-        'cancel: W9-θ cancel-of-parked-train-member workflow.py:2639; recon targeted.py:1001',
+        'cancel: W9-θ cancel-of-parked-train-member workflow.py::TaskWorkflow._finalise_cancellation; '
+        'recon targeted.py::TargetedReconciler._sweep_cancel_orphan',
     ),
 ]
 
