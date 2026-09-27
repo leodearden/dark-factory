@@ -1,6 +1,7 @@
 """Tests for scripts/sitting/inventory.py — the fleet-wide open-question inventory (task 5376)."""
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -227,6 +228,63 @@ class TestCollectOpenItems:
             'esc-60-2': queue / 'archive' / '2026-09-01' / 'esc-60-2.json',
         }
         assert set(inv.escalation_index[_recon_queue(df_root)]) == {'esc-60-2'}
+
+
+class TestDecisionProject:
+    """The linked record's own project, as read: the close payload's compare-and-swap expectation, never ``project``."""
+
+    def test_a_recon_queue_l2_linked_to_another_projects_record_keeps_both_projects(self, fleet, df_root):
+        """The measured shape: dark-factory's recon queue carries know_live / reify / solar / autopilot gates."""
+        _write_escalation(df_root / 'data' / 'reconciliation' / 'escalations', id='esc-500-1', level=2)
+        _write_decision(
+            fleet, id='know_live-esc-500-1', project='know_live', escalation_id='esc-500-1',
+            escalations_dir=_recon_queue(df_root),
+        )
+
+        (item,) = _collect([_queue(df_root), _recon_queue(df_root)], fleet).items
+
+        assert item.project == 'dark_factory'
+        assert item.decision_id == 'know_live-esc-500-1'
+        assert item.decision_project == 'know_live'
+
+    def test_a_decision_item_carries_its_folded_project_twice(self, fleet, df_root):
+        _write_decision(fleet, id='lone-df', project='df')
+
+        (item,) = _collect([_queue(df_root)], fleet).items
+
+        assert item.kind == 'decision'
+        assert item.decision_project == item.project == 'dark_factory'
+
+    def test_an_unlinked_escalation_item_has_none(self, fleet, df_root):
+        _write_escalation(df_root / 'data' / 'escalations', id='esc-501-1', level=2)
+
+        (item,) = _collect([_queue(df_root)], fleet).items
+
+        assert (item.decision_id, item.decision_project) == (None, '')
+
+    def test_a_decision_project_without_a_decision_id_is_refused(self):
+        with pytest.raises(ValueError, match='decision_project'):
+            mod.OpenItem(key=mod.escalation_key('/q', 'esc-1-1'), escalation_id='esc-1-1', decision_project='reify')
+
+
+class TestQueueTag:
+    def test_the_two_known_queue_shapes(self, df_root):
+        assert mod.queue_tag(_queue(df_root)) == ''
+        assert mod.queue_tag(_recon_queue(df_root)) == 'recon'
+
+    def test_any_other_queue_gets_a_stable_digest_of_its_normalized_path(self, tmp_path):
+        elsewhere = tmp_path / 'elsewhere' / 'queue'
+        other = tmp_path / 'other' / 'queue'
+
+        tag = mod.queue_tag(str(elsewhere))
+
+        assert re.fullmatch(r'q[0-9a-f]{10}', tag)
+        assert mod.queue_tag(str(elsewhere) + '/') == tag
+        assert mod.queue_tag(str(other)) != tag
+
+    def test_every_tag_survives_decision_id_sanitisation(self, tmp_path, df_root):
+        for queue in (_queue(df_root), _recon_queue(df_root), str(tmp_path / 'Odd Dir' / 'q.v2')):
+            assert re.fullmatch(r'[a-z0-9]*', mod.queue_tag(queue))
 
 
 class TestFailOpen:
