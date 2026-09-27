@@ -7,7 +7,8 @@ default is 1 (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`).
 The knob is green-tier (`config.py::RELOADABLE_FIELDS`), so it applies through
 `reload_config` without a restart.
 
-Value history: 1 -> 3 on 2026-09-03, -> 1 on 2026-09-08, -> 2 on 2026-09-23.
+Value history: 1 -> 3 on 2026-09-03, -> 1 on 2026-09-08, -> 2 on 2026-09-23,
+-> 1 on 2026-09-27 (task 5797, §2026-09-27 below).
 Each later re-measurement appends a dated section below and reuses the
 Reproduction commands.
 
@@ -458,10 +459,12 @@ print('at T', depth_at(T, None), depth_at(T, STALE))
 
 ### 7. Status and hot-apply
 
-- The revert is committed on branch `task/5797` at `b7018eae1e`
-  (`verify_admission_task_slots: 1`, plus a dated paragraph in the yaml block
-  pointing here). It was validated with `orchestrator check-config` (no unknown
-  keys) and `load_config` (resolves to 1), and with
+- The revert is the commit on branch `task/5797` titled `config(5797):
+  verify_admission_task_slots 2 -> 1` (`verify_admission_task_slots: 1`, plus
+  a dated paragraph in the yaml block pointing here). Its SHA changes when the
+  branch is rebased or merged, so find it by that title on main. It was
+  validated with `orchestrator check-config` (no unknown keys) and
+  `load_config` (resolves to 1), and with
   `tests/scripts/test_orchestrator_config_duplicate_keys.py`,
   `tests/scripts/test_orchestrator_restart_config_drift.py` and
   `orchestrator/tests/test_config_verify_admission_reload.py` (14 + 16
@@ -489,7 +492,11 @@ print('at T', depth_at(T, None), depth_at(T, STALE))
   `submit_task` was called, so both were filed through `escalate_info` as the
   plan's fallback, and no ticket ids exist:
   - **esc-5797-3** (cleanup_needed): codify this A/B cut as a runnable script
-    once task 5798 lands (suggestion_hash `f0ba647a8e9f59c4`).
+    once task 5798 lands (suggestion_hash `f0ba647a8e9f59c4`). The script
+    must import the measured-rows predicate from
+    `dashboard/src/dashboard/data/burndown.py::_measured_rows`, not copy the
+    SQL literal that §6's M4 snippet carries; the literal drifts silently
+    when that predicate changes (addendum esc-5797-5).
   - **esc-5797-4** (infra_issue): the burndown.db dark-factory snapshot hole,
     2026-09-21T14:50Z..2026-09-27T11:10Z (suggestion_hash `4dc5cea5d2cb7646`).
 
