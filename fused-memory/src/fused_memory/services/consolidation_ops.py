@@ -13,17 +13,19 @@ consolidation executor has no MCP boundary in front of it and must run
 the SAME code ``server/tools.py::consolidate_memories`` runs, not a
 second implementation of it.
 
-ONE LOOP, ONE CLASSIFIER, ONE SCROLL (INV-5). Tag-only is a MODE of
-:func:`execute_retain_consolidation` — chosen by ``canonical_content is
-None`` — never a sibling function, so the peer-tag loop has exactly one
-home and the two paths cannot drift. :func:`patch_memory_metadata` is
-likewise the single home of ``update_memory``'s split contract — a
-refusal is RETURNED, every other failure is RAISED — for all three of
-the op's patch sites: the retain tag here, and the child reparent and
-supersedes narrowing the tool keeps. :func:`read_topic_closure` is the
-single home of the closure scroll, exposed separately only so each
-caller can place it where its own ordering requires; a caller with a
-delete arm must re-read it AFTER the fold.
+ONE LOOP, ONE CLASSIFIER, ONE SCROLL (INV-5). :func:`apply_retain_arm`
+is the arm's writes — establish the canonical, tag the peers — and the
+single home of the peer-tag loop. Tag-only is a MODE of it, chosen by
+``canonical_content is None``, never a sibling function, so the two
+paths cannot drift. :func:`execute_retain_consolidation` composes it
+with :func:`read_topic_closure` and the shared envelope for a caller with
+no delete arm; the tool, which has one, calls :func:`apply_retain_arm`
+and reads the closure itself once its fold is done.
+:func:`patch_memory_metadata` is likewise the single home of
+``update_memory``'s split contract — a refusal is RETURNED, every other
+failure is RAISED — for all three of the op's patch sites: the retain
+tag here, and the child reparent and supersedes narrowing the tool
+keeps.
 
 THE MINT DELIBERATELY BYPASSES THE TOOL-LEVEL WRITE GUARDS. It goes
 through ``MemoryService.add_memory``, so it never meets the near-
@@ -59,7 +61,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'TOPIC_MEMBER_LIMIT',
+    'RetainArmApplied',
+    'RetainArmRefused',
     'TopicClosure',
+    'apply_retain_arm',
     'execute_retain_consolidation',
     'patch_memory_metadata',
     'read_topic_closure',
@@ -89,6 +94,31 @@ class TopicClosure:
     total: int
     truncated: bool
     available: bool
+
+
+@dataclass(frozen=True)
+class RetainArmApplied:
+    """The canonical the arm established, and what became of each peer.
+
+    ``canonical_supersedes`` is what a minted canonical durably claims to
+    replace; tag-only mints nothing, so it is empty there.
+    """
+
+    canonical_id: str
+    canonical_supersedes: list[str]
+    retained: list[str]
+    retain_failures: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class RetainArmRefused:
+    """A refusal returned before any peer was read or patched.
+
+    ``response`` is the ``{'error', 'error_type', ...}`` wire shape, for the
+    caller to hand back unchanged.
+    """
+
+    response: dict[str, Any]
 
 
 # ONE call-and-classify block for EVERY metadata patch this op makes:
@@ -161,10 +191,10 @@ async def read_topic_closure(
 ) -> TopicClosure:
     """Scroll every member of *topic*. The ONE home of the closure listing.
 
-    Callers place it where their own ordering contract requires — this arm
-    reads it once the canonical exists, while a caller that also DELETES
-    must re-read it after the fold, or it reports a reaped record as a live
-    topic member in the same envelope that reports it deleted.
+    Read it once the topic's membership is final. A caller that also
+    DELETES reads it after its fold, never before: a listing taken earlier
+    reports a reaped record as a live topic member in the same envelope
+    that reports it deleted.
     """
     # (6) The closure listing comes from the deterministic scroll, NOT
     # `search`. A ranked top-N read can silently omit the canonical this
@@ -251,22 +281,78 @@ async def execute_retain_consolidation(
     causation_id: str | None = None,
     source: str = 'mcp_tool',
 ) -> dict[str, Any]:
-    """Mint the canonical, tag the retained peers, list the topic's closure.
+    """Apply the retain arm, then list the topic's closure (PRD C3).
 
-    The retain arm of ``consolidate_memories``, callable without a server
-    or a tool closure so the auto-consolidation executor reaches the SAME
-    code the tool does. Returns ``build_consolidation_result``'s envelope
-    with every delete-arm disposition empty, or a ``{'error',
-    'error_type'}`` refusal.
+    For a caller with no delete arm, such as the auto-consolidation
+    executor. Returns ``build_consolidation_result``'s envelope with every
+    delete-arm disposition empty, or the arm's ``{'error', 'error_type'}``
+    refusal unchanged. The arguments are :func:`apply_retain_arm`'s.
+    """
+    arm = await apply_retain_arm(
+        memory_service,
+        project_id=project_id,
+        topic=topic,
+        canonical_content=canonical_content,
+        retain_ids=retain_ids,
+        category=category,
+        agent_id=agent_id,
+        run_id=run_id,
+        extra_canonical_meta=extra_canonical_meta,
+        session_id=session_id,
+        causation_id=causation_id,
+        source=source,
+    )
+    if isinstance(arm, RetainArmRefused):
+        return arm.response
+
+    closure = await read_topic_closure(
+        memory_service, project_id=project_id, topic=topic, run_id=run_id
+    )
+
+    return build_consolidation_result(
+        canonical_id=arm.canonical_id,
+        topic=topic,
+        canonical_supersedes=arm.canonical_supersedes,
+        deleted=[],
+        failed_deletes=[],
+        survivors=[],
+        survivor_check_failed=[],
+        retained=arm.retained,
+        retain_failures=arm.retain_failures,
+        reparented=[],
+        reparent_failures=[],
+        topic_members=closure.members,
+        topic_members_total=closure.total,
+        topic_members_truncated=closure.truncated,
+        topic_members_available=closure.available,
+    )
+
+
+async def apply_retain_arm(
+    memory_service: MemoryService,
+    *,
+    project_id: str,
+    topic: str,
+    canonical_content: str | None,
+    retain_ids: list[str],
+    category: str | None,
+    agent_id: str | None,
+    run_id: str | None,
+    extra_canonical_meta: dict[str, Any] | None,
+    session_id: str | None = None,
+    causation_id: str | None = None,
+    source: str = 'mcp_tool',
+) -> RetainArmApplied | RetainArmRefused:
+    """Establish the canonical and tag the retained peers: the arm's writes.
 
     ``canonical_content=None`` selects TAG-ONLY (PRD D14): no canonical is
-    minted and the topic's existing one is reported instead. It is a MODE
+    minted and the topic's existing one is resolved instead. It is a MODE
     of this function rather than a sibling, so the peer-tag loop below has
     exactly one home and cannot drift between the two.
 
     Every refusal — authorization, ``CanonicalWriteFailed``,
-    ``TagOnlyIncumbentNotFound`` — is returned before any peer is read or
-    patched.
+    ``TagOnlyIncumbentNotFound`` — comes back as :class:`RetainArmRefused`
+    before any peer is read or patched.
     """
     # AUTHORIZE FIRST, above every read and every write: an unauthorized
     # caller is turned away before anything is done on its behalf and
@@ -298,11 +384,11 @@ async def execute_retain_consolidation(
         metadata_patch=True,
     )
     if not decision.allowed:
-        return {
+        return RetainArmRefused({
             'error': decision.error,
             'error_type': decision.error_type,
             'agent_id': agent_id,
-        }
+        })
 
     # (4) The canonical FIRST: no delete or metadata patch may precede an
     # ESTABLISHED canonical, which the mint arm establishes by writing it
@@ -345,7 +431,7 @@ async def execute_retain_consolidation(
         # and reap a live cluster in favour of a record that does not exist.
         minted_id = written.memory_ids[0] if written.memory_ids else None
         if not minted_id:
-            return {
+            return RetainArmRefused({
                 'error': (
                     'consolidate_memories: the canonical write returned no memory '
                     'id, so nothing was deleted. The supersedes are untouched — '
@@ -354,7 +440,7 @@ async def execute_retain_consolidation(
                 'error_type': 'CanonicalWriteFailed',
                 'topic': topic,
                 'supersedes': list(canonical_meta.get('supersedes') or []),
-            }
+            })
         canonical_id = minted_id
     else:
         # TAG-ONLY (PRD D14). NOTHING is written to the incumbent:
@@ -378,7 +464,7 @@ async def execute_retain_consolidation(
             incumbent_id = None
             reason = f'its canonical could not be read ({exc})'
         if not incumbent_id:
-            return {
+            return RetainArmRefused({
                 'error': (
                     f'consolidate_memories: tag-only was asked to report the '
                     f'existing canonical for {topic!r}, but {reason}. No peer '
@@ -388,7 +474,7 @@ async def execute_retain_consolidation(
                 ),
                 'error_type': 'TagOnlyIncumbentNotFound',
                 'topic': topic,
-            }
+            })
         canonical_id = incumbent_id
 
     # (5a) THE RETAIN ARM — the ratified default (gate 3200). Each peer
@@ -497,24 +583,9 @@ async def execute_retain_consolidation(
             continue
         retained.append(retain_id)
 
-    closure = await read_topic_closure(
-        memory_service, project_id=project_id, topic=topic, run_id=run_id
-    )
-
-    return build_consolidation_result(
+    return RetainArmApplied(
         canonical_id=canonical_id,
-        topic=topic,
         canonical_supersedes=list(canonical_meta.get('supersedes') or []),
-        deleted=[],
-        failed_deletes=[],
-        survivors=[],
-        survivor_check_failed=[],
         retained=retained,
         retain_failures=retain_failures,
-        reparented=[],
-        reparent_failures=[],
-        topic_members=closure.members,
-        topic_members_total=closure.total,
-        topic_members_truncated=closure.truncated,
-        topic_members_available=closure.available,
     )

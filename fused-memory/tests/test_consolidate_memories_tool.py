@@ -2507,16 +2507,19 @@ class TestTheClosureListingIsReadAfterTheFold:
     @pytest.mark.asyncio
     async def test_a_reaped_topic_member_is_not_listed_as_live(self):
         svc = make_service()
-        # Two ANSWERS to the same question, before and after the fold. The
-        # world's answer changes because the op changed it; modelling the
-        # scroll as a constant would make any placement of the read look
-        # correct.
-        svc.get_memories_by_metadata = AsyncMock(
-            side_effect=[
-                [_scroll_row(m) for m in (CANONICAL, RETAIN_1, RETAIN_2, S1)],
-                [_scroll_row(m) for m in (CANONICAL, RETAIN_1, RETAIN_2)],
+
+        # The scroll answers from the world, which the op changes: a record
+        # this call has deleted is no longer a topic member. A constant
+        # answer would make any placement of the read look correct.
+        async def _live_topic_rows(**_):
+            reaped = {c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list}
+            return [
+                _scroll_row(m)
+                for m in (CANONICAL, RETAIN_1, RETAIN_2, S1)
+                if m not in reaped
             ]
-        )
+
+        svc.get_memories_by_metadata = AsyncMock(side_effect=_live_topic_rows)
 
         result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
 
@@ -2528,14 +2531,20 @@ class TestTheClosureListingIsReadAfterTheFold:
         assert S1 in result['deleted']
 
     @pytest.mark.asyncio
-    async def test_the_retain_only_arm_pays_for_exactly_one_scroll(self):
-        """The ratified default (gate 3200), and the only shape the
-        auto-consolidation executor takes. With no delete arm there is no
-        fold for a second read to see, so owing one would be pure cost."""
+    @pytest.mark.parametrize(
+        'shape',
+        [
+            {'retain': [RETAIN_1, RETAIN_2]},
+            {'supersedes': [], 'retain': [RETAIN_1, RETAIN_2], 'run_id': None},
+        ],
+        ids=['with-a-fold', 'retain-only'],
+    )
+    async def test_the_closure_is_scrolled_exactly_once(self, shape):
+        """The envelope's `topic_members*` fields have ONE source: the
+        listing read once the fold is done. A second read would be a second
+        source for the same fields, and a wasted scroll on every call."""
         svc = make_service()
 
-        await call_consolidate(
-            svc, supersedes=[], retain=[RETAIN_1, RETAIN_2], run_id=None
-        )
+        await call_consolidate(svc, **shape)
 
         svc.get_memories_by_metadata.assert_awaited_once()

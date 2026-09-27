@@ -30,6 +30,9 @@ from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.services.consolidation_ops import (
     TOPIC_MEMBER_LIMIT,
+    RetainArmApplied,
+    RetainArmRefused,
+    apply_retain_arm,
     execute_retain_consolidation,
 )
 
@@ -189,7 +192,7 @@ def make_service(
     return svc
 
 
-async def call_execute(svc, **overrides):
+def _arm_args(**overrides):
     args = {
         'project_id': PROJECT_ID,
         'topic': TOPIC,
@@ -204,7 +207,11 @@ async def call_execute(svc, **overrides):
         'source': SOURCE,
     }
     args.update(overrides)
-    return await execute_retain_consolidation(svc, **args)
+    return args
+
+
+async def call_execute(svc, **overrides):
+    return await execute_retain_consolidation(svc, **_arm_args(**overrides))
 
 
 def _patched_ids(svc):
@@ -449,6 +456,36 @@ class TestTheEnvelopeIsTheSharedBuilders:
         result = await call_execute(svc)
 
         assert result['status'] == 'partial'
+
+
+class TestTheArmsWritesStandApartFromItsClosure:
+    """`apply_retain_arm` is the arm's writes alone, for a caller with a
+    delete arm of its own: it lists no closure, so that caller reads the
+    closure once, after its fold, and has one source for it."""
+
+    @pytest.mark.asyncio
+    async def test_the_writes_report_a_typed_outcome_and_list_no_closure(self):
+        svc = make_service()
+
+        arm = await apply_retain_arm(svc, **_arm_args())
+
+        assert arm == RetainArmApplied(
+            canonical_id=CANONICAL,
+            canonical_supersedes=[],
+            retained=[M1, M2],
+            retain_failures=[],
+        )
+        svc.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_its_own_type_carrying_the_wire_shape(self):
+        svc = make_service(minted_ids=())
+
+        arm = await apply_retain_arm(svc, **_arm_args())
+
+        assert isinstance(arm, RetainArmRefused)
+        assert arm.response['error_type'] == 'CanonicalWriteFailed'
+        svc.update_memory.assert_not_awaited()
 
 
 class TestTagOnlyTouchesNothingOnTheIncumbent:

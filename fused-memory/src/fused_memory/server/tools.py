@@ -166,7 +166,8 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 from fused_memory.services.consolidation_ops import (
-    execute_retain_consolidation,
+    RetainArmRefused,
+    apply_retain_arm,
     patch_memory_metadata,
     read_topic_closure,
 )
@@ -5779,16 +5780,15 @@ def create_mcp_server(
                 'hint': _CONSOLIDATE_GATE_HINT,
             }
 
-        # (4)+(5a) THE RETAIN ARM, as one op: mint the canonical, tag the
-        # retained peers, list the topic's closure. It is shared verbatim
-        # with the auto-consolidation executor, which has no tool boundary
-        # in front of it, so the two callers cannot drift.
+        # (4)+(5a) THE RETAIN ARM's writes: mint the canonical, tag the
+        # retained peers. The auto-consolidation executor reaches the same
+        # function through `execute_retain_consolidation`, so the two
+        # callers cannot drift.
         #
-        # Its refusals come back as `{'error_type': ...}` and are returned
-        # UNCHANGED: every one of them is raised above the arm's first
-        # write, so nothing was mutated and there is no partial state for
-        # this body to describe.
-        retain_arm = await execute_retain_consolidation(
+        # A refusal is returned UNCHANGED: every one is decided before any
+        # peer is read or patched, so there is no partial state for this
+        # body to describe.
+        retain_arm = await apply_retain_arm(
             memory_service,
             project_id=project_id,
             topic=topic,
@@ -5805,15 +5805,9 @@ def create_mcp_server(
             causation_id=causation_id,
             source=source,
         )
-        if retain_arm.get('error_type'):
-            return retain_arm
-        canonical_id = retain_arm['canonical_id']
-        retained = retain_arm['retained']
-        retain_failures = retain_arm['retain_failures']
-        topic_members = retain_arm['topic_members']
-        topic_members_total = retain_arm['topic_members_total']
-        topic_members_truncated = retain_arm['topic_members_truncated']
-        topic_members_available = retain_arm['topic_members_available']
+        if isinstance(retain_arm, RetainArmRefused):
+            return retain_arm.response
+        canonical_id = retain_arm.canonical_id
 
         # (3b) The MUTATING repoint pass, now that the replacement EXISTS.
         # The canonical satisfies the gate's "the replacement must not be a
@@ -6195,28 +6189,11 @@ def create_mcp_server(
             if still_there:
                 survivors.append(supersede_id)
 
-        # (6) RE-READ THE CLOSURE, but only when there was a fold to see.
-        # The retain arm's listing is taken at MINT time, which is the only
-        # place it can be taken by a function that owns the mint; a call
-        # with a delete arm must report the POST-fold closure or it names a
-        # record as a live topic member in the same envelope that reports
-        # it `deleted` — and the flagship case, a supersede that already
-        # carries the topic, is the ordinary shape of a fold.
-        #
-        # Subtracting the confirmed-gone ids from the stale listing would
-        # replace a live read with an inference, which is the
-        # silent-fail-soft this op was built to end. So the retain-only arm
-        # — the gate-3200 default, and every call the auto-consolidation
-        # executor makes — keeps paying for exactly one scroll, and only
-        # the rarer delete path owes a second cheap deterministic read.
-        if supersedes_ids:
-            closure = await read_topic_closure(
-                memory_service, project_id=project_id, topic=topic, run_id=run_id
-            )
-            topic_members = closure.members
-            topic_members_total = closure.total
-            topic_members_truncated = closure.truncated
-            topic_members_available = closure.available
+        # (6) The topic's closure, read once the fold is done — see
+        # `read_topic_closure` for why the placement matters.
+        closure = await read_topic_closure(
+            memory_service, project_id=project_id, topic=topic, run_id=run_id
+        )
 
         # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
         # stamped HERE rather than from each delete's success branch as the
@@ -6426,14 +6403,14 @@ def create_mcp_server(
             failed_deletes=failed_deletes,
             survivors=survivors,
             survivor_check_failed=survivor_check_failed,
-            retained=retained,
-            retain_failures=retain_failures,
+            retained=retain_arm.retained,
+            retain_failures=retain_arm.retain_failures,
             reparented=reparented,
             reparent_failures=reparent_failures,
-            topic_members=topic_members,
-            topic_members_total=topic_members_total,
-            topic_members_truncated=topic_members_truncated,
-            topic_members_available=topic_members_available,
+            topic_members=closure.members,
+            topic_members_total=closure.total,
+            topic_members_truncated=closure.truncated,
+            topic_members_available=closure.available,
             citation_repoint=citation_repoint,
             tombstones_written=tombstones_written,
             # What was OWED — the confirmed-gone set, not every supersede.
