@@ -2715,6 +2715,18 @@ class TestNonHumanOriginFilter:
         assert len(mod.iter_df_guards(records)) == 1
         assert len(mod.iter_interrupts(records)) == 1
 
+    def test_non_human_origin_drops_the_records_tool_result_carrier_too(self):
+        # Provenance is a property of the RECORD, so it filters every carrier
+        # the record holds -- not only its user text.
+        content = 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'
+        stamped = [_with_origin(_tool_result('tool-1', content), 'task-notification')]
+        unstamped = [_tool_result('tool-1', content)]
+
+        assert mod.iter_df_guards(stamped) == []
+        assert mod.iter_not_found(stamped) == []
+        assert len(mod.iter_df_guards(unstamped)) == 1
+        assert len(mod.iter_not_found(unstamped)) == 1
+
     def test_signal_counts_unaffected_by_a_task_notification_turn(self):
         base = _all_signals_records()
         with_notification = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)] + base

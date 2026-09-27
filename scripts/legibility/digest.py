@@ -601,9 +601,8 @@ def _dialogue_text_sources(
     assistant_text: bool = False,
     user_text: bool = False,
 ) -> list[tuple[int, str]]:
-    """The carriers :func:`_signal_text_sources` yields, minus every one that
-    is re-ingested machine content OR comes from a record whose harness
-    provenance names a non-human producer (:func:`_is_reingested_carrier`).
+    """The carriers :func:`_signal_text_sources` yields, minus every one
+    :func:`_is_non_dialogue_carrier` rejects.
 
     Two layers, two questions: :func:`_signal_text_sources` answers "which
     native carriers exist", and this answers "which of them are this
@@ -626,7 +625,7 @@ def _dialogue_text_sources(
             assistant_text=assistant_text,
             user_text=user_text,
         )
-        if not _is_reingested_carrier(records[index], text)
+        if not _is_non_dialogue_carrier(records[index], text)
     ]
 
 
@@ -714,9 +713,10 @@ def has_non_human_origin(record: dict[str, Any]) -> bool:
     return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
 
 
-def _is_reingested_carrier(record: dict[str, Any], text: str) -> bool:
+def _is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
     """The ONE question the gold bucket and every signal detector ask of a
-    carrier: the record half is provenance, the text half is content."""
+    carrier: the record half is provenance, the text half is content. The
+    record half covers every carrier the record holds, tool_results included."""
     return has_non_human_origin(record) or is_reingested_content(text)
 
 
@@ -1373,7 +1373,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     one of those injected shapes lands in the transcript as ordinary
     user-role text (isMeta unset), so isMeta alone cannot exclude any of
     them. The gold bucket asks the SAME predicate every scalar detector asks
-    (:func:`_is_reingested_carrier`) rather than holding a private copy of
+    (:func:`_is_non_dialogue_carrier`) rather than holding a private copy of
     the rule: task 5685's ruling that the fix belongs at the
     content-classification layer, not per bucket.
 
@@ -1396,7 +1396,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if _is_reingested_carrier(record, text):
+        if _is_non_dialogue_carrier(record, text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
