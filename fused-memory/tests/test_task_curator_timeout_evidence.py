@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult, TranscriptEvidence
+from shared.cli_invoke import AgentResult, TranscriptEvidence, transcript_evidence
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.usage_gate import UsageGate
 from test_task_curator import _agent_result, _make_config, _pool_with_ids
@@ -573,3 +573,94 @@ class TestCuratorTranscriptSalvage:
 
         with patch(_EVIDENCE_READ, return_value=salvageable), pytest.raises(CuratorFailureError):
             await _decide_single(curator, invoke, _pool_with_ids(('9001', 'pending')))
+
+
+_CURATOR_DECISION_KEYS = {
+    'action', 'justification', 'target_id', 'target_fingerprint', 'rewritten_task',
+}
+
+
+def _fixture_records(name: str) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in _fixture_lines(name)]
+
+
+def _killed_run_for_fixture(name: str) -> AgentResult:
+    """The killed-run result _parse_claude_output would mint for this transcript."""
+    turns = sum(1 for record in _fixture_records(name) if record.get('type') == 'assistant')
+    subtype = 'error_timeout_killed_with_progress' if turns > 0 else 'error_empty_output'
+    return _killed_run(subtype, transcript_turns=turns)
+
+
+def _salvage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelno == logging.WARNING and 'salvag' in record.getMessage().lower()
+    ]
+
+
+class TestCitedTranscriptCorpus:
+    """Each cited transcript, redacted into a fixture, lands on the branch it is
+    Exhibit A for. A failure here is a real-transcript seam (interleaved
+    attachment / queue-operation / last-prompt records) the synthetic cases
+    missed."""
+
+    @pytest.mark.parametrize(('name', 'turns', 'payload_keys', 'other_tools'), [
+        pytest.param('esc_curator_4_pre_turn_stall.jsonl', 0, None, (), id='esc-curator-4'),
+        pytest.param(
+            'esc_curator_33_salvageable.jsonl', 2, _CURATOR_DECISION_KEYS, (), id='esc-curator-33',
+        ),
+        pytest.param(
+            'esc_curator_2_tool_wandering.jsonl', 6, None, ('ToolSearch', 'TaskGet', 'ToolSearch'),
+            id='esc-curator-2',
+        ),
+    ])
+    def test_shared_evidence_reading(self, name, turns, payload_keys, other_tools):
+        evidence = transcript_evidence(_fixture_records(name))
+
+        assert evidence.assistant_turns == turns
+        if payload_keys is None:
+            assert evidence.schema_payload is None
+        else:
+            assert evidence.schema_payload is not None
+            assert set(evidence.schema_payload) == payload_keys
+        assert evidence.other_tool_uses == other_tools
+
+    @pytest.mark.asyncio
+    async def test_esc_curator_4_is_the_genuine_pre_turn_stall(self, tmp_path, caplog):
+        name = 'esc_curator_4_pre_turn_stall.jsonl'
+        invoke = _scripted_invoker((_fixture_lines(name), _killed_run_for_fixture(name)))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(_call_single, _gated_curator(tmp_path), invoke)
+
+        assert err.zero_output_timeout is True
+        assert err.transcript_turns == 0
+        assert err.tools_used == ()
+        assert _salvage_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_esc_curator_33_verdict_is_salvaged(self, tmp_path):
+        name = 'esc_curator_33_salvageable.jsonl'
+        verdict = transcript_evidence(_fixture_records(name)).schema_payload
+        assert verdict is not None
+        invoke = _scripted_invoker((_fixture_lines(name), _killed_run_for_fixture(name)))
+
+        decision = await _decide_single(
+            _gated_curator(tmp_path), invoke, _pool_with_ids((verdict['target_id'], 'pending')),
+        )
+
+        assert decision.action == verdict['action']
+        assert decision.target_id == verdict['target_id']
+
+    @pytest.mark.asyncio
+    async def test_esc_curator_2_reports_its_tool_excursion(self, tmp_path, caplog):
+        name = 'esc_curator_2_tool_wandering.jsonl'
+        invoke = _scripted_invoker((_fixture_lines(name), _killed_run_for_fixture(name)))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(_call_single, _gated_curator(tmp_path), invoke)
+
+        assert err.zero_output_timeout is False
+        assert err.transcript_turns == 6
+        assert err.tools_used == ('ToolSearch', 'TaskGet', 'ToolSearch')
+        assert len(_leak_warnings(caplog)) == 1
