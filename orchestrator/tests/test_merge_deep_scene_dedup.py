@@ -14,8 +14,9 @@ Both checks carry a positive control, because a satisfied check and an inert
 one look the same.
 
 Scope: the deep integration gate and deep landing modules, plus the invariant
-gate's re-definition sweep.  test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py
-are NOT yet covered; task 5172 owns extending this file to them.
+gate's re-definition sweep.  test_merge_queue_deep_dispatch.py and
+test_merge_queue_build_chain.py are NOT yet covered; task 5172 owns extending
+this file to them.
 """
 from __future__ import annotations
 

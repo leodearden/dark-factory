@@ -980,7 +980,7 @@
     "orchestrator/tests/test_merge_queue_conflict_graph.py": {"patch_targets": [], "private_reads": 26},
     "orchestrator/tests/test_merge_queue_deep_dispatch.py": {"patch_targets": ["CHAIN_BUILD_TIMEOUT_SECS", "_run_post_merge_verify", "build_chain", "release_chain_build_lane"], "private_reads": 138},
     "orchestrator/tests/test_merge_queue_deep_integration_gate.py": {"patch_targets": ["_run_post_merge_verify", "build_chain"], "private_reads": 80},
-    "orchestrator/tests/test_merge_queue_deep_landing.py": {"patch_targets": ["_maybe_schedule_shadow_compare", "build_chain", "release_chain_build_lane"], "private_reads": 88},
+    "orchestrator/tests/test_merge_queue_deep_landing.py": {"patch_targets": ["_maybe_schedule_shadow_compare", "build_chain"], "private_reads": 84},
     "orchestrator/tests/test_merge_queue_depth_telemetry.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_disposition_wiring.py": {"patch_targets": [], "private_reads": 0},
