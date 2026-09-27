@@ -63,7 +63,6 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-    STREAK_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     SUPPRESSION_STREAK_THRESHOLD_CYCLES,
 )
@@ -17082,8 +17081,7 @@ class TestMemoryConsolidatorSuppressionStreak:
 
     async def _stored_streak(self, ledger) -> int | None:
         rows = await ledger.list_suppression_streaks('p')
-        streaks = {r.entity_uuid: json.loads(r.payload_json)[STREAK_PAYLOAD_KEY] for r in rows}
-        return streaks.get(self._U)
+        return {row.entity_uuid: row.streak for row in rows}.get(self._U)
 
     def _pending_storms(self, queue) -> list:
         return [

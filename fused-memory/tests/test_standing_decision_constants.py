@@ -10,6 +10,8 @@ vocabularies that β/γ/δ/ε/ζ consume. No introspection/docstring meta-tests.
 
 from __future__ import annotations
 
+import pytest
+
 from fused_memory.reconciliation import standing_decision_constants as sdc
 
 
@@ -101,32 +103,12 @@ def test_suppression_streak_threshold_is_three_cycles():
     assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES == 3
 
 
-def test_streak_payload_key_is_distinct_from_done_suppressions_key():
-    """The streak count's payload key is a non-empty str that does not collide
-    with flag_dedup's consecutive-cycle done-suppression counter key."""
-    from fused_memory.reconciliation.flag_dedup import _DONE_SUPPRESSIONS_PAYLOAD_KEY
-
-    assert isinstance(sdc.STREAK_PAYLOAD_KEY, str)
-    assert sdc.STREAK_PAYLOAD_KEY
-    assert sdc.STREAK_PAYLOAD_KEY != _DONE_SUPPRESSIONS_PAYLOAD_KEY
-
-
-def test_streak_window_payload_key_is_distinct_from_every_streak_row_key():
-    """The per-cycle window's payload key is a non-empty str that collides with
-    none of the other keys the ledger writes on a streak row, nor with
-    flag_dedup's done-suppression counter key."""
-    from fused_memory.reconciliation.flag_dedup import _DONE_SUPPRESSIONS_PAYLOAD_KEY
-
-    assert isinstance(sdc.STREAK_WINDOW_PAYLOAD_KEY, str)
-    assert sdc.STREAK_WINDOW_PAYLOAD_KEY
-    other_keys = {
-        sdc.STREAK_PAYLOAD_KEY,
-        'last_run_id',
-        'grounds',
-        'updated_at',
-        _DONE_SUPPRESSIONS_PAYLOAD_KEY,
-    }
-    assert sdc.STREAK_WINDOW_PAYLOAD_KEY not in other_keys
+@pytest.mark.parametrize('key', [sdc.STREAK_PAYLOAD_KEY, sdc.STREAK_WINDOW_PAYLOAD_KEY])
+def test_streak_payload_keys_are_non_empty_strings(key):
+    """That no two keys on a streak row collide is shown by the row's round
+    trip in test_recon_ledger.py."""
+    assert isinstance(key, str)
+    assert key
 
 
 def test_streak_volume_threshold_is_the_per_cycle_n():

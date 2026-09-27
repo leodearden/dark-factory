@@ -195,6 +195,94 @@ def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
     )
 
 
+def nonnegative_int_from_payload(payload: object, key: str) -> int:
+    """Read the non-negative ``int`` counter stored under *key* in a ledger payload.
+
+    Returns 0 for anything else — a payload that is not a dict, an absent key,
+    ``None``, a bool (``True`` is an ``int`` in Python and must not be read as
+    the count 1), a string, or a negative value.  Free-form JSON off a ledger
+    row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _positive_int_tuple_from_payload(payload: object, key: str) -> tuple[int, ...]:
+    """Read the list of positive ``int`` counts stored under *key* in a ledger payload.
+
+    Returns ``()`` for anything but a list whose every entry is an ``int`` >= 1
+    and not a bool; one malformed entry discards the whole list.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return ()
+    value = payload.get(key)
+    if not isinstance(value, list) or any(
+        isinstance(entry, bool) or not isinstance(entry, int) or entry < 1 for entry in value
+    ):
+        return ()
+    return tuple(value)
+
+
+#: The streak row's payload key for the run that last wrote it.  Private
+#: because only this module writes and reads it: consumers get it as
+#: :attr:`SuppressionStreakRow.last_run_id`.
+_STREAK_LAST_RUN_ID_KEY = 'last_run_id'
+
+
+@dataclass(frozen=True)
+class SuppressionStreakRow:
+    """One decoded suppression-streak row (task 2943), as
+    :meth:`ReconLedgerStore.list_suppression_streaks` returns it.
+
+    ``streak`` is the number of consecutive full cycles in which the standing
+    decision on ``(entity_uuid, grounds)`` suppressed a flag.
+    ``recent_counts`` holds the suppression counts of the streak's most recent
+    cycles, oldest first, never more entries than ``streak``.
+    ``last_run_id`` is the run that last wrote the row.
+    """
+
+    entity_uuid: str
+    grounds: str
+    streak: int
+    recent_counts: tuple[int, ...]
+    last_run_id: str
+
+
+def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
+    """Decode a suppression-streak record without trusting its payload's shape.
+
+    Anything :meth:`ReconLedgerStore.upsert_suppression_streak` would have
+    rejected reads as the smaller value: a payload that is not a JSON object
+    reads as empty, a malformed streak as 0, a malformed window as ``()``, a
+    window longer than its streak (as one left on a zero streak is) as
+    ``()``, and a non-string run id as ``''``.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    streak = nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY)
+    recent_counts = _positive_int_tuple_from_payload(payload, STREAK_WINDOW_PAYLOAD_KEY)
+    last_run_id = payload.get(_STREAK_LAST_RUN_ID_KEY)
+    return SuppressionStreakRow(
+        entity_uuid=record.entity_uuid or record.run_id,
+        grounds=record.flag_type,
+        streak=streak,
+        recent_counts=recent_counts if len(recent_counts) <= streak else (),
+        last_run_id=last_run_id if isinstance(last_run_id, str) else '',
+    )
+
+
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
@@ -869,7 +957,7 @@ class ReconLedgerStore:
         payload = {
             STREAK_PAYLOAD_KEY: streak,
             STREAK_WINDOW_PAYLOAD_KEY: list(recent_counts),
-            'last_run_id': last_run_id,
+            _STREAK_LAST_RUN_ID_KEY: last_run_id,
             'grounds': grounds,
             'updated_at': updated_at,
         }
@@ -888,8 +976,13 @@ class ReconLedgerStore:
             )
         )
 
-    async def list_suppression_streaks(self, project_id: str) -> list[ReconLedgerRecord]:
-        """Return every suppression-streak row for a project."""
+    async def list_suppression_streaks(self, project_id: str) -> list[SuppressionStreakRow]:
+        """Return every suppression-streak row for a project, decoded.
+
+        Stored payloads are never trusted for shape (see
+        :func:`_streak_row_from_record`), so a hand-edited or older-shaped row
+        can lose its streak or window but can never read as a larger one.
+        """
         rows = await self._require_access().read_all(
             """
             SELECT * FROM recon_ledger
@@ -897,7 +990,7 @@ class ReconLedgerStore:
             """,
             (project_id, RECORD_KIND_ENTITY_SUPPRESSION_STREAK),
         )
-        return [_record_from_row(row) for row in rows]
+        return [_streak_row_from_record(_record_from_row(row)) for row in rows]
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.

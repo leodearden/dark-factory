@@ -14152,21 +14152,29 @@ def _suppressing(*entity_uuids: str) -> flag_dedup.EntityStandingSuppressionResu
     return _suppressing_counts({u: 1 for u in entity_uuids})
 
 
-async def _stored_payload_values(ledger: ReconLedgerStore, key: str) -> dict[str, Any]:
-    rows = await ledger.list_suppression_streaks(_STREAK_PID)
-    values: dict[str, Any] = {}
-    for row in rows:
-        assert row.entity_uuid is not None, 'a suppression-streak row always carries its entity_uuid'
-        values[row.entity_uuid] = json.loads(row.payload_json)[key]
-    return values
-
-
 async def _stored_streaks(ledger: ReconLedgerStore) -> dict[str, int]:
-    return await _stored_payload_values(ledger, STREAK_PAYLOAD_KEY)
+    return {row.entity_uuid: row.streak for row in await ledger.list_suppression_streaks(_STREAK_PID)}
 
 
-async def _stored_windows(ledger: ReconLedgerStore) -> dict[str, list]:
-    return await _stored_payload_values(ledger, STREAK_WINDOW_PAYLOAD_KEY)
+async def _stored_windows(ledger: ReconLedgerStore) -> dict[str, list[int]]:
+    return {
+        row.entity_uuid: list(row.recent_counts)
+        for row in await ledger.list_suppression_streaks(_STREAK_PID)
+    }
+
+
+async def _stored_streak_record(
+    ledger: ReconLedgerStore, entity_uuid: str = _ESD_U1
+) -> ReconLedgerRecord | None:
+    """The raw streak record, for what the decoded row does not carry
+    (write time, expiry)."""
+    return await ledger.get_by_identity(
+        _STREAK_PID,
+        RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+        task_id='',
+        flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        run_id=entity_uuid,
+    )
 
 
 async def _seed_raw_streak_payload(ledger: ReconLedgerStore, payload: dict[str, Any]) -> None:
@@ -14229,12 +14237,12 @@ class TestUpdateSuppressionStreaks:
                 escalate=False,
             )
         ]
-        rows = await ledger_memory_service.recon_ledger.list_suppression_streaks(_STREAK_PID)
-        assert len(rows) == 1
-        payload = json.loads(rows[0].payload_json)
-        assert payload[STREAK_PAYLOAD_KEY] == 1
-        assert payload['last_run_id'] == 'run-1'
-        assert rows[0].expires_at == '2026-08-30T00:00:00+00:00', (
+        ledger = ledger_memory_service.recon_ledger
+        (row,) = await ledger.list_suppression_streaks(_STREAK_PID)
+        assert (row.streak, row.recent_counts, row.last_run_id) == (1, (1,), 'run-1')
+        record = await _stored_streak_record(ledger)
+        assert record is not None
+        assert record.expires_at == '2026-08-30T00:00:00+00:00', (
             'expires_at is the write time plus STANDING_DECISION_TTL_DAYS'
         )
 
@@ -14291,7 +14299,7 @@ class TestUpdateSuppressionStreaks:
             flag_dedup.EntityStandingSuppressionResult.empty_batch(),
             now='2026-06-02T00:00:00+00:00',
         )
-        (reset_row,) = await ledger.list_suppression_streaks(_STREAK_PID)
+        reset_record = await _stored_streak_record(ledger)
 
         updates = await _run_cycle(
             ledger_memory_service,
@@ -14301,8 +14309,8 @@ class TestUpdateSuppressionStreaks:
         )
 
         assert updates == []
-        (row,) = await ledger.list_suppression_streaks(_STREAK_PID)
-        assert row == reset_row
+        assert reset_record is not None
+        assert await _stored_streak_record(ledger) == reset_record
 
     @pytest.mark.asyncio
     async def test_replayed_run_id_does_not_increment(self, ledger_memory_service):
@@ -14446,28 +14454,16 @@ class TestUpdateSuppressionStreaks:
         }
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'stored_window',
-        [
-            pytest.param('2,2', id='str'),
-            pytest.param({'0': 2}, id='object'),
-            pytest.param(4, id='int'),
-            pytest.param([True, 2], id='bool-entry'),
-            pytest.param([2, 0], id='zero-entry'),
-            pytest.param([2, -1], id='negative-entry'),
-            pytest.param([2, '2'], id='str-entry'),
-        ],
-    )
-    async def test_malformed_stored_window_reads_as_empty(
-        self, ledger_memory_service, stored_window
-    ):
-        """A lost window can only under-count: it may delay a filing, never cause one."""
+    async def test_malformed_stored_window_under_counts(self, ledger_memory_service):
+        """A lost window can only under-count: it may delay a filing, never cause
+        one.  Which shapes read as lost is the ledger's decoding, pinned in
+        test_recon_ledger.py."""
         await _seed_raw_streak_payload(
             ledger_memory_service.recon_ledger,
             {
                 STREAK_PAYLOAD_KEY: 2,
                 'last_run_id': 'run-seed',
-                STREAK_WINDOW_PAYLOAD_KEY: stored_window,
+                STREAK_WINDOW_PAYLOAD_KEY: [5, True],
             },
         )
 
@@ -14558,6 +14554,8 @@ class TestUpdateSuppressionStreaksFailSafe:
         """A transient read error leaves an established streak intact."""
         ledger = ledger_memory_service.recon_ledger
         await _seed_streak(ledger, _ESD_U1, 2)
+        seeded = await _stored_streak_record(ledger)
+        assert seeded is not None
         monkeypatch.setattr(
             ledger, 'list_suppression_streaks', AsyncMock(side_effect=RuntimeError('boom'))
         )
@@ -14568,54 +14566,16 @@ class TestUpdateSuppressionStreaksFailSafe:
             )
 
         assert updates == []
-        seeded = await ledger.get_by_identity(
-            _STREAK_PID,
-            RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
-            task_id='',
-            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-            run_id=_ESD_U1,
+        assert await _stored_streak_record(ledger) == seeded
+        assert await _stored_streak_record(ledger, _ESD_U2) is None, (
+            'no row may be written when the prior state could not be read'
         )
-        assert seeded is not None
-        assert json.loads(seeded.payload_json)[STREAK_PAYLOAD_KEY] == 2
-        assert (
-            await ledger.get_by_identity(
-                _STREAK_PID,
-                RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
-                task_id='',
-                flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-                run_id=_ESD_U2,
-            )
-            is None
-        ), 'no row may be written when the prior state could not be read'
         assert any(rec.levelno == logging.WARNING for rec in caplog.records)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'payload_json',
-        [
-            '[2, 3]',
-            '"two"',
-            'not json',
-            json.dumps({STREAK_PAYLOAD_KEY: True}),
-            json.dumps({STREAK_PAYLOAD_KEY: '2'}),
-            json.dumps({STREAK_PAYLOAD_KEY: -3}),
-        ],
-    )
-    async def test_malformed_stored_streak_reads_as_zero(
-        self, ledger_memory_service, payload_json
-    ):
-        await ledger_memory_service.recon_ledger.upsert(
-            ReconLedgerRecord(
-                project_id=_STREAK_PID,
-                record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
-                payload_json=payload_json,
-                state='active',
-                created_at=_STREAK_NOW,
-                flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-                run_id=_ESD_U1,
-                entity_uuid=_ESD_U1,
-                expires_at='2099-01-01T00:00:00+00:00',
-            )
+    async def test_malformed_stored_streak_restarts_at_one(self, ledger_memory_service):
+        await _seed_raw_streak_payload(
+            ledger_memory_service.recon_ledger, {STREAK_PAYLOAD_KEY: '2'}
         )
 
         (update,) = await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))

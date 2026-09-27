@@ -354,14 +354,16 @@ from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.internal_writers import is_internal_writer
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import (
+    ReconLedgerRecord,
+    SuppressionStreakRow,
+    nonnegative_int_from_payload,
+)
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_TOKEN_FAMILIES,
     STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
-    STREAK_PAYLOAD_KEY,
-    STREAK_WINDOW_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     SUPPRESSION_STREAK_THRESHOLD_CYCLES,
     SUPPRESSION_STREAK_VOLUME_THRESHOLD,
@@ -1353,48 +1355,40 @@ class SuppressionStreakUpdate:
     escalate: bool
 
 
-def _decoded_streak_payload(row: ReconLedgerRecord) -> dict[str, Any]:
-    """A streak row's payload as a dict, or ``{}`` when it is not a JSON object."""
-    try:
-        payload = json.loads(row.payload_json)
-    except ValueError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+def _advanced_streak(
+    prior: SuppressionStreakRow | None, count: int, run_id: str, window_cycles: int
+) -> tuple[int, tuple[int, ...]]:
+    """The ``(streak, window)`` of a decision that suppressed *count* flags this cycle.
+
+    It extends *prior*'s streak by one and appends *count* to its window,
+    keeping the last *window_cycles* counts.  When *prior* was last written by
+    this *run_id* (a replayed cycle) both are held as stored.
+    """
+    if prior is None:
+        return 1, (count,)
+    if run_id and prior.last_run_id == run_id:
+        return prior.streak, prior.recent_counts
+    return prior.streak + 1, (*prior.recent_counts, count)[-window_cycles:]
 
 
 def _next_suppression_streaks(
-    stored: dict[tuple[str, str], dict[str, Any]],
+    stored: dict[tuple[str, str], SuppressionStreakRow],
     result: EntityStandingSuppressionResult,
     run_id: str,
     window_cycles: int,
 ) -> dict[tuple[str, str], tuple[int, tuple[int, ...]]]:
     """The ``(entity_uuid, grounds) -> (streak, window)`` rows this cycle must write.
 
-    A suppressing decision extends its stored streak by one and appends this
-    cycle's suppression count to its stored window, keeping the last
-    *window_cycles* counts.  When the stored ``last_run_id`` is this *run_id*
-    (a replayed cycle) both are held as stored.  A stored non-zero streak whose
-    decision suppressed nothing resets to ``(0, ())``; a stored 0 needs no
-    write.
-
-    A stored window longer than its stored streak reads as empty, like any
-    other malformed window.  That covers a window left on a zero-streak row, so
-    a leftover never carries across a reset.  Pure, sync, no I/O.
+    Every suppressing decision advances (:func:`_advanced_streak`).  A stored
+    non-zero streak whose decision suppressed nothing resets to ``(0, ())``;
+    a stored 0 needs no write.  Pure, sync, no I/O.
     """
     next_rows: dict[tuple[str, str], tuple[int, tuple[int, ...]]] = {}
     for entity_uuid, count in result.suppressed_by_decision.items():
         key = (entity_uuid, result.grounds_by_decision.get(entity_uuid, ''))
-        prior = stored.get(key, {})
-        prior_streak = _nonnegative_int_from_payload(prior, STREAK_PAYLOAD_KEY)
-        prior_window = _positive_int_tuple_from_payload(prior, STREAK_WINDOW_PAYLOAD_KEY)
-        if len(prior_window) > prior_streak:
-            prior_window = ()
-        if run_id and prior.get('last_run_id') == run_id:
-            next_rows[key] = (prior_streak, prior_window)
-        else:
-            next_rows[key] = (prior_streak + 1, (*prior_window, count)[-window_cycles:])
-    for key, payload in stored.items():
-        if key not in next_rows and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
+        next_rows[key] = _advanced_streak(stored.get(key), count, run_id, window_cycles)
+    for key, prior in stored.items():
+        if key not in next_rows and prior.streak:
             next_rows[key] = (0, ())
     return next_rows
 
@@ -1442,11 +1436,10 @@ async def update_suppression_streaks(
     NOTHING (logged WARNING), because without the prior counts every write
     would clobber an established streak.  A failed write costs that one
     entity its update (logged WARNING, excluded from the return), not the
-    cycle.  Stored payloads are never trusted for shape: anything but a
-    non-negative int reads as streak 0, and anything but a list of positive
-    ints no longer than the stored streak reads as an empty window.  A lost
-    window can only under-count, so it may delay a filing by up to K cycles
-    but never cause one.
+    cycle.  The ledger decodes a malformed stored row as streak 0 or an empty
+    window (``ReconLedgerStore.list_suppression_streaks``).  A lost window can
+    only under-count, so it may delay a filing by up to K cycles but never
+    cause one.
 
     Every write refreshes ``expires_at`` to *now* plus
     ``STANDING_DECISION_TTL_DAYS``, spelled as ``isoformat()`` like the
@@ -1480,10 +1473,7 @@ async def update_suppression_streaks(
             exc_info=True,
         )
         return []
-    stored = {
-        ((row.entity_uuid or row.run_id).lower(), row.flag_type): _decoded_streak_payload(row)
-        for row in rows
-    }
+    stored = {(row.entity_uuid.lower(), row.grounds): row for row in rows}
 
     now_dt = datetime.now(UTC) if now is None else datetime.fromisoformat(now)
     expires_at = (now_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
@@ -1808,48 +1798,11 @@ _DONE_SUPPRESSIONS_PAYLOAD_KEY: str = 'cross_project_done_suppressions'
 _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
 
 
-def _nonnegative_int_from_payload(payload: Any, key: str) -> int:
-    """Read the non-negative ``int`` counter stored under *key* in a ledger payload.
-
-    Returns 0 for anything else — a payload that is not a dict, an absent key,
-    ``None``, a bool (``True`` is an ``int`` in Python and must not be read as
-    the count 1), a string, or a negative value.  Free-form JSON off a ledger
-    row is never trusted for shape.
-
-    Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(payload, dict):
-        return 0
-    value = payload.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return 0
-    return value
-
-
-def _positive_int_tuple_from_payload(payload: Any, key: str) -> tuple[int, ...]:
-    """Read the list of positive ``int`` counts stored under *key* in a ledger payload.
-
-    Returns ``()`` for anything but a list whose every entry is an ``int`` >= 1
-    and not a bool; one malformed entry discards the whole list.  Free-form
-    JSON off a ledger row is never trusted for shape.
-
-    Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(payload, dict):
-        return ()
-    value = payload.get(key)
-    if not isinstance(value, list) or any(
-        isinstance(entry, bool) or not isinstance(entry, int) or entry < 1 for entry in value
-    ):
-        return ()
-    return tuple(value)
-
-
 def _prior_done_suppression_count(prior_payload: Any) -> int:
     """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload;
     0 when absent (every marker written before the task 4381 amendment) or
     malformed."""
-    return _nonnegative_int_from_payload(prior_payload, _DONE_SUPPRESSIONS_PAYLOAD_KEY)
+    return nonnegative_int_from_payload(prior_payload, _DONE_SUPPRESSIONS_PAYLOAD_KEY)
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
