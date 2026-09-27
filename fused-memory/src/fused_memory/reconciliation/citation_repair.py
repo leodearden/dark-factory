@@ -80,7 +80,11 @@ from fused_memory.models.reconciliation import RunStatus, StageReport
 # ``citation_verifier._CANONICAL_UUID_RE`` already exist, and a third copy of the
 # same gate is exactly the lockstep duplication INV-5 forbids.
 from fused_memory.reconciliation.citation_verifier import is_concrete_memory_id
-from fused_memory.reconciliation.journal import CITATION_REPAIRS_KEY
+from fused_memory.reconciliation.journal import (
+    CITATION_REPAIRS_KEY,
+    REPAIRABLE_RUN_STATUS_VALUES,
+    flagged_findings_by_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,34 +95,6 @@ __all__ = ['build_citation_repair_record', 'repair_memory_citation']
 # false-flagged as dangling — the same hazard ``verify_cited_memories``
 # documents as its reason for skipping non-mem0 entries.
 SUPPORTED_STORE = 'mem0'
-
-# The run statuses a repair may touch — an ALLOWLIST, deliberately inverted from
-# the "refuse status == 'running'" check this replaces, because the two failure
-# directions are asymmetric: wrongly PERMITTING yields a write that reports
-# ``status: repaired`` and is then silently overwritten (what the run_still_live
-# hint itself calls worse than a clean refusal), while wrongly REFUSING yields a
-# loud, recoverable error. So a status absent from the enum-of-today must land on
-# the refusing side by default.
-#
-# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
-# excluded precisely because something does — ``journal.get_interrupted_runs()``
-# is ``SELECT * FROM runs WHERE status = 'interrupted'``, the startup
-# adopt-and-resume pass re-claims exactly those runs, and the resumed cycle
-# rewrites the whole stage_reports blob from its own loaded copy.
-REPAIRABLE_RUN_STATUSES = frozenset(
-    {
-        RunStatus.completed,
-        RunStatus.failed,
-        RunStatus.rolled_back,
-        RunStatus.circuit_breaker,
-    }
-)
-
-# Compared on raw ``.value`` strings so the gate holds whether ``run.status``
-# arrives as a coerced ``RunStatus`` or as a bare ``str`` off the journal row.
-# Every member's name happens to equal its value today, so StrEnum hashing would
-# coincide — the gate deliberately does not rest on that coincidence.
-_REPAIRABLE_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
 
 
 # The citation's DEFECT CLASS — a closed enum, because it is written verbatim
@@ -274,8 +250,9 @@ _ERR_CONCURRENT_MODIFICATION: dict[str, str] = {
 # forward (``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.update_run_stage_reports``)
 # — so this verdict is the backstop for a writer that bypasses that path.
 # Returning ``repaired`` for a repair that was overwritten is the precise "worse
-# than a clean refusal" outcome REPAIRABLE_RUN_STATUSES' own comment exists to
-# prevent.
+# than a clean refusal" outcome the allowlist's own comment
+# (``fused-memory/src/fused_memory/reconciliation/journal.py::REPAIRABLE_RUN_STATUSES``)
+# exists to prevent.
 #
 # DIVISION OF LABOUR with ``_ERR_CONCURRENT_MODIFICATION``: the compare-and-set
 # owns writers landing BEFORE this call's write; this backstops the remaining
@@ -444,9 +421,9 @@ def _find_finding(
     for stage_name, report in run.stage_reports.items():
         if not isinstance(report, StageReport):
             continue
-        for finding in report.items_flagged:
-            if isinstance(finding, dict) and finding.get('finding_id') == finding_id:
-                return stage_name, report, finding
+        finding = flagged_findings_by_id(report.items_flagged).get(finding_id)
+        if finding is not None:
+            return stage_name, report, finding
     return None
 
 
@@ -550,11 +527,11 @@ def _run_still_live_hint(
     message names the one that actually fired.
     """
     parts: list[str] = []
-    if status_value not in _REPAIRABLE_STATUS_VALUES:
+    if status_value not in REPAIRABLE_RUN_STATUS_VALUES:
         parts.append(
             f'run {target_run_id} is in status {status_value!r}, which is not one '
             'of the terminal statuses a repair may touch '
-            f'({sorted(_REPAIRABLE_STATUS_VALUES)}); its stage_reports blob is '
+            f'({sorted(REPAIRABLE_RUN_STATUS_VALUES)}); its stage_reports blob is '
             'rewritten wholesale from a writer\'s own loaded copy at each stage '
             'end, so a journal-side repair would be silently clobbered.'
         )
@@ -762,7 +739,7 @@ async def repair_memory_citation(
     # 'completed' while ReconReportState is still writing its entries through.
     status_value = str(run.status)
     in_process = target_run_id in live_run_ids
-    if status_value not in _REPAIRABLE_STATUS_VALUES or in_process:
+    if status_value not in REPAIRABLE_RUN_STATUS_VALUES or in_process:
         return _ERR_RUN_STILL_LIVE | {
             'target_run_id': target_run_id,
             # ``run_status``, deliberately NOT ``status``: every success branch

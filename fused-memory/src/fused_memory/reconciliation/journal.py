@@ -27,6 +27,7 @@ from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
+    RunStatus,
     StageId,
     StageReport,
     Watermark,
@@ -44,6 +45,36 @@ logger = logging.getLogger(__name__)
 # run owner's wholesale write must recognise a persisted repair
 # (``_carry_forward_citation_repairs``); ``citation_repair`` imports it from here.
 CITATION_REPAIRS_KEY = 'citation_repairs'
+
+# The run statuses a citation repair may touch — an ALLOWLIST, deliberately
+# inverted from the "refuse status == 'running'" check it replaced, because the
+# two failure directions are asymmetric: wrongly PERMITTING yields a write that
+# reports ``status: repaired`` and is then silently overwritten, while wrongly
+# REFUSING yields a loud, recoverable error. So a status absent from the
+# enum-of-today must land on the refusing side by default.
+#
+# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
+# excluded precisely because something does — ``get_interrupted_runs()`` feeds
+# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
+# stage_reports blob from its own loaded copy.
+#
+# It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
+# invariant: a write that does not carry repairs forward must never land on a
+# row holding one of these statuses (``complete_run_if_status`` refuses to).
+REPAIRABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.completed,
+        RunStatus.failed,
+        RunStatus.rolled_back,
+        RunStatus.circuit_breaker,
+    }
+)
+
+# Compared on raw ``.value`` strings so a gate holds whether a status arrives as
+# a coerced ``RunStatus`` or as a bare ``str`` off the journal row. Every
+# member's name happens to equal its value today, so StrEnum hashing would
+# coincide — the gates deliberately do not rest on that coincidence.
+REPAIRABLE_RUN_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
 
 # Each refusal of the owner's compare-and-set is a distinct concurrent commit to
 # the same row, so exhausting this takes a sustained stream of repairs.
@@ -416,10 +447,16 @@ class ReconciliationJournal:
         gone), and nothing was written.
 
         ``stage_reports`` is written wholesale WITHOUT carrying citation repairs
-        forward. That is safe only because the status gate admits non-terminal
-        rows, and citation repair refuses those
-        (``fused-memory/src/fused_memory/reconciliation/citation_repair.py::REPAIRABLE_RUN_STATUSES``).
+        forward, so an ``expected_status`` in ``REPAIRABLE_RUN_STATUSES`` — a row
+        a repair may already have written — raises ``ValueError`` before
+        anything is written.
         """
+        if str(expected_status) in REPAIRABLE_RUN_STATUS_VALUES:
+            raise ValueError(
+                f'complete_run_if_status: expected_status {str(expected_status)!r} '
+                'is a status citation repair writes under, and this wholesale '
+                'write would erase its repairs'
+            )
         async with self._require_access().write() as db:
             cursor = await db.execute(
                 'UPDATE runs SET stage_reports = ?, status = ?, completed_at = ? '
@@ -1191,32 +1228,35 @@ def _carry_forward_citation_repairs(
         incoming_report = incoming.get(stage_key)
         if not isinstance(persisted_report, dict) or not isinstance(incoming_report, dict):
             continue
-        incoming_by_id = {
-            finding['finding_id']: finding
-            for finding in _flagged_findings(incoming_report)
-            if _is_finding_id(finding.get('finding_id'))
-        }
-        for persisted_finding in _flagged_findings(persisted_report):
-            finding_id = persisted_finding.get('finding_id')
+        incoming_by_id = flagged_findings_by_id(incoming_report.get('items_flagged'))
+        persisted_by_id = flagged_findings_by_id(persisted_report.get('items_flagged'))
+        for finding_id, persisted_finding in persisted_by_id.items():
             repairs = persisted_finding.get(CITATION_REPAIRS_KEY)
-            if not (_is_finding_id(finding_id) and finding_id in incoming_by_id):
+            target = incoming_by_id.get(finding_id)
+            if target is None or not (isinstance(repairs, list) and repairs):
                 continue
-            if not (isinstance(repairs, list) and repairs):
-                continue
-            target = incoming_by_id[finding_id]
             target['cited_memories'] = persisted_finding.get('cited_memories')
             target[CITATION_REPAIRS_KEY] = repairs
 
 
-def _flagged_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
-    items = report.get('items_flagged')
-    if not isinstance(items, list):
-        return []
-    return [item for item in items if isinstance(item, dict)]
+def flagged_findings_by_id(items_flagged: Any) -> dict[str, dict[str, Any]]:
+    """Index one stage report's ``items_flagged`` by ``finding_id``.
 
-
-def _is_finding_id(value: Any) -> bool:
-    return isinstance(value, str) and bool(value)
+    The one definition of how a finding is located, shared by the owner's
+    carry-forward and ``citation_repair``, so both always resolve an id to the
+    same finding. An entry that is not a dict, or has no non-empty string
+    ``finding_id``, is not indexed; on a repeated id the first entry wins.
+    """
+    if not isinstance(items_flagged, list):
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in items_flagged:
+        if not isinstance(item, dict):
+            continue
+        finding_id = item.get('finding_id')
+        if isinstance(finding_id, str) and finding_id:
+            indexed.setdefault(finding_id, item)
+    return indexed
 
 
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:

@@ -20,7 +20,10 @@ from fused_memory.models.reconciliation import (
     VerdictSeverity,
     Watermark,
 )
-from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.journal import (
+    REPAIRABLE_RUN_STATUSES,
+    ReconciliationJournal,
+)
 
 
 @pytest_asyncio.fixture
@@ -1240,6 +1243,35 @@ class TestCompleteRunIfStatus:
             is False
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'expected_status',
+        [
+            *sorted(REPAIRABLE_RUN_STATUSES),
+            pytest.param(RunStatus.completed.value, id='bare-str-completed'),
+        ],
+    )
+    async def test_a_status_citation_repair_writes_under_raises_before_writing(
+        self, journal, expected_status
+    ):
+        """This write does not carry citation repairs forward, so gating it on a
+        status a repair may already have written under would let it erase one."""
+        run_id = await self._seed(journal, RunStatus(expected_status))
+        before, before_text = await journal.get_run_with_stage_reports_text(run_id)
+
+        with pytest.raises(ValueError, match='expected_status'):
+            await journal.complete_run_if_status(
+                run_id,
+                expected_status=expected_status,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == before_text
+        assert after.status == before.status
+        assert after.completed_at == before.completed_at
+
 
 class TestUpdateRunStageReportsPreservesCitationRepairs:
     """The run owner's wholesale rewrite never erases a citation repair a
@@ -1388,3 +1420,38 @@ class TestUpdateRunStageReportsPreservesCitationRepairs:
 
         after = (await journal.get_run(run_id)).stage_reports['integrity_check']
         assert after.items_flagged == owner_copy.items_flagged
+
+    @pytest.mark.asyncio
+    async def test_a_row_changing_under_every_attempt_raises_having_written_nothing(
+        self, journal, monkeypatch
+    ):
+        """A competitor commits between each of the owner's reads and its
+        compare-and-set, so every attempt is genuinely refused. The owner gives
+        up loudly, and its copy never lands — not even as a last-resort
+        unconditional write."""
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'must never land'
+        real_compare_and_set = journal._compare_and_set_stage_reports_text
+        competitor_texts: list[str] = []
+
+        async def a_competitor_commits_first(run_id_, text, *, expected_text):
+            _, current = await journal.get_run_with_stage_reports_text(run_id_)
+            competitor = json.loads(current)
+            competitor['competitor'] = {'write': len(competitor_texts)}
+            competitor_texts.append(json.dumps(competitor))
+            assert await real_compare_and_set(
+                run_id_, competitor_texts[-1], expected_text=current
+            )
+            return await real_compare_and_set(run_id_, text, expected_text=expected_text)
+
+        monkeypatch.setattr(
+            journal, '_compare_and_set_stage_reports_text', a_competitor_commits_first
+        )
+
+        with pytest.raises(RuntimeError, match=run_id):
+            await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert competitor_texts
+        assert stored_text == competitor_texts[-1]
+        assert 'must never land' not in stored_text
