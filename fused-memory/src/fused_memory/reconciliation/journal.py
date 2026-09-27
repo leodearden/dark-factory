@@ -389,6 +389,40 @@ class ReconciliationJournal:
                 (status, datetime.now(UTC).isoformat(), run_id),
             )
 
+    async def complete_run_if_status(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        status: str,
+        stage_reports: dict[str, StageReport | dict],
+    ) -> bool:
+        """Terminalise a run in ONE statement, only if it still holds
+        ``expected_status`` — for a caller acting on a row image it read earlier.
+
+        ``False`` means the row's status moved on since that read (or the row is
+        gone), and nothing was written.
+
+        ``stage_reports`` is written wholesale WITHOUT carrying citation repairs
+        forward. That is safe only because the status gate admits non-terminal
+        rows, and citation repair refuses those
+        (``fused-memory/src/fused_memory/reconciliation/citation_repair.py::REPAIRABLE_RUN_STATUSES``).
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                'UPDATE runs SET stage_reports = ?, status = ?, completed_at = ? '
+                'WHERE id = ? AND status = ?',
+                (
+                    _serialize_stage_reports(stage_reports),
+                    status,
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                    expected_status,
+                ),
+            )
+            applied = cursor.rowcount == 1
+        return applied
+
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
