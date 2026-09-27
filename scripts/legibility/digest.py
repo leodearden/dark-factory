@@ -602,7 +602,8 @@ def _dialogue_text_sources(
     user_text: bool = False,
 ) -> list[tuple[int, str]]:
     """The carriers :func:`_signal_text_sources` yields, minus every one that
-    is re-ingested machine content (:func:`is_reingested_content`).
+    is re-ingested machine content OR comes from a record whose harness
+    provenance names a non-human producer (:func:`_is_reingested_carrier`).
 
     Two layers, two questions: :func:`_signal_text_sources` answers "which
     native carriers exist", and this answers "which of them are this
@@ -625,7 +626,7 @@ def _dialogue_text_sources(
             assistant_text=assistant_text,
             user_text=user_text,
         )
-        if not is_reingested_content(text)
+        if not _is_reingested_carrier(records[index], text)
     ]
 
 
