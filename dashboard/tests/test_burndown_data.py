@@ -2215,7 +2215,8 @@ class TestReadSideSeesMeasuredRowsOnly:
         assert series['labels'] == [_hours_before_read(2)]
         assert series['done'] == [7]
 
-    async def test_projects_omit_a_gap_only_project(self, tmp_path):
+    async def test_projects_list_a_gap_only_project(self, tmp_path):
+        """The shaper renders a never-measured project unknown; its series stays empty."""
         db = tmp_path / 'burndown.db'
         _create_burndown_db(db)
         conn = sqlite3.connect(str(db))
@@ -2227,8 +2228,9 @@ class TestReadSideSeesMeasuredRowsOnly:
         conn.close()
 
         async with aiosqlite.connect(str(db)) as c:
-            assert await get_burndown_projects(c) == ['legacy', 'measured']
-            assert await aggregate_burndown_projects([c]) == ['legacy', 'measured']
+            assert await get_burndown_projects(c) == ['gap-only', 'legacy', 'measured']
+            assert await aggregate_burndown_projects([c]) == ['gap-only', 'legacy', 'measured']
+        assert (await _series_of(db, 'gap-only'))['labels'] == []
 
     async def test_series_carries_the_new_columns_null_before_the_migration(self, tmp_path):
         db = tmp_path / 'migrated.db'

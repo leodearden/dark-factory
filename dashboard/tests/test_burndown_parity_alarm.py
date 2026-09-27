@@ -611,7 +611,7 @@ async def _shaped_as_the_route_does(path: Path) -> dict:
         per_pid = await asyncio.gather(
             *(aggregate_burndown_series([db], pid, days=30, now=_NOW) for pid in projects)
         )
-    return redux_api.shape_burndown(dict(zip(projects, per_pid, strict=True)))
+    return redux_api.shape_burndown(dict(zip(projects, per_pid, strict=True)), served_at=_T2)
 
 
 class TestRaggedTwoProjectStore:
@@ -643,3 +643,41 @@ class TestRaggedTwoProjectStore:
         body = shaped[0]
         assert body['BURNDOWN_BY_PROJECT']['B']['parity_breach_count'] == 1
         assert body['BURNDOWN']['parity_breach_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_b_is_served_stale_as_of_t1(self, shaped):
+        latest = shaped[0]['BURNDOWN_BY_PROJECT']['B']['latest']
+        assert latest['state'] == 'stale'
+        assert datetime.fromisoformat(latest['as_of']) == _T1
+        assert _T2 - datetime.fromisoformat(latest['as_of']) == _T2 - _T1
+
+    @pytest.mark.asyncio
+    async def test_a_is_served_fresh(self, shaped):
+        assert shaped[0]['BURNDOWN_BY_PROJECT']['A']['latest']['state'] == 'fresh'
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_is_stale_as_of_b_and_names_it(self, shaped):
+        latest = shaped[0]['BURNDOWN']['latest']
+        assert latest['state'] == 'stale'
+        assert datetime.fromisoformat(latest['as_of']) == _T1
+        assert 'B' in latest['reason']
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_forecast_is_measured_so_equality_is_not_vacuous(self, shaped):
+        """The window spans eight days, so the payloads compared above hold a forecast."""
+        assert shaped[0]['BURNDOWN']['forecast']['value'] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_gap_only_project_is_listed_and_served_unknown(self, tmp_path):
+        """C's sampler never measured it: C renders unknown and the total a lower bound."""
+        path = tmp_path / 'with_gap_only_project.db'
+        _ragged_store(path, with_b_gap=True)
+        _add_gap_row(path, 'C', _T1.isoformat())
+        _add_gap_row(path, 'C', _T2.isoformat())
+
+        body = await _shaped_as_the_route_does(path)
+
+        assert body['BURNDOWN_BY_PROJECT']['C']['latest']['state'] == 'unknown'
+        aggregate = body['BURNDOWN']['latest']
+        assert aggregate['state'] == 'lower_bound'
+        assert 'C' in aggregate['reason']

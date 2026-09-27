@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from dashboard import loops
 from dashboard.data import burndown, census, redux_api
 
 # ---------------------------------------------------------------------------
@@ -834,17 +839,17 @@ def test_shape_burndown_emits_completed_and_velocity():
     }
     body = redux_api.shape_burndown(series)
 
-    df = body['BURNDOWN_BY_PROJECT']['dark_factory']
+    df = body['BURNDOWN_BY_PROJECT']['dark_factory']['latest']['value']
     assert df['completed'] == 2       # 5 - 3
     assert df['velocity'] == 1.0      # 2 / 2 distinct days
     assert df['window_days'] == 2     # 2026-05-20 and 2026-05-21
 
-    ri = body['BURNDOWN_BY_PROJECT']['reify']
+    ri = body['BURNDOWN_BY_PROJECT']['reify']['latest']['value']
     assert ri['completed'] == 2       # 12 - 10
     assert ri['velocity'] == 1.0      # 2 / 2 distinct days
     assert ri['window_days'] == 2     # same label range
 
-    agg = body['BURNDOWN']
+    agg = body['BURNDOWN']['latest']['value']
     assert agg['completed'] == 4      # sum(2, 2) — not delta on aggregate series
     assert agg['velocity'] == 2.0     # 4 / 2 aggregate distinct days
     assert agg['window_days'] == 2    # union of all labels = 2 distinct days
@@ -867,8 +872,8 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
         },
     }
     body = redux_api.shape_burndown(series)
-    assert body['BURNDOWN']['completed'] == 0
-    assert body['BURNDOWN']['velocity'] == 0.0
+    assert body['BURNDOWN']['latest']['value']['completed'] == 0
+    assert body['BURNDOWN']['latest']['value']['velocity'] == 0.0
 
 
 # --- divergent per-project label rows -------------------------------------
@@ -1003,11 +1008,12 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
     assert len(block['labels']) == 3
     assert block['done'] == [3, 7]          # verbatim — not padded, not truncated
     assert block['in_progress'] == [1, 2, 3]
-    assert block['completed'] == 0
-    assert block['velocity'] == 0.0
-    assert block['window_days'] == 0
-    assert block['forecast_low'] is None
-    assert block['forecast_high'] is None
+    completion = block['latest']['value']
+    assert completion['completed'] == 0
+    assert completion['velocity'] == 0.0
+    assert completion['window_days'] == 0
+    assert block['forecast']['state'] == 'unknown'
+    assert block['forecast']['value'] is None
 
     agg = body['BURNDOWN']
     assert agg['labels'] == [
@@ -1016,7 +1022,7 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
     # The unreported third slot is a hole, not a 0.
     assert agg['done'] == [3, 7, None]
     assert agg['in_progress'] == [1, 2, 3]
-    assert agg['completed'] == 0            # sum of per-project completeds
+    assert agg['latest']['value']['completed'] == 0   # sum of per-project completeds
 
 
 def test_shape_burndown_aggregate_endpoint_is_the_sum_of_each_projects_last_measured_row():
@@ -1102,8 +1108,221 @@ def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
         'forecast_low': 27.8,
         'forecast_high': 29.2,
     }
-    assert agg['forecast_low'] == 27.8
-    assert agg['forecast_high'] == 29.2
+    assert agg['forecast']['value'] == {'forecast_low': 27.8, 'forecast_high': 29.2}
+
+
+# ---------------------------------------------------------------------------
+# shape_burndown — every block serves its own provenance (task 5592)
+# ---------------------------------------------------------------------------
+
+_BOUND = 2 * loops._SAMPLE_INTERVAL_SECONDS
+_BASE = datetime(2026, 5, 20, tzinfo=UTC)
+_WIRE_SERIES_KEYS = (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS)
+_DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
+_FLAT_FIELDS_NOW_IN_DATUMS = ('completed', 'velocity', 'window_days', 'forecast_low', 'forecast_high')
+_EMPTY = {'labels': []}
+
+
+def _label(minutes: float) -> str:
+    """A UTC snapshot label *minutes* after the fixtures' base instant."""
+    return (_BASE + timedelta(minutes=minutes)).isoformat()
+
+
+def _served(minutes: float) -> datetime:
+    return _BASE + timedelta(minutes=minutes)
+
+
+_ALPHA = _nine_member_series([_label(0), _label(10), _label(20)], base=1)
+_BRAVO = _nine_member_series([_label(0), _label(10)], base=1000)
+
+
+def _eight_daily(first_done: int) -> dict:
+    labels = [(_BASE + timedelta(days=d)).isoformat() for d in range(8)]
+    return {'labels': labels, 'done': [first_done + 2 * d for d in range(8)],
+            'pending': [30 - d for d in range(8)]}
+
+
+def _served_datums(body: dict) -> dict:
+    """Every Datum a burndown payload serves, keyed by where it sits."""
+    blocks = {'BURNDOWN': body['BURNDOWN']}
+    blocks.update({f'BURNDOWN_BY_PROJECT[{pid}]': block
+                   for pid, block in body['BURNDOWN_BY_PROJECT'].items()})
+    return {f'{where}.{field}': block[field]
+            for where, block in blocks.items() for field in ('latest', 'forecast')}
+
+
+_PAYLOADS_OF_EVERY_STATE = {
+    'fresh': ({'alpha': _ALPHA}, _served(25)),
+    'carried': ({'alpha': _ALPHA, 'bravo': _BRAVO}, _served(25)),
+    'empty-project': ({'alpha': _ALPHA, 'echo': _EMPTY}, _served(25)),
+    'past-the-bound': ({'alpha': _ALPHA}, _served(20) + timedelta(seconds=_BOUND + 1)),
+    'forecastable': ({'alpha': _eight_daily(0), 'bravo': _eight_daily(50)}, _served(7 * 24 * 60)),
+    'nothing-measured': ({'echo': _EMPTY}, _served(25)),
+    'no-projects': ({}, _served(25)),
+}
+
+
+def test_shape_burndown_latest_is_fresh_for_a_project_measured_at_the_newest_sample():
+    block = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(25))[
+        'BURNDOWN_BY_PROJECT']['alpha']
+    completion = burndown.compute_window_completion(_ALPHA)
+    assert block['latest'] == {
+        'value': {
+            'counts': {key: _ALPHA[key][-1] for key in _WIRE_SERIES_KEYS},
+            'completed': completion['completed'],
+            'velocity': completion['velocity'],
+            'window_days': completion['window_days'],
+        },
+        'as_of': _label(20),
+        'state': 'fresh',
+        'reason': None,
+        'freshness_bound_seconds': _BOUND,
+    }
+
+
+def test_shape_burndown_latest_is_stale_for_a_project_carried_to_the_newest_sample():
+    """bravo last measured at +10min; the newest sample is alpha's at +20min."""
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    latest = body['BURNDOWN_BY_PROJECT']['bravo']['latest']
+    assert latest['state'] == 'stale'
+    assert latest['as_of'] == _label(10)
+    assert _label(20) in latest['reason']
+    assert '600s' in latest['reason']
+    assert latest['value']['counts'] == {key: _BRAVO[key][-1] for key in _WIRE_SERIES_KEYS}
+
+
+def test_shape_burndown_latest_is_unknown_for_a_project_with_no_measured_row():
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25))
+    latest = body['BURNDOWN_BY_PROJECT']['echo']['latest']
+    assert latest['state'] == 'unknown'
+    assert latest['value'] is None
+    assert latest['as_of'] is None
+    assert 'no measured burndown sample in this window' in latest['reason']
+
+
+def test_shape_burndown_aggregate_latest_headline_is_the_spark_endpoint():
+    """Sketch #6: the tile's number and the spark's last point are one number."""
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    agg = body['BURNDOWN']
+    value = agg['latest']['value']
+    assert value['counts'] == {key: agg[key][-1] for key in _WIRE_SERIES_KEYS}
+    fold = burndown.aggregate_window_completion(
+        {'alpha': burndown.compute_window_completion(_ALPHA),
+         'bravo': burndown.compute_window_completion(_BRAVO)},
+        agg['labels'],
+    )
+    assert {key: value[key] for key in ('completed', 'velocity', 'window_days')} == fold
+
+
+def test_shape_burndown_aggregate_latest_is_stale_as_of_its_oldest_contribution():
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    latest = body['BURNDOWN']['latest']
+    assert latest['state'] == 'stale'
+    assert latest['as_of'] == _label(10)
+    assert 'bravo' in latest['reason']
+    assert 'alpha' not in latest['reason']
+
+
+def test_shape_burndown_aggregate_latest_is_a_lower_bound_when_a_project_is_unmeasured():
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25))
+    latest = body['BURNDOWN']['latest']
+    assert latest['state'] == 'lower_bound'
+    assert latest['value'] is not None
+    assert 'echo' in latest['reason']
+
+
+def test_shape_burndown_aggregate_latest_is_fresh_when_every_project_is_measured_at_the_newest():
+    both = {'alpha': _ALPHA, 'bravo': _nine_member_series([_label(5), _label(20)], base=500)}
+    latest = redux_api.shape_burndown(both, served_at=_served(25))['BURNDOWN']['latest']
+    assert latest['state'] == 'fresh'
+    assert latest['reason'] is None
+    assert latest['as_of'] == _label(20)
+
+
+def test_shape_burndown_latest_goes_stale_past_the_freshness_bound():
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA}, served_at=_served(20) + timedelta(seconds=_BOUND + 1),
+    )
+    for latest in (body['BURNDOWN']['latest'], body['BURNDOWN_BY_PROJECT']['alpha']['latest']):
+        assert latest['state'] == 'stale'
+        assert f'{_BOUND}s' in latest['reason']
+        assert _label(20) in latest['reason']
+
+
+def test_shape_burndown_aggregate_latest_is_unknown_when_nothing_was_measured():
+    for series in ({'echo': _EMPTY}, {}):
+        latest = redux_api.shape_burndown(series, served_at=_served(25))['BURNDOWN']['latest']
+        assert latest['state'] == 'unknown'
+        assert latest['value'] is None
+        assert latest['reason']
+
+
+def test_shape_burndown_forecast_datum_carries_its_blocks_latest_provenance():
+    series = {'alpha': _eight_daily(0), 'bravo': _eight_daily(50)}
+    body = redux_api.shape_burndown(series, served_at=_served(7 * 24 * 60))
+
+    blocks = [(body['BURNDOWN'], burndown.aggregate_forecast_confidence(series.values()))]
+    blocks += [(body['BURNDOWN_BY_PROJECT'][pid], burndown.compute_forecast_confidence(s))
+               for pid, s in series.items()]
+    for block, expected in blocks:
+        forecast, latest = block['forecast'], block['latest']
+        assert expected['forecast_low'] is not None
+        assert forecast['value'] == expected
+        assert (forecast['as_of'], forecast['state'], forecast['reason']) == (
+            latest['as_of'], latest['state'], latest['reason'],
+        )
+
+
+def test_shape_burndown_forecast_datum_is_unknown_on_sparse_history():
+    body = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(25))
+    for block in (body['BURNDOWN'], body['BURNDOWN_BY_PROJECT']['alpha']):
+        assert block['forecast']['state'] == 'unknown'
+        assert block['forecast']['value'] is None
+        assert block['forecast']['reason']
+
+
+@pytest.mark.parametrize('case', _PAYLOADS_OF_EVERY_STATE)
+def test_shape_burndown_every_datum_declares_two_sample_intervals(case):
+    """PRD open question 1: burndown data is sampled, so its bound is two intervals."""
+    series, served_at = _PAYLOADS_OF_EVERY_STATE[case]
+    for where, datum in _served_datums(redux_api.shape_burndown(series, served_at=served_at)).items():
+        assert set(datum) == _DATUM_KEYS, where
+        assert datum['freshness_bound_seconds'] == _BOUND, where
+
+
+@pytest.mark.parametrize('case', _PAYLOADS_OF_EVERY_STATE)
+def test_shape_burndown_every_datum_keeps_the_wire_triad(case):
+    """unknown <=> no value <=> no as_of; anything but fresh says why."""
+    series, served_at = _PAYLOADS_OF_EVERY_STATE[case]
+    for where, datum in _served_datums(redux_api.shape_burndown(series, served_at=served_at)).items():
+        unknown = datum['state'] == 'unknown'
+        assert unknown == (datum['value'] is None) == (datum['as_of'] is None), where
+        if datum['state'] != 'fresh':
+            assert isinstance(datum['reason'], str) and datum['reason'].strip(), where
+
+
+def test_shape_burndown_reasons_do_not_move_with_the_serving_instant():
+    """A payload over data already past the bound is identical one second later."""
+    served_at = _served(20) + timedelta(seconds=_BOUND + 60)
+    series = {'alpha': _ALPHA, 'bravo': _BRAVO, 'echo': _EMPTY}
+    assert redux_api.shape_burndown(series, served_at=served_at) == redux_api.shape_burndown(
+        series, served_at=served_at + timedelta(seconds=1),
+    )
+
+
+def test_shape_burndown_per_project_blocks_carry_completed_per_day():
+    series = {'alpha': _eight_daily(0), 'bravo': _BRAVO}
+    body = redux_api.shape_burndown(series, served_at=_served(25))
+    for pid, s in series.items():
+        assert body['BURNDOWN_BY_PROJECT'][pid]['completed_per_day'] == (
+            burndown.compute_window_completion(s)['completed_per_day']
+        )
+
+
+def test_shape_burndown_blocks_carry_no_flat_copy_of_a_datum_value():
+    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    for block in (body['BURNDOWN'], *body['BURNDOWN_BY_PROJECT'].values()):
+        assert not set(_FLAT_FIELDS_NOW_IN_DATUMS) & set(block)
 
 
 # ---------------------------------------------------------------------------
