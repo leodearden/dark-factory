@@ -179,6 +179,11 @@ async def _await_heartbeat_refreshes(wf: TaskWorkflow, count: int = 1) -> None:
     )
 
 
+async def _stop_heartbeat_after_first_refresh(wf: TaskWorkflow) -> None:
+    await _await_heartbeat_refreshes(wf)
+    await wf._stop_claimant_heartbeat()
+
+
 # A fixed 50 ms wait survives a stall of at most 50 - 10 = 40 ms (35 ms: 1 refresh, 45 ms: 0).
 _DISPATCH_STALL_SECS = 0.06
 
@@ -224,8 +229,7 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
     wf = _make_workflow(project_root=tmp_path, task_id='303', claimant_heartbeat_interval_secs=0.01)
 
     await _setup(wf)
-    await _await_heartbeat_refreshes(wf)
-    await wf._stop_claimant_heartbeat()
+    await _stop_heartbeat_after_first_refresh(wf)
 
     assert wf.scheduler.set_task_claimant.await_count >= 1  # type: ignore[attr-defined]
     args, kwargs = wf.scheduler.set_task_claimant.call_args  # type: ignore[attr-defined]
@@ -247,8 +251,7 @@ async def test_heartbeat_loop_still_refreshes_after_a_loop_stall_at_dispatch(tmp
         'the stall ran inside _setup, so it no longer lands between the test starting '
         "its wait and the heartbeat loop's first step"
     )
-    await _await_heartbeat_refreshes(wf)
-    await wf._stop_claimant_heartbeat()
+    await _stop_heartbeat_after_first_refresh(wf)
 
     assert stall_ran.is_set(), 'the dispatch write never queued the stall, so none was exercised'
     assert cast(AsyncMock, wf.scheduler.set_task_claimant).await_count >= 1
