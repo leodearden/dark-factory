@@ -1141,7 +1141,10 @@ class TestBlastRadiusExpansion:
             async def handle_blast_radius_expansion(
                 self, task_id, current, needed, /, *, persist_files=None
             ):
-                return False  # Can't acquire locks
+                # Can't acquire locks: re-pend like the real acquire-failure
+                # branch of scheduler.py::Scheduler.handle_blast_radius_expansion.
+                await self.set_task_status(task_id, 'pending')
+                return False
 
         stub = ExpandingArchitectStub()
         deny_scheduler = DenyingScheduler()
@@ -5381,14 +5384,19 @@ class TestPlanDoneEarlyReturn:
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+
+        # run()'s SM-2 exit check reads scheduler.get_status back — the real
+        # _execute_verify_review_loop body (which would persist 'blocked')
+        # never runs, so the stub seeds the fake's status history itself, at
+        # call time. Seeding it before run() is overwritten by the dispatch
+        # claim's 'in-progress'.
+        async def fake_loop_blocked(*args, **kwargs):
+            scheduler.statuses.setdefault(workflow.task_id, []).append('blocked')
+            return WorkflowOutcome.BLOCKED
+
         workflow._execute_verify_review_loop = AsyncMock(
-            return_value=WorkflowOutcome.BLOCKED,
+            side_effect=fake_loop_blocked,
         )
-        # run()'s SM-2 exit check reads scheduler.get_status back —
-        # _execute_verify_review_loop is stubbed above (its real body, which
-        # would persist 'blocked', never runs), so seed the fake's status
-        # history to match the forced BLOCKED outcome directly.
-        scheduler.statuses.setdefault(workflow.task_id, []).append('blocked')
 
         outcome = (await workflow.run()).outcome
 

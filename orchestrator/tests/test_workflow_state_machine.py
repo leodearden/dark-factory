@@ -197,7 +197,6 @@ class TestNeverAFourthTable:
             assert machine.state == frm
 
 
-
 class TestExitContractCoversEveryOutcome:
     """The genuine cross-layer guard ``shared/src/shared/task_transitions.py``
     cannot host: ``_OUTCOME_ALLOWED``'s keys are a hand-kept mirror of the
@@ -220,6 +219,7 @@ class TestExitContractCoversEveryOutcome:
         assert any(
             shared_outcome_allows_status(outcome, status) for status in TaskStatus
         )
+
 
 class TestStateToStatusProjection:
     """Pins each ``STATE_TO_STATUS`` entry independently of ``WorkflowStateMachine``
