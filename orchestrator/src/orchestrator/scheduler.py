@@ -30,6 +30,7 @@ from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
+from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator import git_ops
 from orchestrator.config import (
@@ -2909,12 +2910,14 @@ class Scheduler:
         The fused-memory wire format may surface metadata as a JSON string,
         a dict, or absent. Normalize once at this boundary so every consumer
         can assume ``isinstance(task['metadata'], dict)`` without re-parsing.
+        The absent-vs-unreadable rule itself lives in
+        ``shared.task_metadata_wire.coerce_task_metadata``.
 
-        A non-JSON or non-dict-shaped value collapses to ``{}`` — every
-        consumer reads dict-keyed sub-fields, so a non-dict carries no
-        information they can use.
+        Absent metadata (``None``, a missing key, or ``''``) is the NORMAL
+        shape (most tasks carry none) and stays silent — warning there would be
+        pure noise, every tick.
 
-        The collapse is LOUD: a discarded value emits a WARNING naming the task
+        An UNREADABLE value collapses to ``{}`` LOUDLY: a WARNING names the task
         id, the discarded type and a truncated repr.  It warns rather than
         raises because this runs per task inside the scheduler's task-list
         normalisation, so one malformed task must not take down a whole tick.
@@ -2923,37 +2926,18 @@ class Scheduler:
         distinguish "no markers" from "markers unreadable" — without it a task
         whose metadata arrived as an unparseable string is waved through
         looking marker-free, with no trace that anything was dropped.
-
-        Absent / ``None`` metadata is the NORMAL shape (most tasks carry none)
-        and stays silent — warning there would be pure noise, every tick.
         """
         raw = task.get('metadata')
-        if isinstance(raw, dict):
-            return
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
-            if not isinstance(parsed, dict):
-                logger.warning(
-                    'Task %s metadata discarded: str did not decode to a dict '
-                    '(type=str, repr=%.200r) — collapsing to {}; any markers it '
-                    'carried are NOT visible to downstream gates',
-                    task.get('id'), raw,
-                )
-                task['metadata'] = {}
-                return
-            task['metadata'] = parsed
-            return
-        if raw is not None:
+        meta = coerce_task_metadata(raw)
+        if meta is None:
             logger.warning(
-                'Task %s metadata discarded: not a dict or JSON string '
+                'Task %s metadata discarded: not a dict or a JSON-object string '
                 '(type=%s, repr=%.200r) — collapsing to {}; any markers it '
                 'carried are NOT visible to downstream gates',
                 task.get('id'), type(raw).__name__, raw,
             )
-        task['metadata'] = {}
+            meta = {}
+        task['metadata'] = meta
 
     @staticmethod
     def is_deterministic(task: dict) -> bool:
