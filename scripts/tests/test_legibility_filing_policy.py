@@ -321,7 +321,7 @@ HARNESS = filing_policy.ProjectRef(HARNESS_ROOT, "dark_factory")
 IN_TREE_REMEDIATION = {"path": "docs/x.md", "change": "Add a note on the timeout"}
 
 
-def _resolve(cluster, *, harness=HARNESS):
+def _resolve(cluster, *, harness: filing_policy.ProjectRef | None = HARNESS):
     return filing_policy.resolve_target(cluster, observed=OBSERVED, harness=harness)
 
 

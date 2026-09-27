@@ -17,8 +17,11 @@ harness error that can only come from the harness itself.
 from __future__ import annotations
 
 import enum
+import logging
 import re
 from dataclasses import dataclass
+
+logger = logging.getLogger("legibility.filing_policy")
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,12 @@ class ProjectRef:
 class FixSurfaceMatch:
     component: str
     evidence: str
+
+
+@dataclass(frozen=True)
+class FilingTarget:
+    project: ProjectRef
+    fix_surface: tuple[FixSurfaceMatch, ...] = ()
 
 
 class _Scope(enum.Enum):
@@ -115,3 +124,52 @@ def harness_fix_surface(cluster: dict, *, harness_root: str) -> tuple[FixSurface
     markers = (*_MARKERS, _checkout_path_marker(harness_root))
     matches = (_first_match(marker, cluster) for marker in markers)
     return tuple(match for match in matches if match is not None)
+
+
+def proposed_remediation(cluster: dict) -> dict | None:
+    """The cluster's in-tree remediation, when it has the ``{path, change}`` shape."""
+    remediation = cluster.get("remediation")
+    if not isinstance(remediation, dict):
+        return None
+    for key in ("path", "change"):
+        value = remediation.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+    return remediation
+
+
+def _override_project(cluster: dict) -> ProjectRef | None:
+    """The explicit ``target_project_root``/``target_project_id`` pair (PRD
+    decision 4). The two name one project and move together: a partial pair
+    is warned and treated as absent, never mixed with the observed project."""
+    has_root = "target_project_root" in cluster
+    has_id = "target_project_id" in cluster
+    if has_root and has_id:
+        return ProjectRef(cluster["target_project_root"], cluster["target_project_id"])
+    if has_root or has_id:
+        logger.warning(
+            "census: cluster %r supplies only one of "
+            "target_project_root/target_project_id (must move together, "
+            "PRD decision 4) -- ignoring the partial override",
+            cluster.get("title"),
+        )
+    return None
+
+
+def resolve_target(
+    cluster: dict, *, observed: ProjectRef, harness: ProjectRef | None,
+) -> FilingTarget:
+    """Where *cluster* files. An explicit override pair wins. Otherwise a
+    harness fix surface moves it to *harness*, unless the verifier proposed a
+    remediation inside the observed tree (an ambiguous cluster stays put)."""
+    override = _override_project(cluster)
+    if override is not None:
+        return FilingTarget(override)
+    if harness is None or harness.project_id == observed.project_id:
+        return FilingTarget(observed)
+    if proposed_remediation(cluster) is not None:
+        return FilingTarget(observed)
+    fix_surface = harness_fix_surface(cluster, harness_root=harness.project_root)
+    if fix_surface:
+        return FilingTarget(harness, fix_surface)
+    return FilingTarget(observed)
