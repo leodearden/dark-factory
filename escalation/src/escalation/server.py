@@ -9,11 +9,11 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from shared.branch_names import canonical_queued_branch_name
 
 # Fully qualified rather than `from shared import ...`: the module is
@@ -28,6 +28,7 @@ from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.merge_state import MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
@@ -1158,6 +1159,9 @@ def create_server(
         escalation_sink=_file_markup_residue,
         fact_sink=_emit_markup_fact,
     ))
+    # Any tool call missing a required argument gets a structured refusal
+    # instead of pydantic's raw text (shared/src/shared/mcp_missing_arguments.py).
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
@@ -3265,7 +3269,11 @@ def create_server(
     async def merge_request(
         task_id: str,
         branch: str,
-        worktree: str,
+        worktree: Annotated[str, Field(description=(
+            "Absolute path of the task's own git worktree: the checkout the "
+            'merge worker rebases and merges from, typically '
+            '<project_root>/.worktrees/<task_id>.'
+        ))],
         description: str = '',
         wait_secs: int = 0,
         verified_green: bool = False,
