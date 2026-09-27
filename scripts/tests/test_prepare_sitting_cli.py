@@ -354,7 +354,7 @@ class TestCloseCollision:
 
         assert [run.returncode for run in runs] == [0, 0], [run.stderr for run in runs]
         after = self._decision_files(env)
-        closed = DecisionRecord.from_json(after.pop(f'{derived}.json'))
+        closed = DecisionRecord.from_json(after.pop(f'{derived}.json').decode())
         assert after == before
         assert closed.state == 'answered'
         assert closed.closing_evidence
