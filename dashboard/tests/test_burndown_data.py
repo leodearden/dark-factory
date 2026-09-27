@@ -1477,8 +1477,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         assert breach, f'expected a cap-breach WARNING, got: {warnings}'
         message = breach[0]
         assert str(config.project_root) in message, message
-        assert '3' in message, f'in-progress count missing from: {message}'
-        assert '2' in message, f'cap missing from: {message}'
+        assert '3 live in-progress vs cap 2' in message, message
 
         # The row is still written — the alarm annotates history, it does not
         # suppress it.
