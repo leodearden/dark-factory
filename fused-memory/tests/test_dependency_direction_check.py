@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import MockAddEpisodeResult, MockEdge, install_identity_mocks
 
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.dependency_direction_check import (
     REVERSED,
     SIBLING_SEQUENTIAL,
@@ -575,27 +576,44 @@ class TestMemoryServiceSubPass:
         assert REVERSED in blob and SIBLING_SEQUENTIAL in blob
 
     @pytest.mark.asyncio
-    async def test_e_project_root_resolution_and_its_fallback(self, mock_config):
+    async def test_e_project_root_comes_from_known_projects(self, mock_config):
         svc = _service(mock_config)
-        result = _result(BAD_FACTS)
 
-        await svc._check_dependency_direction(result, group_id=GROUP)
+        await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+
         assert _tm(svc).get_dependency_edges.await_args.args[0] == (
             '/srv/dark-factory'
         )
 
-        # Unknown group -> the _memory_metadata_project_root() fallback.
-        _tm(svc).get_dependency_edges.reset_mock()
-        svc.set_known_projects({})
-        svc._memory_metadata_project_root = MagicMock(return_value='/fallback')
-        await svc._check_dependency_direction(result, group_id=GROUP)
-        assert _tm(svc).get_dependency_edges.await_args.args[0] == '/fallback'
+    @pytest.mark.asyncio
+    async def test_e_an_unregistered_group_is_refused_never_given_a_fallback_root(
+        self, mock_config, caplog
+    ):
+        # THE TRAP: a non-empty configured root. Without it the stock config's
+        # `taskmaster=None` leaves any fallback empty, and a fallback-using
+        # implementation would refuse anyway, so this test would pass vacuously.
+        mock_config.taskmaster = TaskmasterConfig(project_root='/srv/other-project')
+        svc = _service(mock_config)
+        # Non-empty but lacking GROUP: no "any registered root" guess either.
+        svc.set_known_projects({'some_other_project': '/srv/elsewhere'})
 
-        # Unresolvable -> 0, and no taskmaster call at all.
-        _tm(svc).get_dependency_edges.reset_mock()
-        svc._memory_metadata_project_root = MagicMock(return_value='')
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == []
+        with caplog.at_level(logging.WARNING, logger=_MS_LOGGER):
+            records = await svc._check_dependency_direction(
+                _result(BAD_FACTS), group_id=GROUP
+            )
+
+        assert records == []
+        # Task ids overlap across projects: judging this episode against a
+        # foreign graph would misclassify true facts, so it is never read...
         _tm(svc).get_dependency_edges.assert_not_awaited()
+        # ...and nothing is retired, since retirement is destructive.
+        _ue(svc).assert_not_awaited()
+        # The refusal is loud, never silent.
+        assert any(
+            GROUP in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
 
     @pytest.mark.asyncio
     async def test_f_no_taskmaster_returns_no_records_without_raising(self, mock_config):
