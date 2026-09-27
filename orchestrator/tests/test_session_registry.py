@@ -6213,6 +6213,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         manual_boost=7,
         escalations_dir=queue,
         closing_evidence='the operator dropped it: superseded by esc-5914-2',
+        closed_at='2026-08-01T00:00:00+00:00',
     )
     incoming = _make_decision(
         text="the watcher's current view",
@@ -6245,6 +6246,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         'state',
         'manual_boost',
         'closing_evidence',
+        'closed_at',
         'escalations_dir',
     }
 
@@ -9940,6 +9942,12 @@ def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
 _EVIDENCE = 'gate 1 ruling_is_leos_own: held\nLeo 2026-09-20: esc-400-1 option A'
 
 
+def _assert_utc_instant_within(stamp: str, before: datetime, after: datetime) -> None:
+    instant = datetime.fromisoformat(stamp)
+    assert instant.utcoffset() == timedelta(0)
+    assert before <= instant <= after
+
+
 class TestClosingEvidence:
     """The deciding evidence, quoted verbatim on the closed record, and the one mutator that writes it."""
 
@@ -9990,11 +9998,15 @@ class TestClosingEvidence:
 
         monkeypatch.setattr(sr, 'write_decision', recording_write)
 
+        before = datetime.now(UTC)
         updated = self._close(tmp_path, state)
+        after = datetime.now(UTC)
 
         assert updated is not None
         assert (updated.state, updated.closing_evidence) == (state, _EVIDENCE)
-        assert [(w['state'], w['closing_evidence']) for w in written] == [(state, _EVIDENCE)]
+        [write] = written
+        assert (write['state'], write['closing_evidence'], write['closed_at']) == (state, _EVIDENCE, updated.closed_at)
+        _assert_utc_instant_within(updated.closed_at, before, after)
         [reread] = sr.list_decisions(root=tmp_path)
         assert reread == updated
 
@@ -10024,6 +10036,7 @@ class TestClosingEvidence:
             self._close(tmp_path, state, evidence)
 
         assert path.read_bytes() == before
+        assert sr.DecisionRecord.from_json(path.read_text()).closed_at == ''
 
     @pytest.mark.parametrize(('state', 'evidence'), [
         (sr.DecisionState.OPEN, _EVIDENCE),
@@ -10105,11 +10118,83 @@ class TestClosingEvidence:
         )
 
     def test_same_queue_refile_keeps_the_evidence(self) -> None:
-        existing = _make_decision(state=sr.DecisionState.ANSWERED, closing_evidence=_EVIDENCE, escalations_dir='/q')
+        closed_at = '2026-09-20T05:31:00+00:00'
+        existing = _make_decision(
+            state=sr.DecisionState.ANSWERED, closing_evidence=_EVIDENCE, closed_at=closed_at, escalations_dir='/q'
+        )
         incoming = _make_decision(state=sr.DecisionState.OPEN, escalations_dir='/q')
 
-        assert sr.merge_same_queue_refile(existing, incoming).closing_evidence == _EVIDENCE
-        assert sr.merge_decision_enrichment(existing, incoming).closing_evidence == _EVIDENCE
+        for merged in (sr.merge_same_queue_refile(existing, incoming), sr.merge_decision_enrichment(existing, incoming)):
+            assert (merged.closing_evidence, merged.closed_at) == (_EVIDENCE, closed_at)
+
+
+class TestClosedAt:
+    """When the evidence-carrying close happened: custody, stamped by close_decision_with_evidence alone."""
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closed_at == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, closed_at='2026-09-20T05:31:00+00:00')
+
+        assert d.to_dict()['closed_at'] == '2026-09-20T05:31:00+00:00'
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closed_at': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closed_at']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closed_at == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closed_at == ''
+
+    def test_attaching_evidence_after_the_reaper_closed_stamps_it(self, tmp_path: Path) -> None:
+        seeded = _make_decision(id='dec-close', state=sr.DecisionState.ANSWERED)
+        sr.write_decision(seeded, root=tmp_path)
+
+        before = datetime.now(UTC)
+        updated = sr.close_decision_with_evidence(
+            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path, **_identity_of(seeded)
+        )
+        after = datetime.now(UTC)
+
+        assert updated is not None
+        _assert_utc_instant_within(updated.closed_at, before, after)
+
+    def test_a_same_queue_write_decision_refile_keeps_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = str(tmp_path / 'data' / 'escalations')
+        filing = {'id': 'dec-close', 'project': 'dark_factory', 'text': 'approve?', 'escalations_dir': queue}
+        _file_decision(**filing)
+        closed = sr.close_decision_with_evidence(
+            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path,
+            expected_project='dark_factory', expected_escalations_dir=queue,
+        )
+        assert closed is not None and closed.closed_at
+
+        _file_decision(**{**filing, 'text': 'approve? (rephrased)'})
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.text == 'approve? (rephrased)'
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, closed.closed_at,
+        )
+
+    def test_the_other_state_and_boost_writers_never_stamp_it(self, tmp_path: Path) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        closed = sr.update_decision_state('dec-close', sr.DecisionState.ANSWERED, root=tmp_path)
+        boosted = sr.set_manual_boost('dec-close', 7, root=tmp_path)
+
+        assert closed is not None and boosted is not None
+        assert (closed.closed_at, boosted.closed_at) == ('', '')
 
 
 class TestCloseDecisionVerb:
@@ -10194,7 +10279,7 @@ class TestCloseDecisionIdentity:
             assert named in message
         assert path.read_bytes() == before
         [reread] = sr.list_decisions(root=tmp_path)
-        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.OPEN, '')
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (sr.DecisionState.OPEN, '', '')
 
     @pytest.mark.parametrize('queue', ['/q/data/escalations/', '/q/./data/escalations'], ids=['slash', 'dot'])
     def test_both_sides_are_folded_before_the_compare(self, tmp_path: Path, queue: str) -> None:
