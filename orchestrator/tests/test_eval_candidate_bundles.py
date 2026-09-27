@@ -20,6 +20,25 @@ from __future__ import annotations
 
 import pytest
 
+# The 2026-09 endpoint slate as LITERALS (task 5384), deliberately not read
+# from the ``*_MODEL`` constants: a pin that reads what it protects guards
+# nothing (INV-10).
+_SLATE_MODELS_BY_NAME = {
+    'minimax-m3-endpoint': 'MiniMax-M3',
+    'glm-5.3-endpoint': 'glm-5.3',
+    'glm-5.3-flash-endpoint': 'glm-5.3-flash',
+    'deepseek-v4-endpoint': 'deepseek-v4',
+    'kimi-endpoint': 'kimi-latest',
+}
+# (model, input_per_1m, output_per_1m) list prices, USD per 1M tokens.
+_SLATE_LIST_PRICES = [
+    ('MiniMax-M3', 0.30, 1.20),
+    ('glm-5.3', 1.40, 4.40),
+    ('glm-5.3-flash', 0.15, 0.50),
+    ('deepseek-v4', 0.28, 0.42),
+    ('kimi-latest', 0.60, 2.50),
+]
+
 
 class TestClaudeEndpointCandidatesRoster:
     """Shape of ``claude_endpoint_candidates()``: incumbents + non-incumbents."""
@@ -291,13 +310,72 @@ class TestGetConfigByNameAndPropagation:
         assert orch_config.models.implementer == bundle.model
 
 
-_SLATE_MODELS_BY_NAME = {
-    'minimax-m3-endpoint': 'MiniMax-M3',
-    'glm-5.3-endpoint': 'glm-5.3',
-    'glm-5.3-flash-endpoint': 'glm-5.3-flash',
-    'deepseek-v4-endpoint': 'deepseek-v4',
-    'kimi-endpoint': 'kimi-latest',
-}
+
+class TestCandidatePriceCostBasis:
+    """Every candidate endpoint price declares how its arm is billed.
+
+    Under a GLM Coding Plan, GLM is credit-metered, so its dollar figure is an
+    imputed list price rather than a measured cost. An untagged imputed price
+    is the ``hardware_time_seconds`` mistake repeated
+    (eval-framework-revival-prd.md decision 1; live-shadow-eval-prd.md
+    decision 16), so the tag lives in the table itself.
+    """
+
+    def test_cost_basis_is_the_prd_decision_16_vocabulary(self):
+        from enum import StrEnum
+
+        from orchestrator.evals.configs import CostBasis
+
+        assert issubclass(CostBasis, StrEnum)
+        assert {member.value for member in CostBasis} == {'metered', 'subscription'}
+
+    def test_every_entry_is_a_typed_record_with_a_cost_basis(self):
+        from orchestrator.evals.configs import (
+            CANDIDATE_ENDPOINT_PRICES,
+            CandidateEndpointPrice,
+            CostBasis,
+        )
+
+        assert CANDIDATE_ENDPOINT_PRICES
+        for price in CANDIDATE_ENDPOINT_PRICES.values():
+            assert isinstance(price, CandidateEndpointPrice)
+            assert isinstance(price.cost_basis, CostBasis)
+
+    @pytest.mark.parametrize(('model', 'basis', 'imputed'), [
+        ('glm-5.3', 'subscription', True),
+        ('glm-5.3-flash', 'subscription', True),
+        ('MiniMax-M3', 'metered', False),
+        ('deepseek-v4', 'metered', False),
+        ('kimi-latest', 'metered', False),
+    ])
+    def test_per_model_cost_basis_is_pinned(self, model, basis, imputed):
+        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES, CostBasis
+
+        price = CANDIDATE_ENDPOINT_PRICES[model]
+        assert price.cost_basis is CostBasis(basis)
+        assert price.imputed is imputed
+
+    def test_entries_are_immutable(self):
+        import dataclasses
+
+        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
+
+        price = CANDIDATE_ENDPOINT_PRICES['glm-5.3']
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            price.input_per_1m = 0.0  # type: ignore[misc]
+
+    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
+    def test_price_table_projection_stays_rates_only(
+        self, model, input_per_1m, output_per_1m,
+    ):
+        """runner.py builds ``PriceEntry(**rates)`` from this table, so the
+        cost-basis tag must not leak into the projection."""
+        from orchestrator.evals.configs import claude_endpoint_price_table
+
+        assert claude_endpoint_price_table()[model] == {
+            'input_per_1m': input_per_1m,
+            'output_per_1m': output_per_1m,
+        }
 
 
 class TestEndpointSlatePin:
@@ -328,13 +406,7 @@ class TestEndpointSlatePin:
         for name, model in _SLATE_MODELS_BY_NAME.items():
             assert by_name[name].model == model
 
-    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), [
-        ('MiniMax-M3', 0.30, 1.20),
-        ('glm-5.3', 1.40, 4.40),
-        ('glm-5.3-flash', 0.15, 0.50),
-        ('deepseek-v4', 0.28, 0.42),
-        ('kimi-latest', 0.60, 2.50),
-    ])
+    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
     def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
         from orchestrator.evals.configs import claude_endpoint_price_table
 
