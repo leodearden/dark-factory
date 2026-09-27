@@ -27,6 +27,7 @@ import census as mod
 import codebook
 import coder
 import digest as digest_mod
+import filing_policy
 import inventory
 import pytest
 from legibility import census_trigger, unlanded
@@ -771,6 +772,91 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
         "census's own project_root"
     )
     assert "hosted_project" in payloads[0]["description"]
+
+
+# ---------------------------------------------------------------------------
+# task 5931 step-7: RED — build_task_payloads routes a dark-factory-owned fix
+# surface to the harness project (filing_policy.resolve_target).
+# ---------------------------------------------------------------------------
+
+_REIFY_ROOT = "/home/leo/src/reify"
+_HARNESS = filing_policy.ProjectRef("/home/leo/src/dark-factory", "dark_factory")
+
+_MISFILED_INTO_REIFY = [
+    pytest.param(
+        _verified_cluster(area="task-dependency-management / fused-memory task system"),
+        id="reify-7894",
+    ),
+    pytest.param(_verified_cluster(area="fused-memory MCP / task-store reads"), id="reify-7895"),
+    pytest.param(
+        _verified_cluster(
+            evidence=[
+                "read_file({...}) -> <tool_use_error>Error: No such tool available: "
+                "read_file</tool_use_error>"
+            ],
+        ),
+        id="reify-7900",
+    ),
+    pytest.param(
+        _verified_cluster(title="fused-memory add_memory call times out on session-end reflection write"),
+        id="reify-7901",
+    ),
+]
+
+_REIFY_7909_SHAPED = _verified_cluster(
+    title="sed -n <start>,<end> without trailing print command yields 'missing command' error",
+    area="shell-tool-invocation",
+)
+
+
+def _reify_payloads(clusters, *, harness: filing_policy.ProjectRef | None = _HARNESS):
+    return mod.build_task_payloads(
+        clusters, project_root=_REIFY_ROOT, project_id="reify", harness=harness,
+    )
+
+
+@pytest.mark.parametrize("cluster", _MISFILED_INTO_REIFY)
+def test_build_task_payloads_routes_harness_fix_surface_to_the_harness(cluster):
+    assert _reify_payloads([cluster])[0]["project_root"] == _HARNESS.project_root
+
+
+def test_routed_payload_metadata_names_the_observed_origin_and_fix_surface():
+    [payload] = _reify_payloads([_verified_cluster(area="fused-memory MCP / task-store reads")])
+    metadata = payload["metadata"]
+    assert metadata["source"] == "legibility_census"
+    assert metadata["origin_project_id"] == "reify"
+    assert metadata["x_fix_surface"] == [{"component": "fused-memory", "evidence": "fused-memory"}]
+    assert "cross_repo" not in metadata
+    assert "cross_repo_project" not in metadata
+
+
+def test_routed_payload_description_names_the_observed_project():
+    [payload] = _reify_payloads([_verified_cluster(area="fused-memory MCP / task-store reads")])
+    assert "project: reify" in payload["description"]
+    assert "project: dark_factory" not in payload["description"]
+
+
+def test_marker_less_payload_stays_observed_without_fix_surface():
+    [payload] = _reify_payloads([_REIFY_7909_SHAPED])
+    assert payload["project_root"] == _REIFY_ROOT
+    assert "x_fix_surface" not in payload["metadata"]
+
+
+def test_remediated_payload_stays_observed_and_describes_the_remediation():
+    cluster = _verified_cluster(
+        area="fused-memory MCP / task-store reads",
+        remediation={"path": "docs/x.md", "change": "Add a note"},
+    )
+    [payload] = _reify_payloads([cluster])
+    assert payload["project_root"] == _REIFY_ROOT
+    assert "docs/x.md" in payload["description"]
+    assert "Add a note" in payload["description"]
+
+
+def test_build_task_payloads_without_harness_targets_the_observed_project():
+    clusters = [param.values[0] for param in _MISFILED_INTO_REIFY]
+    payloads = mod.build_task_payloads(clusters, project_root=_REIFY_ROOT, project_id="reify")
+    assert [payload["project_root"] for payload in payloads] == [_REIFY_ROOT] * len(clusters)
 
 
 # ---------------------------------------------------------------------------
