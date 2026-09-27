@@ -9379,6 +9379,176 @@ async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
     )
 
 
+@contextlib.asynccontextmanager
+async def _owner_terminalises_after_read(journal, reader_name: str, run_id: str):
+    """Make *run_id*'s own coroutine terminalise it BETWEEN a recovery pass's
+    read (``journal.<reader_name>``) and that pass's write, the way
+    ``run_full_cycle`` does: ``complete_run``, then its trailing
+    ``update_run_stage_reports``.
+
+    Yields a dict holding the owner's terminal row under ``'run'`` once the
+    wrapped read has fired.
+    """
+    from fused_memory.models.reconciliation import StageId
+
+    real_read = getattr(journal, reader_name)
+    owners: dict[str, ReconciliationRun | None] = {}
+
+    async def read_then_owner_terminalises(*args, **kwargs):
+        rows = await real_read(*args, **kwargs)
+        await journal.complete_run(run_id, 'completed')
+        now = datetime.now(UTC)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                    stats={'written_by': 'owner'},
+                )
+            },
+        )
+        owners['run'] = await journal.get_run(run_id)
+        return rows
+
+    setattr(journal, reader_name, read_then_owner_terminalises)
+    try:
+        yield owners
+    finally:
+        setattr(journal, reader_name, real_read)
+
+
+async def _event_statuses(event_buffer, events) -> list[str]:
+    ids = [e.id for e in events]
+    db = event_buffer._require_access().connection
+    async with db.execute(
+        'SELECT status FROM event_buffer WHERE id IN ({})'.format(
+            ','.join('?' for _ in ids)
+        ),
+        ids,
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [row['status'] for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_does_not_clobber_a_run_its_own_coroutine_terminalised(
+    journal, event_buffer, mock_memory_service,
+):
+    """Race A: the reaper read the run as a stale 'running' row, then the run's
+    own coroutine terminalised it before the reaper wrote. The reaper's
+    terminalisation is gated on the status its read observed, so the owner's
+    terminal image survives and no other part of the recovery fires: its
+    drained events are not restored for double-processing, and no stale-run
+    escalation is filed for a run that finished.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    run = ReconciliationRun(
+        id='run-self-terminalised-stale',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-A',
+    )
+    await journal.start_run(run)
+    events = [_make_event(project_id), _make_event(project_id)]
+    for e in events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run.id)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    live_instance = event_buffer.instance_id
+    assert live_instance != 'dead-instance-A'
+
+    async with _owner_terminalises_after_read(
+        journal, 'get_stale_runs', run.id
+    ) as owners:
+        await harness._recover_stale_runs()
+
+    owners_run = owners['run']
+    assert owners_run is not None, 'the owner never terminalised the run'
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.completed
+    assert '_error' not in after.stage_reports
+    assert after.stage_reports == owners_run.stage_reports
+    assert after.completed_at == owners_run.completed_at
+
+    assert await _event_statuses(event_buffer, events) == ['drained', 'drained']
+
+    categories = [
+        call.args[0] if call.args else call.kwargs.get('category')
+        for call in harness._escalate.call_args_list
+    ]
+    assert 'recon_stale_run' not in categories
+
+    assert await event_buffer.get_lock_holder_instance_id(project_id) == live_instance
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_does_not_clobber_a_run_its_own_coroutine_terminalised(
+    journal, event_buffer, mock_memory_service,
+):
+    """Race A through the startup predecessor pass: the pass read the run as
+    'running', then the run's own coroutine terminalised it before the pass
+    wrote. The owner's terminal image survives and its drained events are not
+    restored.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+    dead_pred_iid = 'dead-pred'
+    assert event_buffer.instance_id != dead_pred_iid
+
+    run = ReconciliationRun(
+        id='run-self-terminalised-predecessor',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=dead_pred_iid,
+    )
+    await journal.start_run(run)
+    events = [_make_event(project_id), _make_event(project_id)]
+    for e in events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run.id)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    async with event_buffer._require_access().write() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
+            'WHERE project_id = ?',
+            (dead_pred_iid, datetime.now(UTC).isoformat(), project_id),
+        )
+
+    async with _owner_terminalises_after_read(
+        journal, 'get_running_runs', run.id
+    ) as owners:
+        await harness._recover_predecessor_runs()
+
+    owners_run = owners['run']
+    assert owners_run is not None, 'the owner never terminalised the run'
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.completed
+    assert '_error' not in after.stage_reports
+    assert after.stage_reports == owners_run.stage_reports
+    assert after.completed_at == owners_run.completed_at
+
+    assert await _event_statuses(event_buffer, events) == ['drained', 'drained']
+
+
 @pytest.mark.asyncio
 async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
     journal, event_buffer, mock_memory_service,
