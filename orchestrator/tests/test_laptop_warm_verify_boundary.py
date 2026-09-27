@@ -2679,6 +2679,66 @@ def test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe():
     )
 
 
+def _build_fake_task_listing(
+    proc_root: Path,
+    pid: int,
+    *,
+    live: dict[int, list[int]],
+    without_children_file: tuple[int, ...] = (),
+    exited: tuple[int, ...] = (),
+) -> None:
+    task_dir = proc_root / str(pid) / 'task'
+    task_dir.mkdir(parents=True)
+    for tid, kids in live.items():
+        (task_dir / str(tid)).mkdir()
+        (task_dir / str(tid) / 'children').write_text(''.join(f'{kid} ' for kid in kids))
+    for tid in without_children_file:
+        (task_dir / str(tid)).mkdir()
+    for tid in exited:
+        # Listed, yet `children` raises FileNotFoundError and exists() is False: a thread released after the listing.
+        (task_dir / str(tid)).symlink_to(proc_root / 'gone' / str(tid))
+
+
+@pytest.mark.parametrize(
+    ('live', 'without_children_file', 'exited', 'expected', 'consequence'),
+    [
+        pytest.param(
+            {1234: [5678, 9012], 1240: []}, (), (1241,), {5678, 9012},
+            'None would drop wait_subtree_live to the full read_ppid_map walk on '
+            'every tick a sibling thread exits -- the cost task 4014 removed',
+            id='exited-thread-beside-a-live-one-is-skipped',
+        ),
+        pytest.param(
+            {1234: [5678]}, (1238,), (), None,
+            'a live thread whose children cannot be read hides its children, so '
+            'any answer here can be a false cheap negative that makes '
+            'wait_subtree_live skip its walk every tick and spin to its timeout '
+            'on a kernel without CONFIG_PROC_CHILDREN',
+            id='live-thread-without-children-file-cannot-probe',
+        ),
+        pytest.param(
+            {}, (), (1234,), None,
+            'set() here is a false cheap negative for a process that exited '
+            'mid-probe, which makes wait_subtree_live skip its walk instead of '
+            'falling back to it',
+            id='every-listed-thread-exited-cannot-probe',
+        ),
+    ],
+)
+def test_read_direct_children_tri_state_over_a_fake_task_listing(
+    tmp_path, live, without_children_file, exited, expected, consequence,
+):
+    """The probe's tri-state on the branches this kernel cannot produce on demand."""
+    pid = 4321
+    _build_fake_task_listing(
+        tmp_path, pid, live=live, without_children_file=without_children_file, exited=exited,
+    )
+
+    result = _read_direct_children(pid, _proc_root=tmp_path)
+
+    assert result == expected, f'expected {expected!r}, got {result!r} -- {consequence}'
+
+
 def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
     """A terminated-but-unreaped child reads as EXITED, although signal 0 still answers.
 
