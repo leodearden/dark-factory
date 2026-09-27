@@ -167,10 +167,12 @@ Ledger read failure → **fail-open** (no suppression this cycle).
 
 ### Storm escapes (INV-4)
 
-- A single decision suppressing more than N flags in one cycle, or across a streak of
-  cycles (at least one flag in each of K consecutive full cycles, K =
-  `SUPPRESSION_STREAK_THRESHOLD_CYCLES` = 3, inclusive; task 2943) → recon escalation for
-  review (thresholds tactical, task γ; suggested N=5/cycle).
+- A single decision suppressing more than N flags in one cycle, or more than N flags in
+  total across a streak of K = `SUPPRESSION_STREAK_THRESHOLD_CYCLES` = 3 consecutive full
+  cycles (the sliding window of the last K, excluding a cycle already over N; task 2943)
+  → recon escalation for review (thresholds tactical, task γ; suggested N=5/cycle).
+  One flag per cycle, which is how a decision that works behaves, sums to K ≤ N and
+  never fires.
 - Sweep-failure streak ≥3 consecutive cycles → recon escalation.
 - Hook B is storm-immune by construction (never drops).
 
@@ -220,7 +222,7 @@ depends on it.
 | 10 | TTL expiry | `expires_at` past | gc flips `expired/ttl` |
 | 11 | Merge invalidation | decision on uuid A; `merge_entities(A,B)` | row `expired/merge` |
 | 12 | Storm escape | one decision suppresses >N flags in a cycle | recon escalation filed |
-| 12b | Streak escape | one decision suppresses ≥1 flag (≤N each) in K=3 consecutive full cycles | recon escalation filed on the 3rd; a cycle suppressing nothing resets the streak |
+| 12b | Streak escape | one decision suppresses >N flags in total (each cycle ≤N) across K=3 consecutive full cycles | recon escalation filed; one flag per cycle indefinitely files nothing; a cycle suppressing nothing resets the streak |
 | 13 | Backfill | b0057f3d migrated | active reify row; corrections absent from ledger |
 | 14 | Tool visibility | Stage-1/Stage-3 runner config | writer tool in both disallow lists (config assertion) |
 
@@ -277,9 +279,20 @@ in-batch producer tasks with the test observing the rejection fire.
    fields → columns; blob fields → payload JSON). Suggested: `entity_uuid` + `grounds` as
    columns, rest in payload. Decide in α.
 4. **Storm thresholds** — N per cycle and streak length. Suggested: 5/cycle, streak 3.
-   Decide in γ (suppression) / ζ (sweep). **Suppression streak decided (task 2943):** K=3
-   (`SUPPRESSION_STREAK_THRESHOLD_CYCLES`), inclusive `streak >= K`, matching ζ's
-   `GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD`.
+   Decide in γ (suppression) / ζ (sweep). **Suppression streak decided (task 2943):** a
+   decision escalates when its streak has reached K=3
+   (`SUPPRESSION_STREAK_THRESHOLD_CYCLES`, inclusive `streak >= K`, matching ζ's
+   `GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD`) AND the flags it suppressed across its last K
+   cycles total more than N=5 (`SUPPRESSION_STREAK_VOLUME_THRESHOLD`, defined as the
+   per-cycle N; strict `>`). A cycle already over N is left out of that total because the
+   per-cycle escape reported it. Options weighed and rejected:
+   - "At least one flag in each of K cycles" (the rule first landed) pages every healthy
+     decision. Hook A drops a flag only after Stage 1 emits it, so the §Goal's success case
+     is one suppression per cycle, indefinitely.
+   - Novelty of the suppressed `flag_type` fires on the LLM's routine rewording of flag
+     types (task 2503).
+   - Filing once per streak still pages once for every healthy decision, whose streak
+     never ends.
 5. **Grounds token-family seed list** for the fallback match. Decide in γ.
 6. **Evidence-only stamping shape** on the migrated mem0 originals (`x_`-namespace metadata
    per the Tier-C convention). Decide in η.

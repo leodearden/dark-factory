@@ -799,13 +799,13 @@ class ReconLedgerStore:
         updated_at: str,
         expires_at: str,
     ) -> None:
-        """Write (last-write-wins) one suppression-streak row: the number of
-        consecutive full cycles in which the standing decision on
-        ``(entity_uuid, grounds)`` suppressed at least one flag (task 2943).
-
-        The row also carries ``recent_counts``, the per-cycle suppression counts
-        of the streak's most recent cycles, oldest first. Capping that window at
-        K is the caller's job, so the ledger stays threshold-agnostic.
+        """Write (last-write-wins) one suppression-streak row: the streak count
+        of the standing decision on ``(entity_uuid, grounds)`` plus its recent
+        per-cycle window (task 2943).  The streak counts the consecutive full
+        cycles in which the decision suppressed a flag; ``recent_counts`` holds
+        the suppression counts of the streak's most recent cycles, oldest first.
+        Capping that window at K is the caller's job, so the ledger stays
+        threshold-agnostic.
 
         The PK slots deliberately mirror
         :meth:`upsert_entity_standing_decision` — ``task_id=''``,

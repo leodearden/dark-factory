@@ -1346,13 +1346,16 @@ class MemoryConsolidator(BaseStage):
         esd_result: EntityStandingSuppressionResult,
         report: StageReport,
     ) -> None:
-        """Advance every standing decision's suppression streak and file those at K.
+        """Advance every standing decision's suppression streak and file the sustained drains.
 
         The storm escape's cross-cycle arm (task 2943).  The per-cycle escape
         catches one decision suppressing a flood in ONE cycle; this one catches
-        a persistent low-grade drain — at least one flag in each of K
-        consecutive full cycles, every one under N — which can hide a genuinely
-        new finding as surely as a single-cycle flood.
+        a sustained drain — a streak of at least K consecutive full cycles
+        whose last K suppressed more than N flags in total, not counting a
+        cycle the per-cycle escape already reported — which can hide a
+        genuinely new finding as surely as a single-cycle flood.  One flag per
+        cycle, which is how a decision that works behaves, totals K <= N and
+        never files.
 
         It runs on EVERY full cycle, zero-flag ones included, which is why
         run() calls it after the ``if report.items_flagged:`` block rather than
