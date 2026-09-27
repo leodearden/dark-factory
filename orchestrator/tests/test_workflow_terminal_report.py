@@ -460,10 +460,10 @@ class TestRunExitConsistencyAssert:
     'requeued'->pending rows of ``_OUTCOME_ALLOWED``).
 
     Negative: an injected outcome<->status divergence (DB row says 'done'
-    while the actual exit is BLOCKED) must make ``run()`` raise loudly
-    rather than silently return the mismatched report — this is the
-    assertion that is RED until step-8 wires SM-2 into the ``run()``
-    wrapper.
+    while the actual exit is BLOCKED) is RECORDED, not raised: ``run()``
+    returns the real BLOCKED report (TR-1 — the report is the channel), so
+    the harness never sees a synthetic mislabel (spec §8-E11; the WHY is
+    ``orchestrator/src/orchestrator/exit_contract.py``).
 
     Guard: a ``None`` (unreadable) or out-of-vocabulary status row must not
     crash a normal run — SM-2 fails safe rather than exploding on a
@@ -540,7 +540,8 @@ class TestRunExitConsistencyAssert:
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == wf.machine.state
 
-    async def test_outcome_status_mismatch_raises_loudly(
+    @pytest.mark.exit_contract_violation_expected
+    async def test_outcome_status_mismatch_is_recorded_not_raised(
         self, config, git_ops, task_assignment, monkeypatch,
     ):
         """Negative: DB row says 'done' while the actual exit is BLOCKED.
@@ -576,12 +577,11 @@ class TestRunExitConsistencyAssert:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        with pytest.raises((AssertionError, ValueError)) as exc_info:
-            await workflow.run()
+        report = await workflow.run()
 
-        message = str(exc_info.value).lower()
-        assert 'blocked' in message
-        assert 'done' in message
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.phase == workflow.machine.state
+        assert report.reason.lower().startswith('all accounts capped')
 
     async def test_guard_skips_when_status_is_none(
         self, config, git_ops, task_assignment, monkeypatch,

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
     ExitCheck,
@@ -334,3 +335,7 @@ class TestRecordExitVerdict:
         _record(_store_unavailable(), enforce=enforce, event_store=None, escalation_queue=None)
         assert len(_contract_records(caplog, 'violation')) == 1
         assert len(_contract_records(caplog, 'store_unavailable')) == 1
+
+
+def test_enforce_flag_ships_dark():
+    assert OrchestratorConfig().workflow_exit_contract_enforce is False
