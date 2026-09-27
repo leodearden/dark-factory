@@ -9,7 +9,8 @@ const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
 const {
-  prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, groupTasksByPrd, orderPrdGroups,
+  prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, prdProgress, prdProgressReading,
+  groupTasksByPrd, orderPrdGroups,
 } = window.DF_PRD_GROUPING;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
@@ -263,7 +264,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
 // renderEdges={false} (skip its own overlay) and handed the SAME shared
 // nodeRefs map (via the nodeRefs prop) so its nodes register into the map
 // the hoisted overlay reads from.
-function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ graphTasks, allProjectTasks, progress, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
@@ -300,8 +301,8 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
   const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
   const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
 
-  // The "n/m terminal" count, the outline/pip aggregate status, and the
-  // member bar all read from each PRD's FULL member set (every task with that prd,
+  // The outline/pip aggregate status and the member bar both read from each
+  // PRD's FULL member set (every task with that prd,
   // regardless of the active status display filter or focus narrowing) —
   // per the plan's truthful-burndown requirement. Keyed by prd (null for
   // the "no PRD" bucket) for O(1) lookup per rendered box below. Rendered
@@ -320,7 +321,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
         const key = g.noPrd ? null : g.prd;
         const fullMembers = fullMembersByPrd.get(key) || g.tasks;
         return (
-          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers}
+          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers} progress={progress}
                   selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
         );
       })}
@@ -332,30 +333,18 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
 // tooltip), a status-colored outline + title pip (aggregatePrdStatus over
 // the FULL member set's tally, driving an `s-<status>` class exactly like the
 // `.taskgraph .node.s-*` idiom — see graph_layout-era node rendering above),
-// "n/m terminal" + a thin bar with one segment per member (prdBarSegments
-// over the same tally), and a collapse control that hides the box body while
+// "≥n/m terminal" (prdProgress, over the snapshot rows and the terminal
+// window), a thin bar with one segment per member (prdBarSegments over the
+// tally), and a collapse control that hides the box body while
 // leaving the title bar + bar visible. Finished PRDs default to collapsed.
 //
 // Kept as its own component (not inlined in ProjectPrdGroups' .map() above)
 // so each box's `collapsed` state is an independent useState — Rules of
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
-function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nodeRefs }) {
+function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
   const summary = summarizePrdMembers(fullMembers);
   const agg = aggregatePrdStatus(summary);
-
-  // active_tasks.py only exempts a PRD's done/cancelled members from its
-  // project-wide terminal-task cap while the PRD still has an active-status
-  // member (`_ACTIVE_STATUSES` server-side — the same statuses
-  // aggregatePrdStatus treats as non-done/non-cancelled: blocked,
-  // in-progress, merge-deferred, pending, deferred). Active-status tasks
-  // are never capped, so if fullMembers (this PRD's complete client-visible
-  // membership) contains none, this PRD was NOT exempt server-side and its
-  // done/cancelled members may extend past that cap — "n/m done" could then
-  // undercount the true total. That's a possibility, not a certainty (the
-  // cap may simply not have been hit), so it's surfaced as a tooltip on the
-  // count rather than a stronger UI treatment.
-  const countMayUndercount = agg === 'done' || agg === 'cancelled';
 
   // Lazy-init only: this is a *default*, not an enforced state — later
   // renders (e.g. a member finishing while the box is open) must not yank a
@@ -412,12 +401,8 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
         </span>
         <span className="status-pip"></span>
         <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>{title}</span>
-        <span className="prd-box-count"
-              title={countMayUndercount
-                ? 'No active members in this PRD, so it wasn\'t exempt from the dashboard\'s done/cancelled-task cap — this count may undercount the true total.'
-                : undefined}>
-          {summary.views.terminal}/{summary.total} terminal
-        </span>
+        {/* PRD decision 8: a lower_bound '≥n/m', not a tooltip — task 4416's option (a). */}
+        <span className="prd-box-count"><DatumReading datum={progress} format={prdProgressReading(g.prd)} /> terminal</span>
       </div>
       <div className="prd-bar">
         {prdBarSegments(summary).map(seg => (
@@ -689,6 +674,28 @@ function TasksTab({ projectFilter, search }) {
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
 
+  // PRD decision 5: a project's terminal window is fetched on demand only, once
+  // as the project enters the wanted set and never per poll. It is always
+  // lower_bound, so its age badge says how old it is.
+  const projectIds = projects.map(p => p.id);
+  const grouped = projectIds.filter(id => groupByPrdMap[id] === 'prd');
+  const wanted = terminalWindowProjects(projectIds, filter, grouped);
+  const wantedKey = wanted.join('\n');
+  const [terminalOutcomes, setTerminalOutcomes] = uS_T({});
+  uE_T(() => {
+    let current = true;
+    setTerminalOutcomes(o => ({ ...o, ...Object.fromEntries(wanted.map(project => [project, null])) }));
+    for (const project of wanted) {
+      DF_LOADER_T.requestOnDemand('terminal', project).then(outcome => {
+        if (current) setTerminalOutcomes(o => ({ ...o, [project]: outcome }));
+      });
+    }
+    return () => { current = false; };
+  }, [wantedKey]);
+  const terminalOf = (id) => (wanted.includes(id)
+    ? DF_LOADER_T.onDemandDatum('terminal', id, terminalOutcomes[id] ?? null)
+    : unrequestedTerminalRows(DF_T[DF_LOADER_T.ON_DEMAND_KEYS.terminal.key(id)]));
+
   // Surface a banner when task data is missing or incomplete — without it the
   // Tasks tab renders an empty grid that looks indistinguishable from "no
   // active work". That rationale still motivates the total-outage case, and it
@@ -766,7 +773,8 @@ function TasksTab({ projectFilter, search }) {
     return terms.every(term => haystack.includes(term));
   }
 
-  const selectedTask = selectedId ? allTasks.find(t => t.id === selectedId) : null;
+  const knownTasks = [...allTasks, ...wanted.flatMap(id => terminalOf(id).value || [])];
+  const selectedTask = selectedId ? knownTasks.find(t => t.id === selectedId) : null;
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
@@ -825,7 +833,7 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const census = projectCensus(DF_T, p.id);
             const rows = projectRows(DF_T, p.id);
-            const terminal = unrequestedTerminalRows(DF_T[DF_LOADER_T.ON_DEMAND_KEYS.terminal.key(p.id)]);
+            const terminal = terminalOf(p.id);
             const listed = viewRows(rows, terminal, filter);
             const held = viewRows(rows, terminal, EVERY_VIEW_T).rows;
             const filtered = listed.rows.filter(searchMatches);
@@ -886,7 +894,8 @@ function TasksTab({ projectFilter, search }) {
                 {groupView.emptiedByFocus
                   ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                   : groupByPrd
-                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} selectedId={selectedId}
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} progress={prdProgress(rows, terminal)}
+                                        selectedId={selectedId}
                                         onSelect={setSelectedId} onEnterFocus={enterFocus} />
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
                                  onSelect={setSelectedId} onEnterFocus={enterFocus} />}
