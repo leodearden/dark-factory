@@ -22,8 +22,6 @@ test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q.
 
 from __future__ import annotations
 
-import os
-
 from setup_host_sections import (
     run_section,
     slice_section,
@@ -64,29 +62,18 @@ def _run_probe(
     tmp_path,
     section_text,
     *,
-    stub_name: str | None = None,
-    stub_body: str | None = None,
+    stub_name: str,
+    stub_body: str,
     env_extra=None,
 ):
-    """Run *section_text* in a tmp tree, with at most one scripted PATH stub.
+    """Run *section_text* in a tmp tree, with one scripted PATH stub.
 
     One scaffold for every probe site: build the stub dir, write the site's
     stub, hand `run_section` a tmp repo root. Sites differ only in the slice
     they pass, the stub they script, and whether they need $COMPOSE_FILE — so
     a new probe site is a wrapper, not another copy of this.
-
-    *stub_name* None writes no stub at all, which is how the no-`claude` host
-    is expressed. The two travel together — every site that names a stub also
-    scripts its body — so a name without a body is a harness bug. It is
-    asserted rather than defaulted to "": an empty default would quietly
-    install a stub that runs nothing and exits 0, which is a PASSING probe
-    for a producer that was never scripted, i.e. exactly the vacuous green
-    `dispatch_stub_body` is written to avoid.
     """
-    stub_bin = _stub_bin(tmp_path)
-    if stub_name is not None:
-        assert stub_body is not None, f"stub_name={stub_name!r} passed without a stub_body"
-        write_stub(stub_bin, stub_name, stub_body)
+    write_stub(_stub_bin(tmp_path), stub_name, stub_body)
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
     return run_section(
@@ -194,140 +181,6 @@ def test_section_2_reports_healthy_on_a_clean_reply(tmp_path):
     combined = result.stdout + result.stderr
     assert "OK FalkorDB healthy" in combined, combined
     assert "FAIL FalkorDB did not become healthy" not in combined, combined
-
-
-# --- section 6: the jcodemunch MCP "already installed?" check --------------
-# The slice deliberately starts one block EARLY, at the .jcodemunch.jsonc
-# config write. The natural anchor — `if command -v claude &>/dev/null; then` —
-# occurs TWICE in this file and `slice_section` takes the first, which is a
-# different block entirely; and every narrower anchor is either comment prose
-# or opens the slice mid-`if` and yields unbalanced bash. The extra block only
-# writes $REPO_ROOT/.jcodemunch.jsonc into the tmp repo root, which is inert.
-_JCODEMUNCH_START = 'if [ ! -f "$REPO_ROOT/.jcodemunch.jsonc" ]; then'
-_JCODEMUNCH_END = 'ok "jcodemunch MCP added to user config"\n  fi\nfi'
-
-# Printed by the `claude` stub when `mcp add` runs. Telling "already installed"
-# from "installed it again" is the whole point: re-adding a server that IS
-# registered is the operator-visible harm here, and that re-add runs under
-# `set -e`, so a failing one takes the whole bootstrap down.
-_ADD_SENTINEL = "STUB-CLAUDE-MCP-ADD-RAN"
-
-# A `claude mcp list` line naming jcodemunch, and one naming only another server.
-_LISTING_NAMES_IT = "jcodemunch: uvx jcodemunch-mcp - Connected"
-_LISTING_WITHOUT_IT = "some-other-server: uvx other - Connected"
-
-
-def _run_jcodemunch(tmp_path, list_body):
-    """Slice the jcodemunch MCP block and run it against a scripted `claude`."""
-    return _run_probe(
-        tmp_path,
-        slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
-        stub_name="claude",
-        stub_body=dispatch_stub_body(
-            (
-                ('*"mcp add"*', f"    printf '{_ADD_SENTINEL}\\n'\n    exit 0\n"),
-                ('*"mcp list"*', list_body),
-            )
-        ),
-    )
-
-
-def test_jcodemunch_sees_an_installed_server_when_the_listing_exits_nonzero(tmp_path):
-    """A listing that NAMES jcodemunch means it is installed, whatever its status.
-
-    `claude mcp list` reports on the whole probe — one unreachable server among
-    several is enough for a non-zero status — so its status says nothing about
-    whether jcodemunch appeared. Reading the verdict from the pipeline conflates
-    the two and re-runs `claude mcp add` on an already-registered server.
-    """
-    result = _run_jcodemunch(tmp_path, match_then_nonzero(_LISTING_NAMES_IT))
-
-    combined = result.stdout + result.stderr
-    assert "OK jcodemunch MCP already in user config" in combined, combined
-    assert _ADD_SENTINEL not in combined, combined
-
-
-def test_jcodemunch_sees_an_installed_server_when_the_listing_is_sigpiped(tmp_path):
-    """A long listing dies of SIGPIPE the instant `grep -q` matches its first line."""
-    result = _run_jcodemunch(tmp_path, match_then_bulk(_LISTING_NAMES_IT))
-
-    combined = result.stdout + result.stderr
-    assert "OK jcodemunch MCP already in user config" in combined, combined
-    assert _ADD_SENTINEL not in combined, combined
-
-
-def test_jcodemunch_adds_the_server_when_the_listing_does_not_name_it(tmp_path):
-    """Guard: a listing without jcodemunch still installs it."""
-    result = _run_jcodemunch(tmp_path, clean_match(_LISTING_WITHOUT_IT))
-
-    combined = result.stdout + result.stderr
-    assert _ADD_SENTINEL in combined, combined
-    assert "OK jcodemunch MCP added to user config" in combined, combined
-
-
-def test_jcodemunch_adds_the_server_when_the_listing_cannot_be_read(tmp_path):
-    """Guard: an unreadable listing installs, and the capture must not abort.
-
-    `returncode == 0` is the pin against a bare `out="$(...)"` capture, which
-    under `set -e` would kill the bootstrap on any host where `claude mcp list`
-    fails rather than falling through to the add.
-    """
-    result = _run_jcodemunch(tmp_path, SILENT_FAILURE)
-
-    combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
-    assert _ADD_SENTINEL in combined, combined
-
-
-def _path_without_claude(stub_bin):
-    """The stub dir, plus every inherited PATH entry that carries no `claude`.
-
-    `run_section` PREPENDS its stub dir to the inherited PATH, so simply
-    writing no `claude` stub is not enough: on a developer host Claude Code is
-    installed and the section would probe that real one. Dropping only the
-    directories that actually hold a `claude` executable keeps `mkdir` and
-    `cat` — which the preamble and this slice both need — while making
-    `command -v claude` fail deterministically rather than per-host.
-    """
-    kept = [
-        entry
-        for entry in os.environ.get("PATH", "").split(os.pathsep)
-        if entry and not os.access(os.path.join(entry, "claude"), os.X_OK)
-    ]
-    return os.pathsep.join([str(stub_bin), *kept])
-
-
-def test_jcodemunch_block_is_inert_on_a_host_with_no_claude(tmp_path):
-    """A host without Claude Code installed skips the block: no failure, no claim.
-
-    setup-host.sh keeps the `claude mcp list` capture INSIDE the
-    `command -v claude` guard and says so in a comment; every other test here
-    supplies a `claude` stub, so the case that placement was chosen for went
-    unexercised. What this pins from the outside: the section exits 0 and
-    claims neither "already in user config" nor "added to user config".
-
-    That is the whole observable contract, and it is deliberately not
-    overstated — a hoist that kept its `|| true` is invisible from out here,
-    because a capture of a missing binary yields the same empty string. What
-    it DOES catch is the two ways the block stops being inert: a capture
-    hoisted without `|| true` (a failed simple command mid-bootstrap under
-    `set -e`), and a guard dropped altogether, which reaches `claude mcp add`
-    and exits 127.
-    """
-    result = _run_probe(
-        tmp_path,
-        slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
-        env_extra={"PATH": _path_without_claude(stub_bin_dir(tmp_path))},
-    )
-
-    combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
-    # Positive first: three absence assertions over a slice that never ran are
-    # a vacuous green, and the restricted PATH is exactly what could cause it.
-    assert "Project config written" in combined, combined
-    assert "jcodemunch MCP already in user config" not in combined, combined
-    assert "jcodemunch MCP added to user config" not in combined, combined
-    assert _ADD_SENTINEL not in combined, combined
 
 
 # --- section 12: the FalkorDB health check ---------------------------------

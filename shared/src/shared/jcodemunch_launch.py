@@ -65,12 +65,6 @@ __all__ = [
 # So every launch site must carry this lever — above all one that runs at a
 # canonical checkout rather than a linked worktree, since a lever-less launch
 # at a real git root is exactly what mints that legacy index.
-# Known gap: ONE sibling launch site still skips this lever and re-spells
-# command/args instead of importing these constants — scripts/setup-host.sh's
-# user-scope `claude mcp add ... -- uvx --python 3.12 jcodemunch-mcp`
-# registration. Its creating a legacy git-root index would silently
-# re-collapse that repo's worktrees per the precondition above, undermining
-# this fix. Tracked at tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ.
 JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
 JCODEMUNCH_ENV: dict[str, str] = {
     'JCODEMUNCH_NO_VERSION_HINT': '1',

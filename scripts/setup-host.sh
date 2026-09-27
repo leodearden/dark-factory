@@ -825,19 +825,18 @@ else
   ok "Project config already exists"
 fi
 
-# Add jcodemunch MCP to user-level Claude config (idempotent)
+# Register jcodemunch in the user-level Claude config from the shared launch
+# contract (shared/src/shared/jcodemunch_launch.py), replacing any existing
+# entry so every run converges on it: `claude mcp add-json` refuses a name
+# that already exists.
+_jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)"
 if command -v claude &>/dev/null; then
-  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
-  # that pipeline can report an installed server as absent.
-  # Here the cost is re-running `claude mcp add` on a server already registered.
-  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
-  # run `claude mcp list` on hosts with no claude installed.
-  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
-  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
-    ok "jcodemunch MCP already in user config"
+  claude mcp remove --scope user jcodemunch >/dev/null 2>&1 || true
+  if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
+    ok "jcodemunch MCP registered in user config"
   else
-    claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
-    ok "jcodemunch MCP added to user config"
+    fail "jcodemunch MCP not registered in user config"
+    warn "  Fix: claude mcp add-json --scope user jcodemunch \"\$(PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch)\""
   fi
 fi
 
