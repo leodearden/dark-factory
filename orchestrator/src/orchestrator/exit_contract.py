@@ -74,12 +74,26 @@ attributes are truthy.
 from __future__ import annotations
 
 import enum
+import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from escalation.models import Escalation
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
 
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.workflow_types import WorkflowState
+
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
+logger = logging.getLogger(__name__)
+
+EXIT_CONTRACT_CATEGORY = 'workflow_exit_contract'
+# The structured ``logging`` extra every recorded verdict carries — the test
+# suite's zero-would-violate guard keys on it, never on message text.
+VERDICT_LOG_ATTRIBUTE = 'exit_contract_verdict'
 
 
 class ExitVerdictKind(enum.StrEnum):
@@ -159,3 +173,141 @@ def judge_exit(
     if not allowed:
         return verdict(ExitVerdictKind.VIOLATION, ExitCheck.OUTCOME_STATUS)
     return verdict(ExitVerdictKind.CONSISTENT)
+
+
+def record_exit_verdict(
+    verdict: ExitVerdict,
+    *,
+    task_id: str,
+    enforce: bool,
+    event_store: EventStore | None,
+    escalation_queue: EscalationQueue | None,
+    worktree: str | None,
+    filing_claimant_run_id: str | None,
+) -> None:
+    """Make a VIOLATION or STORE_UNAVAILABLE verdict loud.  Never raises.
+
+    Writes a log line and a ``workflow_exit_contract`` event; in enforce mode a
+    VIOLATION also files one deduped L1.  Never touches the task's status.
+    """
+    if verdict.kind in (ExitVerdictKind.CONSISTENT, ExitVerdictKind.UNCHECKED):
+        return
+    mode = 'enforce' if enforce is True else 'log'
+    extra = {VERDICT_LOG_ATTRIBUTE: verdict.kind.value}
+    escalation_id: str | None = None
+    if verdict.kind is ExitVerdictKind.STORE_UNAVAILABLE:
+        logger.warning(
+            'Task %s: run() exit status write failed — the exit is crash-shaped '
+            'and the stranded sweep is its backstop, not a contract violation: %s',
+            task_id, _render(_payload(verdict, mode, None)), extra=extra,
+        )
+    elif mode == 'log':
+        logger.warning(
+            'Task %s: run()-exit contract would-violate: %s',
+            task_id, _render(_payload(verdict, mode, None)), extra=extra,
+        )
+    else:
+        escalation_id = _file_l1(
+            verdict,
+            task_id=task_id,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+            worktree=worktree,
+            filing_claimant_run_id=filing_claimant_run_id,
+        )
+        logger.error(
+            'Task %s: run()-exit contract violated: %s',
+            task_id, _render(_payload(verdict, mode, escalation_id)), extra=extra,
+        )
+    if event_store is not None:
+        event_store.emit(
+            EventType.workflow_exit_contract,
+            task_id=task_id,
+            phase=verdict.machine_state.value,
+            data=_payload(verdict, mode, escalation_id),
+        )
+
+
+def _payload(verdict: ExitVerdict, mode: str, escalation_id: str | None) -> dict:
+    """The ONE rendering of a verdict — shared by the log line and the event."""
+    failure = verdict.write_failure
+    return {
+        'verdict': verdict.kind.value,
+        'mode': mode,
+        'check': verdict.check.value if verdict.check is not None else None,
+        'outcome': str(getattr(verdict.outcome, 'value', verdict.outcome)),
+        'status': verdict.status_row,
+        'report_phase': verdict.report_phase.value,
+        'machine_state': verdict.machine_state.value,
+        'failed_write': (
+            {'target_status': failure.target_status, 'error': failure.error}
+            if failure is not None else None
+        ),
+        'escalation_id': escalation_id,
+    }
+
+
+def _render(payload: dict) -> str:
+    return ' '.join(f'{key}={value!r}' for key, value in payload.items())
+
+
+def _file_l1(
+    verdict: ExitVerdict,
+    *,
+    task_id: str,
+    event_store: EventStore | None,
+    escalation_queue: EscalationQueue | None,
+    worktree: str | None,
+    filing_claimant_run_id: str | None,
+) -> str | None:
+    """File the enforce-mode L1 unless one is already open; its id, or None."""
+    if escalation_queue is None:
+        return None
+    facts = _payload(verdict, 'enforce', None)
+    try:
+        if escalation_queue.has_open_l1(task_id, category=EXIT_CONTRACT_CATEGORY):
+            return None
+        l1 = Escalation(
+            id=escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category=EXIT_CONTRACT_CATEGORY,
+            summary=(
+                f'run()-exit contract violated for task {task_id}: outcome '
+                f'{facts["outcome"]!r} with status {facts["status"]!r} '
+                f'({facts["check"]} check)'
+            )[:200],
+            detail=(
+                f'{_render(facts)}\n'
+                'The run()-exit contract (docs/task-escalation-state-spec.md §5) '
+                'forbids this exit; the task status was left as found.  The WHY '
+                'is orchestrator/src/orchestrator/exit_contract.py.\n'
+            ),
+            suggested_action='investigate_exit_contract',
+            worktree=worktree,
+            workflow_state=verdict.machine_state.value,
+            level=1,
+            filing_claimant_run_id=filing_claimant_run_id,
+        )
+        escalation_queue.submit(l1)
+    except Exception:
+        logger.exception(
+            'Task %s: filing the %s L1 failed; recording the violation without it',
+            task_id, EXIT_CONTRACT_CATEGORY,
+        )
+        return None
+    if event_store is not None:
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=task_id,
+            phase=verdict.machine_state.value,
+            data={
+                'escalation_id': l1.id,
+                'category': EXIT_CONTRACT_CATEGORY,
+                'severity': 'blocking',
+                'level': 1,
+                'summary': l1.summary[:200],
+            },
+        )
+    return l1.id
