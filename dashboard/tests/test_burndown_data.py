@@ -1458,12 +1458,12 @@ class TestCollectSnapshotTaskSourceAndCap:
         """The E12 'silently' defect: exceeding the cap must be loud.
 
         The message must carry all three facts — which project, how many
-        in-progress, and against what cap — so the log line stands alone.
+        live in-progress, and against what cap — so the log line stands alone.
         """
         db_path, config, conn = burndown_env
         _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
 
-        tasks = [_live_now(id=1), _live_now(id=2), _stranded(id=3)]
+        tasks = [_live_now(id=1), _live_now(id=2), _live_now(id=3), _stranded(id=4)]
 
         with (
             _serve(_CannedStore({config.project_root: tasks})),
@@ -1485,7 +1485,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         async with conn.execute('SELECT in_progress, concurrency_cap FROM snapshots') as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row['in_progress'] == 3
+        assert row['in_progress'] == 4
         assert row['concurrency_cap'] == 2
 
     @pytest.mark.asyncio
@@ -1508,6 +1508,43 @@ class TestCollectSnapshotTaskSourceAndCap:
             if r.levelno == logging.WARNING and 'cap' in r.getMessage().lower()
         ]
         assert not breach, f'at-capacity must not alarm; got: {breach}'
+
+    @pytest.mark.asyncio
+    async def test_stranded_pile_up_over_the_cap_does_not_warn(
+        self, burndown_env, caplog, dummy_client,
+    ):
+        """Stranded rows hold no slot, so only the live count breaches (PRD decision 9)."""
+        db_path, config, conn = burndown_env
+        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
+
+        tasks = [
+            _live_now(id=1), _live_now(id=2),
+            _stranded(id=3), _stranded(id=4), _stranded(id=5),
+        ]
+
+        with (
+            _serve(_CannedStore({config.project_root: tasks})),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        breach = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'cap' in r.getMessage().lower()
+        ]
+        assert not breach, f'a strand pile-up is not over-dispatch; got: {breach}'
+
+        async with conn.execute(
+            'SELECT in_progress, in_progress_live, in_progress_stranded, concurrency_cap '
+            'FROM snapshots'
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row['in_progress'] == 5
+        assert row['in_progress_live'] == 2
+        assert row['in_progress_stranded'] == 3
+        assert row['concurrency_cap'] == 2
 
     @pytest.mark.asyncio
     async def test_cap_is_read_once_per_root_not_once_per_task(
