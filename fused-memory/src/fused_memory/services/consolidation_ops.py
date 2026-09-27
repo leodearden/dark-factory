@@ -212,6 +212,27 @@ async def read_topic_closure(
     )
 
 
+async def _resolve_incumbent_canonical(
+    memory_service: Any, *, project_id: str, topic: str
+) -> str | None:
+    """The id of *topic*'s existing canonical, or ``None`` if it names none.
+
+    A canonical-filtered scroll, not the closure listing: that listing is
+    capped at ``TOPIC_MEMBER_LIMIT`` and can miss the incumbent on a crowded
+    topic. A read failure propagates to the caller.
+    """
+    rows = await memory_service.get_memories_by_metadata(
+        project_id=project_id,
+        filters={'topic': topic, 'canonical': True},
+        limit=TOPIC_MEMBER_LIMIT,
+    )
+    incumbent = select_canonical_payload(
+        rows, allowed_categories=None, include_planned=True
+    )
+    incumbent_id = (incumbent or {}).get('id')
+    return incumbent_id if isinstance(incumbent_id, str) and incumbent_id else None
+
+
 async def execute_retain_consolidation(
     memory_service: Any,
     *,
@@ -239,6 +260,10 @@ async def execute_retain_consolidation(
     minted and the topic's existing one is reported instead. It is a MODE
     of this function rather than a sibling, so the peer-tag loop below has
     exactly one home and cannot drift between the two.
+
+    Every refusal — authorization, ``CanonicalWriteFailed``,
+    ``TagOnlyIncumbentNotFound`` — is returned before any peer is read or
+    patched.
     """
     # AUTHORIZE FIRST, above every read and every write: an unauthorized
     # caller is turned away before anything is done on its behalf and
@@ -276,26 +301,27 @@ async def execute_retain_consolidation(
             'agent_id': agent_id,
         }
 
+    # (4) The canonical FIRST: no delete or metadata patch may precede an
+    # ESTABLISHED canonical, which the mint arm establishes by writing it
+    # and tag-only by resolving it. The ordering IS the anti-ratchet
+    # property, and it is asymmetric on purpose:
+    #
+    #   delete-then-write, on a failed write  -> net LOSS, unrecoverable
+    #                                            (no write path reaches a
+    #                                            deleted point id)
+    #   write-then-delete, on a failed delete -> net ADD, reportable in
+    #                                            `failed_deletes` and
+    #                                            re-runnable
+    #
+    # This order makes the first outcome impossible and the second
+    # visible.
     canonical_meta: dict[str, Any] = {}
-    canonical_id: str | None = None
+    canonical_id: str
     if canonical_content is not None:
-        # (4) The canonical FIRST, and NO delete or metadata patch may appear
-        # above this point in the body. The ordering IS the anti-ratchet
-        # property, and it is asymmetric on purpose:
-        #
-        #   delete-then-write, on a failed write  -> net LOSS, unrecoverable
-        #                                            (no write path reaches a
-        #                                            deleted point id)
-        #   write-then-delete, on a failed delete -> net ADD, reportable in
-        #                                            `failed_deletes` and
-        #                                            re-runnable
-        #
-        # This order makes the first outcome impossible and the second
-        # visible. `CanonicalUniquenessViolation` and
-        # `MemoryMetadataValidationError` are left to propagate to
-        # `@mcp_tool_errors`: the op refused before touching anything, so
-        # there is no partial state to describe and the flattened
-        # {'error', 'error_type'} envelope is the whole truth.
+        # `CanonicalUniquenessViolation` and `MemoryMetadataValidationError`
+        # are left to propagate to `@mcp_tool_errors`: the op refused before
+        # touching anything, so there is no partial state to describe and
+        # the flattened {'error', 'error_type'} envelope is the whole truth.
         canonical_meta = dict(extra_canonical_meta or {})
         canonical_meta.update({'topic': topic, 'canonical': True})
         written = await memory_service.add_memory(
@@ -314,8 +340,8 @@ async def execute_retain_consolidation(
         # IndexError flattened into an unreadable error, or (worse, had this
         # been a dict lookup) carry a None canonical id into the delete loop
         # and reap a live cluster in favour of a record that does not exist.
-        canonical_id = written.memory_ids[0] if written.memory_ids else None
-        if not canonical_id:
+        minted_id = written.memory_ids[0] if written.memory_ids else None
+        if not minted_id:
             return {
                 'error': (
                     'consolidate_memories: the canonical write returned no memory '
@@ -326,6 +352,41 @@ async def execute_retain_consolidation(
                 'topic': topic,
                 'supersedes': list(canonical_meta.get('supersedes') or []),
             }
+        canonical_id = minted_id
+    else:
+        # TAG-ONLY (PRD D14). NOTHING is written to the incumbent:
+        # `content_amend=False` is load-bearing, and an incumbent that
+        # arrives inside `retain_ids` is refused by the loop's
+        # `RetainedPeerIsCanonical` branch rather than demoted — the
+        # caller's predicate is meant to strip it and disclose the strip.
+        try:
+            incumbent_id = await _resolve_incumbent_canonical(
+                memory_service, project_id=project_id, topic=topic
+            )
+            reason = 'its topic names no canonical'
+        except Exception as exc:
+            logger.warning(
+                'consolidate_memories: tag-only could not read the canonical '
+                'for %r; refusing before any peer is touched',
+                topic,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            incumbent_id = None
+            reason = f'its canonical could not be read ({exc})'
+        if not incumbent_id:
+            return {
+                'error': (
+                    f'consolidate_memories: tag-only was asked to report the '
+                    f'existing canonical for {topic!r}, but {reason}. No peer '
+                    'was read or tagged and nothing was minted, so the call '
+                    'can simply be re-run once the topic has a canonical, or '
+                    'with canonical_content to mint one.'
+                ),
+                'error_type': 'TagOnlyIncumbentNotFound',
+                'topic': topic,
+            }
+        canonical_id = incumbent_id
 
     # (5a) THE RETAIN ARM — the ratified default (gate 3200). Each peer
     # is TAGGED IN PLACE: it keeps its Qdrant point id, so every citation,
@@ -436,53 +497,6 @@ async def execute_retain_consolidation(
     closure = await read_topic_closure(
         memory_service, project_id=project_id, topic=topic, run_id=run_id
     )
-
-    if canonical_id is None:
-        # TAG-ONLY (PRD D14). The incumbent comes out of the listing the
-        # scroll above ALREADY returned — same `{'id', 'created_at',
-        # 'metadata'}` rows the selector consumes — so it costs no extra
-        # round trip, and the reachable >1-canonical case gets that
-        # selector's total order rather than a scroll position.
-        # (`memory_metadata.enforce` ships False, so duplicates land
-        # through ordinary writes.)
-        #
-        # NOTHING is written to the incumbent. `content_amend=False` is
-        # load-bearing: this function stamps metadata and writes new
-        # records, and refreshing the incumbent's text would make the
-        # deliberately wider metadata bar a route into a silent-rewrite
-        # primitive. An incumbent that arrives inside `retain_ids` is
-        # refused by the loop's `RetainedPeerIsCanonical` branch above
-        # rather than demoted — the caller's predicate is meant to strip
-        # it and disclose the strip.
-        incumbent = (
-            select_canonical_payload(
-                closure.members, allowed_categories=None, include_planned=True
-            )
-            if closure.available
-            else None
-        )
-        canonical_id = (incumbent or {}).get('id')
-        if not isinstance(canonical_id, str) or not canonical_id:
-            # FAIL CLOSED, never an envelope with a null `canonical_id`:
-            # `build_consolidation_result` types it `str`, and a result
-            # claiming a canonical that does not exist is the
-            # silent-fail-soft this op exists to surface.
-            reason = (
-                'its closure listing could not be read'
-                if not closure.available
-                else 'its closure names no canonical'
-            )
-            return {
-                'error': (
-                    f'consolidate_memories: tag-only was asked to report the '
-                    f'existing canonical for {topic!r}, but {reason}, so there '
-                    'is no incumbent to report. Any peer tags that already '
-                    'landed are NOT undone; re-run once the topic has a '
-                    'canonical, or pass canonical_content to mint one.'
-                ),
-                'error_type': 'TagOnlyIncumbentNotFound',
-                'topic': topic,
-            }
 
     return build_consolidation_result(
         canonical_id=canonical_id,
