@@ -4281,6 +4281,28 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Task 3542 — observe-before-enforce gate for the run()-exit contract, flat
+    # like its neighbour above: no `defaults.yaml` stanza and no
+    # `RELOADABLE_FIELDS` entry.  The canonical WHY is
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    #
+    # THE PROMOTION PATH:
+    #   1. OBSERVE.  With the default False, count the `would-violate` rows
+    #      (`workflow_exit_contract` events, verdict='violation', mode='log').
+    #   2. ENFORCE.  Task mu flips this default to True after the soak.
+    #   3. KEEP.  Unlike convert_to_blocked_enforce, never delete this field:
+    #      enforce is the steady state, and the log mode is its escape hatch.
+    workflow_exit_contract_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the run()-exit contract (task 3542; spec §5).  False — the '
+            'shipped default — is LOG MODE: a violating exit logs a '
+            '`would-violate` WARNING and emits a `workflow_exit_contract` event. '
+            'True also files one deduped L1 (category workflow_exit_contract). '
+            'In neither mode does the check write the task status or raise.'
+        ),
+    )
+
     # Kill-switch for the verified-green merge-queue-direct remediation
     # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
     # (default), a stranded-`blocked` task whose warm lane holds an ASSIGNED,

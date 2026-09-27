@@ -85,6 +85,11 @@ from orchestrator.delivered_checks import (
 )
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.exit_contract import (
+    ExitStatusWriteFailure,
+    judge_exit,
+    record_exit_verdict,
+)
 from orchestrator.git_ops import (
     BranchResetError,
     GitOps,
@@ -157,7 +162,6 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     WorkflowState,
     WorkflowStateMachine,
     classify_failure,
-    outcome_allows_status,
 )
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
@@ -1397,6 +1401,10 @@ class TaskWorkflow:
         # DONE/CANCELLED exit (no block ever hit) has no stashed report, so
         # run() synthesizes one from machine.state instead.
         self._terminal_report: TerminalReport | None = None
+        # Relaxation 2's carrier: the exit status write that failed and was
+        # swallowed, else None — see _note_exit_status_write and
+        # orchestrator/src/orchestrator/exit_contract.py.
+        self._exit_status_write_failure: ExitStatusWriteFailure | None = None
         # Last blocked-from-merge-queue reason — captured by
         # _submit_to_merge_queue and consumed by the merge-phase thrash
         # check (Fix 3).  Cleared between merge attempts so a stale
@@ -3364,40 +3372,20 @@ class TaskWorkflow:
         so one is synthesized here from ``machine.state`` with empty
         reason/detail and ``category=None``.
 
-        SM-2: before returning, assert the report is internally consistent.
-        ``report.phase`` must always equal the live state-machine state (it
-        is built from ``machine.state`` at construction, so a mismatch here
-        means a report was constructed from a stale/foreign source). When
-        the authoritative last-persisted status is legible, ``report.outcome``
-        must also be an allowed pairing with it (``outcome_allows_status``) —
-        this is what catches the false-done class (DB row says 'done' while
-        the actual outcome is BLOCKED). A ``None`` or out-of-vocabulary
-        status row (transient ``get_status`` failure, or a status outside
-        the closed vocabulary) is treated as fail-safe-wait rather than a
-        mismatch, so a flaky read never crashes ``run()``.
-
-        The outcome<->status half is skipped entirely in eval mode
-        (``self._worktree_external``): the MERGE phase — and with it the
-        only call that ever persists a terminal 'done' row — is
-        unconditionally skipped for external worktrees (see the ``MERGE
-        (skip for eval mode)`` guard above), so an eval-mode DONE exit
-        legitimately leaves the last persisted status wherever the pre-empt
-        claim left it. Every other terminal-bookkeeping step in this class
-        (lane release, DONE-cleanup gate) already carries this same
-        ``not self._worktree_external`` guard for the identical reason —
-        eval mode's task row is not the authoritative record real dispatch
-        relies on.
+        SM-2, the run()-exit contract: before returning, the exit is JUDGED —
+        ``report.phase`` against ``machine.state``, and ``report.outcome``
+        against the last-persisted status row — and a violation is RECORDED,
+        never raised.  Log mode (the shipped default) warns ``would-violate``;
+        enforce mode (``config.workflow_exit_contract_enforce``, task mu) also
+        files one deduped L1.  Either way this returns the real report and the
+        check writes no status.  The canonical WHY is
+        ``orchestrator/src/orchestrator/exit_contract.py``; the rows it does
+        not judge are :meth:`_exit_status_facts`'s.
 
         CancellationScope (CX-1, W9-θ): ``_drive()`` runs under a
         :class:`CancellationScope` supervising both the harness's hard
         ``task.cancel()`` and the soft ``_cancel_event`` as ONE typed
-        :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.  The
-        outcome<->status half of SM-2 is additionally skipped on a
-        hard-cancel exit (``cancel_kind == 'hard'``): ``_enter_phase``
-        never persists status, so a forcibly-torn-down workflow leaves the
-        live row at whatever it was (typically 'in-progress') — it does not
-        own its terminal row; the harness R3 grace window + reconcile sweep
-        do. The phase-consistency half always still holds.
+        :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
         scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
@@ -3417,39 +3405,70 @@ class TaskWorkflow:
                 detail='', category=None,
             )
         )
-        assert report.phase == self.machine.state, (
-            f'run()-exit SM-2: report.phase {report.phase!r} != '
-            f'machine.state {self.machine.state!r} (task {self.task_id})'
+        status_row, write_failure = await self._exit_status_facts(cancel_kind)
+        record_exit_verdict(
+            judge_exit(
+                outcome=report.outcome,
+                report_phase=report.phase,
+                machine_state=self.machine.state,
+                status_row=status_row,
+                write_failure=write_failure,
+            ),
+            task_id=self.task_id,
+            enforce=self.config.workflow_exit_contract_enforce,
+            event_store=self.event_store,
+            escalation_queue=self.escalation_queue,
+            worktree=str(self.worktree) if self.worktree else None,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
-        if not self._worktree_external and cancel_kind != 'hard':
-            try:
-                last_status_row = await self.scheduler.get_status(self.task_id)
-            except Exception:
-                # get_status's own contract is str | None (it never raises —
-                # see Scheduler.get_status), so this only fires against a
-                # non-conforming test double.  Same fail-safe fallback as the
-                # worktree-missing-fallback get_status call above.
-                logger.exception(
-                    'Task %s: get_status failed during run()-exit SM-2 check; '
-                    'skipping the outcome<->status consistency check',
-                    self.task_id,
-                )
-                last_status_row = None
-            if last_status_row is not None:
-                try:
-                    status_consistent = outcome_allows_status(report.outcome, last_status_row)
-                except ValueError:
-                    # Out-of-vocabulary/unreadable status row — fail-safe:
-                    # skip the check rather than crash run() on a transient
-                    # or garbled read (mirrors the pre-empt check's None
-                    # handling).
-                    status_consistent = True
-                if not status_consistent:
-                    raise AssertionError(
-                        f'run()-exit SM-2: outcome {report.outcome!r} inconsistent '
-                        f'with status {last_status_row!r} (task {self.task_id})'
-                    )
         return report
+
+    async def _exit_status_facts(
+        self, cancel_kind: Literal['hard', 'soft'] | None,
+    ) -> tuple[str | None, ExitStatusWriteFailure | None]:
+        """The ``(status_row, write_failure)`` the run()-exit contract judges.
+
+        ``(None, None)`` — outcome<->status unjudged, phase still judged — where
+        this workflow does not own its exit row:
+
+        * eval mode (``self._worktree_external``): the MERGE phase, and with it
+          the only call that ever persists a terminal 'done' row, is skipped
+          for external worktrees, so an eval-mode DONE exit legitimately leaves
+          the row wherever the pre-empt claim left it (the same guard the lane
+          release and DONE-cleanup gate carry);
+        * a hard cancel: ``_enter_phase`` never persists status, so a
+          forcibly-torn-down workflow leaves the row as it was — the harness
+          R3 grace window and reconcile sweep own it.
+
+        A raising ``get_status`` (its contract is ``str | None``, so only a
+        non-conforming double does this) reads as an unknown row.
+        """
+        if self._worktree_external or cancel_kind == 'hard':
+            return None, None
+        try:
+            status_row = await self.scheduler.get_status(self.task_id)
+        except Exception:
+            logger.exception(
+                'Task %s: get_status failed during the run()-exit contract '
+                'check; the outcome<->status half goes unjudged',
+                self.task_id,
+            )
+            status_row = None
+        return status_row, self._exit_status_write_failure
+
+    def _note_exit_status_write(
+        self, target_status: str, exc: BaseException | None,
+    ) -> None:
+        """Record (``exc`` set) or clear (``exc`` None) the outcome of an exit
+        status write that swallows its failure — relaxation 2 of the run()-exit
+        contract (``orchestrator/src/orchestrator/exit_contract.py``).  Cleared
+        on success so a stale failure can never misclassify a later exit."""
+        self._exit_status_write_failure = (
+            None if exc is None
+            else ExitStatusWriteFailure(
+                target_status=target_status, error=f'{type(exc).__name__}: {exc}',
+            )
+        )
 
     async def _merge_and_finalise(self, branch_name: str) -> WorkflowOutcome:
         """Run the MERGE phase and, on success, the SUCCESS/finalise tail.
@@ -3958,8 +3977,8 @@ class TaskWorkflow:
         ``WORKFLOW_PRESERVE_STATUSES`` is a SUPERSET of ``TERMINAL_STATUSES``
         and CONTAINS ``'done'``, so testing membership first would return
         BLOCKED for a ``done`` row — and ``outcome_allows_status(BLOCKED,
-        'done')`` is False, which makes ``run()``'s SM-2 exit consistency check
-        (:3248) raise ``AssertionError``.  Conversely
+        'done')`` is False, which makes :meth:`TaskWorkflow.run`'s exit
+        contract record a violation.  Conversely
         ``outcome_allows_status(DONE, 'done')`` is True and
         ``outcome_allows_status(BLOCKED, x)`` is True for every other member of
         the set, so this exact split is the only SM-2-consistent one.  Do not
@@ -3972,8 +3991,8 @@ class TaskWorkflow:
 
         Returns:
             ``DONE`` / ``BLOCKED`` when the steward parked the row — with the
-            matching phase already entered, so ``run()``'s ``report.phase ==
-            self.machine.state`` assertion (:3228) holds — or ``None`` when the
+            matching phase already entered, so :meth:`TaskWorkflow.run`'s
+            ``report.phase == machine.state`` check holds — or ``None`` when the
             row carries no terminal decision and the caller should carry on.
         """
         current_status = await self.scheduler.get_status(self.task_id)
@@ -4644,11 +4663,13 @@ class TaskWorkflow:
           deliberately NOT performed here: introducing phantom-done policy on
           a requeue path would be new policy surface, and the any-level
           dispatch gate already owns done-legitimacy.
-        * anything else — log at ERROR and return ``None``. The caller keeps
-          its REQUEUED exit and the row stays ``in-progress``, which
-          ``_OUTCOME_ALLOWED['requeued']`` still permits today; task θ's
-          narrowing of that row to ``{PENDING}`` is what will make this case
-          loud at ``run()``'s SM-2 check, and that is the correct owner.
+        * anything else — log at ERROR, record the failure in the exit-write
+          ledger (:meth:`_note_exit_status_write`) and return ``None``. The
+          caller keeps its REQUEUED exit and the row stays ``in-progress``,
+          which ``_OUTCOME_ALLOWED['requeued'] == {PENDING}`` forbids; the
+          ledger is what makes ``run()``'s exit contract reclassify this exit
+          as crash-shaped (ONE ``store_unavailable`` record, never a
+          violation — relaxation 2, ``orchestrator/src/orchestrator/exit_contract.py``).
 
         This helper never re-raises, and that is delivered BY CONSTRUCTION
         (the terminal ``except Exception`` arm), not merely by the rejection
@@ -4688,6 +4709,7 @@ class TaskWorkflow:
                 'REQUEUED with the row left in-progress',
                 self.task_id, exc.error_code, exc.raw,
             )
+            self._note_exit_status_write('pending', exc)
         except WorkflowCancelled:
             # Load-bearing, NOT defensive noise: WorkflowCancelled subclasses
             # Exception (workflow_types.py), so the blanket arm below would
@@ -4713,6 +4735,9 @@ class TaskWorkflow:
                 'REQUEUED with the row left in-progress',
                 self.task_id, exc,
             )
+            self._note_exit_status_write('pending', exc)
+        else:
+            self._note_exit_status_write('pending', None)
         return None
 
     async def _plan(self) -> WorkflowOutcome:
@@ -7174,6 +7199,9 @@ class TaskWorkflow:
                 'found_on_main reconciler is the durable backstop',
                 self.task_id, status, why, exc,
             )
+            self._note_exit_status_write(status, exc)
+        else:
+            self._note_exit_status_write(status, None)
 
     def _schedule_architect_merge_done(
         self, fut: asyncio.Future, *, tip: str, evidence: str,
@@ -15605,8 +15633,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         it. This branch is also a live crash fix, not only a relabelling:
         ``_OUTCOME_ALLOWED['done'] == {DONE}``
         (``shared/task_transitions.py``), so the DONE-on-``cancelled`` exits
-        this replaces fail ``run()``'s SM-2 consistency assertion with an
-        ``AssertionError``; ``_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}``
+        this replaces are violations of ``run()``'s exit contract;
+        ``_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}``
         makes the truthful pairing consistent by construction. It also
         de-inflates the completed tally, which counts ``outcome == DONE``.
 
@@ -15695,11 +15723,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self.scheduler.set_task_status(
                 self.task_id, 'blocked', reopen_reason=bypass_summary,
             )
-        except Exception:
+        except Exception as reopen_error:
             logger.exception(
                 'Task %s: reopen with reopen_reason failed; continuing to L1',
                 self.task_id,
             )
+            self._note_exit_status_write('blocked', reopen_error)
+        else:
+            self._note_exit_status_write('blocked', None)
 
         if self.escalation_queue:
             from escalation.models import Escalation
@@ -17152,8 +17183,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
            A human resolved the task out-of-band; exit cleanly, reporting
            which terminal it actually was.  Collapsing both onto ``DONE``
            was not merely imprecise: ``_OUTCOME_ALLOWED['done'] == {DONE}``,
-           so a DONE exit against a ``cancelled`` row fails ``run()``'s SM-2
-           consistency assertion, and the completed tally (``outcome ==
+           so a DONE exit against a ``cancelled`` row violates ``run()``'s
+           exit contract, and the completed tally (``outcome ==
            DONE``) counted a cancellation as a completion.  The CANCELLED
            branch also completes SM-1 terminal absorption — though on this
            path ``_finalise_cancellation`` has already entered CANCELLED, so

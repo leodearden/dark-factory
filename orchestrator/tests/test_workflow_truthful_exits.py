@@ -17,8 +17,9 @@ choke point (``TaskWorkflow._repend_for_requeue``).
 the task status, see a member of ``TERMINAL_STATUSES``, and return
 ``WorkflowOutcome.DONE`` — including when the observed status is
 ``cancelled``.  That is both a lie (the tally counts it as completed) and a
-live crash: ``_OUTCOME_ALLOWED['done'] == {DONE}``, so ``run()``'s SM-2
-exit check raises ``AssertionError``.  The fix maps the observed status onto
+contract violation: ``_OUTCOME_ALLOWED['done'] == {DONE}``, so ``run()``'s
+exit contract records it (``orchestrator/src/orchestrator/exit_contract.py``).
+The fix maps the observed status onto
 its truthful outcome through one shared choke point
 (``TaskWorkflow._observed_terminal_outcome``).
 """
@@ -169,7 +170,7 @@ def test_observed_terminal_outcome_is_sm2_consistent(tmp_path: Path, status: str
     Asserted through ``outcome_allows_status`` — the SAME authority ``run()``
     consumes — so this test cannot drift from the production predicate.
     ``_OUTCOME_ALLOWED['done'] == {DONE}`` is exactly why returning DONE on a
-    ``'cancelled'`` row raises ``AssertionError`` out of ``run()`` today.
+    ``'cancelled'`` row is a violation ``run()``'s exit contract records.
     """
     wf = _make_workflow(tmp_path=tmp_path)
 
@@ -247,9 +248,11 @@ async def test_repend_for_requeue_logs_other_rejections_and_returns_none(
 ):
     """(d) A non-terminal ``SetTaskStatusRejected`` is loud (ERROR) but not fatal.
 
-    The caller keeps its REQUEUED exit — the row stays ``in-progress``, which
-    ``_OUTCOME_ALLOWED['requeued']`` still permits today; task θ's narrowing to
-    ``{PENDING}`` is what will make this case loud at the SM-2 check.
+    The caller keeps its REQUEUED exit with the row left ``in-progress``.  The
+    failed write lands in the exit-write ledger, so ``run()``'s exit contract
+    reclassifies that exit as crash-shaped — ONE ``store_unavailable`` record,
+    never a violation (relaxation 2; boundary-tested in
+    ``test_workflow_state_machine_boundary.py``).
     """
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
@@ -502,8 +505,8 @@ async def test_warm_lane_requeue_survives_a_dead_repend_write(tmp_path: Path):
     assert report.counts_against_requeue_cap == disp.counts_against_requeue_cap
     mark_blocked.assert_not_awaited()
     # Degraded but no worse than the pre-γ3 floor: the row is left exactly
-    # where that code always left it, and SM-2 still passes
-    # (``_OUTCOME_ALLOWED['requeued']`` admits IN_PROGRESS today).
+    # where that code always left it, and run()'s exit contract records the
+    # exit as store_unavailable (relaxation 2), not as a violation.
     assert sched.statuses[wf.task_id][-1] == 'in-progress'
 
 
@@ -633,10 +636,10 @@ async def test_soft_cancel_on_done_row_still_returns_done(tmp_path: Path):
 
 
 def test_done_outcome_is_not_allowed_on_a_cancelled_row():
-    """Why boundary #14a is a live crash, not a mislabelling.
+    """Why boundary #14a is a contract violation, not a mislabelling.
 
-    ``_OUTCOME_ALLOWED['done'] == {DONE}``, so run()'s SM-2 exit check raises
-    ``AssertionError`` on a DONE outcome against a ``cancelled`` row; the
+    ``_OUTCOME_ALLOWED['done'] == {DONE}``, so run()'s exit contract records a
+    violation for a DONE outcome against a ``cancelled`` row; the
     truthful CANCELLED pairing is consistent by construction.  Tally
     correctness follows mechanically — ``Harness._compute_tallies`` counts
     ``report.completed`` as ``outcome == DONE`` only, so a DONE-on-cancelled
@@ -650,10 +653,8 @@ def test_done_outcome_is_not_allowed_on_a_cancelled_row():
 async def test_run_soft_cancel_on_cancelled_row_reports_cancelled(tmp_path: Path):
     """End-to-end: ``run()`` returns CANCELLED and does not trip its own SM-2.
 
-    Today the soft-cancel path returns DONE against the ``cancelled`` row, and
-    ``run()``'s exit check raises
-    ``AssertionError: run()-exit SM-2: outcome ... inconsistent with status
-    'cancelled'`` — so this is a crash out of ``run()``, not a cosmetic
+    Before γ3 the soft-cancel path returned DONE against the ``cancelled`` row,
+    which ``run()``'s exit contract judges a violation — not a cosmetic
     mislabel.
     """
     sched = FakeScheduler()

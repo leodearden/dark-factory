@@ -710,16 +710,19 @@ class TestStateMachineLegalityAndConsistency:
         assert queue.get_by_task(wf.task_id) == []
 
     async def test_row6_failed_bypass_reopen_is_store_unavailable(
-        self, config, git_ops, task_assignment, monkeypatch, caplog,
+        self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
     ):
         """Relaxation 2 via ``_handle_terminal_exit_on_block``: the block write
-        meets a bypass 'done' row, and the reopen write then dies too."""
+        meets a bypass 'done' row, and the reopen write then dies too.  The
+        bypass L1 is still filed — recording the dead write must not cost it."""
         from orchestrator.scheduler import TerminalExitRejection
 
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         event_store = MagicMock()
         workflow.event_store = event_store
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
         _force_blocked_exit_over_a_done_row(scheduler, monkeypatch)
         record_write = scheduler.set_task_status
 
@@ -748,6 +751,9 @@ class TestStateMachineLegalityAndConsistency:
         events = _exit_contract_events(event_store)
         assert [e['verdict'] for e in events] == ['store_unavailable']
         assert events[0]['failed_write']['target_status'] == 'blocked'
+        assert [
+            esc.category for esc in queue.get_by_task(workflow.task_id, status='pending')
+        ] == ['bypass_done']
 
     async def test_row6_none_status_does_not_crash_normal_run(
         self, config, git_ops, task_assignment, monkeypatch,
