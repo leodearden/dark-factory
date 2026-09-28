@@ -48,6 +48,7 @@ from df_pytest_isolation import (  # noqa: E402
     read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -4589,6 +4590,40 @@ def _boundary_run_drain_script(
     hazard can no longer recur -- there is only one copy.
     """
     timeout = _boundary_drain_run_budget() if timeout is None else timeout
+    cmd, full_env = _boundary_drain_script_invocation(
+        bin_dir, state_path, fleet_dir, clock_file, env,
+    )
+    return run_in_new_session(cmd, env=full_env, timeout=timeout)
+
+
+def _boundary_run_drain_script_until(
+    bin_dir, state_path, fleet_dir, clock_file, *, condition, env=None, timeout=None
+):
+    """`_boundary_run_drain_script`, stopped as soon as *condition* holds.
+
+    Returns df_pytest_isolation.run_in_new_session_until's RunUntilOutcome.
+    For a proof that must observe the script MID-RUN, stopping it on a
+    readiness condition it makes observable (its drain poll ledger, say)
+    rather than on a wall-clock kill. ``timeout`` follows
+    `_boundary_run_drain_script`'s ``None`` sentinel and never-double-scale
+    rules; here it is a must-not-hang deadline, paid only when *condition*
+    never holds.
+    """
+    timeout = _boundary_drain_run_budget() if timeout is None else timeout
+    cmd, full_env = _boundary_drain_script_invocation(
+        bin_dir, state_path, fleet_dir, clock_file, env,
+    )
+    return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+def _boundary_drain_script_invocation(bin_dir, state_path, fleet_dir, clock_file, env):
+    """The argv and env both boundary spawn wrappers run the drain script with:
+    the fake systemctl prepended onto PATH, the fleet dir and deploy clock
+    pointed into the test's tmpdir, then *env* on top.
+
+    RESTART_ALL_SCRIPT is read HERE, at call time, which is what lets the
+    containment tests redirect it at a synthetic leaker.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
@@ -4596,11 +4631,7 @@ def _boundary_run_drain_script(
     full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
     if env:
         full_env.update(env)
-    return run_in_new_session(
-        ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
-        env=full_env,
-        timeout=timeout,
-    )
+    return ["bash", str(RESTART_ALL_SCRIPT), "--drain"], full_env
 
 
 def _boundary_load_state(state_path):
