@@ -40,6 +40,7 @@ from df_pytest_isolation import (
     deploy_clock_violation_reason,
     fleet_dir_redirect_violation_reason,
     load_scaled_grace,
+    read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -315,41 +316,6 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
 
 def _load_state(state_path):
     return json.loads(state_path.read_text())
-
-
-def _read_poll_trace(path, *, complete_only=False):
-    """Read the drain poll ledger, as one ``(verdict, unit)`` pair per poll.
-
-    The ledger is written by restart-all-orchestrators.sh's
-    ``drain_check_verdict`` when ``ORCH_DRAIN_POLL_TRACE_FILE`` is set: one
-    append-only TSV line per drain poll, so its LENGTH is a load-independent
-    count of what the spawned script actually did inside the gate.
-
-    Returns the EMPTY LIST when the file does not exist, so a test whose
-    ledger never appeared fails on its own assertion message rather than on a
-    bare FileNotFoundError that says nothing about what was being proven.
-
-    ``complete_only`` is for a reader racing the script (the
-    `_rewrites_on_gate_polls` watcher): it drops the text after the last
-    newline, a record still being appended, which must never count. A
-    finished ledger is read whole, so a torn final record still fails the
-    field-count check below instead of vanishing.
-    """
-    try:
-        text = Path(path).read_text()
-    except FileNotFoundError:
-        return []
-    if complete_only:
-        text = text[: text.rfind("\n") + 1]
-    records = []
-    for raw_line in text.splitlines():
-        fields = raw_line.split("\t")
-        assert len(fields) == 2, (
-            f"poll-trace records are <verdict>\\t<unit>, exactly two fields; "
-            f"got {raw_line!r} in {path}"
-        )
-        records.append((fields[0], fields[1]))
-    return records
 
 
 def _assert_poll_ledger(polls, *, at_least, verdict, unit, too_few, context):
@@ -850,7 +816,7 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
         f"having started. got stdout={result.stdout!r}"
     )
     _assert_poll_ledger(
-        _read_poll_trace(trace_path),
+        read_drain_poll_trace(trace_path),
         at_least=2, verdict="absent", unit=UNIT_R,
         too_few=(
             f"the {unknown_grace}s grace must have been POLLED through rather "
@@ -957,7 +923,7 @@ def test_the_poll_ledger_records_idle_on_the_gate_fast_path(tmp_path):
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    polls = _read_poll_trace(trace_path)
+    polls = read_drain_poll_trace(trace_path)
     assert polls == [("idle", UNIT_R)], (
         f"the fast path is exactly one poll, recorded <verdict>\\t<unit> in "
         f"that order; got {polls!r} stdout={result.stdout!r}"
@@ -1008,7 +974,7 @@ def test_a_drain_check_that_cannot_run_is_traced_as_the_coerced_absent(tmp_path)
         f"rc={result.returncode} stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
-    polls = _read_poll_trace(trace_path)
+    polls = read_drain_poll_trace(trace_path)
     assert polls == [("absent", UNIT_R)], (
         f"the heartbeat is fresh and idle, so 'absent' here can only be the "
         f"coerced verdict the gate acted on -- anything else means the "
@@ -1141,7 +1107,7 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     # load_scaled_grace's 1-minute loadavg has not registered yet: factor 1.0
     # budgets 3.0s, which the 3.9s run above would have missed.
     _assert_poll_ledger(
-        _read_poll_trace(trace_path),
+        read_drain_poll_trace(trace_path),
         at_least=2, verdict="absent", unit=UNIT_R,
         too_few=(
             f"the script was killed without polling the drain gate twice, so "
@@ -1271,7 +1237,7 @@ def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
 
     def _position_once_triggered(rewrite, since):
         while True:
-            records = _read_poll_trace(trace_path, complete_only=True)
+            records = read_drain_poll_trace(trace_path, complete_only=True)
             if records[since:].count((rewrite.after, unit)) >= rewrite.polls:
                 return len(records)
             if stop.wait(_REWRITE_WATCH_INTERVAL_SECS):
@@ -1314,7 +1280,7 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
     {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
     str(_DRAIN_POLL_INTERVAL_SECS)}. `state` is the fake systemctl's
     recorded state and `polls` the gate's finished poll ledger, as read by
-    `_read_poll_trace`.
+    `read_drain_poll_trace`.
     """
     assert "ORCH_DRAIN_POLL_TRACE_FILE" not in knobs, (
         "_run_busy_unit_through OWNS ORCH_DRAIN_POLL_TRACE_FILE: its rewrite "
@@ -1340,7 +1306,7 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
             bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=spawn_timeout,
         )
 
-    return result, _load_state(state_path), _read_poll_trace(trace_path)
+    return result, _load_state(state_path), read_drain_poll_trace(trace_path)
 
 
 def _polls_outlasting(secs: int) -> int:
@@ -1367,7 +1333,7 @@ def _assert_resumed_from_the_busy_loop(result, state, polls):
     """Assert drain_gate's IN-LOOP resume: defer on a busy read, then resume
     on an idle read taken straight from the busy poll loop.
 
-    `polls` is `_read_poll_trace` output. The ledger is what pins the ORDER
+    `polls` is `read_drain_poll_trace` output. The ledger is what pins the ORDER
     in which the gate observed the unit's states; stdout only implies it.
     """
     context = (
