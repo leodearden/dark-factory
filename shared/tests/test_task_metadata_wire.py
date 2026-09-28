@@ -19,6 +19,7 @@ class TestAbsent:
     def test_absent_result_is_fresh_not_shared(self):
         first = coerce_task_metadata(None)
         second = coerce_task_metadata(None)
+        assert first is not None
         assert first is not second
         first['k'] = 1
         assert coerce_task_metadata(None) == {}
