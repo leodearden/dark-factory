@@ -1322,8 +1322,9 @@ This is a LOCK, not a spec under development: every new report line those
 flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
-leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no cost-control flags). A deliberate change to
+leaked into the unflagged path (and therefore into every flagless run: an
+operator run with no flags, or a trickle launch whose census.trickle_caps
+are null). A deliberate change to
 the flagless report may move this lock, in a commit whose message says why;
 that record is what distinguishes it from a leak."""
 
@@ -4627,8 +4628,8 @@ def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spel
 
 
 def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
-    # The nightly launcher (nightly.py) passes only --project-root/--config and
-    # no cost-control flags, so this is the shape that must stay behaviorally
+    # The flagless shape -- an operator run with no flags, or a trickle launch
+    # whose census.trickle_caps are null -- must stay behaviorally
     # byte-identical.
     _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()

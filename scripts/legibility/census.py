@@ -3699,9 +3699,12 @@ def main(argv: list[str] | None = None) -> int:
 
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
     each defaulting to today's unbounded behavior so a flagless
-    invocation -- notably the nightly trickle's, which passes only
-    ``--project-root``/``--config`` and no cost-control flags -- is
-    unchanged: ``--max-batches N`` bounds mining (the
+    invocation is unchanged. The nightly trickle's launch passes
+    ``--max-batches`` / ``--max-verify-clusters`` from the project's
+    legibility.yaml ``census.trickle_caps`` (``config.TrickleCensusCaps``;
+    either one omitted when set to null). census.py itself never reads that
+    block, so these flags remain the single cap mechanism.
+    ``--max-batches N`` bounds mining (the
     capped-away sessions are NOT re-mined by a later census -- this run
     still advances ``last_census_at``, so the next window starts here),
     ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
