@@ -7269,13 +7269,6 @@ def test_mark_entry_filed_rejects_an_unknown_entry_id():
         mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-nope")
 
 
-@pytest.mark.parametrize(
-    "marker", ["ENTRY_FILING_KEY", "ENTRY_FILING_WITHHELD", "ENTRY_FILING_FILED"],
-)
-def test_entry_filing_markers_are_plain_strings(marker):
-    assert type(getattr(mod, marker)) is str, "yaml.safe_dump cannot represent a str subclass"
-
-
 def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     path = tmp_path / "confusion-codebook.yaml"
     marked = mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")

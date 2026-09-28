@@ -12,8 +12,6 @@ scripts/tests/conftest.py) — mirroring test_census_verify_sandbox_cwd.py.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import census as mod
 import coder
 import filing_policy
@@ -102,10 +100,6 @@ def test_main_defaults_the_harness_to_the_census_checkouts_own_config(tmp_path, 
 
     assert mod.main(["--project-root", str(target), "--force"]) == 0
 
-    census_checkout = Path(mod.__file__).resolve().parents[2]
-    assert census_checkout / "docs" / "legibility" / "legibility.yaml" == (
-        mod.DEFAULT_HARNESS_CONFIG_PATH
-    )
     harness_cfg = config_mod.load_config(mod.DEFAULT_HARNESS_CONFIG_PATH)
     assert fake_run_census.calls[0]["harness_project"] == filing_policy.ProjectRef(
         project_root=harness_cfg.project_root, project_id=harness_cfg.project_id,

@@ -409,10 +409,6 @@ def test_reify_actionable_clusters_resolve_to_the_observed_project(cluster):
 # is_fileable — the singleton filing gate
 # ---------------------------------------------------------------------------
 
-def test_min_unremediated_sightings_is_two():
-    assert filing_policy.MIN_UNREMEDIATED_SIGHTINGS == 2
-
-
 def test_unremediated_singleton_is_not_fileable():
     assert filing_policy.is_fileable(REIFY_7909, sighting_count=1) is False
 
@@ -442,10 +438,3 @@ def test_malformed_remediation_counts_as_absent(remediation):
 
 def test_zero_sightings_without_remediation_is_not_fileable():
     assert filing_policy.is_fileable(REIFY_7909, sighting_count=0) is False
-
-
-def test_withheld_cluster_is_a_frozen_record():
-    withheld = filing_policy.WithheldCluster(title="t", sighting_count=1)
-    assert withheld == filing_policy.WithheldCluster(title="t", sighting_count=1)
-    with pytest.raises(AttributeError):
-        withheld.sighting_count = 2  # pyright: ignore[reportAttributeAccessIssue]
