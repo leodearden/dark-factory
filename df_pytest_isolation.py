@@ -1697,6 +1697,48 @@ LEAK_TOKEN_ENV = 'DF_PYTEST_LEAK_TOKEN'
 DRAIN_SCRIPT_CMDLINE_MARKER = 'restart-all-orchestrators.sh'
 
 
+def read_drain_poll_trace(
+    path: str | os.PathLike[str], *, complete_only: bool = False,
+) -> list[tuple[str, str]]:
+    """Read the drain gate's poll ledger as one ``(verdict, unit)`` pair per poll.
+
+    ``scripts/restart-all-orchestrators.sh::drain_check_verdict`` appends one
+    ``<verdict>\\t<unit>`` record per drain poll when
+    ``ORCH_DRAIN_POLL_TRACE_FILE`` is set, AFTER python3 has read the
+    heartbeat. So the ledger's LENGTH is a load-independent count of what the
+    gate actually did, which is what lets a test assert on the script's
+    progress instead of on how long its own clock ran (task 4486). It lives
+    here because both test roots read it and cannot import each other's test
+    modules.
+
+    An absent ledger reads as ``[]``, so a caller whose ledger never appeared
+    fails on its own diagnostic rather than on a bare ``FileNotFoundError``.
+
+    ``complete_only`` is for a reader racing the script: it drops the text
+    after the last newline, a record still being appended, which must never
+    count. A finished ledger is read whole, so a torn final record fails the
+    field check instead of vanishing. The failure is a ``ValueError``, not
+    ``pytest.fail``: a watcher thread collecting ``Exception`` must see it,
+    and ``Failed`` is a ``BaseException``.
+    """
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return []
+    if complete_only:
+        text = text[: text.rfind('\n') + 1]
+    records = []
+    for raw_line in text.splitlines():
+        fields = raw_line.split('\t')
+        if len(fields) != 2:
+            raise ValueError(
+                f'poll-trace records are <verdict>\\t<unit>, exactly two fields; '
+                f'got {raw_line!r} in {path}'
+            )
+        records.append((fields[0], fields[1]))
+    return records
+
+
 def leaked_drain_processes(
     token: str | None, *, proc_root: str | os.PathLike[str] = Path('/proc'),
 ) -> list[tuple[int, str]]:
