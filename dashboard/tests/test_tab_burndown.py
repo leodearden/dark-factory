@@ -12,6 +12,9 @@ from _dashboard_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     destructure_bindings,
+    extract_function_body,
+    strip_js_comments,
+    walk_balanced,
 )
 
 # ---------------------------------------------------------------------------
@@ -395,3 +398,124 @@ class TestVelocitySparkWiring:
             tabs_jsx_body,
             re.DOTALL,
         )
+
+
+# ---------------------------------------------------------------------------
+# tabs.jsx BurnTab — every tile, pip and cell reads a SERVED burndown Datum
+# ---------------------------------------------------------------------------
+#
+# The burndown payload carries its own staleness: each block (the aggregate and
+# every project) serves `latest` and `forecast` Datums whose state says whether
+# a project was carried forward, is missing from the window, or is fresh.
+# plainDatum/derivedDatum wrap a bare number in the ENDPOINT's receipt, which
+# knows only when the payload arrived — so a tile built that way would read a
+# carried project's hours-old count as fresh. BurnTab therefore builds no
+# Datum of its own; burndown_bands.js::burndownDatum stamps the served one.
+
+_BURN_TILE_LABELS = {'Net velocity', 'Completed (window)', 'Pending', 'Forecast clear'}
+
+
+def _burn_tab_body(tabs_jsx_body):
+    return strip_js_comments(extract_function_body(tabs_jsx_body, 'BurnTab'))
+
+
+def _self_closing_elements(src, tag):
+    """Every flat ``<tag ... />`` element's attribute text, braces respected.
+
+    Walks brace depth so an arrow's ``=>`` or a nested JSX value inside a
+    ``{...}`` prop cannot end the element early; only a ``/>`` at depth 0 does.
+    """
+    elements = []
+    for m in re.finditer(rf'<{tag}\b', src):
+        depth = 0
+        for i in range(m.end(), len(src)):
+            c = src[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            elif depth == 0 and src.startswith('/>', i):
+                elements.append(src[m.end():i])
+                break
+        else:
+            raise AssertionError(f'<{tag} at offset {m.start()} is never closed')
+    return elements
+
+
+def _prop_expr(attrs, name):
+    """The expression inside ``name={...}``, or None when the prop is absent."""
+    m = re.search(rf'\b{name}=\{{', attrs)
+    if not m:
+        return None
+    return walk_balanced(attrs, m.end() - 1)[1:-1].strip()
+
+
+def _prop_label(attrs):
+    m = re.search(r'\blabel=["\']([^"\']*)["\']', attrs)
+    return m.group(1) if m else None
+
+
+def _burn_tiles(body):
+    return {_prop_label(a): a for a in _self_closing_elements(body, 'ST')}
+
+
+class TestBurnTabReadsServedDatums:
+    def test_burntab_builds_no_endpoint_granular_datum(self, tabs_jsx_body):
+        """No plainDatum/derivedDatum: every reading is a served, stamped Datum."""
+        body = _burn_tab_body(tabs_jsx_body)
+        assert 'plainDatum(' not in body
+        assert 'derivedDatum(' not in body
+
+    def test_burntab_reads_the_latest_and_forecast_datums(self, tabs_jsx_body):
+        body = _burn_tab_body(tabs_jsx_body)
+        for field in ('latest', 'forecast'):
+            assert re.search(rf'burndownDatum\([^()]*["\']{field}["\']\s*\)', body), (
+                f'BurnTab never reads the served {field!r} Datum through burndownDatum'
+            )
+
+    def test_tabs_jsx_binds_the_datum_reader_and_forecast_formatter(self, tabs_jsx_body):
+        m = re.search(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_BURNDOWN_BANDS', tabs_jsx_body)
+        assert m, 'tabs.jsx no longer destructures window.DF_BURNDOWN_BANDS'
+        locals_bound = {local for _, local in destructure_bindings(m.group(1))}
+        assert {'burndownDatum', 'forecastText'} <= locals_bound
+
+    def test_every_aggregate_tile_renders_a_served_datum(self, tabs_jsx_body):
+        """Each tile's datum is a burndownDatum result, never a wrapped bare number."""
+        body = _burn_tab_body(tabs_jsx_body)
+        tiles = _burn_tiles(body)
+        assert set(tiles) == _BURN_TILE_LABELS
+        for label, attrs in tiles.items():
+            expr = _prop_expr(attrs, 'datum')
+            assert expr, f'the {label!r} tile passes no datum'
+            if not expr.startswith('burndownDatum('):
+                assert re.fullmatch(r'[A-Za-z_$][\w$]*', expr), (
+                    f'the {label!r} tile datum {expr!r} is neither a burndownDatum '
+                    'call nor a name bound to one'
+                )
+                assert re.search(rf'\bconst\s+{re.escape(expr)}\s*=\s*burndownDatum\(', body), (
+                    f'the {label!r} tile datum {expr!r} is not bound to a burndownDatum result'
+                )
+
+    def test_backlog_tile_label_is_retired(self, tabs_jsx_body):
+        """The tile shows the pending MEMBER; the backlog VIEW (pending + deferred) is OrchTab's."""
+        assert not re.search(r'label=["\']Backlog["\']', _burn_tab_body(tabs_jsx_body))
+
+    def test_active_label_is_retired_for_running(self, tabs_jsx_body):
+        body = _burn_tab_body(tabs_jsx_body)
+        assert not re.search(r'label=["\']active["\']', body)
+        assert not re.search(r'>\s*Active\s*<', body)
+        assert re.search(r'label=["\']running["\']', body)
+        assert re.search(r'>\s*Running\s*<', body)
+
+    def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
+        """No client point estimate: the server refuses to synthesise one on sparse history."""
+        body = _burn_tab_body(tabs_jsx_body)
+        assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
+        assert 'forecastDays' not in body
+
+    def test_endpoint_table_no_longer_names_burndown(self, tabs_jsx_body):
+        src = strip_js_comments(tabs_jsx_body)
+        m = re.search(r'const\s+EP\s*=\s*Object\.freeze\(\{', src)
+        assert m, 'tabs.jsx no longer declares its EP endpoint table'
+        assert not re.search(r'\bburndown\s*:', walk_balanced(src, m.end() - 1))
+        assert 'EP.burndown' not in src
