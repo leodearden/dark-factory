@@ -603,7 +603,11 @@ evaluating a descriptor against main yields a *bit*, not a verdict —
 only on `broken` (a done producer whose capability is nowhere on main) and
 `vacuous_live_gate` (an open producer whose check already passes);
 `superseded` — a correct descriptor that later work legitimately undid — is
-reported and never actionable.
+reported and never actionable. A separate report-only section lists sidecar
+descriptors carrying a structural code (`vacuous_present_self_referential`,
+`vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
+against today's tree, and a reworded comment or a later file flips them, so
+they never affect the exit code and no gating test sweeps them.
 
 **At runtime**, a `DEP_CAPABILITY_NOT_DELIVERED` escalation whose check is
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,

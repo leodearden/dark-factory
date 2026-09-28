@@ -25,11 +25,15 @@ the checked-in corpus, applying the authoring-time 2x2 with the reference tree
 set to main-today flags 313/548 descriptors (57%) — overwhelmingly correctly
 delivered work (esc-3500-1). The producer's STATUS is what turns the bit into
 a disposition, and status lives in ``.taskmaster/tasks/tasks.db``. That is why
-this is a script rather than a test: the shared-suite ratchet
-(``shared/tests/test_capability_manifest.py::TestCheckedInGrepDescriptorHygiene``)
-must run in any checkout, so it sweeps only the STRUCTURAL codes — which are
-statements about a descriptor's shape and stay true whatever tree they are
-measured against — and deliberately leaves the vacuity direction to this tool.
+this is a script rather than a test.
+
+THE STRUCTURAL SECTION IS REPORT-ONLY. The lint's structural codes
+(self-referential, comment-only, filename-shaped) are listed for every
+checked-in sidecar descriptor, but they are measurements of the tree, not of
+the descriptor alone: rewording one comment, or landing a later file that
+mentions the pattern, flips them. So they never affect the exit code, and no
+gating test sweeps them; the authoring-time gate is where new descriptors are
+held to them.
 
 THE REFERENCE POINT IS MAIN TODAY, NOT THE TASK'S DONE-TIME SHA. That ruling
 is measured, not assumed (fold-in esc-4545-2): cross-tabbing done-time-vs-today
@@ -103,6 +107,7 @@ from shared.delivered_check_polarity import (  # noqa: E402
     CheckOutcome,
     evaluate_grep_at_tree,
     extract_delivered_checks,
+    lint_delivered_checks,
 )
 
 MANIFEST_SUFFIX = ".capability-manifest.yaml"
@@ -197,10 +202,46 @@ class AuditCoverage(NamedTuple):
     sidecars_unloadable: int
 
 
+#: The lint codes that describe where a descriptor's matches LIE rather than
+#: whether it matches — reported in their own section, never gating.
+STRUCTURAL_CODES = (
+    "vacuous_present_self_referential",
+    "vacuous_present_comment_only",
+    "filename_shaped",
+)
+
+
+class StructuralFinding(NamedTuple):
+    row: DescriptorRow
+    code: str
+
+
 class ProjectAudit(NamedTuple):
     project_root: str
     findings: list[Finding]
     coverage: AuditCoverage
+    structural: tuple[StructuralFinding, ...] = ()
+
+
+def structural_findings(
+    rows: list[DescriptorRow], *, repo_root: str, ref: str = GATE_REF
+) -> tuple[StructuralFinding, ...]:
+    """The sidecar descriptors the authoring lint gives a structural code at *ref*.
+
+    Through ``lint_delivered_checks`` itself, with the row's sidecar as
+    ``manifest_path`` so the self-reference rule can see the descriptor's own
+    family — the same classification the authoring gate reaches.
+    """
+    found = []
+    for row in rows:
+        check = {
+            "name": row.name, "kind": row.kind, "pattern": row.pattern,
+            "expect": row.expect, "paths": list(row.paths), "manifest_path": row.manifest,
+        }
+        for lint in lint_delivered_checks([check], files=None, repo_root=repo_root, ref=ref):
+            if lint.code in STRUCTURAL_CODES:
+                found.append(StructuralFinding(row=row, code=lint.code))
+    return tuple(found)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +685,7 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     return ProjectAudit(
         project_root=project_root,
         findings=findings,
+        structural=structural_findings(manifest_rows, repo_root=project_root, ref=ref),
         coverage=AuditCoverage(
             descriptors_total=len(findings),
             descriptors_without_task=sum(
@@ -681,6 +723,8 @@ _TERMINAL_SECTIONS = (
 )
 
 _SECTIONS = _LIVE_SECTIONS + _TERMINAL_SECTIONS
+
+_STRUCTURAL_LABEL = "STRUCTURAL, report-only"
 
 #: One line per disposition saying WHY, in the reader's terms. A disposition
 #: name alone is a verdict without an argument: it tells an operator what the
@@ -790,6 +834,13 @@ def format_report(audits: list[ProjectAudit]) -> str:
             lines.append(f"  {label} ({len(rows)})")
             for finding in rows:
                 lines.extend(_format_finding(finding))
+        lines.append(f"  {_STRUCTURAL_LABEL} ({len(audit.structural)})")
+        for item in audit.structural:
+            lines.append(format_kv_line([
+                ("task_id", item.row.task_id), ("name", item.row.name),
+                ("code", item.code), ("pattern", repr(item.row.pattern)),
+                ("manifest", item.row.manifest),
+            ]))
         lines.append("")
         lines.extend(format_coverage_block(
             _COVERAGE_CAVEAT,
@@ -811,6 +862,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
         lines.append("no projects audited")
         for label, _ in _SECTIONS:
             lines.append(f"  {label} (0)")
+        lines.append(f"  {_STRUCTURAL_LABEL} (0)")
         lines.append("  " + _COVERAGE_CAVEAT)
     return "\n".join(lines)
 
@@ -840,6 +892,10 @@ def format_json(audits: list[ProjectAudit]) -> str:
                         for finding in audit.findings
                     ],
                     "coverage": audit.coverage._asdict(),
+                    "structural": [
+                        {**item.row._asdict(), "paths": list(item.row.paths), "code": item.code}
+                        for item in audit.structural
+                    ],
                 }
                 for audit in audits
             ]

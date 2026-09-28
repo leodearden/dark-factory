@@ -11,9 +11,7 @@ red the moment another task lands. Every assertion runs against synthetic temp
 databases and synthetic temp git repos whose contents the test controls
 exactly — the same discipline that file's docstring requires.
 
-WHY STATUS IS THE AXIS, and why this sweep cannot be the shared-suite ratchet
-(shared/tests/test_capability_manifest.py::TestCheckedInGrepDescriptorHygiene).
-Evaluating a descriptor against MAIN TODAY yields a bit, not a verdict: the
+WHY STATUS IS THE AXIS. Evaluating a descriptor against MAIN TODAY yields a bit, not a verdict: the
 same "``expect: present`` and it matches" observation is the SUCCESS state of a
 landed producer and a never-fires vacuous gate on a live one. Measured over the
 checked-in corpus, a status-blind rule flags 313/548 (57%) of descriptors —
@@ -761,6 +759,47 @@ class TestReportShape:
         result = _run_cli('--project-root', str(root))
 
         assert 'reason:' in result.stdout
+
+
+class TestStructuralSection:
+    def test_structural_codes_are_listed_and_never_gate(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A sidecar descriptor whose only match is a comment is REPORTED under
+        its structural code, and a run carrying nothing else still exits 0:
+        a structural code is a measurement of today's tree, which drifts."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={
+                'src/a.py': '# ArchiveHook is described here, never defined\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 20\n'
+                    '    capabilities:\n'
+                    '      - name: hook-wired\n'
+                    '        binding: b\n'
+                    '        verdict: PASS\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: ArchiveHook\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                ),
+            },
+            tasks=[{'id': 20, 'status': 'done'}],
+        )
+
+        text = _run_cli('--project-root', str(root))
+        payload = json.loads(_run_cli('--project-root', str(root), '--json').stdout)
+
+        assert text.returncode == 0, text.stdout + text.stderr
+        assert 'STRUCTURAL, report-only (1)' in text.stdout
+        assert [(s['name'], s['code']) for s in payload['projects'][0]['structural']] == [
+            ('hook-wired', 'vacuous_present_comment_only')
+        ]
 
 
 class TestReadOnly:

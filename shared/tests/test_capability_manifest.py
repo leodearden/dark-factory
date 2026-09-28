@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple, get_args
 
@@ -32,13 +31,11 @@ from capability_manifest_corpus import (
     REPO_ROOT,
     AmbiguousIndexEntry,
     GitUnavailable,
-    GrepCheckRef,
     ScriptCheckRef,
     check_manifest,
     check_script_target,
     committed_file_mode,
     discover_manifests,
-    iter_grep_checks,
     iter_script_checks,
 )
 from pydantic import BaseModel, ValidationError
@@ -56,7 +53,6 @@ from shared.capability_manifest import (
     load_capability_manifest,
     parse_capability_manifest,
 )
-from shared.delivered_check_polarity import lint_delivered_checks
 from shared.task_metadata import parse_metadata
 
 
@@ -1245,132 +1241,6 @@ _SCRIPT_CHECK_IDS = [
 #: TestCheckedInScriptCheckTargets (code-review amendment, task 3649).
 _SCRIPT_KIND_RE = re.compile(r'\bkind:\s*[\'"]?script\b')
 
-#: Derived from _MANIFEST_PATHS for exactly the reasons _SCRIPT_CHECKS is —
-#: no second corpus walk, and iter_grep_checks is likewise non-raising, so
-#: nothing escapes at module import time to take down collection of the
-#: whole module. Feeds TestCheckedInGrepDescriptorHygiene (task 3500).
-_GREP_CHECKS = [ref for path in _MANIFEST_PATHS for ref in iter_grep_checks(path)]
-_GREP_CHECK_IDS = [
-    f'{ref.manifest.relative_to(REPO_ROOT)}::{ref.task_label}::{ref.capability}'
-    for ref in _GREP_CHECKS
-]
-
-#: Independent, loader-free way to count the `kind: grep` checks a sidecar
-#: DECLARES — same regex-over-raw-text discipline as _SCRIPT_KIND_RE, so it
-#: still counts a declaration inside a sidecar iter_grep_checks dropped.
-#:
-#: ANCHORED at line start, unlike _SCRIPT_KIND_RE, and that difference is
-#: measured rather than stylistic: `kind: grep` also appears in PROSE inside
-#: this corpus (docs/prds/memory-eval-program.capability-manifest.yaml:150
-#: narrates "the superseded {kind: grep, pattern: ...}" inside a binding
-#: note), and an unanchored regex counts that as a 564th declaration against
-#: 563 real ones — turning the equality guard below permanently red for a
-#: reason that is not a coverage gap. `kind: script` happens to be narrated
-#: nowhere, which is why the older constant gets away with no anchor. The
-#: leading `[-{ ]*` still admits a list dash and the flow style
-#: (`- {kind: grep, ...}`) at the start of a line.
-_GREP_KIND_RE = re.compile(r'^[ \t]*[-{ ]*kind:\s*[\'"]?grep\b', re.MULTILINE)
-
-#: The `discover_manifests() is None` predicate — "git could not answer at
-#: all" — evaluated ONCE at import instead of once per test item.
-#:
-#: The corpus classes above call discover_manifests() inline inside each
-#: guard, which is free at their scale (a handful of items each). The
-#: per-descriptor ratchet below is parametrized over 563 rows, and every
-#: inline call is a fresh `git ls-files` subprocess: measured at ~40s of that
-#: class's ~70s wall clock, i.e. more than the entire corpus sweep it guards.
-#: Same predicate, same skip, one subprocess.
-_CORPUS_DISCOVERABLE = discover_manifests() is not None
-
-#: The three codes shared.delivered_check_polarity emits that are STRUCTURAL
-#: statements about a descriptor's SHAPE rather than about its polarity
-#: relative to a tree: a descriptor matching only its own manifest/PRD family,
-#: one matching only comment lines, and one whose pattern names a FILE rather
-#: than a symbol inside it. Each stays true whatever the reference tree is,
-#: which is precisely what makes them sweepable over a corpus of already-landed
-#: tasks — see TestCheckedInGrepDescriptorHygiene's docstring for why the
-#: vacuity codes are NOT swept here.
-_STRUCTURAL_CODES = frozenset(
-    {
-        'vacuous_present_self_referential',
-        'vacuous_present_comment_only',
-        'filename_shaped',
-    }
-)
-
-#: Concurrency for the corpus sweep below. The work is one-or-more `git grep`
-#: subprocesses per descriptor — I/O-bound, not CPU-bound — so a worker count
-#: above the core count is the right shape. Measured over today's 563
-#: descriptors on this repo: 118s serial, 10s at 8 workers, 4.7s at 16. 8 is
-#: the conservative pick: it buys the order-of-magnitude and leaves headroom
-#: for whatever else the session is running (this repo runs its suites under a
-#: make-style jobserver — see shared/src/shared/pytest_jobserver.py).
-_HYGIENE_SWEEP_WORKERS = 8
-
-#: Populated by the sweep on first use, then reused. NOT computed at import:
-#: importing this module to run one unrelated test must not pay for 563 git
-#: greps, and a module-import-time cost cannot be skipped on a non-checkout.
-_STRUCTURAL_SWEEP: dict[GrepCheckRef, str | None] | None = None
-
-
-def _classify_grep_descriptor(ref: GrepCheckRef) -> str | None:
-    """The structural code shared.delivered_check_polarity reports for *ref*, or None.
-
-    Feeds the checked-in descriptor through the SAME lint the authoring-time
-    gates run (``commit_planning`` and ``stamp_capability_manifests``), so the
-    ratchet can never drift from the gate it is ratcheting: a rule the gate
-    stops emitting stops being swept, and a rule it starts emitting is swept
-    the moment it lands.
-
-    ``files=None`` is deliberate. The corpus row carries no task metadata, so
-    there is no declared file scope to compare against — which makes every
-    ``expect='absent'`` descriptor look "over-broad" to the ``absent_overbroad``
-    rule. That verdict is discarded here (it is a WARN, and not one of
-    :data:`_STRUCTURAL_CODES`), so the missing scope costs nothing but a grep.
-    """
-    findings = lint_delivered_checks(
-        [
-            {
-                'name': ref.capability,
-                'kind': 'grep',
-                'pattern': ref.pattern,
-                'expect': ref.expect,
-                'paths': list(ref.paths),
-                'manifest_path': str(ref.manifest.relative_to(REPO_ROOT)),
-            }
-        ],
-        files=None,
-        repo_root=REPO_ROOT,
-        ref='HEAD',
-    )
-    return next((f.code for f in findings if f.code in _STRUCTURAL_CODES), None)
-
-
-def _structural_sweep() -> dict[GrepCheckRef, str | None]:
-    """Classify every checked-in grep descriptor, once per session.
-
-    Both halves of the ratchet read this one map — the per-descriptor guard
-    and the anti-rot guard — so the corpus is swept once rather than twice,
-    and the two can never disagree about what today's violations are.
-    """
-    global _STRUCTURAL_SWEEP
-    if _STRUCTURAL_SWEEP is None:
-        with ThreadPoolExecutor(max_workers=_HYGIENE_SWEEP_WORKERS) as pool:
-            codes = list(pool.map(_classify_grep_descriptor, _GREP_CHECKS))
-        _STRUCTURAL_SWEEP = dict(zip(_GREP_CHECKS, codes, strict=True))
-    return _STRUCTURAL_SWEEP
-
-
-def _structural_debt_key(ref: GrepCheckRef, code: str) -> tuple[str, str, str, str]:
-    """The allowlist key: (manifest_rel, task_label, capability_name, code).
-
-    Repo-relative manifest path rather than the absolute one, so the frozen
-    list is identical in every checkout and worktree. Including *code* means
-    a descriptor allowlisted for one defect is still guarded against acquiring
-    a different one.
-    """
-    return (str(ref.manifest.relative_to(REPO_ROOT)), ref.task_label, ref.capability, code)
-
 
 class OpenVerdictRef(NamedTuple):
     """One ``verdict: OPEN`` capability row located in a checked-in sidecar."""
@@ -1749,199 +1619,6 @@ class TestCheckedInScriptCheckTargets:
         assert mode == '100755', (
             f'{prefix} is committed at mode {mode}, not 100755 — a working-tree '
             'chmod that is never staged leaves main ERRORing'
-        )
-
-
-#: FROZEN structural debt: every (manifest, task_label, capability, code) the
-#: sweep reports TODAY. Populated by MEASUREMENT, never by hand — see
-#: TestCheckedInGrepDescriptorHygiene's docstring for the baseline and the
-#: date. Each entry carries the owning task id so the debt is attributable.
-_KNOWN_STRUCTURAL_DEBT: frozenset[tuple[str, str, str, str]] = frozenset(
-    {
-        # task 3199 — the pattern's only match is a markdown heading in a
-        # sibling report, so the check asserts the heading was written.
-        (
-            'docs/prds/memory-metadata-vocabulary.capability-manifest.yaml',
-            'zeta',
-            'decision-table-report-committed',
-            'vacuous_present_comment_only',
-        ),
-        # task 2792 — one of the two specimens task 3500 was filed on: the sole
-        # `archive_task_transcripts` match in git_ops.py is a COMMENT
-        # (git_ops.py:14282), so the check was green before the backstop existed.
-        (
-            'plans/agent-transcript-archival-prd.capability-manifest.yaml',
-            'β',
-            'backstop-at-cleanup-worktree-chokepoint',
-            'vacuous_present_comment_only',
-        ),
-        # task 2862 — matches only the script's own header comments.
-        (
-            'plans/fable-architect-eval-admission-prd.capability-manifest.yaml',
-            'τ1',
-            'eval-bootstrap-smoke-gate',
-            'vacuous_present_comment_only',
-        ),
-        # task 5599 — the only match is the markdown heading the task was
-        # asked to write in design-invariants.md; no match at the sidecar's
-        # authoring commit, so the authoring gate would have accepted it. The
-        # comment-only refinement reads a markdown `#` as prose.
-        (
-            'plans/inv12-exceptions-owned-or-ratified-prd.capability-manifest.yaml',
-            'α',
-            'inv12-heading-defines-the-slug',
-            'vacuous_present_comment_only',
-        ),
-        # task 5754 — a "kept" check: the SKILL.md sentence already matched at
-        # the sidecar's authoring commit, so it never gated anything, and its
-        # one match is a `**Limits.**` markdown line.
-        (
-            'plans/plan-deviation-recording-prd.capability-manifest.yaml',
-            'δ',
-            'watcher-per-task-limit-kept',
-            'vacuous_present_comment_only',
-        ),
-        # task 5324 — the pattern `resolver` matches only two comments in the
-        # reconciliation harness, so the check is green on prose.
-        (
-            'plans/uuid-prefix-resolution-prd.capability-manifest.yaml',
-            'δ',
-            'recon-harness-passes-service-resolver',
-            'vacuous_present_comment_only',
-        ),
-    }
-)
-
-
-class TestCheckedInGrepDescriptorHygiene:
-    """No checked-in `kind: grep` descriptor acquires a NEW structural defect.
-
-    A RATCHET, not a gate. The entries in :data:`_KNOWN_STRUCTURAL_DEBT` are
-    pre-existing descriptors in sidecars under `plans/` and `docs/prds/` that
-    task 3500 does not own and must not edit; this class's job is to stop the
-    population GROWING, and to make each repair mechanically visible when
-    someone else's task does fix one.
-
-    WHAT IS SWEPT. Exactly the three STRUCTURAL codes in
-    :data:`_STRUCTURAL_CODES` — a descriptor whose matches lie only in its own
-    manifest/PRD family, one whose matches are all comment lines, and one
-    whose pattern names a FILE rather than a symbol inside it. Each is a
-    statement about the descriptor's SHAPE and stays true whatever tree it is
-    measured against, which is what makes it sweepable over a corpus of
-    already-landed tasks.
-
-    WHAT IS DELIBERATELY NOT SWEPT, and why this class would otherwise be
-    unusable: the VACUITY direction. `shared.delivered_check_polarity`'s core
-    2x2 rejects an `expect: present` descriptor that MATCHES its reference
-    tree — sound at authoring time, where HEAD is by construction the pre-task
-    tree, and inverted here. At main-today an `expect: present` descriptor
-    that matches is the SUCCESS state of a landed producer, not vacuity.
-    Measured over this corpus at HEAD: 292 `vacuous_present` + 28
-    `vacuous_absent` = 320 of 563 descriptors (57%), overwhelmingly correctly
-    delivered work. Telling those apart from real defects needs the task's
-    STATUS, which needs `.taskmaster/tasks/tasks.db` — so that determination
-    belongs to the status-aware sweep script (`scripts/audit_delivered_checks.py`),
-    not to a test that must run in any checkout.
-
-    MEASURED BASELINE — 2026-08-29, at HEAD of task 3500's branch (which
-    touches no sidecar, so the corpus is main's): 563 grep descriptors, 6
-    structural violations — 4 `vacuous_present_comment_only`, 1
-    `vacuous_present_self_referential`, 1 `filename_shaped`. Two of the six
-    are the specimens the task was filed on: the `archive_task_transcripts`
-    comment-only match in `git_ops.py` (t2792) and the
-    `test_workflow_merge_gating_strand` filename-shaped descriptor (task 3536).
-    The baseline is recorded here rather than asserted as a count: a count
-    assertion would go red on an unrelated sidecar landing, and
-    `_KNOWN_STRUCTURAL_DEBT` already pins the identities exactly.
-    REBASELINED 2026-09-28 on merging main: three entries had been repaired
-    by later work and were deleted (3536's descriptor included), and three
-    comment-only descriptors from sidecars landed since were added; the
-    per-row diagnosis is in that commit's message.
-
-    RED SIGNAL, PROVEN BY MUTATION. A ratchet frozen at today's measurement is
-    green on arrival by construction, which is inherent to the shape and not a
-    reason to trust it unverified — so both halves were mutated, following
-    TestCheckedInManifestCorpus's precedent: (1) dropping one real violator
-    from `_KNOWN_STRUCTURAL_DEBT` turned that descriptor's row red with the
-    attributed message while a clean descriptor's row stayed green; (2)
-    inserting an entry for a descriptor that does not violate turned
-    test_every_allowlisted_descriptor_still_violates red naming it.
-    """
-
-    def test_grep_check_corpus_is_not_vacuous(self):
-        # @pytest.mark.parametrize over an empty list collects ZERO cases and
-        # reports success — the precise silent-pass this guard exists to
-        # remove. Skip (not fail) on a non-checkout, mirroring
-        # test_script_check_corpus_is_not_vacuous.
-        if discover_manifests() is None:
-            pytest.skip('not a git checkout (git ls-files failed)')
-        assert _GREP_CHECKS, 'no kind: grep delivered_check found in any checked-in sidecar'
-
-    def test_sweep_covers_every_declared_grep_check(self):
-        # Non-vacuity only asserts non-empty, so a single sidecar going
-        # tracked-but-absent or temporarily schema-invalid would drop its
-        # whole block of descriptors out of iter_grep_checks' swallow with
-        # this class still green — silently un-ratcheting them. Same
-        # cross-check discipline as test_sweep_covers_every_declared_script_check:
-        # re-derive the expected count by regex over raw sidecar TEXT,
-        # bypassing the loader entirely, and assert EQUALITY rather than a
-        # hand-bumped floor.
-        if discover_manifests() is None:
-            pytest.skip('not a git checkout (git ls-files failed)')
-        declared = 0
-        for path in _MANIFEST_PATHS:
-            try:
-                text = path.read_text(encoding='utf-8')
-            except OSError:
-                pytest.fail(_missing_from_worktree_message(path))
-            declared += len(_GREP_KIND_RE.findall(text))
-        assert len(_GREP_CHECKS) == declared, (
-            f'{declared} `kind: grep` checks are declared across the checked-in '
-            f'sidecars but only {len(_GREP_CHECKS)} reached the sweep — '
-            'iter_grep_checks dropped one (unloadable or schema-invalid sidecar; '
-            'see TestCheckedInManifestCorpus for the attributed error), so it is '
-            'silently un-ratcheted'
-        )
-
-    # The whole corpus is swept on the first of these to run; the rest read
-    # the cache. 300s covers that one-off sweep against pyproject's 60s
-    # default, which pytest-timeout applies per test item.
-    @pytest.mark.timeout(300)
-    @pytest.mark.parametrize('ref', _GREP_CHECKS, ids=_GREP_CHECK_IDS)
-    def test_descriptor_has_no_unallowlisted_structural_defect(self, ref):
-        if not _CORPUS_DISCOVERABLE:
-            pytest.skip('not a git checkout (git ls-files failed)')
-        code = _structural_sweep()[ref]
-        if code is None:
-            return
-        key = _structural_debt_key(ref, code)
-        assert key in _KNOWN_STRUCTURAL_DEBT, (
-            f'{key[0]}: task {ref.task_label}: capability {ref.capability!r} declares a '
-            f'{code} delivered_check (pattern {ref.pattern!r}) that is NOT in '
-            f'_KNOWN_STRUCTURAL_DEBT. shared.delivered_check_polarity rejects this '
-            f'shape at authoring time, so a NEW one means the descriptor was written '
-            f'around the gate rather than through it. Fix the descriptor — assert a '
-            f'symbol the implementation introduces, in live code, scoped to the code '
-            f'rather than to plans/ — instead of widening the allowlist.'
-        )
-
-    @pytest.mark.timeout(300)
-    def test_every_allowlisted_descriptor_still_violates(self):
-        # The anti-rot half. Without it the allowlist only ever grows: a
-        # descriptor someone else repairs leaves a stale entry that silently
-        # re-permits the same defect if the same key is ever re-declared.
-        if not _CORPUS_DISCOVERABLE:
-            pytest.skip('not a git checkout (git ls-files failed)')
-        live = {
-            _structural_debt_key(ref, code)
-            for ref, code in _structural_sweep().items()
-            if code is not None
-        }
-        stale = sorted(_KNOWN_STRUCTURAL_DEBT - live)
-        assert not stale, (
-            f'{len(stale)} _KNOWN_STRUCTURAL_DEBT entries no longer violate — the '
-            f'descriptor was repaired (or removed) and the allowlist entry must be '
-            f'deleted, not left to re-permit the defect: {stale}'
         )
 
 
