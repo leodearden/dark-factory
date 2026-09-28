@@ -18,8 +18,9 @@ to ``action="create"`` so task creation is never blocked.
 A timed-out LLM call is classified from its own transcript when the curator is gated
 (task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
 escalation that folds into one record per project; a run killed with progress returns
-its completed StructuredOutput verdict if the transcript holds one, else escalates with
-its real turn count and tool sequence; any non-schema tool use logs a loud WARNING.
+a verdict the CLI accepted (its ``structured_output`` attachment) if the transcript
+holds one, else escalates with its real turn count and tool sequence; any non-schema
+tool use logs a loud WARNING. A schema-tool denial is always escalated, never salvaged.
 
 Batch API (task 924)
 --------------------
@@ -190,6 +191,27 @@ def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
         ),
         base_dir=base_dir,
     )
+
+
+def _salvageable_verdict(
+    agent_result: AgentResult, evidence: TranscriptEvidence | None,
+) -> dict | None:
+    """The verdict a failed call may be salvaged with, else None.
+
+    Only a run that was KILLED (so its stdout never arrived) after the CLI
+    accepted its verdict qualifies. Any other failure's stdout was already
+    parsed by ``_parse_claude_output``, which owns stdout salvage, and a denied
+    schema tool must reach its loud escalation.
+    """
+    if (
+        not agent_result.timed_out
+        or agent_result.schema_tool_denied
+        or agent_result.structured_output is not None
+        or evidence is None
+    ):
+        return None
+    return evidence.accepted_schema_payload
+
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
@@ -2920,41 +2942,37 @@ class TaskCurator:
     def _resolve_failed_result(
         self, agent_result: AgentResult, transcript_scope: Mapping[str, Any],
     ) -> tuple[AgentResult, TranscriptEvidence | None]:
-        """Salvage a failed call's completed verdict from its own transcript.
+        """Read a failed call's transcript evidence, and salvage its verdict if allowed.
 
         Returns ``(result, evidence)``. A successful result comes back unchanged
-        and unread. A failed one gets ONE evidence read; when stdout delivered no
-        structured output but the transcript holds a completed StructuredOutput,
-        the result becomes a success carrying that payload, so the verdict meets
-        exactly the parsing and validation a returned one does.
+        and unread. A failed one gets ONE evidence read, for reporting.
+        Salvage is only for a run KILLED after the CLI accepted its verdict (the
+        transcript's ``structured_output`` attachment). The result then becomes
+        a success carrying that verdict, which meets exactly the parsing and
+        validation a returned one does. A denied or non-kill failure is never
+        salvaged.
 
         Known limitation: when ``invoke_with_cap_retry`` re-mints the session id
         for a fresh retry (after a cap hit or a pre-turn rejection,
         ``_reset_for_fresh_retry``), the curator's session id names an EARLIER
         attempt. Evidence is then absent or stale. That can only cause a missed
         salvage, never a false one, since a capped or rejected attempt has no
-        completed StructuredOutput.
+        acceptance record.
         """
         if agent_result.success:
             return agent_result, None
         evidence = self._read_failure_evidence(transcript_scope)
-        if (
-            evidence is None
-            or evidence.accepted_schema_payload is None
-            or agent_result.structured_output is not None
-        ):
+        verdict = _salvageable_verdict(agent_result, evidence)
+        if verdict is None:
             return agent_result, evidence
         logger.warning(
-            'TaskCurator: salvaged a completed verdict from the transcript of failed '
+            'TaskCurator: salvaged an accepted verdict from the transcript of killed '
             'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
             transcript_scope.get('session_id'), agent_result.subtype,
-            agent_result.transcript_turns, json.dumps(evidence.accepted_schema_payload, default=str),
+            agent_result.transcript_turns, json.dumps(verdict, default=str),
         )
         salvaged = replace(
-            agent_result,
-            success=True,
-            structured_output=evidence.accepted_schema_payload,
-            schema_salvaged=True,
+            agent_result, success=True, structured_output=verdict, schema_salvaged=True,
         )
         return salvaged, evidence
 
