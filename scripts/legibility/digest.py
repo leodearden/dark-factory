@@ -601,8 +601,8 @@ def _dialogue_text_sources(
     assistant_text: bool = False,
     user_text: bool = False,
 ) -> list[tuple[int, str]]:
-    """The carriers :func:`_signal_text_sources` yields, minus every one that
-    is re-ingested machine content (:func:`is_reingested_content`).
+    """The carriers :func:`_signal_text_sources` yields, minus every one
+    :func:`_is_non_dialogue_carrier` rejects.
 
     Two layers, two questions: :func:`_signal_text_sources` answers "which
     native carriers exist", and this answers "which of them are this
@@ -625,7 +625,7 @@ def _dialogue_text_sources(
             assistant_text=assistant_text,
             user_text=user_text,
         )
-        if not is_reingested_content(text)
+        if not _is_non_dialogue_carrier(records[index], text)
     ]
 
 
@@ -689,6 +689,35 @@ def is_reingested_content(text: str) -> bool:
     addition to this union.
     """
     return is_coder_judgment_payload(text) or is_harness_injected_turn(text)
+
+
+HUMAN_ORIGIN_KIND: str = 'human'
+"""The only Claude Code ``origin.kind`` that asserts a human typed the record."""
+
+
+def has_non_human_origin(record: dict[str, Any]) -> bool:
+    """True when *record*'s own structured provenance names a non-human
+    producer: Claude Code stamps queued user prompts with ``origin`` (a
+    background task-notification, an auto-continuation, a coordinator or
+    peer message, ...), and any kind but :data:`HUMAN_ORIGIN_KIND` counts.
+
+    Unknown provenance -- no ``origin``, a non-dict one, or one without a str
+    ``kind`` -- answers False, so the record falls through to the text rules.
+    Why there is no text fallback: plans/confusion-reduction-prd.md §7.2.2
+    (generation 4).
+    """
+    origin = record.get('origin')
+    if not isinstance(origin, dict):
+        return False
+    kind = origin.get('kind')
+    return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
+
+
+def _is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
+    """The ONE question the gold bucket and every signal detector ask of a
+    carrier: the record half is provenance, the text half is content. The
+    record half covers every carrier the record holds, tool_results included."""
+    return has_non_human_origin(record) or is_reingested_content(text)
 
 
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1333,17 +1362,20 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and re-ingested machine content
-    (:func:`is_reingested_content`): a pasted coder judgment, and every
-    harness-injected briefing/prompt/report/context-block turn -- the
-    orchestrator briefing, the trickle-coder and resume prompts, the
-    reconciliation judge's run-review prompt and a lone memory-context
-    block alike (see :func:`is_harness_injected_turn`). Every one of those
-    injected shapes lands in the transcript as ordinary user-role text
-    (isMeta unset), so isMeta alone cannot exclude any of them. The gold
-    bucket asks the SAME predicate every scalar detector asks rather than
-    holding a private copy of the rule: task 5685's ruling that the fix
-    belongs at the content-classification layer, not per bucket.
+    entirely tool_result blocks, a record whose harness provenance names a
+    non-human producer (:func:`has_non_human_origin` -- a background-task
+    notification, an auto-continuation, a coordinator or peer message), and
+    re-ingested machine content (:func:`is_reingested_content`): a pasted
+    coder judgment, and every harness-injected briefing/prompt/report/
+    context-block turn -- the orchestrator briefing, the trickle-coder and
+    resume prompts, the reconciliation judge's run-review prompt and a lone
+    memory-context block alike (see :func:`is_harness_injected_turn`). Every
+    one of those injected shapes lands in the transcript as ordinary
+    user-role text (isMeta unset), so isMeta alone cannot exclude any of
+    them. The gold bucket asks the SAME predicate every scalar detector asks
+    (:func:`_is_non_dialogue_carrier`) rather than holding a private copy of
+    the rule: task 5685's ruling that the fix belongs at the
+    content-classification layer, not per bucket.
 
     This function is the SINGLE source for both the gold user_corrections
     section and render_digest's n_user_turns score component, so this one
@@ -1364,7 +1396,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if is_reingested_content(text):
+        if _is_non_dialogue_carrier(record, text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
@@ -1384,7 +1416,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 3
+DIGEST_INSTRUMENT_VERSION: int = 4
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1405,6 +1437,9 @@ keys do NOT bump it.
   3 -- the re-ingested-content classifier (:func:`is_reingested_content`,
        task 5685), consulted by every text-pattern detector and the
        gold-turn filter.
+  4 -- the non-human-origin record rule (:func:`has_non_human_origin`,
+       task 5956), consulted with the content classifier by the gold-turn
+       filter and every dialogue carrier.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
