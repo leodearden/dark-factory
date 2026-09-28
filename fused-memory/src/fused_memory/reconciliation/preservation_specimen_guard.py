@@ -49,7 +49,7 @@ VERBATIM while only the suppression ROW side is decomposed (see
 side), so a suppression row for ``'3105'`` still does not match a finding
 carrying ``'3105,4223'``.  Inheriting that gap would make this guard
 zero-recall on exactly the task it exists to protect.  The flag-side splitter
-followed here is ``_cluster_growth_candidate_task_ids`` (task 3476).
+followed here is ``_flag_candidate_task_ids`` (task 3476).
 
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
@@ -377,7 +377,7 @@ def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
     and a separator-only value (``','``) yields no candidates rather than a junk
     id.
 
-    This follows :func:`~fused_memory.reconciliation.flag_dedup._cluster_growth_candidate_task_ids`
+    This follows :func:`~fused_memory.reconciliation.flag_dedup._flag_candidate_task_ids`
     (task 3476), the existing FLAG-side splitter — deliberately not
     ``_decompose_suppression_task_id``, whose docstring scopes it to the
     suppression ROW side only.

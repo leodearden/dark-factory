@@ -21,7 +21,14 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
@@ -5891,6 +5898,247 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
             'acknowledge_resolved_flags so its stage1_flag_marker is reclaimed; got '
             f'{call_kwargs.get("resolved_flags")!r}'
         )
+
+
+async def _run_consolidator_filter_chain(
+    stage: MemoryConsolidator,
+    flags: list[dict],
+    *,
+    events: list | None = None,
+) -> tuple[StageReport, list[list[dict]], AsyncMock]:
+    """Run *stage* over an LLM report carrying *flags*, through the real filter chain.
+
+    Returns the final report, every flag list dedup_flags was handed, and the
+    acknowledge_resolved_flags mock.  filter_false_absence_flags is a
+    passthrough so only the chain under test decides what survives.
+    """
+    base_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=list(flags),
+        stats={},
+        llm_calls=1,
+        tokens_used=100,
+    )
+    dedup_call_args: list[list[dict]] = []
+
+    async def _dedup_spy(**kwargs):
+        dedup_call_args.append(kwargs.get('flags', []))
+        return kwargs.get('flags', [])
+
+    ack_mock = AsyncMock(return_value=1)
+    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    with (
+        patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+        patch(f'{module}.dedup_flags', new=_dedup_spy),
+        patch(
+            f'{module}.filter_false_absence_flags',
+            new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+        ),
+        patch(f'{module}.acknowledge_resolved_flags', new=ack_mock),
+    ):
+        report = await stage.run(
+            events=[] if events is None else events,
+            watermark=Watermark(project_id=stage.project_id),
+            prior_reports=[],
+            run_id='r-test',
+        )
+    return report, dedup_call_args, ack_mock
+
+
+class TestMemoryConsolidatorAlreadyRecordedCaveatFilter:
+    """filter_already_recorded_caveat_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271).
+
+    A premature-widening-caveat flag whose cited caveat-source memory id is
+    already in the task's live metadata is dropped before dedup_flags, counted
+    in already_recorded_caveat_flags_dropped, and reclaimed as RESOLVED via
+    acknowledge_resolved_flags(mode='delete').
+    """
+
+    _CAVEAT_MEMORY_ID = '6597957b-2269-4913-b4a3-8c5bff0df51d'
+
+    def _stage(self, *, hint_queries: list[str]) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('pump_web_ui', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        task_18 = {
+            'id': 18,
+            'title': 'Widen the pump-curve evidence window',
+            'status': 'pending',
+            'description': '',
+            'details': '',
+            'metadata': {'memory_hints': {'queries': hint_queries}},
+        }
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(
+            side_effect=lambda tid, root: task_18 if str(tid) == '18' else {'status': 'pending'}
+        )
+        return stage
+
+    def _caveat_flag(self) -> dict:
+        return {
+            'task_id': '18',
+            'flag_type': 'premature_widening_evidence_caveat',
+            'category': 'task_metadata_gap',
+            'description': (
+                "Task 18's metadata.memory_hints still lacks the premature-widening "
+                'evidence caveat.'
+            ),
+            'cited_tasks': [{'project_id': 'pump_web_ui', 'task_id': '18', 'title': 't'}],
+            'cited_memories': [{'memory_id': self._CAVEAT_MEMORY_ID, 'store': 'mem0'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_recorded_caveat_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(hint_queries=[
+            'task 18 temporal caveat recorded 2026-07-30c. '
+            f'Full rationale: Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+        ])
+        caveat_flag = self._caveat_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [caveat_flag, survivor],
+        )
+
+        assert caveat_flag not in (report.items_flagged or []), (
+            "the caveat is already in task 18's live metadata, so the flag must "
+            'be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert caveat_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        assert survivor in dedup_call_args[0]
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [caveat_flag], (
+            'the drop is a RESOLUTION, so exactly the caveat flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_caveat_survives_with_a_zero_stat(self):
+        stage = self._stage(hint_queries=['pump curve evidence window widening'])
+        caveat_flag = self._caveat_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(stage, [caveat_flag])
+
+        assert caveat_flag in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+
+
+class TestMemoryConsolidatorBenignSweepDeletionFilter:
+    """filter_benign_sweep_deletion_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271), over the events run() was handed.
+
+    A deletion-pattern flag whose swept id a documented sweep tombstoned is
+    dropped before dedup_flags, counted in benign_sweep_deletion_flags_dropped,
+    and reclaimed as RESOLVED via acknowledge_resolved_flags(mode='delete').
+    """
+
+    _SWEPT = '445c97ac-14d7-4956-9e46-e4475eecff16'
+
+    def _stage(self, *, tombstoned: bool) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+        trim = {'deleter': 'stage1_cycle_summary_trim', 'deleting_run_id': 'run-trim'}
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=lambda pid, mid: trim if tombstoned and mid == self._SWEPT else None
+        )
+        return stage
+
+    def _deletion_flag(self) -> dict:
+        return {
+            'task_id': '165',
+            'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+            'description': (
+                f'Evidentiary-anchor deletion recurs: mem0 {self._SWEPT} deleted '
+                '+0.065s after the ledger-stamp write.'
+            ),
+        }
+
+    def _deleted_event(self) -> ReconciliationEvent:
+        return ReconciliationEvent(
+            id='evt-deleted',
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id='p',
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': self._SWEPT},
+        )
+
+    @pytest.mark.asyncio
+    async def test_benign_sweep_flag_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(tombstoned=True)
+        deletion_flag = self._deletion_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [deletion_flag, survivor], events=[self._deleted_event()],
+        )
+
+        assert deletion_flag not in (report.items_flagged or []), (
+            'the only swept id carries a documented trim tombstone, so the flag '
+            'describes a designed sweep and must be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert deletion_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [deletion_flag], (
+            'the drop is a RESOLUTION, so exactly the deletion flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.parametrize(('with_event', 'decision'), [
+        (True, 'kept_unexplained_deletion'),
+        (False, 'kept_no_swept_ids'),
+    ])
+    @pytest.mark.asyncio
+    async def test_gate_reads_the_events_run_was_given(self, with_event, decision):
+        """Untombstoned, the id is swept only if run()'s events deleted it."""
+        stage = self._stage(tombstoned=False)
+        deletion_flag = self._deletion_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(
+            stage,
+            [deletion_flag],
+            events=[self._deleted_event()] if with_event else [],
+        )
+
+        survivors = [
+            f for f in report.items_flagged or []
+            if f.get('flag_type') == deletion_flag['flag_type']
+        ]
+        assert len(survivors) == 1, f'the flag must survive; got {report.items_flagged!r}'
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+        assert survivors[0]['sweep_deletion_provenance']['decision'] == decision
 
 
 # ---------------------------------------------------------------------------
