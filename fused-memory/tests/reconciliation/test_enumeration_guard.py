@@ -242,7 +242,13 @@ class TestPassThrough:
 # CHANGE 1(a): the fragment shape check
 # --------------------------------------------------------------------------- #
 
-FULL_UUID_HINT = validate_full_uuid('21f78de1')['hint']
+def uuid_shape_error(value: str, **kwargs: str) -> dict[str, str]:
+    error = validate_full_uuid(value, **kwargs)
+    assert error is not None
+    return error
+
+
+FULL_UUID_HINT = uuid_shape_error('21f78de1')['hint']
 
 # (payload, [(path, fragment), ...]) — each a list-element fragment the shape
 # check must name.
@@ -319,7 +325,7 @@ class TestTruncatedFragmentShape:
         ]
         assert rejection['hint'] == FULL_UUID_HINT
         for path, value in offenders:
-            assert validate_full_uuid(value, field_name=path)['error'] in (
+            assert uuid_shape_error(value, field_name=path)['error'] in (
                 rejection['error']
             )
         service.get_memory_by_id.assert_not_awaited()
@@ -593,6 +599,7 @@ class TestDescriptionAnnotation:
             description=GATE_5537_DESCRIPTION,
         )
 
+        assert result.description is not None
         before = GATE_5537_DESCRIPTION.split('\n')
         after = result.description.split('\n')
         assert len(after) == len(before)
@@ -617,6 +624,7 @@ class TestDescriptionAnnotation:
             description=description,
         )
 
+        assert result.description is not None
         assert result.description.startswith(description)
         assert 'liveness inconclusive (TimeoutError)' in result.description
         assert 'deleted' not in result.description

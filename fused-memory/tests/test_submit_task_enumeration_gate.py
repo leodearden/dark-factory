@@ -121,7 +121,8 @@ async def submit(
 
 def forwarded(interceptor_method: AsyncMock) -> dict[str, Any]:
     interceptor_method.assert_awaited_once()
-    return interceptor_method.await_args.kwargs
+    assert interceptor_method.await_args is not None
+    return dict(interceptor_method.await_args.kwargs)
 
 
 class TestSubmitTask:
@@ -243,6 +244,7 @@ class TestUpdateTask:
         assert metadata['mem0_falsified_entries'] == list(LIVE_IDS)
         assert [r['outcome'] for r in metadata['x_liveness_exceptions']] == ['absent']
         assert 'x_liveness_reverified_at' in metadata
+        assert description is not None
         assert 'already deleted, verified' in description.split('\n')[2]
         assert result['enumeration_liveness']['dropped_absent'] == 1
 
