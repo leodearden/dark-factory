@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.pins import classify_pins
+from shared import delivered_check_polarity
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -8292,8 +8293,6 @@ class Harness:
         parsed = self._parse_delivered_check_detail(detail)
         if parsed is None:
             return None
-        from shared import delivered_check_polarity  # noqa: PLC0415
-
         findings = [
             f
             for f in delivered_check_polarity.lint_delivered_checks(
@@ -8401,9 +8400,12 @@ class Harness:
         # the escalation is the load-bearing signal and the diagnosis is an
         # enhancement to it, so a lint failure must cost the enhancement and
         # nothing else. Runs AFTER the dedupe read so it can neither trigger a
-        # second file nor change what the existing one matches on.
+        # second file nor change what the existing one matches on, and in a
+        # worker thread because the lint shells out to git.
         try:
-            diagnosis = self._diagnose_delivered_check_authoring(detail)
+            diagnosis = await asyncio.to_thread(
+                self._diagnose_delivered_check_authoring, detail
+            )
         except Exception:
             logger.warning(
                 'Delivered-check block for task %s — authoring diagnosis '

@@ -33,6 +33,7 @@ exclusively through ``acquire_next()``'s returned ``TaskAssignment`` / None
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -805,6 +806,41 @@ class TestAuthoringDefectIsDistinguishable:
             (t['status'] for t in session.tasks if str(t.get('id')) == 'D3500C'), None,
         )
         assert status == 'blocked'
+
+    @pytest.mark.asyncio
+    async def test_the_diagnosis_runs_off_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lint shells out to git (bounded at 30 s per probe); run on the
+        orchestrator's event loop it would stall every other coroutine for
+        that long. It must run in a worker thread."""
+        import shared.delivered_check_polarity as polarity
+
+        real_lint = polarity.lint_delivered_checks
+        loop_running_in_lint_thread: list[bool] = []
+
+        def _recording_lint(*args, **kwargs):
+            try:
+                asyncio.get_running_loop()
+                loop_running_in_lint_thread.append(True)
+            except RuntimeError:
+                loop_running_in_lint_thread.append(False)
+            return real_lint(*args, **kwargs)
+
+        monkeypatch.setattr(polarity, 'lint_delivered_checks', _recording_lint)
+
+        harness, _session = _drive_to_l2(
+            tmp_path / 'off-loop', tmp_path / 'esc',
+            marker_rel_path=_MISAUTHORED_REL_PATH,
+            check=_grep_check(
+                _MISAUTHORED_CAP, _MISAUTHORED_PATTERN, [_MISAUTHORED_REL_PATH],
+            ),
+            producer_id='P3500F', dependent_id='D3500F',
+        )
+        escs = await _tick_through_grace(harness, 'D3500F')
+
+        assert len(escs) == 1 and 'AUTHORING DIAGNOSIS' in escs[0].detail
+        assert loop_running_in_lint_thread == [False]
 
     @pytest.mark.asyncio
     async def test_dedupe_is_unchanged_by_the_diagnosis(self, tmp_path: Path) -> None:
