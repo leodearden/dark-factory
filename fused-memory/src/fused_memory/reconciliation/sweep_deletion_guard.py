@@ -30,35 +30,23 @@ from collections.abc import Iterable
 from typing import Any
 
 from fused_memory.models.reconciliation import EventType, ReconciliationEvent
-from fused_memory.reconciliation.flag_dedup import (
-    canonical_flag_type_family,
-    extract_flag_uuids,
-)
+from fused_memory.reconciliation.flag_dedup import FlagTypeFamily, extract_flag_uuids
 from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
 
 logger = logging.getLogger(__name__)
 
-#: ``flag_type`` spellings Stage 1 has used for this finding, as measured in
-#: reconciliation.db's stage reports.  Reworded / reordered / re-cased variants
-#: of these also match, via :func:`canonical_flag_type_family`.
-EVIDENTIARY_ANCHOR_DELETION_FLAG_TYPES: frozenset[str] = frozenset({
-    'mem0_evidentiary_anchor_deletion_pattern',
-    'mem0_evidentiary_anchor_full_mirror_loss',
-    'cycle_summary_evidentiary_anchor_mirror_deletion_confirmed',
-})
-
-_EVIDENTIARY_ANCHOR_DELETION_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in EVIDENTIARY_ANCHOR_DELETION_FLAG_TYPES
+#: The finding's spellings as measured in reconciliation.db's stage reports.
+EVIDENTIARY_ANCHOR_DELETION_FAMILY = FlagTypeFamily(
+    name='evidentiary_anchor_deletion',
+    spellings=frozenset({
+        'mem0_evidentiary_anchor_deletion_pattern',
+        'mem0_evidentiary_anchor_full_mirror_loss',
+        'cycle_summary_evidentiary_anchor_mirror_deletion_confirmed',
+    }),
+    drift_token='anchor',
 )
 
 _BENIGN_SWEEP_DELETERS: frozenset[str] = frozenset(MEM0_TOMBSTONE_DELETERS)
-
-
-def _is_evidentiary_anchor_deletion_flag_type(flag_type: Any) -> bool:
-    return (
-        isinstance(flag_type, str)
-        and canonical_flag_type_family(flag_type) in _EVIDENTIARY_ANCHOR_DELETION_FAMILIES
-    )
 
 
 def _deleted_memory_ids(events: Iterable[ReconciliationEvent]) -> set[str]:
@@ -110,24 +98,6 @@ def _swept_record(memory_id: str, tombstone: dict[str, Any] | None) -> dict[str,
     }
 
 
-def _log_possible_drift(flags: list[dict[str, Any]]) -> None:
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and 'anchor' in ft.casefold()
-        and not _is_evidentiary_anchor_deletion_flag_type(ft)
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.benign_sweep_deletion_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update EVIDENTIARY_ANCHOR_DELETION_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(EVIDENTIARY_ANCHOR_DELETION_FLAG_TYPES),
-        )
-
-
 async def filter_benign_sweep_deletion_flags(
     memory_service: Any,
     project_id: str,
@@ -166,9 +136,11 @@ async def filter_benign_sweep_deletion_flags(
     named_by_pos: dict[int, set[str]] = {
         i: extract_flag_uuids(flag)
         for i, flag in enumerate(flags)
-        if _is_evidentiary_anchor_deletion_flag_type(flag.get('flag_type'))
+        if EVIDENTIARY_ANCHOR_DELETION_FAMILY.matches(flag.get('flag_type'))
     }
-    _log_possible_drift(flags)
+    EVIDENTIARY_ANCHOR_DELETION_FAMILY.log_drift(
+        flags, log_event='reconciliation.benign_sweep_deletion_filter_possible_drift',
+    )
     if not named_by_pos:
         return list(flags)
 

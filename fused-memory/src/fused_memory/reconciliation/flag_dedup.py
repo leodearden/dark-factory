@@ -349,6 +349,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import cached_property
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
@@ -495,6 +496,59 @@ def canonical_flag_type_family(flag_type: str) -> str:
     """
     tokens = _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold())
     return '_'.join(sorted({t for t in tokens if t}))
+
+
+@dataclass(frozen=True)
+class FlagTypeFamily:
+    """The ``flag_type`` spellings of one Stage-1 finding that a filter acts on.
+
+    ``flag_type`` is LLM-authored with no committed schema entry, so a filter
+    keyed on it goes silently inert whenever Stage 1 coins a new spelling.
+    :meth:`matches` tolerates what :func:`canonical_flag_type_family`
+    collapses, and :meth:`log_drift` makes the rest observable.
+
+    ``name`` labels the family in the drift log; ``spellings`` are the
+    measured ones; ``drift_token`` marks a ``flag_type`` as probably meant for
+    this family.  A non-empty ``unseen_spelling_tokens`` also admits a
+    never-observed spelling whose tokens include all of them.
+    """
+
+    name: str
+    spellings: frozenset[str]
+    drift_token: str
+    unseen_spelling_tokens: frozenset[str] = frozenset()
+
+    @cached_property
+    def _canonical_spellings(self) -> frozenset[str]:
+        return frozenset(canonical_flag_type_family(s) for s in self.spellings)
+
+    def matches(self, flag_type: Any) -> bool:
+        """True iff *flag_type* is a spelling of this family; ``False`` for any non-``str``."""
+        if not isinstance(flag_type, str) or not flag_type:
+            return False
+        if canonical_flag_type_family(flag_type) in self._canonical_spellings:
+            return True
+        tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
+        return bool(self.unseen_spelling_tokens) and self.unseen_spelling_tokens <= tokens
+
+    def log_drift(self, flags: list[dict[str, Any]], *, log_event: str) -> None:
+        """Log as *log_event* each ``flag_type`` carrying ``drift_token`` that does not match."""
+        unmatched = [
+            ft
+            for flag in flags
+            if isinstance(ft := flag.get('flag_type'), str)
+            and self.drift_token in ft.casefold()
+            and not self.matches(ft)
+        ]
+        if unmatched:
+            logger.info(
+                '%s family=%s unmatched_flag_types=%s known_types=%s '
+                '— add the spelling to that FlagTypeFamily if drift confirmed',
+                log_event,
+                self.name,
+                unmatched,
+                sorted(self.spellings),
+            )
 
 
 #: ``(project_id, task_id, family)`` keys for which :func:`filter_suppressed`
@@ -5497,63 +5551,34 @@ async def filter_style_only_authorship_flags(
 # Accounted duplicate-cluster-growth guard (task-3476)
 # ---------------------------------------------------------------------------
 
-#: ``flag_type`` spellings OBSERVED on Stage-1 duplicate-cluster-growth findings
-#: (task 3476).  Deliberately NOT a closed set: these two are the spellings the
-#: run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident actually
-#: produced, and ``flag_type`` is LLM-authored with no committed schema entry
-#: (``grep -rn cluster_growth fused-memory/`` returned zero hits before this
-#: change).  Kept as documentation and as the drift log's reference point;
-#: :func:`_is_cluster_growth_flag_type` also accepts unlisted spellings that
-#: carry both the ``cluster`` and ``growth`` tokens.
-CLUSTER_GROWTH_FLAG_TYPES: frozenset[str] = frozenset({
-    'procedural_knowledge_cluster_growth',
-    'duplicate_procedural_knowledge_cluster_growth',
-})
-
-#: Precomputed canonical-family keys for :data:`CLUSTER_GROWTH_FLAG_TYPES` so a
-#: reworded / reordered / re-cased LLM spelling of a KNOWN flag_type still
-#: matches (mirrors :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
-_CLUSTER_GROWTH_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in CLUSTER_GROWTH_FLAG_TYPES
+#: The duplicate-cluster-growth finding (task 3476).  ``spellings`` are the two
+#: the run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident
+#: produced; they are observed samples, not a closed set (``grep -rn
+#: cluster_growth fused-memory/`` returned zero hits before task 3476), so the
+#: family also admits any unseen spelling carrying both the ``cluster`` and
+#: ``growth`` tokens (``'mem0_duplicate_cluster_growth'``,
+#: ``'memory_cluster_growth_detected'``).
+#:
+#: That token arm is deliberately BROADER than the exact-family matching used
+#: by the sibling filters (:func:`filter_terminal_metadata_flags`,
+#: :func:`filter_stale_bulk_get_statuses_flags`,
+#: :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
+#: a way it is not for :func:`filter_suppressed`, whose family collisions can
+#: hide a genuinely-recurring finding for cycles: this family only ever admits
+#: a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS solely
+#: after positively confirming that EVERY cited memory UUID is already written
+#: into the referenced task's own description body.  A mis-classified
+#: flag_type can therefore only ever reclassify a finding that is, by
+#: construction, already accounted for -- never silence an unaccounted one.
+CLUSTER_GROWTH_FAMILY = FlagTypeFamily(
+    name='cluster_growth',
+    spellings=frozenset({
+        'procedural_knowledge_cluster_growth',
+        'duplicate_procedural_knowledge_cluster_growth',
+    }),
+    drift_token='cluster',
+    unseen_spelling_tokens=frozenset({'cluster', 'growth'}),
 )
-
-
-def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
-    """True iff *flag_type* names a duplicate-cluster-growth finding (task 3476).
-
-    Two independent arms:
-
-    1. :func:`canonical_flag_type_family` membership in
-       :data:`_CLUSTER_GROWTH_FAMILIES` -- catches case, separator, whitespace
-       and word-order variants of a spelling we have actually seen.
-    2. The TOKEN PAIR test: the casefolded flag_type, tokenized with
-       :data:`_FLAG_TYPE_TOKEN_SPLIT_RE`, contains BOTH ``'cluster'`` and
-       ``'growth'`` -- catches spellings we have not seen
-       (``'mem0_duplicate_cluster_growth'``, ``'memory_cluster_growth_detected'``).
-
-    Arm 2 is deliberately BROADER than the exact-family-set matching used by
-    the sibling filters (:func:`filter_terminal_metadata_flags`,
-    :func:`filter_stale_bulk_get_statuses_flags`,
-    :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
-    a way it is not for :func:`filter_suppressed`, whose family collisions can
-    hide a genuinely-recurring finding for cycles: this predicate only ever
-    admits a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS
-    solely after positively confirming that EVERY cited memory UUID is already
-    written into the referenced task's own description body.  A mis-classified
-    flag_type can therefore only ever reclassify a finding that is, by
-    construction, already accounted for -- never silence an unaccounted one.
-
-    Total over malformed LLM-authored input: a non-``str`` (``None``, an int, a
-    list) returns ``False`` rather than raising.
-
-    Pure, sync, no I/O.
-    """
-    if not isinstance(flag_type, str) or not flag_type:
-        return False
-    if canonical_flag_type_family(flag_type) in _CLUSTER_GROWTH_FAMILIES:
-        return True
-    tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
-    return 'cluster' in tokens and 'growth' in tokens
 
 
 def _flag_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
@@ -5716,15 +5741,15 @@ class _TaskTextAccountingGate:
 
     Consumed by :func:`_drop_flags_accounted_in_task_text`.  Each field is one
     way the gates built on it differ: which flags are candidates, which task
-    text is read, and how the gate names itself in its logs.
+    text is read, and the full name of each event the gate logs.
     """
 
-    log_prefix: str
-    is_candidate_flag_type: Callable[[Any], bool]
-    drift_token: str
-    known_flag_types: frozenset[str]
-    known_flag_types_name: str
+    family: FlagTypeFamily
     task_text: Callable[[dict[str, Any]], str]
+    drift_event: str
+    unconfirmable_event: str
+    get_task_error_event: str
+    dropped_event: str
 
 
 async def _drop_flags_accounted_in_task_text(
@@ -5756,7 +5781,7 @@ async def _drop_flags_accounted_in_task_text(
 
     for i, flag in enumerate(flags):
         flag_type = flag.get('flag_type')
-        if not gate.is_candidate_flag_type(flag_type):
+        if not gate.family.matches(flag_type):
             continue
         memory_ids = _flag_cited_memory_ids(flag)
         task_ids = _flag_candidate_task_ids(flag)
@@ -5770,28 +5795,7 @@ async def _drop_flags_accounted_in_task_text(
         cited_by_pos[i] = memory_ids
         task_ids_by_pos[i] = task_ids
 
-    # Detect potential LLM naming drift: flag_type strings that look like this
-    # family (contain gate.drift_token) but that gate.is_candidate_flag_type does
-    # not match.  flag_type has no committed schema entry, so an unrecognised
-    # spelling would silently make the guard a no-op; this log makes that
-    # observable (the filter_terminal_metadata_flags drift-log precedent).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and gate.drift_token in ft.casefold()
-        and not gate.is_candidate_flag_type(ft)
-    ]
-    if drift_candidates:
-        logger.info(
-            '%s_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update %s if drift confirmed',
-            gate.log_prefix,
-            drift_candidates,
-            sorted(gate.known_flag_types),
-            gate.known_flag_types_name,
-        )
+    gate.family.log_drift(flags, log_event=gate.drift_event)
 
     # The drift log above sees only ONE of the ways this guard goes silently
     # no-op.  A flag whose flag_type matched perfectly well but that cites
@@ -5801,10 +5805,9 @@ async def _drop_flags_accounted_in_task_text(
     # saying so.  Same aggregate-per-call shape as the drift log.
     if unconfirmable:
         logger.info(
-            '%s_filter_unconfirmable_candidates '
-            'skipped=%s — flag_type matched but the finding carries nothing to '
-            'confirm against; these flags are KEPT',
-            gate.log_prefix,
+            '%s skipped=%s — flag_type matched but the finding carries nothing '
+            'to confirm against; these flags are KEPT',
+            gate.unconfirmable_event,
             unconfirmable,
         )
 
@@ -5831,7 +5834,7 @@ async def _drop_flags_accounted_in_task_text(
                 taskmaster,
                 tid,
                 project_root,
-                log_event=f'{gate.log_prefix}_filter_get_task_error',
+                log_event=gate.get_task_error_event,
             )
             for tid in wanted_task_ids
         ]
@@ -5861,9 +5864,8 @@ async def _drop_flags_accounted_in_task_text(
             kept.append(flag)
             continue
         logger.info(
-            '%s_flag_dropped '
-            'task_id=%s matched_task_id=%s memory_ids=%s',
-            gate.log_prefix, flag.get('task_id'), matched_task_id, cited_by_pos[i],
+            '%s task_id=%s matched_task_id=%s memory_ids=%s',
+            gate.dropped_event, flag.get('task_id'), matched_task_id, cited_by_pos[i],
         )
     return kept
 
@@ -5874,12 +5876,12 @@ def _task_body_text(record: dict[str, Any]) -> str:
 
 
 _CLUSTER_GROWTH_ACCOUNTING_GATE = _TaskTextAccountingGate(
-    log_prefix='reconciliation.accounted_cluster_growth',
-    is_candidate_flag_type=_is_cluster_growth_flag_type,
-    drift_token='cluster',
-    known_flag_types=CLUSTER_GROWTH_FLAG_TYPES,
-    known_flag_types_name='CLUSTER_GROWTH_FLAG_TYPES',
+    family=CLUSTER_GROWTH_FAMILY,
     task_text=_task_body_text,
+    drift_event='reconciliation.accounted_cluster_growth_filter_possible_drift',
+    unconfirmable_event='reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates',
+    get_task_error_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
+    dropped_event='reconciliation.accounted_cluster_growth_flag_dropped',
 )
 
 
@@ -5906,7 +5908,7 @@ async def filter_accounted_cluster_growth_flags(
     test is ``description`` + ``details``.
 
     **The drop rule.**  A flag is a CANDIDATE iff
-    :func:`_is_cluster_growth_flag_type` accepts its ``flag_type`` AND it cites
+    :data:`CLUSTER_GROWTH_FAMILY` matches its ``flag_type`` AND it cites
     at least one memory id, EVERY one of them discriminating
     (:func:`_is_discriminating_memory_id`), AND at least one task id resolves.
     A candidate is DROPPED iff SOME single candidate task's current body
@@ -5959,26 +5961,13 @@ async def filter_accounted_cluster_growth_flags(
 # Already-recorded caveat guard (task 5271)
 # ---------------------------------------------------------------------------
 
-#: ``flag_type`` spellings observed on Stage-1 "task N's metadata still lacks
-#: the evidence caveat" findings (pump_web_ui run e8913eb1, finding 3b15dd73).
-PREMATURE_WIDENING_CAVEAT_FLAG_TYPES: frozenset[str] = frozenset({
-    'premature_widening_evidence_caveat',
-})
-
-#: Precomputed canonical-family keys for
-#: :data:`PREMATURE_WIDENING_CAVEAT_FLAG_TYPES` (mirrors
-#: :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
-_PREMATURE_WIDENING_CAVEAT_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in PREMATURE_WIDENING_CAVEAT_FLAG_TYPES
+#: The Stage-1 "task N's metadata still lacks the evidence caveat" finding, as
+#: spelled in pump_web_ui run e8913eb1, finding 3b15dd73.
+PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
+    name='premature_widening_caveat',
+    spellings=frozenset({'premature_widening_evidence_caveat'}),
+    drift_token='caveat',
 )
-
-
-def _is_premature_widening_caveat_flag_type(flag_type: Any) -> bool:
-    """True iff *flag_type*'s family is a known premature-widening-caveat spelling."""
-    return (
-        isinstance(flag_type, str)
-        and canonical_flag_type_family(flag_type) in _PREMATURE_WIDENING_CAVEAT_FAMILIES
-    )
 
 
 def _task_metadata_text(record: dict[str, Any]) -> str:
@@ -5989,12 +5978,12 @@ def _task_metadata_text(record: dict[str, Any]) -> str:
 
 
 _ALREADY_RECORDED_CAVEAT_GATE = _TaskTextAccountingGate(
-    log_prefix='reconciliation.already_recorded_caveat',
-    is_candidate_flag_type=_is_premature_widening_caveat_flag_type,
-    drift_token='caveat',
-    known_flag_types=PREMATURE_WIDENING_CAVEAT_FLAG_TYPES,
-    known_flag_types_name='PREMATURE_WIDENING_CAVEAT_FLAG_TYPES',
+    family=PREMATURE_WIDENING_CAVEAT_FAMILY,
     task_text=_task_metadata_text,
+    drift_event='reconciliation.already_recorded_caveat_filter_possible_drift',
+    unconfirmable_event='reconciliation.already_recorded_caveat_filter_unconfirmable_candidates',
+    get_task_error_event='reconciliation.already_recorded_caveat_filter_get_task_error',
+    dropped_event='reconciliation.already_recorded_caveat_flag_dropped',
 )
 
 

@@ -12148,7 +12148,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
 
 class TestIsClusterGrowthFlagType:
-    """`_is_cluster_growth_flag_type` recognises the duplicate-cluster-growth
+    """`CLUSTER_GROWTH_FAMILY.matches` recognises the duplicate-cluster-growth
     family across LLM spelling drift (task 3476).
 
     Stage 1 emits these findings with an LLM-authored, un-enumerated
@@ -12168,11 +12168,10 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_known_canonical_spellings_match(self, flag_type):
         """Both spellings named in the incident are recognised."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
-            f'{flag_type!r} is a canonical incident spelling and must match. '
-            'RED: _is_cluster_growth_flag_type does not exist yet.'
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
+            f'{flag_type!r} is a canonical incident spelling and must match.'
         )
 
     @pytest.mark.parametrize('flag_type', [
@@ -12184,9 +12183,9 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_case_separator_and_word_order_variants_match(self, flag_type):
         """canonical_flag_type_family normalization collapses these onto a known family."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
             f'{flag_type!r} is a case/separator/word-order variant of a known '
             'spelling and must match via canonical_flag_type_family'
         )
@@ -12203,9 +12202,9 @@ class TestIsClusterGrowthFlagType:
         this filter only ever DROPS on positively-confirmed UUID presence, so
         over-matching can only reclassify an already-accounted-for finding.
         """
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
             f'{flag_type!r} carries both the cluster and growth tokens and must '
             'match via the token-pair arm'
         )
@@ -12218,9 +12217,9 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_single_token_flag_types_do_not_match(self, flag_type):
         """Only ONE of the two tokens is not enough — the pair is required."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} carries only one of the cluster/growth tokens and '
             'must NOT match'
         )
@@ -12234,21 +12233,63 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_unrelated_flag_types_do_not_match(self, flag_type):
         """Unrelated / empty flag types never match."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} is unrelated to cluster growth and must NOT match'
         )
 
     @pytest.mark.parametrize('flag_type', [None, 123, 4.2, [], {}, object()])
     def test_non_string_input_is_false_not_raising(self, flag_type):
         """The predicate must be TOTAL over malformed LLM-authored input."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} is not a str; the predicate must return False rather '
             'than raise (flag dicts are LLM-authored and unvalidated)'
         )
+
+
+class TestFlagTypeFamily:
+    """`FlagTypeFamily` (task 5271 amendment): one value per Stage-1 finding's
+    spellings, shared by the accounting gates and sweep_deletion_guard."""
+
+    _FAMILY = flag_dedup.FlagTypeFamily(
+        name='widget_anomaly',
+        spellings=frozenset({'widget_anomaly_detected'}),
+        drift_token='widget',
+    )
+
+    def test_without_unseen_tokens_only_canonical_variants_match(self):
+        assert self._FAMILY.matches('Detected-Widget Anomaly') is True
+        assert self._FAMILY.matches('widget_anomaly_detected_again') is False, (
+            'a family with no unseen_spelling_tokens must not admit an added word'
+        )
+
+    def test_log_drift_names_the_event_the_family_and_only_unmatched_types(self, caplog):
+        flags = [
+            {'flag_type': 'widget_anomaly_detected'},
+            {'flag_type': 'widget_drift_suspected'},
+            {'flag_type': 'stale_metadata'},
+            {'flag_type': None},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            self._FAMILY.log_drift(flags, log_event='reconciliation.widget_filter_possible_drift')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].startswith('reconciliation.widget_filter_possible_drift ')
+        assert 'family=widget_anomaly' in messages[0]
+        assert "unmatched_flag_types=['widget_drift_suspected']" in messages[0]
+
+    def test_log_drift_is_silent_when_every_token_bearer_matches(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._FAMILY.log_drift(
+                [{'flag_type': 'Widget-Anomaly Detected'}], log_event='reconciliation.x',
+            )
+
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -12953,7 +12994,7 @@ class TestFilterAccountedClusterGrowthFlags:
             f'the drift log must name the unmatched flag_type; got {drift[0]!r}'
         )
         assert 'procedural_knowledge_cluster_growth' in drift[0], (
-            'the drift log must name CLUSTER_GROWTH_FLAG_TYPES as its reference '
+            'the drift log must name the CLUSTER_GROWTH_FAMILY spellings as its reference '
             f'point; got {drift[0]!r}'
         )
 
