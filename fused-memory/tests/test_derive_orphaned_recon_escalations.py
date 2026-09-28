@@ -30,6 +30,7 @@ from escalation.queue import EscalationQueue
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
+    escalation_project_id,
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.utils.target_store_preflight import TargetStoreMissing
@@ -41,6 +42,7 @@ SCRIPT_PATH = (
 GATE_BACKLOG = 'reconciliation_stale_gate_backlog'
 HUMAN_OPERATOR = 'reconciliation_stale_human_operator'
 DARK_ROOT = '/srv/dark-factory'
+REIFY_ROOT = '/srv/reify'
 PROJECT_ROOTS = {'dark_factory': DARK_ROOT}
 
 
@@ -404,6 +406,7 @@ class TestDeriveOrphanedReconEscalations:
         )
         stats = await sweep_orphaned_recon_escalations(
             EscalationQueue(queue_dir), taskmaster, PROJECT_ROOTS,
+            running_project_id='dark_factory',
         )
 
         for key in (
@@ -413,11 +416,53 @@ class TestDeriveOrphanedReconEscalations:
             assert report[key] == stats[key], (
                 f'{key}: {report[key]} via the script, {stats[key]} in-cycle'
             )
-        assert len(stats['flags']) == len(report['reapable_ids'])
-        for esc_id in report['reapable_ids']:
+        reread = EscalationQueue(queue_dir)
+        own_project_reapable = [
+            esc_id for esc_id in report['reapable_ids']
+            if escalation_project_id(reread.get(esc_id)) == 'dark_factory'
+        ]
+        assert own_project_reapable, 'the seeded queue must exercise the agreement'
+        assert len(stats['flags']) == len(own_project_reapable)
+        for esc_id in own_project_reapable:
             assert sum(esc_id in f['description'] for f in stats['flags']) == 1, (
                 f'{esc_id} is reapable by the script but named by no in-cycle flag'
             )
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_flags_only_its_own_project_while_the_script_reaps_the_fleet(
+        self, tmp_path,
+    ):
+        """THE TASK-5813 ACCEPTANCE: flags are per-project, the reap is fleet-wide.
+
+        dark_factory's cycle must not flag reify's orphan under a bare numeric
+        id, yet still count it; and the operator script, which is the only
+        channel that reaches an orphan whose project never runs a cycle, must
+        still close both.
+        """
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, '650')
+        _submit(queue, '5944', project_id='reify')
+        roots = {'dark_factory': DARK_ROOT, 'reify': REIFY_ROOT}
+        taskmaster = _make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}},
+            REIFY_ROOT: {'master': {'5944': 'cancelled'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            EscalationQueue(tmp_path), taskmaster, roots,
+            running_project_id='dark_factory',
+        )
+
+        assert [f['task_id'] for f in stats['flags']] == ['650']
+        assert stats['terminal'] == 2, 'both orphans still count in the stats'
+
+        report = await _mod.run(
+            queue_dir=tmp_path, project_roots=roots, apply=True, taskmaster=taskmaster,
+        )
+
+        assert set(report['reapable_ids']) == {'esc-650-1', 'esc-5944-1'}
+        assert report['reaped'] == 2
+        assert EscalationQueue(tmp_path).get_pending() == []
 
     @pytest.mark.asyncio
     async def test_apply_is_idempotent(self, seeded_queue, taskmaster):
