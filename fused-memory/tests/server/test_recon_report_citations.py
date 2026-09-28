@@ -2562,6 +2562,57 @@ class TestCiteTaskFoldPurgeRecord:
         )[0]
         assert record['truncated_fields'] == ['description', 'suggested_action']
 
+    @pytest.mark.asyncio
+    async def test_records_keep_the_first_n_and_count_the_overflow(self, store, caplog):
+        from fused_memory.server.recon_report import _MAX_PURGED_FINDINGS
+
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded_ids = []
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            for i in range(_MAX_PURGED_FINDINGS + 3):
+                loser_id = self._file_null_task_finding(state, f'restatement #{i}')
+                folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+                assert folded == {
+                    'error': 'duplicate_finding',
+                    'error_type': 'ReconReportDuplicateFinding',
+                    'existing_finding_id': anchor_id,
+                }
+                folded_ids.append(loser_id)
+
+        row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert [r['finding']['finding_id'] for r in row['purged_findings']] == (
+            folded_ids[:_MAX_PURGED_FINDINGS]
+        )
+        assert row['purged_findings_overflow'] == 3
+
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == _MAX_PURGED_FINDINGS + 3
+        for loser_id, message in zip(folded_ids, warnings, strict=True):
+            assert loser_id in message, message
+        for message in warnings[:_MAX_PURGED_FINDINGS]:
+            assert 'structural_copy=kept' in message, message
+        for message in warnings[_MAX_PURGED_FINDINGS:]:
+            assert 'structural_copy=dropped' in message, message
+
+    @pytest.mark.asyncio
+    async def test_below_the_cap_the_overflow_count_stays_zero(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor')
+        loser_id = self._file_null_task_finding(state, 'single restatement')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert len(row['purged_findings']) == 1
+        assert row['purged_findings_overflow'] == 0
+
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
 # routes delete_finding through the shared _purge_finding helper
