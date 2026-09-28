@@ -549,6 +549,45 @@ def test_find_matching_transcript_bound_session_id_absent_is_missing_even_with_p
 
 
 # ---------------------------------------------------------------------------
+# task 5873: unbound slash-command spawns (STRONG tier)
+# ---------------------------------------------------------------------------
+
+_SLASH_ARGS = (
+    "4743 (esc esc-4743-9, preexisting_main_break, blocking: bring current main "
+    "into task/4743, re-verify, and land via the merge queue)"
+)
+
+
+def test_find_matching_transcript_unbound_slash_command_matches_expanded_first_turn(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+
+    expanded = _write_transcript(
+        projects, _DF_CWD, "expanded.jsonl",
+        _slash_expanded("unblock", _SLASH_ARGS + _SPAWN_TRAILER),
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == expanded
+
+
+def test_find_matching_transcript_unbound_slash_command_other_command_same_args_returns_none(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+
+    _write_transcript(projects, _DF_CWD, "deb-sibling.jsonl", _slash_expanded("deb", _SLASH_ARGS))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+# ---------------------------------------------------------------------------
 # step-9/10: pure preventer guard — payload_exports_force_persistence
 # (fixture strings ONLY — never the real committed spawn-claude.sh)
 # ---------------------------------------------------------------------------
