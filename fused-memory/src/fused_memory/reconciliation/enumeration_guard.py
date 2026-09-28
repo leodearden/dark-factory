@@ -57,13 +57,30 @@ demands top-level metadata lists.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
+
+from fused_memory.utils.validation import validate_full_uuid
 
 X_ENUMERATION_SCOPE_KEY = 'x_enumeration_scope'
 X_LIVENESS_REVERIFIED_AT_KEY = 'x_liveness_reverified_at'
 X_LIVENESS_EXCEPTIONS_KEY = 'x_liveness_exceptions'
+
+ENUMERATED_ID_TRUNCATED = 'EnumeratedIdTruncated'
+
+_TRUNCATED_OUTCOME = 'truncated'
+
+_STAT_KEYS: tuple[str, ...] = (
+    'mem0_enumerations',
+    'unproven_lists',
+    'verified',
+    'dropped_absent',
+    'inconclusive',
+    'truncated',
+    'annotated_lines',
+)
 
 
 class EnumerationGateResult(NamedTuple):
@@ -75,6 +92,19 @@ class EnumerationGateResult(NamedTuple):
     description: str | None
     metadata: Any
     stats: dict[str, int] | None
+
+
+def _strict_uuid_prefix_pattern() -> re.Pattern[str]:
+    """Every strict prefix of the canonical 8-4-4-4-12 layout that keeps its
+    whole first group: ``21f78de1``, ``21f78de1-a5f3``, ``21f78de1-a5f3-42``...
+    A full UUID never matches; ``utils.validation.is_full_uuid`` owns that shape."""
+    rest = '[0-9a-f]{0,11}'
+    for _ in range(3):
+        rest = f'(?:[0-9a-f]{{4}}(?:-{rest})?|[0-9a-f]{{0,3}})'
+    return re.compile(f'[0-9a-f]{{8}}(?:-{rest})?', re.IGNORECASE)
+
+
+_UUID_FRAGMENT = _strict_uuid_prefix_pattern()
 
 
 def _utc_now() -> datetime:
@@ -99,6 +129,43 @@ def _metadata_as_dict(metadata: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _list_element_fragments(node: Any, path: str = '') -> Iterator[tuple[str, str]]:
+    """``(path, value)`` for each list element, at any depth, that is a UUID
+    fragment. Paths use ``citation_verifier.find_citation_occurrences``'
+    vocabulary (``key.child[0]``)."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _list_element_fragments(value, f'{path}.{key}' if path else str(key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            element_path = f'{path}[{index}]'
+            if isinstance(value, str) and _UUID_FRAGMENT.fullmatch(value):
+                yield element_path, value
+            else:
+                yield from _list_element_fragments(value, element_path)
+
+
+def _truncated_rejection(fragments: list[tuple[str, str]]) -> dict[str, Any]:
+    problems = [
+        problem
+        for path, value in fragments
+        if (problem := validate_full_uuid(value, field_name=path)) is not None
+    ]
+    return {
+        'error': (
+            'recon-stage metadata enumerates memory ids by truncated fragment: '
+            + '; '.join(problem['error'] for problem in problems)
+        ),
+        'error_type': ENUMERATED_ID_TRUNCATED,
+        'offenders': [{'path': path, 'value': value} for path, value in fragments],
+        'hint': problems[0]['hint'],
+    }
+
+
+def _truncated_record(path: str, value: str) -> dict[str, str]:
+    return {'memory_id': value, 'path': path, 'outcome': _TRUNCATED_OUTCOME}
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
@@ -121,4 +188,17 @@ async def enumeration_liveness_gate(
     parsed = _metadata_as_dict(metadata)
     if parsed is None:
         return passthrough
-    return passthrough
+
+    fragments = list(_list_element_fragments(parsed))
+    if fragments and is_filing:
+        return passthrough._replace(rejection=_truncated_rejection(fragments))
+
+    records = [_truncated_record(path, value) for path, value in fragments]
+    stats = dict.fromkeys(_STAT_KEYS, 0)
+    stats['truncated'] = len(records)
+    if not any(stats.values()):
+        return passthrough
+
+    rewritten = dict(parsed)
+    rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
+    return EnumerationGateResult(None, description, rewritten, stats)
