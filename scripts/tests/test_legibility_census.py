@@ -7175,3 +7175,101 @@ def test_run_census_keeps_a_remediated_harness_marked_cluster_observed(tmp_path)
     [filed] = kwargs["submit_fn"].calls
     assert filed["project_root"] == str(tmp_path)
     assert outcome.cross_project_tickets == ()
+
+
+# ---------------------------------------------------------------------------
+# task 5931 review fix: a withheld entry is durably marked and released on
+# recurrence.
+# ---------------------------------------------------------------------------
+
+def _persisted_entry(codebook_path, title):
+    [entry] = [e for e in codebook.load(codebook_path)["entries"] if e["title"] == title]
+    return entry
+
+
+def test_run_census_marks_a_withheld_promotion_in_the_codebook(tmp_path):
+    kwargs = _gate_kwargs(tmp_path)
+
+    mod.run_census(**kwargs)
+
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
+    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+
+
+@pytest.mark.parametrize(
+    "gate_overrides",
+    [
+        pytest.param({"sessions": ("s1", "s2")}, id="recurred"),
+        pytest.param({"remediation": _IN_TREE_REMEDIATION}, id="remediated"),
+    ],
+)
+def test_run_census_leaves_a_fileable_promotion_unmarked(tmp_path, gate_overrides):
+    kwargs = _gate_kwargs(tmp_path, **gate_overrides)
+
+    mod.run_census(**kwargs)
+
+    assert mod.ENTRY_FILING_KEY not in _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
+
+
+def _codebook_with_withheld_entry():
+    cb = _minimal_v2_codebook()
+    cb["entries"].append(
+        {
+            "id": "entry-withheld",
+            "title": "A withheld confusion",
+            "severity": "medium",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "sightings": [],
+            mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD,
+        }
+    )
+    return cb
+
+
+def test_mark_entry_filed_flips_the_marker_retained():
+    before = _codebook_with_withheld_entry()
+
+    result = mod.mark_entry_filed(before, "entry-withheld")
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-withheld")
+    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
+    assert next(e for e in result["entries"] if e["id"] == "entry-a") == before["entries"][0]
+
+    assert codebook.validate(result) == []
+    codebook.assert_no_deletion(before, result)
+
+    assert before["entries"][1][mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD, (
+        "the input is never mutated"
+    )
+
+
+def test_mark_entry_filed_rejects_an_unknown_entry_id():
+    with pytest.raises(ValueError, match="entry-nope"):
+        mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-nope")
+
+
+@pytest.mark.parametrize(
+    "marker", ["ENTRY_FILING_KEY", "ENTRY_FILING_WITHHELD", "ENTRY_FILING_FILED"],
+)
+def test_entry_filing_markers_are_plain_strings(marker):
+    assert type(getattr(mod, marker)) is str, "yaml.safe_dump cannot represent a str subclass"
+
+
+def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
+    path = tmp_path / "confusion-codebook.yaml"
+    marked = mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")
+
+    codebook.dump(marked, path)
+    first_bytes = path.read_bytes()
+    loaded = codebook.load(path)
+    codebook.dump(loaded, path)
+
+    entry = next(e for e in loaded["entries"] if e["id"] == "entry-withheld")
+    assert type(entry[mod.ENTRY_FILING_KEY]) is str
+    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert path.read_bytes() == first_bytes
