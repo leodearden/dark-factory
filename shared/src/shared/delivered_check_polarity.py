@@ -1067,12 +1067,13 @@ def _declared_filename_finding(
                 message=(
                     f'delivered_check {name!r} (expect=present, pattern {pattern!r}) is '
                     f'the NAME of {declared!r}, a file this task declares, not a symbol '
-                    f'inside it. A grep check reads file CONTENTS and a module rarely '
-                    f'mentions its own name, so this check goes green only if some file '
-                    f"happens to. If the capability IS that file's existence, declare it "
-                    f"as kind='path', expect='present', paths=[{declared!r}]; otherwise "
-                    f'assert a symbol defined INSIDE the file (a class, function or '
-                    f'constant the producer adds).'
+                    f'inside it. A grep over file CONTENTS cannot state that a file '
+                    f'exists: this check goes green only by the coincidence of some '
+                    f'file — its own docstring or usage text, an importer — mentioning '
+                    f"the name, and stays red if none does. If the capability IS that "
+                    f"file's existence, declare it as kind='path', expect='present', "
+                    f'paths=[{declared!r}]; otherwise assert a symbol defined INSIDE '
+                    f'the file (a class, function or constant the producer adds).'
                 ),
                 detail=(declared,),
             )

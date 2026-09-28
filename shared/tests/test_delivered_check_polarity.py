@@ -1785,6 +1785,8 @@ class TestDeclaredFilenameShaped:
         message = findings[0].message
         assert "kind='path'" in message
         assert "'orchestrator/tests/test_workflow_merge_gating_strand.py'" in message
+        assert 'cannot state that a file exists' in message
+        assert 'coincidence' in message
 
     def test_the_3536_descriptor_replayed_against_its_real_authoring_commit(self):
         repo_root = Path(__file__).resolve().parents[2]
