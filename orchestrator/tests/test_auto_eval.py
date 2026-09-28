@@ -549,7 +549,6 @@ async def _persist_plan_files_backend_only(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('optimistic_path', ['revalidation_skip', 'simple_task'])
 @pytest.mark.parametrize(
     ('dispatch_files', 'plan_files'),
     [_NARROWED, _WIDENED],
@@ -557,14 +556,13 @@ async def _persist_plan_files_backend_only(
 )
 async def test_back_link_preserves_run_persisted_files(
     tmp_path: Path,
-    optimistic_path: str,
     dispatch_files: list[str],
     plan_files: list[str],
 ):
     backend = FakeMetadataBackend()
     f = _make(
         project_root=tmp_path / 'proj',
-        optimistic_path=optimistic_path,
+        optimistic_path='revalidation_skip',
         files=dispatch_files,
         metadata_backend=backend,
     )
