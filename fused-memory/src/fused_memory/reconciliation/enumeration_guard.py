@@ -486,6 +486,45 @@ def _rewrite(
     return EnumerationGateResult(None, description, metadata, reported)
 
 
+def render_enumeration_guard_section() -> str:
+    """The Stage-2 prompt section for this gate, rendered from the names it
+    enforces (the ``render_*_section`` convention of ``recon_self_model``), so
+    the guidance cannot drift from the code that rejects a violation."""
+    stores = ', '.join(f'`{store.value}`' for store in SourceStore)
+    categories = ', '.join(f'`{category.value}`' for category in MemoryCategory)
+    example = json.dumps(enumeration_scope_example())
+    return (
+        '## Enumerated Memory IDs\n'
+        'When a task you file or update enumerates Mem0 memories ("these are the '
+        'N entries to decide on"), the write gate re-checks that list at write '
+        'time. Write it so the gate can:\n\n'
+        '1. Carry the enumeration as a TOP-LEVEL metadata list of full 36-char '
+        'UUIDs, each copied verbatim from a resolved record, never an 8-char or '
+        'partial fragment. A fragment list element is rejected when filing '
+        f'(`{ENUMERATED_ID_TRUNCATED}`) and recorded as a `{_TRUNCATED_OUTCOME}` '
+        'exception when updating. An enumeration that exists only in description '
+        'prose is never checked.\n'
+        '2. Re-resolve every id with `get_memory_by_id` immediately before filing '
+        'or updating. Never copy a Stage-1 enumeration forward verbatim.\n'
+        '3. The gate drops ids that are genuinely absent and records them in '
+        f'`{X_LIVENESS_EXCEPTIONS_KEY}`. It keeps and annotates ids whose lookup '
+        'was inconclusive, because inconclusive is not absence. It stamps '
+        f'`{X_LIVENESS_REVERIFIED_AT_KEY}`. Never write either key yourself: an '
+        'incoming copy is overwritten or stripped.\n'
+        '4. Filing a GATE that carries a Mem0 enumeration requires '
+        f'`{X_ENUMERATION_SCOPE_KEY}`, a structured object stating what was '
+        f'searched: `stores` (from {stores}), `categories` (from {categories}), '
+        '`exhaustive` (a bool: true only if every store and category was swept) '
+        f'and an optional string `note`. Example: `{example}`. Omitting it on a '
+        f'gate filing is rejected (`{ENUMERATION_SCOPE_MISSING}`). A present value '
+        'of any other shape, the legacy prose string included, is rejected on '
+        f'every write (`{ENUMERATION_SCOPE_MALFORMED}`).\n\n'
+        'WHY: reify gate 5537 shipped about 11 minutes after Mem0 entry 0d542614 '
+        'was deleted, nominating the deleted row as the likeliest deletion '
+        "target, and carried the truncated id '21f78de1'."
+    )
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
