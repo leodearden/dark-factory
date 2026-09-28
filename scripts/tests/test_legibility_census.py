@@ -7273,3 +7273,242 @@ def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     assert type(entry[mod.ENTRY_FILING_KEY]) is str
     assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
     assert path.read_bytes() == first_bytes
+
+
+def _withheld_entry_id(first, title=_GATED_TITLE):
+    """The id run 1 gave the entry it promoted for *title* -- read, never assumed."""
+    return _persisted_entry(first["codebook_path"], title)["id"]
+
+
+def _matches_reply(entry_id):
+    return {"matches": [{"entry_id": entry_id}], "candidates": []}
+
+
+def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **overrides):
+    """A later census over *first*'s persisted codebook, whose "recurrence"
+    digests code as ``reply(entry_id)`` for the entry *first* promoted for
+    *title*. Every other prompt (the headroom probe included) is an empty,
+    banner-free judgment."""
+    entry_id = _withheld_entry_id(first, title)
+
+    def response_fn(prompt, model):
+        if "recurrence" in prompt:
+            return json.dumps(reply(entry_id))
+        return json.dumps({"matches": [], "candidates": []})
+
+    kwargs = dict(
+        codebook_dict=codebook.load(first["codebook_path"]),
+        batch_source=[[_hand_digest("s2-recurrence", "the same confusion again")]],
+        invoke=_make_fake_invoke(response_fn),
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+        date="2026-07-21",
+        report_path=tmp_path / "confusion-census-2026-07-21.md",
+    )
+    kwargs.update(overrides)
+    return _run_census_kwargs(tmp_path, **kwargs)
+
+
+def _withheld_first_run(tmp_path, **overrides):
+    first = _gate_kwargs(tmp_path, **overrides)
+    outcome = mod.run_census(**first)
+    assert first["submit_fn"].calls == [], "run 1 must withhold the singleton"
+    assert outcome.withheld
+    return first
+
+
+def test_run_census_files_a_withheld_entry_once_a_matches_op_makes_it_recur(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    entry_id = _withheld_entry_id(first)
+    second = _recurrence_kwargs(tmp_path, first, reply=_matches_reply)
+
+    outcome = mod.run_census(**second)
+
+    [filed] = second["submit_fn"].calls
+    assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
+    assert outcome.filed_ticket_ids == ["tkt_1"]
+    assert outcome.released_entry_ids == (entry_id,)
+    assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
+        mod.ENTRY_FILING_KEY
+    ] == mod.ENTRY_FILING_FILED
+
+
+def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_path):
+    first = {
+        **_hosted_kwargs(tmp_path, harness_project=_HARNESS),
+        "batch_source": [[_hand_digest("s1-df-marked", "a task-store read timed out")]],
+    }
+    mod.run_census(**first)
+    assert first["submit_fn"].calls == [], "run 1 must withhold the singleton"
+    second = _recurrence_kwargs(
+        tmp_path, first,
+        reply=_matches_reply,
+        title=_DF_TITLE,
+        config=first["config"],
+        project_id=first["project_id"],
+        harness_project=_HARNESS,
+    )
+
+    outcome = mod.run_census(**second)
+
+    [filed] = second["submit_fn"].calls
+    assert filed["project_root"] == _HARNESS.project_root
+    assert filed["metadata"]["origin_project_id"] == "hosted_project"
+    assert "x_fix_surface" in filed["metadata"]
+    assert outcome.cross_project_tickets == (
+        mod.CrossProjectTicket(ticket_id="tkt_1", project_root=_HARNESS.project_root),
+    )
+
+
+def test_run_census_never_refiles_a_released_entry(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    second = _recurrence_kwargs(tmp_path, first, reply=_matches_reply)
+    mod.run_census(**second)
+    third = _recurrence_kwargs(
+        tmp_path, second,
+        reply=_matches_reply,
+        batch_source=[[_hand_digest("s3-recurrence", "and the same confusion once more")]],
+    )
+
+    outcome = mod.run_census(**third)
+
+    assert third["submit_fn"].calls == []
+    assert outcome.released_entry_ids == ()
+
+
+def _miscoded_candidate_reply(_entry_id):
+    return json.loads(_happy_invoke_response("novel-verified", model=None))
+
+
+def test_run_census_files_a_miscoded_recurrence_once_and_releases_the_entry(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    second = _recurrence_kwargs(
+        tmp_path, first,
+        reply=_miscoded_candidate_reply,
+        verify_fn=_make_fake_verify_fn(verified_titles={_GATED_TITLE}, remediation=None),
+    )
+
+    mod.run_census(**second)
+
+    assert len(second["submit_fn"].calls) == 1, "one ticket per title, never two"
+    assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
+        mod.ENTRY_FILING_KEY
+    ] == mod.ENTRY_FILING_FILED
+
+
+def _make_rejecting_submit_fn():
+    calls = []
+
+    def rejecting_submit_fn(**kwargs):
+        calls.append(kwargs)
+        return {"error": "x", "error_type": "y"}
+
+    rejecting_submit_fn.calls = calls
+    return rejecting_submit_fn
+
+
+def test_run_census_keeps_the_marker_when_the_release_filing_fails(tmp_path, caplog):
+    first = _withheld_first_run(tmp_path)
+    second = _recurrence_kwargs(
+        tmp_path, first, reply=_matches_reply, submit_fn=_make_rejecting_submit_fn(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**second)
+
+    assert len(second["submit_fn"].calls) == 1
+    assert outcome.released_entry_ids == ()
+    assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
+        mod.ENTRY_FILING_KEY
+    ] == mod.ENTRY_FILING_WITHHELD
+    assert any(
+        r.levelno == logging.WARNING and _GATED_TITLE in r.getMessage() for r in caplog.records
+    )
+
+    third = _recurrence_kwargs(tmp_path, second, reply=_matches_reply)
+    retried = mod.run_census(**third)
+
+    [filed] = third["submit_fn"].calls
+    assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
+    assert retried.released_entry_ids == (_withheld_entry_id(first),)
+
+
+def test_run_census_dry_run_offers_a_released_entry_but_leaves_it_withheld(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    payloads_path = tmp_path / "confusion-census-2026-07-21-payloads.json"
+    second = _recurrence_kwargs(
+        tmp_path, first,
+        reply=_matches_reply,
+        submit_fn=_poison("submit_fn"),
+        dry_run_payloads_path=payloads_path,
+    )
+
+    mod.run_census(**second)
+
+    [payload] = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert payload["title"] == f"[legibility census] {_GATED_TITLE}"
+    assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
+        mod.ENTRY_FILING_KEY
+    ] == mod.ENTRY_FILING_WITHHELD
+
+
+def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    second = _recurrence_kwargs(
+        tmp_path, first, reply=lambda _entry_id: _matches_reply("entry-a"),
+    )
+
+    outcome = mod.run_census(**second)
+
+    assert second["submit_fn"].calls == []
+    assert outcome.released_entry_ids == ()
+    assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
+        mod.ENTRY_FILING_KEY
+    ] == mod.ENTRY_FILING_WITHHELD
+
+
+def test_run_census_does_not_release_an_entry_retired_this_run(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    second = _recurrence_kwargs(
+        tmp_path, first,
+        reply=_matches_reply,
+        verify_fn=_make_fake_verify_fn(
+            remediation=None, fixed_entry_ids=(_withheld_entry_id(first),),
+        ),
+    )
+
+    outcome = mod.run_census(**second)
+
+    assert second["submit_fn"].calls == []
+    assert outcome.released_entry_ids == ()
+
+
+def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
+    legacy = _minimal_v2_codebook()
+    legacy["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": session,
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+        for session in ("legacy-1", "legacy-2")
+    ]
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        codebook_dict=legacy,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert kwargs["submit_fn"].calls == []
+    assert outcome.released_entry_ids == ()
