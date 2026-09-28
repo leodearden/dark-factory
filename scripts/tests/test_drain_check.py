@@ -160,6 +160,24 @@ def _run_cli(*args, env=None):
     )
 
 
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="idle\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--unit", UNIT)
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # DRAIN_CHECK_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+
+    _run_cli("--unit", UNIT, timeout=3)
+    assert captured["timeout"] == 3
+
+
 def test_cli_prints_idle_for_fresh_merge_idle_heartbeat(tmp_path):
     _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=NOW)
 
