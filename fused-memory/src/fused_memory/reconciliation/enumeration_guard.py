@@ -57,12 +57,21 @@ demands top-level metadata lists.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from fused_memory.utils.validation import validate_full_uuid
+from fused_memory.models.scope import resolve_project_id_for_root
+from fused_memory.reconciliation.citation_verifier import (
+    LivenessVerdict,
+    MemoryLiveness,
+    resolve_memory_liveness,
+)
+from fused_memory.utils.validation import is_full_uuid, validate_full_uuid
+
+logger = logging.getLogger(__name__)
 
 X_ENUMERATION_SCOPE_KEY = 'x_enumeration_scope'
 X_LIVENESS_REVERIFIED_AT_KEY = 'x_liveness_reverified_at'
@@ -166,6 +175,117 @@ def _truncated_record(path: str, value: str) -> dict[str, str]:
     return {'memory_id': value, 'path': path, 'outcome': _TRUNCATED_OUTCOME}
 
 
+class _LivenessPass(NamedTuple):
+    """The proven Mem0 enumerations, rebuilt without their absent members,
+    plus the exception records and counters of the pass that proved them."""
+
+    enumerations: dict[str, list[Any]]
+    records: list[dict[str, str]]
+    stats: dict[str, int]
+
+
+def _candidate_lists(parsed: dict[str, Any]) -> dict[str, list[Any]]:
+    return {
+        key: value
+        for key, value in parsed.items()
+        if isinstance(value, list) and any(is_full_uuid(member) for member in value)
+    }
+
+
+async def _resolve_members(
+    candidates: dict[str, list[Any]],
+    memory_service: Any,
+    project_root: str,
+) -> dict[str, LivenessVerdict]:
+    """One verdict per DISTINCT candidate id, memoised for this call only: a
+    longer-lived cache would reintroduce the stale read this gate closes."""
+    distinct = dict.fromkeys(
+        member
+        for members in candidates.values()
+        for member in members
+        if is_full_uuid(member)
+    )
+    if not distinct:
+        return {}
+    project_id = resolve_project_id_for_root(project_root)
+    verdicts = {
+        memory_id: await resolve_memory_liveness(memory_service, project_id, memory_id)
+        for memory_id in distinct
+    }
+    inconclusive = {
+        memory_id: verdict.error_type
+        for memory_id, verdict in verdicts.items()
+        if verdict.outcome is MemoryLiveness.INCONCLUSIVE
+    }
+    if inconclusive:
+        logger.warning(
+            'enumeration liveness inconclusive for %d id(s), kept unverified: %s',
+            len(inconclusive), inconclusive,
+        )
+    return verdicts
+
+
+def _member_verdict(
+    member: Any, verdicts: dict[str, LivenessVerdict],
+) -> LivenessVerdict | None:
+    return verdicts.get(member) if is_full_uuid(member) else None
+
+
+def _liveness_record(path: str, memory_id: str, verdict: LivenessVerdict) -> dict[str, str]:
+    record = {'memory_id': memory_id, 'path': path, 'outcome': verdict.outcome.value}
+    if verdict.error_type is not None:
+        record['error_type'] = verdict.error_type
+    return record
+
+
+def _rebuild_enumeration(
+    key: str, members: list[Any], verdicts: dict[str, LivenessVerdict],
+) -> tuple[list[Any], list[dict[str, str]]]:
+    """The list without its ABSENT members, and a record for every member that
+    is not LIVE. An INCONCLUSIVE member stays in place: unknown is not absent."""
+    kept: list[Any] = []
+    records: list[dict[str, str]] = []
+    for index, member in enumerate(members):
+        verdict = _member_verdict(member, verdicts)
+        if verdict is not None and verdict.outcome is not MemoryLiveness.LIVE:
+            records.append(_liveness_record(f'{key}[{index}]', member, verdict))
+        if verdict is None or verdict.outcome is not MemoryLiveness.ABSENT:
+            kept.append(member)
+    return kept, records
+
+
+def _is_live(member: Any, verdicts: dict[str, LivenessVerdict]) -> bool:
+    verdict = _member_verdict(member, verdicts)
+    return verdict is not None and verdict.outcome is MemoryLiveness.LIVE
+
+
+async def _liveness_pass(
+    parsed: dict[str, Any], memory_service: Any, project_root: str,
+) -> _LivenessPass:
+    candidates = _candidate_lists(parsed)
+    verdicts = await _resolve_members(candidates, memory_service, project_root)
+    proven = {
+        key: members for key, members in candidates.items()
+        if any(_is_live(member, verdicts) for member in members)
+    }
+    enumerations: dict[str, list[Any]] = {}
+    records: list[dict[str, str]] = []
+    verified = 0
+    for key, members in proven.items():
+        enumerations[key], list_records = _rebuild_enumeration(key, members, verdicts)
+        records.extend(list_records)
+        verified += sum(_is_live(member, verdicts) for member in members)
+    outcomes = [record['outcome'] for record in records]
+    stats = {
+        'mem0_enumerations': len(proven),
+        'unproven_lists': len(candidates) - len(proven),
+        'verified': verified,
+        'dropped_absent': outcomes.count(MemoryLiveness.ABSENT.value),
+        'inconclusive': outcomes.count(MemoryLiveness.INCONCLUSIVE.value),
+    }
+    return _LivenessPass(enumerations, records, stats)
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
@@ -193,12 +313,16 @@ async def enumeration_liveness_gate(
     if fragments and is_filing:
         return passthrough._replace(rejection=_truncated_rejection(fragments))
 
+    liveness = await _liveness_pass(parsed, memory_service, project_root)
     records = [_truncated_record(path, value) for path, value in fragments]
-    stats = dict.fromkeys(_STAT_KEYS, 0)
-    stats['truncated'] = len(records)
+    records.extend(liveness.records)
+    stats = dict.fromkeys(_STAT_KEYS, 0) | liveness.stats | {'truncated': len(fragments)}
     if not any(stats.values()):
         return passthrough
 
-    rewritten = dict(parsed)
-    rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
+    rewritten = parsed | liveness.enumerations
+    if records:
+        rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
+    if rewritten == parsed:
+        return passthrough._replace(stats=stats)
     return EnumerationGateResult(None, description, rewritten, stats)
