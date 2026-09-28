@@ -717,15 +717,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
 
 
 class CostBasis(StrEnum):
-    """How an arm is billed: the closed vocabulary of live-shadow PRD decision 16.
-
-    A member IS the value ``shadow_cells.cost_basis`` stores. Sited here as the
-    vocabulary's first consumer, following ``evals/live_fixture.py::ShadowShape``:
-    when leaf α (task 5382) adds that column it imports this enum rather than
-    restating the two values (heuristic 11). Relocating it down beside α's row
-    record is α's call, with this module importing it back; what must not
-    happen is a second copy of the values.
-    """
+    """How an arm is billed: the closed cost-basis vocabulary of live-shadow PRD decision 16."""
 
     METERED = 'metered'
     SUBSCRIPTION = 'subscription'
