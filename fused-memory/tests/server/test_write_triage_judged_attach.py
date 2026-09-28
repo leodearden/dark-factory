@@ -187,6 +187,59 @@ class TestTheJudgedCandidateIsTheAttachTarget:
         judge.assert_not_awaited()
 
 
+class TestAnAttachMovedOffTheBandsWinnerIsLogged:
+    """One line names the judged candidate whenever it moves the attach."""
+
+    @staticmethod
+    async def _retarget_lines(
+        answer: object, slate: list[MemoryResult], caplog,
+    ) -> list[str]:
+        with caplog.at_level(logging.INFO, logger=triage_write.__module__):
+            await _triage(slate, _judge_answering(answer), _counter())
+        return [
+            record.getMessage() for record in caplog.records
+            if 'retargeted' in record.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_line_names_the_judged_candidate_and_both_canonicals(
+        self, caplog,
+    ) -> None:
+        lines = await self._retarget_lines(
+            TriageJudgeVerdict(OUTCOME_AMENDED, 'm3'),
+            _middle_band_slate(kind=AMENDMENT_KIND, **{PARENT_ID_KEY: 'parent-P'}),
+            caplog,
+        )
+
+        assert len(lines) == 1, caplog.text
+        for name in ('m3', 'parent-P', _BAND_WINNER):
+            assert repr(name) in lines[0], lines[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('answer', 'm3_metadata'),
+        [
+            pytest.param(
+                TriageJudgeVerdict(OUTCOME_AMENDED, _BAND_WINNER), {},
+                id='the winner named',
+            ),
+            pytest.param(
+                TriageJudgeVerdict(OUTCOME_AMENDED, 'm3'),
+                {'kind': SIGHTING_KIND, PARENT_ID_KEY: _BAND_WINNER},
+                id='a child of the winner named',
+            ),
+            pytest.param(OUTCOME_AMENDED, {}, id='a bare word'),
+            pytest.param(TriageJudgeVerdict(OUTCOME_STORED), {}, id='stored'),
+        ],
+    )
+    async def test_a_verdict_leaving_the_winners_canonical_in_place_logs_nothing(
+        self, answer, m3_metadata, caplog,
+    ) -> None:
+        slate = _middle_band_slate(**m3_metadata)
+
+        assert await self._retarget_lines(answer, slate, caplog) == []
+
+
 def _logged_exception(record: logging.LogRecord) -> str:
     assert record.exc_info is not None, 'a fail-open is logged with its exception'
     return str(record.exc_info[1])

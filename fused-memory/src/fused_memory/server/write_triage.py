@@ -883,7 +883,9 @@ async def triage_write(
             # here -- one home for that decision.
             candidates=results,
         )
-        return _apply_judge_verdict(decision, answer, results)
+        judged = _apply_judge_verdict(decision, answer, results)
+        _log_retarget(decision, judged, project_id)
+        return judged
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
@@ -942,6 +944,22 @@ def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
     if isinstance(answer, tuple) and len(answer) == 2:
         return TriageJudgeVerdict._make(answer)
     raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
+
+
+def _log_retarget(band: BandDecision, judged: BandDecision, project_id: str) -> None:
+    """Log a judged attach the named candidate moved off the band winner's canonical.
+
+    How often the judge overrules the max-cosine winner is what an operator
+    reads to decide whether the judge earns its call.
+    """
+    if judged.judged_candidate_id is None or judged.canonical_id == band.canonical_id:
+        return
+    logger.info(
+        'write_triage judged attach retargeted: project=%s outcome=%s judge named '
+        '%r -> canonical=%r, not the band winner canonical=%r',
+        project_id, judged.outcome, judged.judged_candidate_id,
+        judged.canonical_id, band.canonical_id,
+    )
 
 
 #: The exception classes the retired guard's call site re-raised as wiring
