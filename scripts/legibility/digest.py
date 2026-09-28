@@ -1107,14 +1107,25 @@ anchor plus one corroborator already meets the >=2 threshold, anchoring it
 costs genuine gold turns for zero recall."""
 
 HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
-    '## project context', '## conventions', '## recent decisions',
-    '## task context',
+    '## project context', '## conventions', '## conventions & gotchas',
+    '## recent decisions', '## task context',
 )
 """CORROBORATING heading literals -- the structural sub-blocks a real
-briefing carries alongside an anchor
-(orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
-:1270, '## Conventions' :1277, '## Recent Decisions' :1284, '## Task
-Context' :1294 inside ``_get_memory_context``'s recalled_sections list).
+briefing carries alongside an anchor. Matched as WHOLE lowercased LINES
+(see :func:`is_harness_injected_turn`), so a renamed heading needs its own
+entry rather than matching by prefix.
+
+Two generations, both live, because this filter reads transcripts written
+long before it: today
+``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``
+renders its headings from the section titles in
+``shared/src/shared/briefing_queries.py`` -- '## Conventions & Gotchas' and
+'## Task Context' -- while '## Project Context', '## Conventions' and
+'## Recent Decisions' are the pre-task-3659 spellings, retired from the
+query table but still present throughout the archived corpus. Do not prune
+the retired three: dropping them silently un-classifies every historical
+briefing turn.
+
 Never sufficient alone: a human turn headed '## Conventions' carries no
 anchor and stays gold.
 
@@ -1125,13 +1136,21 @@ prompt template (:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212) and was
 listed here until the task 3610 amendment pass, but '# Task' + '# Action'
 is also an ordinary human spec-writing shape, and losing a genuine gold
 turn is a SILENT error where an admitted briefing turn is a visible one.
-It costs almost no recall: every one of those templates begins with
-``{context}``, so a real briefing always carries the '# Context' anchor
-and, whenever memory context is available, its '##' sub-blocks too. The
-corner this declines is the memory-UNAVAILABLE variant of the two
-identity-less templates (build_reviewer_prompt :998, build_merger_prompt
-:1109), which then shows only '# Context' + '# Action' -- a shape the
-pre-3610 all-of-three rule did not catch either, so nothing regresses."""
+It costs almost no recall: every template that carries a memory block
+begins with ``{context}``, so such a briefing always carries the
+'# Context' anchor and, whenever memory context is available, its '##'
+sub-blocks too. The corner this declines is the memory-UNAVAILABLE variant
+of ``BriefingAssembler.build_reviewer_prompt``, the one identity-less
+template that still has a context slot, which then shows only '# Context' +
+'# Action' -- a shape the pre-3610 all-of-three rule did not catch either,
+so nothing regresses. ``BriefingAssembler.build_merger_prompt`` is out of
+this rule's reach entirely: since task 3659 it carries no memory block at
+all, so it emits no '# Context' anchor to be corroborated (D7 -- the merger
+is mechanical and the generic block was never shown to help it). It is
+covered instead by its own :data:`MERGER_HEADINGS` set below, because
+losing it here would have been a REGRESSION, not a declined corner: before
+3659 the merger prompt opened with '# Context' and was classified by this
+very rule."""
 
 RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',
@@ -1159,9 +1178,36 @@ and (b) are one source class (harness injection) with two injectors
 (orchestrator briefing vs. judge prompt), which is why these headings live
 here rather than behind a separate 'pasted report' predicate."""
 
+MERGER_HEADINGS: tuple[str, ...] = (
+    '# task intent', '# merge conflicts', '# action',
+)
+"""Injected merge-resolution PROMPT heading literals
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_merger_prompt``,
+a single f-string emitting '# Task Intent', '# Merge Conflicts', '# Action').
+
+This set exists because task 3659 removed the merger's memory block, and
+with it the '# Context' anchor that had been the ONLY heading
+:data:`HARNESS_BRIEFING_HEADINGS` could recognise in a merger dispatch.
+Measured against the real builder: pre-3659 shape -> True (with recalled
+memory AND with the memory-unavailable notice alike), post-3659 shape ->
+False. Without this entry every merge-conflict dispatch -- the docstring
+measures 7 per 14 days -- would be mined as a genuine human turn and
+rendered in the digest's gold 'User Correction' section (PRD Sec 5).
+
+Strict all-of, like every non-briefing injector: the task-3610 relaxation
+was earned by forensics on the briefing shape alone. All three headings are
+'# '-level, which is exactly why the all-of match is required here and why
+these literals must NOT be folded into
+:data:`HARNESS_BRIEFING_SUBHEADINGS` -- a '# '-level corroborator would
+pair with the '# task' anchor and clear the >=2 threshold on its own, the
+false-positive the 3610 amendment pass removed '# action' to prevent. As a
+co-occurring triple they are not an ordinary human shape: '# Merge
+Conflicts' carries the discrimination."""
+
 HARNESS_HEADING_SETS: tuple[tuple[str, ...], ...] = (
     HARNESS_BRIEFING_HEADINGS,
     RECON_RUN_REVIEW_HEADINGS,
+    MERGER_HEADINGS,
 )
 """Every known harness-injected heading set, matched independently: a turn
 is harness-injected when ALL headings of ANY one set co-occur. Adding a
@@ -1205,6 +1251,7 @@ literals as one-line additions."""
 
 HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_this context was recalled from the ',
+    '_memory unavailable (',
     '_memory unavailable — proceed with codebase exploration',
     '_no memory context available',
 )
@@ -1213,26 +1260,41 @@ HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
 the standing provenance caveat's prefix
 (``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
 section was actually recalled), and its two no-recalled-sections literal
-families (memory-unavailable / no-memory-context-available). The caveat
-marker deliberately stops BEFORE its ``{project_id}`` interpolation
-point: a marker spanning it would be project-specific and would fail for
-every non-dark_factory project the census runs against (this module has
-no knowledge of which project a transcript belongs to). These three
-markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
-as of this commit: the four no-recalled-sections paths (each of the two
-literal families has a plain and a drop_note-bearing variant, both
-covered by the same family marker), PLUS the recalled-sections path
-(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+families (memory-unavailable / no-memory-context-available). Every
+marker deliberately stops BEFORE an interpolation point -- the caveat's
+``{project_id}`` and MEMORY_OUTAGE_NOTICE's ``{reasons}`` -- because a
+marker spanning one is not stable across call sites: the caveat's would
+be project-specific and would fail for every non-dark_factory project the
+census runs against (this module has no knowledge of which project a
+transcript belongs to), and the outage notice's would pin one reason
+class out of three.
+
+The memory-unavailable family has TWO markers, both live, for the reason
+the sibling ``HARNESS_BRIEFING_SUBHEADINGS`` carries two generations of
+heading spellings: task 3659 reworded that notice to name WHY memory was
+unavailable, so ``'_memory unavailable ('`` covers what is rendered today
+and the longer literal covers the archived pre-3659 corpus. Do not prune
+the retired one -- dropping it silently un-classifies every historical
+outage turn.
+
+These four markers are EXHAUSTIVE over ``_get_memory_context``'s return
+paths as of this commit: the no-recalled-sections paths (each of the two
+literal families has a plain, a drop_note-bearing and a notices-bearing
+variant, all three covered by the same family marker, since the family
+line leads the body and the notices and drop_note are appended after it),
+PLUS the recalled-sections path
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+-- covered by the caveat marker ALONE, including
 its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
 trailing "_Memory unavailable for the remaining queries..._" note a
 later-failing query appends, since both are appended AFTER the caveat
 prefix this marker matches on, never before it. That exhaustiveness
 claim is what
 ``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
-(the four no-recalled-sections paths) and
+(every no-recalled-sections shape) and
 ``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
-(the fifth, composite path) together check, so a new return path added
-to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
+(the composite recalled path) together check, so a new return path added
+to that function should arrive with its own marker here. Matched only in CONJUNCTION with
 a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
 never as a relaxation of the briefing anchor+corroborator guard -- that
 guard is load-bearing and its two negative tests
@@ -1416,7 +1478,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 4
+DIGEST_INSTRUMENT_VERSION: int = 5
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1440,6 +1502,8 @@ keys do NOT bump it.
   4 -- the non-human-origin record rule (:func:`has_non_human_origin`,
        task 5956), consulted with the content classifier by the gold-turn
        filter and every dialogue carrier.
+  5 -- the merger's heading set (MERGER_HEADINGS) and the rescoped
+       memory-block markers, task 3659.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
