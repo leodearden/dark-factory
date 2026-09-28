@@ -825,12 +825,26 @@ else
   ok "Project config already exists"
 fi
 
-# Register jcodemunch in the user-level Claude config from the shared launch
-# contract (shared/src/shared/jcodemunch_launch.py), replacing any existing
-# entry so every run converges on it: `claude mcp add-json` refuses a name
-# that already exists.
+# Install the prebuilt, version-pinned launcher the shared launch contract
+# (shared/src/shared/jcodemunch_launch.py) names, then register jcodemunch in
+# the user-level Claude config from that contract, replacing any existing entry
+# so every run converges on it: `claude mcp add-json` refuses a name that
+# already exists. `uv tool install` exits 0 even when its bin dir is not on
+# PATH, so registration is gated on the registered command resolving.
 _jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)"
-if command -v claude &>/dev/null; then
+_jcodemunch_install_argv_lines="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch install-argv)"
+mapfile -t _jcodemunch_install_argv <<<"$_jcodemunch_install_argv_lines"
+_jcodemunch_command="$(jq -r .command <<<"$_jcodemunch_server_json")"
+if "${_jcodemunch_install_argv[@]}"; then
+  ok "$_jcodemunch_command launcher installed at the contract's pin"
+else
+  fail "$_jcodemunch_command launcher install failed"
+  warn "  Fix: ${_jcodemunch_install_argv[*]}"
+fi
+if ! command -v "$_jcodemunch_command" &>/dev/null; then
+  fail "$_jcodemunch_command is not on PATH, so jcodemunch was not registered in user config"
+  warn "  Fix: put \"\$(uv tool dir --bin)\" on PATH (uv tool update-shell), then re-run scripts/setup-host.sh"
+elif command -v claude &>/dev/null; then
   claude mcp remove --scope user jcodemunch >/dev/null 2>&1 || true
   if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
     ok "jcodemunch MCP registered in user config"
