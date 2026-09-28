@@ -13,6 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from drain_check import classify, heartbeat_path, resolve_fleet_dir
 
 FRESH_WINDOW = 120.0
@@ -131,6 +132,9 @@ def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
 
 # ---------------------------------------------------------------------------
 # step-5: CLI (argparse) tests -- drive via subprocess.run
+#
+# The budget is not a literal: see cli_subprocess_timeout.py, which also
+# documents the DRAIN_CHECK_TEST_TIMEOUT override.
 # ---------------------------------------------------------------------------
 
 def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
@@ -147,7 +151,10 @@ def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
     return payload
 
 
-def _run_cli(*args, env=None):
+_CLI_TIMEOUT = cli_timeout_from_env("DRAIN_CHECK_TEST_TIMEOUT")
+
+
+def _run_cli(*args, env=None, timeout=_CLI_TIMEOUT):
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
@@ -156,7 +163,7 @@ def _run_cli(*args, env=None):
         env=full_env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
