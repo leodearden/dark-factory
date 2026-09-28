@@ -72,10 +72,11 @@ class TrickleCensusCaps(BaseModel):
     A manual census.py run never reads this block; its caps are the flags the
     operator types. The 50/150 defaults are the bound ratified for reify's
     attended first census (skills/census/SKILL.md), so an unattended census
-    is bounded unless a project says otherwise.
+    is bounded unless a project says otherwise. Frozen, so one instance can be
+    shared as a default without any holder being able to uncap it.
     """
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
     max_batches: int | None = Field(default=50, ge=1, strict=True)
     max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)

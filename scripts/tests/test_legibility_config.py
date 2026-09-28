@@ -207,6 +207,12 @@ class TestTrickleCensusCaps:
         assert cfg.census.max_interval_days == 3
         assert cfg.census.trickle_caps.max_batches == 10
 
+    def test_caps_are_immutable_so_no_holder_can_uncap_a_shared_instance(self):
+        caps = mod.TrickleCensusCaps()
+        with pytest.raises(ValidationError):
+            caps.max_batches = None
+        assert caps.max_batches == 50
+
 
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""

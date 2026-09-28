@@ -603,6 +603,8 @@ _RELATIVE_CENSUS_ARG_DETAIL = (
     "(legibility-trickle@.service's WorkingDirectory) -- task 3269's defect."
 )
 
+_SCHEMA_DEFAULT_TRICKLE_CAPS = TrickleCensusCaps()
+
 
 def _census_cap_args(caps: TrickleCensusCaps) -> list[str]:
     """census.py's cost-control flags for *caps*; a ``None`` cap omits its flag."""
@@ -618,7 +620,7 @@ def _default_census_launcher(
     project_root: str | Path,
     *,
     config_path: str | Path | None = None,
-    caps: TrickleCensusCaps | None = None,
+    caps: TrickleCensusCaps = _SCHEMA_DEFAULT_TRICKLE_CAPS,
     env=None,
 ) -> None:
     """Best-effort subprocess launch of the census entrypoint (task η)
@@ -651,10 +653,10 @@ def _default_census_launcher(
     *caps* is the trickle's census bound (task 5900, task 5782's precondition
     (b)), emitted as census.py's own ``--max-batches`` /
     ``--max-verify-clusters`` flags, which remain the single cap mechanism.
-    Absent means the bounded ``TrickleCensusCaps`` schema default, never
-    uncapped; a ``None`` field is an explicit uncapped opt-out for that flag.
+    Omitted, it is the bounded ``TrickleCensusCaps`` schema default, never
+    uncapped. ``None`` has one meaning here, on a caps FIELD only: the
+    explicit uncapped opt-out for that one flag.
     """
-    caps = caps if caps is not None else TrickleCensusCaps()
     argv = [
         sys.executable,
         str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
