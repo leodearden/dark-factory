@@ -433,6 +433,36 @@
           "current": 31590
         }
       ]
+    },
+    {
+      "task_id": "5460",
+      "reason": "Net-additive: conftest gains the session autouse pristine_repo_templates fixture that installs _git_fixtures' per-worker template root under basetemp; autouse because the shared _workflow_helpers seeders are awaited as helper(repo) by ~20 modules and cannot request a fixture.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1201,
+          "current": 1220
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 773,
+          "current": 783
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56236,
+          "current": 56255
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31574,
+          "current": 31584
+        }
+      ]
     }
   ]
 }
