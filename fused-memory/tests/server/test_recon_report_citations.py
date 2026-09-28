@@ -8,10 +8,12 @@ Covers:
 - TestCiteRun      — cite_run UUID shape gate, run_not_found, happy path, finding_unknown (task 2595)
 - TestCiteToolsViaFastMCP — tools registered, end-to-end via call_tool, P4 schema rejection
 - TestReconReportComponentsWiring — _build_recon_report_components service injection
+- TestCiteTaskFoldPurgeRecord — task-4865 structured record of fold-purged findings
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import patch
 
@@ -2284,6 +2286,279 @@ class TestCiteTaskFoldPurgeLogging:
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [fid1, fid2]
 
+
+
+# ---------------------------------------------------------------------------
+# task-4865 step-5: TestCiteTaskFoldPurgeRecord — RED until step-6 keeps a
+# structured copy of every fold-purged finding on the CITING stage's
+# persisted entry.
+# ---------------------------------------------------------------------------
+
+
+def _persisted_purge_record_rows(store, run_id) -> dict[str, dict]:
+    """stage -> decoded ``entry_json`` of every persisted row of *run_id*:
+    the operator's actual recovery surface for a fold-purged finding."""
+    return {
+        row['stage']: json.loads(row['entry_json'])
+        for row in store.load_all()
+        if row['run_id'] == run_id
+    }
+
+
+class TestCiteTaskFoldPurgeRecord:
+    """A cite_task fold keeps a structured, persisted copy of the finding it
+    purges, on the CITING stage's entry (always resident, so always within
+    the run's persist reach), attributed to the stage that filed it.
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'rr.db')
+        store.open()
+        yield store
+        store.close()
+
+    def _make_state(self, store, *, ttl_seconds=300, memory_service=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {
+            (tid, root): {'id': tid, 'title': f'T-{tid}'}
+            for root in known_roots
+            for tid in ['2405', '2406', '9999']
+        }
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=ttl_seconds,
+            clock=lambda: t[0],
+            task_interceptor=_FakeTaskInterceptor(results=results),
+            memory_service=memory_service,
+            store=store,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @staticmethod
+    def _file_null_task_finding(state, description, suggested_action='a', flag_type=None):
+        result = state.add_finding(
+            run_id='run-1', severity='moderate', category='cross_project',
+            description=description, suggested_action=suggested_action,
+            actionable=True, task_id=None, flag_type=flag_type,
+        )
+        assert 'finding_id' in result, result
+        return result['finding_id']
+
+    @staticmethod
+    def _flagged_ids(state, stage):
+        report = state.get_assembled_report('run-1', stage)
+        assert report is not None, stage
+        return [item['finding_id'] for item in report['flagged_items']]
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_fold_persists_a_structured_record(self, store, caplog):
+        memory_service = _FakeMemoryService(
+            entity_nodes=[{'uuid': 'e' * 32, 'name': 'Widget Service'}]
+        )
+        state, _ = self._make_state(store, memory_service=memory_service)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'dark_factory:2405 still pending')
+        loser_id = self._file_null_task_finding(
+            state, 'blocked pending dark_factory task 2405 per routing check',
+            suggested_action='reroute once unblocked',
+            flag_type='cross_project_routing_stale',
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        assert 'error' not in await state.cite_entity('run-1', loser_id, 'Widget Service')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
+        assert self._flagged_ids(state, 'reconciler') == [anchor_id]
+
+        records = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
+        assert len(records) == 1, records
+        record = records[0]
+        assert {k: v for k, v in record.items() if k != 'finding'} == {
+            'fold': 'project_scoped',
+            'owning_stage': 'reconciler',
+            'surviving_finding_id': anchor_id,
+            'attempted_citation': {'project_id': 'dark_factory', 'task_id': '2405'},
+            'truncated_fields': [],
+        }
+        purged = record['finding']
+        assert purged['finding_id'] == loser_id
+        assert purged['severity'] == 'moderate'
+        assert purged['category'] == 'cross_project'
+        assert purged['description'] == 'blocked pending dark_factory task 2405 per routing check'
+        assert purged['suggested_action'] == 'reroute once unblocked'
+        assert purged['actionable'] is True
+        assert purged['task_id'] is None
+        assert purged['flag_type'] == 'cross_project_routing_stale'
+        assert purged['cited_entities'] == [
+            {'entity_uuid': 'e' * 32, 'canonical_name': 'Widget Service'}
+        ]
+
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert loser_id in warnings[0]
+        assert 'blocked pending dark_factory task 2405 per routing check' in warnings[0]
+        assert 'recoverable ONLY from this line' not in warnings[0]
+        assert "recorded_on_stage='reconciler'" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_entity_scoped_fold_persists_a_structured_record(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(
+            run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory'
+        )
+        survivor = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ2 desc', suggested_action='a',
+            task_id='2405', flag_type='cross_project',
+        )
+        survivor_id = survivor['finding_id']
+        loser_id = self._file_null_task_finding(
+            state, 'occ1 desc, worded differently and lost on fold',
+            flag_type='cross_project',
+        )
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': survivor_id,
+        }
+        assert self._flagged_ids(state, 'task_knowledge_sync') == [survivor_id]
+
+        records = _persisted_purge_record_rows(store, 'run-1')['task_knowledge_sync'][
+            'purged_findings'
+        ]
+        assert len(records) == 1, records
+        record = records[0]
+        assert record['fold'] == 'entity_scoped'
+        assert record['owning_stage'] == 'task_knowledge_sync'
+        assert record['surviving_finding_id'] == survivor_id
+        assert record['attempted_citation'] == {'project_id': 'dark_factory', 'task_id': '2405'}
+        assert record['truncated_fields'] == []
+        assert record['finding']['finding_id'] == loser_id
+        assert record['finding']['flag_type'] == 'cross_project'
+        assert record['finding']['description'] == 'occ1 desc, worded differently and lost on fold'
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_fold_records_on_the_citing_stage(self, store, caplog):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(state, 'filed by s1, folded from s2')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert rows['s1']['purged_findings'] == []
+        records = rows['s2']['purged_findings']
+        assert [(r['owning_stage'], r['finding']['finding_id']) for r in records] == [
+            ('s1', loser_id)
+        ]
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert "stage='s1'" in warnings[0]
+        assert "recorded_on_stage='s2'" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_fold_of_an_evicted_owner_is_still_persisted(self, store):
+        state, t = self._make_state(store, ttl_seconds=10)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(state, 'filed by s1 before it evicted')
+        state.complete('run-1', 's1 done')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        t[0] = 11.0
+        assert state.tick() == 1
+        assert state.get_assembled_report('run-1', 's1') is None
+
+        anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
+        records = _persisted_purge_record_rows(store, 'run-1')['s2']['purged_findings']
+        assert [(r['owning_stage'], r['finding']['finding_id']) for r in records] == [
+            ('s1', loser_id)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_non_folding_cite_task_records_nothing(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        first = self._file_null_task_finding(state, 'desc A')
+        second = self._file_null_task_finding(state, 'desc B', flag_type='other_flag')
+
+        assert 'error' not in await state.cite_task('run-1', first, 'dark_factory', '2405')
+        assert 'error' not in await state.cite_task('run-1', second, 'dark_factory', '2406')
+
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert {stage: row['purged_findings'] for stage, row in rows.items()} == {
+            'reconciler': []
+        }
+
+    @pytest.mark.asyncio
+    async def test_delete_finding_records_nothing(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'cited and kept')
+        doomed_id = self._file_null_task_finding(state, 'explicitly deleted')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        deleted = state.delete_finding('run-1', doomed_id)
+
+        assert 'error' not in deleted, deleted
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert rows['reconciler']['purged_findings'] == []
+
+    @pytest.mark.asyncio
+    async def test_record_caps_long_text_and_names_the_truncated_fields(self, store):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _MAX_PURGED_TEXT_CHARS,
+            _truncate_field,
+        )
+
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'short anchor')
+        long_description = 'x' * _MAX_FINDING_TEXT_CHARS
+        long_action = 'y' * _MAX_FINDING_TEXT_CHARS
+        loser_id = self._file_null_task_finding(
+            state, long_description, suggested_action=long_action,
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        (record,) = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
+        assert record['finding']['description'] == _truncate_field(
+            long_description, _MAX_PURGED_TEXT_CHARS
+        )[0]
+        assert record['finding']['suggested_action'] == _truncate_field(
+            long_action, _MAX_PURGED_TEXT_CHARS
+        )[0]
+        assert record['truncated_fields'] == ['description', 'suggested_action']
 
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
