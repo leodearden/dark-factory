@@ -286,6 +286,55 @@ async def _liveness_pass(
     return _LivenessPass(enumerations, records, stats)
 
 
+def _mention_pattern(memory_id: str) -> re.Pattern[str]:
+    """The full id, or its 8-char prefix as a whole word — but not as the head
+    of a DIFFERENT dashed id that merely shares the prefix."""
+    return re.compile(
+        rf'(?<![0-9a-f]){re.escape(memory_id)}(?![0-9a-f])'
+        rf'|(?<![0-9a-f]){re.escape(memory_id[:8])}(?![0-9a-f]|-[0-9a-f])',
+        re.IGNORECASE,
+    )
+
+
+def _annotation_marker(memory_id: str) -> str:
+    return f'[{memory_id[:8]}: '
+
+
+def _annotation(record: dict[str, str], verified_at: str) -> str:
+    if record['outcome'] == MemoryLiveness.ABSENT.value:
+        note = f'already deleted, verified {verified_at}'
+    else:
+        note = f'liveness inconclusive ({record.get("error_type")}), checked {verified_at}'
+    return f'{_annotation_marker(record["memory_id"])}{note}]'
+
+
+def _annotate_description(
+    description: str | None, records: list[dict[str, str]], verified_at: str,
+) -> tuple[str | None, int]:
+    """Append one annotation per (line, id) for each line naming a recorded id;
+    a line already carrying that id's marker is skipped, so re-running is a
+    no-op. Returns the caller's own string when no line changed."""
+    if description is None or not records:
+        return description, 0
+    annotations: dict[str, str] = {}
+    for record in records:
+        annotations.setdefault(record['memory_id'], _annotation(record, verified_at))
+    mentions = {memory_id: _mention_pattern(memory_id) for memory_id in annotations}
+    lines = description.split('\n')
+    annotated = 0
+    for index, line in enumerate(lines):
+        additions = [
+            annotation
+            for memory_id, annotation in annotations.items()
+            if mentions[memory_id].search(line)
+            and _annotation_marker(memory_id) not in line
+        ]
+        if additions:
+            lines[index] = ' '.join([line, *additions])
+            annotated += 1
+    return ('\n'.join(lines) if annotated else description), annotated
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
@@ -314,15 +363,22 @@ async def enumeration_liveness_gate(
         return passthrough._replace(rejection=_truncated_rejection(fragments))
 
     liveness = await _liveness_pass(parsed, memory_service, project_root)
+    verified_at = now().isoformat()
+    annotated_description, annotated_lines = _annotate_description(
+        description, liveness.records, verified_at,
+    )
     records = [_truncated_record(path, value) for path, value in fragments]
     records.extend(liveness.records)
-    stats = dict.fromkeys(_STAT_KEYS, 0) | liveness.stats | {'truncated': len(fragments)}
+    stats = dict.fromkeys(_STAT_KEYS, 0) | liveness.stats | {
+        'truncated': len(fragments),
+        'annotated_lines': annotated_lines,
+    }
     if not any(stats.values()):
         return passthrough
 
     rewritten = parsed | liveness.enumerations
     if records:
         rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
-    if rewritten == parsed:
+    if rewritten == parsed and annotated_description is description:
         return passthrough._replace(stats=stats)
-    return EnumerationGateResult(None, description, rewritten, stats)
+    return EnumerationGateResult(None, annotated_description, rewritten, stats)
