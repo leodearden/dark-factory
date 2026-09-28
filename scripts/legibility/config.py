@@ -63,8 +63,27 @@ class Saturation(BaseModel):
     consecutive_batches: int = 2
 
 
+class TrickleCensusCaps(BaseModel):
+    """``census.trickle_caps`` — the cost caps the NIGHTLY TRICKLE forwards to
+    the census it launches, as census.py's existing ``--max-batches`` /
+    ``--max-verify-clusters`` flags.
+
+    ``null`` omits that flag (uncapped — an explicit per-project opt-out).
+    A manual census.py run never reads this block; its caps are the flags the
+    operator types. The 50/150 defaults are the bound ratified for reify's
+    attended first census (skills/census/SKILL.md), so an unattended census
+    is bounded unless a project says otherwise.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    max_batches: int | None = Field(default=50, ge=1, strict=True)
+    max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
+
+
 class Census(BaseModel):
-    """``census`` block — census-trigger (ζ) and saturation tuning (PRD §5.2 points 6-7)."""
+    """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
+    points 6-7) and the nightly trickle's census launch caps."""
 
     model_config = ConfigDict(extra='allow')
 
@@ -74,6 +93,7 @@ class Census(BaseModel):
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)
+    trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
 
 
 class Models(BaseModel):
