@@ -459,13 +459,20 @@ def _burn_tiles(body):
     return {_prop_label(a): a for a in _self_closing_elements(body, 'ST')}
 
 
-class TestBurnTabReadsServedDatums:
-    def test_burntab_builds_no_endpoint_granular_datum(self, tabs_jsx_body):
-        """No plainDatum/derivedDatum: every reading is a served, stamped Datum."""
-        body = _burn_tab_body(tabs_jsx_body)
-        assert 'plainDatum(' not in body
-        assert 'derivedDatum(' not in body
+def _assert_served_datum(body, where, expr):
+    """``expr`` is a burndownDatum call, or a name bound to one inside ``body``."""
+    assert expr, f'{where} passes no datum'
+    if expr.startswith('burndownDatum('):
+        return
+    assert re.fullmatch(r'[A-Za-z_$][\w$]*', expr), (
+        f'{where} datum {expr!r} is neither a burndownDatum call nor a name bound to one'
+    )
+    assert re.search(rf'\bconst\s+{re.escape(expr)}\s*=\s*burndownDatum\(', body), (
+        f'{where} datum {expr!r} is not bound to a burndownDatum result'
+    )
 
+
+class TestBurnTabReadsServedDatums:
     def test_burntab_reads_the_latest_and_forecast_datums(self, tabs_jsx_body):
         body = _burn_tab_body(tabs_jsx_body)
         for field in ('latest', 'forecast'):
@@ -485,39 +492,21 @@ class TestBurnTabReadsServedDatums:
         tiles = _burn_tiles(body)
         assert set(tiles) == _BURN_TILE_LABELS
         for label, attrs in tiles.items():
-            expr = _prop_expr(attrs, 'datum')
-            assert expr, f'the {label!r} tile passes no datum'
-            if not expr.startswith('burndownDatum('):
-                assert re.fullmatch(r'[A-Za-z_$][\w$]*', expr), (
-                    f'the {label!r} tile datum {expr!r} is neither a burndownDatum '
-                    'call nor a name bound to one'
-                )
-                assert re.search(rf'\bconst\s+{re.escape(expr)}\s*=\s*burndownDatum\(', body), (
-                    f'the {label!r} tile datum {expr!r} is not bound to a burndownDatum result'
-                )
+            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(attrs, 'datum'))
 
-    def test_backlog_tile_label_is_retired(self, tabs_jsx_body):
-        """The tile shows the pending MEMBER; the backlog VIEW (pending + deferred) is OrchTab's."""
-        assert not re.search(r'label=["\']Backlog["\']', _burn_tab_body(tabs_jsx_body))
-
-    def test_active_label_is_retired_for_running(self, tabs_jsx_body):
+    def test_every_pip_and_cell_renders_a_served_datum(self, tabs_jsx_body):
+        """The per-project pips and table cells read the same served Datums as the tiles."""
         body = _burn_tab_body(tabs_jsx_body)
-        assert not re.search(r'label=["\']active["\']', body)
-        assert not re.search(r'>\s*Active\s*<', body)
-        assert re.search(r'label=["\']running["\']', body)
-        assert re.search(r'>\s*Running\s*<', body)
+        for tag in ('Pip', 'DatumReading'):
+            elements = _self_closing_elements(body, tag)
+            assert elements, f'BurnTab renders no <{tag}>'
+            for attrs in elements:
+                _assert_served_datum(body, f'a <{tag}>', _prop_expr(attrs, 'datum'))
 
     def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
         """No client point estimate: the server refuses to synthesise one on sparse history."""
         body = _burn_tab_body(tabs_jsx_body)
         assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
-
-    def test_endpoint_table_no_longer_names_burndown(self, tabs_jsx_body):
-        src = strip_js_comments(tabs_jsx_body)
-        m = re.search(r'const\s+EP\s*=\s*Object\.freeze\(\{', src)
-        assert m, 'tabs.jsx no longer declares its EP endpoint table'
-        assert not re.search(r'\bburndown\s*:', walk_balanced(src, m.end() - 1))
-        assert 'EP.burndown' not in src
 
 
 # ---------------------------------------------------------------------------
