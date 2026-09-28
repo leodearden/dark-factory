@@ -12,7 +12,8 @@ reify esc-5557/esc-5626 showed that adjudicating a apparent contradiction
 needs code-reading and cross-checking that the synchronous ``add_memory``
 write path cannot do and should not try. A ``contests`` verdict routes the
 entry to the machinery that CAN adjudicate; it is a detection, not a ruling.
-The band already named the target, so a verdict is only a word.
+The verdict names the candidate it is about; the band only names the record
+the slate is guaranteed to contain.
 
 **It RAISES; it does not swallow.** ``triage_write`` already wraps the judge
 call in an ``except`` arm that logs with ``exc_info``, records exactly one
@@ -59,10 +60,11 @@ from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    TriageJudgeVerdict,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -81,6 +83,9 @@ class JudgeOutputError(Exception):
 
 #: The key the judge is instructed to put its answer under.
 VERDICT_KEY = 'verdict'
+
+#: The key naming the candidate an attach verdict is about.
+CANDIDATE_ID_KEY = 'candidate_id'
 
 #: The CLOSED 4-way judge vocabulary, mapped onto leaf beta's ack outcomes.
 #:
@@ -143,9 +148,9 @@ class JudgeExemplar(NamedTuple):
 #: The `restates`/`amends` pair differs only by a trailing novel fragment, so
 #: the discrimination between them is shown on otherwise identical material.
 #:
-#: Declaration order mirrors the decision procedure the prompt states — ask
-#: whether any candidate makes the same core claim first, reach for `distinct`
-#: only when none does — not the vocabulary's alphabet.
+#: Declaration order mirrors the instruction the prompt states — find the
+#: candidate that shares the entry's core claim first, answer `distinct` only
+#: when none does — not the vocabulary's alphabet.
 #:
 #: SYNTHETIC AND OFF-CORPUS BY CONSTRUCTION. Nothing here is drawn from
 #: ``tests/fixtures/write_triage_calibration.jsonl``; drawing from it would be
@@ -198,17 +203,24 @@ def _reject(reason: str, payload: object) -> JudgeOutputError:
     return JudgeOutputError(f'judge output rejected ({reason}): {quoted}')
 
 
-def parse_judge_verdict(raw: str) -> str:
-    """Map one raw judge response onto a member of ``TRIAGE_OUTCOMES``.
+def parse_judge_verdict(raw: str, slate_ids: Collection[str]) -> TriageJudgeVerdict:
+    """Map one raw judge response onto a :class:`TriageJudgeVerdict`.
 
     Accepts a bare JSON object, a fenced ```json block, and JSON embedded in
     surrounding prose — via :func:`fused_memory.routing.json_extract.extract_json`,
     the repo's existing fenced-code/brace-counting extractor, rather than a
     fourth private JSON scraper.
 
+    An attach verdict must name its candidate under :data:`CANDIDATE_ID_KEY`,
+    and that id must be one of *slate_ids* — the slate the model was actually
+    SHOWN. A record retrieved but trimmed off the slate was never seen, so
+    naming it is a hallucination, not a choice. ``distinct`` names none.
+
     RAISES :class:`JudgeOutputError` for everything else: an unrecognised
     verdict word, a missing or non-string verdict key, a non-object payload,
-    empty or whitespace-only text, and prose containing no JSON at all.
+    empty or whitespace-only text, prose containing no JSON at all, an attach
+    verdict naming no candidate or one off the slate, and ``distinct`` naming
+    one.
 
     Raising rather than defaulting is the load-bearing part. ``triage_write``
     counts a fail-open for a judge that raises or answers out-of-vocabulary;
@@ -242,12 +254,38 @@ def parse_judge_verdict(raw: str) -> str:
     if not isinstance(word, str):
         raise _reject(f'no string {VERDICT_KEY!r} key', payload)
 
-    verdict = JUDGE_VERDICTS.get(word.strip().lower())
-    if verdict is None:
+    outcome = JUDGE_VERDICTS.get(word.strip().lower())
+    if outcome is None:
         raise _reject(
             f'{word!r} is not one of {sorted(JUDGE_VERDICTS)}', payload,
         )
-    return verdict
+    return TriageJudgeVerdict(outcome, _named_candidate(payload, outcome, slate_ids))
+
+
+def _named_candidate(
+    payload: dict[str, Any], outcome: str, slate_ids: Collection[str],
+) -> str | None:
+    """The slate id *payload* names, or ``None`` for a verdict that attaches nothing."""
+    candidate_id = payload.get(CANDIDATE_ID_KEY)
+    if outcome == OUTCOME_STORED:
+        if candidate_id is not None:
+            raise _reject(
+                f'a verdict that attaches nothing names {candidate_id!r}', payload,
+            )
+        return None
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise _reject(
+            f'an attach verdict must name its candidate as a non-empty string '
+            f'{CANDIDATE_ID_KEY!r}',
+            payload,
+        )
+    if candidate_id not in slate_ids:
+        raise _reject(
+            f'{candidate_id!r} is not a candidate on the rendered slate '
+            f'{sorted(slate_ids)}',
+            payload,
+        )
+    return candidate_id
 
 
 # --- candidate selection ----------------------------------------------------
@@ -274,10 +312,9 @@ _ELIDED_MARKER = '…[elided]'
 #: worst-case :func:`build_judge_prompt` render, meaning
 #: :data:`_DEFAULT_JUDGE_CANDIDATE_COUNT` candidates and a new entry with
 #: every field over :data:`_FIELD_CHARS`, each candidate carrying the 36-char
-#: uuid a real record has, and the ``attach_target`` line rendered. Not the
-#: system prompt alone: the two halves are summed on every request, so
-#: budgeting either in isolation budgets nothing. And not a construction
-#: :func:`judge_write` never makes, for the same reason.
+#: uuid a real record has. Not the system prompt alone: the two halves are
+#: summed on every request, so budgeting either in isolation budgets nothing.
+#: And not a construction :func:`judge_write` never makes, for the same reason.
 #:
 #: WHY IT IS A CONSTANT rather than a literal in the test that checks it. The
 #: system prompt is the half that grows — a vocabulary word, a worked example,
@@ -297,26 +334,19 @@ _ELIDED_MARKER = '…[elided]'
 #: The tolerance is SIZED, not chosen for comfort — but what has to stay
 #: small is the SLACK, budget minus the measured worst case, which is what a
 #: future addition could spend without anyone having to come here. That slack
-#: is 140 chars. The four worked examples presently rendered cost 157 to 192
+#: is 58 chars. The four worked examples presently rendered cost 157 to 192
 #: chars apiece including the blank line between them, so even the cheapest
 #: fifth one does not fit and its author has to either make room or make the
 #: case here. A ceiling that admitted another example would have stopped
 #: bounding anything.
 #:
-#: Measured at task 4811, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 10_260 chars — system 2_312, plus a 7_948-char
-#: render of six fields each OVER `_FIELD_CHARS`. The first measurement read
-#: 10_051 because it was built from 5-char stand-in ids and no attach target,
-#: neither of which production ever hands this function. The 209-char
-#: difference is not slop:
-#:
-#: * every stored record's id is a 36-char uuid — all 104 in
-#:   ``tests/fixtures/write_triage_calibration.jsonl`` are — and
-#:   :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so
-#:   a full slate costs 155 chars more than short ids suggest;
-#: * :func:`judge_write` forwards ``attach_target_id`` on every call, so the
-#:   ``  attach_target: {id}`` line is always rendered — 54 more chars, a
-#:   fixed cost of the call rather than an optional extra.
+#: Measured at task 5794, PRODUCTION-SHAPED and with the elision marker
+#: counted: the worst case is 10_342 chars — system 2_468, plus a 7_874-char
+#: render of six fields each OVER `_FIELD_CHARS`. The ids are not slop: every
+#: stored record's id is a 36-char uuid — all 104 in
+#: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
+#: :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so a
+#: full slate costs 155 chars more than 5-char stand-in ids suggest.
 #:
 #: Note "over" `_FIELD_CHARS`, not "at": `_elide` returns a field of exactly
 #: `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS` plus
@@ -363,12 +393,12 @@ def select_judge_candidates(
 
     *canonical_id* — the band's winner, hoisted to a parent where the winner
     was itself a child — is guaranteed present in the returned set, evicting
-    the weakest candidate if it would otherwise fall outside the top *n*. A
-    judge shown a set that excludes the attach target is answering about a
-    different memory than the one the attach will touch. When the hoisted
-    parent is not itself in the result set, the CHILD that carried the
-    evidence is kept instead, because dropping both would leave no view of
-    the match at all.
+    the weakest candidate if it would otherwise fall outside the top *n*. It
+    is the strongest evidence retrieval found, so the model is always SHOWN
+    it, even though the verdict may name a different candidate. When the
+    hoisted parent is not itself in the result set, the CHILD that carried
+    the evidence is kept instead, because dropping both would leave no view
+    of the match at all.
 
     Returns ``[]`` for an empty or wholly uncomparable slate, and raises
     nothing: an empty candidate set is a decision (:func:`judge_write` answers
@@ -433,6 +463,13 @@ def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
     )
 
 
+#: The one spelling of the judge's output contract, rendered into BOTH halves
+#: of the call so the system prompt and the user turn cannot disagree about it.
+JUDGE_REPLY_SHAPE = json.dumps({
+    VERDICT_KEY: f'<one of: {", ".join(JUDGE_VERDICTS)}>',
+    CANDIDATE_ID_KEY: '<the id of the candidate your verdict is about; null for distinct>',
+})
+
 #: The judge's standing instructions. D3 lives HERE, in the model's own
 #: prompt, not only in a docstring: a model told merely to "classify" will
 #: happily decide which of two contradictory memories is true, and reify
@@ -462,11 +499,12 @@ are not in conflict. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
-Decide in this order. First ask whether ANY candidate makes the same core \
-claim as the new entry. If one does, the answer is "restates" or "amends", \
-never "distinct"; answer "distinct" only when none does. Between "amends" \
-and "contests", prefer "amends" — a genuine incompatibility is a last \
-resort, not a default reading.
+Find the candidate whose core claim the new entry shares (or, for \
+"contests", contradicts), answer about THAT candidate, and name it by its \
+id: the verdict is filed against the candidate you name and no other. \
+Answer "distinct", naming none, only when no candidate qualifies. Between \
+"amends" and "contests", prefer "amends" — a genuine incompatibility is a \
+last resort, not a default reading.
 
 Worked examples:
 
@@ -474,65 +512,11 @@ Worked examples:
 
 Reply with a bare JSON object and nothing else:
 
-{{"{VERDICT_KEY}": "<one of: {', '.join(JUDGE_VERDICTS)}>"}}\
+{JUDGE_REPLY_SHAPE}\
 """
 
 
-def _attach_target_of(
-    candidates: list[MemoryResult], attach_target_id: str | None,
-) -> MemoryResult | None:
-    """WHICH record the band's verdict will be filed against — at most one.
-
-    The SAME ordered ``next(...) or next(...)`` expression
-    :func:`select_judge_candidates`' rescue arm uses, so the marker and the
-    rescue resolve the winner IDENTICALLY rather than merely sharing two
-    clauses. Precedence is exact-id-first; the ``PARENT_ID_KEY`` arm is the
-    FALLBACK for a hoisted parent that is absent from the slate, not a
-    co-equal alternative. That fallback is not defensive padding:
-    ``_canonical_id_of`` HOISTS a child winner to its parent id, so
-    ``decision.canonical_id`` routinely names a record that is not in the
-    slate at all, and a bare ``candidate.id == attach_target_id`` marker marks
-    NOTHING there — the silent version of the defect rather than a fix for it.
-
-    Resolving ONE target for the whole slate is what makes the mark
-    determinate, and this deliberately replaces an earlier per-candidate
-    predicate that asked the two clauses UNORDERED, once per candidate. On a
-    slate holding a canonical parent AND one of its ``PARENT_ID_KEY``
-    children — the ordinary consolidated-topic case, since ``_canonical_id_of``
-    hoists and ``retrieve_candidates`` returns children un-filtered — both
-    clauses were true somewhere and EVERY such record got marked; several
-    children of one parent multiplied it further. That defeats the very
-    determinacy the mark exists to establish: the prompt's constant sentence
-    says the marked candidate is the one the verdict will be filed against,
-    and with two marks that sentence is simply false.
-
-    ``None`` resolves to nothing, and so does an id naming no candidate: the
-    mark MATCHES against the slate rather than interpolating what it was
-    handed. That is what
-    ``scripts/check_write_triage_attach_target.py::_echoes_argument``
-    separates a real marker from a free-text parameter by.
-    """
-    if attach_target_id is None:
-        return None
-    return next(
-        (c for c in candidates if c.id == attach_target_id),
-        None,
-    ) or next(
-        (
-            c
-            for c in candidates
-            if (c.metadata or {}).get(PARENT_ID_KEY) == attach_target_id
-        ),
-        None,
-    )
-
-
-def build_judge_prompt(
-    content: str,
-    candidates: list[MemoryResult],
-    *,
-    attach_target_id: str | None = None,
-) -> str:
+def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     """Render the user-side prompt: the new entry, then the candidates.
 
     CONTENT ONLY. No metadata is interpolated — not the agent_id, not the
@@ -540,30 +524,11 @@ def build_judge_prompt(
     task context reaches the judge", and rendering no metadata at all is what
     makes it a structural property rather than an incidental one: there is no
     field list to keep in sync and no leak to notice later. Candidate ids ARE
-    rendered, because they let the model tell the candidates apart AND
-    identify the one marked as the attach target — they are opaque memory
-    uuids, not context.
+    rendered, because the model NAMES the candidate its verdict is about by
+    id — they are opaque memory uuids, not context.
 
-    *attach_target_id* is the band's winner (``decision.canonical_id``). The
-    single candidate :func:`_attach_target_of` resolves gains an
-    ``attach_target`` line naming its own id, wherever it sits in the slate;
-    every other candidate, and an id matching none of them, renders exactly as
-    it would with no target at all. AT MOST ONE candidate is ever marked —
-    the target is resolved once for the whole slate, not re-decided per
-    candidate — which is what makes the constant "the candidate marked
-    ``attach_target`` is the one this verdict will be filed against" sentence
-    below true rather than merely intended. Position is NOT a sound encoding
-    of the target:
-    :func:`select_judge_candidates` rescues a hoisted parent's evidence child
-    by APPENDING it, so the target is LAST on that slate and first on a flat
-    one (measured in
-    ``plans/write-triage-attach-target-contradiction.md`` §2).
-
-    This closes item 1 of ``scripts/check_write_triage_flip_preconditions.sh``
-    via option (b) — the prompt names the attach target. Option (a), a verdict
-    that carries the candidate id it reasoned about, remains task 4798 item 7
-    and is NOT superseded by this: the gate accepts either remedy because what
-    it asserts is the invariant, not the mechanism.
+    No candidate is marked or singled out. The verdict carries its own id, so
+    neither slate position nor the band's winner steers the answer.
 
     Every field is bounded by :data:`_FIELD_CHARS` and marked with
     :data:`_ELIDED_MARKER` when cut, so the call stays near C1's ~2.5k-token
@@ -578,15 +543,8 @@ def build_judge_prompt(
         '',
         'EXISTING CANDIDATES:',
     ]
-    target = _attach_target_of(candidates, attach_target_id)
     for candidate in candidates:
         lines.append(f'- id: {candidate.id}')
-        if target is not None and candidate is target:
-            # Names the CANDIDATE's id, not the argument. A bare
-            # `attach_target: true` flag would leave no differing line
-            # mentioning any candidate id, which is precisely what the gate's
-            # `_swap_verdict` rejects.
-            lines.append(f'  attach_target: {candidate.id}')
         lines.append(f'  text: {_elide(candidate.content)}')
     if not candidates:
         lines.append('(none)')
@@ -599,26 +557,13 @@ def build_judge_prompt(
     # contract in the user turn means the worst case is a weaker prompt, not
     # a model answering in a vocabulary parse_judge_verdict rejects on every
     # single write. (2) An out-of-vocabulary answer is a counted fail-open
-    # (write_triage.py:839), so vocabulary drift does not surface as a bad
-    # verdict — it surfaces as a storm escalation describing an outage.
+    # (write_triage.py::triage_write), so vocabulary drift does not surface as
+    # a bad verdict — it surfaces as a storm escalation describing an outage.
     lines.append(
         'Classify the relationship between NEW ENTRY and the candidates. '
         f'Answer with exactly one of: {", ".join(JUDGE_VERDICTS)}.',
     )
-    # CONSTANT, and rendered unconditionally — it interpolates nothing. A
-    # sentence carrying `attach_target_id` would re-enter the echo path the
-    # gate's `_echoes_argument` control exists to catch, and one rendered only
-    # when a target matched would make the prompt differ for an id naming no
-    # candidate. Appearing identically in every rendering, it cannot perturb
-    # which candidate the swap test attributes a difference to.
-    lines.append(
-        'The candidate marked "attach_target" is the one this verdict will be '
-        'filed against; the others are context for the comparison.',
-    )
-    lines.append(
-        'Reply with a bare JSON object and nothing else: '
-        f'{{"{VERDICT_KEY}": "<one of those four words>"}}',
-    )
+    lines.append(f'Reply with a bare JSON object and nothing else: {JUDGE_REPLY_SHAPE}')
     return '\n'.join(lines)
 
 
@@ -800,12 +745,13 @@ def resolve_judge_candidate_count(memory_service: Any) -> int:
 
 # --- the LLM call ------------------------------------------------------------
 
-#: Output cap. The answer is a four-word closed vocabulary inside a one-key
-#: JSON object, so this is generous by an order of magnitude — sized to leave
-#: room for a model that adds a `reasoning` key (the parser ignores extra
-#: keys) without leaving room for an essay billed per token on every
-#: middle-band write.
-_JUDGE_MAX_TOKENS = 64
+#: Output cap. The answer is a closed-vocabulary word plus a candidate id — a
+#: 36-char opaque uuid, which tokenizes far worse than prose — inside a
+#: two-key JSON object. Sized to leave room for a model that adds a short
+#: `reasoning` key (the parser ignores extra keys) without leaving room for an
+#: essay billed per token on every middle-band write. Too tight is not a worse
+#: verdict: a truncated answer is unparseable, i.e. a counted fail-open.
+_JUDGE_MAX_TOKENS = 128
 
 
 def _provider_credentials(memory_service: Any, provider: str) -> dict[str, Any]:
@@ -844,8 +790,8 @@ async def _call_llm(
     Mirrors ``reconciliation/judge.py::_call_llm``'s two-arm fan-out at
     write-path scale. Determinism (``temperature=0.0``) and the token cap
     (:data:`_JUDGE_MAX_TOKENS`) are pinned IDENTICALLY on both arms: the
-    judge is a classifier answering one word from a closed vocabulary, so
-    sampling buys nothing and costs parse failures — and a parse failure
+    judge is a classifier answering from a closed vocabulary, so sampling
+    buys nothing and costs parse failures — and a parse failure
     here is a counted fail-open, not merely a worse answer. Omitting
     ``temperature`` on an arm does not mean "unset": Anthropic's default is
     1.0.
@@ -946,8 +892,8 @@ async def judge_write(
     project_id: str,
     decision: Any,
     candidates: Any = (),
-) -> str:
-    """Adjudicate one middle-band write. Returns a member of ``TRIAGE_OUTCOMES``.
+) -> TriageJudgeVerdict:
+    """Adjudicate one middle-band write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
     replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
@@ -956,9 +902,10 @@ async def judge_write(
     only a canonical ID cannot classify anything.
 
     Flow: resolve config LIVE → return ``stored`` early if disabled or if the
-    slate selects to empty → build the prompt, which NAMES the attach target
-    (``decision.canonical_id``, the same id the selector was given) → call the
-    provider under ``asyncio.wait_for`` → parse.
+    slate selects to empty (the selector guarantees the band's winner is
+    shown) → build the prompt → call the provider under ``asyncio.wait_for``
+    → parse against the rendered slate, so the verdict can only name a
+    candidate the model was shown.
 
     RAISES on every failure — transport, timeout, unparseable output,
     out-of-vocabulary verdict — and catches nothing. ``triage_write`` owns the
@@ -1009,29 +956,21 @@ async def judge_write(
             '%r without an LLM call',
             OUTCOME_STORED,
         )
-        return OUTCOME_STORED
+        return TriageJudgeVerdict(OUTCOME_STORED)
 
-    # ONE expression for "the band's winner" on this path. The selector
-    # guarantees it is in the slate; the renderer marks it wherever it landed.
-    # Reading `decision.canonical_id` twice would let a future edit hand the
-    # selector one id and the renderer another, and neither call site would
-    # look wrong on its own.
-    attach_target_id = getattr(decision, 'canonical_id', None)
     selected = select_judge_candidates(
         candidates,
         resolve_judge_candidate_count(memory_service),
-        canonical_id=attach_target_id,
+        canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
-        return OUTCOME_STORED
+        return TriageJudgeVerdict(OUTCOME_STORED)
 
     raw = await _call_llm(
         provider=resolve_judge_provider(memory_service),
         model=resolve_judge_model(memory_service),
-        prompt=build_judge_prompt(
-            content, selected, attach_target_id=attach_target_id,
-        ),
+        prompt=build_judge_prompt(content, selected),
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
     )
-    return parse_judge_verdict(raw)
+    return parse_judge_verdict(raw, [candidate.id for candidate in selected])

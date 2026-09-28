@@ -771,9 +771,14 @@ def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Count WHERE each case attached, not merely whether its class was right.
 
     `score_cases` scores the verdict WORD against the curator label. This
-    scores the production consequence: `triage_write` files every non-`stored`
-    outcome against `decision.canonical_id`, so a case can answer `amended` —
-    correct for its label — while attaching the write to an unrelated record.
+    scores the attach target, so a case can answer `amended` — correct for its
+    label — while attaching the write to an unrelated record.
+
+    The target scored is each row's `attach_target_id`: the band winner,
+    `decision.canonical_id`. A deterministic `restated` attaches there; a
+    judged attach does not, because `triage_write` files it against the
+    candidate the judge named, which the rows do not carry. For the middle
+    band these counts describe the band winner, not production's attach.
 
     Pure counting over the per-case dump. Every rule is a field of a row;
     nothing is recomputed from the cases here.
@@ -1072,11 +1077,14 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         '`stored` are counted there without an LLM having seen the case — and '
         '`production_shape.middle_band` is the judge\'s own accuracy. '
         'A verdict that is correct for its curator label can still attach to '
-        'ANOTHER RECORD: `triage_write` files every non-`stored` outcome '
-        'against `decision.canonical_id`, the band\'s argmax, not against '
-        'whatever the judge reasoned about. '
-        '`production_shape.duplicate_attach.strict` is the figure that '
-        'accounts for that and `per_class` is not.',
+        'ANOTHER RECORD, which `per_class` cannot show. '
+        '`production_shape.duplicate_attach.strict` and '
+        '`production_shape.wrong_record_attach` score `attach_target_id`, the '
+        'band winner `decision.canonical_id`. A deterministic `restated` '
+        'attaches there, but a judged one does NOT: `triage_write` files a '
+        'middle-band attach against the candidate the judge NAMED, which this '
+        'report does not yet record (task 6007). For the middle band those two '
+        'figures describe the band winner, not production\'s attach.',
     ),
 }
 
@@ -1653,8 +1661,8 @@ def _ask_judge(
         candidates=list(slate),
     ))
     return JudgeAnswer(
-        outcome=verdict,
-        verdict=verdict,
+        outcome=verdict.outcome,
+        verdict=verdict.outcome,
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
         usage=_usage_of(recorded[before:]),

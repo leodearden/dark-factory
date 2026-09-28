@@ -8,7 +8,7 @@ const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
-const { censusOver, runningOfInFlight, inFlightCount } = window.DF_TASK_SNAPSHOT;
+const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -122,7 +122,7 @@ function App() {
 
   const railCounts = {
     orch: summary.orchRunning,
-    tasks: <DatumReading datum={tasksCensus} format={inFlightCount} />,
+    tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
     // visible from the rail and not only from the tab. 'interrupted' is
