@@ -189,11 +189,22 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # since these markers carry no source metadata field.
         #
         # That collector is NO LONGER age-based (task 4375). Retirement is now
-        # COMPOSITE: a marker is deleted only when it is past the 14-day age
-        # cutoff AND is not a protected cycle_summary mirror AND its kind is
-        # not in mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is
-        # confirmed terminal. The age-only rule destroyed 40 kind='cadence_check'
-        # audit records in autopilot_video, all citing a merely-'deferred' task.
+        # COMPOSITE: a marker is deleted only when it is past the
+        # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
+        # cycle_summary mirror AND its kind is not in
+        # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
+        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
+        # records in autopilot_video, all citing a merely-'deferred' task.
+        #
+        # That routine has TWO firing sites (task 4376). The primary one, and
+        # the correctness and audit mechanism, is the unconditional
+        # per-project, per-cycle sweep in TaskKnowledgeSync.run(). The second,
+        # reconciliation/targeted.py::TargetedReconciler._on_task_done via
+        # stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task,
+        # exists only to cut latency: best-effort, no retry, and inert whenever
+        # the targeted reconciler is not wired. The ELIGIBILITY RULE is
+        # identical at both — the hook narrows only terminal_task_ids, to the
+        # one task that just closed — so the rule above holds for both sites.
         #
         # The terminal-closure arm NARROWS the declared-vs-actual gap this
         # comment documents, without closing it: the Mem0 side now applies the
