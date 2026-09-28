@@ -37,20 +37,17 @@
 // index.html's load order is the enforced contract, pinned per-module by
 // tests/test_index_html.py.
 //
-// WHICH NAME TO BIND IT UNDER DEPENDS ON THE KIND OF FILE, and getting it wrong
-// fails at LOAD rather than at first use:
-//   · a classic `<script>` — data.js, task_row_cells.js, and this file — shares
-//     ONE global lexical scope with every other classic script, so a `const`
-//     matching a top-level declaration elsewhere dies with "Identifier 'x' has
-//     already been declared" before the file reaches its own `window.DF_*`
-//     assignment, taking every downstream destructure with it. Rename in the
-//     destructure: `{ datumView: viewOfDatum }`.
+// WHICH NAME TO BIND IT UNDER — getting it wrong fails at LOAD, with
+// "Identifier 'x' has already been declared", before the file reaches its own
+// `window.DF_*` assignment:
+//   · a classic `<script>` — data.js, task_row_cells.js, and this file — must
+//     not bind any name another classic script declares at top level.
 //   · a `type="text/babel"` tag — charts.jsx, shell.jsx, tabs.jsx and the
-//     tab_*.jsx files — is downlevelled by Babel-standalone, whose top-level
-//     bindings never join that scope. Bind under datum.js's own names.
-// Measured, not assumed: classic_script_scope.test.mjs's SCOPE note records
-// three independent witnesses, and it caught the destructure below in its
-// first spelling.
+//     tab_*.jsx files — compiles to global `var`s, which clash only with a
+//     classic top-level `const`/`let`/`class`: datum.js's function names are
+//     safe there, its `const`s are not.
+// Either way, rename in the destructure: `{ datumView: viewOfDatum }`.
+// dashboard/tests/js/classic_script_scope.test.mjs enforces both.
 
 // ── One age formatter for the whole dashboard ──
 // Renamed per the CANONICAL note above: endpoint_staleness.js already declares

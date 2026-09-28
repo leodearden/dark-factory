@@ -16,15 +16,12 @@ import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 _LOAD_SAFETY_MECHANISM = (
-    'Babel-standalone 7.29.0 (the build index.html loads, default presets '
-    "['react','env']) compiles a JSX file's top-level `const` into a global "
-    '`var` with no wrapper function. A `var` sharing its name with a classic '
-    "script's top-level `const` throws `SyntaxError: Identifier '...' has "
-    'already been declared` at load, and data.js declares ON_DEMAND_KEYS, '
-    'REFRESH_OUTCOMES and ON_DEMAND_VIEWS exactly that way. Then none of '
-    'tab_tasks.jsx runs, window.DF_TASKS stays undefined and the Tasks tab '
-    'blanks. No test here compiles JSX, so this pin is the only guard: bind the '
-    'loader as ONE namespace alias and reach every export through it.'
+    "A .jsx file's top-level bindings compile to global `var`s, and data.js "
+    'declares ON_DEMAND_KEYS, REFRESH_OUTCOMES and ON_DEMAND_VIEWS with top-level '
+    '`const`, so binding any of them under its own name kills tab_tasks.jsx on '
+    'load and blanks the Tasks tab. dashboard/tests/js/classic_script_scope.test.mjs '
+    'enforces that rule for every .jsx file; this pin keeps tab_tasks.jsx on its '
+    'chosen shape: ONE namespace alias, every export reached through it.'
 )
 
 
