@@ -9281,6 +9281,90 @@ class TestSweepStaleMem0FlagForStage2Markers:
         assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
 
 
+class TestRetireFlagMarkersForTerminalTask:
+    """retire_flag_markers_for_terminal_task is the done-transition hook's
+    public seam onto the per-cycle flag_for_stage2 sweep (task 4376).
+
+    It owns no eligibility predicate: it forwards to
+    _sweep_stale_mem0_flag_for_stage2_markers with terminal_task_ids narrowed
+    to the one closing task, so every gate the sweep has, the seam has too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_the_sweep_with_a_one_task_terminal_set(self, monkeypatch):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            retire_flag_markers_for_terminal_task,
+        )
+
+        sentinel = 4242
+        sweep = AsyncMock(return_value=sentinel)
+        monkeypatch.setattr(tks, '_sweep_stale_mem0_flag_for_stage2_markers', sweep)
+        svc = AsyncMock()
+
+        result = await retire_flag_markers_for_terminal_task(
+            svc, 'dark_factory', 'run-1', task_id='  4376  ',
+        )
+
+        assert result == sentinel
+        sweep.assert_awaited_once()
+        assert sweep.await_args is not None
+        assert sweep.await_args.args[:3] == (svc, 'dark_factory', 'run-1')
+        terminal_task_ids = sweep.await_args.kwargs['terminal_task_ids']
+        assert terminal_task_ids is not None
+        assert not isinstance(terminal_task_ids, str)
+        assert set(terminal_task_ids) == {'4376'}
+        assert all(type(tid) is str for tid in terminal_task_ids)
+
+    @pytest.mark.asyncio
+    async def test_inherits_every_sweep_gate_end_to_end(self):
+        from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+            retire_flag_markers_for_terminal_task,
+        )
+
+        audit_kind = 'cadence_check'
+        assert audit_kind in PROTECTED_AUDIT_KINDS
+
+        now = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
+        stale = (now - timedelta(days=_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6)).isoformat()
+        fresh = (now - timedelta(days=1)).isoformat()
+
+        def member(mid: str, created_at: str, **metadata) -> dict:
+            return {
+                'id': mid,
+                'created_at': created_at,
+                'metadata': {'flag_for_stage2': True, **metadata},
+            }
+
+        members = [
+            member('eligible', stale, task_id='T', run_id='prior-run'),
+            member('fresh', fresh, task_id='T', run_id='prior-run'),
+            member('mirror', stale, task_id='T', kind='cycle_summary'),
+            member('audit', stale, task_id='T', kind=audit_kind),
+            member('other-task', stale, task_id='OTHER', run_id='prior-run'),
+        ]
+        svc = AsyncMock()
+        svc.get_memories_by_metadata = AsyncMock(return_value=members)
+        svc.delete_memory = AsyncMock(return_value=None)
+
+        result = await retire_flag_markers_for_terminal_task(
+            svc, 'dark_factory', 'run-1', task_id='T', now=now,
+        )
+
+        assert result == 1
+        svc.delete_memory.assert_awaited_once()
+        assert svc.delete_memory.await_args is not None
+        kwargs = svc.delete_memory.await_args.kwargs
+        assert kwargs['memory_id'] == 'eligible'
+        assert kwargs['store'] == 'mem0'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['causation_id'] == 'run-1'
+        assert kwargs['_source'] == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+
 class TestWarnOnFlagForStage2TypeDrift:
     """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
     type-drift diagnostic for the flag_for_stage2 GC sweep (task 2966
