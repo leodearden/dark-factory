@@ -10966,8 +10966,7 @@ class Harness:
             'routing': {
                 'routing_tier': RoutingState.from_metadata(task_metadata).routing_tier + 1,
             },
-            'modules': list(task_metadata.get('modules') or []),
-            'files': list(task_metadata.get('files') or []),
+            'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
         title = (
