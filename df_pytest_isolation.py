@@ -287,6 +287,7 @@ together by
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import enum
 import json
 import math
@@ -296,7 +297,7 @@ import subprocess
 import time
 import uuid
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1531,20 +1532,7 @@ def run_in_new_session(
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as expired:
-        _kill_process_group(p, pgid)
-        try:
-            out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
-        except subprocess.TimeoutExpired:
-            # Something still holds the pipe open despite the group kill.
-            # Give up on the output rather than on the timeout: the caller
-            # asked for a bound and gets one.
-            #
-            # Deliberately NOT bound with `as`: Python unbinds an `as` name at
-            # the end of its except block, so reusing the name here would clear
-            # the binding the re-raise below depends on.
-            p.kill()
-            _release_abandoned_child(p)
-            out, err = ('', '') if text else (b'', b'')
+        out, err = _stop_group_and_drain(p, pgid, text=text)
         # `expired.timeout`, not the `timeout` parameter, and not by accident.
         # The parameter is `float | None`, but typeshed pins both
         # `TimeoutExpired.__init__(cmd, timeout: float, ...)` and the attribute
@@ -1558,11 +1546,108 @@ def run_in_new_session(
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+# How often run_in_new_session_until re-reads its condition while the child
+# runs. A retried `communicate()` loses no output, so this only sets latency.
+_CONDITION_POLL_SLICE_SECS = 0.05
+
+
+@dataclasses.dataclass(frozen=True)
+class RunUntilOutcome:
+    """How a :func:`run_in_new_session_until` run ended, short of its deadline.
+
+    ``stopped_on_condition`` is False when the child exited on its own first,
+    in which case ``completed`` is exactly what ``run_in_new_session`` would
+    have returned. When True, the group was stopped mid-run and ``completed``
+    carries the output printed up to the stop.
+    """
+
+    completed: subprocess.CompletedProcess
+    stopped_on_condition: bool
+
+
+def run_in_new_session_until(
+    cmd: list[str],
+    *,
+    condition: Callable[[], bool],
+    timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> RunUntilOutcome:
+    """:func:`run_in_new_session`, stopping the whole group once *condition* holds.
+
+    For a proof that must observe the child MID-RUN: "the script is still
+    waiting" is established by stopping it on an observable readiness
+    condition (a ledger the script writes, a file it creates) instead of by a
+    wall-clock kill, so how fast the host happens to be cannot decide the
+    verdict. *timeout* is a must-not-hang deadline, paid only when the
+    condition never holds; it raises ``TimeoutExpired`` with the partial
+    output, exactly as ``run_in_new_session`` does.
+
+    Spawned and contained exactly as ``run_in_new_session`` is, through the
+    same stop, and every exit path stops the group -- including an exception
+    raised by *condition* itself, which then propagates.
+    """
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=True,
+    )
+    pgid = p.pid
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                out, err = p.communicate(timeout=_CONDITION_POLL_SLICE_SECS)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                completed = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+                return RunUntilOutcome(completed, stopped_on_condition=False)
+            stopped_on_condition = condition()
+            if stopped_on_condition or time.monotonic() >= deadline:
+                break
+    except BaseException:
+        with contextlib.suppress(Exception):
+            _stop_group_and_drain(p, pgid, text=text)
+        raise
+    out, err = _stop_group_and_drain(p, pgid, text=text)
+    if not stopped_on_condition:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    completed = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    return RunUntilOutcome(completed, stopped_on_condition=True)
+
+
+def _stop_group_and_drain(
+    p: subprocess.Popen, pgid: int, *, text: bool,
+) -> tuple[Any, Any]:
+    """SIGKILL the captured *pgid*, then collect what the child printed, BOUNDED.
+
+    The one copy of the containment both spawners share; the reasoning for
+    each half (the frozen pgid, the bounded drain) is
+    :func:`run_in_new_session`'s docstring.
+    """
+    _kill_process_group(p, pgid)
+    try:
+        return p.communicate(timeout=_POST_KILL_DRAIN_SECS)
+    except subprocess.TimeoutExpired:
+        # Something still holds the pipe open despite the group kill. Give up
+        # on the output rather than on the bound: the caller asked for one and
+        # gets it.
+        p.kill()
+        _release_abandoned_child(p)
+        return ('', '') if text else (b'', b'')
+
+
 def _release_abandoned_child(p: subprocess.Popen) -> None:
     """Reap *p* and close its pipes after a drain we gave up on.
 
-    Reachable only from :func:`run_in_new_session`'s last-resort branch, where
-    the bounded second ``communicate()`` itself timed out. Nothing has waited on
+    Reachable only from :func:`_stop_group_and_drain`'s last-resort branch,
+    where the bounded second ``communicate()`` itself timed out. Nothing has waited on
     the child there and nothing has closed the two pipe fds ``Popen`` opened for
     it, so without this they survive until ``Popen.__del__`` runs — a
     ``ResourceWarning`` plus two leaked descriptors PER OCCURRENCE, inside the
@@ -1570,9 +1655,9 @@ def _release_abandoned_child(p: subprocess.Popen) -> None:
     branch taken when something is STILL holding those pipes, i.e. the one most
     likely to repeat within a single run.
 
-    Every step is best-effort and swallowed: the caller is already on its way to
-    raising ``TimeoutExpired``, and replacing a legible timeout with a cleanup
-    error would hide the thing the caller actually needs to see.
+    Every step is best-effort and swallowed: the caller is already on its way
+    out of the spawn, usually raising ``TimeoutExpired``, and replacing a legible
+    timeout with a cleanup error would hide the thing the caller needs to see.
     """
     with contextlib.suppress(Exception):
         p.wait(timeout=_ABANDONED_CHILD_REAP_SECS)
@@ -1586,10 +1671,10 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     """SIGKILL the captured *pgid*, degrading to the direct child if unsure.
 
     Every failure mode degrades to ``p.kill()`` rather than propagating: the
-    caller is already on its way to raising ``TimeoutExpired``, and masking
-    that with a signalling error would replace a legible timeout with a
-    confusing one. ``ProcessLookupError`` is the ordinary case of a child that
-    exited between the timeout and the signal.
+    caller is already on its way out of the spawn, usually raising
+    ``TimeoutExpired``, and masking that with a signalling error would replace
+    a legible timeout with a confusing one. ``ProcessLookupError`` is the
+    ordinary case of a child that exited between the timeout and the signal.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
