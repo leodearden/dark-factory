@@ -608,10 +608,11 @@ function defaultSmoothingForWindow(windowKey) {
 // the window's left boundary is non-decreasing as i advances, so `left` only
 // ever moves forward.
 //
-// Cf. dailyDeltas() in shell.jsx — related but distinct: dailyDeltas buckets by
-// calendar day, clamps rates to >=0, and returns N-1 entries (day-to-day diff).
-// deriveVelocitySeries uses a configurable trailing time window, allows negative
-// rates (backlog can shrink), and returns N entries aligned to each sample.
+// Cf. burndown.py::compute_window_completion's `completed_per_day` — related
+// but distinct: the server buckets by calendar day, clamps each day's gain at 0
+// and serves one entry per ISO day. deriveVelocitySeries uses a configurable
+// trailing time window, allows negative rates (backlog can shrink), and returns
+// N entries aligned to each sample.
 function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
   const t = labels.map(l => {

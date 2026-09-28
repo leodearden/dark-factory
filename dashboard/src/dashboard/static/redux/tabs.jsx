@@ -405,11 +405,7 @@ function OrchTab({ projectFilter, search }) {
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
-                    {(() => {
-                      const pb = DF.BURNDOWN_BY_PROJECT[o.project];
-                      const rates = window.DF_SHELL.dailyDeltas(pb?.labels, pb?.done);
-                      return <div style={{ height: 50 }}><SP values={rates} color={CP.accent} /></div>;
-                    })()}
+                    <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
               </div>
