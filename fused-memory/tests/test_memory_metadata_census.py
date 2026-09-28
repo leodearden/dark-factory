@@ -121,6 +121,14 @@ class _FakeClock:
         self.now += seconds
 
 
+def _detector(clock, *, threshold=5, window_seconds=300, **options):
+    from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+    return UnknownKeyStormDetector(
+        threshold=threshold, window_seconds=window_seconds, time_fn=clock, **options
+    )
+
+
 class TestUnknownKeyStormDetector:
     """Per-(project_id, agent_id) rolling-window counter.
 
@@ -129,22 +137,15 @@ class TestUnknownKeyStormDetector:
     never identify the culprit.
     """
 
-    def _detector(self, clock, *, threshold=5, window_seconds=300, **options):
-        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
-
-        return UnknownKeyStormDetector(
-            threshold=threshold, window_seconds=window_seconds, time_fn=clock, **options
-        )
-
     def test_below_threshold_never_fires(self):
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=5)
+        detector = _detector(clock, threshold=5)
         for _ in range(4):
             assert detector.record('p', 'a', ['k']) is False
 
     def test_fires_exactly_on_the_crossing_call(self):
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=5)
+        detector = _detector(clock, threshold=5)
         results = [detector.record('p', 'a', ['k']) for _ in range(5)]
         assert results == [False, False, False, False, True]
 
@@ -155,7 +156,7 @@ class TestUnknownKeyStormDetector:
         a detector that latched True would hammer it on every single write.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3)
+        detector = _detector(clock, threshold=3)
         assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
         for _ in range(10):
             assert detector.record('p', 'a', ['k']) is False
@@ -163,14 +164,14 @@ class TestUnknownKeyStormDetector:
     def test_each_key_counts_as_one_warn(self):
         """The census emits one line per KEY, so the counter must too."""
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3)
+        detector = _detector(clock, threshold=3)
         assert detector.record('p', 'a', ['k1', 'k2']) is False
         assert detector.record('p', 'a', ['k3']) is True
 
     def test_writers_do_not_aggregate(self):
         """A different agent_id must not push another writer over the line."""
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3)
+        detector = _detector(clock, threshold=3)
         assert detector.record('p', 'agent-a', ['k']) is False
         assert detector.record('p', 'agent-b', ['k']) is False
         assert detector.record('p', 'agent-b', ['k']) is False
@@ -179,7 +180,7 @@ class TestUnknownKeyStormDetector:
 
     def test_projects_do_not_aggregate(self):
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3)
+        detector = _detector(clock, threshold=3)
         assert detector.record('proj-a', 'a', ['k']) is False
         assert detector.record('proj-b', 'a', ['k']) is False
         assert detector.record('proj-b', 'a', ['k']) is False
@@ -188,7 +189,7 @@ class TestUnknownKeyStormDetector:
     def test_stale_warns_drop_out_of_the_window(self):
         """A slow trickle must never accumulate into a false storm."""
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector = _detector(clock, threshold=3, window_seconds=300)
         assert detector.record('p', 'a', ['k']) is False
         assert detector.record('p', 'a', ['k']) is False
         clock.advance(301)
@@ -199,7 +200,7 @@ class TestUnknownKeyStormDetector:
 
     def test_empty_key_list_is_a_no_op(self):
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=1)
+        detector = _detector(clock, threshold=1)
         assert detector.record('p', 'a', []) is False
 
     def test_a_writer_that_falls_silent_leaves_no_residue(self):
@@ -212,8 +213,7 @@ class TestUnknownKeyStormDetector:
         that key space is effectively unbounded in a long-lived MCP server.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
-        detector._sweep_every = 2
+        detector = _detector(clock, threshold=3, window_seconds=300, sweep_every=2)
 
         detector.record('p', 'transient-writer', ['k'])
         assert ('p', 'transient-writer') in detector._warns
@@ -230,8 +230,7 @@ class TestUnknownKeyStormDetector:
     def test_the_sweep_never_evicts_the_writer_that_triggered_it(self):
         """Its deque was appended at `now`, so it is never stale."""
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
-        detector._sweep_every = 1
+        detector = _detector(clock, threshold=3, window_seconds=300, sweep_every=1)
 
         detector.record('p', 'a', ['k'])
         detector.record('p', 'a', ['k'])
@@ -247,8 +246,7 @@ class TestUnknownKeyStormDetector:
         drifts, is fixed, and later drifts again.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=2, window_seconds=300)
-        detector._sweep_every = 2
+        detector = _detector(clock, threshold=2, window_seconds=300, sweep_every=2)
 
         assert detector.record('p', 'a', ['k', 'k2']) is True
         assert detector._warns[('p', 'a')].latched is True
@@ -264,7 +262,7 @@ class TestUnknownKeyStormDetector:
         self,
     ):
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector = _detector(clock, threshold=3, window_seconds=300)
         assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
             False,
             False,
@@ -282,7 +280,7 @@ class TestUnknownKeyStormDetector:
     def test_a_partially_drained_writer_that_re_crosses_in_one_call_is_heard(self):
         """The t=1000 pair ages out by t=1301, leaving 3 of 5: below the line."""
         clock = _FakeClock(now=1000.0)
-        detector = self._detector(clock, threshold=5, window_seconds=300)
+        detector = _detector(clock, threshold=5, window_seconds=300)
         assert detector.record('p', 'a', ['a', 'b']) is False
         clock.now = 1100.0
         assert detector.record('p', 'a', ['c', 'd', 'e']) is True
@@ -300,7 +298,7 @@ class TestUnknownKeyStormDetector:
         recurrences = []
         for sweep_every in (1, 256):
             clock = _FakeClock()
-            detector = self._detector(
+            detector = _detector(
                 clock, threshold=3, window_seconds=300, sweep_every=sweep_every
             )
             assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
@@ -312,7 +310,7 @@ class TestUnknownKeyStormDetector:
 
     def _latched_at_1100_then_advanced(self, advance):
         clock = _FakeClock(now=1000.0)
-        detector = self._detector(clock, threshold=4, window_seconds=300)
+        detector = _detector(clock, threshold=4, window_seconds=300)
         assert detector.record('p', 'a', ['k', 'k']) is False
         clock.now = 1100.0
         assert detector.record('p', 'a', ['k', 'k']) is True
@@ -383,18 +381,11 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
     forbids. The behavioural halves stay where they are.
     """
 
-    def _detector(self, clock, *, threshold=5, window_seconds=300):
-        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
-
-        return UnknownKeyStormDetector(
-            threshold=threshold, window_seconds=window_seconds, time_fn=clock
-        )
-
     def test_each_writer_window_is_a_shared_storm_counter(self):
         from shared.storm_counter import StormCounter
 
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=5)
+        detector = _detector(clock, threshold=5)
         detector.record('p', 'a', ['k'])
 
         assert isinstance(detector._warns[('p', 'a')], StormCounter)
@@ -408,7 +399,7 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
         :meth:`UnknownKeyStormDetector.record`'s docstring rules out.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=5)
+        detector = _detector(clock, threshold=5)
         detector.record('p', 'a', ['k'])
 
         assert detector._warns[('p', 'a')].fire_mode == 'latched'
@@ -422,7 +413,7 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
         times and expects a fire, so the mode is load-bearing.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=5)
+        detector = _detector(clock, threshold=5)
         detector.record('p', 'a', ['k'])
 
         assert detector._warns[('p', 'a')].count_distinct is False
@@ -441,7 +432,7 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
         latched one does not.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector = _detector(clock, threshold=3, window_seconds=300)
 
         crossing = [detector.record('p', 'a', ['k']) for _ in range(3)]
         assert crossing == [False, False, True]
@@ -467,7 +458,7 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
         than assumed.
         """
         clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector = _detector(clock, threshold=3, window_seconds=300)
 
         assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
         counter = detector._warns[('p', 'a')]
