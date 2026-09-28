@@ -1476,6 +1476,53 @@ the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
 
+### Gate-enforced x_ keys: x_enumeration_scope and the liveness stamp
+
+Three `x_` keys are not free-form annotations: a write-time gate owns
+their shape (task 3056). They stay in the `x_` namespace, so they need no
+blessed-key registration and mint no `unknown_key` census line.
+
+**Which writes the gate sees.** Only `submit_task` and `update_task` calls
+from a `recon-stage-*` agent whose metadata parses as an object; every
+other write passes through untouched, with no lookups. It filters the
+outgoing payload only and never reads or repairs stored task state.
+
+**`x_enumeration_scope` — required when a recon stage files an enumerating
+gate.** A Mem0 enumeration is a top-level metadata list with at least one
+full-UUID member that resolves live via `get_memory_by_id`. The key name
+plays no part: recon gates already spell memory lists many ways. A
+recon-stage `submit_task` that carries one and is a human-gate filing
+(`fused-memory/src/fused_memory/middleware/recurring_gate_guard.py::is_gate_submission`)
+must also carry `x_enumeration_scope`, or it is rejected with
+`EnumerationScopeMissing`. The value is a structured object — `stores`,
+`categories`, `exhaustive`, and an optional `note` — validated wherever it
+is present, on filing and update alike. Any other shape, a legacy prose
+scope string included, is rejected with `EnumerationScopeMalformed`.
+
+**`x_liveness_reverified_at` and `x_liveness_exceptions` — written only by
+the gate.** The gate re-resolves each enumerated id at write time. It
+drops ids that are genuinely absent and keeps ids whose lookup was
+inconclusive, recording both in `x_liveness_exceptions`, and it stamps
+`x_liveness_reverified_at` whenever it re-resolved an enumeration. An
+incoming copy of either key is overwritten or stripped, so a stamp carried
+forward from an earlier write never poses as a fresh verification. Never
+write them yourself. The response reports the gate's counts under
+`enumeration_liveness` whenever it checked anything.
+
+**Fragments.** A UUID-prefix fragment such as `21f78de1`, as a metadata
+list element at any depth, is rejected when filing
+(`EnumeratedIdTruncated`) and recorded as a `truncated` exception when
+updating, so an `update_task` never loses its write over one.
+
+The authoritative rules — their order, the residuals the gate deliberately
+leaves open, and the incident that motivated it — live in
+`fused-memory/src/fused_memory/reconciliation/enumeration_guard.py` (module
+docstring). The guidance Stage 2 is shown is rendered from the same
+constants by `enumeration_guard.py::render_enumeration_guard_section`, and
+`enumeration_guard.py::enumeration_scope_example` is a well-formed scope.
+The allowed `stores` / `categories` values are deliberately not repeated
+here, so this section cannot drift from the code that enforces them.
+
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 
 `metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
