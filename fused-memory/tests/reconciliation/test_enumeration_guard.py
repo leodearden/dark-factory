@@ -24,6 +24,7 @@ import pytest
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.enumeration_guard import (
     X_LIVENESS_EXCEPTIONS_KEY,
+    X_LIVENESS_REVERIFIED_AT_KEY,
     EnumerationGateResult,
     enumeration_liveness_gate,
 )
@@ -689,3 +690,150 @@ class TestDescriptionAnnotation:
         )
 
         assert result.description == description
+
+
+# --------------------------------------------------------------------------- #
+# CHANGE 1(c): the gate-owned stamp and exceptions keys
+# --------------------------------------------------------------------------- #
+
+# Gate 5537's hand-written value: prose, copied forward from a remediation run.
+GATE_5537_STAMP = (
+    '2026-07-25 (remediation run 97762388-504c-4603-a57d-dd3c9e3bae02) — all 5 '
+    'enumerated ids (b3f55b47, 21f78de1-a5f3-4259-b907-16c8f2328e2f, 0d542614, '
+    '23eff0cd, 9a4e568b) re-resolved via get_memory_by_id at update time'
+)
+STALE_EXCEPTIONS = [
+    {'memory_id': DELETED_0D5, 'path': 'x_old[0]', 'outcome': 'absent'},
+]
+
+# name -> (enumeration, memory service) for each way a list can be re-resolved.
+REVERIFIED = {
+    'all-live': (
+        [LIVE_B3F, LIVE_21F],
+        lambda: memory_service(live=(LIVE_B3F, LIVE_21F)),
+    ),
+    'one-absent': (
+        [LIVE_B3F, DELETED_0D5],
+        lambda: memory_service(live=(LIVE_B3F,)),
+    ),
+    'one-inconclusive': (
+        [LIVE_B3F, LIVE_21F],
+        lambda: memory_service(
+            live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
+        ),
+    ),
+}
+
+
+class TestGateOwnedKeys:
+    """The stamp says THIS write re-resolved an enumeration; nothing else may
+    set it, and a copied-forward value never survives the gate."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('case', sorted(REVERIFIED))
+    async def test_a_reverified_enumeration_is_stamped_in_utc(
+        self, project_root, case,
+    ):
+        members, make_service = REVERIFIED[case]
+
+        result = await run_gate(
+            project_root, {'mem0_falsified_entries': members},
+            service=make_service(),
+        )
+
+        stamp = result.metadata[X_LIVENESS_REVERIFIED_AT_KEY]
+        assert stamp == FIXED_NOW.isoformat()
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == FIXED_NOW.utcoffset()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'incoming', [GATE_5537_STAMP, '2026-07-25T00:00:00+00:00'],
+        ids=['gate-5537-prose', 'older-iso'],
+    )
+    async def test_an_incoming_stamp_is_overwritten(self, project_root, incoming):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F],
+            X_LIVENESS_REVERIFIED_AT_KEY: incoming,
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+        )
+
+        assert result.metadata[X_LIVENESS_REVERIFIED_AT_KEY] == FIXED_NOW.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_incoming_exceptions_are_replaced_never_merged(self, project_root):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5],
+            X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+        )
+
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            {
+                'memory_id': DELETED_0D5,
+                'path': 'mem0_falsified_entries[1]',
+                'outcome': 'absent',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_exceptions_are_absent_when_this_write_produced_none(
+        self, project_root,
+    ):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F],
+            X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+        )
+
+        assert X_LIVENESS_EXCEPTIONS_KEY not in result.metadata
+        assert result.metadata[X_LIVENESS_REVERIFIED_AT_KEY] == FIXED_NOW.isoformat()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('lists', [
+        {},
+        {'origin_finding_ids': list(FINDING_IDS)},
+        {'x_deleted_before_gate_open': [DELETED_0D5]},
+    ], ids=['no-lists', 'finding-ids', 'deliberately-deleted'])
+    async def test_without_a_proven_enumeration_both_keys_are_stripped(
+        self, project_root, lists,
+    ):
+        metadata = {
+            **GATE_5533_SCALARS,
+            **lists,
+            X_LIVENESS_REVERIFIED_AT_KEY: GATE_5537_STAMP,
+            X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
+        }
+
+        result = await run_gate(project_root, metadata, service=memory_service())
+
+        assert result.rejection is None
+        assert result.metadata == {**GATE_5533_SCALARS, **lists}
+
+    @pytest.mark.asyncio
+    async def test_a_fragment_only_update_is_recorded_but_not_stamped(
+        self, project_root,
+    ):
+        metadata = {
+            'mem0_legacy_repeat_entries': list(GATE_5533_FRAGMENTS),
+            X_LIVENESS_REVERIFIED_AT_KEY: GATE_5537_STAMP,
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(), is_filing=False,
+        )
+
+        assert X_LIVENESS_REVERIFIED_AT_KEY not in result.metadata
+        assert [r['outcome'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == (
+            ['truncated'] * len(GATE_5533_FRAGMENTS)
+        )
