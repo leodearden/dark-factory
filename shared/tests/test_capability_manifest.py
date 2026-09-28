@@ -1782,30 +1782,32 @@ _KNOWN_STRUCTURAL_DEBT: frozenset[tuple[str, str, str, str]] = frozenset(
             'eval-bootstrap-smoke-gate',
             'vacuous_present_comment_only',
         ),
-        # task 3633 — matches only the descriptor's own `pattern:` line and the
-        # PRD sentence describing it; satisfied by its own existence.
+        # task 5599 — the only match is the markdown heading the task was
+        # asked to write in design-invariants.md; no match at the sidecar's
+        # authoring commit, so the authoring gate would have accepted it. The
+        # comment-only refinement reads a markdown `#` as prose.
         (
-            'plans/fable-architect-trial-v2-prd.capability-manifest.yaml',
-            'γ1',
-            'planrate-is-judge-free',
-            'vacuous_present_self_referential',
-        ),
-        # task 2900 — matches only a comment in standing_decision_constants.py.
-        (
-            'plans/stage1-entity-standing-decision-prd.capability-manifest.yaml',
-            'η',
-            'backfill-migration-script-committed',
+            'plans/inv12-exceptions-owned-or-ratified-prd.capability-manifest.yaml',
+            'α',
+            'inv12-heading-defines-the-slug',
             'vacuous_present_comment_only',
         ),
-        # task 3536 — the other filing specimen (MODE 3): the pattern is the
-        # module name test_workflow_merge_gating_strand, which exists as a
-        # tracked PATH and appears in no file's CONTENTS, so the check can
-        # never go green however completely the capability is delivered.
+        # task 5754 — a "kept" check: the SKILL.md sentence already matched at
+        # the sidecar's authoring commit, so it never gated anything, and its
+        # one match is a `**Limits.**` markdown line.
         (
-            'plans/task-escalation-state-graph-prd.capability-manifest.yaml',
-            'γ1',
-            'no-steward-less-escalated-exit-at-merge-entry',
-            'filename_shaped',
+            'plans/plan-deviation-recording-prd.capability-manifest.yaml',
+            'δ',
+            'watcher-per-task-limit-kept',
+            'vacuous_present_comment_only',
+        ),
+        # task 5324 — the pattern `resolver` matches only two comments in the
+        # reconciliation harness, so the check is green on prose.
+        (
+            'plans/uuid-prefix-resolution-prd.capability-manifest.yaml',
+            'δ',
+            'recon-harness-passes-service-resolver',
+            'vacuous_present_comment_only',
         ),
     }
 )
@@ -1851,6 +1853,10 @@ class TestCheckedInGrepDescriptorHygiene:
     The baseline is recorded here rather than asserted as a count: a count
     assertion would go red on an unrelated sidecar landing, and
     `_KNOWN_STRUCTURAL_DEBT` already pins the identities exactly.
+    REBASELINED 2026-09-28 on merging main: three entries had been repaired
+    by later work and were deleted (3536's descriptor included), and three
+    comment-only descriptors from sidecars landed since were added; the
+    per-row diagnosis is in that commit's message.
 
     RED SIGNAL, PROVEN BY MUTATION. A ratchet frozen at today's measurement is
     green on arrival by construction, which is inherent to the shape and not a
