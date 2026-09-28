@@ -19,44 +19,24 @@ booleans and on flips. ``k`` appears only as a metric parameterisation.
 """
 from __future__ import annotations
 
+import errno
 import functools
-import importlib.util
 import json
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
+from shared.testing_streams import closed_pipe_stdout
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_retrieval_probe.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'memory_eval_retrieval_probe'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +716,20 @@ class TestDeriveFromGuardClusters:
         emitted = {c['topic'] for c in _of(derived, 'topic_guard_cluster')}
         assert emitted == {c.topic_id for c in guard_clusters}
 
+    def test_a_guard_cluster_wins_a_slug_collision_with_a_census_topic(
+        self, calibration_rows, guard_clusters,
+    ):
+        """The nightly census regularly grows a topic value that equals a guard
+        slug. The guard's hand-written match phrases must survive it rather
+        than lose to a phrasing synthesised from the slug itself."""
+        slug = guard_clusters[0].topic_id
+        census = {'grand_total': {'topic': {'entries': [{'value': slug, 'count': 9}]}}}
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [winner] = [c for c in result.candidates if c['topic'] == slug]
+        assert winner['derived_from'] == 'topic_guard_cluster'
+        assert result.disclosures['slug_collisions_dropped'] >= 1
+
     def test_guard_phrases_seed_phrasings(self, derived, guard_clusters):
         by_slug = {c.topic_id: c for c in guard_clusters}
         for candidate in _of(derived, 'topic_guard_cluster'):
@@ -1208,6 +1202,48 @@ class TestRankIndex:
         assert _mod().rank_index([]) == {}
 
 
+class TestRanksAtDepth:
+    """`ranks_at_depth(ranks, k)` — the depth-scoped view of a full-depth index.
+
+    Provably identical to `rank_index(results[:k])`: `rank_index` keeps the
+    FIRST rank, so a hash whose first rank is <= k has that same rank in the
+    truncated list, and one whose first rank is > k does not appear in the
+    truncated list at all. Pinning that identity is what justifies deriving
+    the view instead of re-hashing a truncated copy.
+    """
+
+    def test_matches_rehashing_the_truncated_list_at_every_depth(self):
+        m = _mod()
+        results = _filler(9)
+        ranks = m.rank_index(results)
+
+        for k in (0, 1, 4, len(results), len(results) + 5):
+            assert m.ranks_at_depth(ranks, k) == m.rank_index(results[:k])
+
+    def test_a_repeated_hash_keeps_its_first_rank_across_the_cut(self):
+        """Same content at rank 1 (<= k) and rank 7 (> k): the derived view
+        must map it to its first rank, not drop it because a later
+        occurrence of the same content fell outside the depth."""
+        m = _mod()
+        results = [_R(content='dup', id='D1'), *_filler(5), _R(content='dup', id='D2')]
+        ranks = m.rank_index(results)
+        k = 3
+
+        depth_view = m.ranks_at_depth(ranks, k)
+
+        assert depth_view[m.content_key('dup')] == 1
+        assert depth_view == m.rank_index(results[:k])
+
+    def test_it_does_not_mutate_the_input_mapping(self):
+        m = _mod()
+        ranks = m.rank_index(_filler(5))
+        before = dict(ranks)
+
+        m.ranks_at_depth(ranks, 2)
+
+        assert ranks == before
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
@@ -1675,15 +1711,21 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
     )
 
 
-def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False):
+def _inversion_obs(
+    topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5, beyond_depth=0,
+):
     m = _mod()
     return m.InversionObservation(
         topic=topic,
         phrasing='q',
+        k=k,
         pairs_registered=pairs,
         # Default: every registered pair came back both-present. Tests that
         # care about the exposure gap set it explicitly.
         pairs_comparable=pairs if comparable is None else comparable,
+        # Default: nothing was trimmed by the scored-depth pin. Tests that
+        # care about the diagnostic set it explicitly.
+        pairs_beyond_scored_depth=beyond_depth,
         inversions=tuple(
             m.InversionRecord(
                 topic=topic, phrasing='q',
@@ -1947,6 +1989,13 @@ class TestBuildSeries:
             _build(observations, counts={'observations_served_by_mem0_at_k5': 99})
 
         assert 'observations_served_by_mem0_at_k5' in str(excinfo.value)
+
+        inversion_observations = m.ProbeObservations(inversions=[_inversion_obs('a', k=5)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _build(inversion_observations, counts={'inversion_observations_at_k5': 99})
+
+        assert 'inversion_observations_at_k5' in str(excinfo.value)
 
     def test_a_non_colliding_caller_key_passes_through(self):
         """The guard must not be a ban on caller-supplied counts."""
@@ -2379,8 +2428,8 @@ def _report_observations():
         claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
         inversions=[m.InversionObservation(
-            topic='alpha-topic', phrasing='tuned',
-            pairs_registered=1, pairs_comparable=1,
+            topic='alpha-topic', phrasing='tuned', k=5,
+            pairs_registered=1, pairs_comparable=1, pairs_beyond_scored_depth=0,
             inversions=(m.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
                 superseded_hash='dead' * 4, successor_hash='beef' * 4,
@@ -2668,7 +2717,7 @@ class TestProbeReport:
 # The read-only claim is the load-bearing one in this whole leaf: an eval that
 # writes to the corpus it measures is not an eval. Asserting it in a docstring
 # proves nothing, so it is asserted as BEHAVIOUR — the probe is driven, end to
-# end through argparse and _run, against a MemoryService double whose every
+# end through argparse and main, against a MemoryService double whose every
 # write method raises. A run that completes is a run that never wrote.
 #
 # Still no thresholds: every assertion below is on a call, a flag, an exit
@@ -2856,9 +2905,9 @@ def _canned_hits(registry):
 def _install_double(monkeypatch, double):
     """Point the lazily-imported MemoryService at *double*.
 
-    No test-only seam in the script: `_run` imports MemoryService inside the
+    No test-only seam in the script: `_probe` imports MemoryService inside the
     function (the D8 pattern), so patching the module attribute is enough to
-    drive the real argparse/_run/emit path end to end.
+    drive the real argparse/main/emit path end to end.
     """
     import fused_memory.services.memory_service as ms  # noqa: PLC0415
 
@@ -3404,6 +3453,142 @@ class TestRunStampOverride:
         assert run_stamp() == '20260101T010101Z'
 
 
+class _UnopenableStoreDouble(_ServiceDouble):
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+
+def _error_lines(stderr: str) -> list[str]:
+    """Only the ``error:`` lines: logging may or may not reach stderr under
+    pytest's root handlers, so the whole stream is not a stable count."""
+    return [line for line in stderr.splitlines() if line.startswith('error: ')]
+
+
+class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
+    """Every non-stdout ``OSError`` ends in ONE attributed line and a documented code.
+
+    The process boundary (``shared.cli_boundary.run_cli``) reports any
+    ``OSError`` escaping ``main()`` as "cannot write to stdout", so each seam
+    that knows what its failure means converts it first: the store open, the
+    artifact write, and ``--derive-registry``'s source read.
+    """
+
+    STAMP = '20260730T090000Z'
+
+    def _argv(self, monkeypatch, tmp_path, out_root: Path) -> list[str]:
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(_probe_registry())), encoding='utf-8')
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', self.STAMP)
+        return [
+            '--registry', str(registry_path),
+            '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+        ]
+
+    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        double = _UnopenableStoreDouble()
+        _install_double(monkeypatch, double)
+        out_root = tmp_path / 'out'
+
+        code = m.main(self._argv(monkeypatch, tmp_path, out_root))
+
+        assert code == m.EXIT_RUN_FAILED == 1
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert 'store' in errors[0]
+        assert '/unwritable/queue-data' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert double.closed
+        assert not list(out_root.rglob('metrics-*.json'))
+
+    def test_an_out_root_that_cannot_be_written(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+        _install_double(monkeypatch, double)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        out_root = blocker / 'out'
+
+        code = m.main(self._argv(monkeypatch, tmp_path, out_root))
+
+        assert code == m.EXIT_RUN_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert str(out_root) in errors[0]
+        assert 'stdout' not in errors[0]
+        assert double.closed
+
+    def test_a_derivation_source_that_cannot_be_read(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        monkeypatch.setattr(m, 'DEFAULT_CALIBRATION_PATH', tmp_path / 'absent.jsonl')
+
+        code = m.main(['--derive-registry'])
+
+        assert code == m.EXIT_RUN_FAILED
+        captured = capsys.readouterr()
+        errors = _error_lines(captured.err)
+        assert len(errors) == 1
+        assert 'absent.jsonl' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert captured.out == ''
+
+    def test_a_registry_that_cannot_be_read_is_an_input_error(self, tmp_path, capsys):
+        m = _mod()
+        absent = tmp_path / 'absent-registry.json'
+
+        code = m.main(['--registry', str(absent), '--project-id', 'dark_factory'])
+
+        assert code == m.EXIT_BAD_INPUT == 2
+        err = capsys.readouterr().err
+        assert str(absent) in err
+        assert 'stdout' not in err
+
+
+class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
+    """The metrics and report are on disk before the report is printed, so a
+    stdout failure there must say where they are: the exit status alone says
+    only that the run could not complete."""
+
+    STAMP = '20260730T090000Z'
+
+    @pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
+    def test_the_error_line_names_both_artifacts(
+        self, monkeypatch, tmp_path, capsys, buffering,
+    ):
+        m = _mod()
+        registry = _probe_registry()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble(by_query=_canned_hits(registry)))
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', self.STAMP)
+        out_root = tmp_path / 'out'
+        argv = [
+            '--registry', str(registry_path),
+            '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+        ]
+
+        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
+            code = run_cli(lambda: m.main(argv))
+        monkeypatch.undo()
+
+        eval_dir = out_root / m.EVAL_ID
+        metrics_path = eval_dir / f'metrics-{self.STAMP}.json'
+        report_path = eval_dir / f'report-{self.STAMP}.txt'
+        assert code == EXIT_STDOUT_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert str(metrics_path) in errors[0]
+        assert str(report_path) in errors[0]
+        assert metrics_path.exists()
+        assert report_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # step-23: the user-observable signal, on a seeded ephemeral collection
 #
@@ -3557,7 +3742,7 @@ class TestSeededInducedRegression:
     """Delete the canonical; the tripwire item must flip. That is the signal."""
 
     def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
-        self, monkeypatch, probe_config, probe_project_id,
+        self, probe_config, probe_project_id,
     ):
         """A leaked collection under the default prefix would live forever.
 
@@ -3568,24 +3753,19 @@ class TestSeededInducedRegression:
         this module's docstring and the merge lane's ``-m 'not integration'``
         selection. ``mem0_collection_name`` is pure, so ask it directly.
         """
-        import importlib.util as _ilu  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-
         from fused_memory.models.scope import Scope  # noqa: PLC0415
 
         collection = Scope(project_id=probe_project_id).mem0_collection_name(
             probe_config.mem0.collection_prefix,
         )
 
-        path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
-        spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
-        assert spec is not None and spec.loader is not None
-        cleanup = _ilu.module_from_spec(spec)
-        # setitem, not a bare assignment: exec_module needs the module visible
-        # in sys.modules, but leaving it there leaks into the rest of the
-        # session. monkeypatch undoes it at teardown.
-        monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
-        spec.loader.exec_module(cleanup)
+        # The SAME module object conftest.py's session lease fixture installs
+        # under this key, not a second copy of it: the key is shared, so a
+        # local re-exec is what would have leaked (task 3895).
+        cleanup = load_script_module(
+            SCRIPT_PATH.parent / 'cleanup_test_collections.py',
+            mod_name='cleanup_test_collections',
+        )
 
         assert collection.startswith(cleanup.PREFIX)
 
@@ -3859,6 +4039,47 @@ class TestStoresServedDisclosure:
         assert counts['degraded_queries'] == 1
         assert counts['degraded_observations_at_k5'] == 1
         assert counts['degraded_observations_at_k10'] == 1
+
+    def test_the_inversion_family_disclosure_counts_ride_in_the_machine_readable_artifact(self):
+        """Prose-only disclosure is invisible to every consumer that reads JSON.
+
+        The two non-degraded observations are the same population
+        `superseded-above-successor`'s exposure (`n`) is summed over, so this
+        row must be comparable to exactly that metric. The degraded one must
+        be walled off into its own key rather than polluting either count —
+        the same discipline `degraded_observations_at_k` holds the phrasing
+        family to.
+
+        `inversion_pairs_beyond_scored_depth_at_k5` is a different kind of
+        row — a trim diagnostic, not an exposure — but is walled off from
+        the degraded observation the same way as the other two.
+        """
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=3, inversions=1, k=5, beyond_depth=2),
+            _inversion_obs('b', pairs=2, k=5, beyond_depth=1),
+            _inversion_obs('c', pairs=99, k=5, degraded=True, beyond_depth=99),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 2
+        assert counts['inversion_pairs_registered_at_k5'] == 5
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 3
+        assert counts['degraded_inversion_observations_at_k5'] == 1
+
+    def test_inversion_observations_at_different_depths_produce_separate_keys(self):
+        """Two coexisting depths must not be merged into one number — the
+        same hazard the serving-store disclosure guards against, restated
+        for the inversion family."""
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=1, k=5, beyond_depth=1),
+            _inversion_obs('a', pairs=1, k=10, beyond_depth=1),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 1
+        assert counts['inversion_observations_at_k10'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k10'] == 1
 
     def test_the_probe_band_records_both_exposures_distinctly(self):
         """Registered pairs and comparable pairs are different facts.
@@ -4149,6 +4370,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {expected}
         assert {o.k for o in observations.claims} == {expected}
+        assert {o.k for o in observations.inversions} == {expected}
 
     def test_a_deep_call_still_scores_at_the_pinned_depth(self):
         """min(), not max(): contamination and claim recall are DEFINED at the
@@ -4158,6 +4380,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
 
     def test_the_default_path_is_unchanged(self):
         m = _mod()
@@ -4165,3 +4388,72 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
+
+
+class TestInversionFamilyIsPinnedToScoredDepth:
+    """The inversion/comparable-pair family is scored at ``scored_k``, not the
+    fetch depth — the same comparability contract `contamination` and `claim
+    recall` already hold, verified end-to-end through `probe_topic`."""
+
+    def _observe(self, *, superseded_rank, successor_rank, ks=(10,), total=10):
+        m = _mod()
+        entry = _pair_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        results = _filler(total)
+        results[superseded_rank - 1] = _R(content='old text', id='OLD')
+        results[successor_rank - 1] = _R(content='new text', id='NEW')
+        search = _search_returning({}, default_factory=lambda: _healthy(results))
+
+        import asyncio  # noqa: PLC0415
+
+        asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
+        return observations
+
+    def test_a_pair_visible_only_beyond_the_scored_depth_is_not_comparable(self):
+        """A deeper fetch must not widen the family: both members return only
+        beyond the tripwire depth (ranks 6 and 7 at ks=(10,)); at full fetch
+        depth this pair would be comparable and 6 < 7 would fire an
+        inversion, which is precisely what the scored-depth pin must
+        suppress."""
+        observations = self._observe(superseded_rank=6, successor_rank=7)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
+            # Both-present at full fetch depth (ranks 6, 7 <= limit=10) but
+            # not both within scored_k=5: the pin's cut is disclosed, not
+            # silently indistinguishable from a corpus with nothing to trim.
+            assert obs.pairs_beyond_scored_depth == 1
+
+    def test_a_pair_inside_the_scored_depth_stays_comparable(self):
+        """The pin narrows only what is genuinely out of scope: a pair fully
+        inside the top 5 (rank 1, 2) is still comparable and still inverts."""
+        observations = self._observe(superseded_rank=1, successor_rank=2)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 1
+            assert len(obs.inversions) == 1
+            # Nothing was trimmed: the pair was already inside scored_k.
+            assert obs.pairs_beyond_scored_depth == 0
+
+    def test_a_straddling_pair_is_not_comparable(self):
+        """One member inside the scored depth (rank 1), one beyond it
+        (rank 6): a pair that cannot both be seen at the scored depth is no
+        exposure, even though both are visible at the full fetch depth."""
+        observations = self._observe(superseded_rank=1, successor_rank=6)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
+            # Both-present at full fetch depth (rank 1 and rank 6 <= limit=10)
+            # but not both within scored_k=5: the straddle is a trim too, not
+            # just a comparable-pairs miss.
+            assert obs.pairs_beyond_scored_depth == 1

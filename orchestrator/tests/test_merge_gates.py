@@ -218,6 +218,119 @@ class TestReachBackRouting:
         )
         git_ops.push_main.assert_awaited_once()
 
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+        """A clean landing records the advanced SHA as a queue-verified main tip.
+
+        This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
+        later request rebased onto this tip may trust footprint-disjointness
+        precisely because a green gate run was observed on it here.  A tip that
+        never reaches this return — a nightly job's commit, a direct human
+        commit, a push — is never recorded and is therefore never trusted.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
+        )
+
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        req = MagicMock()
+        req.task_id = 'task-finalize-records-tip'
+        req.branch = 'br-finalize-records-tip'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+
+        landed = 'deadbeefcafe0001'
+        assert not main_tip_is_queue_verified(landed), (
+            'precondition: the tip must not already be registered'
+        )
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
+                merged_branch_tip='trusted-tip',
+                advanced_sha=landed,
+            )
+
+        assert outcome.status == 'done', f'expected done, got {outcome!r}'
+        assert main_tip_is_queue_verified(landed), (
+            'a clean landing must record its advanced SHA as queue-verified, '
+            'otherwise every subsequent rebase-under-drift re-verifies forever'
+        )
+
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+        """A landing BLOCKED by a post-advance gate records nothing.
+
+        Main has already advanced at that point, but the gate chain says the
+        landed content is not what was verified — so the tip carries no green
+        verdict and must not license a later disjointness skip.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
+        )
+
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        req = MagicMock()
+        req.task_id = 'task-finalize-blocked-tip'
+        req.branch = 'br-finalize-blocked-tip'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+
+        landed = 'deadbeefcafe0002'
+        broken_pyright = MagicMock(
+            broken=True, failing_subprojects=['pkg'], detail='boom',
+        )
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=broken_pyright),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
+                merged_branch_tip='trusted-tip',
+                advanced_sha=landed,
+            )
+
+        assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
+        assert not main_tip_is_queue_verified(landed), (
+            'a tip whose post-advance gates failed must NOT be recorded as '
+            'queue-verified'
+        )
+
+
     async def test_check_post_merge_pyright_reachback_to_run_unscoped_typechecks(self) -> None:
         """(c) _check_post_merge_pyright must resolve _run_unscoped_typechecks
         via orchestrator.merge_queue (it has no merge_gates-local copy at all —
@@ -472,6 +585,62 @@ class TestGateFunctionsReachBack:
         assert verdict.emit_subtype == 'post_merge_equivalence_failed'
         assert verdict.reason is not None
         assert verdict.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+    async def test_equivalence_block_reason_invites_the_correct_triage(
+        self,
+    ) -> None:
+        """A confirmed drop must name the triage diff AND its direction.
+
+        The complement of the two gates' rename awareness (task 5342): a
+        block that SURVIVES rename resolution is a genuine candidate
+        drop, and the message is the only thing steering what the reader
+        does next.  In the measured esc-5694-5 incident it steered the
+        RCA to the opposite of the truth — it named no diff direction, so
+        the diff was read backwards, and it never mentioned ``--follow``,
+        without which a relocated path's history looks empty and the file
+        reads as missing.
+
+        Only load-bearing properties are pinned here, not prose:
+        ``startswith`` because ``unblock_types.py`` and ``workflow.py``
+        both dispatch on the prefix; the branch-tip-FIRST argument order
+        because reading it the other way inverts the meaning of every
+        ``+``/``-`` line; and the structured routing fields, so a reword
+        cannot silently change the verdict.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _run_equivalence_gate,
+        )
+        from orchestrator.merge_types import OutcomeKind
+
+        advanced_sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+        merged_tip = 'f0e1d2c3b4a5968778695a4b3c2d1e0f'
+        ctx = self._make_ctx(
+            advanced_sha=advanced_sha, resolved_merged_tip=merged_tip,
+        )
+        with patch(
+            'orchestrator.merge_queue._check_post_merge_equivalence',
+            AsyncMock(return_value=['pkg/sub/mod.py']),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.reason is not None
+        reason = verdict.reason
+
+        assert reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+        # Branch tip FIRST, advanced main SECOND.  A correctness property,
+        # not wording: the opposite order inverts the RCA.
+        assert (
+            f'git diff {merged_tip[:12]} {advanced_sha[:12]}'
+        ) in reason, reason
+
+        assert '--follow' in reason, reason
+        assert 'pkg/sub/mod.py' in reason, reason
+
+        assert verdict.emit_subtype == OutcomeKind.post_merge_equivalence_failed
+        assert verdict.merge_sha == advanced_sha
 
     async def test_run_pyright_gate_ok_when_clean(self) -> None:
         from orchestrator.merge_gates import _run_pyright_gate

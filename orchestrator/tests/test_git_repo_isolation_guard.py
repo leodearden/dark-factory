@@ -676,3 +676,78 @@ class TestSessionCeilingIsLiveInThisSuite:
             f'GIT_CEILING_DIRECTORIES entries {ceiling.split(":")!r}, so git run '
             'from a tmp dir anywhere in this suite can still walk up out of it'
         )
+
+
+class TestAmbientGitDirCannotRedirectThisSuite:
+    """The FOURTH layer (incident 2026-08-31) is ARMED in this run.
+
+    A ``GIT_CEILING_DIRECTORIES`` ceiling bounds the upward WALK of repository
+    discovery.  ``GIT_DIR`` does not walk: it names the repository outright, so
+    the ceiling above is not weakened by it but BYPASSED, and every layer
+    documented in this module's docstring -- including the two per-call
+    ``_orch_helpers`` ones, which set a ceiling and a ``cwd`` and nothing else --
+    is inert against it.  ``df_pytest_isolation._df_git_env_hermetic`` closes
+    that, function-scoped because the leak arrives mid-session from another
+    test (task 4966) rather than at session start.
+
+    WHY THIS MATTERS HERE: 139 test files in this repo run ``git config user.*``
+    or ``git commit`` against a ``tmp_path`` repo.  Under a leaked ``GIT_DIR``
+    all 139 write to the leaked repository instead.  On 2026-08-31 that put
+    placeholder fixture content on ``main`` in the live project_root checkout
+    and wrote ``[user] name=Test email=test@example.com`` into its
+    ``.git/config``.
+    """
+
+    def test_the_hermetic_fixture_fired_in_this_run(self) -> None:
+        """Asserts it FIRED, not that it exists -- same standard as the ceiling.
+
+        Same dead-wiring hazard as :class:`TestSessionCeilingIsLiveInThisSuite`:
+        the verify lane makes rootdir the SUBPROJECT, so a fixture wired only
+        into the repo-root conftest would be dead in exactly the suite with the
+        most git-invoking test files, and silently so.
+        """
+        leaked = [k for k in os.environ if k in {
+            'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+            'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+        }]
+        assert leaked == [], (
+            f'{leaked} survived into a test body, so a git command run here '
+            'targets that repository regardless of any cwd or ceiling. '
+            'orchestrator/tests/conftest.py must import _df_git_env_hermetic '
+            'from df_pytest_isolation -- the import IS the wiring.'
+        )
+
+    def test_a_ceiling_does_not_contain_an_explicit_git_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """The mechanism itself, so the class above is not merely asserted.
+
+        Runs real git with the ceiling armed AND ``GIT_DIR`` set, and shows the
+        write lands in the GIT_DIR repo. If a future git release ever made a
+        ceiling contain an explicit GIT_DIR, this test would go red and the
+        fourth layer could be reconsidered -- that is the point of pinning the
+        premise rather than only the remedy.
+        """
+        victim = tmp_path / 'victim'
+        victim.mkdir()
+        env = dict(os.environ)
+        env['GIT_CEILING_DIRECTORIES'] = str(tmp_path.resolve())
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(victim)],
+                       check=True, capture_output=True)
+
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
+        env['GIT_DIR'] = str(victim / '.git')
+        subprocess.run(
+            ['git', '-C', str(elsewhere), 'config', 'user.email', 'leak@example.invalid'],
+            env=env, check=True, capture_output=True,
+        )
+
+        written = subprocess.run(
+            ['git', '-C', str(victim), 'config', '--local', '--get', 'user.email'],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        assert written == 'leak@example.invalid', (
+            'GIT_DIR no longer overrides -C under an armed ceiling; the premise '
+            'of _df_git_env_hermetic has changed and should be re-derived'
+        )

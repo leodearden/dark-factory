@@ -33,20 +33,30 @@ _BREAKER_SENTINEL = '__no_landings_breaker__'
 # ---------------------------------------------------------------------------
 
 
-def _make_harness(tmp_path: Path) -> tuple[Harness, MagicMock]:
+def _make_harness(
+    tmp_path: Path, *, window: int = 3, floor: int = 1000,
+) -> tuple[Harness, MagicMock, EscalationQueue]:
     """Harness with a real Scheduler + EscalationQueue and a spy RunStore.
 
     Mirrors test_harness_resume_scheduler._make_harness.  Returns
-    (harness, mock_run_store).
+    (harness, mock_run_store, escalation_queue).
+
+    *window* and *floor* are set as CONFIG knobs, so the breaker built by
+    harness.py::Harness.__init__ carries them — the same wiring
+    TestHarnessBreakerConfigWiring pins — rather than the instance being
+    overwritten with a hand-built breaker afterwards.
     """
     config = OrchestratorConfig(project_root=tmp_path)
+    config.no_landings_breaker_window_samples = window
+    config.no_landings_breaker_disk_free_floor_bytes = floor
     harness = Harness(config)
     mock_run_store = MagicMock(spec=RunStore)
     harness._run_store = mock_run_store
     harness._run_id = 'run-breaker-0001'
     harness.event_store = EventStore(tmp_path / 'events.db', 'run-breaker-0001')
-    harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
-    return harness, mock_run_store
+    escalations = EscalationQueue(tmp_path / 'escalations')
+    harness._escalation_queue = escalations
+    return harness, mock_run_store, escalations
 
 
 def _stub_merge_worker(harness: Harness, landings_total: int) -> MagicMock:
@@ -55,11 +65,6 @@ def _stub_merge_worker(harness: Harness, landings_total: int) -> MagicMock:
     worker.snapshot.return_value = {'metrics': {'landings_total': landings_total}}
     harness._merge_worker = worker
     return worker
-
-
-def _small_breaker(window: int = 3, floor: int = 1000) -> NoLandingsCircuitBreaker:
-    """Return a breaker with a small window for test speed."""
-    return NoLandingsCircuitBreaker(window_samples=window, disk_free_floor_bytes=floor)
 
 
 def _make_falling_disk_iter(
@@ -91,10 +96,9 @@ class TestHarnessNoLandingsFire:
         floor=10_000_000 > disk values (180k–200k) so disk-pressure gate
         (last_free < floor) is satisfied and the trip fires.
         """
-        harness, _rs = _make_harness(tmp_path)
-        # Override the breaker with a small-window instance; floor above all disk
-        # values so last_free < floor and the disk-pressure gate is satisfied.
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         _stub_merge_worker(harness, landings_total=5)  # landings stay flat
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -111,8 +115,9 @@ class TestHarnessNoLandingsFire:
     @pytest.mark.asyncio
     async def test_fire_files_info_escalation(self, tmp_path: Path) -> None:
         """After trip, exactly one INFO escalation with correct attributes is filed."""
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -123,10 +128,9 @@ class TestHarnessNoLandingsFire:
                 await harness._run_no_landings_breaker_pass()
 
         # Exactly one pending INFO escalation with the right role
-        assert harness._escalation_queue is not None
         pending = [
             e
-            for e in harness._escalation_queue.get_by_task(
+            for e in escalations.get_by_task(
                 _BREAKER_SENTINEL, status='pending'
             )
             if e.agent_role == _BREAKER_ROLE
@@ -141,8 +145,9 @@ class TestHarnessNoLandingsFire:
     @pytest.mark.asyncio
     async def test_fire_escalation_mentions_window_and_disk(self, tmp_path: Path) -> None:
         """Escalation summary and detail describe window, landings, and disk trend."""
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -152,10 +157,9 @@ class TestHarnessNoLandingsFire:
             for _ in range(3):
                 await harness._run_no_landings_breaker_pass()
 
-        assert harness._escalation_queue is not None
         pending = [
             e
-            for e in harness._escalation_queue.get_by_task(
+            for e in escalations.get_by_task(
                 _BREAKER_SENTINEL, status='pending'
             )
             if e.agent_role == _BREAKER_ROLE
@@ -176,8 +180,9 @@ class TestHarnessNoLandingsFire:
         never trigger disk-recovery resume — only a clean landing would resume,
         which never happens here (landings_total stays flat at 5).
         """
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=500_000)
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=500_000,
+        )
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -188,10 +193,9 @@ class TestHarnessNoLandingsFire:
             for _ in range(6):
                 await harness._run_no_landings_breaker_pass()
 
-        assert harness._escalation_queue is not None
         all_pending = [
             e
-            for e in harness._escalation_queue.get_by_task(
+            for e in escalations.get_by_task(
                 _BREAKER_SENTINEL, status='pending'
             )
             if e.agent_role == _BREAKER_ROLE
@@ -203,8 +207,9 @@ class TestHarnessNoLandingsFire:
     @pytest.mark.asyncio
     async def test_bare_harness_no_worker_is_graceful_noop(self, tmp_path: Path) -> None:
         """Harness without _merge_worker makes the pass a graceful no-op."""
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         # No _merge_worker attached (harness._merge_worker is None by default)
         assert harness._merge_worker is None
         # Must not raise
@@ -215,8 +220,9 @@ class TestHarnessNoLandingsFire:
     @pytest.mark.asyncio
     async def test_disk_stat_oserror_is_fail_open(self, tmp_path: Path) -> None:
         """OSError from shutil.disk_usage must never halt dispatch (fail-open)."""
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         _stub_merge_worker(harness, landings_total=5)
 
         with patch('shutil.disk_usage', side_effect=OSError('disk stat failed')):
@@ -256,8 +262,9 @@ class TestHarnessNoLandingsResume:
 
         floor=10_000_000 so last_free=180_000 < floor and the trip fires.
         """
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         await self._drive_to_trip(harness)
         assert harness.scheduler.is_paused, 'precondition: scheduler must be paused'
 
@@ -277,15 +284,15 @@ class TestHarnessNoLandingsResume:
 
         floor=10_000_000 so last_free=180_000 < floor and the trip fires.
         """
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
         await self._drive_to_trip(harness)
 
         # Confirm escalation was filed
-        assert harness._escalation_queue is not None
         before = [
             e
-            for e in harness._escalation_queue.get_by_task(
+            for e in escalations.get_by_task(
                 _BREAKER_SENTINEL, status='pending'
             )
             if e.agent_role == _BREAKER_ROLE
@@ -299,10 +306,9 @@ class TestHarnessNoLandingsResume:
             await harness._run_no_landings_breaker_pass()
 
         # After resume, no open breaker INFO escalation
-        assert harness._escalation_queue is not None
         after = [
             e
-            for e in harness._escalation_queue.get_by_task(
+            for e in escalations.get_by_task(
                 _BREAKER_SENTINEL, status='pending'
             )
             if e.agent_role == _BREAKER_ROLE
@@ -320,8 +326,9 @@ class TestHarnessNoLandingsResume:
           - resume fires (free=200_000 >= floor=190_000)
         """
         floor = 190_000  # between free_at_trip=180_000 and recovery=200_000
-        harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=floor)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=floor,
+        )
         await self._drive_to_trip(harness)
         assert harness.scheduler.is_paused
 
@@ -343,36 +350,36 @@ class TestHarnessNoLandingsResume:
 class TestHarnessBreakerConfigWiring:
     """Harness.__init__ builds the breaker from config knobs, not module defaults.
 
-    RED until step-06 GREEN wires config into _NLCB() construction.
+    One test, because there is one line of wiring: setting both knobs in a
+    single construction pins each of them exactly as two single-knob tests
+    did, and additionally pins that neither knob's value leaks into the
+    other's slot.
+
+    The floor is read off the public ``disk_free_floor_bytes`` property, the
+    reading its own docstring directs callers (test sanity checks included) to
+    use and the one ``harness.py`` uses in its escalation messages.
+    ``window_samples`` has no public counterpart, and adding one is a
+    production change outside this task's scope -- so that half stays a
+    private read until the breaker grows the matching property.
     """
 
-    def test_window_samples_wired_from_config(self, tmp_path: Path) -> None:
-        """harness._no_landings_breaker._window_samples == config.no_landings_breaker_window_samples."""
-        config = OrchestratorConfig(project_root=tmp_path)
-        config.no_landings_breaker_window_samples = 17  # non-default
-        harness = Harness(config)
-        assert harness._no_landings_breaker._window_samples == 17, (
-            f'expected _window_samples=17, got {harness._no_landings_breaker._window_samples}'
-        )
-
-    def test_disk_free_floor_bytes_wired_from_config(self, tmp_path: Path) -> None:
-        """harness._no_landings_breaker._disk_free_floor_bytes == config.no_landings_breaker_disk_free_floor_bytes."""
-        config = OrchestratorConfig(project_root=tmp_path)
-        config.no_landings_breaker_disk_free_floor_bytes = 123_456_789  # non-default
-        harness = Harness(config)
-        assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789, (
-            f'expected _disk_free_floor_bytes=123456789, '
-            f'got {harness._no_landings_breaker._disk_free_floor_bytes}'
-        )
-
     def test_both_config_knobs_wired_together(self, tmp_path: Path) -> None:
-        """Both config knobs are propagated to the breaker in one Harness construction."""
+        """Both config knobs reach the lane breaker in one Harness construction."""
         config = OrchestratorConfig(project_root=tmp_path)
         config.no_landings_breaker_window_samples = 17
         config.no_landings_breaker_disk_free_floor_bytes = 123_456_789
         harness = Harness(config)
-        assert harness._no_landings_breaker._window_samples == 17
-        assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789
+        breaker = harness._no_landings_breaker
+        assert isinstance(breaker, NoLandingsCircuitBreaker), (
+            'Harness must build the lane breaker itself, not a stand-in'
+        )
+        assert breaker.disk_free_floor_bytes == 123_456_789, (
+            f'expected disk_free_floor_bytes=123456789, '
+            f'got {breaker.disk_free_floor_bytes}'
+        )
+        assert breaker._window_samples == 17, (
+            f'expected window_samples=17, got {breaker._window_samples}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +424,9 @@ class TestHarnessIdleQueueClears:
         pass 3; pass 4 completes a strictly-falling window of 3 → trip → paused.
         RED until step-08 adds reset() on the depth==0 path.
         """
-        harness, _rs = _make_harness(tmp_path)
-        # High floor so disk-recovery resume never fires accidentally
-        harness._no_landings_breaker = _small_breaker(window=3, floor=500_000)
+        harness, _rs, _escalations = _make_harness(
+            tmp_path, window=3, floor=500_000,
+        )
 
         landings = 5  # stays flat throughout
 

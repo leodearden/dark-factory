@@ -15,6 +15,14 @@ const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
 const { pinningBadgeState } = window.DF_PINS_RECOVERY;
+// The Datum wrapper. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
+const { plainDatum } = window.DF_DATUM;
+
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ANALYTICS = '/api/v2/dashboard/escalation-analytics';
 const { LifecycleFlowDiagram } = window.DF_ESC_FLOW || {};
 
 // ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
@@ -367,7 +375,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
             <C.StatTile
               key={level}
               label={`L${level} resolution time`}
-              value={fmtUptime(pct.p50)}
+              datum={plainDatum(pct.p50, EP_ANALYTICS)}
+              format={fmtUptime}
               hint={`p50 · p90 ${fmtUptime(pct.p90)}`}
             />
           );
@@ -375,7 +384,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
         {lifespan.l1_to_l2_promotion && lifespan.l1_to_l2_promotion.count > 0 && (
           <C.StatTile
             label="L1→L2 promotion"
-            value={fmtUptime(lifespan.l1_to_l2_promotion.p50_secs)}
+            datum={plainDatum(lifespan.l1_to_l2_promotion.p50_secs, EP_ANALYTICS)}
+            format={fmtUptime}
             hint={`p50 · p90 ${fmtUptime(lifespan.l1_to_l2_promotion.p90_secs)}`}
           />
         )}
@@ -528,6 +538,7 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
             <C.LineChart
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
+              formatY={C.formatCountTick}
               formatX={fmtDateTime}
             />
           </TimeChart>

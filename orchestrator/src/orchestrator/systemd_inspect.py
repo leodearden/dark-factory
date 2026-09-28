@@ -36,24 +36,99 @@ logger = logging.getLogger(__name__)
 _INSPECT_TIMEOUT_SECS: float = 10.0
 
 
+def _wedged_unit_sentinel() -> dict:
+    """The MainPID=0 degradation sentinel, in ONE place (task 4157).
+
+    Returned by :func:`inspect_systemd_unit` whenever it cannot obtain a
+    trustworthy reading — the task-2091 ``communicate()`` timeout, and (task
+    4157) a subprocess SPAWN failure. ``DeterministicRunner._inspect_unit_guarded``
+    returns it too, for an injected inspector that raises past this module.
+
+    A FACTORY returning a fresh dict, deliberately NOT a module-level constant:
+    callers do not merely read the result, they retain and embed it —
+    ``_enrich_deploy_state_baseline`` persists baseline-derived values into
+    ``deploy_state``, the baseline gate interpolates it into an escalation
+    detail, and ``_capturing_inspector`` stashes it into ``captured['new_state']``
+    for ``done_provenance``. A shared mutable dict would let any future
+    in-place mutation along one of those paths corrupt every other call site's
+    view, including across tasks in the same process.
+    """
+    return {
+        'MainPID': 0,
+        'ActiveState': '',
+        'ActiveEnterTimestamp': '',
+        'ActiveEnterTimestampMonotonic': 0,
+    }
+
+
 async def inspect_systemd_unit(
     unit: str,
     *,
     timeout_secs: float,
     reap_grace_secs: float = 5.0,
+    degradation_sink: dict | None = None,
 ) -> dict:
     """Query systemctl for unit state fields needed for fresh-PID verify / health checks.
 
     Returns a dict with at minimum: MainPID (int), ActiveState (str),
     ActiveEnterTimestamp (str), ActiveEnterTimestampMonotonic (int).
     Integers default to 0 on parse failure (sentinel-safe).
+
+    Never raises on a systemd-side failure: BOTH degradation modes — a
+    subprocess SPAWN failure (task 4157: missing ``systemctl``, or a fork
+    failure under resource pressure) and a ``communicate()`` timeout (task
+    2091: systemd busy/hung) — return :func:`_wedged_unit_sentinel`'s
+    MainPID=0 / ActiveState='' dict instead. That sentinel is rejected
+    downstream rather than trusted, so a degraded reading fails closed: see
+    the branch comment below.
+
+    A non-``OSError`` spawn failure (e.g. ``NotImplementedError`` from an
+    event loop with no subprocess support) is deliberately NOT caught — it
+    signals a broken runtime, not a degraded systemd, and a sentinel would
+    lie about the unit's state.
+
+    ``degradation_sink`` is an optional caller-supplied dict used as an OUT
+    parameter: when a degradation occurs, ``sink['cause']`` is set to a short
+    human-readable string naming WHICH mode fired and why (the errno/exception
+    repr for a spawn failure, the elapsed budget for a timeout). The four
+    sentinel fields stay byte-identical in both modes — classifiers
+    (``_deterministic_deploy_health_verdict``, the baseline ``ActiveState``
+    gate, ``FreshPidVerify``) must not be able to tell the modes apart — but a
+    HUMAN reading the resulting escalation must, since EMFILE, a missing
+    ``systemctl`` binary and a hung systemd call for three different operator
+    responses. Threading the cause here keeps that fact out of the journal-only
+    path that INV-2 ``structured-facts-at-failure`` forbids. Omitting the sink
+    (all pre-4157 callers) changes nothing.
     """
-    proc = await asyncio.create_subprocess_exec(
-        'systemctl', '--user', 'show', unit,
-        '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'systemctl', '--user', 'show', unit,
+            '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        # Task 4157: the spawn itself can fail — a missing/unresolvable
+        # `systemctl` (FileNotFoundError) or a fork failure under resource
+        # pressure (EMFILE/ENOMEM, PermissionError). This `await` was
+        # previously OUTSIDE any try, so such an OSError escaped raw past
+        # DeterministicRunner.run()'s "always returns BLOCKED, never a raw
+        # exception" contract and past the escalations an operator needs.
+        # Converge on the SAME sentinel the timeout branch returns below, so
+        # both degradation modes are indistinguishable to every CLASSIFIER —
+        # deliberately NOT to the operator: the reviewer amendment threads the
+        # distinguishing cause out through `degradation_sink` instead, because
+        # EMFILE, a missing `systemctl` and a hung systemd need three different
+        # operator responses even though all three must fail closed identically.
+        logger.warning(
+            'systemctl show %s could not be spawned (%r) — returning MainPID=0 sentinel',
+            unit, exc,
+        )
+        if degradation_sink is not None:
+            degradation_sink['cause'] = (
+                f'systemctl show {unit} could not be spawned: {exc!r}'
+            )
+        return _wedged_unit_sentinel()
     try:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_secs,
@@ -77,6 +152,11 @@ async def inspect_systemd_unit(
             'systemctl show %s timed out after %ss — returning MainPID=0 sentinel',
             unit, timeout_secs,
         )
+        if degradation_sink is not None:
+            degradation_sink['cause'] = (
+                f'systemctl show {unit} timed out after {timeout_secs}s '
+                f'(systemd busy/hung)'
+            )
         # On the VERIFY leg, MainPID=0 routes through the existing
         # verify-fail path: fresh-PID verify already treats MainPID=0 as
         # a sentinel failure -> born-at-L2 escalate + blocked (matching
@@ -85,12 +165,12 @@ async def inspect_systemd_unit(
         # pid > 0) — run()'s baseline capture additionally checks
         # ActiveState=='' to catch a wedged baseline before the deploy
         # is even attempted.
-        return {
-            'MainPID': 0,
-            'ActiveState': '',
-            'ActiveEnterTimestamp': '',
-            'ActiveEnterTimestampMonotonic': 0,
-        }
+        #
+        # Task 4157: the spawn-failure branch above converges on this same
+        # sentinel, so BOTH degradation modes are rejected by those two
+        # downstream checks identically — one sentinel, one definition
+        # (`_wedged_unit_sentinel`), one set of consumers to reason about.
+        return _wedged_unit_sentinel()
     result: dict = {}
     for line in (stdout or b'').decode(errors='replace').splitlines():
         if '=' in line:

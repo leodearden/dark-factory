@@ -25,7 +25,7 @@ Type=notify
 NotifyAccess=all
 WatchdogSec=120
 WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project fused-memory \
   python -m fused_memory.server.main \
   --transport http \
   --config /home/leo/src/dark-factory/fused-memory/config/config.yaml

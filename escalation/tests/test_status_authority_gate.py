@@ -35,8 +35,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
+from _escalation_http import escalation_http_call
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
@@ -139,53 +138,15 @@ def http_server(
     yield base_url, queue
 
 
-async def _call_over_http(
-    base_url: str,
-    tool_name: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **tool_kwargs: Any,
-) -> dict[str, Any]:
-    """Call *tool_name* over real HTTP, optionally with capability headers.
-
-    The SINGLE place in this module that knows the capability-header wire
-    protocol. *levels*/*identity*, when not None, are sent as the literal
-    ``X-Escalation-Levels``/``X-Escalation-Identity`` request headers; when
-    None the header is omitted entirely (never sent as an empty string). The
-    per-tool helpers below are one-liners over this, so the header construction
-    cannot drift between them.
-
-    STILL a near-twin of ``test_capability_guard_http.py``'s ``_call_over_http``
-    -- deliberately, not by oversight. Task 3736 deduped the SERVER LIFECYCLE
-    half of this harness (``serve_escalation_mcp_module``); folding these last
-    two call helpers into a shared conftest fixture is a follow-up, because a
-    conftest helper is reachable only AS a fixture (a bare
-    ``from conftest import ...`` is unsafe under ``--import-mode=importlib``)
-    and converting every call site across both modules to request it is a much
-    larger mechanical change. See the harness comment in
-    ``test_capability_guard_http.py``.
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool(tool_name, tool_kwargs)
-        return result.data
-
-
 async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
     """``resolve_issue`` over real HTTP — the C1-C4 subject."""
-    return await _call_over_http(base_url, 'resolve_issue', **kwargs)
+    return await escalation_http_call(base_url, 'resolve_issue', **kwargs)
 
 
 async def _promote_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
     """``promote_to_l2`` over real HTTP. Proves ``promote_to_l2`` is gated by
     identity (``PROMOTE_ALLOWED``) but never by ``X-Escalation-Levels``."""
-    return await _call_over_http(base_url, 'promote_to_l2', **kwargs)
+    return await escalation_http_call(base_url, 'promote_to_l2', **kwargs)
 
 
 # ---------------------------------------------------------------------------

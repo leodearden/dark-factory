@@ -13,6 +13,7 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import yaml
 from hypothesis import given
 from hypothesis import strategies as st
@@ -530,3 +531,286 @@ class TestSeverityWeightsVocabularyWarning:
             load_priorities(custom_path)
 
         assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+class TestProjectWeightKeyFolding:
+    """load_priorities folds project_weights KEYS onto the canonical project
+    token (task 3812), so a hand-edited priorities.yaml key actually matches
+    the canonical item.project score() now sees.
+
+    Mandatory, not an extra: panes.weight_editor.known_projects unions the
+    scanned record/decision projects with this table's own KEYS. Folding only
+    the record side would relocate the two-names-for-one-project bug INTO the
+    weights file -- a stale 'dark-factory' key would be offered as a second
+    weightable project alongside 'dark_factory', and a weight set on it would
+    silently never apply to anything. That is precisely the new silent
+    failure task 3807's design decision named as the reason it excluded this
+    work.
+
+    Load-time (rather than normalizing inside score()) keeps score() a pure
+    dict lookup, and makes a load->save cycle HEAL a drifted file in place.
+    """
+
+    def _load(self, tmp_path, text):
+        from cockpit.priority import load_priorities
+
+        path = tmp_path / 'priorities.yaml'
+        path.write_text(text)
+        return load_priorities(path)
+
+    def test_separator_and_case_variants_fold_onto_the_canonical_key(self, tmp_path):
+        result = self._load(tmp_path, 'project_weights:\n  dark-factory: 2.0\n')
+
+        assert result.project_weights == {'dark_factory': 2.0}
+
+    def test_an_aliased_key_folds_onto_the_canonical_key(self, tmp_path):
+        result = self._load(tmp_path, 'project_weights:\n  df: 1.0\n')
+
+        assert result.project_weights == {'dark_factory': 1.0}
+
+    def test_synthetic_and_basename_keys_are_folded_but_never_merged(self, tmp_path):
+        """The fold is mechanical: it merges SPELLINGS of one project, and
+        never absorbs a distinct token into a real project. Mirrors the
+        registry_reader collapse guard."""
+        result = self._load(
+            tmp_path,
+            'project_weights:\n'
+            '  fm-neutral-classifier-cwd-_3yp2s4h: 1.0\n'
+            '  orchestrator: 2.0\n'
+            '  _lane-3: 3.0\n',
+        )
+
+        assert result.project_weights == {
+            'fm_neutral_classifier_cwd_3yp2s4h': 1.0,
+            'orchestrator': 2.0,
+            'lane_3': 3.0,
+        }
+
+    def test_an_explicitly_empty_table_stays_empty(self, tmp_path):
+        """_weight_table's contract is preserved: an explicit ``{}`` means
+        "no per-project overrides", and folding it must not resurrect the
+        bundled table."""
+        result = self._load(tmp_path, 'project_weights: {}\n')
+
+        assert result.project_weights == {}
+
+    def test_an_already_canonical_key_wins_a_collision_in_either_yaml_order(self, tmp_path):
+        """The collision rule is deterministic and ORDER-INDEPENDENT: when a
+        canonical key and a variant both fold to the same token, the
+        canonical one's value wins regardless of which came first in the
+        file."""
+        variant_first = self._load(
+            tmp_path, 'project_weights:\n  dark-factory: 1.0\n  dark_factory: 2.0\n'
+        )
+        canonical_first = self._load(
+            tmp_path, 'project_weights:\n  dark_factory: 2.0\n  dark-factory: 1.0\n'
+        )
+
+        assert variant_first.project_weights == {'dark_factory': 2.0}
+        assert canonical_first.project_weights == {'dark_factory': 2.0}
+
+    def test_among_variants_alone_the_lexicographically_last_raw_key_wins(self, tmp_path):
+        """With no canonical key present, the tie is still broken
+        deterministically rather than by yaml order: the lexicographically
+        LAST raw key supplies the value ('dark-factory' > 'DARK-FACTORY')."""
+        variant_first = self._load(
+            tmp_path, 'project_weights:\n  dark-factory: 1.0\n  DARK-FACTORY: 3.0\n'
+        )
+        other_order = self._load(
+            tmp_path, 'project_weights:\n  DARK-FACTORY: 3.0\n  dark-factory: 1.0\n'
+        )
+
+        assert variant_first.project_weights == {'dark_factory': 1.0}
+        assert other_order.project_weights == {'dark_factory': 1.0}
+
+    def test_a_collision_logs_the_discarded_weight_at_warning(self, tmp_path, caplog):
+        """A collision DISCARDS a weight the operator actually typed, and the
+        next save (which re-emits only the in-memory table) then deletes the
+        losing line from the file -- so the drop is announced, not silent.
+        Same visible-not-silent idiom as the empty-fold drop, and the repo's
+        loud-over-silent-degradation norm. Naming BOTH raw keys is what makes
+        it actionable: the operator has to know which line to edit."""
+        with caplog.at_level(logging.WARNING):
+            result = self._load(
+                tmp_path, 'project_weights:\n  dark-factory: 9.0\n  dark_factory: 1.0\n'
+            )
+
+        assert result.project_weights == {'dark_factory': 1.0}
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "'dark-factory'" in msg and "'dark_factory'" in msg and '9.0' in msg
+            for msg in warnings
+        ), f'Expected a WARNING naming both keys and the discarded 9.0; got: {warnings}'
+
+    def test_repairing_a_lone_drifted_key_stays_quiet(self, tmp_path, caplog):
+        """Folding a single drifted key loses NOTHING -- the operator's weight
+        still applies, just under the canonical token -- so the routine repair
+        makes no noise. The WARNING is reserved for a discard."""
+        with caplog.at_level(logging.WARNING):
+            result = self._load(tmp_path, 'project_weights:\n  dark-factory: 2.0\n')
+
+        assert result.project_weights == {'dark_factory': 2.0}
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_severity_and_category_weights_are_not_folded(self, tmp_path):
+        """Scope: only project_weights holds PROJECT TOKENS. severity and
+        category are unrelated key vocabularies -- folding them would
+        silently rewrite an operator's own category names."""
+        result = self._load(
+            tmp_path,
+            'severity_weights:\n  my-Severity: 2.0\n'
+            'category_weights:\n  my-bug: 1.0\n'
+            'project_weights:\n  dark-factory: 1.0\n',
+        )
+
+        assert result.category_weights == {'my-bug': 1.0}
+        assert result.severity_weights == {'my-Severity': 2.0}
+        assert result.project_weights == {'dark_factory': 1.0}
+
+    def test_a_priorities_built_in_memory_is_untouched(self, tmp_path):
+        """The fold is a LOAD-time rule over parsed YAML, not a Priorities
+        invariant: a table handed straight to dataclasses.replace keeps
+        whatever keys the caller chose (which is why test_priority.py's own
+        'mapped-project'/'proj-a' scoring tests still hold)."""
+        from cockpit.priority import Priorities
+
+        built = replace(Priorities.default(), project_weights={'dark-factory': 4.0})
+
+        assert built.project_weights == {'dark-factory': 4.0}
+
+
+class TestProjectWeightKeysOfAnyYamlType:
+    """load_priorities stays TOTAL over the non-str mapping keys yaml.safe_load
+    hands it for perfectly ordinary UNQUOTED hand edits (task 3812).
+
+    ``2085:`` parses as an int, ``1.5:`` as a float, ``yes:`` as a bool and
+    ``~:`` as None. The project_weights key fold added by this task sorts its
+    keys, and ``normalize_project_token(k) == k`` is False for every one of
+    those AND for a non-canonical str key like the very ``dark-factory:`` the
+    fold exists to repair -- so both land in the SAME first-element sort group
+    and the tuple comparison falls through to the RAW key, comparing e.g. an
+    int against a str. That TypeError escapes _priorities_from_dict ->
+    load_priorities OUTSIDE its ``except (OSError, yaml.YAMLError)`` guard,
+    breaking the documented 'never raises' contract and PRD section 2's hard
+    rule that a view is never a dependency: the cockpit would fail to start on
+    a hand-edited file that merely has an unquoted number for a key. Before
+    this task the raw table passed through untouched and such a key simply
+    never matched in score(), so it is a regression the fold introduced.
+
+    Every assertion below goes through a REAL priorities.yaml written to disk
+    and read back with load_priorities: only a real yaml.safe_load produces
+    non-str keys, so a hand-built dict would not reproduce the defect.
+
+    The pairing with ``dark-factory: 2.0`` is load-bearing, not decoration --
+    a lone non-str key sorts fine against itself and would NOT reproduce the
+    bug.
+    """
+
+    def _load(self, tmp_path, text):
+        from cockpit.priority import load_priorities
+
+        path = tmp_path / 'priorities.yaml'
+        path.write_text(text)
+        return load_priorities(path)
+
+    @pytest.mark.parametrize(
+        ('key_line', 'expected'),
+        [
+            ('  2085: 1.0\n', {'2085': 1.0, 'dark_factory': 2.0}),
+            ('  1.5: 1.0\n', {'1.5': 1.0, 'dark_factory': 2.0}),
+            ('  yes: 1.0\n', {'true': 1.0, 'dark_factory': 2.0}),
+            ('  ~: 1.0\n', {'dark_factory': 2.0}),
+        ],
+        ids=['int', 'float', 'bool', 'none'],
+    )
+    def test_a_non_str_key_beside_a_variant_key_loads_instead_of_raising(
+        self, tmp_path, key_line, expected
+    ):
+        """One non-str key next to one non-canonical str key -- the minimal
+        reproducer, once per key type yaml.safe_load can produce.
+
+        The assertion shape is deliberately the RETURNED table, never
+        pytest.raises: the contract being pinned is that load_priorities
+        returns a Priorities, so a test that merely tolerated the TypeError
+        would pin the opposite of what is wanted. The ``~`` (None) row folds
+        to the '' unset sentinel and is DROPPED -- see
+        test_a_key_that_folds_to_empty_is_dropped.
+        """
+        from cockpit.priority import Priorities
+
+        result = self._load(tmp_path, 'project_weights:\n' + key_line + '  dark-factory: 2.0\n')
+
+        assert isinstance(result, Priorities)
+        assert result.project_weights == expected
+
+    def test_all_key_types_and_both_spellings_in_one_table(self, tmp_path):
+        """All four non-str shapes plus both project spellings at once, so no
+        PAIR of key types can be left mutually incomparable by a fix that only
+        made one type sortable."""
+        result = self._load(
+            tmp_path,
+            'project_weights:\n'
+            '  2085: 1.0\n'
+            '  1.5: 2.0\n'
+            '  yes: 3.0\n'
+            '  ~: 4.0\n'
+            '  dark-factory: 5.0\n'
+            '  dark_factory: 6.0\n',
+        )
+
+        assert result.project_weights == {
+            '2085': 1.0,
+            '1.5': 2.0,
+            'true': 3.0,
+            # The canonical key still wins the collision with 'dark-factory'.
+            'dark_factory': 6.0,
+        }
+
+    def test_a_bare_task_id_key_is_folded_by_value_not_discarded(self, tmp_path):
+        """An unquoted int key must WORK, not merely not-crash.
+
+        Bare-task-id project tokens are real in this fleet (this task's own
+        registry_reader tests seed '3565' as a real spelling), so simply
+        DROPPING every non-str key would be the wrong repair: it would silently
+        discard a weight an operator did set on a live project.
+        """
+        from cockpit.priority import score
+
+        result = self._load(tmp_path, 'project_weights:\n  2085: 3.0\n')
+
+        assert result.project_weights == {'2085': 3.0}
+        assert score(_make_item(project='2085'), result, _NOW) > score(
+            _make_item(project='unmapped-project'), result, _NOW
+        )
+
+    def test_a_key_that_folds_to_empty_is_dropped(self, tmp_path, caplog):
+        """A key folding to '' -- the UNSET-project sentinel, not a token -- is
+        dropped, visibly.
+
+        ``~:`` (None), ``'':`` and ``'   ':`` all normalize to ''. Keeping one
+        would silently apply that weight to every row whose project is unset
+        (1,347 such records measured 2026-09-07), and would put the scorer back
+        in disagreement with panes.weight_editor.known_projects, which already
+        excludes '' -- the exact scorer/picker divergence task 3812 exists to
+        make impossible. Dropping is therefore right, but it must be VISIBLE:
+        each discard is logged at WARNING naming the raw key.
+        """
+        from cockpit.priority import score
+
+        with caplog.at_level(logging.WARNING):
+            result = self._load(
+                tmp_path,
+                "project_weights:\n  ~: 5.0\n  '': 6.0\n  '   ': 7.0\n  dark-factory: 1.0\n",
+            )
+
+        assert '' not in result.project_weights
+        assert result.project_weights == {'dark_factory': 1.0}
+        # Behavioural: an unset-project row still scores at defaults.project.
+        assert score(_make_item(project=''), result, _NOW) == score(
+            _make_item(project='unmapped-project'), result, _NOW
+        )
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        for raw_key in ('None', "''", "'   '"):
+            assert any('project_weights' in msg and raw_key in msg for msg in warnings), (
+                f'Expected a WARNING naming dropped key {raw_key}; got: {warnings}'
+            )

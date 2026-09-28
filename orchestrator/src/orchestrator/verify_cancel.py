@@ -46,6 +46,18 @@ Cross-host rollout
 Both the server and the laptop host run the ``df`` checkout, so landing this
 module on ``main`` ships the cancellation contract to the laptop via its
 normal checkout sync — no separate deploy step required.
+
+Self-kill report
+----------------
+The stdin watchdog (:func:`start_stdin_watchdog`) cancels the same subtree
+when the *dispatch channel itself* dies, and — having no structured return
+path left after ``os._exit`` — reports why in one
+``WATCHDOG_FIRE_TRIGGER_TOKEN=<WatchdogTrigger>`` line on stderr.  That line
+is a wire format, so this module owns both ends of it: the tokens, and the
+:func:`elide_middle` / :data:`JOURNALD_LINE_MAX_BYTES` pair that keeps the
+token alive when the dispatcher relays a huge remote stderr into journald.
+``merge_queue.py``'s ``except RunnerUnavailable`` handler imports that pair
+from here rather than respelling the protocol at the receiving end.
 """
 
 from __future__ import annotations
@@ -56,10 +68,14 @@ import os
 import re
 import select
 import signal
+import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -821,18 +837,53 @@ def remove_lock_holder_pgid(worktree_base: Path) -> None:
 # above cleans up *after the fact*; this watchdog prevents it from ever being
 # needed on the connection-death path).
 #
-# Protocol: the dispatcher (``verify_runner.RemoteRunner.run_merge_verify``)
-# opens the ssh child with ``stdin=PIPE`` and writes a heartbeat newline down
-# the channel every ``HEARTBEAT_INTERVAL_SECS`` for the full verify span. The
-# remote (``orchestrator verify-merge --request-id``) spawns a watchdog
-# thread owning fd 0 *before* the build starts (see :func:`start_stdin_watchdog`).
-# It fires on stdin EOF (the channel was cleanly closed) or when no heartbeat
-# arrives within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no
-# clean close).  ``setsid`` + the pgid file are unchanged by this protocol —
+# Protocol: the dispatcher (``verify_runner._default_ssh_heartbeat_run``)
+# opens the ssh child on the read end of a pipe it owns and beats one
+# ``HEARTBEAT_TOKEN`` down the write end every ``HEARTBEAT_INTERVAL_SECS`` for
+# the full verify span (see :func:`start_stdin_heartbeat`). The remote
+# (``orchestrator verify-merge --request-id``) spawns a watchdog thread owning
+# fd 0 *before* the build starts (see :func:`start_stdin_watchdog`). It fires
+# on stdin EOF (the channel was cleanly closed) or when no heartbeat arrives
+# within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no clean
+# close). Both halves are dedicated OS threads for one shared reason: neither
+# end's verdict about the channel may depend on how busy the other end's event
+# loop is.  ``setsid`` + the pgid file are unchanged by this protocol —
 # ``setsid`` does not close fd 0, so the watchdog reads stdin regardless of
 # session, and ``cancel_request`` keeps tree-killing by pgid with zero
 # contract churn.
 # ---------------------------------------------------------------------------
+
+# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
+# connect, not a mid-session stall — if the TCP session goes silently dead
+# (NAT/conntrack timeout, network partition, wedged remote process producing
+# no output), an ssh child with no keepalive can block indefinitely. These
+# ServerAlive probes ride the live TCP session (independent of stdout cadence),
+# so ssh itself detects a dead peer and exits non-zero within
+# SSH_TRANSPORT_DEAD_PEER_SECS -> RunnerUnavailable -> existing re-dispatch /
+# local-fallback path (incident 5111). A long-but-progressing remote verify
+# keeps the session alive and is unaffected. Values are chosen well inside the
+# remote verify timeout budget.
+#
+# They live HERE, rather than beside ``_SSH_BASE_OPTS`` in verify_runner.py
+# where they were defined until task 4195, because this module now derives the
+# watchdog's deadline from them — and verify_runner imports one-way from here
+# (the direction named in this module's §"Self-kill report"), so deriving in
+# the other direction would be a circular import. verify_runner re-exports both
+# names and keeps interpolating them into ``_SSH_BASE_OPTS``, so all four ssh
+# argv sites are unaffected.
+SSH_SERVER_ALIVE_INTERVAL: int = 15
+SSH_SERVER_ALIVE_COUNT_MAX: int = 4
+
+#: When ssh itself declares the peer dead and exits non-zero.
+SSH_TRANSPORT_DEAD_PEER_SECS: float = SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX
+
+#: How far past the transport's own verdict the watchdog waits before reaching
+#: its own.  Must stay ABOVE 1.0: at or below it the watchdog re-enters the band
+#: where it out-votes ssh on a question ssh is the authority for.  1.5 is the
+#: smallest conventional margin clear of that, and it clears every measured loop
+#: stall by a wide factor.
+WATCHDOG_TRANSPORT_HEADROOM: float = 1.5
+
 
 #: Heartbeat cadence (seconds) the dispatcher writes down the ssh child's
 #: stdin for the full verify span.  A module constant rather than a config
@@ -843,18 +894,237 @@ def remove_lock_holder_pgid(worktree_base: Path) -> None:
 HEARTBEAT_INTERVAL_SECS: float = 5.0
 
 #: The watchdog fires if no heartbeat (or EOF) arrives within this window.
-#: 2x the heartbeat cadence tolerates a single missed/delayed beat before
-#: declaring the dispatch channel dead.
-WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
+#: DERIVED from the transport rather than pinned independently of it, because
+#: the watchdog's purpose is to stop a setsid'd remote outliving a dead
+#: connection — not to reach that verdict FIRST.  ssh already declares the peer
+#: dead at SSH_TRANSPORT_DEAD_PEER_SECS (60s) and exits non-zero into the
+#: dispatcher's existing re-dispatch path, so the independently-pinned 10.0s
+#: this replaces (2x the heartbeat cadence) opened a 10-60s band in which the
+#: remote killed healthy builds on links ssh would have ridden through.
+#:
+#: Measured 2026-08-12: the orchestrator's shared event loop stalled to MAX
+#: 16.1s against that 10.0s budget, and ~53.8% of reify's remote dispatches
+#: died without unwinding — their local re-runs then passed at 78.7%, i.e. the
+#: builds had been healthy.  The derived 90.0s is 18 heartbeat periods wide
+#: where the old value was 2.
+#:
+#: PER-HOST OVERRIDE — leo-laptop does not run this value, and retuning either input
+#: above will not move it: its /usr/local/bin/orchestrator shim exports
+#: ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS="${ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS:-600}"
+#: (ssh read-only 2026-09-18, still live 09-20), and ``cli.py::_env_float`` lets that env
+#: var displace this constant outright — proof, not re-argued here:
+#: ``orchestrator/tests/test_laptop_warm_verify_boundary.py::test_watchdog_timeout_env_override_fires_fast_without_heartbeat``
+#: Unclamped by choice: a ``max(env, derived)`` clamp reddens that file's 60s wedge
+#: detector, and the override is an operator's only mid-incident lever.  Nothing here
+#: observes that host's value.  It is HELD on purpose (task 5577, ruled 2026-09-21): 90.0s
+#: ran there 2026-09-14 and the first dispatch under it (req 42ef0d6b) still died at 901s;
+#: no 90.0s sample since.  Do NOT delete the export because the numbers agree — they do
+#: not; reversal is gated on that host's leftover-pgid rate at 90.0s.  That sample needs
+#: no shim edit: the ``:-`` defers to whatever the dispatch env already sets.
+WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = (
+    WATCHDOG_TRANSPORT_HEADROOM * SSH_TRANSPORT_DEAD_PEER_SECS
+)
 
 #: Grace period between the SIGTERM and SIGKILL passes when the watchdog
 #: fires and kills the build subtree (see :func:`fire_watchdog_kill`).
 WATCHDOG_KILL_GRACE_SECS: float = 5.0
 
 
+class WatchdogTrigger(StrEnum):
+    """Which :func:`run_stdin_watchdog` branch judged the dispatch channel dead.
+
+    The two branches have nothing in common but the kill they cause: ``EOF``
+    means the writing end closed the channel (the orchestrator died, or ssh
+    dropped), ``HEARTBEAT_STARVATION`` means no beat arrived inside the
+    window (a hard partition, or a timeout tuned too tight for this host).
+
+    The member *values* are the tokens that cross the ssh stderr channel back
+    to the dispatcher (see :func:`fire_watchdog_kill`), so this enum is their
+    single definition — emitter and operator grep cannot drift apart.
+    """
+
+    EOF = 'eof'
+    HEARTBEAT_STARVATION = 'heartbeat_starvation'
+
+
+#: Key of the ``<key>=<trigger>`` pair :func:`fire_watchdog_kill` writes to
+#: stderr just before self-terminating.  Named rather than inlined so the
+#: emitter and the tests that pin the operator's ``journalctl | grep`` cannot
+#: drift apart.
+WATCHDOG_FIRE_TRIGGER_TOKEN: str = 'watchdog_fire_trigger'
+
+
+JOURNALD_LINE_MAX_BYTES: int = 48 * 1024
+"""journald's default ``LineMax``. Every orchestrator unit sets
+``StandardError=journal``, so a longer line is truncated by the journal itself
+— silently, and from the tail, which is exactly where
+:data:`WATCHDOG_FIRE_TRIGGER_TOKEN` lands in a relayed remote stderr."""
+
+
+def elide_middle(text: str, *, head: int = 200, tail: int = 800) -> str:
+    """Keep the first *head* and last *tail* characters, naming how many were dropped.
+
+    For strings whose two informative ends sit either side of an arbitrarily
+    large middle, where a plain head or tail slice would discard one of them.
+    A dead remote's relayed stderr is logged this way: the ssh rc is at its
+    head and :data:`WATCHDOG_FIRE_TRIGGER_TOKEN` at its tail, with a whole
+    verify's INFO logging in between.
+
+    *head* and *tail* are counts of characters to KEEP, so zero keeps nothing
+    from that end and a *text* no longer than their sum comes back verbatim.
+
+    The defaults sum to 1000 characters — at most 4 KiB of UTF-8, far below
+    :data:`JOURNALD_LINE_MAX_BYTES`, which is the number to check against
+    before widening either end.
+    """
+    if len(text) <= head + tail:
+        return text
+    # Not ``text[-tail:]``: at tail=0 that is ``text[0:]``, the whole string.
+    kept_tail = text[-tail:] if tail else ''
+    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{kept_tail}'
+
+
+HEARTBEAT_TOKEN: bytes = b'\n'
+"""What one beat looks like on the wire, defined once for both ends.
+
+:func:`run_stdin_watchdog` only requires a *non-empty* read to reset its
+window, so this token's CONTENT is not load-bearing — its single-sourcing is,
+and this is the end that writes it."""
+
+
+def run_stdin_heartbeat(
+    write_fd: int,
+    stop_event: threading.Event,
+    *,
+    interval: float = HEARTBEAT_INTERVAL_SECS,
+    write_fn=os.write,
+    close_fn=os.close,
+) -> None:
+    """Blocking producer loop: write one :data:`HEARTBEAT_TOKEN` per *interval* to *write_fd*.
+
+    The counterpart of :func:`run_stdin_watchdog`, and hardened the same way
+    for the same reason.  Intended to run in a dedicated daemon OS thread (see
+    :func:`start_stdin_heartbeat`) whose timer is a ``threading.Event`` timed
+    wait — rather than as an asyncio task sharing the dispatcher's event loop
+    — so the cadence means what it says however saturated or wedged that loop
+    is.  A consumer that fires on a blocking ``select`` is no use if the
+    producer feeding it is itself scheduled behind whatever stalled the loop.
+
+    The same *stop_event* is both the timer and the stop signal: the loop
+    waits on it BEFORE each write (so the first beat lands at t=*interval*),
+    and setting it ends the loop within one GIL switch instead of waiting out
+    a full beat.
+
+    This function OWNS *write_fd* and closes it on every exit path, which is
+    what delivers EOF to the remote's watchdog.  No caller may close it too: a
+    double close can close an unrelated descriptor that has since reused the
+    number.
+
+    A failed beat never raises out of this loop and never alters the
+    dispatch's returned ``(rc, stdout, stderr)``, for three separately benign
+    reasons:
+
+    * ``BrokenPipeError`` / ``ConnectionResetError`` — the child is already
+      gone (EPIPE).  The existing transport-failure handling (non-zero rc or
+      unparseable stdout -> ``RunnerUnavailable`` -> re-dispatch or local
+      fallback) already covers the dead-channel outcome, so a beat losing the
+      race to that teardown is not news.
+    * ``BlockingIOError`` — the write end is non-blocking and the pipe is
+      full.  Skipping the beat is the correct answer: a full pipe proves the
+      channel is alive but undrained, which is not the condition the watchdog
+      exists to detect, and blocking here instead would park this thread
+      indefinitely and wedge the dispatch's teardown join.  That the write end
+      IS non-blocking is established by :func:`start_stdin_heartbeat`, which
+      is what hands this loop its fd; this suppression would be unreachable
+      dead weight without it.
+
+    The tuple is deliberately narrow.  Any other ``OSError`` — EBADF, ENOSPC
+    — propagates and ends the thread, because none of them has a benign
+    reading and a thread dying loudly into the journal beats a producer that
+    silently stops beating while the dispatch believes it is covered.
+
+    *write_fn* / *close_fn* are injectable (default ``os.write`` /
+    ``os.close``) so tests can script deterministic behavior without a real
+    pipe or wall-clock waits, mirroring the watchdog's *select_fn* /
+    *read_fn*.
+    """
+    try:
+        while not stop_event.wait(interval):
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, BlockingIOError):
+                write_fn(write_fd, HEARTBEAT_TOKEN)
+    finally:
+        with contextlib.suppress(OSError):
+            close_fn(write_fd)
+
+
+#: Thread name for the writer spawned by :func:`start_stdin_heartbeat`.  Named
+#: rather than anonymous so it is identifiable in a thread dump (``cli.py``'s
+#: shutdown watchdog enumerates live threads by name) and so a test can assert
+#: none survives a dispatch.
+HEARTBEAT_THREAD_NAME: str = 'ssh-stdin-heartbeat'
+
+
+class HeartbeatHandle(NamedTuple):
+    """Return value of :func:`start_stdin_heartbeat`."""
+
+    stop: Callable[[], None]
+    thread: threading.Thread
+
+
+def start_stdin_heartbeat(
+    write_fd: int,
+    *,
+    interval: float = HEARTBEAT_INTERVAL_SECS,
+    write_fn=os.write,
+    close_fn=os.close,
+) -> HeartbeatHandle:
+    """Spawn a started daemon thread running :func:`run_stdin_heartbeat` against *write_fd*.
+
+    The PRODUCER counterpart of :func:`start_stdin_watchdog`, and the reason
+    the symmetry matters: the consumer was given a dedicated OS thread so it
+    fires even when the *build's* event loop is wedged, and this gives the
+    dispatcher's beat the same immunity to the *orchestrator's* loop — which
+    carries the scheduler, agent dispatch, the merge worker and the uvicorn
+    escalation server, and was measured stalling for 16.1s against what was
+    then a 10.0s starvation budget on 2026-08-12.  A beat scheduled behind
+    that stall is a beat the remote correctly reads as a dead channel.
+
+    ``daemon=True`` so the writer can never block interpreter shutdown.
+
+    Puts *write_fd* in NON-BLOCKING mode before starting the thread, rather
+    than trusting each call site to have done so.  Two documented guarantees
+    rest on that mode and neither is checkable from where they are stated: the
+    ``BlockingIOError`` arm of :func:`run_stdin_heartbeat`'s suppression (a
+    full pipe skips one beat), and every caller's BOUNDED teardown join (see
+    ``verify_runner.HEARTBEAT_STOP_JOIN_SECS``), whose ceiling is sized on the
+    premise that ``os.write`` can never park.  A blocking fd voids both
+    silently — the writer parks forever on a full pipe and the join simply
+    expires — so the mode is ESTABLISHED here, where the fd is handed to the
+    thread, instead of asserted here or set at one remote call site.
+
+    Returns a :class:`HeartbeatHandle`; ``handle.stop()`` sets the loop's
+    Event and is idempotent — safe to call twice, or after the thread has
+    already exited — matching ``cli.py::_force_exit_after_delay``'s ``disarm``.
+    ``handle.thread`` is exposed so callers and tests can ``join()`` it.
+    *write_fd* belongs to the thread, which closes it on every exit path (see
+    :func:`run_stdin_heartbeat`); no caller may close it too.
+    """
+    os.set_blocking(write_fd, False)
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=run_stdin_heartbeat,
+        args=(write_fd, stop_event),
+        kwargs={'interval': interval, 'write_fn': write_fn, 'close_fn': close_fn},
+        name=HEARTBEAT_THREAD_NAME,
+        daemon=True,
+    )
+    thread.start()
+    return HeartbeatHandle(stop=stop_event.set, thread=thread)
+
+
 def run_stdin_watchdog(
     read_fd: int,
-    on_fire,
+    on_fire: Callable[[WatchdogTrigger], None],
     *,
     heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     select_fn=select.select,
@@ -879,18 +1149,20 @@ def run_stdin_watchdog(
       resets and the loop continues watching.
 
     *on_fire* is called at most once — the function returns immediately
-    afterward.  *select_fn* / *read_fn* are injectable (default
+    afterward — with the :class:`WatchdogTrigger` naming the branch taken, so
+    a self-kill stays attributable to one of those two very different causes
+    everywhere downstream.  *select_fn* / *read_fn* are injectable (default
     ``select.select`` / ``os.read``) so tests can script deterministic fd-0
     behavior without a real pipe or wall-clock waits.
     """
     while True:
         ready, _, _ = select_fn([read_fd], [], [], heartbeat_timeout)
         if not ready:
-            on_fire()
+            on_fire(WatchdogTrigger.HEARTBEAT_STARVATION)
             return
         data = read_fn(read_fd, read_size)
         if data == b'':
-            on_fire()
+            on_fire(WatchdogTrigger.EOF)
             return
         # Non-empty data: a heartbeat arrived -- window resets, keep watching.
 
@@ -898,6 +1170,7 @@ def run_stdin_watchdog(
 def fire_watchdog_kill(
     pgid: int,
     *,
+    trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
     ppid_map_provider=read_ppid_map,
     kill=os.kill,
@@ -905,6 +1178,7 @@ def fire_watchdog_kill(
     sleep=time.sleep,
     exit_fn=os._exit,
     exit_code: int = 1,
+    stderr=None,
 ) -> None:
     """Kill the build subtree rooted at *pgid* and unconditionally self-terminate.
 
@@ -930,11 +1204,21 @@ def fire_watchdog_kill(
       abandoned verify-merge leader always terminates (freeing its flock and
       letting sshd reap it) even if some descendant could not be killed.
 
+    *trigger* names the :func:`run_stdin_watchdog` branch that judged the
+    channel dead.  It is REPORTED, never acted on -- the kill sequence is
+    identical for both branches -- and it is required and keyword-only so no
+    call site can omit the branch identity and make a self-kill
+    unattributable again.  *stderr* (default ``sys.stderr``, resolved at call
+    time) is the channel it is reported on: once ``exit_fn`` has run there is
+    no structured return path left, and on a remote verify this stderr is the
+    only thing the dispatcher still sees.
+
     Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
     (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
     a permission race is fine, this is a best-effort escalation), sleep
     *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), then ``exit_fn(exit_code)`` as the final action.
+    (same suppression), report the trigger on stderr, then
+    ``exit_fn(exit_code)`` as the final action.
     """
     ppid_map = ppid_map_provider()
     descendants = collect_descendants(pgid, ppid_map)
@@ -950,6 +1234,15 @@ def fire_watchdog_kill(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             kill(pid, signal.SIGKILL)
 
+    # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
+    # buffered line would be dropped.  Suppress everything: a failed
+    # diagnostic (broken pipe on a dead ssh channel) must never prevent the
+    # self-exit that frees the flock and lets sshd reap the leader.
+    stream = stderr if stderr is not None else sys.stderr
+    with contextlib.suppress(Exception):
+        stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
+        stream.flush()
+
     exit_fn(exit_code)
 
 
@@ -961,7 +1254,7 @@ def start_stdin_watchdog(
     read_fd: int = 0,
     select_fn=select.select,
     read_fn=os.read,
-    fire=None,
+    fire: Callable[[WatchdogTrigger], None] | None = None,
 ) -> threading.Thread:
     """Spawn a started daemon thread running :func:`run_stdin_watchdog` against *read_fd*.
 
@@ -973,12 +1266,13 @@ def start_stdin_watchdog(
     thread never blocks interpreter shutdown on its own.
 
     *fire* is injectable for tests (default: a closure over
-    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).
-    *select_fn* / *read_fn* / *read_fd* pass through to
-    :func:`run_stdin_watchdog`.
+    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).  It is
+    called with the :class:`WatchdogTrigger` naming the branch that fired,
+    which the default callback forwards on.  *select_fn* / *read_fn* /
+    *read_fd* pass through to :func:`run_stdin_watchdog`.
     """
     on_fire = fire if fire is not None else (
-        lambda: fire_watchdog_kill(pgid, grace_secs=grace_secs)
+        lambda trigger: fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
     )
     thread = threading.Thread(
         target=run_stdin_watchdog,

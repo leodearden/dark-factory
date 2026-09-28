@@ -48,5 +48,42 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Investigate Graphiti async-queue embedding indexing latency for temporal_fact writes",
+      "description": "Graphiti temporal_fact snapshot writes via add_memory(category='temporal_facts') cannot be located by subsequent semantic search within the same Stage 1 reconciliation run. Confirmed across 4 consecutive cycles: eeaed90d, 3f5aa3e3, 006c9e12, 8bc60575. The async-queue path delays embedding indexing beyond Stage 1's search window. Stage 1 currently mitigates by writing a fresh snapshot each cycle (temporal supersession), but stale edges may persist. Investigate options: (1) switch snapshot writes to synchronous Graphiti write path, (2) add post-write verification with retry in Stage 1, or (3) formally accept the pattern and document that temporal supersession is sufficient \u2014 removing stale-edge search from Stage 1. Affected entity: a1e8c5b1 (task-count snapshot). Related observation: e1331008-f81e-4574-bc3d-76b09671ea7a.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1225",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-13T13:39:25.328Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py",
+      "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py",
+      "fused-memory/tests/test_stages.py"
+    ],
+    "base_sha": "1ed32d35dbc3f2cfcdc335ee707e9cd25aa07d24",
+    "branch_sha": "0fc550cde00c3ef25ee0d8170898bf7a864e0b4f",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "f5f022ed21774aafc282dabb28bcbf770bcebec1",
+      "merge_base_sha": "1ed32d35dbc3f2cfcdc335ee707e9cd25aa07d24",
+      "diff_reproduces_from": "git diff 1ed32d35db f5f022ed21",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

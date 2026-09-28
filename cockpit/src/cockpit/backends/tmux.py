@@ -76,6 +76,13 @@ class TmuxBackend:
         moves each target from its scratch index to its final compacted
         index.
 
+        Duplicate-tolerant: each distinct tmux_target is assigned an index
+        at most once, so *targets* may legitimately repeat one (a
+        DecisionRecord and the AWAITING_INPUT session it links to resolve to
+        the same DisplayTarget). Absorbing the repeat here keeps the
+        compacted 0..N-1 range gap-free regardless of caller -- see the
+        inline comment on the index-assignment loop below.
+
         Signal-don't-move (the invariant PRD boundary B4/B6 guards live): a
         reorder must never change which window the operator is actually
         looking at. move-window can't be made focus-neutral on its own -- a
@@ -109,12 +116,30 @@ class TmuxBackend:
         # its own session's index 0). tmux_target is captured as a plain str
         # (not target.tmux_target, which stays str | None) so the loop below
         # is narrowing-clean for pyright.
+        #
+        # INVARIANT: each tmux_target appears at most once in this index
+        # assignment. A repeat is skipped BEFORE it consumes an index --
+        # otherwise it would take a second index AND produce a doomed second
+        # park against the source window the first one just vacated ("no such
+        # window"), leaving a gap in the final compacted 0..N-1 range. Dedup
+        # is on the tmux_target STRING, not the DisplayTarget object: two
+        # targets differing only in wm_title still name exactly one tmux
+        # window, and this backend addresses windows solely by that string.
+        # A duplicate is a benign caller-side collision this method absorbs,
+        # not a fault, so the skip logs at DEBUG rather than WARNING.
         valid: list[tuple[int, str]] = []
         session_positions: dict[str, int] = {}
+        seen: set[str] = set()
         for target in targets:
             if not target.tmux_target:
                 logger.warning('TmuxBackend.reorder: target has no tmux_target: %r', target)
                 continue
+            if target.tmux_target in seen:
+                logger.debug(
+                    'TmuxBackend.reorder: skipping duplicate target %r', target.tmux_target
+                )
+                continue
+            seen.add(target.tmux_target)
             session = target.tmux_target.split(':', 1)[0]
             index = session_positions.get(session, 0)
             session_positions[session] = index + 1

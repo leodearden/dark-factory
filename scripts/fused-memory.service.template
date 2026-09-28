@@ -36,7 +36,7 @@ ExecStartPre=/usr/bin/docker compose -f __REPO_ROOT__/fused-memory/docker/docker
 # race — the failure mode that cancelled the dependent orchestrators (which
 # had a hard Requires= on us) on 2026-05-27. Budget 280s < TimeoutStartSec=300.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:6379 127.0.0.1:6333
-ExecStart=__UV_PATH__ run --project fused-memory \
+ExecStart=__UV_PATH__ run --no-sync --project fused-memory \
   python -m fused_memory.server.main \
   --transport http \
   --config __REPO_ROOT__/fused-memory/config/config.yaml

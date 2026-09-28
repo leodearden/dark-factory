@@ -25,5 +25,36 @@
       "description": "The new test test_emit_returns_event_id has 'assert any(True for r in rows if ...)' which is a tautological assertion \u2014 any() with a generator of True values always returns True when there's at least one match, but the generator yields True unconditionally for ALL rows (the 'if' filters the generator but True is always the yielded value). Should be 'assert any(r[\"task_id\"] == \"99\" for r in rows)'.",
       "mutation_type": "always_passes"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Cover the event id returned by EventStore.emit",
+      "description": "`orchestrator/src/orchestrator/event_store.py::EventStore.emit` hands back the identifier of the row it wrote, and `orchestrator/tests/test_event_store.py` never exercises that return value \u2014 every existing case calls `emit` for its side effect alone, so the identifier could stop being produced with no test noticing. Add a case that emits a single event, asserts an identifier comes back, and confirms the matching row is readable from the events table. Capture the returned identifier at the existing `test_emit_writes_event` call site too, so the return value is exercised on the main write path as well.",
+      "test_strategy": "Run `pytest orchestrator/tests/test_event_store.py`. The new case must fail if `emit` returns `None` or if the row it claims to have written is absent, and must stay self-contained on `tmp_path` like the rest of the module.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "orchestrator/tests/test_event_store.py"
+    ],
+    "base_sha": "2dec42fdb8a9f321c8d1f1c8cce2c21dc1f6c72f",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index",
+      "applies_cleanly": true,
+      "tolerance_flags": [],
+      "candidates_tested": 1,
+      "reason": "Only commit in main's history (first-parent or otherwise, before 2026-04-08) that touches orchestrator/tests/test_event_store.py: '2dec42fd: Merge fix/merge-queue-branch-prefix: pass bare task ID in merge-queue skill', 2026-04-03 15:33:51+0100. Plain `git apply --cached --check` succeeds immediately (rc=0) against this commit's tree -- no header/count defects in this fixture, unlike the other synthetic diffs.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

@@ -8,8 +8,11 @@ A candidate is rejected when its title / description / details / files
 cite a path prefix owned by a project other than the one being filed
 into.  "Cite" is two-sided (task 3120): the prefix must sit at a left word
 boundary AND be followed by something that looks like a path segment, so a
-bare MENTION ("see ``fused-memory/``") or an English slash-construction
-("not a ``backend/``timeout error") is not a hit.  The verdict's
+bare MENTION ("see ``fused-memory/``") or a TWO-element English
+slash-construction ("not a ``backend/``timeout error") is not a hit.  A
+THREE-OR-MORE-element slash-construction ("the ``client/``server/db split")
+is still a hit — known false-positive residue, see :func:`_build_pattern`
+(task 4160).  The verdict's
 ``suggested_project`` field carries the owning
 project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
@@ -23,7 +26,24 @@ signal (task 3106).
 
 That yields THREE outcomes at the interceptor's ``submit_task`` seam
 (``TaskInterceptor._path_guard_or_skip``), in evaluation order — recorded
-here so a future reader need not re-derive the taxonomy from the call site:
+here so a future reader need not re-derive the taxonomy from the call site,
+plus one bypass that PRECEDES all three:
+
+0. AUDITED BYPASS (:func:`is_routing_override`, task 3123) — the caller
+   supplied a non-blank ``routing_override_reason``.  Checked FIRST, before
+   any of the three below can be reached, so that "no enforcement side-effect
+   fires on the override path" is a STRUCTURAL property rather than one each
+   future branch must re-establish.  The verdicts ARE still computed inside
+   this branch, for REPORTING ONLY: the interceptor files a
+   ``scope_violation`` override escalation naming the reason and the paths
+   that WOULD have been flagged, then returns without enforcing anything.
+
+   The escalation is what makes this an AUDITED bypass rather than a silent
+   one.  Its predecessor — a lone ``logger.warning`` — was never a sufficient
+   audit trail, and not only because a log is easy to miss: ``journalctl -p
+   warning`` does NOT match Python ``logger.warning`` records (they carry the
+   syslog priority the handler assigns, not the Python level), so the obvious
+   way an operator would go looking for these found nothing.
 
 1. FILES-CERTAIN REJECT (:func:`check_files_for_scope`, task 2206) — a
    DECLARED file is owned by another project.  Hard reject, no LLM
@@ -87,16 +107,24 @@ if TYPE_CHECKING:
 
 _PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
 
-# One path segment: the chars that may legally appear in a single path
-# component (no '/').  Used only inside the right-context lookahead.
-_SEG: str = r'[A-Za-z0-9_.\-]+'
+# The chars that may legally appear in a single path component (no '/').
+_SEG_CHARS: str = r'[A-Za-z0-9_.\-]'
 
-# Right-context assertion (task 3120): the token after '<prefix>/' must
-# look like a path segment — either another '/' follows, or it carries a
-# file extension.  NOTE: the interval quantifier is written {{1,6}} here
-# because this is an f-string; braces in the RENDERED value are not
-# re-processed when it is interpolated into _build_pattern below.
-_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z0-9]{{1,6}}(?![A-Za-z0-9]))'
+# One path segment.
+_SEG: str = rf'{_SEG_CHARS}+'
+
+# A file-extension-bearing token.  The stem is DOT-INCLUSIVE (_SEG_CHARS*)
+# so a multi-dot filename ('a.b.txt') can backtrack the stem to 'a.b' and
+# still expose '.txt'; the extension itself must be 2-6 chars whose LEADING
+# char is alphabetic (rules out a purely-numeric "extension" like 'v1.2' /
+# '0.5', and a single dotted-initial letter like 'A.I.'), with the
+# remaining chars alphanumeric so a genuinely digit-bearing extension
+# ('.mp3', '.h5', '.sha256') still matches.
+# NOTE: {{1,5}} is doubled because this is an f-string; braces in the
+# RENDERED value are not re-processed when it is interpolated below.
+_EXT: str = rf'{_SEG_CHARS}*\.[A-Za-z][A-Za-z0-9]{{1,5}}(?![A-Za-z0-9])'
+
+_RIGHT_CONTEXT: str = rf'(?={_SEG}/|{_EXT})'
 
 
 def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
@@ -121,10 +149,29 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
 
     RIGHT boundary (task 3120) — the token following ``<prefix>/`` must look
     like a path segment: either another ``/`` follows (``crates/reify/src.rs``)
-    or the token carries a file extension (``gui/package.json``).  Without
-    this, any English slash-construction whose left half happens to name a
-    registered top-level directory lexed as a path — "not a ``backend/``
-    timeout error", "``tools/``call", "``archive/``pause".
+    or the token carries a file extension (``gui/package.json``).  Task 3120
+    closed the TWO-element English slash-construction shape whose left half
+    happens to name a registered top-level directory — "not a
+    ``backend/``timeout error", "``tools/``call", "``archive/``pause"; a
+    THREE-OR-MORE-element one ("the ``client/``server/db split") still
+    satisfies the ``_SEG/`` alternative and survives as known false-positive
+    residue (task 4160, see below).  The extension alternative
+    (:data:`_EXT`) requires a 2-6 char extension whose LEADING character is
+    ALPHABETIC, with the remaining chars ALPHANUMERIC, over a DOT-INCLUSIVE
+    stem (task 4160): the previous ``[A-Za-z0-9]{1,6}`` let the extension
+    START with a digit, so a two-component version string
+    (``backend/v1.2``), a decimal (``corpus/0.5``), and dotted initials
+    (``backend/A.I.``) all lexed as paths.  Anchoring only the LEADING
+    character — rather than banning digits outright — keeps a genuinely
+    digit-bearing extension matching (``crates/x.mp3``, ``crates/x.h5``,
+    ``crates/x.sha256``), since a purely-numeric or single-letter token can
+    never satisfy a mandatory leading letter followed by >=1 more
+    character.  The stem is dot-inclusive specifically so a multi-dot
+    filename (``gui/a.b.txt``) still survives the 2-char floor — the engine
+    backtracks the stem past the first dot to expose ``.txt`` — but the
+    same backtracking re-admits a THREE-OR-MORE-component version string
+    whose FINAL component is alphabetic (``backend/v1.2.final``); known
+    false-positive residue, see below.
 
     A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
     because that is the bare-MENTION class ("see ``fused-memory/``", "the
@@ -146,8 +193,12 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     file entries through :func:`check_files_for_scope` rather than rely on
     this heuristic scan.
 
-    KNOWN FAIL-OPEN residue, deliberately not closed (each is pinned by a
-    test so the gap stays visible rather than implied covered):
+    KNOWN residue, deliberately not closed — split into the two directions a
+    heuristic like this can fail, each entry pinned by an executing test so
+    the gap stays visible rather than implied covered:
+
+    (i) MISSED DETECTIONS (fail-open) — a real path reference is NOT
+    recognised:
 
     - extensionless right context — ``<prefix>/<dir>`` and extensionless
       filenames (``fused-memory/src``, ``crates/reify-eval``,
@@ -156,17 +207,54 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
       spelling; it is accepted anyway because admitting it would mean
       accepting any ``<word>/<word>``, which is exactly the English-
       punctuation shape this assertion exists to reject;
-    - extensions longer than 6 chars (the ``{1,6}`` cap) — ``docs/.gitignore``,
+    - extensions longer than 6 chars (the ``{2,6}`` cap) — ``docs/.gitignore``,
       ``crates/x.markdown``, ``crates/x.properties`` fail the extension
       alternative.  The mechanism is the LENGTH cap, NOT the leading dot: a
       short-extension dotfile such as ``docs/.env`` still matches;
     - glob spellings — the metacharacter in ``plans/*.md`` is in neither the
-      segment class nor the extension class.
+      segment class nor the extension class;
+    - single-character extensions (task 4160) — ``crates/x.c``, ``crates/x.h``
+      fail the ``{2,6}``-floored extension alternative.  ``crates/x.c`` and
+      ``backend/A.I.`` are structurally identical to the matcher (stem, dot,
+      one letter), so closing the dotted-initials FALSE positive necessarily
+      costs the single-letter extension — no rule closes one while keeping
+      the other.
 
-    All three are MISSED detections, never false ones — the same conservative
-    direction ``project_prefix_registry`` already takes for
-    ``../other-repo/x.py`` and ``~user/...``.  Widening the character classes
-    to admit them would start re-admitting the punctuation shapes above.
+    (ii) FALSE POSITIVES (fail-loud) — prose is WRONGLY recognised as a path:
+
+    - three-or-more-element English slash-construction (task 4160) — ``the
+      client/server/db split``, ``a read/write/execute decision`` still
+      match via the ``_SEG/`` alternative, because each interior segment is
+      followed by another ``/``.  NOT closed: the only mechanical fix —
+      requiring the ``_SEG/`` chain to terminate in an extension — would
+      stop detecting genuine EXTENSIONLESS directory paths
+      (``fused-memory/src/fused_memory/middleware/``, ``crates/reify/src``),
+      a strictly larger and more common real-prose class in this repo than
+      the shape it would close, so closing it would be a net detection loss;
+    - multi-component version string with an alphabetic final component
+      (task 4160) — ``backend/v1.2.final``, ``gui/1.0.beta`` still match:
+      the DOT-INCLUSIVE stem (:data:`_EXT`, needed to keep ``gui/a.b.txt``
+      matching) backtracks past the earlier dots and offers the trailing
+      word as the extension, while an all-numeric final component
+      (``backend/v1.2.3``) is still closed.  NOT closed for the same reason
+      as the entry above: nothing in the regex distinguishes this shape
+      from the genuine multi-dot filename ``gui/a.b.txt`` — both are a
+      dot-inclusive stem followed by a 2-6 char alphabetic-led tail.
+
+    Blast radius is bounded for both entries above: the prose advisory this
+    feeds NEVER rejects a submission outright (the module docstring's
+    outcome (3)) and is suppressed entirely by
+    :func:`local_attesting_signals` (task 3106) whenever the declared
+    deliverables attest local work, so a false positive only reaches a
+    submission with no locally-attesting declared files, where it stamps
+    ``metadata.possible_scope_mismatch`` and files an info-severity
+    ``scope_violation`` escalation.
+
+    The MISSED-detection direction is the same conservative one
+    ``project_prefix_registry`` already takes for ``../other-repo/x.py`` and
+    ``~user/...``; widening the character classes to admit any of (i) would
+    start re-admitting the FALSE-positive punctuation shapes above and in
+    (ii).
 
     Cache note: ``_PATTERN_CACHE`` is keyed by the prefix tuple; the boundary
     class and the right-context assertion are both compile-time constants
@@ -585,6 +673,17 @@ def is_routing_override(routing_override_reason: str | None) -> bool:
     it is a non-empty string after stripping leading/trailing whitespace.
     Empty strings, None, and whitespace-only strings all return False —
     preserving the default no-override semantics.
+
+    That strip-only rule is the whole of the validation, and it is the PINNED
+    contract — but note what a ``True`` here actually gates: it disables ALL
+    THREE outcomes of the module taxonomy above, the FILES-certain HARD REJECT
+    included, not merely the prose advisory.  There is no allowlist, no format
+    constraint, and no cross-check of the stated reason against the paths the
+    submission actually claims.
+
+    Callers are REQUIRED to emit the audit escalation on the ``True`` branch
+    (see outcome (0) in the module docstring); a bypass that leaves no
+    operator-visible record is indistinguishable from no bypass at all.
 
     Use only when sure the task belongs to the submitting project.
     If unsure, escalate rather than risking a mis-filed task.

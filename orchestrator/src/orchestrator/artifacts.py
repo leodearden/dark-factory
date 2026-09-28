@@ -379,16 +379,21 @@ class TaskArtifacts:
         """Read the created_at timestamp stored at init time.
 
         Mirrors ``read_base_commit``'s shape, but is exception-tolerant for a
-        corrupt/unreadable metadata.json (returns ``None`` instead of
-        raising) so a runtime "started" lookup never raises.
+        corrupt/unreadable or malformed metadata.json (returns ``None``
+        instead of raising) so a runtime "started" lookup never raises.
         """
         meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return None
         try:
-            metadata = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
+            metadata = json.loads(meta_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning(
+                'Malformed metadata.json at %s: not an object', meta_path
+            )
             return None
         return metadata.get('created_at')
 
@@ -628,9 +633,10 @@ class TaskArtifacts:
 
         Returns a fresh default state ``{'amendment_rounds_total': 0,
         'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
-        and — mirroring ``read_created_at``'s fail-safe (:264-279) — logs a
-        warning and returns those same defaults on a corrupt/unreadable or
-        malformed file rather than raising.  A present-but-partial file is
+        and — in the same fail-safe spirit as ``read_created_at`` (:378-398),
+        though the two readers' exact exception coverage has since diverged —
+        logs a warning and returns those same defaults on a corrupt/unreadable
+        or malformed file rather than raising.  A present-but-partial file is
         merged over the defaults so all canonical keys are always exposed.
         """
         default = {
@@ -1645,7 +1651,8 @@ class TaskArtifacts:
         the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
         still-open fd, and BaseException-safe cleanup are all things a local
         copy would have to re-earn), and the consolidation is machine-enforced
-        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+        by ``TestNoRegrownAtomicWriters`` in
+        ``tests/scripts/test_atomic_write_regrowth.py``.
 
         ``append_iteration_log`` is deliberately NOT routed through here: it
         is genuinely append-only, and tmp+rename would turn an O(1) append

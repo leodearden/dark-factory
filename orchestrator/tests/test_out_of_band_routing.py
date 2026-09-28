@@ -247,6 +247,10 @@ _REVIEW_PHASE1 = VerifyResult(
 # a future grep-driven cleanup can tell a deliberate workaround from an accident.
 # Enforced, not merely documented: moving this root under a pytest path fails
 # 5 tests in this module with that ValueError (measured, task 3551).
+# This is THE sanctioned exception to the sandboxed-project_root invariant that
+# _orch_helpers.assert_sandboxed_project_root owns (task 3647) — which is why
+# that helper names this literal, and why a reader who greps the invariant lands
+# here rather than "fixing" a root that must stay outside tmp_path.
 _REVIEW_PROJECT_ROOT = Path('/tmp/dark-factory-review-nonpytest-root')
 
 

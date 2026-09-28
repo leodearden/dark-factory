@@ -28,7 +28,11 @@ def test_shape_orchestrators_picks_first_pid_and_basename_project():
     assert orch['pids'] == [482103, 482104]
     assert orch['project'] == 'dark-factory'
     assert orch['running'] is True
-    assert orch['summary']['total'] == 0
+    assert 'summary' not in orch, (
+        'nothing measures a task count on this path any more, so the shaper '
+        'must not project one — a fabricated all-zero summary would read as a '
+        f'measured "this orchestrator has no tasks": {orch}'
+    )
     assert 'current_task' not in orch
 
 
@@ -106,6 +110,75 @@ def test_shape_orchestrators_propagates_offline_marker():
     [orch] = body['ORCHESTRATORS']
     assert orch.get('offline') is True, f'expected offline=True in ORCHESTRATORS entry, got: {orch}'
     assert orch.get('error') == 'boom', f'expected error=boom in ORCHESTRATORS entry, got: {orch}'
+    assert orch.get('degraded') is False, (
+        'this fetch was attempted and demonstrably failed, so the root is '
+        'proven unreachable; reporting it as merely unmeasured understates a '
+        f'real outage, got: {orch}'
+    )
+
+
+def test_shape_orchestrators_projects_degraded():
+    """A root the budget starved reaches the wire as degraded, NOT as offline.
+
+    The pair matters, not either field alone: a degraded root's state is
+    UNKNOWN, while an offline root is proven down.  Collapsing them here would
+    re-merge on the wire what the raw entry keeps apart.  Discovery has set
+    neither flag since task 5587; the pair is the shaper's contract for any
+    caller that supplies it.
+    """
+    raw = [{
+        'pids': [7777],
+        'prd': '/home/leo/src/dark-factory/prd.md',
+        'label': 'dark-factory/main',
+        'project_root': '/home/leo/src/dark-factory',
+        'running': True,
+        'started': 'Mar18',
+        'last_update': None,
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+        'offline': False,
+        'degraded': True,
+        'error': (
+            'exceeded its 7.0s share of the 20.0s orchestrators budget; its '
+            'task tree is UNKNOWN for this render (not zero)'
+        ),
+    }]
+
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch.get('degraded') is True, f'expected degraded=True in ORCHESTRATORS entry, got: {orch}'
+    assert orch.get('offline') is False, (
+        'the budget expired before this root was measured; nothing proved it '
+        f'unreachable, and saying so sends an operator to a healthy service: {orch}'
+    )
+
+
+def test_shape_orchestrators_degraded_defaults_false_when_absent():
+    """An entry with no ``degraded`` key shapes to False, never a missing key.
+
+    Every wire entry must carry the field: the orchestrators tab reads
+    ``o.degraded`` directly, so a well-formed payload may never hand it
+    ``undefined``.
+    """
+    raw = [{
+        'pids': [2000],
+        'prd': None,
+        'label': 'proj',
+        'project_root': '/home/leo/src/proj',
+        'running': True,
+        'started': 'Mar18',
+        'last_update': None,
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+    }]
+
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch.get('degraded') is False, (
+        f'degraded must be present and False on every entry, got: {orch}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1118,7 @@ def test_shape_burndown_per_project_carries_parity_block():
     """Every per-project block carries compute_parity_alarm's four fields."""
     labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
     series = {
-        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
     body = redux_api.shape_burndown(series)
@@ -1072,7 +1145,7 @@ def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
     """
     labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
     series = {
-        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
     agg = redux_api.shape_burndown(series)['BURNDOWN']
@@ -1084,6 +1157,31 @@ def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
     # from one project beside a cap from another explains nothing.
     assert agg['parity_peak'] == 33
     assert agg['parity_cap'] == 24
+
+
+def test_shape_burndown_parity_ignores_a_series_with_no_split():
+    """The alarm reads the RAW series, never ``_with_split``'s census-filled copy.
+
+    The display block still fills the missing split with the census so the
+    stacked chart conserves, but that fill is not a live measurement and must
+    not be compared against the cap.
+    """
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'legacy': {
+            'labels': labels,
+            'done': [0, 0], 'blocked': [0, 0], 'pending': [0, 0],
+            'in_progress': [30, 30],
+            'concurrency_cap': [24, 24],
+        },
+    }
+    body = redux_api.shape_burndown(series)
+
+    legacy = body['BURNDOWN_BY_PROJECT']['legacy']
+    assert legacy['parity_alarm'] is False
+    assert legacy['parity_peak'] is None
+    assert legacy['in_progress_live'] == [30, 30]
+    assert body['BURNDOWN']['parity_alarm'] is False
 
 
 def test_shape_burndown_aggregate_parity_ignores_capless_projects():

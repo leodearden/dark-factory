@@ -190,12 +190,12 @@ Injectable ``now`` for deterministic tests.
 from __future__ import annotations
 
 import logging
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from shared.git_async import run_git
 from shared.task_claimant import has_live_claimant
 from shared.task_metadata import RoutingState
 
@@ -322,7 +322,7 @@ class WorkflowLiveness:
     worktree_stale: bool = False
 
 
-def detect_live_workflow(
+async def detect_live_workflow(
     task_id: str,
     project_root: str | Path,
     *,
@@ -336,6 +336,7 @@ def detect_live_workflow(
     pure_gate: bool | None = None,
     corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
+    worktree_index: Mapping[str, bool] | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
 
@@ -444,6 +445,21 @@ def detect_live_workflow(
             parameter is only for performance hoisting, not test isolation.
             Ignored when :func:`_orchestrator_signal_ineligible` returns True
             for the given *status*/*task_kind* pair.
+        worktree_index: Pre-computed ``{ref: prunable}`` map from
+            :func:`worktree_index_for`.  When provided, skips this call's
+            ``git worktree list --porcelain`` subprocess entirely — use this to
+            hoist the whole-repo worktree list out of a per-task loop (task
+            3778; it was ~20 s of a measured 29 s render).  Like
+            *_orchestrator_live* this parameter is for performance hoisting
+            only, not test isolation — tests monkeypatch the module attributes
+            directly.
+
+            THREE-VALUED, matching :func:`worktree_index_for`'s contract:
+            ``None`` (the default) means "unknown" and triggers this call's own
+            probe, so behaviour is byte-for-byte unchanged for callers that do
+            not pass it; ``{}`` means "known: the repo has no registered
+            worktrees" and suppresses the probe, yielding
+            ``worktree_registered=False``; a populated map is used directly.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -451,7 +467,10 @@ def detect_live_workflow(
     branch = f'{branch_prefix}{task_id}'
     root = str(project_root)
 
-    worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    if worktree_index is None:
+        worktree_present, worktree_prunable = await _check_worktree_registered(root, branch)
+    else:
+        worktree_present, worktree_prunable = _registration_from_index(worktree_index, branch)
     worktree_registered = worktree_present and not worktree_prunable
     # Hoisted once so the recent-commit and worktree-staleness age checks
     # (task 3947) share one instant, rather than risking a skew where the two
@@ -459,7 +478,7 @@ def detect_live_workflow(
     # already performs exactly this None-resolution internally, so passing
     # `reference` in here is behaviour-preserving.
     reference = now if now is not None else datetime.now(UTC)
-    last_commit_at, recent_commit = _check_recent_commit(
+    last_commit_at, recent_commit = await _check_recent_commit(
         root, branch, now=reference, max_commit_age_hours=max_commit_age_hours
     )
     # Single-shot memo for the branch's own-commit count (`git rev-list --count
@@ -468,9 +487,9 @@ def detect_live_workflow(
     # never runs more than once per detect_live_workflow invocation.
     _own_count: list[int | None] = []
 
-    def _own_commit_count() -> int | None:
+    async def _own_commit_count() -> int | None:
         if not _own_count:
-            _own_count.append(_branch_own_commit_count(root, base_branch, branch))
+            _own_count.append(await _branch_own_commit_count(root, base_branch, branch))
         return _own_count[0]
 
     # branch_bare: branch carries zero commits of its own beyond base_branch
@@ -491,7 +510,7 @@ def detect_live_workflow(
     if worktree_registered and not recent_commit:
         branch_bare = False
     else:
-        own_commit_count = _own_commit_count()
+        own_commit_count = await _own_commit_count()
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
 
@@ -507,7 +526,7 @@ def detect_live_workflow(
         and not recent_commit
         and _worktree_age_exceeded(last_commit_at, reference, max_worktree_age_hours)
     ):
-        own = _own_commit_count()
+        own = await _own_commit_count()
         # own is None: unknown count (missing branch, rev-list error/timeout,
         # unparseable output). own == 0: bare branch. Both fail safe to False
         # — an unknown or bare count is never positive evidence of staleness.
@@ -600,7 +619,7 @@ def detect_live_workflow(
     )
 
 
-def is_workflow_live_for_task(
+async def is_workflow_live_for_task(
     task_id: str,
     project_root: str | Path,
     **kwargs,
@@ -610,7 +629,8 @@ def is_workflow_live_for_task(
     Accepts the same keyword arguments as :func:`detect_live_workflow`,
     including the ``_orchestrator_live`` performance hint.
     """
-    return detect_live_workflow(task_id, project_root, **kwargs).is_live
+    liveness = await detect_live_workflow(task_id, project_root, **kwargs)
+    return liveness.is_live
 
 
 # ---------------------------------------------------------------------------
@@ -895,56 +915,182 @@ def _orchestrator_signal_ineligible(
     return branch_bare and not worktree_registered and not recent_commit
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
-    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+def parse_worktree_index(stdout: str) -> dict[str, bool]:
+    """Parse ``git worktree list --porcelain`` output into ``{ref: prunable}``.
 
-    Parses ``git -C <root> worktree list --porcelain`` output into
-    blank-line-delimited stanzas (one per registered worktree). ``registered``
-    is True iff some stanza contains a line equal to ``branch refs/heads/<branch>``;
-    ``prunable`` is True iff that SAME stanza also contains a line starting with
-    ``prunable`` — git's marker for a worktree whose directory has been removed
-    or reaped, but whose registration has not yet been pruned (reify#5245's
-    shape: a stale worktree entry survives after the directory itself is gone).
+    THE SINGLE HOME OF THE PORCELAIN GRAMMAR. Both the per-task probe
+    (:func:`_check_worktree_registered`) and the hoisted whole-repo index
+    (:func:`worktree_index_for`) are expressed on top of this function, so the
+    stanza/prunable semantics cannot drift between them.
 
-    Any subprocess error or unexpected output silently returns ``(False, False)``
-    (fail-safe).
+    The output is blank-line-delimited stanzas, one per registered worktree.
+    A stanza contributes an entry keyed on its ``branch <ref>`` line's ref
+    (e.g. ``refs/heads/task/4321``); the value is True iff that SAME stanza
+    also contains a line starting with ``prunable`` — git's marker for a
+    worktree whose directory has been removed or reaped but whose registration
+    has not yet been pruned (reify#5245's shape: a stale worktree entry
+    survives after the directory itself is gone). Detached-HEAD stanzas carry
+    no ``branch`` line and so contribute nothing.
+
+    Malformed, empty or blank-only input yields ``{}`` and never raises — this
+    is a pure text parse with no error channel of its own; I/O failures are
+    the caller's to classify (see :func:`worktree_index_for`, which is careful
+    to return ``None`` rather than ``{}`` for them).
 
     Note: git only started emitting the ``prunable`` porcelain annotation in
     git 2.36 (2022). On an older git binary, a reaped worktree's directory can
-    be gone yet no ``prunable`` line is ever produced, so ``prunable`` silently
+    be gone yet no ``prunable`` line is ever produced, so the value silently
     stays False and a reaped worktree keeps counting as registered — the same
     silent-degradation shape reify#5245 hardened against, just one layer down
     in the toolchain. If a stale/reaped-worktree false positive resists this
     fix, check ``git --version`` on the host running this detector first.
     """
+    index: dict[str, bool] = {}
+    for stanza in stdout.split('\n\n'):
+        lines = [line.strip() for line in stanza.splitlines()]
+        ref = next(
+            (line[len('branch '):] for line in lines if line.startswith('branch ')),
+            None,
+        )
+        if not ref:
+            continue
+        index[ref] = any(line.startswith('prunable') for line in lines)
+    return index
+
+
+async def worktree_index_for(project_root: str) -> dict[str, bool] | None:
+    """Run ``git worktree list --porcelain`` ONCE and return the parsed index.
+
+    This is the hoisting entry point for task 3778: the worktree list is
+    invariant across every task in a reconciliation render, but was being
+    re-run inside :func:`_check_worktree_registered` on every
+    :func:`detect_live_workflow` call. Measured on the dark_factory repo at
+    ~513 worktrees, that is ~40 ms x ~500 tasks ≈ 20 s of an observed 29 s
+    render — the dominant term of the event-loop stall this task fixes.
+
+    THREE-VALUED CONTRACT — the return type is load-bearing:
+
+    - ``None``  → *unknown*. The probe failed (I/O error, timeout, non-zero
+      rc). Callers must fall back to the per-task probe. Returning ``{}`` here
+      instead would report every task as ``worktree_registered=False`` from a
+      hoisted ERROR, turning a transient git glitch into a project-wide
+      "nothing is live" verdict — exactly the false negative the detector's
+      exemption rules exist to prevent.
+    - ``{}``    → *known empty*. The probe succeeded and the repo genuinely has
+      no registered worktrees. No per-task probe is needed. Collapsing this
+      into ``None`` would waste the entire hoist on the commonest cheap case.
+    - ``{...}`` → *known*. Use it directly.
+
+    EVERY ``None`` IS LOGGED AT WARNING, here rather than at the callers. All
+    three failure legs — a spawn ``OSError``, a non-zero rc, and a timeout
+    (which ``run_git`` RETURNS as ``timed_out=True`` with a non-zero rc rather
+    than raising) — converge on this one function, and it is the only place
+    that knows it is about to hand back the "unknown" sentinel. A caller's
+    ``except Exception`` can only see an UNEXPECTED exception, so leaving these
+    legs at DEBUG made the designed failures the silent ones: an unknown index
+    costs every probed task its own re-probe, up to
+    ``MAX_ACTIVE_TASKS_RENDERED`` of them at ``_GIT_TIMEOUT`` each, which is
+    exactly the invisible degradation task 3778 exists to end.
+
+    The REPETITION is diagnostic, not noise: N+1 of these lines in one render
+    means the hoist failed and all N per-task fallbacks re-paid the cost, which
+    is the shape an operator needs to see. :func:`worktree_index_kwargs` is the
+    wrapper both fan-out call sites use.
+    """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'worktree', 'list', '--porcelain'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.debug('live_workflow_detector: worktree list failed: %s', exc)
-        return False, False
+    except OSError as exc:
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: spawn failed for %s '
+            '(%s) — every probed task falls back to its own worktree list',
+            project_root, exc,
+        )
+        return None
 
     if result.returncode != 0:
-        logger.debug(
-            'live_workflow_detector: worktree list returned %d: %s',
-            result.returncode, result.stderr.strip(),
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: worktree list %s for '
+            '%s (rc=%d): %s — every probed task falls back to its own worktree list',
+            'TIMED OUT' if result.timed_out else 'returned non-zero',
+            project_root, result.returncode, result.stderr.strip(),
         )
+        return None
+
+    return parse_worktree_index(result.stdout)
+
+
+async def worktree_index_kwargs(project_root: str) -> dict[str, dict[str, bool]]:
+    """Return the ``detect_live_workflow`` kwargs carrying the hoisted index.
+
+    THE SINGLE HOME OF THE HOIST WIRING. A fan-out caller hoists the whole-repo
+    worktree list once and threads it into every per-task probe; doing that
+    correctly means honouring :func:`worktree_index_for`'s three-valued
+    contract, and spelling that out at each call site put one contract in two
+    places (task 3778 review). Both call sites are now a single splat::
+
+        liveness = await detect_live_workflow(
+            task_id, project_root, **await worktree_index_kwargs(project_root),
+        )
+
+    MIND THE TWO DIFFERENT ``{}``. This function's ``{}`` means *omit the
+    kwarg* — the index is unknown, so each task probes for itself exactly as it
+    did before the hoist existed. A known-empty repo is ``{'worktree_index':
+    {}}``, a real answer that suppresses the per-task probes. Collapsing the two
+    would either waste the hoist on the commonest cheap case or report every
+    task ``worktree_registered=False`` from a hoisted ERROR — see
+    :func:`worktree_index_for` for why that false negative is the one to avoid.
+
+    The fail-safe catch lives here so no caller can forget it: an unexpected
+    exception (anything :func:`worktree_index_for` does not already classify)
+    degrades to the per-task probe and is logged at WARNING with a traceback.
+    The three ANTICIPATED failures are already logged by
+    :func:`worktree_index_for` itself, so every path to "unknown" is loud
+    exactly once.
+    """
+    try:
+        index = await worktree_index_for(project_root)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: hoist raised for %s '
+            '— every probed task falls back to its own worktree list',
+            project_root, exc_info=True,
+        )
+        return {}
+    return {} if index is None else {'worktree_index': index}
+
+
+def _registration_from_index(index: Mapping[str, bool], branch: str) -> tuple[bool, bool]:
+    """Look *branch* up in a parsed worktree index, returning ``(registered, prunable)``."""
+    ref = f'refs/heads/{branch}'
+    if ref not in index:
         return False, False
-
-    target = f'branch refs/heads/{branch}'
-    for stanza in result.stdout.split('\n\n'):
-        lines = [line.strip() for line in stanza.splitlines()]
-        if target in lines:
-            prunable = any(line.startswith('prunable') for line in lines)
-            return True, prunable
-    return False, False
+    return True, index[ref]
 
 
-def _check_recent_commit(
+async def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+
+    Runs the porcelain probe for THIS branch alone and reads the answer out of
+    :func:`parse_worktree_index`. Any subprocess error or unexpected output
+    returns ``(False, False)`` (fail-safe) — note this deliberately differs from
+    :func:`worktree_index_for`, which distinguishes failure (``None``) from
+    emptiness; here the caller has no third state to express. The failure itself
+    is not silent: :func:`worktree_index_for` logs every ``None`` at WARNING.
+
+    Callers fanning this out across many tasks should hoist
+    :func:`worktree_index_kwargs` instead and splat it into
+    :func:`detect_live_workflow` — the whole point of task 3778.
+    """
+    index = await worktree_index_for(project_root)
+    if index is None:
+        return False, False
+    return _registration_from_index(index, branch)
+
+
+async def _check_recent_commit(
     project_root: str,
     branch: str,
     *,
@@ -958,13 +1104,11 @@ def _check_recent_commit(
     of *now* (or ``datetime.now(UTC)`` when *now* is ``None``).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'log', '-1', '--format=%cI', branch],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug('live_workflow_detector: git log failed for %s: %s', branch, exc)
         return None, False
 
@@ -1016,7 +1160,7 @@ def _worktree_age_exceeded(
     return reference - last_commit_at > timedelta(hours=max_worktree_age_hours)
 
 
-def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
+async def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
     """Return the number of commits *branch* carries beyond *base_branch*.
 
     Runs ``git -C <root> rev-list --count <base_branch>..<branch>``.  A result
@@ -1028,13 +1172,11 @@ def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -
     ``0``/bare by callers).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'rev-list', '--count', f'{base_branch}..{branch}'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug(
             'live_workflow_detector: rev-list failed for %s..%s: %s',
             base_branch, branch, exc,

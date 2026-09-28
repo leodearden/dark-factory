@@ -33,6 +33,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
@@ -47,6 +48,7 @@ from shared.task_statuses import TaskStatus
 from shared.transcript_archive import (
     archive_before_delete,
     archive_task_transcripts,
+    durable_archive_path,
     resolve_archive_root,
     restore_archived_transcript,
 )
@@ -423,6 +425,58 @@ class _McpLike(Protocol):
     def mcp_config_json(self, escalation_url: str | None = None) -> dict: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ResumeFailure:
+    """One armed resume that did not survive — ε's unit of evidence (task 3733).
+
+    Produced at :meth:`TaskWorkflow._invoke`'s ARM SEAM: the single place both
+    resume producers converge (the harness crash-recovery arm and the
+    in-workflow progress-timeout re-arm below) and the only place the archive
+    restore actually happens. The harness eligibility predicate cannot report
+    this — it runs a whole process-phase earlier and takes ``archive_available``
+    as a bool precisely so it acquires no filesystem dependency of its own.
+
+    Immutable and slotted: it is evidence, read later by the escalation
+    renderer, and nothing downstream has any business editing it.
+
+    ``stage`` is ``'pre_flight'`` (we corroborated before dispatch and the
+    transcript was not there) or ``'cli'`` (we armed ``--resume`` and the CLI
+    rejected the session anyway). ``restore`` carries the four-valued outcome
+    the pre_flight arm block produced and is ``None`` at the cli stage — the
+    restore ran a phase earlier and is not what failed there, which is why
+    every cli rejection is genuine by construction.
+    ``archive_root``/``archive_path`` are best-effort: ``None`` means the
+    lookup faulted or was never reached, and the renderer says "none located"
+    rather than implying an archive was checked and found empty.
+    """
+
+    task_id: str
+    session_id: str
+    role: str
+    stage: str
+    restore: str | None
+    archive_root: str | None
+    archive_path: str | None
+    detail: str | None
+
+
+class ResumeOutcomeSink(Protocol):
+    """Who listens to those reports (task ε/3733).
+
+    Implemented by ``orchestrator.harness.Harness``, which classifies each
+    report against its by-design carve-outs and runs the INV-4 storm streak.
+    The workflow REPORTS; the harness CLASSIFIES — so no policy about what
+    counts as by-design lives on the dispatch path.
+
+    TWO NAMED METHODS rather than one callback taking an outcome
+    discriminator: each has a single well-defined purpose, with no boolean flag
+    and no optional-field soup on a payload shared between two questions.
+    """
+
+    def note_resume_failed(self, report: ResumeFailure) -> None: ...
+    def note_resume_succeeded(self) -> None: ...
+
+
 class _BriefingLike(Protocol):
     async def build_architect_prompt(
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
@@ -438,12 +492,12 @@ class _BriefingLike(Protocol):
         worktree: Path | None = ...,
     ) -> str: ...
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = ...,
+        self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
-        self, plan: dict, iteration_log: list[dict],
+        self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
     ) -> str: ...
@@ -1181,6 +1235,7 @@ class TaskWorkflow:
         *,
         run_id: str | None = None,
         prompt_store: PromptArtifactStore | None = None,
+        resume_outcome_sink: ResumeOutcomeSink | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1201,6 +1256,11 @@ class TaskWorkflow:
         # _resolve_role_system_prompt (production — mirrors TaskCurator's
         # _prompt_store / _resolve_curator_prompt).
         self._prompt_store = prompt_store
+        # ε (task 3733): who hears about every armed resume that failed — the
+        # production Harness, whose streak escalates a RUN of them. Optional and
+        # None by default, so the eval dispatch path acquires no streak and no
+        # escalation queue and stays byte-identical.
+        self.resume_outcome_sink = resume_outcome_sink
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -1458,6 +1518,57 @@ class TaskWorkflow:
         # Background asyncio.Task running _claimant_heartbeat_loop, started
         # right after the dispatch stamp and cancelled in run()'s finally.
         self._claimant_heartbeat_task: asyncio.Task | None = None
+
+    @property
+    def _filing_claimant_run_id(self) -> str:
+        """This incarnation's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        ONLY while the incarnation that FILED it lives, and liveness is judged
+        by comparing this value WHOLE against the live claimant.  That live
+        claimant is read from the ``claimant_run_id`` DB column, so this
+        property is also the SINGLE expression composing that column's value
+        — :meth:`_setup_worktree_and_artifacts`'s dispatch stamp routes
+        through it.  Two copies could drift, and a drifted filing identity
+        classifies a genuinely LIVE filer's own L0 as ``dead_l0``, the unsafe
+        direction.  Byte-identical by construction is the only guarantee
+        strong enough for an exact-string rule.
+
+        KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP, a
+        task 3563 follow-up): ``or ''`` means a HARNESS-LESS workflow
+        (``_process_run_id is None`` — tests/evals, see the field comment at
+        its declaration) composes the PARTIAL identity
+        ``'/{session_id}/pid={pid}'``.  That string carries the ``/pid=``
+        marker, so it passes ``escalation.pins._norm_id``'s shape guard and is
+        then compared whole as if it were KNOWN.  The ``plan.lock`` writer
+        deliberately does the OPPOSITE — it omits the key entirely when the
+        run id is unknown, so ``TaskGroundTruth`` resolves a fail-safe
+        ``None`` (see the :meth:`Artifacts.lock_plan` call site and the
+        ``Claimant`` docstring), and ``Harness._filing_claimant_run_id``
+        makes that same choice because it has no DB counterpart to match.
+        Task 3563 landed while deliberately leaving THIS side alone, so the
+        asymmetry is ratified and owned elsewhere.  Normalising it is the
+        follow-up's job; do not "fix" it by changing the plan.lock side to
+        match, and do not change it here — this side must keep matching the
+        DB stamp it composes.
+
+        Both components are read via ``getattr`` because this sits on the
+        ESCALATION-FILING path, which ``object.__new__(TaskWorkflow)`` test
+        fixtures reach while setting only the handful of attributes their
+        methods touch (see ``tests/test_workflow_sandbox_refusal.py``).  This
+        does NOT weaken the byte-identity guarantee above — the dispatch stamp
+        routes through this same property, so the two cannot diverge whatever
+        the attributes hold.  Nor does it widen the hazard: a MISSING
+        attribute and a declared-but-``None`` one are the same statement (the
+        component is unknown), which the ratified ``or ''`` already maps to an
+        empty component.
+        """
+        return compose_claimant_run_id(
+            getattr(self, '_process_run_id', None) or '',
+            getattr(self, 'session_id', None) or '',
+            os.getpid(),
+        )
 
     @property
     def state(self) -> WorkflowState:
@@ -2299,23 +2410,15 @@ class TaskWorkflow:
         # claimant atomically with the dispatch status write, so there is no
         # window where the task is in-progress with no live claimant.
         #
-        # KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP,
-        # a task 3563 follow-up): `or ''` means a HARNESS-LESS workflow
-        # (`_process_run_id is None` — tests/evals, see the field comment at
-        # its declaration) stamps the PARTIAL identity '/{session_id}/pid={pid}'.
-        # That string carries the '/pid=' marker, so it passes
-        # escalation.pins._norm_id's shape guard and is then compared whole
-        # against filing identities as if it were KNOWN. The plan.lock writer
-        # below deliberately does the OPPOSITE — it omits the key entirely when
-        # the run id is unknown, so TaskGroundTruth resolves a fail-safe None
-        # (see the lock_plan call site and the Claimant docstring). Normalising
-        # THIS side is the follow-up's job; do not "fix" it by changing the
-        # plan.lock side to match.
+        # Composed via `_filing_claimant_run_id` (task 3550), which is the ONE
+        # expression producing this workflow's identity — the same value every
+        # Escalation this incarnation files carries. `escalation.pins` Link 4
+        # compares the two WHOLE, so they must not be able to drift; the
+        # property's docstring also carries the `or ''` KNOWN HAZARD note that
+        # used to live here.
         await self.scheduler.set_task_status(
             self.task_id, 'in-progress',
-            claimant_run_id=compose_claimant_run_id(
-                self._process_run_id or '', self.session_id, os.getpid(),
-            ),
+            claimant_run_id=self._filing_claimant_run_id,
             heartbeat_at=datetime.now(UTC).isoformat(),
         )
         self._claimant_heartbeat_task = asyncio.create_task(
@@ -3413,12 +3516,18 @@ class TaskWorkflow:
 
         A HEAD match alone is NOT sufficient (task 3024): it proves only that
         the branch has not MOVED, not that it still MERGES. Main advancing
-        underneath an unchanged branch can introduce a rebase conflict, and the
-        fast-path would then hand an empty ``plan.files`` workflow to the merge
-        phase — tripping the merge-entry scope invariant on every dispatch, in a
-        loop no escalation action could break. So the resume preconditions also
-        require that the branch STILL cleanly merges onto current main, probed
-        object-store-only via :meth:`GitOps.merge_tree_conflicts`.
+        underneath an unchanged branch can introduce a rebase conflict, so the
+        resume preconditions also require that the branch STILL cleanly merges
+        onto current main, probed object-store-only via
+        :meth:`GitOps.merge_tree_conflicts`.
+
+        Task 3024 justified that probe by the empty-``plan.files`` merge-entry
+        loop, on the theory that a conflict was what emptied it. That was a
+        MISDIAGNOSIS (esc-3388-9): ``plan.files`` was empty on this path
+        unconditionally, because the fast path skips every ``read_plan()`` call
+        site and so left ``self.plan`` at its ``__init__`` default. The plan is
+        now read below, which is what actually closes that loop; the probe is
+        retained on its own independent merit.
 
         Fail-safe fall-through to the full pipeline (returns ``None``) on a
         missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, a
@@ -3496,10 +3605,48 @@ class TaskWorkflow:
             )
             await self._clear_merge_retry_pending()
             return None
+        # Populate self.plan BEFORE jumping to the merge phase (esc-3388-9).
+        # This path skips plan/execute/verify/review, and every
+        # ``self.plan = self.artifacts.read_plan()`` call site lives in the
+        # pipeline it skips — the first is in :meth:`_drive` just BELOW the
+        # call to this method.  So without this read ``self.plan`` is still
+        # the ``__init__`` default ``{}``, and :meth:`_check_scope_invariant`
+        # at merge entry sees an EMPTY plan.files against a non-empty
+        # metadata.files: the task-3429 "an empty plan cannot be verified as
+        # a safe metadata.files superset" arm, which files a blocking L0.
+        # That fired on EVERY dispatch through this fast path — the exact
+        # "loop no escalation action could break" the docstring above warns
+        # about, since resolving the L0 via `resume` re-stamps
+        # merge_retry_pending and lands right back here.
+        #
+        # Task 3024 added the merge_tree_conflicts probe above believing a
+        # rebase conflict was what emptied plan.files.  It is not: plan.files
+        # was empty on this path whether or not the branch conflicted,
+        # because nothing ever read the plan.  The probe is still correct and
+        # is retained on its own merits (a stale obligation must not merge a
+        # branch that no longer applies); it just never addressed this.
+        plan = self.artifacts.read_plan() if self.artifacts is not None else {}
+        if not plan.get('files'):
+            # Nothing to verify the merge-entry scope invariant against, so
+            # honouring the fast path would trip it and re-enter the loop
+            # above.  Void the obligation and take the full pipeline, which
+            # re-plans and regenerates plan.json.  Mirrors the
+            # confirmed-conflict arm: an obligation that can never be
+            # satisfied as stamped is cleared rather than preserved.
+            logger.warning(
+                'Task %s: merge_retry_pending HEAD match (%s) but the plan has '
+                'no files (artifacts root=%s) — cannot verify the merge-entry '
+                'scope invariant, clearing stamp and running full pipeline',
+                self.task_id, current_head,
+                self.artifacts.root if self.artifacts is not None else None,
+            )
+            await self._clear_merge_retry_pending()
+            return None
+        self.plan = plan
         logger.info(
             'Task %s: merge_retry_pending HEAD match (%s) — resuming straight to '
-            'merge phase, skipping plan/execute/verify/review',
-            self.task_id, current_head,
+            'merge phase, skipping plan/execute/verify/review (plan.files=%s)',
+            self.task_id, current_head, plan.get('files'),
         )
         await self._clear_merge_retry_pending()
         return await self._merge_and_finalise(branch_name)
@@ -4354,14 +4501,98 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.REQUEUED
 
+    async def _requeue_on_server_error(self, result: AgentResult) -> WorkflowOutcome:
+        """Requeue a zero-output execute iteration attributed to a provider
+        5xx (PRD `plans/server-side-api-error-handling-prd.md` task γ,
+        contract C2 requeue-not-block invariant).
+
+        Called from ``_execute_iterations``'s zero-output branch BEFORE
+        ``consecutive_zero_output`` increments (the guard sits at the very
+        top of that branch) — so this class of result never touches the
+        zero-output wedge breaker. A watchdog SIGTERM kill flushes the CLI's
+        result JSON with ``api_error_status`` set, and ``is_zero_output_timeout``
+        is shape-only (PRD decision 2: ``timed_out`` + ``transcript_turns==0``,
+        consulting neither status nor subtype) — so without this guard a
+        provider outage is indistinguishable from a genuine local wedge and
+        eventually trips the breaker into a `blocked`/L0/steward chain
+        (2026-07-29 incident). Exits on the FIRST occurrence rather than
+        retrying in-loop: in-loop retries have no pacing, and the scheduler's
+        transient-requeue lane already owns cooldown/counters/cap (PRD
+        decisions 3 and 6) — so this method's only job is to get the row back
+        onto the queue with the right evidence attached, not to retry it here.
+
+        Exits via :meth:`_repend_for_requeue` so the REQUEUED return is
+        TRUTHFUL (the row is written ``pending`` before the harness slot is
+        released). A terminal row observed out-of-band during that write is
+        returned INSTEAD of REQUEUED — but the two terminals then diverge at
+        the caller, so neither reading generalises: a ``cancelled`` row wins
+        over the requeue intent and ends the dispatch, while a ``done`` row is
+        returned as DONE, which :meth:`_execute_verify_review_loop`
+        deliberately reads with its ordinary ``_execute_iterations`` meaning
+        (execution finished, continue to VERIFY) rather than as a terminal
+        exit.
+        """
+        cls = classify_agent_failure(result)
+        # Compose the `agent API error: HTTP <status>` marker into the reason
+        # UNCONDITIONALLY rather than trusting cls.summary to lead with it.
+        # The entry guard here (`is_server_error_status`, mandated by this
+        # task's sidecar delivered_check) and the summary producer
+        # (`shared/cli_invoke.py::classify_agent_failure`) are different
+        # predicates and can in principle disagree, in which case cls.summary
+        # would describe this requeue as a "wedge" while this guard classified
+        # it as a provider outage. Compose unconditionally so the reason never
+        # describes a provider outage as a wedge: the marker is what the
+        # legacy fallback in scheduler.is_transient_api_requeue, and every
+        # operator-facing block-reason reader, keys on. Which rules of that
+        # ladder defer, and why, is deliberately NOT restated here — the
+        # ladder is owned and enumerated by its own docstring, and a copy on
+        # this side would go stale on the next reorder with nothing to catch
+        # it. No divergence is production-reachable today, so this is a
+        # DEFENSIVE invariant, not a live bug fix; its authority is this
+        # task's own contract ("the marker in the reason"). The structured
+        # api_error_status field routes correctly either way (INV-1).
+        marker = f'agent API error: HTTP {result.api_error_status}'
+        summary = cls.summary if marker in cls.summary else f'{marker} — {cls.summary}'
+        reason = f'Execution failed: {summary}'
+        detail = (
+            f'iteration={self.metrics.execute_iterations} '
+            f'api_error_status={result.api_error_status} '
+            f'policy=transient-requeue (exit-on-first, no in-loop retry — PRD '
+            f'decisions 3 and 6)\n'
+            f'{cls.diagnostic_detail}'
+        )
+        logger.warning(
+            'Task %s: server-side API error (HTTP %s) on execute iteration %s — '
+            'requeueing (transient, exit-on-first)',
+            self.task_id, result.api_error_status, self.metrics.execute_iterations,
+        )
+
+        repend_outcome = await self._repend_for_requeue()
+        if repend_outcome is not None:
+            return repend_outcome
+
+        self._terminal_report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason=reason,
+            phase=self.machine.state,
+            detail=detail,
+            category=None,
+            # No BLOCKED transition on this path — blocked_from_phase mirrors
+            # the current (working) phase, same as _requeue_on_lock_conflict.
+            blocked_from_phase=self.machine.state,
+            api_error_status=result.api_error_status,
+        )
+        return WorkflowOutcome.REQUEUED
+
     async def _repend_for_requeue(self) -> WorkflowOutcome | None:
         """Write ``pending`` so a REQUEUED exit is TRUTHFUL, returning a terminal
         override outcome when the row turns out to be terminal, else ``None``.
 
-        The single choke point for the two SLOT-EXITING requeue paths that
+        The single choke point for the three SLOT-EXITING requeue paths that
         historically returned ``WorkflowOutcome.REQUEUED`` with NO status
-        write — ``_drive()``'s ``except WarmLaneRequeue`` clause and
-        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6).
+        write — ``_drive()``'s ``except WarmLaneRequeue`` clause,
+        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6), and
+        ``_requeue_on_server_error`` (PRD γ / task 3316, contract C2).
         Leaving the row ``in-progress`` there is not merely imprecise: the
         harness's slot ``finally`` nulls the claimant immediately afterwards,
         producing exactly the ``(in-progress, NULL claimant)`` shape
@@ -4374,7 +4605,7 @@ class TaskWorkflow:
         already used by ``_plan()``'s plan-lock requeue and the
         blocking-dependency requeue.
 
-        SCOPE — "two" is a claim about SLOT EXITS, not about the literal
+        SCOPE — "three" is a claim about SLOT EXITS, not about the literal
         ``return WorkflowOutcome.REQUEUED`` population, which is larger.  The
         membership test is "does this return hand control back to the harness,
         so the slot ``finally`` nulls the claimant next?".  The other REQUEUED
@@ -7242,6 +7473,7 @@ class TaskWorkflow:
                 ),
                 suggested_action='manual_intervention',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -7467,6 +7699,25 @@ class TaskWorkflow:
             exec_outcome = await self._execute_iterations()
             if exec_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
+            # REQUEUED: the 5xx-attributed transient exit (PRD γ / contract
+            # C2). _requeue_on_server_error has already re-pended the row to
+            # 'pending' and stashed the TerminalReport, so this hands control
+            # straight back to _drive's `if outcome != DONE: return outcome`
+            # tail — VERIFY must not run against a task that is already going
+            # back on the queue under a released claim.
+            if exec_outcome == WorkflowOutcome.REQUEUED:
+                return WorkflowOutcome.REQUEUED
+            # CANCELLED: _repend_for_requeue's terminal-override arm (the row
+            # was cancelled out-of-band while we held the slot).
+            # _observed_terminal_outcome has already moved the machine to
+            # WorkflowState.CANCELLED; running VERIFY would be work against a
+            # cancelled task. A 'done' terminal-override deliberately keeps
+            # today's DONE semantics instead (falls through to
+            # VERIFY → REVIEW → MERGE, where the existing already-merged /
+            # recovery guards adjudicate it) — no new done-legitimacy policy
+            # is introduced on a requeue path.
+            if exec_outcome == WorkflowOutcome.CANCELLED:
+                return WorkflowOutcome.CANCELLED
             if exec_outcome == WorkflowOutcome.BLOCKED:
                 # Zero-output hang: use the distinct infra_issue reason instead
                 # of the generic 'Execution iterations exhausted' so the escalation
@@ -8193,7 +8444,7 @@ class TaskWorkflow:
             }
 
             prompt = await self.briefing.build_implementer_prompt(
-                self.plan, iteration_log, rebase_notice=rebase_notice,
+                self.plan, rebase_notice=rebase_notice,
                 task_id=self.task_id, wip_notice=wip_notice,
             )
             pre_head = await self._get_head_commit()
@@ -8269,6 +8520,25 @@ class TaskWorkflow:
             # the CLI never started real work.  Retrying identically burns time
             # (~20 min/iteration × threshold) with no chance of progress.
             if is_zero_output_timeout(result):
+                # A watchdog SIGTERM kill flushes the CLI's result JSON with
+                # api_error_status set BEFORE the wall-clock timeout is
+                # distinguished from a genuine pre-first-token wedge — and
+                # is_zero_output_timeout is shape-only (timed_out +
+                # transcript_turns==0), consulting neither status nor
+                # subtype, so a provider outage satisfies it exactly like a
+                # real wedge.  A genuine local wedge carries NO HTTP status
+                # (api_error_status is None), so this guard exits BEFORE the
+                # counter increment below — the class never touches the
+                # wedge breaker — and requeues on the FIRST occurrence
+                # (PRD `plans/server-side-api-error-handling-prd.md` task γ,
+                # contract C2; decisions 3 and 6: in-loop retries have no
+                # pacing, and blocked for this class is reachable only via
+                # transient-cap exhaust in the scheduler).  2026-07-29
+                # incident: an unclassified 5xx fed this breaker and produced
+                # a blocked/L0/steward storm.
+                if is_server_error_status(result.api_error_status):
+                    self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
+                    return await self._requeue_on_server_error(result)
                 consecutive_zero_output += 1
                 # Capture forensic evidence for every zero-output timeout (best-effort;
                 # the helper suppresses all I/O errors internally).
@@ -8966,6 +9236,7 @@ class TaskWorkflow:
             suggested_action='verify_wip_reconciliation',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -10389,13 +10660,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         assert self.worktree is not None and self.artifacts is not None
 
         self.plan = self.artifacts.read_plan()
-        iteration_log, corrupted = self.artifacts.read_iteration_log()
+        # Read for the corruption signal alone — the amender prompt no longer
+        # renders iteration history (task 5744), and this is the only place
+        # that would notice a corrupt log before the pass runs.
+        _entries, corrupted = self.artifacts.read_iteration_log()
         if corrupted:
             self._escalate_corruption(corrupted)
 
         prompt = await self.briefing.build_amender_prompt(
             plan=self.plan,
-            iteration_log=iteration_log,
             suggestions=in_scope,
             locked_modules=list(self.modules),
             task_id=self.task_id,
@@ -11252,6 +11525,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 suggested_action='main_health_auto_heal_in_flight',
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             if fp:
                 esc.dedupe_fingerprint = fp
@@ -12093,6 +12367,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                     level=1,
                     train_state=train_state,  # type: ignore[arg-type]
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self.escalation_queue.submit(esc)
                 logger.warning(
@@ -12293,6 +12568,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
             train_state=train_state,  # type: ignore[arg-type]
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._submit_halt_owning_escalation(esc)
         logger.info(
@@ -12350,6 +12626,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 train_state=train_state,  # type: ignore[arg-type]
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -12394,6 +12671,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
@@ -12438,6 +12716,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
@@ -12807,6 +13086,69 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             harness_version=role.prompt_harness_version,
         ).text
 
+    def _report_resume_failed(
+        self, *, stage: str, session_id: str, role_name: str,
+        restore: str | None, archive_root: Path | None, detail: str | None,
+    ) -> None:
+        """Hand one failed armed resume to the sink (task ε/3733).
+
+        Built from the SAME values the ``session_resume_failed`` event beside
+        each call site carries, so the runs.db row an operator queries and the
+        escalation they are paged by cannot disagree (the rationale
+        ``Harness._on_archival_failure`` records for its own shared payload).
+
+        The archive path is looked up through ``durable_archive_path`` — the
+        sanctioned SOLE session-id-keyed locator (PRD §8 contract I-E), total
+        by its own contract — rather than by growing a second glob that would
+        have to agree with it forever. A ``None`` *archive_root* (the root
+        composition itself faulted, or no restore was attempted) yields a
+        ``None`` path rather than a guess.
+
+        Best-effort and total: instrumentation runs on the production dispatch
+        path and must never be the thing that costs a dispatch.
+        """
+        sink = self.resume_outcome_sink
+        if sink is None:
+            return
+        try:
+            archive_path = (
+                durable_archive_path(archive_root, str(self.task_id), session_id)
+                if archive_root is not None else None
+            )
+            sink.note_resume_failed(ResumeFailure(
+                task_id=str(self.task_id),
+                session_id=str(session_id),
+                role=role_name,
+                stage=stage,
+                restore=restore,
+                archive_root=str(archive_root) if archive_root is not None else None,
+                archive_path=str(archive_path) if archive_path is not None else None,
+                detail=detail,
+            ))
+        except Exception:
+            logger.warning(
+                'Task %s: failed to report a lost resume of session %s to the '
+                'resume-outcome sink', self.task_id, session_id, exc_info=True,
+            )
+
+    def _report_resume_succeeded(self) -> None:
+        """Tell the sink an adopted resume SURVIVED (task ε/3733).
+
+        What makes the storm streak a circuit breaker rather than a rolling
+        burst count: one working resume proves the systematic cause is not
+        present and retires the run. Total, for the same reason as above.
+        """
+        sink = self.resume_outcome_sink
+        if sink is None:
+            return
+        try:
+            sink.note_resume_succeeded()
+        except Exception:
+            logger.warning(
+                'Task %s: failed to report a surviving resume to the '
+                'resume-outcome sink', self.task_id, exc_info=True,
+            )
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -13025,6 +13367,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             #                 follows) — emitted rather than assumed away, so
             #                 that if it ever does happen it is countable.
             restore_outcome = 'disabled'
+            # Bound up front so the ε report below can read them on EVERY path
+            # (task 3733). When `resolve_archive_root` itself raises, the name
+            # is otherwise never bound at all, and "the root composition
+            # faulted" and "an archive was located" must not be the same
+            # unreadable state to the operator.
+            archive_root: Path | None = None
+            restore_detail: str | None = None
             if (
                 self.config.session_resume.restore_from_archive
                 and self._config_dir is not None
@@ -13071,6 +13420,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # dispatch fresh — a broken restore costs context, never a
                     # dispatch.
                     restore_outcome = 'fault'
+                    restore_detail = f'{type(exc).__name__}: {exc}'
                     # Names the whole rehydration, not just the archive-root
                     # composition: with strict=True the restore's own I/O
                     # faults land here too, and are in fact the majority of
@@ -13105,7 +13455,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
             # RE-CORROBORATE against the config dir we are about to USE.
             #
-            # The harness eligibility guard (_session_resume_eligible) checks a
+            # The harness eligibility guard (_session_resume_reasons) checks a
             # BOOT-TIME snapshot path — the config dir that existed when
             # recovery ran.  self._config_dir is constructed fresh (see
             # _setup_worktree) from whatever lane was acquired AFTERWARDS, and
@@ -13180,6 +13530,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             'restore': restore_outcome,
                         },
                     )
+                # …and feed INV-4's streak (task ε/3733). Deliberately NOT
+                # inside the event-store guard: the escalation is a different
+                # consumer of the same fact, and a dispatch with no event store
+                # (evals, several suites) must not silently lose the alarm.
+                self._report_resume_failed(
+                    stage='pre_flight',
+                    session_id=vetoed_session_id,
+                    role_name=role.name,
+                    restore=restore_outcome,
+                    archive_root=archive_root,
+                    detail=restore_detail or (
+                        'no transcript for this session under the config dir '
+                        'the CLI resolves --resume against'
+                    ),
+                )
         else:
             session_id_val = str(uuid.uuid4())
             resume_count_to_write = 0
@@ -13385,7 +13750,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # push it above 1. resume_session_id is non-None iff the arm site above
         # corroborated and adopted, which is that predicate exactly.
         resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
-        if resume_fallbacks and resume_session_id and self.event_store:
+        if resume_fallbacks and resume_session_id:
             # …and name the session actually LOST, which session_id_val often
             # is not: cli_invoke's _reset_for_fresh_retry regenerates the
             # pre-allocated id, and a cap re-arm replaces the armed id with
@@ -13398,20 +13763,40 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 str(s) for s in
                 (getattr(result, 'resume_fallback_session_ids', ()) or ())
             ]
-            self.event_store.emit(
-                EventType.session_resume_failed,
-                task_id=self.task_id,
-                data={
-                    'stage': 'cli',
-                    'session_id': (
-                        lost_session_ids[0] if lost_session_ids
-                        else resume_session_id
-                    ),
-                    'session_ids': lost_session_ids,
-                    'role': role.name,
-                    'fallbacks': resume_fallbacks,
-                },
+            lost_session_id = (
+                lost_session_ids[0] if lost_session_ids else resume_session_id
             )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.session_resume_failed,
+                    task_id=self.task_id,
+                    data={
+                        'stage': 'cli',
+                        'session_id': lost_session_id,
+                        'session_ids': lost_session_ids,
+                        'role': role.name,
+                        'fallbacks': resume_fallbacks,
+                    },
+                )
+            # Genuine by construction (task ε/3733): the restore ran a phase
+            # earlier and is not what failed here, so the report carries no
+            # restore outcome and the harness cannot carve it out.
+            self._report_resume_failed(
+                stage='cli',
+                session_id=lost_session_id,
+                role_name=role.name,
+                restore=None,
+                archive_root=archive_root,
+                detail=(
+                    f'the CLI rejected the armed session and retried fresh '
+                    f'({resume_fallbacks} fallback(s))'
+                ),
+            )
+        elif resume_session_id:
+            # Adopted AND survived — the reset half of the circuit breaker.
+            # `resume_session_id` is non-None iff the arm site corroborated and
+            # adopted, so this is exactly "a resume we DECIDED to make worked".
+            self._report_resume_succeeded()
 
         # Record the last successfully-completed role (updated only on success,
         # mirrors the cost-accumulation path below — failed/raised invocations
@@ -14733,6 +15118,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -14822,6 +15208,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='install_sandbox_backend_or_set_backend_none',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15139,6 +15526,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15174,6 +15562,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_log_corruption',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -15334,6 +15723,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(l1)
             if self.event_store:
@@ -15668,6 +16058,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     suggested_action=suggested_action,
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 if dedupe_fingerprint:
                     # Cross-task N->1 dedup: stamp the fingerprint and route
@@ -15840,9 +16231,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     #     already-merged task.  Escalation.filing_claimant_run_id
                     #     is the field that would make a real
                     #     filed-by-this-incarnation predicate possible, but it
-                    #     is stamped only in tests today, never on a
-                    #     production filing path; stamping it is the
-                    #     principled follow-up.
+                    #     is now stamped on every production filing path
+                    #     (task 3550: TaskWorkflow, Harness, and the
+                    #     escalate_blocker/escalate_info chokepoint).  This
+                    #     sweep's dismissal set is nonetheless STILL
+                    #     deliberately unchanged — narrowing it to a real
+                    #     filed-by-this-incarnation predicate is a behaviour
+                    #     change owned by task 3541, not by the task that
+                    #     merely populated the field.
                     # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
                     #     each of them has an L1 open by construction, so
                     #     dismissing a stray L0 there is deliberate
@@ -16140,6 +16536,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             level=1,
             train_state=train_state,
             root_cause=root_cause,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16582,6 +16979,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='triage_suggestions',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16621,6 +17019,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -17223,6 +17622,7 @@ def build_workflow(
     cancel_event: asyncio.Event | None = None,
     resume_session_id: dict | None = None,
     run_id: str | None = None,
+    resume_outcome_sink: ResumeOutcomeSink | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -17257,4 +17657,5 @@ def build_workflow(
         cancel_event=cancel_event,
         resume_session_id=resume_session_id,
         run_id=run_id,
+        resume_outcome_sink=resume_outcome_sink,
     )

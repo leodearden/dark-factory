@@ -1053,8 +1053,9 @@ class TestPostRebaseVerifyFailure:
             verify_call += 1
             # First verify: in-worktree (pass).
             # Second verify: post-rebase (fail) — workflow should still proceed.
-            # Third+ verify: merge queue's own verification (pass).
-            if verify_call <= 1 or verify_call >= 3:
+            # The merge queue runs its own verify through conftest's autouse
+            # passed=True stub and never reaches this function.
+            if verify_call <= 1:
                 return VerifyResult(
                     passed=True, test_output='OK', lint_output='',
                     type_output='', summary='All checks passed',
@@ -1066,10 +1067,16 @@ class TestPostRebaseVerifyFailure:
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
-        monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
         outcome = (await workflow.run()).outcome
 
+        assert verify_call == 2, (
+            'expected exactly the in-worktree + post-rebase verifies through '
+            f'orchestrator.workflow.run_scoped_verification; got {verify_call}. '
+            'A third call means the merge queue no longer runs its own verify '
+            'through conftest, and this stub is now failing a verify it never '
+            'meant to judge.'
+        )
         # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
 
@@ -2387,13 +2394,6 @@ class TestWipRecoveryNoAdvance:
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
-            AsyncMock(return_value=VerifyResult(
-                passed=True, test_output='OK', lint_output='',
-                type_output='', summary='All checks passed',
-            )),
-        )
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='OK', lint_output='',
                 type_output='', summary='All checks passed',

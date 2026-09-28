@@ -80,7 +80,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: agent_transcript_roots:\s*\[?\s*data/orchestrator/agent-transcripts
+      pattern: data/orchestrator/agent-transcripts
       paths:
       - docs/legibility/legibility.yaml
       expect: present

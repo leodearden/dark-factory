@@ -7,62 +7,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load prune_recon_cycle_summaries.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    mod_name = 'prune_recon_cycle_summaries'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='prune_recon_cycle_summaries')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    scans (task 4127). That probe touches the real filesystem, so without this
-    fixture every ``--apply`` test would pass or fail according to whether the
-    machine running pytest happens to be able to write mem0's history
-    directory -- and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (a
-    MagicMock memory service, no live Qdrant), so the environment must not be
-    an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scans (task
+    4127). This suite is deliberately MOCK-unit (a MagicMock memory service, no
+    live Qdrant). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test
+    -- to refuse, to record, or to pass -- so the guard's own behaviour is
+    still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -1006,50 +978,16 @@ class TestRunApplyStoreMutationPreflight:
     def _known_map(self, pid='dark_factory') -> dict:
         return {pid: '/some/path'}
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- the refusal exits the
-        interpreter as an uncaught traceback -- so this ERROR record is the
-        ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'prune_recon_cycle_summaries'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory=memory,
@@ -1064,7 +1002,7 @@ class TestRunApplyStoreMutationPreflight:
         ``scroll_by_metadata`` plus a conditional ``count_by_metadata`` PER
         PROJECT, and ``--project-id`` is optional, so the wasted work would
         otherwise scale with the size of the project registry."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1080,7 +1018,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the prune report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         report = await _mod.run(
@@ -1140,7 +1078,7 @@ class TestRunApplyStoreMutationPreflight:
         Rigged so the scan WOULD abort: an empty scroll against a non-zero
         ground-truth count is the under-count case.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory([])
         memory.mem0.count_by_metadata = AsyncMock(return_value=7)
 
@@ -1164,7 +1102,7 @@ class TestRunApplyStoreMutationPreflight:
         Note ``--yes-i-am-sure`` is NOT a dry-run switch -- it only overrides
         this cap -- so it must not affect the preflight either way.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1189,7 +1127,7 @@ class TestRunApplyStoreMutationPreflight:
         that ``run`` raises leaves the swallowed-on-the-way-out case -- the one
         that would read as a successful prune -- untested.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
         monkeypatch.setattr(
             sys, 'argv', ['prune_recon_cycle_summaries.py', '--apply'],
@@ -1208,11 +1146,11 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'prune_recon_cycle_summaries'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

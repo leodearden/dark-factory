@@ -24,23 +24,7 @@ from __future__ import annotations
 
 import re
 
-import pytest
-from starlette.testclient import TestClient
-
 _BANNER_SRC = '/static/redux/tasks_offline_banner.js'
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
 
 
 def _script_srcs(body: str) -> list[str]:

@@ -77,6 +77,13 @@ USAGE
     ./harvest_production_queries.py \
         --journal /home/leo/src/dark-factory/data/reconciliation/write_journal.db \
         --out fused-memory/tests/fixtures/production_query_sample.jsonl
+
+Run it FROM THE MAIN CHECKOUT. ``_repo_relative`` anchors ``_REPO_ROOT`` on
+this file's location, and the live journal sits under the main checkout's
+gitignored ``/data/``, so the same command run from a ``.worktrees/<id>``
+lane records the journal's ABSOLUTE path -- re-introducing the home-directory
+leak, and reddening
+``test_the_committed_sidecar_records_a_repo_relative_journal_path``.
 """
 from __future__ import annotations
 
@@ -122,6 +129,24 @@ BRIEFING_SEARCH_LIMIT = 5
 UNSPECIFIED_LIMIT = 'unspecified'
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
+
+#: Repo root, derived from this file: scripts/ -> fused-memory/ -> root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+#: sqlite's busy timeout for the journal connection, in SECONDS.
+#: NAMED after sqlite3's ``connect(timeout=)`` kwarg, which despite that
+#: spelling is the BUSY timeout and NOTHING else: it bounds how long a
+#: statement waits for a concurrent writer's lock, never how long opening
+#: the file may take.  A harvest does not give up 30s after failing to open
+#: the journal; `_connect_readonly`'s docstring states the same axis.
+#: sqlite3's implicit default is 5.0; this raises it because the journal
+#: is a live multi-gigabyte file a running fused-memory server is
+#: appending to, so a writer holding a lock is the expected case, not an
+#: exceptional one.  A read that waits is strictly better than a read
+#: that refuses -- and, before this, `database is locked` was reported
+#: as a missing table (see the scan in `harvest`).
+JOURNAL_CONNECT_TIMEOUT = 30.0
+
 DEFAULT_TAIL_SAMPLE = 40
 DEFAULT_SEED = 4004
 
@@ -196,6 +221,18 @@ class HarvestResult:
     tail_share: float | None
     literal_share: float | None
     family_share: float | None
+    """Share of all four BRIEFING TEMPLATES: the 3 literals PLUS the family.
+
+    The numerator is `literal_total + family_total`, i.e. the UNION -- not
+    the parameterized `task {task_id} ...` family alone.  The two are far
+    apart and the name invites the wrong reading: in the committed sidecar
+    this is 0.645536 while the parameterized family by itself is 0.125334
+    (its `TemplateClass.traffic_share`).  The CLI prints it under the label
+    `4-template family`, which is the union, and `read_transform_selection`
+    publishes the same union under the same name -- computed independently
+    as the sum of the four template shares.
+    """
+
     journal_path: str
     tail_sample: int
     tail_top: int
@@ -273,12 +310,19 @@ def _connect_readonly(db_path: Path | str) -> sqlite3.Connection:
     ``mode=ro`` refuses at the VFS layer; ``PRAGMA query_only`` refuses at
     the statement layer. Both are set because this points at a live
     multi-gigabyte journal the fused-memory server is writing to.
+
+    ``JOURNAL_CONNECT_TIMEOUT`` governs the third axis: not WHETHER a write
+    is possible but how long a read WAITS for a concurrent writer before
+    giving up. Against a journal being actively appended to, lock contention
+    is the expected case, so a read that waits beats a read that refuses.
     """
     path = Path(db_path)
     if not path.exists():
         raise JournalUnavailableError(f'write journal not found: {path}')
     try:
-        con = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        con = sqlite3.connect(
+            f'file:{path}?mode=ro', uri=True, timeout=JOURNAL_CONNECT_TIMEOUT
+        )
     except sqlite3.Error as exc: # pragma: no cover - OS-level failure
         raise JournalUnavailableError(f'cannot open {path} read-only: {exc}') from exc
     con.execute('PRAGMA query_only=ON')
@@ -369,6 +413,48 @@ def _share(count: int, total: int) -> float | None:
     return round(count / total, 6)
 
 
+def _repo_relative(path: Path | str) -> str:
+    """`data/reconciliation/write_journal.db`, not somebody's home dir.
+
+    An artifact naming an absolute checkout is neither reproducible nor
+    readable by anyone else, and it leaks the worktree the run happened
+    in -- the rule
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
+    already states.
+
+    Paths outside the repo are returned RESOLVED-ABSOLUTE, not shortened
+    to a bare filename: they are genuinely checkout-independent, and a
+    journal parked outside the tree must stay identifiable.
+
+    THIRD copy of this helper under `fused-memory/scripts/`, and the three
+    DISAGREE on exactly that fallback -- so copy deliberately rather than by
+    proximity.  `census_memory_metadata.py::_repo_relative` also falls back
+    to resolved-absolute (this one is shaped after it), and pairs with a
+    READING-side `census_memory_metadata.py::_resolved_repo_path` that
+    re-anchors a recorded relative value at the repo root; this module has
+    no such reader because nothing reads `journal_path` back, so a future
+    consumer would have to add one.  `bake_off_storage_shape.py::_repo_relative`
+    falls back to `resolved.name` instead.  Each stays private: these
+    scripts are loaded via `_fm_helpers.load_script_module`, not imported
+    as a package.
+
+    `_REPO_ROOT` is derived from this file's location, so it differs
+    between the main checkout and every `.worktrees/<id>` lane -- the
+    caveat `census_memory_metadata.py::_repo_relative` already records.
+    The live journal sits under the main checkout's gitignored `/data/`,
+    so a harvest run from a worktree falls through to the absolute branch.
+    That is correct for the VALUE and a hazard for REGENERATION: re-running
+    the harvest from a lane re-emits the home-directory path this exists to
+    remove.  Regenerate from the MAIN checkout, which is where the committed
+    sidecar's relative value comes from.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(_REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def _query_id(text: str, source: str) -> str:
     """A stable, content-derived id, so a re-harvest keeps its row ids."""
     import hashlib  # noqa: PLC0415
@@ -398,33 +484,75 @@ def harvest(
         tail_top = max(1, tail_sample // 2)
     tail_top = min(tail_top, tail_sample)
 
-    con = _connect_readonly(db_path)
-    try:
-        try:
-            rows = con.execute(
-                "SELECT params FROM write_ops WHERE operation = 'search'"
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise JournalUnavailableError(
-                f'{db_path} has no readable write_ops table: {exc}'
-            ) from exc
-    finally:
-        con.close()
-
     counts: Counter[str] = Counter()
     # The limit rides in the same params blob as the text, so it is
     # accumulated in the same pass.  Discarding it is what produced the
     # fabricated `observed_limit` this keying replaces.
     limits: dict[str, Counter[int | None]] = {}
     unparsed = 0
-    for (params,) in rows:
-        op = _query_op(params)
-        if op is None:
-            unparsed += 1
-            continue
-        text, limit = op
-        counts[text] += 1
-        limits.setdefault(text, Counter())[limit] += 1
+
+    con = _connect_readonly(db_path)
+    try:
+        try:
+            # PROBE for the table before scanning, so a genuine schema fault
+            # is DISTINGUISHED from every other sqlite failure rather than
+            # inferred from one.  Previously any `sqlite3.Error` here was
+            # relabelled `has no readable write_ops table`, so `database is
+            # locked` -- the likeliest failure against a journal a running
+            # server is writing to -- sent an operator to diagnose a missing
+            # table that was right there.
+            present = con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='write_ops'"
+            ).fetchone()
+            if present is None:
+                # No `: {exc}` tail -- nothing raised.  An empty probe is a
+                # READING, not a failure, and `JournalUnavailableError` is
+                # not a `sqlite3.Error`, so this passes through the handler
+                # below untouched.
+                raise JournalUnavailableError(f'{db_path} has no write_ops table')
+            # STREAMED, not `.fetchall()`ed: the live journal is
+            # multi-gigabyte and the committed sidecar records 431,621 search
+            # ops, so materializing the `params` blobs is a multi-hundred-MB
+            # peak allocation for a stream consumed exactly once.
+            #
+            # The TRADE, stated in full: peak RSS is bounded, at the cost of
+            # holding the read snapshot open across `json.loads` of every
+            # blob rather than for the fetch alone.  The journal is WAL
+            # (`fused-memory/src/fused_memory/services/write_journal.py::WriteJournal`),
+            # so writers are never blocked -- but frames newer than the
+            # oldest open reader snapshot cannot be reclaimed, so the
+            # server's `PRAGMA wal_checkpoint(TRUNCATE)`
+            # (`write_journal.py::WriteJournal.checkpoint`) is starved and
+            # the WAL grows for the whole scan.  Worth it against a
+            # multi-hundred-MB allocation, and `fetchmany()` chunking is not
+            # an improvement: it would cap memory identically without
+            # releasing the snapshot any earlier.
+            for (params,) in con.execute(
+                "SELECT params FROM write_ops WHERE operation = 'search'"
+            ):
+                op = _query_op(params)
+                if op is None:
+                    unparsed += 1
+                    continue
+                text, limit = op
+                counts[text] += 1
+                limits.setdefault(text, Counter())[limit] += 1
+        # Deliberately wrapped around the WHOLE loop, not just the
+        # `execute()`: streaming moves the point of failure, so a `disk I/O
+        # error` can now surface on any `next()` mid-scan.  Narrowing this
+        # guard would let a mid-scan sqlite failure escape unnamed.
+        except sqlite3.Error as exc:
+            # Names the REAL failure and the path, with `from exc` keeping
+            # the original message and traceback.  The named type is kept
+            # deliberately: `JournalUnavailableError` already covers
+            # "absent, unreadable, or is not a write journal", and a locked
+            # or I/O-failing journal IS unreadable.  Only the wording lied.
+            raise JournalUnavailableError(
+                f'cannot read write_ops from {db_path}: {exc}'
+            ) from exc
+    finally:
+        con.close()
 
     total = sum(counts.values())
 
@@ -564,8 +692,10 @@ def harvest(
         tail_distinct=len(tail_counts),
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
+        # The UNION of all four briefing templates, not the parameterized
+        # family alone -- see `HarvestResult.family_share`.
         family_share=_share(literal_total + family_total, total),
-        journal_path=str(db_path),
+        journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
         tail_top=tail_top,
         seed=seed,

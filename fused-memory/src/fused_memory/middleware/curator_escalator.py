@@ -342,7 +342,7 @@ class CuratorEscalator:
 
         if zero_output_timeout:
             # Transient Anthropic-backend INFRA hang on the curator's
-            # sonnet+json-schema call shape (task 1550). Two hangs hours apart
+            # sonnet+json-schema call shape (task 1743). Two hangs hours apart
             # each read as "failure 1 of 3" under the normal burst window —
             # the outage was invisible. Always surface, bypassing burst
             # suppression (don't touch _failure_log).
@@ -592,7 +592,7 @@ class CuratorEscalator:
             'zero-output/full-timeout hangs hours apart otherwise each read as '
             '"failure 1 of 3" and never cross the escalate threshold — the outage '
             'is invisible. Root cause: transient Anthropic-backend degradation on '
-            'the curator\'s sonnet+json-schema call shape (task 1550). Dedupe '
+            'the curator\'s sonnet+json-schema call shape (task 1743). Dedupe '
             'degraded to create for this candidate. The circuit-breaker watchdog '
             'will short-circuit further curator LLM calls if this recurs.',
         )

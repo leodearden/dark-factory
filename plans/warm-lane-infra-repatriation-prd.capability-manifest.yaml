@@ -101,7 +101,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: --assigned-lanes
+      pattern: ^[^#]*--assigned-lanes
       paths:
       - orchestrator/scripts/warm-lane/
       - orchestrator/src/orchestrator/

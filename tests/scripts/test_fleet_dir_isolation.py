@@ -76,6 +76,7 @@ from df_pytest_isolation import (  # noqa: E402
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
     fixture_marker,
+    fleet_dir_redirect_target,
     fleet_dir_redirect_violation_reason,
     leaked_fleet_heartbeat_reason,
     non_synthetic_unit_names,
@@ -342,7 +343,12 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     # The fixture's yielded value IS the redirect, not a parallel path. This is
     # the part that is genuinely per-root: it proves THIS rootdir's conftest
-    # bound the fixture that set the variable checked above.
+    # bound a LIVE instance of the fixture -- which then either ESTABLISHED the
+    # value checked above or ADOPTED one another root's instance had already
+    # established (df_pytest_isolation.fleet_dir_redirect_target, task 4890).
+    # The two are indistinguishable from here, deliberately: what this pins is
+    # that the yielded path and the env var AGREE, which is exactly what
+    # stopped holding in a two-root session before adoption existed.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or '').resolve()
 
 
@@ -414,6 +420,97 @@ class TestFleetDirRedirectViolationReason:
             assert '_df_fleet_dir_redirect' in reason, value
 
 
+class TestFleetDirRedirectTarget:
+    """Which already-set ``ORCH_FLEET_DIR`` the session fixture may ADOPT.
+
+    THE FLAKE (task 4398): ``_df_fleet_dir_redirect`` is session-scoped AND
+    autouse, and each test root's conftest binds its OWN copy. A session
+    collecting two roots therefore runs both instances; each unconditionally
+    ``mktemp``s a fresh dir and overwrites the env var, so whichever ran
+    FIRST yields a path that no longer matches ``ORCH_FLEET_DIR`` and its
+    per-root identity assertion fails. Reachable from the ordinary
+    ``pytest scripts/tests/... tests/scripts/...`` command both roots are
+    actually gated by.
+
+    The helper answers "adopt this value, or create a fresh one?", and
+    defines adoption as "already passes the very rule the redirect tests
+    assert" -- so adoption can never accept a value
+    :func:`fleet_dir_redirect_violation_reason` would reject. That is what
+    makes it safe by construction rather than by a second, drifting copy of
+    the soundness test.
+    """
+
+    def test_a_sound_existing_value_is_adopted(self, tmp_path: Path) -> None:
+        """THE MULTI-ROOT CASE: a value already sound for this run is reused.
+
+        This is what stops a second root's session fixture clobbering the
+        first root's -- both end up yielding the same directory the env var
+        actually holds.
+        """
+        existing = tmp_path / 'fleet-dir0'
+        existing.mkdir()
+        assert fleet_dir_redirect_target(str(existing), tmp_path) == existing
+
+    def test_an_unset_value_means_create(self, tmp_path: Path) -> None:
+        """The ordinary single-root first-run case: nothing to adopt."""
+        assert fleet_dir_redirect_target(None, tmp_path) is None
+
+    def test_an_empty_value_means_create(self, tmp_path: Path) -> None:
+        """``''`` is not "set" to a ``${VAR:-…}`` default -- the same
+        distinction the fixture's own teardown already turns on, so an empty
+        value must never be adopted as though it were a redirect.
+        """
+        assert fleet_dir_redirect_target('', tmp_path) is None
+
+    def test_the_live_fleet_dir_is_never_adopted(self, tmp_path: Path) -> None:
+        """Adopting the machine-global cross-project dir would BE the defect
+        this whole family guards against.
+        """
+        assert fleet_dir_redirect_target(str(LIVE_FLEET_DIR), tmp_path) is None
+
+    def test_a_path_inside_the_live_fleet_dir_is_never_adopted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subdirectory is still inside the live rendezvous dir."""
+        assert fleet_dir_redirect_target(str(LIVE_FLEET_DIR / 'sub'), tmp_path) is None
+
+    def test_a_value_outside_this_runs_basetemp_means_create(
+        self, tmp_path: Path,
+    ) -> None:
+        """A stale env var left by a PREVIOUS session must not be inherited.
+
+        Adoption is scoped to this run's basetemp precisely so a leftover
+        value cannot silently make a fresh session write outside its own tmp
+        space -- which is the same thing the "outside basetemp" branch of the
+        violation rule already refuses.
+        """
+        leftover = tmp_path / 'another-run'
+        leftover.mkdir()
+        assert fleet_dir_redirect_target(str(leftover), tmp_path / 'basetemp') is None
+
+    def test_adoption_agrees_with_the_violation_rule_exactly(
+        self, tmp_path: Path,
+    ) -> None:
+        """The two helpers are one rule, not two: adopt iff no violation.
+
+        Pinned as a biconditional over every case above rather than left
+        implicit, so a later tightening of the violation rule cannot leave
+        adoption accepting something the tests now reject.
+        """
+        sound = tmp_path / 'fleet-dirX'
+        sound.mkdir()
+        for value in (
+            str(sound), None, '', str(LIVE_FLEET_DIR),
+            str(LIVE_FLEET_DIR / 'sub'), str(tmp_path / 'elsewhere'),
+        ):
+            adopted = fleet_dir_redirect_target(value, tmp_path)
+            clean = fleet_dir_redirect_violation_reason(value, tmp_path) is None
+            assert (adopted is not None) == clean, (
+                f'adoption and the violation rule disagree on {value!r}: '
+                f'adopted={adopted!r} violation_free={clean}'
+            )
+
+
 class TestSyntheticHeartbeatsIn:
     """Which files in a fleet dir the leak guard counts as evidence.
 
@@ -456,6 +553,7 @@ class TestSyntheticHeartbeatsIn:
         """
         assert synthetic_heartbeats_in(tmp_path / 'nope') == []
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores mode bits')
     def test_an_unreadable_directory_is_empty_not_an_error(
         self, tmp_path: Path,
     ) -> None:
@@ -623,7 +721,32 @@ _NESTED_INI = '[pytest]\n'
 # so a change to SYNTHETIC_UNIT_PREFIX moves the nested harness with it.
 _NESTED_HEARTBEAT = f'{synthetic_unit("nested")}.json'
 
-_NESTED_CONFTEST = f'''\
+# A DISTINCT stem, so the two filenames are individually addressable in the
+# assertions: the before-snapshot tests turn on which of the two is named.
+_PREEXISTING_HEARTBEAT = f'{synthetic_unit("preexisting")}.json'
+
+def _nested_conftest_source(*, preexisting: bool) -> str:
+    """Source for the nested conftest, parameterised by the seed.
+
+    A FUNCTION rather than a second near-copy of the template: the seeding
+    variant differs from the plain one by four lines, and two templates
+    drifting apart is how the nested harness would quietly stop testing what
+    its name claims.
+
+    When *preexisting*, a synthetic heartbeat is written at conftest IMPORT
+    time -- immediately after the fleet dir is created and therefore strictly
+    BEFORE the session-scoped guard's ``before = set(...)`` snapshot runs.
+    That ordering is the whole point of the seam: it is the only way to put a
+    file in the guard's inherited set.
+    """
+    seed = (
+        f"""
+(df_pytest_isolation.LIVE_FLEET_DIR / {_PREEXISTING_HEARTBEAT!r}).write_text("{{}}")
+"""
+        if preexisting
+        else ''
+    )
+    return f"""\
 import sys
 from pathlib import Path
 
@@ -636,9 +759,10 @@ import df_pytest_isolation
 # real machine-global fleet directory.
 df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'
 df_pytest_isolation.LIVE_FLEET_DIR.mkdir(parents=True, exist_ok=True)
-
+{seed}
 from df_pytest_isolation import {_GUARD_NAME}  # noqa: F401
-'''
+"""
+
 
 
 def _nested_test_source(*, leaks: bool) -> str:
@@ -661,18 +785,185 @@ def _nested_test_source(*, leaks: bool) -> str:
     )
 
 
-def _nested_run(tmp_path: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
-    """Run a throwaway pytest session wired to the guard, in its own tmp tree."""
-    root = tmp_path / ('leaking' if leaks else 'clean')
+def _nested_run(
+    tmp_path: Path, *, leaks: bool, preexisting: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp tree.
+
+    *leaks* writes a synthetic heartbeat DURING the nested test; *preexisting*
+    seeds one from the nested conftest at import time, i.e. before the guard's
+    before-snapshot. They are independent, so all four combinations are
+    reachable. ``preexisting=False`` is the default, which keeps the two
+    original call sites byte-identical in behaviour.
+    """
+    # Unique per variant, so the (up to) four trees cannot collide under one
+    # tmp_path when a single test drives more than one.
+    root = tmp_path / (
+        f"{'leaking' if leaks else 'clean'}"
+        f"{'-seeded' if preexisting else ''}"
+    )
     root.mkdir()
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
     (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
+    (root / 'conftest.py').write_text(_nested_conftest_source(preexisting=preexisting))
     (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
         cwd=root, capture_output=True, text=True, timeout=300,
     )
+
+
+# ---------------------------------------------------------------------------
+# The redirect fixture's ADOPT branch, proven in a real two-root session
+# (task 4890 amendment; the behavioural fix for task 4398).
+#
+# TestFleetDirRedirectTarget covers the pure RULE. Nothing covered the FIXTURE
+# branch that consumes it, so an inverted condition or a dropped `return` in
+# _df_fleet_dir_redirect would have left every unit test above green -- and a
+# scoped run of either root alone stays green too, because the failure needs
+# two session-scoped instances live in ONE session. Only the top-level
+# both-roots command (scripts/orchestrator.yaml's test_command) reached it, and
+# a gating command is not a test: it says which RUN went red, not which branch.
+#
+# This reduces 4398 to its essentials in a nested pytest session -- two
+# sub-rootdirs, each with a conftest binding the fixture exactly as this repo's
+# three real roots do -- so the branch is pinned by something that names it.
+# ---------------------------------------------------------------------------
+
+# The binding IS the wiring, and it goes in a CONFTEST rather than a test
+# module: that is what the real roots do (conftest.py, scripts/tests/conftest.py,
+# orchestrator/tests/conftest.py) and it is what makes two independent instances
+# of one session-scoped fixture exist in a single session.
+_ADOPTION_CONFTEST = """\
+import sys
+from pathlib import Path
+
+# The copied df_pytest_isolation sits in the nested ROOT, one level above this
+# sub-root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from df_pytest_isolation import _df_fleet_dir_redirect  # noqa: F401
+"""
+
+# Each nested test RECORDS what its own root's instance yielded, so the outer
+# test can compare the two roots against each other -- the assertion that
+# discriminates adoption from clobbering, and the only one that does so
+# independently of the order pytest happens to run the modules in.
+_ADOPTION_TEST_TEMPLATE = """\
+import os
+from pathlib import Path
+
+
+def test_records_what_this_roots_fixture_yielded(_df_fleet_dir_redirect):
+    '''Takes the fixture BY NAME, exactly as each real root's own test does.'''
+    env = os.environ.get('ORCH_FLEET_DIR')
+
+    observed = Path(__file__).resolve().parent.parent / 'observed'
+    observed.mkdir(exist_ok=True)
+    (observed / __RECORD__).write_text(f'{_df_fleet_dir_redirect}\\n{env}\\n')
+
+    # The per-root identity assertion both real roots carry. THIS is what broke
+    # in task 4398: the instance that ran first kept yielding a path the env var
+    # no longer held once the second instance overwrote it.
+    assert Path(_df_fleet_dir_redirect).resolve() == Path(env or '').resolve()
+    # The fixture's "the directory is CREATED and left EMPTY" contract must
+    # survive adoption, which rules on the PATH and not on the filesystem.
+    assert Path(_df_fleet_dir_redirect).is_dir()
+"""
+
+
+def _adoption_test_source(record: str) -> str:
+    return _ADOPTION_TEST_TEMPLATE.replace('__RECORD__', repr(record))
+
+
+def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
+    """Run one pytest session spanning TWO sub-rootdirs that each bind the fixture.
+
+    The module order on the command line is A, B, A -- the shape task 4398
+    actually reported (``pytest scripts/tests/... tests/scripts/...
+    scripts/tests/...``), where the first root's SECOND module is the one that
+    runs after the other root's instance has had its chance to clobber the env
+    var. The outer assertions do not DEPEND on that order holding, since
+    comparing the two roots' recorded paths discriminates either way; it is
+    here because it costs one file and reproduces the original report exactly.
+    """
+    for sub in ('root_a', 'root_b'):
+        (root / sub).mkdir(parents=True)
+        (root / sub / 'conftest.py').write_text(_ADOPTION_CONFTEST)
+    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
+    (root / 'pytest.ini').write_text(_NESTED_INI)
+    (root / 'root_a' / 'test_a_first.py').write_text(_adoption_test_source('a-first'))
+    (root / 'root_b' / 'test_b_only.py').write_text(_adoption_test_source('b-only'))
+    (root / 'root_a' / 'test_a_second.py').write_text(_adoption_test_source('a-second'))
+    return subprocess.run(
+        [
+            sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+            'root_a/test_a_first.py', 'root_b/test_b_only.py',
+            'root_a/test_a_second.py',
+        ],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+
+
+class TestTheAdoptBranchHoldsInARealSession:
+    """Two roots, one session, one redirect."""
+
+    def test_both_roots_yield_the_one_redirect_the_env_var_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        """The end-to-end proof of ``_df_fleet_dir_redirect``'s adopt branch.
+
+        Asserts the PROPERTY, not the mechanism: whatever the two instances do
+        internally, they must agree on ONE directory and that directory must be
+        what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
+        are load-bearing -- agreeing on a path neither root exported would
+        satisfy the first one alone.
+
+        Without adoption this fails on the recorded paths (``fleet-dir0`` vs
+        ``fleet-dir1`` under one basetemp, which is verbatim what 4398
+        reported) and, when the A-B-A order holds, on the nested run's own exit
+        code as well.
+
+        Note the nested session INHERITS this session's ``ORCH_FLEET_DIR``,
+        which points into the OUTER basetemp -- so the first instance correctly
+        REFUSES it (a previous run's value is never adoptable) and mktemps, and
+        only the second adopts. That is the create path and the adopt path in
+        one run, in the order they occur in production.
+        """
+        root = tmp_path / 'two-roots'
+        result = _nested_adoption_run(root)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode == 0, (
+            'a two-root nested session failed its own per-root identity '
+            'assertions -- the redirect fixture is clobbering across roots '
+            f'again (task 4398). stdout={result.stdout!r} '
+            f'stderr={result.stderr!r}'
+        )
+        assert '3 passed' in combined, (
+            'the nested session did not run all three modules, so it proves '
+            f'nothing about two live instances. output={combined!r}'
+        )
+
+        records = {
+            p.name: p.read_text().splitlines()
+            for p in sorted((root / 'observed').iterdir())
+        }
+        assert set(records) == {'a-first', 'a-second', 'b-only'}, records
+
+        yielded = {name: rec[0] for name, rec in records.items()}
+        env_seen = {name: rec[1] for name, rec in records.items()}
+
+        assert len(set(yielded.values())) == 1, (
+            'the two roots yielded DIFFERENT redirects, so at least one is '
+            'handing its tests a directory the env var does not name -- the '
+            f'adopt branch is not running. yielded={yielded!r}'
+        )
+        assert set(env_seen.values()) == set(yielded.values()), (
+            'every root agreed on a directory that is not what ORCH_FLEET_DIR '
+            'actually held, so a spawned script would read somewhere else '
+            f'entirely. yielded={yielded!r} env={env_seen!r}'
+        )
 
 
 class TestTheGuardFailsTheRunEndToEnd:
@@ -709,3 +1000,61 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert _NESTED_HEARTBEAT not in result.stdout
+
+    def test_a_heartbeat_that_predates_the_session_is_not_reported(
+        self, tmp_path: Path,
+    ) -> None:
+        """The BEFORE-SNAPSHOT branch: the guard subtracts what it inherited.
+
+        ``_df_no_synthetic_heartbeats_in_live_fleet`` snapshots the fleet dir at
+        session start and reports only names that appear AFTER. Nothing else in
+        this file exercises that subtraction -- the leaking variant writes its
+        heartbeat DURING the nested test, and the nested conftest creates the
+        fleet dir EMPTY, so no existing case has a file present before the
+        snapshot runs. Deleting ``before = set(...)`` outright would leave every
+        other test here green.
+
+        That matters in production, not just for coverage: this repo runs
+        several worktrees' suites concurrently against one machine-global fleet
+        dir, so a session inheriting ANOTHER session's in-flight synthetic
+        heartbeat must not attribute it to itself. Without the subtraction the
+        guard would fail runs for leaks they did not cause -- and a guard that
+        cries wolf gets deleted.
+        """
+        result = _nested_run(tmp_path, leaks=False, preexisting=True)
+
+        assert result.returncode == 0, (
+            'a session that merely INHERITED a synthetic heartbeat was failed; '
+            'the guard must subtract its before-snapshot. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert _PREEXISTING_HEARTBEAT not in result.stdout + result.stderr, (
+            'the inherited heartbeat was named in the output of a run that did '
+            f'not create it. stdout={result.stdout!r}'
+        )
+
+    def test_a_new_leak_is_reported_and_the_inherited_one_is_not(
+        self, tmp_path: Path,
+    ) -> None:
+        """The DISCRIMINATING half, and the reason the case above is not enough.
+
+        A guard that simply ignored everything would pass the previous test.
+        This one proves the subtraction is a SET difference rather than a mute
+        button: with both files present the run must still fail, and must name
+        the newly-leaked file WITHOUT naming the inherited one -- which is what
+        makes the failure attributable to the session that actually caused it.
+        """
+        result = _nested_run(tmp_path, leaks=True, preexisting=True)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a genuine leak went unreported because an inherited heartbeat was '
+            f'also present -- the subtraction is too broad. output={combined!r}'
+        )
+        assert _NESTED_HEARTBEAT in combined, (
+            f'the newly-leaked file was not named. output={combined!r}'
+        )
+        assert _PREEXISTING_HEARTBEAT not in combined, (
+            'the INHERITED file was named as a leak of this session. '
+            f'output={combined!r}'
+        )

@@ -82,7 +82,7 @@ import sys
 import types
 from collections.abc import Iterator
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SCRIPT_PATH = REPO_ROOT / "skills" / "factory-init" / "scripts" / "find_escalation_port.py"
@@ -1070,9 +1070,15 @@ def _run_main(
     try:
         sys.argv = ["find_escalation_port.py", *argv]
         # ruff (B010) rejects setattr with a constant name and pyright rejects
-        # assigning to a ModuleType attribute, so the two gates disagree; the targeted
-        # pyright ignore is this repo's established resolution (see the `import pytest`
-        # line above). Neither gate is weakened and no exclude is added.
+        # assigning to a ModuleType attribute, so the two gates disagree; a
+        # targeted per-diagnostic pyright ignore is this repo's established
+        # resolution. Neither gate is weakened and no exclude is added.
+        # These two suppressions are load-bearing and stay. The pointer that
+        # used to stand here, at the `import pytest` line above, was dropped by
+        # task 4516: that pragma named reportMissingImports and was vestigial
+        # (pytest resolves from the worktree .venv the root [tool.pyright]
+        # venvPath/venv keys pin), so it was never an instance of this
+        # gates-disagree resolution and citing it argued the wrong thing.
         fep.is_bound = lambda port: port in bound  # pyright: ignore[reportAttributeAccessIssue]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = fep.main()

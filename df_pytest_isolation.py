@@ -34,7 +34,8 @@ strictly tighter than this one (``cwd.parent`` rather than the basetemp):
 * ``_orch_helpers.git_env_with_ceiling`` — the same ceiling mechanism applied
   per call, on a private env copy.
 
-SECOND DEFENCE — a test run can never falsify a REAL deploy clock.
+SECOND DEFENCE — a test run can never falsify REAL fleet-redeploy coordination
+state: either deploy clock, or task 4755's in-flight lease.
 
 Task 3797.  ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE``
 from ``$ORCH_FLEET_DEPLOY_CLOCK``, defaulting to
@@ -54,6 +55,26 @@ here: the defence must be suite-wide and impossible to opt out of, because the
 defect class is "a spawner that forgets the env var" and the next one has not
 been written yet.
 
+Task 4755 widened the defence from clocks to fleet-redeploy coordination state
+generally, by registering its IN-FLIGHT LEASE
+(``data/orchestrator/fleet_redeploy_lease.json``, env ``ORCH_FLEET_LEASE``) in
+the same table.  It gets the REDIRECT half of this defence and deliberately not
+the change-detection half — ``REDIRECT_ONLY_RELPATHS`` implements that split and
+the comment at ``FLEET_LEASE_RELPATH`` states why, once.  Do not restate it
+here.
+
+Task 5299 closed an asymmetry the guard's own message used to invite: the
+GUARD above is autoused into all nine conftests that import this module, but
+until this task the MITIGATION — redirecting ``ORCH_FLEET_DEPLOY_CLOCK`` and
+``FM_DEPLOY_CLOCK`` at a tmp file — existed only in
+``scripts/tests/conftest.py``.  Any other suite (``shared/tests``,
+``escalation/tests``, ...) that happened to be running when a REAL fleet
+redeploy fired watched the live path with nothing pointing it away, and failed
+for a cause entirely outside that task's control (incident esc-4892-7).  The
+redirect now lives inside ``_df_deploy_clocks_unwritten`` itself, below, rather
+than in a second fixture every conftest would need to import on top of the
+first — the shape that produced the gap in the first place.
+
 Unlike the ceiling, this one guards TWO roots when it runs inside a task
 worktree: that worktree AND the main checkout enclosing it.  The bash script
 derives its clock path from its own location (so a worktree run hits the
@@ -61,6 +82,47 @@ worktree), but ``scripts/orchestrator-watchdog.py`` HARDCODES ``REPO_DIR``, so
 its fused-memory clock and the fleet script it spawns land in the main checkout
 whichever worktree invoked them.  One root would have left the second protected
 path watched-but-unwritable-to, i.e. green and useless.
+
+THAT SECOND ROOT IS ALSO WHAT MADE THE GUARD ACCUSE THE INNOCENT, and task 4823
+is the fix.  The main checkout is machine-operated, so a GENUINE redeploy there
+moves a clock a worktree suite is watching, and the guard had no way to tell
+that apart from a test writing the file.  It now ATTRIBUTES the stamp instead of
+blaming the run: both writers emit ``source`` and ``pytest_session`` alongside
+``ts``/``iso``, ``clock_stamp_provenance`` parses that pair, and only a
+POSITIVELY attributed external write is downgraded — to a
+``DeployClockRedeployWarning``, run still green.  Everything else still fails,
+exactly as before.
+
+``df_pytest_isolation.py::deploy_clock_change_report`` owns that decision and is
+the ONE place the incident, the discriminator and the full verdict table are
+stated; every other site here points at it rather than restating it, so a reader
+correcting the record has one copy to correct.
+
+THE RESIDUAL GAPS, stated plainly rather than left to be rediscovered.  There
+are exactly TWO, both accepted, and both narrower than the measured cost they
+replace.
+
+(1) A LOST TOKEN.  A test that spawns a clock writer through an env-SCRUBBING
+seam — a fake ``systemd-run`` transient unit, say — loses the token, so its
+write carries an empty ``pytest_session`` and reads as external.  3797's actual
+defect class is a spawner that copies ``dict(os.environ)`` and merely forgets
+the clock var, which is covered in full.  If a scrubbing spawner is ever added,
+the fix is to thread the token through it, not to retire the downgrade.
+
+(2) AN OVERWRITTEN FALSIFICATION.  Attribution reads the surviving body, so a
+test stamp that a GENUINE redeploy later overwrites on the SAME clock inside one
+run is attributed to that redeploy and the run stays green.  The pre-4823 guard
+caught this, because it keyed on "the bytes moved" alone; this is the one place
+the defence genuinely narrows.  Narrow: it needs both writes, to one clock,
+inside the same 26-41 minute run, against an 8h redeploy cadence.
+
+Closing (2) means observing the INTERMEDIATE states, which the session-scoped
+snapshot pair cannot do — and the obvious cheap patch does not work: the
+``before`` entry is read before any test runs, so it can never carry this run's
+own token, and parsing its provenance would buy nothing.  The real fix is
+continuous observation (a per-test guard, or a watch on the file), which is
+exactly the cost :func:`_df_deploy_clocks_unwritten` documents rejecting when it
+chose SESSION scope.  Revisit that trade before adding a check here.
 
 THIRD DEFENCE — a test's spawn timeout can never leak a process group.
 
@@ -191,6 +253,26 @@ producer-side one, that ``resolve_fleet_dir()`` read against the ambient env
 lands in this run's basetemp — live in
 ``orchestrator/tests/test_fleet_dir_isolation.py``.
 
+FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+Incident 2026-08-31.  ``git -C <path>`` reads as "act on <path>" but ``-C`` only
+changes directory; ``GIT_DIR`` and its siblings SKIP repository discovery, so an
+ambient ``GIT_DIR`` redirects every such call into the repository it names with
+the ``-C`` argument inert.  139 test files here run ``git config user.*`` or
+``git commit`` against a ``tmp_path`` repo; under a leaked ``GIT_DIR`` all 139
+write somewhere else.  Measured in the live checkout: placeholder content
+committed onto ``main`` and ``[user] name=Test email=test@example.com`` plus
+``commit.gpgsign = false`` written into the real ``.git/config``.
+
+This is NOT covered by the first defence, and the two are easy to conflate.  A
+``GIT_CEILING_DIRECTORIES`` ceiling bounds the upward WALK; an explicit
+``GIT_DIR`` never walks, so the ceiling is bypassed rather than weakened
+(verified against real git: ceiling armed at the basetemp AND ``GIT_DIR`` set
+still wrote to the ``GIT_DIR`` repo).  ``_df_git_env_hermetic`` is FUNCTION
+scoped, unlike all four siblings, because its hazard is introduced MID-session
+by another test rather than present at session start — task 4966 measured
+exactly that as a 1-in-3 flake, green standalone and green in its own file.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -205,12 +287,15 @@ together by
 from __future__ import annotations
 
 import contextlib
+import enum
+import json
 import math
 import os
 import signal
 import subprocess
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -393,12 +478,13 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # Deploy-clock isolation (task 3797)
 # ---------------------------------------------------------------------------
 
-# Both entries are MIN-INTERVAL deploy clocks: scripts/orchestrator-watchdog.py
-# reads each as "this component was redeployed at <ts>" and SKIPS its staleness
-# pass while the corresponding min-interval window is open (8h by default —
-# ORCH_RESTART_MIN_INTERVAL_SECS / FM_RESTART_MIN_INTERVAL_SECS). Falsifying
-# either one therefore SUPPRESSES a staleness backstop for the rest of the day,
-# invisibly and with every test still green.
+# The first two entries are MIN-INTERVAL deploy clocks:
+# scripts/orchestrator-watchdog.py reads each as "this component was redeployed
+# at <ts>" and SKIPS its staleness pass while the corresponding min-interval
+# window is open (8h by default — ORCH_RESTART_MIN_INTERVAL_SECS /
+# FM_RESTART_MIN_INTERVAL_SECS). Falsifying either one therefore SUPPRESSES a
+# staleness backstop for the rest of the day, invisibly and with every test
+# still green.
 #
 # The fused-memory clock is included even though only the fleet clock has
 # actually been falsified so far, because it is the identical defect class, not
@@ -410,9 +496,85 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # LITERALS, not imports: see the module docstring's import constraint. All four
 # mirrors of these paths are pinned together by
 # tests/scripts/test_orchestrator_watchdog.py::test_fleet_deploy_clock_path_matches_across_tiers.
-PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
-    'data/orchestrator/last_redeploy_orchestrator.json',
-    'data/fused-memory/last_redeploy_fused_memory.json',
+#
+# Each clock is NAMED as well as tabulated, so a reader — and the fleet-clock
+# fixture at the bottom of this section — can identify one by MEANING rather
+# than by its position in the table. Position carries no identity here: the
+# ordering below is the order deploy_clock_violation_reason reports offenders
+# in, and a future reorder for message-reading reasons must not silently
+# repoint anything that meant "the fleet clock, not the fused-memory one".
+FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
+FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
+
+# NOT a clock — task 4755's IN-FLIGHT LEASE, written by
+# scripts/restart-all-orchestrators.sh while a fleet sweep is running and
+# removed on every catchable exit path. It gets the REDIRECT half of this
+# section's defence and deliberately NOT the change-detection half; the split
+# is stated here once, and REDIRECT_ONLY_RELPATHS below is what implements it.
+#
+# REDIRECT: yes, and it is what a lease actually needs. Its exposure is a TEST
+# spawning the producer without $ORCH_FLEET_LEASE set, and a lease is exposed
+# in BOTH directions where a clock is exposed in one — one left behind
+# SUPPRESSES real redeploys until the max-age bound expires, and a
+# lease_release run against the live path DELETES a genuine in-flight sweep's
+# lease. Pointing the var at a tmp file removes that at the source. Registered
+# in the table below rather than given a parallel fixture precisely because
+# that table exists to make two structures naming different files (or
+# different vars) for the same thing unrepresentable (heuristic 11, SPOT).
+#
+# CHANGE DETECTION: no, and it CANNOT work for a lease, for two independent
+# reasons. (i) deploy_clock_guard_roots deliberately watches the MAIN checkout
+# as well as this one, and a real sweep creates, per-unit rewrites and removes
+# the live lease there for its whole duration — so a real sweep IS a benign
+# external write, which is the only reason that root is watched at all, and a
+# verify run straddling either end of one would fail an innocent branch
+# (REWRITTEN / DELETED / CREATED). That is the false-positive class task 4823
+# closed, with a far wider window than a clock, which moves once and
+# instantaneously. (ii) Unlike a clock, no provenance in the body could rescue
+# it: the DELETED case has after=None and leaves nothing to attribute.
+#
+# ACCEPTED RESIDUAL, named rather than left to be discovered: a spawner that
+# HARDCODES the lease path instead of reading $ORCH_FLEET_LEASE is no longer
+# detected. Nothing in the repo does that, and what keeps it true is the
+# four-way drift pin plus the per-test monkeypatch.setenv('ORCH_FLEET_LEASE',
+# ...) discipline the existing lease tests follow.
+#
+# Its four mirrors are pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers,
+# and the behaviour above by
+# tests/scripts/test_deploy_clock_isolation.py::TestALeaseOnlyChangeIsNeverReported.
+FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
+
+# The env var a forgetful spawner needed to set to avoid stamping each protected
+# relpath — and, since task 5299, the SINGLE table everything else in this
+# section derives from: the watched-relpath tuple below, the failure message
+# (which names the fix) and the suite-wide redirect fixture all read it, so no
+# two of them can name a different var — or a different SET of files — for the
+# same clock. Task 5299 folded a second table doing this by hand with an
+# `if 'fused-memory' in relpath` check into this one.
+PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
+    FLEET_DEPLOY_CLOCK_RELPATH: 'ORCH_FLEET_DEPLOY_CLOCK',
+    FM_DEPLOY_CLOCK_RELPATH: 'FM_DEPLOY_CLOCK',
+    FLEET_LEASE_RELPATH: 'ORCH_FLEET_LEASE',
+}
+
+# Which entries of the table above get the REDIRECT half of the defence only,
+# and not change detection. A NAMED, structured statement of that split rather
+# than an `if 'lease' in relpath` string test (heuristic 12) and rather than a
+# second literal list of files (which is exactly what task 5299 folded away).
+# The reasoning for the one member is at FLEET_LEASE_RELPATH above.
+REDIRECT_ONLY_RELPATHS: frozenset[str] = frozenset({FLEET_LEASE_RELPATH})
+
+# DERIVED, not a second literal list (heuristic 11, SPOT): a protected clock the
+# guard watches but the table above omits would have made the message path raise
+# KeyError from the session-teardown `finally` below — replacing the actionable
+# 3am message with a traceback at exactly the moment a REAL clock was falsified.
+# Deriving makes that state unrepresentable. Dicts preserve insertion order, so
+# the reporting order documented above is retained.
+PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = tuple(
+    relpath
+    for relpath in PROTECTED_DEPLOY_CLOCK_ENV_VARS
+    if relpath not in REDIRECT_ONLY_RELPATHS
 )
 
 # A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
@@ -441,11 +603,16 @@ def deploy_clock_guard_roots(
     clock was being falsified, which is the same "green and useless" failure the
     relpath drift pin exists to prevent.
 
-    The cost is accepted deliberately: a GENUINE concurrent redeploy in the
-    machine-operated main checkout now fails a worktree suite too, not just a
-    main-checkout one.  That is the loud-over-silent trade this whole defence is
-    built on, and it is why the failure message prints the absolute path plus
-    both observed bodies — so "real redeploy" is one glance away from "test bug".
+    The cost of that second root — a GENUINE concurrent redeploy in the
+    machine-operated main checkout failing a WORKTREE suite, not just a
+    main-checkout one — was accepted deliberately, and
+    :func:`deploy_clock_change_report` has since removed most of it by
+    attributing such a stamp rather than failing on it.  What remains is the
+    fail-closed default for a stamp bearing NO provenance, so widening the
+    guarded roots is still a decision about how loudly to fail on an
+    unattributable change — and it is why the message prints the absolute path
+    plus both observed bodies, so "real redeploy" stays one glance away from
+    "test bug" for exactly that residue.
 
     Own checkout FIRST and deduped, so the message names the run's own checkout
     when both were touched, and so a suite running in the main checkout (where
@@ -492,6 +659,96 @@ def deploy_clock_snapshot(
     return snapshot
 
 
+# The provenance vocabulary (task 4823) — the three spellings four tiers must
+# agree on and none can import from another (see the module docstring's
+# stdlib+pytest import constraint). `scripts/restart-all-orchestrators.sh` and
+# `scripts/orchestrator-watchdog.py` each mirror them as their own literals, and
+# all three mirrors are pinned together by
+# tests/scripts/test_restart_all_orchestrators.py and
+# tests/scripts/test_orchestrator_watchdog.py, which assert against THESE
+# objects rather than against strings of their own.
+PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
+CLOCK_PROVENANCE_SOURCE_KEY = 'source'
+CLOCK_PROVENANCE_SESSION_KEY = 'pytest_session'
+
+
+class DeployClockRedeployWarning(UserWarning):
+    """A REAL deploy stamped a protected clock while a test run was in flight.
+
+    The BENIGN reading of a moved clock, and the one
+    :func:`_df_deploy_clocks_unwritten` could name but never rule in before task
+    4823.  Seeing this in a verify or merge-lane run means a genuine fleet or
+    component redeploy straddled that run: the branch is not at fault, no test
+    or spawner wrote the file, and there is nothing to fix.
+
+    A ``UserWarning`` subclass on purpose.  This repo's only ``filterwarnings``
+    entries (``orchestrator/pyproject.toml``) are targeted
+    ``error:<message-regex>:<category>`` pairs on ``RuntimeWarning`` /
+    ``PytestUnraisableExceptionWarning`` / ``PytestWarning``; a fresh
+    ``UserWarning`` subclass matches none of them, so the downgrade cannot be
+    silently re-escalated back into the failure it replaces.  Dedicated rather
+    than a bare ``UserWarning`` so a suite that wants the old strictness can
+    filter exactly this one to an error.
+    """
+
+
+def clock_stamp_provenance(entry: tuple[bytes, int] | None) -> dict[str, str] | None:
+    """Who wrote this clock stamp, or ``None`` when the stamp cannot say.
+
+    Parses one :func:`deploy_clock_snapshot` entry into
+    ``{CLOCK_PROVENANCE_SOURCE_KEY: <writer>, CLOCK_PROVENANCE_SESSION_KEY:
+    <token>}``, where the token is the ambient :data:`PYTEST_SESSION_TOKEN_ENV`
+    the writer ran under — empty when no pytest session was an ancestor of the
+    write, which is the shape every genuine machine-operated deploy emits.
+
+    ``None`` IS THE FAIL-CLOSED VALUE, and every not-exactly-right shape maps to
+    it: an absent file, an unparseable or non-object body, the pre-4823 legacy
+    ``{ts, iso}``, a body carrying only one of the two keys, or either key
+    holding a non-``str``.  An unattributable stamp must keep TODAY's
+    fail-the-run behaviour, so a writer added later without provenance — or one
+    that emits a half-migrated body — cannot buy itself an exemption by
+    omission.  That is also what makes this change safe to land with no
+    coordinated writer rollout.
+
+    WHY THE DECISION KEYS ON ``pytest_session`` AND NEVER ON ``source``.  The
+    defect this guard exists to catch (task 3797) is a TEST running the REAL
+    writer: ``scripts/tests/test_restart_all_orchestrators.py`` drove
+    ``scripts/restart-all-orchestrators.sh`` against a fake ``systemctl``
+    without redirecting the clock, and that write carries a perfectly
+    legitimate ``source`` — it IS the production script.  So an allowlist of
+    trusted ``source`` values would clear exactly the write that must fail.
+    The only property that actually differs between a test-spawned write and a
+    real deploy is process ANCESTRY, which is what the ambient token records
+    (the same mechanism :data:`LEAK_TOKEN_ENV` established for the drain-leak
+    guard).  ``source`` is triage prose: it makes the file self-describing for
+    an operator reading it by hand, and nothing branches on it.
+
+    Never raises.  This runs inside a session-teardown fixture, where an
+    exception would replace the guard's own message — which names the clock
+    that moved and both observed bodies — with a traceback about JSON.
+
+    No coercion, deliberately: ``None`` must not become ``''``, because the
+    empty string is the POSITIVE assertion "no pytest session was an ancestor
+    of this write", i.e. the one value that forgives a change.
+    """
+    if entry is None:
+        return None
+    try:
+        payload = json.loads(entry[0].decode('utf-8'))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get(CLOCK_PROVENANCE_SOURCE_KEY)
+    session = payload.get(CLOCK_PROVENANCE_SESSION_KEY)
+    if not isinstance(source, str) or not isinstance(session, str):
+        return None
+    return {
+        CLOCK_PROVENANCE_SOURCE_KEY: source,
+        CLOCK_PROVENANCE_SESSION_KEY: session,
+    }
+
+
 def _clock_change_kind(
     before: tuple[bytes, int] | None, after: tuple[bytes, int] | None,
 ) -> str | None:
@@ -529,6 +786,261 @@ def _describe_clock_entry(entry: tuple[bytes, int] | None) -> str:
     return f'{text!r} st_mtime_ns={mtime_ns}'
 
 
+class ClockVerdict(enum.Enum):
+    """What a changed protected clock is attributed to.
+
+    A member, not a string, because both values are BRANCH KEYS — the fixture
+    and :func:`deploy_clock_violation_reason` each select their whole behaviour
+    by comparing one, and a mistyped literal would silently pick the other path
+    with nothing to catch it (docs/code-quality.md heuristic 12).  A mistyped
+    member raises instead.  ``_clock_change_kind`` deliberately stays a plain
+    string: its value is only ever concatenated into prose.
+
+    :func:`deploy_clock_change_report` is the sole producer and states what each
+    verdict means and which inputs reach it.
+    """
+
+    FALSIFIED = 'falsified'
+    EXTERNAL_REDEPLOY = 'external_redeploy'
+
+
+def deploy_clock_change_report(
+    before: dict[str, tuple[bytes, int] | None],
+    after: dict[str, tuple[bytes, int] | None],
+    *,
+    session_token: str | None,
+    root: str | os.PathLike[str] | None = None,
+) -> tuple[ClockVerdict, str] | None:
+    """Attribute the changed protected clocks, or ``None`` if none changed.
+
+    Returns ``(verdict, message)``, where *verdict* is a :class:`ClockVerdict`:
+
+    :attr:`ClockVerdict.FALSIFIED`
+        The change cannot be attributed to anything but this run, or cannot be
+        attributed at all.  This is the DEFAULT — today's behaviour, unchanged —
+        and it covers a provenance-free (pre-4823) body, an unparseable one, a
+        DELETED file, a missing *session_token*, a stamp carrying THIS session's
+        token, and a stamp carrying some other pytest session's token.
+    :attr:`ClockVerdict.EXTERNAL_REDEPLOY`
+        A provenance-aware writer stamped the clock with an EMPTY session token,
+        i.e. no pytest session was an ancestor of the write.  A REAL fleet or
+        component redeploy straddled this run; the run is not at fault.
+
+    THE INCIDENT, stated once here because this function owns the decision; no
+    other site in the repo restates it, they point here.  Task 4823.  The
+    pre-existing guard could see only that the bytes moved, so the benign
+    reading its own message names ("a REAL fleet redeploy fired while this suite
+    was running") could be raised but never RULED IN.  It therefore failed
+    closed on every change — correct as a default, and wrong often enough on a
+    busy merge queue, where a post-merge orchestrator verify runs 26-41 minutes
+    against a documented 8h redeploy cadence, to have blocked FOUR innocent
+    branches across two independent recovery sessions (tasks 3594, 4215, 3803,
+    4274), with 17 occurrences in the archived verify logs.
+
+    THE DISCRIMINATOR is *session_token*, which is what removes that ambiguity:
+    see :func:`clock_stamp_provenance` for why it is the token and never the
+    writer's ``source``.  Correcting this record means correcting it here.
+
+    FAIL-CLOSED ON A FALSY *session_token*, mirroring
+    :func:`leaked_drain_processes` on its own token: an unstamped token must
+    never be read as "nothing can be ours, so everything is external", which
+    would silently forgive every write the first time the fixture failed to
+    stamp one.
+
+    A FOREIGN token is deliberately left failing rather than downgraded to
+    "somebody else's problem".  Under ``merge_verify_breadth: "full"`` many
+    worktrees run this suite against the same main checkout, so a foreign token
+    means another session falsified a shared clock — but that session's OWN
+    guard sees its own token and fails, so the signal is never lost, and this
+    run must not become the arbiter of another run's bug on the strength of a
+    token it cannot verify.
+
+    PRECEDENCE: :attr:`~ClockVerdict.FALSIFIED` anywhere outranks
+    :attr:`~ClockVerdict.EXTERNAL_REDEPLOY` anywhere, so EVERY protected relpath
+    is inspected before a benign verdict is returned.  Among changes of the SAME
+    verdict the first in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS` order is
+    reported.
+
+    That is not a tie-break detail, it is the whole contract: the benign reading
+    is an exemption for the RUN's innocence, and one clock being provably
+    external is no evidence at all about a DIFFERENT file.  The two protected
+    clocks have different writers — ``scripts/restart-all-orchestrators.sh``
+    stamps the fleet one, ``scripts/orchestrator-watchdog.py`` the fused-memory
+    one — so they can genuinely disagree within a single run.  Concretely, the
+    masking this replaced: a real fleet redeploy stamps
+    ``data/orchestrator/last_redeploy_orchestrator.json`` while a test falsifies
+    ``data/fused-memory/last_redeploy_fused_memory.json``, and because the
+    benign clock comes FIRST in protected order the earlier version returned on
+    it and never inspected the second — disarming task 3797's defence for
+    exactly the redeploy-in-flight window this task's downgrade exists to serve.
+    Do not re-introduce an early ``return`` believing first-changed-wins was
+    intentional; it was not, and
+    ``TestAFalsificationIsNeverMaskedByABenignChange`` pins every CROSS-clock
+    direction of it.  Two writes to the SAME clock are a different matter and
+    are residual gap (2) in this module's docstring.
+
+    A benign change IS deliberately swallowed for a root that also carries a
+    falsification.  ``pytest.fail`` is the louder and the only actionable
+    signal, and :func:`_falsified_message` already carries the full attribution,
+    so adding a warning about an unrelated file alongside it would dilute the
+    one message a reader must act on.
+
+    *root* is optional and cosmetic-but-load-bearing in BOTH verdicts: pass the
+    checkout the snapshots were taken against and the message names the ABSOLUTE
+    file.  A run guards more than one checkout (see
+    :func:`deploy_clock_guard_roots`), so a bare relpath leaves the reader unable
+    to tell which one moved.
+    """
+    benign: tuple[ClockVerdict, str] | None = None
+    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
+        before_entry, after_entry = before.get(relpath), after.get(relpath)
+        kind = _clock_change_kind(before_entry, after_entry)
+        if kind is None:
+            continue
+        where = relpath if root is None else str(Path(root) / relpath)
+        observed = (
+            f'observed before: {_describe_clock_entry(before_entry)}\n'
+            f'observed after:  {_describe_clock_entry(after_entry)}\n'
+        )
+        provenance = clock_stamp_provenance(after_entry)
+        if provenance is not None and session_token and not provenance[
+            CLOCK_PROVENANCE_SESSION_KEY
+        ]:
+            # Hold it, keep scanning: a later clock may still be falsified, and
+            # that outranks this.  Only the FIRST benign change is kept, so the
+            # reported one stays first in protected order.
+            if benign is None:
+                benign = (
+                    ClockVerdict.EXTERNAL_REDEPLOY,
+                    _external_redeploy_message(
+                        where, kind, observed,
+                        provenance[CLOCK_PROVENANCE_SOURCE_KEY],
+                    ),
+                )
+            continue
+        return (
+            ClockVerdict.FALSIFIED,
+            _falsified_message(
+                relpath, where, kind, observed, provenance, session_token,
+            ),
+        )
+    return benign
+
+
+def _clock_attribution_line(
+    provenance: dict[str, str] | None, session_token: str | None,
+) -> str:
+    """One line saying what provenance the stamp carried and why it did not clear.
+
+    Appended to the falsified message so a reader is never left guessing whether
+    attribution was attempted — the difference between "this write is provably
+    yours" and "nothing in this file says who wrote it" is the whole reason the
+    two readings below can be told apart at all.
+    """
+    if provenance is None:
+        return (
+            'Attribution: the stamp carries no usable provenance (no '
+            f'{CLOCK_PROVENANCE_SOURCE_KEY!r}/{CLOCK_PROVENANCE_SESSION_KEY!r} '
+            'pair of strings), so it cannot be told apart from a test stamp and '
+            'is treated as one. A provenance-bearing stamp written outside a '
+            'pytest session would have been reported as a benign redeploy.'
+        )
+    source = provenance[CLOCK_PROVENANCE_SOURCE_KEY]
+    token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
+    if not session_token:
+        return (
+            f'Attribution: the stamp names {source!r} as its writer, but this '
+            f'run has no ${PYTEST_SESSION_TOKEN_ENV} of its own to compare it '
+            'against, so nothing here can be cleared. Fail-closed by design — '
+            'an unstamped token must never read as "every write is external".'
+        )
+    if token == session_token:
+        return (
+            f'Attribution: {source!r} wrote this stamp FROM INSIDE this run — it '
+            f'carries this run\'s own ${PYTEST_SESSION_TOKEN_ENV}, so a real '
+            'redeploy is ruled out and a test spawned the writer.'
+        )
+    return (
+        f'Attribution: {source!r} wrote this stamp from inside another pytest '
+        f'session (its ${PYTEST_SESSION_TOKEN_ENV} is not this run\'s). That '
+        'session\'s own guard fails on it too, so the signal is not lost here; '
+        'this run reports it rather than absolving a token it cannot verify.'
+    )
+
+
+def _falsified_message(
+    relpath: str,
+    where: str,
+    kind: str,
+    observed: str,
+    provenance: dict[str, str] | None,
+    session_token: str | None,
+) -> str:
+    """The accusing message — as before task 4823, plus one attribution line.
+
+    Its headline is kept byte-for-byte because it is the message four years of
+    triage notes, ``OPERATIONS.md`` and two end-to-end tests key on: the literal
+    ``'falsified a REAL deploy clock'`` is what
+    ``TestTheGuardFailsTheRunEndToEnd`` asserts on, in both directions.  Only
+    the "Fix" line moved, with task 5299: it now names the suite-wide redirect
+    in :func:`_df_deploy_clocks_unwritten` rather than the ``scripts/tests``
+    conftest fixture that no longer defines one.
+    """
+    env_var = PROTECTED_DEPLOY_CLOCK_ENV_VARS[relpath]
+    return (
+        f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+        + observed
+        + 'scripts/orchestrator-watchdog.py reads that file as "this component '
+        'was redeployed at <ts>" and SKIPS its staleness pass while the '
+        'min-interval window is open (8h by default), so the stamp silently '
+        'disarms staleness recovery for the rest of the day.\n'
+        f'Fix (the usual cause): a test spawned a process that resolved its '
+        f'clock path from the environment and reached the live checkout '
+        f'anyway. Since task 5299 the suite-wide redirect in '
+        f'df_pytest_isolation.py::_df_deploy_clocks_unwritten already points '
+        f'{env_var} at a tmp file for EVERY rootdir, so nobody "forgot to '
+        'set it" — the spawner either built its subprocess env without '
+        'copying os.environ, or hardcoded the path. Copy os.environ (as '
+        'scripts/tests/test_restart_all_orchestrators.py::_run_script does), '
+        'or pass the clock path explicitly per call (as tests/scripts/'
+        'test_orchestrator_watchdog.py::_boundary_run_drain_script does with '
+        'its REQUIRED clock_file parameter).\n'
+        'Benign alternative, worth ruling out first in a machine-operated '
+        'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
+        'operator running restart-all-orchestrators.sh --drain) fired while '
+        'this suite was running. That is a genuine stamp and not a test bug — '
+        'the two bodies printed above ARE that comparison: check the {ts, iso} '
+        'against the deploy you expect.\n'
+        + _clock_attribution_line(provenance, session_token)
+    )
+
+
+def _external_redeploy_message(
+    where: str, kind: str, observed: str, source: str,
+) -> str:
+    """The benign message: a real redeploy straddled the run.
+
+    Self-contained triage, because it is read in a merge-lane verify log by
+    someone who did not run the suite: the absolute file, the change kind, both
+    observed bodies and the writer.  It must NOT contain
+    ``'falsified a REAL deploy clock'`` — that string is the accusing verdict's
+    signature and two end-to-end tests distinguish the two paths by it.
+    """
+    return (
+        f'a REAL deploy stamped a protected clock while this run was in flight: '
+        f'{where} was {kind}.\n'
+        'This run is NOT at fault — no branch, test or spawner here caused it.\n'
+        + observed
+        + f'writer: {source} (its {CLOCK_PROVENANCE_SESSION_KEY!r} is empty, '
+        f'i.e. no pytest session was an ancestor of that write — a test-spawned '
+        f'writer would have inherited this run\'s ${PYTEST_SESSION_TOKEN_ENV} '
+        'and been reported as a falsification instead).\n'
+        'Nothing to do: the clock now holds a genuine deploy time, which is '
+        'what scripts/orchestrator-watchdog.py should read. This is reported '
+        'rather than swallowed so an unexpected redeploy is still visible.'
+    )
+
+
 def deploy_clock_violation_reason(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
@@ -536,54 +1048,38 @@ def deploy_clock_violation_reason(
 ) -> str | None:
     """Explain which protected deploy clock the run falsified, or ``None``.
 
+    The :attr:`~ClockVerdict.FALSIFIED`-only half of
+    :func:`deploy_clock_change_report`, which is the attributing entry point and
+    the one the fixture calls — a change this function passes over is not
+    necessarily unchanged, it may have been attributed to a REAL redeploy.  Kept
+    at its original three-argument signature, so the session token can only come
+    from the ambient :data:`PYTEST_SESSION_TOKEN_ENV`, which is exactly where
+    every spawner picks it up.
+
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
     order, what happened to it, the before/after readings actually observed, and
-    both readings of that observation — a test that forgot to redirect its clock
-    (the common case, with the concrete remedy) and a genuine concurrent redeploy
-    in a machine-operated checkout (not a bug at all).  Naming only the first
-    would invite the reader to assume whichever one they thought of first.
+    both readings of that observation — a spawner that escaped the suite-wide
+    redirect (the common case, with the concrete remedy) and a genuine concurrent
+    redeploy in a machine-operated checkout (not a bug at all).  Naming only the
+    first would invite the reader to assume whichever one they thought of first.
 
     *root* is optional and cosmetic-but-load-bearing: pass the checkout the
     snapshots were taken against and the message names the ABSOLUTE file.  A run
     guards more than one checkout (see :func:`deploy_clock_guard_roots`), so a
     bare relpath leaves the reader unable to tell which one was falsified.
     """
-    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
-        before_entry, after_entry = before.get(relpath), after.get(relpath)
-        kind = _clock_change_kind(before_entry, after_entry)
-        if kind is None:
-            continue
-        env_var = (
-            'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
-        )
-        where = relpath if root is None else str(Path(root) / relpath)
-        return (
-            f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
-            f'observed before: {_describe_clock_entry(before_entry)}\n'
-            f'observed after:  {_describe_clock_entry(after_entry)}\n'
-            'scripts/orchestrator-watchdog.py reads that file as "this component '
-            'was redeployed at <ts>" and SKIPS its staleness pass while the '
-            'min-interval window is open (8h by default), so the stamp silently '
-            'disarms staleness recovery for the rest of the day.\n'
-            f'Fix (the usual cause): a test spawned a process that resolved its '
-            f'clock path from the environment and defaulted to the live checkout. '
-            f'Point {env_var} at a tmp file for the whole suite, as '
-            'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
-            'per call, as tests/scripts/test_orchestrator_watchdog.py::'
-            '_boundary_run_drain_script does with its REQUIRED clock_file '
-            'parameter.\n'
-            'Benign alternative, worth ruling out first in a machine-operated '
-            'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
-            'operator running restart-all-orchestrators.sh --drain) fired while '
-            'this suite was running. That is a genuine stamp and not a test bug — '
-            'the two bodies printed above ARE that comparison: check the {ts, iso} '
-            'against the deploy you expect.'
-        )
-    return None
+    report = deploy_clock_change_report(
+        before, after,
+        session_token=os.environ.get(PYTEST_SESSION_TOKEN_ENV),
+        root=root,
+    )
+    if report is None or report[0] is not ClockVerdict.FALSIFIED:
+        return None
+    return report[1]
 
 
 @pytest.fixture(scope='session', autouse=True)
-def _df_deploy_clocks_unwritten():
+def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
 
     The roots come from :func:`deploy_clock_guard_roots`, seeded with
@@ -595,6 +1091,21 @@ def _df_deploy_clocks_unwritten():
     hardcodes its ``REPO_DIR`` and so writes there regardless of which worktree
     spawned it.  So the guard watches exactly the files a forgetful spawner would
     hit, in every checkout it could hit them in.
+
+    ATTRIBUTES rather than accuses: it stamps a fresh per-session token into
+    :data:`PYTEST_SESSION_TOKEN_ENV` and hands it to
+    :func:`deploy_clock_change_report` at teardown, which decides what a moved
+    clock means — fail, or warn with :class:`DeployClockRedeployWarning` and
+    leave the run green — and states why.
+
+    The token lives in the ENVIRONMENT for the same reason
+    :data:`LEAK_TOKEN_ENV` does, and that fixture established the mechanism:
+    every spawner here builds its child env from ``dict(os.environ)``, so
+    descendants are tagged for free — including the ones nobody has written yet,
+    which is the whole population this defence exists for.  The prior value is
+    saved and restored exactly (popped when it was absent), because conftests
+    nest and this module's own end-to-end tests run nested pytest sessions that
+    must read THEIR token, not an outer one.
 
     SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
     documents — cost (a function-scoped autouse fixture runs once per test,
@@ -608,24 +1119,119 @@ def _df_deploy_clocks_unwritten():
     while a suite runs there.  A restoring guard would silently roll back a
     GENUINE fleet-deploy stamp, re-opening the very 8h window this defence
     exists to close — and doing it invisibly, which is strictly worse than the
-    bug.  Hence the failure message names the benign concurrent-redeploy
-    reading alongside the test-bug one.
+    bug.  Attribution does not change that: knowing a stamp is genuine is a
+    reason to leave it alone, not a licence to touch it.
 
     A failure raised in teardown surfaces as a run-level ERROR with a non-zero
     exit code even when every test passed.  That is the intended loudness: the
     damage is to production state, not to any one test's result.
+
+    THE MITIGATION LIVES HERE TOO, as of task 5299.  Before task 3797's guard
+    above ever fires, EVERY entry of :data:`PROTECTED_DEPLOY_CLOCK_ENV_VARS`
+    is pointed at a tmp file for the WHOLE session — the same redirect
+    ``scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect`` used to apply
+    for that one rootdir only.  The guard above is wired into all NINE
+    conftests that import this module (root plus the eight subproject
+    rootdirs), so a test that spawns ``restart-all-orchestrators.sh`` or
+    ``scripts/orchestrator-watchdog.py`` from ANY of them — not just
+    ``scripts/tests`` — now inherits a redirected env var instead of falling
+    through to the live checkout default. Folding the redirect into this
+    already-universally-wired fixture, rather than adding a second fixture that
+    every conftest would need to import separately, is what keeps mitigation
+    and guard from drifting apart again (heuristic 11, SPOT) — a second,
+    independently-wired mitigation fixture is exactly the shape that produced
+    the scripts-tests-only gap this task closes.
+
+    Deliberately does NOT close the gap for a GENUINE external redeploy: a real
+    ``restart-all-orchestrators.sh --drain`` (the deployed watchdog, or an
+    operator) runs as its own process with its own environment and writes the
+    literal default path directly, regardless of what this session's
+    ``os.environ`` says. This redirect only reaches processes THIS session
+    spawns. The guard's roots therefore still watch the literal live paths, and
+    a concurrent genuine redeploy still moves one of them mid-run — that case
+    is what the ATTRIBUTION above (task 4823) is for: a provenance-bearing
+    stamp with no pytest ancestor is downgraded to a warning rather than
+    failing the run. The two defences are complementary, not redundant: the
+    redirect keeps this session's own spawners off the live clocks, and
+    attribution tells the guard that whatever still moved them was not us.
+
+    Restored EXACTLY on teardown — popping each key when it was absent rather
+    than setting an empty string, for the same reason
+    ``_df_git_ceiling_at_basetemp`` restores absence by deletion: an empty
+    value is not "unset" to the shell scripts' ``${VAR:-…}`` defaults.
     """
+    token = uuid.uuid4().hex
+    prior = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
+    os.environ[PYTEST_SESSION_TOKEN_ENV] = token
     roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
     before = [(root, deploy_clock_snapshot(root)) for root in roots]
+    saved_env = {
+        env_var: os.environ.get(env_var)
+        for env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.values()
+    }
+    redirect_dir = tmp_path_factory.mktemp('deploy-clock-redirect')
+    # THE SUITE-WIDE REDIRECT (task 5299) — the answer to "who sets
+    # ORCH_FLEET_DEPLOY_CLOCK / FM_DEPLOY_CLOCK for this suite?", which this
+    # fixture's name (about DETECTION) does not advertise. Grep lands here.
+    for relpath, env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.items():
+        os.environ[env_var] = str(redirect_dir / Path(relpath).name)
     try:
         yield
     finally:
+        # Restore BEFORE evaluating: nested sessions (this module's own
+        # end-to-end tests run some) must not inherit a token that has stopped
+        # being current. Mirrors _df_no_leaked_drain_processes exactly.
+        if prior is None:
+            os.environ.pop(PYTEST_SESSION_TOKEN_ENV, None)
+        else:
+            os.environ[PYTEST_SESSION_TOKEN_ENV] = prior
+        for env_var, saved in saved_env.items():
+            if saved is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = saved
         for root, snapshot in before:
-            reason = deploy_clock_violation_reason(
-                snapshot, deploy_clock_snapshot(root), root=root,
+            report = deploy_clock_change_report(
+                snapshot, deploy_clock_snapshot(root),
+                session_token=token, root=root,
             )
-            if reason is not None:
-                pytest.fail(reason, pytrace=False)
+            if report is None:
+                continue
+            verdict, message = report
+            if verdict is ClockVerdict.EXTERNAL_REDEPLOY:
+                warnings.warn(message, DeployClockRedeployWarning, stacklevel=1)
+                continue
+            pytest.fail(message, pytrace=False)
+
+
+@pytest.fixture(scope='session')
+def _df_fleet_deploy_clock_redirect(_df_deploy_clocks_unwritten) -> Path:
+    """The ``ORCH_FLEET_DEPLOY_CLOCK`` path this session's redirect resolved to.
+
+    NOT autouse: the redirect itself is applied unconditionally by
+    :func:`_df_deploy_clocks_unwritten`, which every conftest that imports this
+    module already binds.  This fixture exists only so a test that wants to
+    assert ON the redirected path (rather than merely benefit from it) can take
+    it BY NAME instead of reading ``os.environ`` bare — deleting the fixture
+    then fails collection with a message naming it, instead of quietly passing
+    off a leftover env var, mirroring ``_df_fleet_dir_redirect``'s convention.
+
+    Requesting ``_df_deploy_clocks_unwritten`` as a parameter (rather than
+    relying on its autouse ordering) makes the dependency explicit: pytest
+    resolves it before this fixture's body runs, so the env var this reads is
+    guaranteed already redirected.
+
+    Formerly ``scripts/tests/conftest.py``'s own fixture (task 3797); promoted
+    here and generalized to the whole-session redirect (task 5299) so
+    ``scripts/tests`` is no longer the only rootdir that mitigates what the
+    guard above catches everywhere.
+
+    Identifies its clock by :data:`FLEET_DEPLOY_CLOCK_RELPATH`, never by
+    position in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`: that tuple's order is
+    the guard message's reporting order, so a reorder made for readability
+    must not silently repoint this fixture at the fused-memory clock.
+    """
+    return Path(os.environ[PROTECTED_DEPLOY_CLOCK_ENV_VARS[FLEET_DEPLOY_CLOCK_RELPATH]])
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +1272,28 @@ WAIT_PROOF_GRACE_FLOOR_SECS = 30
 # comparing this literal to another literal in the same file cannot fail except
 # when someone edits it, which the tests here would catch anyway.
 LEAK_SELF_TERMINATION_CEILING_SECS = 90
+
+# The other half of that invariant, from the caller's side: the largest spawn
+# timeout a wait-proving test may use.
+#
+# DERIVED, not chosen. wait_proof_grace_secs(t) = max(FLOOR, ceil(t * MULTIPLIER)),
+# so with the values above t=22 -> 88 <= 90 (legal) and t=23 -> 92 > 90 (illegal).
+# 22 is therefore the largest spawn timeout whose derived grace still lets a
+# poller that escapes its kill expire inside the ceiling. The same arithmetic is
+# already spelled out inline at
+# ``scripts/tests/test_restart_all_orchestrators.py`` for the force-fire test's
+# own ``spawn_timeout = 22``; this constant is what stops the NEXT site
+# re-deriving it by hand -- which is how a grace gets chosen freehand, and how
+# 86 orphan pollers accumulated on 2026-08-06.
+#
+# Unlike LEAK_SELF_TERMINATION_CEILING_SECS above -- documented as DECLARATIVE,
+# with nothing computing from it -- this one IS computed from, so moving either
+# WAIT_PROOF_GRACE_MULTIPLIER or the ceiling must be reflected here.
+# ``tests/scripts/test_drain_process_leak_isolation.py::
+# TestWaitProofGraceSecs::test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits``
+# asserts BOTH that this value is legal and that value+1 is not, so it cannot
+# silently drift out of date in either direction.
+WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS = 22
 
 
 def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
@@ -709,11 +1337,95 @@ def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
     return max(WAIT_PROOF_GRACE_FLOOR_SECS, derived)
 
 
+def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
+    """Scale a subprocess budget by host load-per-core, floored and capped.
+
+    The promoted, SHARED form of ``tests/scripts/test_spawn_claude.py``'s
+    module-private ``_load_scaled_grace`` (task 2733, promoted by task 4890).
+    Promoted rather than copied because ``scripts/tests/`` cannot import a
+    ``tests/scripts/`` test module -- the two test roots cannot import each
+    other's modules at all, for the reason already written down at
+    ``tests/scripts/test_orchestrator_watchdog.py::_boundary_run_drain_script``
+    -- and this module is where the cross-root helpers already live.
+
+    THE FLOOR IS THE POINT. An idle host (``loadavg_1min <= cpu_count``) gives
+    ``factor == 1.0`` exactly, and ``max(base, min(cap, ceil(base * 1.0)))``
+    is exactly ``base_secs`` for every ``base_secs <= cap_secs``. So adopting
+    this at an existing call site can only LENGTHEN that site's budget under
+    contention; it can never shorten one, and it cannot slow an unloaded run
+    by so much as a millisecond. That is what makes it safe to swap in under
+    a fixed literal without re-deriving the literal.
+
+    Capped at *cap_secs* so a pathologically loaded host stays bounded, and
+    fails safe to *base_secs* where the platform has no loadavg. Note the
+    ``max``/``min`` ORDER: a *cap_secs* below *base_secs* returns *base_secs*,
+    never the smaller cap, because callers derive caps from unrelated ceilings
+    rather than choosing them above every base.
+
+    That regime is SAFE but INERT, and it WARNS (task 4890 amendment). With
+    ``cap_secs < base_secs`` the ``min`` can never raise the result above the
+    cap and the ``max`` can never let it fall below the base, so the answer is
+    ``base_secs`` at every load: the call site gets exactly zero load
+    protection, which is the opposite of what adopting this function looks
+    like it bought. Returning the safe value SILENTLY would make a
+    mis-derived cap undiscoverable -- the silent-degradation failure this
+    repo's design invariants name -- so a ``RuntimeWarning`` is emitted and
+    the returned value is unchanged. A warning rather than a raise because
+    the regime is REACHABLE by construction, not a programming error: caps
+    here come from unrelated ceilings (a per-test timeout axe, a leak
+    self-termination bound) that a future base may legitimately outgrow, and
+    failing the caller outright would trade an inert budget for a red suite.
+
+    LOAD-PER-CORE, not worker count, is the right signal for the two test
+    roots that use this, and it STAYS right now that they run under xdist.
+    Task 5408 put ``-n auto --dist loadgroup`` on the ``scripts`` module's
+    test_command, which is the command that runs both ``tests/scripts/`` and
+    ``scripts/tests/``, so the clause this paragraph used to carry -- "they run
+    SERIALLY (no xdist, no random ordering)" -- is false and is corrected rather
+    than softened.
+    Nothing about the function changes, for two independent reasons. Loadavg is
+    a WHOLE-HOST signal, so it already counts this suite's own workers
+    alongside every other suite's -- the contention is no longer purely
+    EXTERNAL, but it is still fully visible, which is all this reads it for.
+    And the result is a FLOOR: at ``factor == 1.0`` it returns ``base_secs``
+    exactly, so every call site can only be LENGTHENED under contention, never
+    shortened. A worker-count heuristic would still be the wrong signal: it
+    would see this root's own 8 workers and nothing of the other suites sharing
+    the 32-core host.
+
+    Returns an ``int``: callers stringify these budgets into env vars that
+    bash's integer operators compare, and those reject ``30.0`` -- the same
+    constraint :func:`wait_proof_grace_secs` records.
+    """
+    if cap_secs < base_secs:
+        # BEFORE the loadavg read, so the warning does not depend on the
+        # platform having one: the inertness is a property of the two
+        # arguments alone and holds identically on the fail-safe path.
+        warnings.warn(
+            f'load_scaled_grace(base_secs={base_secs}, cap_secs={cap_secs}): '
+            f'cap_secs is BELOW base_secs, so this budget is INERT -- '
+            f'max(base, min(cap, ...)) returns {base_secs} at every load and '
+            f'this call site gets no load protection at all. The value '
+            f'returned is still safe (never shorter than base_secs), which is '
+            f'why this warns instead of raising. Fix by raising cap_secs or '
+            f'lowering base_secs; if the cap is derived from a ceiling the '
+            f'base has outgrown, that ceiling is the thing to revisit.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return base_secs
+    factor = max(1.0, load1 / (os.cpu_count() or 1))
+    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
+
+
 def _unsafe_pgid_reason(pgid: int) -> str | None:
     """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
 
     Ported (not imported — see the module docstring's stdlib-only constraint)
-    from ``shared.proc_group._unsafe_pgid_reason``, which is the canonical
+    from ``shared.proc_group.unsafe_pgid_reason``, which is the canonical
     async sibling of this function and the place to look for the full history.
 
     This is not belt-and-braces. That module's docstring records task 845: a
@@ -1407,6 +2119,36 @@ def fleet_dir_redirect_violation_reason(
     return None
 
 
+def fleet_dir_redirect_target(
+    existing_value: str | None,
+    basetemp: str | os.PathLike[str],
+) -> Path | None:
+    """The already-sound ``ORCH_FLEET_DIR`` to ADOPT, or ``None`` to create one.
+
+    Defined ON TOP of :func:`fleet_dir_redirect_violation_reason`: adopt
+    *existing_value* exactly when that rule finds no violation in it. One rule,
+    not two -- a second copy of the soundness test would drift, and adoption is
+    the one place where accepting a value the tests reject would silently undo
+    the whole defence.
+
+    WHY ADOPTION EXISTS (task 4398): :func:`_df_fleet_dir_redirect` is
+    session-scoped AND autouse, and each test root's conftest binds its own
+    copy. A session collecting two roots runs BOTH instances; without adoption
+    each unconditionally ``mktemp``s and overwrites the env var, so the root
+    whose fixture ran first yields a path that no longer matches
+    ``ORCH_FLEET_DIR`` and its per-root identity assertion fails. One basetemp
+    per session, so "inside this run's basetemp" is well-defined for the check.
+
+    A value from a PREVIOUS session is not adopted: it lands outside this run's
+    basetemp, which the rule already refuses.
+    """
+    if not existing_value:
+        return None
+    if fleet_dir_redirect_violation_reason(existing_value, basetemp) is not None:
+        return None
+    return Path(existing_value)
+
+
 @pytest.fixture(scope='session', autouse=True)
 def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     """Point ``ORCH_FLEET_DIR`` at a tmp dir for this whole session (task 3799).
@@ -1445,8 +2187,60 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     absent rather than setting an empty string — an empty ``ORCH_FLEET_DIR`` is
     not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
     through to the production path, i.e. be its own bug.
+
+    IDEMPOTENT ACROSS TEST ROOTS (task 4398).  Each root's conftest binds its own
+    copy of this session-scoped fixture, so a session collecting two roots runs
+    both.  When :func:`fleet_dir_redirect_target` says the value already set is
+    sound for this run, this instance ADOPTS it and touches neither ``mktemp``
+    nor ``os.environ`` — otherwise the second instance to run would overwrite the
+    env var out from under the first, leaving the first yielding a path the var
+    no longer holds (which is exactly the failure 4398 reported), and its
+    teardown would then pop a value the owning instance still needs.
+
+    Adoption is NOT the weakening the paragraph above warns against, and the
+    distinction is precise: it is gated on the value already satisfying the very
+    rule every one of these tests asserts, so it can never accept something
+    :func:`fleet_dir_redirect_violation_reason` would reject.  All three
+    properties survive it — hermeticity (the adopted value is inside this run's
+    basetemp and is not the live dir), the per-root PROOF (each root's test still
+    takes this fixture BY NAME, so deleting a conftest binding still fails
+    collection), and per-call ``env=`` overrides still winning.
+
+    WHAT THE RULE CHECKS IS THE PATH, NOT THE FILESYSTEM, so the adopting branch
+    re-establishes the "directory is CREATED" contract itself with an idempotent
+    ``mkdir`` (task 4890 amendment) rather than trusting that whoever set the
+    variable had already made the directory.  A second soundness test here would
+    drift from :func:`fleet_dir_redirect_violation_reason`; simply making the
+    directory cannot, and is a no-op in the ordinary case where the owning
+    instance ``mktemp``'d it.
+
+    NOT gated on an ownership flag, deliberately.  The failure such a flag would
+    guard — some unrelated code leaving a basetemp-internal value behind for this
+    to inherit — needs that value to be present when this SESSION-scoped fixture
+    first runs, i.e. set by another root's instance of this very fixture, which
+    is the case adoption exists for.  A module-global flag would add mutable
+    process state whose own correctness then needs pinning, in exchange for
+    refusing a value that already satisfies the shared rule.  The branch is
+    instead proven end-to-end, in a real two-root session, by
+    ``tests/scripts/test_fleet_dir_isolation.py::TestTheAdoptBranchHoldsInARealSession``.
     """
     saved = os.environ.get(_FLEET_DIR_ENV)
+    adopted = fleet_dir_redirect_target(saved, tmp_path_factory.getbasetemp())
+    if adopted is not None:
+        # Another root's instance already established a sound redirect for this
+        # session. Yield IT and touch os.environ NOT AT ALL: creating a second
+        # dir here would overwrite the env var out from under the instance that
+        # owns it, and popping it on teardown would strip a value that instance
+        # still needs.
+        #
+        # The one thing this branch does do is make the directory, because
+        # fleet_dir_redirect_target rules on the PATH and cannot know whether it
+        # exists -- see the docstring. Idempotent, and a no-op for the owning
+        # instance's mktemp'd dir.
+        adopted.mkdir(parents=True, exist_ok=True)
+        yield adopted
+        return
+
     fleet_dir = tmp_path_factory.mktemp('fleet-dir')
     os.environ[_FLEET_DIR_ENV] = str(fleet_dir)
     try:
@@ -1582,3 +2376,100 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
         reason = leaked_fleet_heartbeat_reason(new)
         if reason is not None:
             pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Ambient git redirection (incident 2026-08-31)
+# ---------------------------------------------------------------------------
+
+# The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
+# only names that change WHICH repository (or which config) a command acts on.
+# Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
+# what a commit says, never where it lands, and tests legitimately set them for
+# determinism.
+#
+# GIT_CEILING_DIRECTORIES is NOT here and must never be: it is the first
+# defence's own mechanism (:func:`_df_git_ceiling_at_basetemp`), so scrubbing it
+# would disarm the guard above this one.
+_GIT_REDIRECT_ENV = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+)
+
+# `git -c` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
+# so they cannot be enumerated by name.
+_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+
+
+def git_redirect_env(env: Iterable[str]) -> list[str]:
+    """The names in *env* that would retarget git away from the path it is given.
+
+    Pure and total over the key set, so the fixture below and any harness
+    building a subprocess env can share one definition of "redirecting" instead
+    of maintaining two lists that drift.
+    """
+    return sorted(
+        key for key in env
+        if key in _GIT_REDIRECT_ENV
+        or key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _df_git_env_hermetic():
+    """FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+    Incident 2026-08-31.  ``git -C <path>`` READS as "act on <path>", but ``-C``
+    only changes directory: ``GIT_DIR`` and its siblings SKIP repository
+    discovery outright, so a single ambient ``GIT_DIR`` silently redirects every
+    such call into whatever repository it names, with the ``-C`` argument inert.
+    139 test files in this repo run ``git config user.*`` / ``git commit``
+    against a ``tmp_path`` repo they created; under a leaked ``GIT_DIR`` all 139
+    write to the leaked repository instead.  Measured outcome in the live
+    checkout: placeholder content committed onto ``main``, and ``[user] name=Test
+    email=test@example.com`` plus ``commit.gpgsign = false`` written into the real
+    ``.git/config`` -- the literal values from one harness's tmp-pinned fixture.
+
+    WHY THE FIRST DEFENCE DOES NOT COVER THIS, since the two look alike and one
+    is directly above the other.  ``GIT_CEILING_DIRECTORIES`` bounds the upward
+    WALK of repository discovery.  An explicit ``GIT_DIR`` never walks, so the
+    ceiling is not weakened by the leak -- it is bypassed entirely.  Verified
+    against real git before this fixture was written: with the ceiling armed at
+    the basetemp AND ``GIT_DIR`` set, ``git -C <under-basetemp> config
+    user.email`` still wrote to the ``GIT_DIR`` repo.  The two defences cover
+    disjoint halves of "git acted on a repo the caller did not name", and
+    neither subsumes the other.
+
+    FUNCTION scope, diverging from all four siblings, and the divergence is the
+    whole point.  Their hazard is ambient state present when the session STARTS,
+    which a session-scoped fixture fixes once.  This one's hazard is a leak
+    introduced MID-SESSION -- task 4966 measured it as a 1-in-3 flake that is
+    green standalone and green when its own file runs alone, i.e. produced by an
+    earlier test in the same process mutating ``os.environ`` and not restoring
+    it.  A session-scoped scrub would run before that leaker and close nothing.
+    The cost objection those siblings answer does not apply: this is a handful of
+    dict lookups with no subprocess and no filesystem access.
+
+    Restores the pre-test value EXACTLY on teardown, including restoring absence
+    by deleting the key.  That keeps the fixture a shield rather than a cleaner:
+    a test that deliberately sets ``GIT_DIR`` for its own subprocess still sees
+    it, and a leak is contained to the test that produced it instead of being
+    silently repaired (which would hide the leaker from task 4966's hunt).
+    """
+    saved = {key: os.environ[key] for key in git_redirect_env(os.environ)}
+    for key in saved:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        for key in git_redirect_env(os.environ):
+            del os.environ[key]
+        os.environ.update(saved)

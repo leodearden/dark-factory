@@ -470,7 +470,7 @@ class TestE8RetentionGcPrunesByCap:
 
     def test_default_caps_are_a_no_op(self, tmp_path, caplog, capsys):
         """(b) DEFAULT CAPS — the same real archive under the shipped defaults
-        (90 days / 5000 dirs) is untouched: nothing removed, nothing even
+        (90 days / 50000 dirs) is untouched: nothing removed, nothing even
         classified as prunable, and not one prune line emitted."""
         archive_root, archived = _archive_five_real_task_dirs(tmp_path)
         caplog.set_level(logging.INFO, logger='gc_agent_transcripts')
@@ -489,7 +489,8 @@ class TestE8RetentionGcPrunesByCap:
             'max_age_days': gct.DEFAULT_MAX_AGE_DAYS,
             'max_task_dirs': gct.DEFAULT_MAX_TASK_DIRS,
         }
-        assert (gct.DEFAULT_MAX_AGE_DAYS, gct.DEFAULT_MAX_TASK_DIRS) == (90, 5000)
+        assert gct.DEFAULT_MAX_AGE_DAYS == 90
+        assert gct.DEFAULT_MAX_TASK_DIRS == 50000
         assert report['scanned'] == 5
         assert report['kept'] == 5
         assert report['pruned'] == 0
