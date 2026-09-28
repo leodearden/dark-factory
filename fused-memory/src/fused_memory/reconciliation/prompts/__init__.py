@@ -953,14 +953,14 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
     ),
     'cite_task': (
         '- `{call}` — both project_id and task_id are required. **Dedup anchor**: cross-cycle'
-        ' dedup keys a finding on its whole citation set (every task, entity, edge and memory'
-        ' it cites); the top-level `task_id` of `add_finding` cannot anchor it. Always call'
-        ' `cite_task` for the primary subject task, and cite the same set every cycle: the'
-        ' primary subject plus only citations that are stable evidence. Adding or dropping'
-        ' any citation re-keys the finding. Keep passing the top-level `task_id` for the'
-        ' subject task anyway: it keys in-run dedup and the `actionable` default. Exception:'
-        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-        ' sole dedup anchor there.\n'
+        ' dedup keys a finding on its whole citation set: `_derive_affected_ids` feeds every'
+        ' cited task, entity, edge and memory into `compute_content_fingerprint`, and never'
+        ' the top-level `task_id` field of `add_finding`. Always call `cite_task` for the'
+        ' primary subject task, and cite the same set every cycle: the primary subject plus'
+        ' only citations that are stable evidence. Adding or dropping any citation re-keys'
+        ' the finding. Keep passing the top-level `task_id` for the subject task anyway: it'
+        ' keys in-run dedup and the `actionable` default. Exception: cross_project findings'
+        ' use `task_id=None` (operator routing); `cite_task` is the sole dedup anchor there.\n'
     ),
     'cite_memory': (
         '- `{call}` — `memory_id` must be the full 36-char UUID from the `id` field of a'
