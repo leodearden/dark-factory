@@ -952,16 +952,13 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
     ),
     'cite_task': (
-        '- `{call}` — both project_id and task_id are required. **Dedup anchor**:'
-        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-        ' `cite_task` is the only cross-cycle dedup anchor: the flag signature also folds'
-        ' every cited task into its key, so the same top-level `task_id` lands in a new'
-        ' bucket whenever citations change. For multi-task findings, cite the same primary'
-        ' task every cycle. Keep passing the top-level `task_id` for the subject task'
-        ' anyway: it keys in-run dedup and the `actionable` default, just not the'
-        ' cross-cycle fingerprint. Exception:'
+        '- `{call}` — both project_id and task_id are required. **Dedup anchor**: cross-cycle'
+        ' dedup keys a finding on its whole citation set (every task, entity, edge and memory'
+        ' it cites); the top-level `task_id` of `add_finding` cannot anchor it. Always call'
+        ' `cite_task` for the primary subject task, and cite the same set every cycle: the'
+        ' primary subject plus only citations that are stable evidence. Adding or dropping'
+        ' any citation re-keys the finding. Keep passing the top-level `task_id` for the'
+        ' subject task anyway: it keys in-run dedup and the `actionable` default. Exception:'
         ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
         ' sole dedup anchor there.\n'
     ),
