@@ -61,8 +61,11 @@ import logging
 import re
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, NamedTuple
 
+from fused_memory.middleware.recurring_gate_guard import is_gate_submission
+from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_project_id_for_root
 from fused_memory.reconciliation.citation_verifier import (
     LivenessVerdict,
@@ -78,6 +81,8 @@ X_LIVENESS_REVERIFIED_AT_KEY = 'x_liveness_reverified_at'
 X_LIVENESS_EXCEPTIONS_KEY = 'x_liveness_exceptions'
 
 ENUMERATED_ID_TRUNCATED = 'EnumeratedIdTruncated'
+ENUMERATION_SCOPE_MISSING = 'EnumerationScopeMissing'
+ENUMERATION_SCOPE_MALFORMED = 'EnumerationScopeMalformed'
 
 _TRUNCATED_OUTCOME = 'truncated'
 
@@ -168,6 +173,83 @@ def _truncated_rejection(fragments: list[tuple[str, str]]) -> dict[str, Any]:
         'error_type': ENUMERATED_ID_TRUNCATED,
         'offenders': [{'path': path, 'value': value} for path, value in fragments],
         'hint': problems[0]['hint'],
+    }
+
+
+def enumeration_scope_example() -> dict[str, Any]:
+    """A well-formed ``x_enumeration_scope``; ``note`` is the one optional field."""
+    return {
+        'stores': [SourceStore.mem0.value],
+        'categories': [MemoryCategory.procedural_knowledge.value],
+        'exhaustive': False,
+        'note': 'how the sweep was bounded, e.g. one search per category',
+    }
+
+
+def _vocabulary_problem(value: Any, vocabulary: type[StrEnum]) -> str | None:
+    allowed = [member.value for member in vocabulary]
+    if not isinstance(value, list) or not value:
+        return f'must be a non-empty list drawn from {allowed}'
+    unknown = [item for item in value if item not in allowed]
+    if unknown:
+        return f'unknown value(s) {unknown!r}; allowed: {allowed}'
+    return None
+
+
+def _scope_problems(scope: Any) -> list[dict[str, str]]:
+    """Every problem with a present scope, per field — never just the first."""
+    if not isinstance(scope, dict):
+        return [{
+            'field': X_ENUMERATION_SCOPE_KEY,
+            'problem': f'must be an object, got {type(scope).__name__}',
+        }]
+    problems = {
+        'stores': _vocabulary_problem(scope.get('stores'), SourceStore),
+        'categories': _vocabulary_problem(scope.get('categories'), MemoryCategory),
+        'exhaustive': (
+            None if isinstance(scope.get('exhaustive'), bool) else 'must be a bool'
+        ),
+        'note': (
+            None if isinstance(scope.get('note', ''), str)
+            else 'must be a string when present'
+        ),
+    }
+    return [
+        {'field': field, 'problem': problem}
+        for field, problem in problems.items()
+        if problem is not None
+    ]
+
+
+def _malformed_scope_rejection(problems: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        'error': f'{X_ENUMERATION_SCOPE_KEY} is malformed: ' + '; '.join(
+            f"{problem['field']} {problem['problem']}" for problem in problems
+        ),
+        'error_type': ENUMERATION_SCOPE_MALFORMED,
+        'problems': problems,
+        'expected_shape': enumeration_scope_example(),
+        'hint': (
+            'State the searched stores and categories and whether the sweep was '
+            'exhaustive as structured fields; a prose scope cannot be checked.'
+        ),
+    }
+
+
+def _missing_scope_rejection(enumerations: list[str]) -> dict[str, Any]:
+    return {
+        'error': (
+            f'a gate enumerating Mem0 entries in {enumerations} cannot be filed '
+            f'without {X_ENUMERATION_SCOPE_KEY}'
+        ),
+        'error_type': ENUMERATION_SCOPE_MISSING,
+        'enumerations': enumerations,
+        'expected_shape': enumeration_scope_example(),
+        'hint': (
+            'Say which stores and categories the enumeration was drawn from and '
+            'whether that sweep was exhaustive, so the gate never claims "these '
+            'are the N entries" unqualified.'
+        ),
     }
 
 
@@ -356,6 +438,54 @@ def _with_gate_owned_keys(
     return rewritten
 
 
+def _rejection_before_lookup(
+    parsed: dict[str, Any], fragments: list[tuple[str, str]], *, is_filing: bool,
+) -> dict[str, Any] | None:
+    if fragments and is_filing:
+        return _truncated_rejection(fragments)
+    if X_ENUMERATION_SCOPE_KEY not in parsed:
+        return None
+    problems = _scope_problems(parsed[X_ENUMERATION_SCOPE_KEY])
+    return _malformed_scope_rejection(problems) if problems else None
+
+
+def _scope_required(parsed: dict[str, Any], liveness: _LivenessPass) -> bool:
+    return (
+        bool(liveness.enumerations)
+        and X_ENUMERATION_SCOPE_KEY not in parsed
+        and is_gate_submission(parsed)
+    )
+
+
+def _rewrite(
+    passthrough: EnumerationGateResult,
+    parsed: dict[str, Any],
+    fragments: list[tuple[str, str]],
+    liveness: _LivenessPass,
+    *,
+    verified_at: str,
+) -> EnumerationGateResult:
+    description, annotated_lines = _annotate_description(
+        passthrough.description, liveness.records, verified_at,
+    )
+    records = [_truncated_record(path, value) for path, value in fragments]
+    records.extend(liveness.records)
+    stats = dict.fromkeys(_STAT_KEYS, 0) | liveness.stats | {
+        'truncated': len(fragments),
+        'annotated_lines': annotated_lines,
+    }
+    reported = stats if any(stats.values()) else None
+    metadata = _with_gate_owned_keys(
+        parsed | liveness.enumerations,
+        records,
+        proven=bool(liveness.enumerations),
+        verified_at=verified_at,
+    )
+    if metadata == parsed and description is passthrough.description:
+        return passthrough._replace(stats=reported)
+    return EnumerationGateResult(None, description, metadata, reported)
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
@@ -380,28 +510,15 @@ async def enumeration_liveness_gate(
         return passthrough
 
     fragments = list(_list_element_fragments(parsed))
-    if fragments and is_filing:
-        return passthrough._replace(rejection=_truncated_rejection(fragments))
+    rejection = _rejection_before_lookup(parsed, fragments, is_filing=is_filing)
+    if rejection is not None:
+        return passthrough._replace(rejection=rejection)
 
     liveness = await _liveness_pass(parsed, memory_service, project_root)
-    verified_at = now().isoformat()
-    annotated_description, annotated_lines = _annotate_description(
-        description, liveness.records, verified_at,
+    if is_filing and _scope_required(parsed, liveness):
+        return passthrough._replace(
+            rejection=_missing_scope_rejection(list(liveness.enumerations)),
+        )
+    return _rewrite(
+        passthrough, parsed, fragments, liveness, verified_at=now().isoformat(),
     )
-    records = [_truncated_record(path, value) for path, value in fragments]
-    records.extend(liveness.records)
-    stats = dict.fromkeys(_STAT_KEYS, 0) | liveness.stats | {
-        'truncated': len(fragments),
-        'annotated_lines': annotated_lines,
-    }
-    reported = stats if any(stats.values()) else None
-
-    rewritten = _with_gate_owned_keys(
-        parsed | liveness.enumerations,
-        records,
-        proven=bool(liveness.enumerations),
-        verified_at=verified_at,
-    )
-    if rewritten == parsed and annotated_description is description:
-        return passthrough._replace(stats=reported)
-    return EnumerationGateResult(None, annotated_description, rewritten, reported)
