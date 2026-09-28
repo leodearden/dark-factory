@@ -11065,13 +11065,14 @@ class Harness:
                 )
 
         # Cross-reference the new id back onto the original task.
+        # ``task_metadata`` is the dispatch-time snapshot, so only the owned
+        # key is written; see
+        # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_optimistic_path.
         try:
             await self.scheduler.update_task(
                 original_id,
-                metadata={
-                    **task_metadata,
-                    'auto_eval_pair': str(new_task_id),
-                },
+                metadata={'auto_eval_pair': str(new_task_id)},
+                metadata_mode='merge',
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
