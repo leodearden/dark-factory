@@ -863,8 +863,8 @@ def _ticket_id_from_submit_result(result) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# promote_candidate / reject_candidate / retire_entry — census-only
-# codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
+# promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
+# census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
 # reuse gamma's validator + never-delete assertion + sole-writer dump;
 # codebook.py itself is NOT modified)
 # ---------------------------------------------------------------------------
@@ -925,6 +925,27 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
     result = copy.deepcopy(cb)
     entry = _find_by_id(result.get("entries") or [], entry_id, kind="retire_entry")
     entry["status"] = "retired"
+
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+ENTRY_FILING_KEY = "filing"
+ENTRY_FILING_WITHHELD = "withheld"
+ENTRY_FILING_FILED = "filed"
+"""An entry's filing marker, written by the census and never by codebook.py
+(the v2 entry schema is open-world). WITHHELD means the singleton filing gate
+held the entry back until it recurs; FILED means a ticket was filed for it
+since. An entry with no marker is not the gate's concern -- it was filed on
+first sight, or predates the gate -- and is never re-filed. Plain ``str``, not
+an Enum: ``codebook.dump`` is ``yaml.safe_dump``, which cannot represent one."""
+
+
+def mark_entry_filed(cb: dict, entry_id: str) -> dict:
+    """Mark entry *entry_id* withheld -> filed on a deep copy, RETAINED."""
+    result = copy.deepcopy(cb)
+    entry = _find_by_id(result.get("entries") or [], entry_id, kind="mark_entry_filed")
+    entry[ENTRY_FILING_KEY] = ENTRY_FILING_FILED
 
     codebook.assert_no_deletion(cb, result)
     return result
@@ -2510,6 +2531,19 @@ def run_census(
     # report and the tests all read one structure.
     dropped_verdicts: list[DroppedVerdict] = []
 
+    # Split BEFORE promotion so a withheld cluster's entry is marked as it is
+    # created. Promotion cannot change the count: it only copies a candidate's
+    # sightings into its entry, and _title_sighting_count dedups by session.
+    fileable, withheld = _split_fileable(verified, updated_codebook)
+    if withheld:
+        logger.info(
+            "census: %d verified cluster(s) recorded but not filed (no in-tree "
+            "remediation, fewer than %d sightings): %s",
+            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
+            [cluster.title for cluster in withheld],
+        )
+    withheld_titles = {cluster.title for cluster in withheld}
+
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
@@ -2548,6 +2582,8 @@ def run_census(
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
         }
+        if cluster.get("title") in withheld_titles:
+            entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
         updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
 
     for cluster in rejected:
@@ -2592,14 +2628,6 @@ def run_census(
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook.
-    fileable, withheld = _split_fileable(verified, updated_codebook)
-    if withheld:
-        logger.info(
-            "census: %d verified cluster(s) recorded but not filed (no in-tree "
-            "remediation, fewer than %d sightings): %s",
-            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
-            [cluster.title for cluster in withheld],
-        )
     task_payloads = build_task_payloads(
         fileable, project_root=project_root, project_id=project_id, harness=harness_project,
     )
