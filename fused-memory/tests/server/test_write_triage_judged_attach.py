@@ -11,6 +11,7 @@ are each written to stand alone.
 
 from __future__ import annotations
 
+import logging
 import types
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
+    OUTCOME_STORED,
     JudgeVerdict,
     TriageFailOpenCounter,
     triage_write,
@@ -168,3 +170,71 @@ class TestTheJudgedCandidateIsTheAttachTarget:
         assert decision.canonical_id == _BAND_WINNER
         assert decision.judged_candidate_id is None
         judge.assert_not_awaited()
+
+
+def _logged_exception(record: logging.LogRecord) -> str:
+    assert record.exc_info is not None, 'a fail-open is logged with its exception'
+    return str(record.exc_info[1])
+
+
+class TestABreachedVerdictFailsOpenOnce:
+    """Every judged-band contract breach stores the write and counts ONE fail-open."""
+
+    @staticmethod
+    async def _triage_breach(answer: object, caplog) -> logging.LogRecord:
+        counter = _counter()
+        with caplog.at_level(logging.DEBUG, logger=triage_write.__module__):
+            decision = await _triage(
+                _middle_band_slate(), _judge_answering(answer), counter,
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
+        assert decision.judged_candidate_id is None
+        assert counter.live_count() == 1
+        fail_opens = [
+            record for record in caplog.records
+            if 'fail-open at stage=judge' in record.getMessage()
+        ]
+        assert len(fail_opens) == 1, caplog.text
+        return fail_opens[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('answer', 'offending'),
+        [
+            pytest.param(
+                JudgeVerdict(OUTCOME_AMENDED, 'not-retrieved'), 'not-retrieved',
+                id='an id naming no retrieved record',
+            ),
+            pytest.param(
+                JudgeVerdict(OUTCOME_STORED, 'm3'), 'm3',
+                id='a stored verdict naming a candidate',
+            ),
+            pytest.param((OUTCOME_AMENDED, 7), 7, id='a non-str id'),
+            pytest.param(JudgeVerdict(OUTCOME_AMENDED, ''), '', id='an empty id'),
+            pytest.param(
+                JudgeVerdict('superseded', 'm3'), 'superseded',
+                id='an outcome outside the vocabulary',
+            ),
+        ],
+    )
+    async def test_a_value_breach_is_a_warning_naming_the_value(
+        self, answer, offending, caplog,
+    ) -> None:
+        record = await self._triage_breach(answer, caplog)
+
+        assert record.levelno == logging.WARNING, caplog.text
+        assert repr(offending) in _logged_exception(record)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'answer',
+        [
+            pytest.param(('amended', 'm3', 'x'), id='a triple'),
+            pytest.param({'outcome': 'amended', 'candidate_id': 'm3'}, id='a dict'),
+            pytest.param(None, id='None'),
+        ],
+    )
+    async def test_a_malformed_answer_shape_is_counted(self, answer, caplog) -> None:
+        await self._triage_breach(answer, caplog)
