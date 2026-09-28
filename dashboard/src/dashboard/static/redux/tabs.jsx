@@ -28,7 +28,7 @@ const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STA
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
 const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // data.js's one copy of the on-demand terminal window's key.
-const { ON_DEMAND_KEYS: ON_DEMAND_WINDOWS } = window.DF_DATA_LOADER;
+const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -285,7 +285,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[ON_DEMAND_WINDOWS.terminal.key(o.project)]), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (

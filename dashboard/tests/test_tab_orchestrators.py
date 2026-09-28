@@ -387,11 +387,11 @@ class TestOrchTabReadsTheCensus:
     def test_the_rows_come_from_the_snapshot_by_view(self, orch_tab_code):
         assert re.search(
             r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
-            r'unrequestedTerminalRows\(\s*DF\[\s*ON_DEMAND_WINDOWS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
+            r'unrequestedTerminalRows\(\s*DF\[\s*LOADER_ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
             orch_tab_code,
         ), (
             'OrchTab rows do not come from viewRows(projectRows(DF, o.project), '
-            'unrequestedTerminalRows(DF[ON_DEMAND_WINDOWS.terminal.key(o.project)]), ...). '
+            'unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
             'OrchTab never requests the terminal window, so an absent one must say so '
             'rather than datumFor\'s "not yet fetched".'
         )

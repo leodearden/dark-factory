@@ -15,15 +15,6 @@ import re
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
 
-_LOAD_SAFETY_MECHANISM = (
-    "A .jsx file's top-level bindings compile to global `var`s, and data.js "
-    'declares ON_DEMAND_KEYS, REFRESH_OUTCOMES and ON_DEMAND_VIEWS with top-level '
-    '`const`, so binding any of them under its own name kills tab_tasks.jsx on '
-    'load and blanks the Tasks tab. dashboard/tests/js/classic_script_scope.test.mjs '
-    'enforces that rule for every .jsx file; this pin keeps tab_tasks.jsx on its '
-    'chosen shape: ONE namespace alias, every export reached through it.'
-)
-
 
 @pytest.fixture(scope='module')
 def tab_tasks_code(tab_tasks_jsx_body):
@@ -78,16 +69,3 @@ def test_task_prose_renders_both_fields_as_markdown(task_prose_code):
         assert re.search(
             rf'<MarkdownText\b[^>]*\btext=\{{\s*\w+\.{field}\s*\}}', task_prose_code,
         ), f'TaskProse must render the fetched {field} through MarkdownText'
-
-
-def test_the_data_loader_is_bound_once_as_a_namespace_alias(tab_tasks_code):
-    assert len(re.findall(r'\bwindow\.DF_DATA_LOADER\b', tab_tasks_code)) == 1, (
-        'window.DF_DATA_LOADER must be read exactly once, by the DF_LOADER_T alias. '
-        + _LOAD_SAFETY_MECHANISM
-    )
-    assert re.search(
-        r'^const\s+DF_LOADER_T\s*=\s*window\.DF_DATA_LOADER\s*;', tab_tasks_code, re.M,
-    ), 'expected a top-level `const DF_LOADER_T = window.DF_DATA_LOADER;`. ' + _LOAD_SAFETY_MECHANISM
-    assert not re.search(r'\}\s*=\s*window\.DF_DATA_LOADER\b', tab_tasks_code), (
-        'the data loader must never be destructured. ' + _LOAD_SAFETY_MECHANISM
-    )

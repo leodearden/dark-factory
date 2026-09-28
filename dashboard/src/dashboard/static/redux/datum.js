@@ -37,17 +37,11 @@
 // index.html's load order is the enforced contract, pinned per-module by
 // tests/test_index_html.py.
 //
-// WHICH NAME TO BIND IT UNDER — getting it wrong fails at LOAD, with
-// "Identifier 'x' has already been declared", before the file reaches its own
-// `window.DF_*` assignment:
-//   · a classic `<script>` — data.js, task_row_cells.js, and this file — must
-//     not bind any name another classic script declares at top level.
-//   · a `type="text/babel"` tag — charts.jsx, shell.jsx, tabs.jsx and the
-//     tab_*.jsx files — compiles to global `var`s, which clash only with a
-//     classic top-level `const`/`let`/`class`: datum.js's function names are
-//     safe there, its `const`s are not.
-// Either way, rename in the destructure: `{ datumView: viewOfDatum }`.
-// dashboard/tests/js/classic_script_scope.test.mjs enforces both.
+// WHICH NAME TO BIND IT UNDER — an export's own name may already be declared at
+// top level by a classic script, and rebinding it can kill the file on LOAD.
+// Rename in the destructure: `{ datumView: viewOfDatum }`. When a name clashes
+// is stated in the SCOPE note of dashboard/tests/js/classic_script_scope.test.mjs,
+// which enforces it for classic and text/babel files alike.
 
 // ── One age formatter for the whole dashboard ──
 // Renamed per the CANONICAL note above: endpoint_staleness.js already declares

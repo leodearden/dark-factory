@@ -254,7 +254,7 @@ class TestOverviewReadsTheCensus:
         bound = set(re.findall(r'\w+', destructure.group(1)))
         used = {
             'projectCensus', 'censusOver', 'censusSegments', 'censusHistory',
-            'censusTotal', 'terminalOfTotal', 'viewShareText', 'CENSUS_VIEWS', 'CENSUS_TILES',
+            'censusTotal', 'terminalOfTotal', 'viewShareText', 'TASK_CENSUS_VIEWS', 'TASK_CENSUS_TILES',
         }
         assert used <= bound, f'tab_overview.jsx reads {sorted(used - bound)} without binding them'
 

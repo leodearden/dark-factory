@@ -138,6 +138,12 @@ test('index.html exposes the classic /static/redux/*.js scripts in document orde
       'the extraction regex has gone stale, which would make the shared-scope ' +
       'load test below silently cover nothing',
   );
+  assert.equal(
+    srcs.length,
+    readIndexHtml().match(/src="\/static\/redux\/[^"?]+\.js[?"]/g).length,
+    'CLASSIC_SCRIPT_RE missed some /static/redux/*.js <script> tag, which would silently ' +
+      `drop it from the shared-scope load below. Extracted: ${srcs.join(', ')}`,
+  );
 
   // Inverse containment: every module this harness CLAIMS to cover must
   // actually have been extracted from index.html. Paired with the forward
@@ -269,9 +275,8 @@ test('the harness actually detects a duplicate top-level const (negative control
 
 // A vendored copy of the exact Babel build index.html loads, so this suite
 // needs no npm install. Versionless on purpose: index.html's tag is the one
-// pin, and the integrity test below holds this copy to it.
+// pin, and loadVendoredBabel holds this copy to it.
 const VENDORED_BABEL = path.join(TESTS_JS_DIR, 'vendor', 'babel.min.js');
-const Babel = createRequire(import.meta.url)(VENDORED_BABEL);
 
 const BABEL_TAG_RE =
   /<script\s+src="(https:\/\/unpkg\.com\/@babel\/standalone@[^"]+\/babel\.min\.js)"\s+integrity="(sha384-[^"]+)"/;
@@ -280,6 +285,26 @@ function pinnedBabelTag() {
   const match = readIndexHtml().match(BABEL_TAG_RE);
   assert.ok(match, `found no @babel/standalone <script> tag with an integrity attribute in ${INDEX_HTML}`);
   return { url: match[1], integrity: match[2] };
+}
+
+function vendoredBabelDigest() {
+  if (!fs.existsSync(VENDORED_BABEL)) return 'missing';
+  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
+}
+
+// Loads the vendored Babel only once its sha384 matches index.html's pin, so a
+// stale, truncated or missing copy fails with the refresh command rather than
+// a parse error. require's own cache makes repeat calls cheap.
+function loadVendoredBabel() {
+  const { url, integrity } = pinnedBabelTag();
+  assert.equal(
+    vendoredBabelDigest(),
+    integrity,
+    `${VENDORED_BABEL} is not the build index.html loads (${url}), so the text/babel ` +
+      'scope test would compile the .jsx files with a different Babel than the browser. ' +
+      `Refresh it: curl -sSfL -o ${VENDORED_BABEL} ${url}`,
+  );
+  return createRequire(import.meta.url)(VENDORED_BABEL);
 }
 
 // The options Babel-standalone builds for a text/babel tag with no
@@ -292,16 +317,17 @@ const SCRIPT_TAG_BABEL_OPTIONS = {
   targets: { browsers: undefined },
 };
 
-// Matches `<script type="text/babel" src="/static/redux/<name>.jsx?v=NN"></script>`.
+// Matches `<script type="text/babel" src="/static/redux/<name>.jsx?v=NN"></script>`,
+// and the `text/jsx` spelling, which Babel-standalone executes too.
 const BABEL_SCRIPT_RE =
-  /<script\s+type="text\/babel"\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.jsx)(?:\?[^"]*)?"\s*><\/script>/g;
+  /<script\s+type="text\/(?:babel|jsx)"\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.jsx)(?:\?[^"]*)?"\s*><\/script>/g;
 
 function babelScriptSrcs(html) {
   return [...html.matchAll(BABEL_SCRIPT_RE)].map(m => m[1]);
 }
 
 function compileAsScriptTag(source, filename) {
-  return Babel.transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
+  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
 }
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
@@ -324,18 +350,11 @@ function probeJsxAgainstSharedScope(ctx, source, filename) {
 }
 
 test('the vendored Babel is the exact build index.html pins', () => {
-  const { url, integrity } = pinnedBabelTag();
-  const digest = `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
-  assert.equal(
-    digest,
-    integrity,
-    `${VENDORED_BABEL} is not the build index.html loads (${url}), so the text/babel ` +
-      'scope test would compile the .jsx files with a different Babel than the browser. ' +
-      `Refresh it: curl -sSfL -o ${VENDORED_BABEL} ${url}`,
-  );
+  assert.equal(typeof loadVendoredBabel().transform, 'function');
 });
 
 test("the harness compiles with the vendored bundle's own script-tag defaults", () => {
+  loadVendoredBabel();
   const bundle = fs.readFileSync(VENDORED_BABEL, 'utf8');
   for (const literal of [SCRIPT_TAG_BABEL_OPTIONS.presets, SCRIPT_TAG_BABEL_OPTIONS.plugins]) {
     assert.ok(
@@ -353,8 +372,8 @@ test('index.html exposes the text/babel .jsx tags in document order', () => {
   assert.ok(srcs.length > 0, `extracted no text/babel .jsx <script> tags from ${INDEX_HTML} — BABEL_SCRIPT_RE has gone stale`);
   assert.equal(
     srcs.length,
-    html.match(/type="text\/babel"/g).length,
-    'BABEL_SCRIPT_RE missed some type="text/babel" tag, which would silently drop it ' +
+    html.match(/type="text\/(?:babel|jsx)"/g).length,
+    'BABEL_SCRIPT_RE missed some type="text/babel" or "text/jsx" tag, which would silently drop it ' +
       `from the scope test below. Extracted: ${srcs.join(', ')}`,
   );
 });
