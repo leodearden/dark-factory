@@ -12,7 +12,9 @@ incidents the gate exists to prevent.
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -39,6 +41,17 @@ LIVE_B3F = 'b3f55b47-0879-49e0-a26d-53bf6ea9689a'
 LIVE_21F = '21f78de1-a5f3-4259-b907-16c8f2328e2f'
 LIVE_23E = '23eff0cd-8515-40fb-9b3e-9a5be19cbc0c'
 DELETED_0D5 = '0d542614-874b-4003-b136-76dd9d8b40f8'
+
+# Canonical UUIDs that are NOT Mem0 ids: Stage-1 finding ids and Graphiti edge
+# uuids, both of which get_memory_by_id (a Mem0 point read) reports as absent.
+FINDING_IDS = [
+    'f11018d4-be96-456b-9ab9-cf6814155500',
+    '00004132-cd91-41dc-a059-bcd698bdd73c',
+]
+GRAPHITI_EDGE_IDS = [
+    '4c1f0a57-6a8e-4d1b-9a53-2d7e1f0c9b11',
+    '9e2b7d44-1f3c-4a6e-8b0d-5c7a3e9f2d22',
+]
 
 # Gate 5533's mem0_legacy_repeat_entries, verbatim: ten bare 8-char fragments
 # with no full id beside them.
@@ -346,3 +359,201 @@ class TestTruncatedFragmentShape:
         assert result.rejection is None
         assert result.metadata is metadata
         assert result.stats is None
+
+
+# --------------------------------------------------------------------------- #
+# CHANGE 1(b): liveness over top-level metadata lists
+# --------------------------------------------------------------------------- #
+
+
+def awaited_ids(service: AsyncMock) -> list[str]:
+    return [c.args[1] for c in service.get_memory_by_id.await_args_list]
+
+
+class TestLiveness:
+    """A top-level list is a Mem0 enumeration iff a member resolves live;
+    only then are its genuinely absent members dropped."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('as_json', [False, True])
+    async def test_gate_5537_deleted_member_is_dropped_and_recorded(
+        self, project_root, as_json,
+    ):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, LIVE_23E, DELETED_0D5],
+        }
+        payload = json.dumps(metadata) if as_json else metadata
+
+        result = await run_gate(
+            project_root, payload,
+            service=memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E)),
+        )
+
+        assert result.rejection is None
+        assert result.metadata['mem0_falsified_entries'] == [
+            LIVE_B3F, LIVE_21F, LIVE_23E,
+        ]
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            {
+                'memory_id': DELETED_0D5,
+                'path': 'mem0_falsified_entries[3]',
+                'outcome': 'absent',
+            },
+        ]
+        assert result.stats is not None
+        assert {k: result.stats[k] for k in (
+            'mem0_enumerations', 'verified', 'dropped_absent', 'inconclusive',
+            'unproven_lists',
+        )} == {
+            'mem0_enumerations': 1, 'verified': 3, 'dropped_absent': 1,
+            'inconclusive': 0, 'unproven_lists': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_member_is_kept_recorded_and_logged(
+        self, project_root, caplog,
+    ):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]}
+        service = memory_service(
+            live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('qdrant timeout')},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await run_gate(project_root, metadata, service=service)
+
+        assert result.rejection is None
+        assert result.metadata['mem0_falsified_entries'] == [LIVE_B3F, LIVE_21F]
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            {
+                'memory_id': LIVE_21F,
+                'path': 'mem0_falsified_entries[1]',
+                'outcome': 'inconclusive',
+                'error_type': 'TimeoutError',
+            },
+        ]
+        assert result.stats is not None
+        assert result.stats['verified'] == 1
+        assert result.stats['dropped_absent'] == 0
+        assert result.stats['inconclusive'] == 1
+        assert any(
+            record.levelno == logging.WARNING and LIVE_21F in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_lists_that_never_resolve_live_are_left_untouched(
+        self, project_root,
+    ):
+        metadata = {
+            'origin_finding_ids': list(FINDING_IDS),
+            'cited_edges': list(GRAPHITI_EDGE_IDS),
+            'x_deleted_before_gate_open': [DELETED_0D5],
+            'x_unreachable': [LIVE_B3F, LIVE_23E],
+        }
+        service = memory_service(raising={
+            LIVE_B3F: RuntimeError('backend down'),
+            LIVE_23E: TimeoutError('qdrant timeout'),
+        })
+
+        result = await run_gate(project_root, metadata, service=service)
+
+        assert result.rejection is None
+        assert result.metadata is metadata
+        assert X_LIVENESS_EXCEPTIONS_KEY not in metadata
+        assert result.stats is not None
+        assert result.stats['unproven_lists'] == 4
+        assert result.stats['mem0_enumerations'] == 0
+
+    @pytest.mark.asyncio
+    async def test_unproven_lists_beside_a_proven_one_stay_untouched(
+        self, project_root,
+    ):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5],
+            'origin_finding_ids': list(FINDING_IDS),
+            'x_deleted_before_gate_open': [DELETED_0D5],
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+        )
+
+        assert result.metadata['mem0_falsified_entries'] == [LIVE_B3F]
+        assert result.metadata['origin_finding_ids'] == FINDING_IDS
+        assert result.metadata['x_deleted_before_gate_open'] == [DELETED_0D5]
+        assert [r['path'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == [
+            'mem0_falsified_entries[1]',
+        ]
+        assert result.stats is not None
+        assert result.stats['unproven_lists'] == 2
+
+    @pytest.mark.asyncio
+    async def test_only_top_level_list_uuids_are_looked_up(self, project_root):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F],
+            'mem0_primary_target': LIVE_21F,
+            'x_notes': [f'see {LIVE_23E} for context'],
+            GATE_METADATA_KEY: {'topic': 't', 'provenance': {
+                'observed_members': [DELETED_0D5], 'authoritative': False,
+            }},
+        }
+        service = memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
+
+        result = await run_gate(project_root, metadata, service=service)
+
+        assert awaited_ids(service) == [LIVE_B3F]
+        assert result.metadata[GATE_METADATA_KEY] == metadata[GATE_METADATA_KEY]
+
+    @pytest.mark.asyncio
+    async def test_each_distinct_id_costs_one_lookup_with_the_root_project_id(
+        self, project_root,
+    ):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5],
+            'x_related_memories': [DELETED_0D5, LIVE_21F, LIVE_B3F],
+        }
+        service = memory_service(live=(LIVE_B3F, LIVE_21F))
+
+        result = await run_gate(project_root, metadata, service=service)
+
+        assert sorted(awaited_ids(service)) == sorted([LIVE_B3F, DELETED_0D5, LIVE_21F])
+        assert {c.args[0] for c in service.get_memory_by_id.await_args_list} == {
+            'reify',
+        }
+        assert result.metadata['x_related_memories'] == [LIVE_21F, LIVE_B3F]
+        assert [r['path'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == [
+            'mem0_falsified_entries[1]', 'x_related_memories[0]',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_input_is_never_mutated(self, project_root):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, DELETED_0D5],
+            X_LIVENESS_EXCEPTIONS_KEY: [{'memory_id': 'old', 'outcome': 'absent'}],
+        }
+        snapshot = copy.deepcopy(metadata)
+
+        await run_gate(
+            project_root, metadata,
+            service=memory_service(
+                live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
+            ),
+        )
+
+        assert metadata == snapshot
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('is_filing', [True, False])
+    async def test_a_backend_failing_every_lookup_never_raises(
+        self, project_root, is_filing,
+    ):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
+        service = AsyncMock()
+        service.get_memory_by_id = AsyncMock(side_effect=RuntimeError('down'))
+
+        result = await run_gate(
+            project_root, metadata, service=service, is_filing=is_filing,
+        )
+
+        assert result.rejection is None
+        assert result.metadata is metadata
