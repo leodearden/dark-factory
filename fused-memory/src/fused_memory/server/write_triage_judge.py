@@ -12,7 +12,8 @@ reify esc-5557/esc-5626 showed that adjudicating a apparent contradiction
 needs code-reading and cross-checking that the synchronous ``add_memory``
 write path cannot do and should not try. A ``contests`` verdict routes the
 entry to the machinery that CAN adjudicate; it is a detection, not a ruling.
-The band already named the target, so a verdict is only a word.
+The verdict names the candidate it is about; the band only names the record
+the slate is guaranteed to contain.
 
 **It RAISES; it does not swallow.** ``triage_write`` already wraps the judge
 call in an ``except`` arm that logs with ``exc_info``, records exactly one
@@ -59,10 +60,11 @@ from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    JudgeVerdict,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -81,6 +83,9 @@ class JudgeOutputError(Exception):
 
 #: The key the judge is instructed to put its answer under.
 VERDICT_KEY = 'verdict'
+
+#: The key naming the candidate an attach verdict is about.
+CANDIDATE_ID_KEY = 'candidate_id'
 
 #: The CLOSED 4-way judge vocabulary, mapped onto leaf beta's ack outcomes.
 #:
@@ -198,17 +203,24 @@ def _reject(reason: str, payload: object) -> JudgeOutputError:
     return JudgeOutputError(f'judge output rejected ({reason}): {quoted}')
 
 
-def parse_judge_verdict(raw: str) -> str:
-    """Map one raw judge response onto a member of ``TRIAGE_OUTCOMES``.
+def parse_judge_verdict(raw: str, slate_ids: Collection[str]) -> JudgeVerdict:
+    """Map one raw judge response onto a :class:`JudgeVerdict`.
 
     Accepts a bare JSON object, a fenced ```json block, and JSON embedded in
     surrounding prose — via :func:`fused_memory.routing.json_extract.extract_json`,
     the repo's existing fenced-code/brace-counting extractor, rather than a
     fourth private JSON scraper.
 
+    An attach verdict must name its candidate under :data:`CANDIDATE_ID_KEY`,
+    and that id must be one of *slate_ids* — the slate the model was actually
+    SHOWN. A record retrieved but trimmed off the slate was never seen, so
+    naming it is a hallucination, not a choice. ``distinct`` names none.
+
     RAISES :class:`JudgeOutputError` for everything else: an unrecognised
     verdict word, a missing or non-string verdict key, a non-object payload,
-    empty or whitespace-only text, and prose containing no JSON at all.
+    empty or whitespace-only text, prose containing no JSON at all, an attach
+    verdict naming no candidate or one off the slate, and ``distinct`` naming
+    one.
 
     Raising rather than defaulting is the load-bearing part. ``triage_write``
     counts a fail-open for a judge that raises or answers out-of-vocabulary;
@@ -242,12 +254,38 @@ def parse_judge_verdict(raw: str) -> str:
     if not isinstance(word, str):
         raise _reject(f'no string {VERDICT_KEY!r} key', payload)
 
-    verdict = JUDGE_VERDICTS.get(word.strip().lower())
-    if verdict is None:
+    outcome = JUDGE_VERDICTS.get(word.strip().lower())
+    if outcome is None:
         raise _reject(
             f'{word!r} is not one of {sorted(JUDGE_VERDICTS)}', payload,
         )
-    return verdict
+    return JudgeVerdict(outcome, _named_candidate(payload, outcome, slate_ids))
+
+
+def _named_candidate(
+    payload: dict[str, Any], outcome: str, slate_ids: Collection[str],
+) -> str | None:
+    """The slate id *payload* names, or ``None`` for a verdict that attaches nothing."""
+    candidate_id = payload.get(CANDIDATE_ID_KEY)
+    if outcome == OUTCOME_STORED:
+        if candidate_id is not None:
+            raise _reject(
+                f'a verdict that attaches nothing names {candidate_id!r}', payload,
+            )
+        return None
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise _reject(
+            f'an attach verdict must name its candidate as a non-empty string '
+            f'{CANDIDATE_ID_KEY!r}',
+            payload,
+        )
+    if candidate_id not in slate_ids:
+        raise _reject(
+            f'{candidate_id!r} is not a candidate on the rendered slate '
+            f'{sorted(slate_ids)}',
+            payload,
+        )
+    return candidate_id
 
 
 # --- candidate selection ----------------------------------------------------
@@ -946,8 +984,8 @@ async def judge_write(
     project_id: str,
     decision: Any,
     candidates: Any = (),
-) -> str:
-    """Adjudicate one middle-band write. Returns a member of ``TRIAGE_OUTCOMES``.
+) -> JudgeVerdict:
+    """Adjudicate one middle-band write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
     replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
@@ -958,7 +996,7 @@ async def judge_write(
     Flow: resolve config LIVE → return ``stored`` early if disabled or if the
     slate selects to empty → build the prompt, which NAMES the attach target
     (``decision.canonical_id``, the same id the selector was given) → call the
-    provider under ``asyncio.wait_for`` → parse.
+    provider under ``asyncio.wait_for`` → parse against the rendered slate.
 
     RAISES on every failure — transport, timeout, unparseable output,
     out-of-vocabulary verdict — and catches nothing. ``triage_write`` owns the
@@ -1009,7 +1047,7 @@ async def judge_write(
             '%r without an LLM call',
             OUTCOME_STORED,
         )
-        return OUTCOME_STORED
+        return JudgeVerdict(OUTCOME_STORED)
 
     # ONE expression for "the band's winner" on this path. The selector
     # guarantees it is in the slate; the renderer marks it wherever it landed.
@@ -1023,7 +1061,7 @@ async def judge_write(
         canonical_id=attach_target_id,
     )
     if not selected:
-        return OUTCOME_STORED
+        return JudgeVerdict(OUTCOME_STORED)
 
     raw = await _call_llm(
         provider=resolve_judge_provider(memory_service),
@@ -1034,4 +1072,4 @@ async def judge_write(
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
     )
-    return parse_judge_verdict(raw)
+    return parse_judge_verdict(raw, [candidate.id for candidate in selected])

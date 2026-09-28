@@ -1653,8 +1653,8 @@ def _ask_judge(
         candidates=list(slate),
     ))
     return JudgeAnswer(
-        outcome=verdict,
-        verdict=verdict,
+        outcome=verdict.outcome,
+        verdict=verdict.outcome,
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
         usage=_usage_of(recorded[before:]),
