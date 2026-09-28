@@ -1106,20 +1106,21 @@ class TestPerRoleMemoryTable:
         assert 'esc-4242-1' in prompt
 
 
-class TestFormatTaskSurfaceIsPinned:
-    """The task-3254 hint-surface guard.
+class TestFormatTaskFieldSurface:
+    """Pins which task fields ``_format_task`` renders into the prompt.
 
-    Task 3254 owns ``memory_hints`` delivery in this same method and has no
-    guard artifact on main, and none of task 3659's delivered checks pins
-    hint behaviour — so a rewrite that quietly stopped rendering one of the
-    fields an agent is briefed from would land undetected.
+    Each populated field must reach the prompt on its own line and each
+    absent one must render nothing, so a rewrite that quietly stopped
+    rendering a field an agent is briefed from would not land undetected.
 
-    Pinned FIELD BY FIELD, not as one byte-for-byte equality: what 3254 needs
-    held is that each populated field reaches the prompt and each absent one
-    renders nothing. A whole-string equality would additionally freeze
-    field ORDER and every label's exact spelling, so a harmless relabelling
-    would break a guard that has nothing to do with it — and it would break
-    on 3254's own added line, which is the change it exists to protect.
+    This does NOT guard ``memory_hints`` delivery: ``briefing.py`` delivers no
+    hints today, and task 3254, which owns that decision, has no protection
+    here.
+
+    Pinned FIELD BY FIELD, not as one byte-for-byte equality: a whole-string
+    equality would additionally freeze field ORDER and every label's exact
+    spelling, so a harmless relabelling would break a guard that has nothing
+    to do with it.
     """
 
     def _task(self) -> dict:
