@@ -66,6 +66,7 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
 def _write_config(
     root: Path, *, project_id: str, escalation_port: int = 8199, cwd_prefixes=None,
     agent_transcript_roots=None, max_daily_digest_bytes: int | None = None,
+    trickle_caps: dict | None = None,
 ) -> Path:
     """Write a minimal valid docs/legibility/legibility.yaml under *root*.
 
@@ -82,6 +83,11 @@ def _write_config(
     ``budget_skipped > 0``) through the supported config seam, rather than
     by resurrecting task 3268's already-fixed raw-transcript-bytes cost
     basis.
+
+    When *trickle_caps* is given, a ``census:`` block carrying those
+    ``trickle_caps:`` keys is appended. Values are spelled with
+    ``json.dumps`` so a ``None`` cap lands as YAML ``null``, not the string
+    ``'None'``.
     """
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(root / "work")]
     legibility_dir = root / "docs" / "legibility"
@@ -100,6 +106,9 @@ def _write_config(
     if max_daily_digest_bytes is not None:
         lines.append("budgets:")
         lines.append(f"  max_daily_digest_bytes: {max_daily_digest_bytes}")
+    if trickle_caps is not None:
+        lines += ["census:", "  trickle_caps:"]
+        lines += [f"    {key}: {json.dumps(value)}" for key, value in trickle_caps.items()]
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
 
@@ -1447,7 +1456,7 @@ def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path
     cfg = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
     _line, fire = nightly.evaluate_census_step(
@@ -1467,7 +1476,7 @@ def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(
     cfg_b = load_config(_write_config(tmp_path / 'proj_b', project_id='proj_b'))
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append(project_root)
 
     for cfg in (cfg_a, cfg_b):
@@ -1484,7 +1493,7 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
     cfg = load_config(config_path)
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
     nightly.evaluate_census_step(
@@ -1493,6 +1502,30 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
     )
 
     assert calls == [(cfg.project_root, config_path)]
+
+
+def test_evaluate_census_step_forwards_the_configs_trickle_caps_to_launcher(tmp_path):
+    """The census bound is decided by the project's legibility.yaml at the one
+    place config maps to launch -- never by the launcher's own fallback, so
+    the caps here are NON-default."""
+    cfg = load_config(_write_config(
+        tmp_path / 'proj_a', project_id='proj_a',
+        trickle_caps={'max_batches': 7, 'max_verify_clusters': 9},
+    ))
+    calls = []
+
+    def rec(project_root, *, config_path=None, caps=None):
+        calls.append(caps)
+
+    nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec,
+    )
+
+    assert len(calls) == 1
+    assert calls[0] is not None
+    assert calls[0].max_batches == 7
+    assert calls[0].max_verify_clusters == 9
 
 
 def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
@@ -1527,6 +1560,68 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     assert Path(kwargs['config_path']).is_absolute()
     # The cfg and the config path name the SAME project.
     assert cfg.project_root == str(tmp_path / 'proj_a')
+
+
+def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
+    tmp_path, monkeypatch, install_fake_httpx,
+):
+    """End to end: a max-interval FIRE through run_nightly and the REAL default
+    launcher carries the project's census.trickle_caps into census.py's argv.
+
+    The injected invoke means no pool is built, so run_nightly hands
+    evaluate_census_step no launcher and the default one runs. Only
+    subprocess.run is spied -- recording every call, since nightly.subprocess
+    is the global module -- so no census really starts. Non-default caps
+    (7/9) make a silent fall-back to the schema default fail.
+    """
+    install_fake_httpx(_no_outbound_post)
+    root = tmp_path / 'proj_a'
+    config_path = _write_config(
+        root, project_id='proj_a',
+        trickle_caps={'max_batches': 7, 'max_verify_clusters': 9},
+    )
+    legibility_dir = root / 'docs' / 'legibility'
+    now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
+    # 11 days stale with a null done-count: only max-interval can fire, and
+    # condition (b) never reaches a status fetcher.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (now - timedelta(days=11)).isoformat(),
+            'last_census_done_count': None,
+        }),
+        encoding='utf-8',
+    )
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+    runs = []
+
+    def _record_run(args, **kwargs):
+        runs.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', _record_run)
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=now,
+        invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: None,
+    )
+
+    assert result.census_fire is True
+    census_launches = [
+        argv for argv in runs if len(argv) > 1 and str(argv[1]).endswith('census.py')
+    ]
+    assert len(census_launches) == 1
+    argv = census_launches[0]
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(root)]
 
 
 class TestRunNightlyBindsTheCensusLauncherToThePool:
