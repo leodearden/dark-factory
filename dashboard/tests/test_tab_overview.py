@@ -189,8 +189,8 @@ def _fleet_census(code):
 def _running_tile_entry(code):
     return _const_bound_to(
         code,
-        r"CENSUS_TILES\.find\(\s*(?P<tile>\w+)\s*=>\s*(?P=tile)\.key\s*===\s*'running'\s*\)",
-        "CENSUS_TILES.find(t => t.key === 'running')",
+        r"TASK_CENSUS_TILES\.find\(\s*(?P<tile>\w+)\s*=>\s*(?P=tile)\.key\s*===\s*'running'\s*\)",
+        "TASK_CENSUS_TILES.find(t => t.key === 'running')",
     )
 
 
@@ -203,9 +203,9 @@ def _panel(code, title):
 
 
 def _the_views_map(panel):
-    """The single ``CENSUS_VIEWS.map(v => ...)`` in *panel*: (parameter, call text)."""
-    maps = list(re.finditer(r'\bCENSUS_VIEWS\.map\(\s*(\w+)\s*=>', panel))
-    assert len(maps) == 1, f'expected one CENSUS_VIEWS.map in the panel, found {len(maps)}'
+    """The single ``TASK_CENSUS_VIEWS.map(v => ...)`` in *panel*: (parameter, call text)."""
+    maps = list(re.finditer(r'\bTASK_CENSUS_VIEWS\.map\(\s*(\w+)\s*=>', panel))
+    assert len(maps) == 1, f'expected one TASK_CENSUS_VIEWS.map in the panel, found {len(maps)}'
     paren = panel.index('(', maps[0].start())
     return maps[0].group(1), walk_balanced(panel, paren, '(', ')')
 
