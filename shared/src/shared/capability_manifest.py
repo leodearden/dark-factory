@@ -205,6 +205,19 @@ class DeliveredCheck(_CheckFieldsBase):
     on every dependent. One typo'd leading slash would wedge a dependent
     forever while emitting nothing a human would ever see, so the
     descriptor is refused loudly at authoring time instead.
+
+    WHAT THIS SCHEMA CANNOT EXPRESS. Validity here is purely structural:
+    every field a ``kind`` requires is present and well-typed. It cannot say
+    whether the descriptor will ever CHANGE VERDICT — an ``expect='present'``
+    grep pattern that already matches, or a ``'path'`` that already exists,
+    is green the day it is written and gates nothing, and a grep pattern
+    that names a FILE rather than a symbol inside it can never go green and
+    wedges whatever depends on it. All are schema-valid. Those rules are
+    tree-relative rather than field-relative, so they live in
+    :mod:`shared.delivered_check_polarity`, which ``commit_planning`` and
+    ``stamp_capability_manifests`` run at authoring time (task 3500). Authors
+    hitting a ``DeliveredCheckPolarityViolation`` should read that module's
+    docstring, not this one.
     """
 
     kind: Literal['grep', 'script', 'path', 'manual']
@@ -382,6 +395,12 @@ class DeliveredCheckMeta(_CheckFieldsBase):
 
     This ``kind`` Literal is the definition of "mechanical" — see
     :data:`MECHANICAL_CHECK_KINDS`, which derives from it.
+
+    Shares :class:`DeliveredCheck`'s limits too: passing this model says the
+    entry is well-SHAPED, not that it can ever change verdict. The
+    authoring-time polarity rules that catch the un-satisfiable shapes live in
+    :mod:`shared.delivered_check_polarity` and run against these entries in
+    ``commit_planning`` and ``stamp_capability_manifests`` (task 3500).
     """
 
     name: str = Field(min_length=1)

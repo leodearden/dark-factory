@@ -16,6 +16,12 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.delivered_check_polarity import (
+    GATE_REF,
+    extract_delivered_checks,
+    lint_delivered_checks,
+    polarity_error,
+)
 from shared.task_statuses import ACTIVE
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
@@ -9277,6 +9283,39 @@ def create_mcp_server(
         empty-corpus backfill. ``deferred``/``cancelled`` commits are never
         indexed — an abandoned or discarded batch must not pollute the corpus.
 
+        DELIVERED-CHECK POLARITY GATE (task 3500). Every batch task's
+        ``metadata.delivered_checks`` is linted against the authoring tree
+        (``main`` of *project_root*, the ref the runtime gate reads) before
+        anything is flipped. The invariant:
+        a sound delivered_check FAILS when it is written and PASSES once its
+        producer lands. A check that is already green gates nothing; a check
+        that can never go green wedges its dependent forever, and at runtime a
+        mis-authored check is indistinguishable from a genuinely undelivered
+        capability. A batch containing any such check is rejected WHOLE with
+        ``error_type='DeliveredCheckPolarityViolation'`` — nothing is flipped —
+        and the payload names each offending check, its diagnosis code
+        (``vacuous_present`` / ``vacuous_absent`` / ``filename_shaped``, plus
+        the ``vacuous_present_self_referential`` and
+        ``vacuous_present_comment_only`` refinements) and the remedy. Repair
+        the descriptor and re-commit; ``shared.delivered_check_polarity`` holds
+        the rules and ``docs/task-authoring.md`` §3.3 the author-facing guide.
+
+        The gate runs ONLY for ``target_status='pending'`` — the one status
+        that releases a task for scheduling, and so the one at which its
+        checks begin gating dependents. A ``cancelled``/``deferred`` commit
+        releases nothing, so gating it would only block cleanup of exactly the
+        mis-authored batch the author is discarding.
+
+        It fails CLOSED on a verdict and OPEN on infrastructure. A check that
+        could not be evaluated at all (no git, root not a repo, unresolvable
+        ref) is neither rejected nor silently passed: it is reported under the
+        ``delivered_check_warnings`` response key, alongside the non-blocking
+        ``absent_overbroad`` warning (an over-broad ``expect=absent`` pattern
+        is genuinely undecidable at authoring time, so it is advisory by
+        design). Each entry is ``{task_id, name, code, severity, message}``.
+        Like ``manifest_stamping``, the key is attached ONLY when non-empty,
+        so a clean batch's response is byte-identical to the pre-gate one.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -9331,11 +9370,77 @@ def create_mcp_server(
         tasks_data = await asyncio.gather(
             *[task_interceptor.get_task(tid, project_root) for tid in ids]
         )
+        # Delivered-check POLARITY gate (task 3500). A delivered_check is a
+        # dep-gate: the scheduler withholds a dependent until the producer's
+        # check reports DELIVERED. A check that is already GREEN when it is
+        # written gates nothing (its dependent dispatches as if unguarded);
+        # one that can NEVER go green wedges its dependent forever — and at
+        # runtime that is indistinguishable from a genuinely undelivered
+        # capability, which is what let the measured 5799 -> 5919 wedge sit
+        # unnoticed. The invariant, enforced here: a sound delivered_check
+        # FAILS at the authoring tree and PASSES once its producer lands.
+        #
+        # The reference tree is GATE_REF (main), the tree the runtime gate
+        # reads, and needs no commit-ordering premise: commit_planning runs
+        # BEFORE the batch lands, so main IS the pre-task tree. (That does
+        # not generalize backwards to an already-landed task — see
+        # shared.delivered_check_polarity's module docstring and the
+        # status-aware scripts/audit_delivered_checks.py.)
+        #
+        # Layered INTO the lock-charter loop above deliberately: the tasks
+        # are already fetched, so the lint costs no extra get_task reads, and
+        # running it AFTER the directory_locks check keeps the lock-charter
+        # rejection's precedence — the new gate must never mask the old one.
+        # `lint_delivered_checks` shells out to git and never raises, so it
+        # goes through asyncio.to_thread rather than blocking the MCP event
+        # loop.
+        polarity_warnings: list[dict[str, Any]] = []
         for tid, task in zip(ids, tasks_data, strict=False):
             meta = task.get('metadata') if isinstance(task, dict) else None
             dirs = directory_locks(extract_files(meta))
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
+
+            # Scoped to `pending`: it is the only target status that releases
+            # a task for scheduling, and so the only one at which its
+            # delivered_checks begin gating dependents. A `cancelled` or
+            # `deferred` commit releases nothing, so gating it would only
+            # block cleanup of exactly the mis-authored batch the author is
+            # discarding.
+            if target_status != 'pending':
+                continue
+            checks = extract_delivered_checks(meta)
+            if not checks:
+                continue
+            findings = await asyncio.to_thread(
+                lint_delivered_checks,
+                checks,
+                files=extract_files(meta),
+                repo_root=project_root,
+                ref=GATE_REF,
+            )
+            if any(f.severity == 'reject' for f in findings):
+                # All-or-nothing, before the flip — mirrors the lock-charter
+                # arm above. The caller is a live agent that can repair the
+                # descriptor and re-commit, which is why this wire point
+                # REJECTS where the capability-manifest stamper (contractually
+                # never-blocking) merely refuses to copy.
+                return polarity_error(findings, task_id=tid)
+            # 'warn' (undecidable at authoring time) and 'errored' (the check
+            # could not be EVALUATED — non-git root, git missing, ref
+            # unresolvable) are reported, never blocking: fail closed on a
+            # VERDICT, fail open on INFRASTRUCTURE. Attached to the response
+            # by the step-14 arm below.
+            polarity_warnings.extend(
+                {
+                    'task_id': tid,
+                    'name': f.check_name,
+                    'code': f.code,
+                    'severity': f.severity,
+                    'message': f.message,
+                }
+                for f in findings
+            )
 
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
@@ -9372,6 +9477,21 @@ def create_mcp_server(
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
+        # Non-blocking half of the polarity gate (task 3500), attached in the
+        # same CONDITIONAL shape as `manifest_stamping` directly above: only
+        # when non-empty, so a clean batch's response is byte-identical to the
+        # pre-gate one (several tests in test_task_tools.py assert
+        # `result == {'success': True}` exactly).
+        #
+        # Everything reaching this list has ALREADY been decided not to block:
+        # a 'warn' is undecidable at authoring time, and an 'errored' is an
+        # availability failure — git missing, root not a repo, ref
+        # unresolvable. An unevaluable check degrades toward the PRE-GATE
+        # status quo (the task commits; its dependent dispatches ungated),
+        # never toward the wedge this gate exists to prevent — but it is
+        # reported here rather than dropped, so it is never a silent pass.
+        if polarity_warnings and isinstance(result, dict):
+            result['delivered_check_warnings'] = polarity_warnings
         return result
 
     @mcp.tool()
