@@ -566,6 +566,7 @@ class TestComputeParityAlarm:
 # ---------------------------------------------------------------------------
 
 _NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+_WINDOW_DAYS = 30
 _T2 = _NOW - timedelta(minutes=5)
 _T1 = _T2 - timedelta(days=1)
 
@@ -595,11 +596,12 @@ def _project_b_row(index: int) -> dict:
     }
 
 
-def _ragged_store(path: Path, *, with_b_gap: bool) -> None:
+def _ragged_store(path: Path, *, with_b_gap: bool, other_rows: tuple[dict, ...] = ()) -> None:
     """A measured daily t-7d..t2; B measured t-7d..t1, then (optionally) a gap at t2."""
     _make_db(path, [
         *(_project_a_row(index) for index in range(8)),
         *(_project_b_row(index) for index in range(7)),
+        *other_rows,
     ])
     if with_b_gap:
         _add_gap_row(path, 'B', _T2.isoformat())
@@ -607,9 +609,9 @@ def _ragged_store(path: Path, *, with_b_gap: bool) -> None:
 
 async def _shaped_as_the_route_does(path: Path) -> dict:
     async with aiosqlite.connect(str(path)) as db:
-        projects = await aggregate_burndown_projects([db])
+        projects = await aggregate_burndown_projects([db], days=_WINDOW_DAYS, now=_NOW)
         per_pid = await asyncio.gather(
-            *(aggregate_burndown_series([db], pid, days=30, now=_NOW) for pid in projects)
+            *(aggregate_burndown_series([db], pid, days=_WINDOW_DAYS, now=_NOW) for pid in projects)
         )
     return redux_api.shape_burndown(dict(zip(projects, per_pid, strict=True)), served_at=_T2)
 
@@ -681,3 +683,17 @@ class TestRaggedTwoProjectStore:
         aggregate = body['BURNDOWN']['latest']
         assert aggregate['state'] == 'lower_bound'
         assert 'C' in aggregate['reason']
+
+    @pytest.mark.asyncio
+    async def test_a_project_whose_rows_all_predate_the_window_changes_nothing(
+        self, tmp_path, shaped,
+    ):
+        """R stopped being sampled before the window opened: it is outside this window's tally."""
+        before_the_window = (_NOW - timedelta(days=_WINDOW_DAYS + 1)).isoformat()
+        path = tmp_path / 'with_retired_project.db'
+        _ragged_store(path, with_b_gap=True, other_rows=(
+            {'project_id': 'R', 'ts': before_the_window, 'state': 'value', 'pending': 9},
+        ))
+        _add_gap_row(path, 'R', before_the_window)
+
+        assert await _shaped_as_the_route_does(path) == shaped[0]

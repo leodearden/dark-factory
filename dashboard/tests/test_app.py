@@ -1585,6 +1585,24 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     )
 
 
+def test_burndown_route_lists_projects_over_the_series_window(client):
+    """The listing and every series share one cutoff, so a project the window
+    never sampled is neither listed nor counted as unmeasured."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        assert client.get('/api/v2/dashboard/burndown?window=7d').status_code == 200
+
+    (listing,) = mock_projects.await_args_list
+    (series,) = mock_series.await_args_list
+    assert listing.kwargs == {'days': 7, 'now': series.kwargs['now']}
+    assert series.kwargs['days'] == 7
+
+
 def test_burndown_route_serves_its_datums_at_the_window_instant(client):
     """The one captured instant is the window cutoff AND the instant every
     burndown Datum is judged at, and it crosses the wire as ``served_at`` —

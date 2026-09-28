@@ -562,20 +562,29 @@ _NULLABLE_SERIES_KEYS = (
 _SERIES_KEYS = (*_ZONES, *_SPLIT, *_NULLABLE_SERIES_KEYS)
 
 
+def _window_start(days: int, now: datetime | None) -> str:
+    """The ISO instant a *days*-long burndown window ending at *now* opens at."""
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
+
+
 async def aggregate_burndown_projects(
     dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+    now: datetime | None = None,
 ) -> list[str]:
     """Return distinct project IDs across *all* burndown DBs, sorted.
 
     Calls :func:`get_burndown_projects` for each DB in *dbs* concurrently via
-    ``asyncio.gather``, then unions the results and returns a sorted list.
-    ``None`` entries are tolerated (``get_burndown_projects`` returns ``[]``
-    for ``None``).
+    ``asyncio.gather`` over one window, then unions the results and returns a
+    sorted list. ``None`` entries are tolerated (``get_burndown_projects``
+    returns ``[]`` for ``None``).
     """
     if not dbs:
         return []
+    now = resolve_now(now)
     per_db: list[list[str]] = list(await asyncio.gather(
-        *(get_burndown_projects(db) for db in dbs)
+        *(get_burndown_projects(db, days=days, now=now) for db in dbs)
     ))
     seen: set[str] = set()
     for project_list in per_db:
@@ -655,18 +664,28 @@ async def aggregate_burndown_series(
     return result
 
 
-async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
-    """Return distinct project IDs that have any snapshot row, gap rows included.
+async def get_burndown_projects(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+    now: datetime | None = None,
+) -> list[str]:
+    """Return distinct project IDs with any snapshot row in the window, gap rows included.
 
-    A project whose only rows are gaps is listed so the shaper renders it
-    unknown rather than leaving it out; its series still carries no row
-    (:func:`get_burndown_series` reads measured rows only).
+    The window is :func:`get_burndown_series`'s. A project whose only rows in
+    it are gaps is listed so the shaper renders it unknown rather than leaving
+    it out; its series still carries no row (the series reads measured rows
+    only). A project with no row at all in the window was not sampled during
+    it — the sampler writes one value-or-gap row per root per tick — so it is
+    not listed, and a retired root cannot mark every total a lower bound until
+    :func:`downsample` expires its rows.
     """
     if db is None:
         return []
     try:
         async with db.execute(
-            'SELECT DISTINCT project_id FROM snapshots ORDER BY project_id',
+            'SELECT DISTINCT project_id FROM snapshots WHERE ts >= ? ORDER BY project_id',
+            (_window_start(days, now),),
         ) as cur:
             rows = await cur.fetchall()
         return [row[0] for row in rows]
@@ -983,7 +1002,7 @@ async def get_burndown_series(
     empty: dict = {'labels': [], **{key: [] for key in _SERIES_KEYS}}
     if db is None:
         return empty
-    since = (resolve_now(now) - timedelta(days=days)).isoformat()
+    since = _window_start(days, now)
     try:
         # Which of the later columns this DB actually has: a hardcoded widened
         # SELECT would raise 'no such column' on an un-migrated peer DB, hit the

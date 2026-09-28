@@ -2228,9 +2228,39 @@ class TestReadSideSeesMeasuredRowsOnly:
         conn.close()
 
         async with aiosqlite.connect(str(db)) as c:
-            assert await get_burndown_projects(c) == ['gap-only', 'legacy', 'measured']
-            assert await aggregate_burndown_projects([c]) == ['gap-only', 'legacy', 'measured']
+            window = {'days': 7, 'now': _READ_NOW}
+            assert await get_burndown_projects(c, **window) == ['gap-only', 'legacy', 'measured']
+            assert await aggregate_burndown_projects([c], **window) == [
+                'gap-only', 'legacy', 'measured',
+            ]
         assert (await _series_of(db, 'gap-only'))['labels'] == []
+
+    async def test_projects_list_only_what_the_window_sampled(self, tmp_path):
+        """A project with no row at all inside the window is not part of its tally.
+
+        The sampler writes one value-or-gap row per root per tick, so a project
+        still being sampled has a row in any window, a gap if every read failed.
+        A retired root's rows linger until downsample expires them at 90 days.
+        """
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'retired', _hours_before_read(8 * 24), done=1)
+        _insert_gap(conn, 'retired', _hours_before_read(8 * 24 - 1))
+        _insert_value(conn, 'failing', _hours_before_read(8 * 24), done=1)
+        _insert_gap(conn, 'failing', _hours_before_read(1))
+        _insert_value(conn, 'sampled', _hours_before_read(1), done=1)
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c, days=7, now=_READ_NOW) == ['failing', 'sampled']
+            assert await aggregate_burndown_projects([c], days=7, now=_READ_NOW) == [
+                'failing', 'sampled',
+            ]
+            assert await get_burndown_projects(c, days=30, now=_READ_NOW) == [
+                'failing', 'retired', 'sampled',
+            ]
 
     async def test_series_carries_the_new_columns_null_before_the_migration(self, tmp_path):
         db = tmp_path / 'migrated.db'
@@ -2277,7 +2307,7 @@ class TestReadSideSeesMeasuredRowsOnly:
         for key in _NEW_SERIES_KEYS:
             assert series[key] == [None], key
         async with aiosqlite.connect(str(db)) as c:
-            assert await get_burndown_projects(c) == [project_id]
+            assert await get_burndown_projects(c, now=read_now) == [project_id]
 
     async def test_aggregate_merges_the_new_keys(self, tmp_path):
         db1, db2 = tmp_path / 'one.db', tmp_path / 'two.db'
