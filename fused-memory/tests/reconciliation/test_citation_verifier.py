@@ -20,6 +20,8 @@ from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
+    LivenessVerdict,
+    MemoryLiveness,
     build_citation_tombstone,
     find_citation_occurrences,
     find_live_citation_occurrences,
@@ -27,6 +29,7 @@ from fused_memory.reconciliation.citation_verifier import (
     repoint_metadata,
     repoint_task_citations,
     repoint_tombstone_chain,
+    resolve_memory_liveness,
     verify_cited_memories,
 )
 
@@ -476,6 +479,60 @@ async def test_repeated_erroring_id_is_not_re_raised_per_citation():
         ]
     assert stats['stage1_citation_verification_errors'] == 2
     assert stats['stage1_phantom_citations_dropped'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# resolve_memory_liveness — the shared three-way verdict (task 3056)
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveMemoryLiveness:
+    """One found / None / raised verdict over ``get_memory_by_id``, shared by
+    ``verify_cited_memories`` and the Stage-2 enumeration guard so the two can
+    never disagree about whether a backend timeout means 'absent'."""
+
+    _MEMORY_ID = '0d542614-874b-4003-b136-76dd9d8b40f8'
+
+    @staticmethod
+    def _service(**get_memory_by_id_kwargs: Any) -> AsyncMock:
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(**get_memory_by_id_kwargs)
+        return memory_service
+
+    async def _verdict(self, memory_service: AsyncMock) -> LivenessVerdict:
+        verdict = await resolve_memory_liveness(
+            memory_service, 'test_project', self._MEMORY_ID,
+        )
+        memory_service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', self._MEMORY_ID,
+        )
+        return verdict
+
+    @pytest.mark.asyncio
+    async def test_a_truthy_record_is_live(self):
+        memory_service = self._service(
+            return_value={'id': self._MEMORY_ID, 'content': 'x', 'metadata': {}},
+        )
+        assert await self._verdict(memory_service) == (MemoryLiveness.LIVE, None)
+
+    @pytest.mark.asyncio
+    async def test_none_is_absent(self):
+        memory_service = self._service(return_value=None)
+        assert await self._verdict(memory_service) == (MemoryLiveness.ABSENT, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc', [TimeoutError('qdrant timeout'), RuntimeError('backend down')],
+    )
+    async def test_a_raised_lookup_is_inconclusive_and_never_propagates(self, exc):
+        memory_service = self._service(side_effect=exc)
+        verdict = await self._verdict(memory_service)
+        assert verdict == (MemoryLiveness.INCONCLUSIVE, type(exc).__name__)
+        assert verdict.outcome is MemoryLiveness.INCONCLUSIVE
+        assert verdict.error_type == type(exc).__name__
+
+    def test_outcomes_are_the_three_documented_values(self):
+        assert {o.value for o in MemoryLiveness} == {'live', 'absent', 'inconclusive'}
 
 
 # --------------------------------------------------------------------------- #
