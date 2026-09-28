@@ -3,7 +3,8 @@
 A middle-band write is shown to the judge alongside a slate of candidates, and
 the judge answers with a verdict AND the id of the candidate that verdict is
 about. That named candidate — not the band's max-cosine winner — is what the
-write attaches to. These tests pin that at the ``triage_write`` seam.
+write attaches to. These tests pin that at the ``triage_write`` seam, and at
+the ``add_memory`` tool with only the model's answer faked.
 
 Helpers are local rather than imported from the sibling triage suites, which
 are each written to stand alone.
@@ -11,24 +12,35 @@ are each written to stand alone.
 
 from __future__ import annotations
 
+import json
 import logging
 import types
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
+from fused_memory.server import tools
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+    is_contested_child,
+)
+from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
+    CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    ROUTED_KEY,
     JudgeVerdict,
     TriageFailOpenCounter,
     triage_write,
 )
+from fused_memory.server.write_triage_judge import CANDIDATE_ID_KEY, VERDICT_KEY
 from fused_memory.services.memory_service import RRF_K, SearchResults
 
 _T_HIGH = 0.90
@@ -238,3 +250,107 @@ class TestABreachedVerdictFailsOpenOnce:
     )
     async def test_a_malformed_answer_shape_is_counted(self, answer, caplog) -> None:
         await self._triage_breach(answer, caplog)
+
+
+def _tool_service(results: list[MemoryResult]) -> AsyncMock:
+    """A memory service whose config is REAL namespaces and whose writes dump.
+
+    Namespaces, not an unspecced mock: an auto-generated attribute reads as a
+    truthy Mock, which the triage resolvers refuse. The judge is enabled on the
+    openai arm; the provider itself is faked per test.
+    """
+    service = AsyncMock()
+    service.config = types.SimpleNamespace(
+        write_triage=types.SimpleNamespace(
+            enabled=True, candidate_k=20, t_high=_T_HIGH, t_low=_T_LOW,
+            judge_enabled=True, judge_provider='openai', judge_model='test-model',
+        ),
+        reconciliation=types.SimpleNamespace(
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.90,
+            procedural_knowledge_topic_guard_clusters=[],
+        ),
+    )
+    written = MagicMock()
+    written.model_dump.return_value = {
+        'id': 'new-id', 'category': 'procedural_knowledge', 'stored_in': ['mem0'],
+    }
+    service.add_memory.return_value = written
+    service.search.return_value = SearchResults(results)
+    return service
+
+
+def _provider_answering(answer: dict) -> MagicMock:
+    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is."""
+    message = types.SimpleNamespace(content=json.dumps(answer))
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.chat.completions.create = AsyncMock(return_value=types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message)],
+    ))
+    return client
+
+
+async def _add_memory(
+    service: AsyncMock, answer: dict, monkeypatch,
+) -> tuple[dict, dict, TriageFailOpenCounter]:
+    """Write through the tool; return the ack, the persisted metadata, the counter."""
+    counter = _counter()
+    monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
+    with patch('openai.AsyncOpenAI', return_value=_provider_answering(answer)):
+        ack = await create_mcp_server(service)._tool_manager.call_tool('add_memory', {
+            'content': 'the new entry',
+            'category': 'procedural_knowledge',
+            'agent_id': 'claude-interactive',
+            'project_id': 'dark_factory',
+        })
+    persisted = service.add_memory.await_args.kwargs.get('metadata') or {}
+    return ack, persisted, counter
+
+
+class TestAddMemoryFilesTheVerdictAgainstTheNamedCandidate:
+    """The tool-level signal: the ack and the persisted child name the judged record."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('word', 'outcome', 'kind'),
+        [
+            ('amends', OUTCOME_AMENDED, AMENDMENT_KIND),
+            ('restates', OUTCOME_RESTATED, SIGHTING_KIND),
+            ('contests', OUTCOME_CONTESTED, AMENDMENT_KIND),
+        ],
+    )
+    async def test_the_ack_and_the_child_name_the_judged_candidate(
+        self, word, outcome, kind, monkeypatch,
+    ) -> None:
+        ack, persisted, counter = await _add_memory(
+            _tool_service(_middle_band_slate()),
+            {VERDICT_KEY: word, CANDIDATE_ID_KEY: 'm3'},
+            monkeypatch,
+        )
+
+        assert ack[ROUTED_KEY] == outcome, f'{ack!r}'
+        assert ack[CANONICAL_ID_KEY] == 'm3', f'{ack!r}'
+        assert persisted[PARENT_ID_KEY] == 'm3', (
+            f'filed under the band winner {_BAND_WINNER!r}, not the judged m3: '
+            f'{persisted!r}'
+        )
+        assert persisted['kind'] == kind, f'{persisted!r}'
+        assert is_contested_child(persisted) is (outcome == OUTCOME_CONTESTED)
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_not_on_the_slate_stores_the_write_standalone(
+        self, monkeypatch,
+    ) -> None:
+        ack, persisted, counter = await _add_memory(
+            _tool_service(_middle_band_slate()),
+            {VERDICT_KEY: 'amends', CANDIDATE_ID_KEY: 'not-on-the-slate'},
+            monkeypatch,
+        )
+
+        assert ack[ROUTED_KEY] == OUTCOME_STORED, f'{ack!r}'
+        assert CANONICAL_ID_KEY not in ack, f'{ack!r}'
+        assert PARENT_ID_KEY not in persisted, f'{persisted!r}'
+        assert counter.live_count() == 1

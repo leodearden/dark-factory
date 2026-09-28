@@ -47,6 +47,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     BandDecision,
+    JudgeVerdict,
     TriageFailOpenCounter,
     triage_write,
 )
@@ -61,6 +62,7 @@ from fused_memory.server.write_triage_judge import (
     _FIELD_CHARS,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
+    CANDIDATE_ID_KEY,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
@@ -80,13 +82,17 @@ from fused_memory.server.write_triage_judge import (
 from fused_memory.services.memory_service import RRF_K, SearchResults
 
 
-def _payload(word: object) -> str:
-    """A well-formed verdict payload keyed off the module's own VERDICT_KEY.
+def _payload(word: object, candidate_id: object = None) -> str:
+    """A verdict payload keyed off the module's own VERDICT_KEY and CANDIDATE_ID_KEY.
 
-    Built rather than spelled, so a rename of the key is exercised by these
-    tests instead of silently bypassing them.
+    Built rather than spelled, so a rename of either key is exercised by these
+    tests instead of silently bypassing them. *candidate_id* is left out of the
+    payload entirely when not given.
     """
-    return json.dumps({VERDICT_KEY: word})
+    answer = {VERDICT_KEY: word}
+    if candidate_id is not None:
+        answer[CANDIDATE_ID_KEY] = candidate_id
+    return json.dumps(answer)
 
 
 # ---------------------------------------------------------------------------
@@ -406,21 +412,32 @@ class TestParseJudgeVerdict:
     ``triage_write`` counts a fail-open only for something that raises or
     returns out-of-vocabulary, and a silent default would make a broken judge
     read exactly like a healthy one answering "nothing matched".
+
+    An attach verdict names the candidate it is about, and that id is checked
+    against the slate the model was shown.
     """
 
+    _SLATE = ('m1',)
+
     @pytest.mark.parametrize(
-        ('word', 'outcome'),
+        ('word', 'candidate_id', 'expected'),
         [
-            ('distinct', OUTCOME_STORED),
-            ('restates', OUTCOME_RESTATED),
-            ('amends', OUTCOME_AMENDED),
-            ('contests', OUTCOME_CONTESTED),
+            ('distinct', None, JudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', JudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', JudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', JudgeVerdict(OUTCOME_CONTESTED, 'm1')),
         ],
         ids=['distinct', 'restates', 'amends', 'contests'],
     )
-    def test_a_bare_json_object_round_trips(self, word: str, outcome: str) -> None:
+    def test_a_bare_json_object_round_trips(
+        self, word: str, candidate_id: str | None, expected: JudgeVerdict,
+    ) -> None:
         """The happy path: exactly what `response_format=json_object` returns."""
-        assert parse_judge_verdict(_payload(word)) == outcome
+        assert parse_judge_verdict(_payload(word, candidate_id), self._SLATE) == expected
+
+    def test_distinct_may_name_its_candidate_as_an_explicit_null(self) -> None:
+        raw = json.dumps({VERDICT_KEY: 'distinct', CANDIDATE_ID_KEY: None})
+        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_STORED)
 
     @pytest.mark.parametrize(
         ('word', 'outcome'),
@@ -448,26 +465,31 @@ class TestParseJudgeVerdict:
         counted fail-open per write, which surfaces as a storm escalation
         describing an outage that is not happening.
         """
-        assert parse_judge_verdict(_payload(word)) == outcome
+        candidate_id = None if outcome == OUTCOME_STORED else 'm1'
+        assert parse_judge_verdict(
+            _payload(word, candidate_id), self._SLATE,
+        ) == JudgeVerdict(outcome, candidate_id)
 
     def test_a_fenced_json_block_parses(self) -> None:
         """A model that ignores the JSON mode and fences its answer still parses."""
-        raw = f'```json\n{_payload("amends")}\n```'
-        assert parse_judge_verdict(raw) == OUTCOME_AMENDED
+        raw = f'```json\n{_payload("amends", "m1")}\n```'
+        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_json_surrounded_by_prose_parses(self) -> None:
         """`extract_json` brace-scans, so leading/trailing prose is tolerated."""
         raw = (
-            'Looking at candidate mem-1, the new entry adds a detail.\n'
-            f'{_payload("amends")}\n'
+            'Looking at candidate m1, the new entry adds a detail.\n'
+            f'{_payload("amends", "m1")}\n'
             'That is my answer.'
         )
-        assert parse_judge_verdict(raw) == OUTCOME_AMENDED
+        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_a_verdict_with_extra_keys_still_parses(self) -> None:
-        """Extra keys are ignored; only the verdict word is contractual."""
-        raw = json.dumps({VERDICT_KEY: 'restates', 'reasoning': 'same fact'})
-        assert parse_judge_verdict(raw) == OUTCOME_RESTATED
+        """Extra keys are ignored; only the verdict and the candidate are contractual."""
+        raw = json.dumps({
+            VERDICT_KEY: 'restates', CANDIDATE_ID_KEY: 'm1', 'reasoning': 'same fact',
+        })
+        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     def test_an_array_wrapped_object_reads_as_that_object(self) -> None:
         """Pinned deliberately, because it is a behaviour and not an accident.
@@ -475,25 +497,23 @@ class TestParseJudgeVerdict:
         ``extract_json`` brace-scans for the first BALANCED OBJECT, so an
         answer wrapped in a list is read as the object inside it. That
         leniency is inherited from the repo's one JSON extractor rather than
-        chosen here, and it is safe at this seam for a specific reason: the
-        BAND names the attach target, not the judge, so a verdict is a single
-        word however it was wrapped. A model that answered with several
-        elements has its first taken — a bounded wrong-word risk against a
-        target that is fixed either way, with the canonical never mutated and
-        the attach always re-parentable (C1).
+        chosen here, and it stays bounded because the id the object names is
+        validated against the slate: whichever element is taken, the write can
+        only attach to a record the model was shown, the canonical is never
+        mutated, and the attach is always re-parentable (C1).
 
         Asserted so that a future change to ``extract_json`` surfaces here
         rather than silently changing what the judge is understood to have
         said.
         """
-        raw = f'[{_payload("restates")}]'
-        assert parse_judge_verdict(raw) == OUTCOME_RESTATED
+        raw = f'[{_payload("restates", "m1")}]'
+        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     @pytest.mark.parametrize(
         ('raw', 'label'),
         [
-            (_payload('supersedes'), 'unrecognised-verdict-word'),
-            (_payload(OUTCOME_RESTATED), 'ack-word-not-judge-word'),
+            (_payload('supersedes', 'm1'), 'unrecognised-verdict-word'),
+            (_payload(OUTCOME_RESTATED, 'm1'), 'ack-word-not-judge-word'),
             (json.dumps({'answer': 'restates'}), 'missing-verdict-key'),
             (_payload(None), 'null-verdict'),
             (_payload(['restates']), 'non-string-verdict'),
@@ -502,8 +522,14 @@ class TestParseJudgeVerdict:
             ('', 'empty-text'),
             ('   \n\t  ', 'whitespace-only-text'),
             ('I cannot answer that request.', 'prose-with-no-json'),
-            (_payload('restates').rstrip('}'), 'unbalanced-json'),
+            (_payload('restates', 'm1').rstrip('}'), 'unbalanced-json'),
             (f'{{{VERDICT_KEY}: restates}}', 'unquoted-json'),
+            (_payload('restates'), 'attach-word-naming-no-candidate'),
+            (_payload('restates', 'm9'), 'id-not-on-the-slate'),
+            (_payload('restates', 7), 'non-string-id'),
+            (_payload('restates', ['m1']), 'list-id'),
+            (_payload('restates', ''), 'empty-id'),
+            (_payload('distinct', 'm1'), 'distinct-naming-a-candidate'),
         ],
         ids=[
             'unrecognised-verdict-word',
@@ -518,6 +544,12 @@ class TestParseJudgeVerdict:
             'prose-with-no-json',
             'unbalanced-json',
             'unquoted-json',
+            'attach-word-naming-no-candidate',
+            'id-not-on-the-slate',
+            'non-string-id',
+            'list-id',
+            'empty-id',
+            'distinct-naming-a-candidate',
         ],
     )
     def test_every_rejection_raises_rather_than_defaulting(
@@ -525,25 +557,31 @@ class TestParseJudgeVerdict:
     ) -> None:
         """A raise is what `triage_write`'s fail-open counter can SEE."""
         with pytest.raises(JudgeOutputError):
-            parse_judge_verdict(raw)
+            parse_judge_verdict(raw, self._SLATE)
 
     def test_the_rejection_message_quotes_the_offending_payload(self) -> None:
         """An operator reading the fail-open log needs the actual output."""
         with pytest.raises(JudgeOutputError) as excinfo:
-            parse_judge_verdict(_payload('supersedes'))
+            parse_judge_verdict(_payload('supersedes', 'm1'), self._SLATE)
         assert 'supersedes' in str(excinfo.value)
+
+    def test_an_off_slate_rejection_names_the_id_and_the_slate(self) -> None:
+        with pytest.raises(JudgeOutputError) as excinfo:
+            parse_judge_verdict(_payload('restates', 'm9'), self._SLATE)
+        assert 'm9' in str(excinfo.value)
+        assert 'm1' in str(excinfo.value), 'the slate it is not on is named too'
 
     def test_a_pathological_payload_is_truncated_in_the_message(self) -> None:
         """The judge output reaches a log line; an unbounded one is a hazard."""
         raw = 'x' * 20_000
         with pytest.raises(JudgeOutputError) as excinfo:
-            parse_judge_verdict(raw)
+            parse_judge_verdict(raw, self._SLATE)
         assert len(str(excinfo.value)) < 2_000
 
     def test_a_non_string_input_raises_rather_than_crashing(self) -> None:
         """An SDK that returned None for the body is a judge failure, not a TypeError."""
         with pytest.raises(JudgeOutputError):
-            parse_judge_verdict(None)  # type: ignore[arg-type]
+            parse_judge_verdict(None, self._SLATE)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -1668,7 +1706,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_STORED
+        assert verdict == JudgeVerdict(OUTCOME_STORED)
         disabled = [
             r for r in caplog.records
             if r.levelno == logging.INFO and 'judge_enabled' in r.getMessage()
@@ -1680,7 +1718,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
     @pytest.mark.asyncio
     async def test_the_enabled_path_emits_no_such_record(self, caplog) -> None:
         """One line per write is affordable only while the switch is ENGAGED."""
-        client = _openai_client(_payload('restates'))
+        client = _openai_client(_payload('restates', 'm1'))
         with caplog.at_level(logging.INFO), \
                 patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
@@ -1706,7 +1744,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 content='c', project_id='p',
                 decision=_decision(None), candidates=[],
             )
-        assert verdict == OUTCOME_STORED
+        assert verdict == JudgeVerdict(OUTCOME_STORED)
         assert not caplog.records, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
@@ -1721,7 +1759,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_STORED
+        assert verdict == JudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1736,7 +1774,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision(None),
                 candidates=[],
             )
-        assert verdict == OUTCOME_STORED
+        assert verdict == JudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1751,7 +1789,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('pin0'),
                 candidates=[_result('pin0', None, omit_store_score=True)],
             )
-        assert verdict == OUTCOME_STORED
+        assert verdict == JudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
 
@@ -1784,7 +1822,7 @@ class TestJudgeWriteNamesTheAttachTarget:
             'child-1', 0.60,
             extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
         )
-        client = _openai_client(_payload('restates'))
+        client = _openai_client(_payload('restates', 'm0'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(),
@@ -1805,7 +1843,7 @@ class TestJudgeWriteNamesTheAttachTarget:
         the exact defect: it would tell the model a record is the attach
         target when nothing said so.
         """
-        client = _openai_client(_payload('restates'))
+        client = _openai_client(_payload('restates', 'm0'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(),
@@ -1826,7 +1864,7 @@ class TestJudgeWriteNamesTheAttachTarget:
         selector never promised to keep, and neither call site would look
         wrong on its own.
         """
-        client = _openai_client(_payload('restates'))
+        client = _openai_client(_payload('restates', 'm0'))
         with (
             patch('openai.AsyncOpenAI', return_value=client),
             patch.object(
@@ -1858,17 +1896,19 @@ class TestJudgeWriteOpenAIArm:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('word', 'outcome'),
+        ('word', 'candidate_id', 'expected'),
         [
-            ('distinct', OUTCOME_STORED),
-            ('restates', OUTCOME_RESTATED),
-            ('amends', OUTCOME_AMENDED),
-            ('contests', OUTCOME_CONTESTED),
+            ('distinct', None, JudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', JudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', JudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', JudgeVerdict(OUTCOME_CONTESTED, 'm1')),
         ],
         ids=['distinct', 'restates', 'amends', 'contests'],
     )
-    async def test_each_verdict_round_trips(self, word: str, outcome: str) -> None:
-        client = _openai_client(_payload(word))
+    async def test_each_verdict_round_trips(
+        self, word: str, candidate_id: str | None, expected: JudgeVerdict,
+    ) -> None:
+        client = _openai_client(_payload(word, candidate_id))
         with patch('openai.AsyncOpenAI', return_value=client):
             verdict = await judge_write(
                 memory_service=_judge_svc(),
@@ -1877,12 +1917,40 @@ class TestJudgeWriteOpenAIArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == outcome
+        assert verdict == expected
+
+    @pytest.mark.asyncio
+    async def test_the_verdict_names_the_candidate_the_model_chose(self) -> None:
+        """The band's winner is m0; the model's own choice is what comes back."""
+        client = _openai_client(_payload('amends', 'm2'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('m0'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89), _result('m2', 0.88)],
+            )
+        assert verdict == JudgeVerdict(OUTCOME_AMENDED, 'm2')
+
+    @pytest.mark.asyncio
+    async def test_an_id_trimmed_off_the_rendered_slate_is_refused(self) -> None:
+        """Retrieved is not enough: the model must have been SHOWN what it names."""
+        client = _openai_client(_payload('amends', 'm4'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(JudgeOutputError):
+            await judge_write(
+                memory_service=_judge_svc(judge_candidate_count=2),
+                content='c',
+                project_id='p',
+                decision=_decision('m0'),
+                candidates=[_result(f'm{i}', 0.90 - i / 100) for i in range(5)],
+            )
 
     @pytest.mark.asyncio
     async def test_the_call_is_made_once_with_the_resolved_shape(self) -> None:
         """Deterministic, bounded, and JSON-forced — one call, no retry loop."""
-        client = _openai_client(_payload('amends'))
+        client = _openai_client(_payload('amends', 'm1'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(judge_model='pinned-model'),
@@ -1929,7 +1997,9 @@ class TestJudgeWriteAnthropicArm:
 
     @pytest.mark.asyncio
     async def test_a_verdict_round_trips_through_the_anthropic_arm(self) -> None:
-        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('contests'))])
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('contests', 'm1'))],
+        )
         with patch('anthropic.AsyncAnthropic', return_value=client):
             verdict = await judge_write(
                 memory_service=_judge_svc('anthropic'),
@@ -1938,12 +2008,12 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_CONTESTED
+        assert verdict == JudgeVerdict(OUTCOME_CONTESTED, 'm1')
 
     @pytest.mark.asyncio
     async def test_the_system_prompt_goes_via_the_system_parameter(self) -> None:
         """Anthropic has no system ROLE — a system message would be a user turn."""
-        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends', 'm1'))])
         with patch('anthropic.AsyncAnthropic', return_value=client):
             await judge_write(
                 memory_service=_judge_svc('anthropic', judge_model='pinned-model'),
@@ -1974,7 +2044,7 @@ class TestJudgeWriteAnthropicArm:
         therefore a COUNTED fail-open on the write path rather than a bad
         answer.
         """
-        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends', 'm1'))])
         with patch('anthropic.AsyncAnthropic', return_value=client):
             await judge_write(
                 memory_service=_judge_svc('anthropic'),
@@ -1988,7 +2058,7 @@ class TestJudgeWriteAnthropicArm:
         """A leading non-text block must not be read as the answer."""
         client = _anthropic_client([
             FakeAnthropicTextBlock(type='thinking', text=''),
-            FakeAnthropicTextBlock(text=_payload('restates')),
+            FakeAnthropicTextBlock(text=_payload('restates', 'm1')),
         ])
         with patch('anthropic.AsyncAnthropic', return_value=client):
             verdict = await judge_write(
@@ -1998,7 +2068,7 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_RESTATED
+        assert verdict == JudgeVerdict(OUTCOME_RESTATED, 'm1')
 
 
 class TestTheClientIsReleased:
@@ -2019,7 +2089,7 @@ class TestTheClientIsReleased:
 
     @pytest.mark.asyncio
     async def test_the_openai_client_is_released_on_the_happy_path(self) -> None:
-        client = (_openai_client(_payload('restates')))
+        client = _openai_client(_payload('restates', 'm1'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(),
@@ -2031,7 +2101,7 @@ class TestTheClientIsReleased:
     @pytest.mark.asyncio
     async def test_the_anthropic_client_is_released_on_the_happy_path(self) -> None:
         client = _anthropic_client(
-            [FakeAnthropicTextBlock(text=_payload('amends'))],
+            [FakeAnthropicTextBlock(text=_payload('amends', 'm1'))],
         )
         with patch('anthropic.AsyncAnthropic', return_value=client):
             await judge_write(
@@ -2253,8 +2323,9 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
             (None, RuntimeError('transport down'), 'transport-error'),
             ('I cannot answer that.', None, 'unparseable'),
             ('', None, 'empty-body'),
+            (_payload('amends', 'not-on-the-slate'), None, 'off-slate-id'),
         ],
-        ids=['transport-error', 'unparseable', 'empty-body'],
+        ids=['transport-error', 'unparseable', 'empty-body', 'off-slate-id'],
     )
     async def test_a_broken_judge_stores_and_counts_exactly_once(
         self, body: str | None, side_effect: Exception | None, label: str,
@@ -2318,7 +2389,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         """The happy path end-to-end: a verdict becomes an ack, nothing counted."""
         counter = TriageFailOpenCounter()
         service = self._mid_band_service()
-        client = _openai_client(_payload('amends'))
+        client = _openai_client(_payload('amends', 'm1'))
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
