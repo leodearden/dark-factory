@@ -195,3 +195,33 @@ class TestDeriveAffectedIds:
         }
         result = _derive_affected_ids(finding)
         assert result == ['valid-mem']
+
+    # ------------------------------------------------------------------ #
+    # Top-level task_id is not an identity source (task 4772)
+    # ------------------------------------------------------------------ #
+
+    def test_top_level_task_id_alone_contributes_no_identity(self):
+        """add_finding(task_id=X) with no cite_* call derives no identity."""
+        result = _derive_affected_ids({'task_id': '598'})
+        assert result == [], (
+            'A top-level task_id must not count as an identity: '
+            'harness._finding_has_reference would then treat an add_finding '
+            'with no cite_* call as referenced, defeating the task-1970 '
+            'placeholder drop in _maybe_remediate, and the cite_task guidance '
+            'in prompts._GUIDANCE_TOOL_PROSE (cite_task is the only '
+            f'cross-cycle dedup anchor) would become false. Got {result!r}'
+        )
+
+    def test_top_level_task_id_not_merged_into_cited_identity(self):
+        """With cite_task present, only the cited ids form the identity."""
+        finding = {
+            'task_id': '598',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T'}],
+        }
+        result = _derive_affected_ids(finding)
+        assert result == ['3839'], (
+            'The top-level task_id must not be merged into the cited identity: '
+            'the content fingerprint is keyed on cited_tasks alone, which is '
+            'what the cite_task guidance in prompts._GUIDANCE_TOOL_PROSE tells '
+            f'the stage LLMs. Got {result!r}'
+        )
