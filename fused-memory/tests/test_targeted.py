@@ -6959,3 +6959,28 @@ class TestOnTaskDoneRetiresFlagMarkers:
         run_id = await self._run_id_for(journal)
         assert self._retire_rows(await journal.get_run_actions(run_id)) == []
         assert self._retire_entries(result) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_retirement_is_best_effort(
+        self, reconciler, journal, mock_memory_service, tmp_path, caplog,
+    ):
+        with (
+            patch(_SEAM, new=AsyncMock(side_effect=RuntimeError('qdrant down'))),
+            caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'),
+        ):
+            result = await self._drive(reconciler, tmp_path, transition='done')
+
+        assert 'error' not in result, result
+        run_id = await self._run_id_for(journal)
+        run = await journal.get_run(run_id)
+        assert run is not None
+        assert run.status == 'completed'
+        assert any(a['type'] == 'knowledge_captured_fast' for a in result['actions'])
+        mock_memory_service.search.assert_awaited()
+        assert self._retire_rows(await journal.get_run_actions(run_id)) == []
+        assert self._retire_entries(result) == []
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'qdrant down' in r.getMessage()
+        ]
+        assert warnings, 'the swallowed failure must be logged at WARNING'
