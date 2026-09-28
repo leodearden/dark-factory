@@ -1186,9 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f'error: {exc}', file=sys.stderr)
         return EXIT_BAD_STAMP
     except OSError as exc:
-        # Converted at this seam because an OSError escaping main() reads as a
-        # stdout failure at the process boundary. The report prints stay
-        # outside this try so a BrokenPipeError is never blamed on artifacts.
+        # Only the artifact write is converted; see
+        # shared/src/shared/cli_boundary.py::run_cli.
         print(
             f'error: cannot write the corpus artifacts under {args.out_root}: {exc}',
             file=sys.stderr,

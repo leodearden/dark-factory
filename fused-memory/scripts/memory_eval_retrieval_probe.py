@@ -230,10 +230,7 @@ class EmptySelectionError(ValueError):
 class ProbeRunError(RuntimeError):
     """The run could not complete; the message is attributed at the seam that raised it.
 
-    Deliberately NOT an ``OSError``: the process boundary
-    (``shared.cli_boundary.run_cli``) reports any ``OSError`` escaping
-    ``main()`` as a stdout failure, so a store, artifact or source failure is
-    converted to this before it can get there.
+    Deliberately not an ``OSError``; see ``shared/src/shared/cli_boundary.py::run_cli``.
     """
 
 
@@ -2991,10 +2988,8 @@ def _derive_registry_text() -> str:
 async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutcome:
     """Open the store, measure *registry* against it, and close it again.
 
-    Only the OPEN is converted to :class:`ProbeRunError`. Query-time store
-    failures were measured not to be ``OSError`` (httpx, redis and qdrant
-    errors all descend from ``Exception``), so wrapping them would widen an
-    ``except`` for nothing.
+    Only the open is converted to :class:`ProbeRunError`; see
+    ``shared/src/shared/cli_boundary.py::run_cli``.
     """
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415

@@ -3094,8 +3094,7 @@ async def _run(args: argparse.Namespace) -> int:
             ),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
-        # Flushed so a failed stdout stops the run HERE, before the metrics
-        # artifact and any --apply delete, whatever the buffering regime.
+        # A failed stdout stops the run before any side effect.
         print(json.dumps(plan, indent=2, default=str))
         sys.stdout.flush()
 
