@@ -201,3 +201,148 @@ class TestSubmitTask:
             call.args[0] for call in memory_service.get_memory_by_id.await_args_list
         }
         assert project_ids == {'reify'}
+
+
+async def update(
+    server, project_root: str, *,
+    metadata: dict[str, Any] | None = None,
+    description: str | None = None,
+    agent_id: str = RECON_AGENT,
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        'id': '5537', 'project_root': project_root, 'agent_id': agent_id,
+    }
+    if metadata is not None:
+        arguments |= {'metadata': metadata, 'metadata_mode': 'merge'}
+    if description is not None:
+        arguments['description'] = description
+    return _parse_result(await server._tool_manager.call_tool('update_task', arguments))
+
+
+def forwarded_update(task_interceptor: AsyncMock) -> tuple[dict[str, Any], str | None]:
+    """The metadata (decoded from the JSON string the handler sends) and the
+    description the interceptor's update_task received."""
+    kwargs = forwarded(task_interceptor.update_task)
+    return json.loads(kwargs['metadata']), kwargs['description']
+
+
+class TestUpdateTask:
+
+    @pytest.mark.asyncio
+    async def test_a_re_asserted_enumeration_is_cleaned_stamped_and_annotated(
+        self, server, project_root, task_interceptor,
+    ):
+        result = await update(
+            server, project_root,
+            metadata={'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5]},
+            description=GATE_DESCRIPTION,
+        )
+
+        assert 'error' not in result
+        metadata, description = forwarded_update(task_interceptor)
+        assert metadata['mem0_falsified_entries'] == list(LIVE_IDS)
+        assert [r['outcome'] for r in metadata['x_liveness_exceptions']] == ['absent']
+        assert 'x_liveness_reverified_at' in metadata
+        assert 'already deleted, verified' in description.split('\n')[2]
+        assert result['enumeration_liveness']['dropped_absent'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_fragment_is_recorded_not_rejected(
+        self, server, project_root, task_interceptor,
+    ):
+        result = await update(
+            server, project_root,
+            metadata={'mem0_falsified_entries': [LIVE_B3F, LIVE_23E, '21f78de1']},
+        )
+
+        assert 'error' not in result
+        metadata, _ = forwarded_update(task_interceptor)
+        assert metadata['mem0_falsified_entries'] == [LIVE_B3F, LIVE_23E, '21f78de1']
+        assert {
+            'memory_id': '21f78de1',
+            'path': 'mem0_falsified_entries[2]',
+            'outcome': 'truncated',
+        } in metadata['x_liveness_exceptions']
+        assert result['enumeration_liveness']['truncated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_lookup_keeps_the_id_and_the_write(
+        self, server, project_root, task_interceptor, memory_service,
+    ):
+        async def _flaky(_project_id: str, memory_id: str) -> dict[str, Any] | None:
+            if memory_id == LIVE_21F:
+                raise TimeoutError('qdrant timeout')
+            return {'id': memory_id} if memory_id in LIVE_IDS else None
+
+        memory_service.get_memory_by_id.side_effect = _flaky
+
+        result = await update(
+            server, project_root,
+            metadata={'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]},
+        )
+
+        assert 'error' not in result
+        metadata, _ = forwarded_update(task_interceptor)
+        assert metadata['mem0_falsified_entries'] == [LIVE_B3F, LIVE_21F]
+        assert metadata['x_liveness_exceptions'] == [{
+            'memory_id': LIVE_21F,
+            'path': 'mem0_falsified_entries[1]',
+            'outcome': 'inconclusive',
+            'error_type': 'TimeoutError',
+        }]
+
+    @pytest.mark.asyncio
+    async def test_scope_is_not_required_on_update(
+        self, server, project_root, task_interceptor,
+    ):
+        metadata = gate_5537_metadata()
+        del metadata['x_enumeration_scope']
+
+        result = await update(server, project_root, metadata=metadata)
+
+        assert 'error' not in result
+        task_interceptor.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_legacy_scope_is_rejected_on_update(
+        self, server, project_root, task_interceptor,
+    ):
+        metadata = gate_5537_metadata(
+            x_enumeration_scope='enumerated over procedural_knowledge ONLY',
+        )
+
+        result = await update(server, project_root, metadata=metadata)
+
+        assert result['error_type'] == 'EnumerationScopeMalformed'
+        assert set(result['expected_shape']) == {
+            'stores', 'categories', 'exhaustive', 'note',
+        }
+        task_interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_non_recon_update_bypasses_the_gate(
+        self, server, project_root, task_interceptor, memory_service,
+    ):
+        result = await update(
+            server, project_root,
+            metadata={'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]},
+            agent_id='claude-interactive',
+        )
+
+        assert 'enumeration_liveness' not in result
+        metadata, _ = forwarded_update(task_interceptor)
+        assert metadata == {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
+        memory_service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_gate_filters_only_the_outgoing_payload(
+        self, server, project_root, task_interceptor, memory_service,
+    ):
+        result = await update(server, project_root, description=GATE_DESCRIPTION)
+
+        assert 'enumeration_liveness' not in result
+        kwargs = forwarded(task_interceptor.update_task)
+        assert kwargs['description'] == GATE_DESCRIPTION
+        assert kwargs['metadata'] is None
+        memory_service.get_memory_by_id.assert_not_awaited()
+        task_interceptor.get_task.assert_not_awaited()
