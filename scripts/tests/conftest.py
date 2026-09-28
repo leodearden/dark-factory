@@ -16,8 +16,8 @@ not its contents as bare top-level names.
 Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
 the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
 by bare name: importlib mode keeps a test file's own directory off sys.path.
-Appended rather than inserted, so it can never shadow a scripts/ module or an
-installed package. Mirrors tests/scripts/conftest.py's `_THIS_DIR` entry.
+Like tests/scripts/conftest.py's `_THIS_DIR` entry, but appended rather than
+inserted, so it can never shadow a scripts/ module or an installed package.
 
 Also home to the shared tasks.db test fixtures (`make_tasks_db`,
 `project_root_with_tasks_db`). Each previously existed as three

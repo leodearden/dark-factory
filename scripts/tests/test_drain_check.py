@@ -133,8 +133,8 @@ def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
 # ---------------------------------------------------------------------------
 # step-5: CLI (argparse) tests -- drive via subprocess.run
 #
-# The budget is not a literal: see cli_subprocess_timeout.py, which also
-# documents the DRAIN_CHECK_TEST_TIMEOUT override.
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_recon_busy_check.py and test_scan_task_toolcall_leaks.py.
 # ---------------------------------------------------------------------------
 
 def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
