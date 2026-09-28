@@ -594,45 +594,11 @@ NEVER — each of these cost a real session a turn or an entire wait
 """
 
 
-# Third member of the wait block: reading the exit code a wait returned (task
-# 5519, legibility census).  Founding sighting: `uv run python -m pytest
-# fused-memory/tests/ ... 2>&1 | tail -6` under a 2400000 ms Bash timeout came
-# back `[exit 137]` with NO output, far short of that budget, and the agent
-# had no way to tell "my timeout fired" from "something external killed it".
-#
-# MEASURED 2026-09-27 from dispatched sessions on this host -- do NOT
-# re-derive:
-#   * pipefail is OFF in the agent shell (`set -o`; `(exit 3) | cat` gives 0),
-#     so the sighting's `| tail -6` reported tail's status, not pytest's.
-#   * `/usr/bin/time -v` on a SIGKILLed child prints "Command terminated by
-#     signal 9", the elapsed wall clock and the max RSS, and still returns 137.
-#     Its max RSS is the LARGEST single descendant, not a sum over xdist
-#     workers -- hence the caveat in the prose.
-#   * cgroup v2: `/proc/self/cgroup` is one `0::` line, and the orchestrator
-#     service's `memory.events` is readable and carries `oom_kill`.  Every
-#     cgroup ancestor reads memory.max=max, so an OOM here is host pressure,
-#     not a hidden per-service cap.
-#   * `dmesg` fails with EPERM.  `journalctl -k` was unavailable in the
-#     architect's session but readable in the implementer's (uid in the `adm`
-#     group), and too slow to be a recipe there: a 14-day window did not
-#     finish in 60s.  Host-dependent, so the prose does not route through it.
-#
-# ELAPSED-VERSUS-BUDGET IS THE PRIMARY READING, deliberately.  The stronger
-# claim "the Bash tool never produces 137" is unfalsifiable from this repo and
-# false if the harness escalates SIGTERM to SIGKILL after a grace, as this
-# repo's own agents/invoke.py::_run_agent_subprocess does.  "It died far short
-# of the budget I set" holds whatever the harness does.
-#
-# THE SESSION WATCHDOG IS EXCLUDED AS A CAUSE, and the prose says so: its kill
-# takes the whole session, so an agent reading a 137 was by that fact not
-# reaped by it.  An earlier plan revision said "suspect the watchdog", which
-# sends the agent after an impossible cause.
-#
-# Composed INTO BACKGROUND_WAIT_GUIDANCE rather than appended to
-# _BASH_CAPABLE_ROLE_PREAMBLE's tail: it is the same concern as waiting (its
-# 143 and 124 readings point at sentences in WAIT_PATTERN_GUIDANCE), and the
-# Bash-capable carrier set comes with the composition.  Constraint (b) above
-# binds it too.  Same no-literal-braces rule as the two members above.
+# Third member of the wait block (task 5519): reading the exit code a wait
+# returned -- your own timeout, or an external kill.  Constraint (b) above binds
+# it, and it stays brace-free like the two members above.  It reads shell
+# 128 + N codes against the clock; verify_classify.py::is_external_kill_rc is a
+# different rule, over negative asyncio returncodes, that ignores a shell 137.
 EXTERNAL_KILL_GUIDANCE = """
 ## Reading an exit code: your own timeout, or an external kill?
 
@@ -648,8 +614,7 @@ Read the code against the CLOCK: a command that died far short of the
 
 A killed run says NOTHING about the code under test: it is neither failing nor
 hanging. Never report it as a test failure or a hang. Say it was killed
-externally, and quote the raw code. Same rule, machine-side:
-`orchestrator/src/orchestrator/verify_classify.py::_EXTERNAL_KILL_SIGNALS`.
+externally, and quote the raw code.
 
 Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
 without `pipefail`, so a pipeline reports its LAST stage's status and the real
@@ -675,9 +640,9 @@ Then, in order:
 - Short of budget with `oom_kill` risen or a large max RSS: shrink the run.
   Shard by directory, cut xdist workers (`-n 4`, not `-n auto`, which starts
   one per core), or run the heaviest subset alone.
-- Neither: `escalate_blocker` with `category='infra_issue'`, quoting the raw
-  code, elapsed time, max RSS and `oom_kill` before and after, rather than
-  guessing a cause.
+- Neither: escalate rather than guess a cause (`escalate_blocker` with
+  `category='infra_issue'` if you hold it, otherwise `escalate_info`), quoting
+  the raw code, elapsed time, max RSS and `oom_kill` before and after.
 """
 
 
@@ -699,9 +664,9 @@ BACKGROUND_WAIT_GUIDANCE = (
 # that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 9180 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2470),
-# WAIT_PATTERN_REMINDER 766 B -> 766/9180 = 8.3%.
+# BACKGROUND_WAIT_GUIDANCE 9128 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2418),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9128 = 8.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
