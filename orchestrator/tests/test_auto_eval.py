@@ -598,6 +598,34 @@ async def test_back_link_sets_pair_without_disturbing_sibling_keys(tmp_path: Pat
     assert backend.blob == {**before, 'auto_eval_pair': 'redo-1'}
 
 
+def _submitted_redo_metadata(f: _Fixture) -> dict:
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    assert len(submitted) == 1
+    return submitted[0][1]['metadata']
+
+
+@pytest.mark.asyncio
+async def test_redo_sibling_does_not_carry_modules(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+    assert f.assignment.task['metadata']['modules'] == ['mod_a']
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert 'modules' not in _submitted_redo_metadata(f)
+
+
+@pytest.mark.asyncio
+async def test_redo_sibling_files_are_sanitized(tmp_path: Path):
+    f = _make(
+        project_root=tmp_path / 'proj',
+        files=['mod_a/src/foo.py', 'mod_b/src/', 'mod_c/src'],
+    )
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert _submitted_redo_metadata(f)['files'] == ['mod_a/src/foo.py']
+
+
 # ---------------------------------------------------------------------------
 # Supersede prior auto-eval redo siblings on repeated re-block (task 2075)
 # ---------------------------------------------------------------------------
