@@ -570,11 +570,10 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # "Restarting 1 orchestrator unit(s)" line, which is the signature of the
     # budget expiring before that echo. The MIRROR test in
     # tests/scripts/test_orchestrator_watchdog.py::
-    # test_boundary4_defers_busy_unit_while_others_proceed carries a comment
-    # recording that 8s was already measured as insufficient for the same defer
-    # line under load and was raised to 20 -- this site's 3s was 2.7x tighter
-    # still. Freshness is NOT the mechanism: `classify` needs now - ts_epoch > 120
-    # for stale, unreachable inside a 3s budget.
+    # test_boundary4_defers_busy_unit_while_others_proceed hit the same wall
+    # at 8s and then 20s, and now stops on the drain poll ledger instead of a
+    # wall-clock kill (task 4207). Freshness is NOT the mechanism: `classify`
+    # needs now - ts_epoch > 120 for stale, unreachable inside a 3s budget.
     spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:

@@ -496,7 +496,8 @@ class TestWaitProofGraceSecs:
     # The two spawn timeouts actually in use, at the three sites step-9 edits:
     # test_defer_withholds_restart_while_busy (3s),
     # test_unknown_grace_withholds_restart_while_absent (3s),
-    # test_boundary4_defers_busy_unit_while_others_proceed (20s).
+    # scripts/tests/test_restart_all_orchestrators.py::
+    # test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await (20s).
     REAL_SPAWN_TIMEOUTS = (3, 20)
 
     def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:

@@ -4530,10 +4530,11 @@ _BOUNDARY_DRAIN_RUN_BASE_SECS = 20
 
 # _BOUNDARY_DRAIN_RUN_CAP_SECS: derived, not tuned -- same value and same
 # reasoning as `tests/scripts/test_spawn_claude.py::_SPAWN_RUN_CAP_SECS`.
-# This budget bounds ONE subprocess and does not feed wait_proof_grace_secs
-# (the callers relying on the default set no force-fire grace), so the only
-# ceiling above it is pytest-timeout's --timeout=300 per-test axe that both
-# test roots' test_command carries. 120 leaves >2x margin inside it.
+# This budget bounds ONE subprocess and never FEEDS a force-fire grace: boundary4
+# uses it as its readiness deadline and does set a grace, but anchors that grace
+# to the gate's defer line, not to this budget. So the only ceiling above it is
+# pytest-timeout's --timeout=300 per-test axe that both test roots'
+# test_command carries. 120 leaves >2x margin inside it.
 #
 # A subprocess wall-clock bound can afford a larger cap than a readiness
 # wait: it is paid only when the child genuinely HANGS, since the happy path
@@ -4940,10 +4941,11 @@ def test_boundary_drain_run_budget_is_load_scaled_off_the_unchanged_base(
 def test_boundary_drain_run_cap_stays_inside_the_per_test_axe() -> None:
     """The cap is DERIVED from pytest-timeout's axe, not tuned to taste.
 
-    This budget does not feed `wait_proof_grace_secs` (the callers that rely
-    on the default set no force-fire grace), so the binding ceiling is the
-    `--timeout=300` per-test axe both roots' test_command carries, and a
-    single spawn is the only thing this budget bounds. Constants only, no
+    This budget never FEEDS a force-fire grace (boundary4 sets one, but
+    anchors it to the gate's defer line rather than to this budget), so the
+    binding ceiling is the `--timeout=300` per-test axe both roots'
+    test_command carries, and a single spawn is the only thing this budget
+    bounds. Constants only, no
     monkeypatching: the scale/floor/clamp arithmetic is already pinned by
     `TestLoadScaledGrace` in tests/scripts/test_fleet_dir_isolation.py, and
     re-deriving it here would be pure duplication. Mirrors the identical
