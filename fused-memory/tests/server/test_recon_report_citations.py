@@ -2079,9 +2079,11 @@ class TestCiteTaskFoldPurgeLogging:
     """Both cite_task in-run folds (task-2425 project-scoped, task-2432
     entity-scoped) purge the losing finding WHOLESALE — its description,
     suggested_action and any citations already attached to it are dropped
-    with no trace (see _purge_finding's docstring). A WARNING carrying that
-    content is the sole recovery channel, so it must be emitted before the
-    purge, on BOTH branches, and never on a non-folding cite_task.
+    from the report (see _purge_finding's docstring). A WARNING carrying that
+    content is the operator-visible, long-retention recovery channel (the
+    structured ``purged_findings`` copy is pinned by TestCiteTaskFoldPurgeRecord),
+    so it must be emitted before the purge, on BOTH branches, and never on a
+    non-folding cite_task.
     """
 
     def _fake_ti(self):
