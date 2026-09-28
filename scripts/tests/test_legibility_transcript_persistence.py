@@ -181,7 +181,14 @@ _USABLE_PROMPT = (
 )
 
 
-def _spawn_record(slug: str, cwd: str, prompt: str, *, start_offset_hours: int = 1):
+def _spawn_record(
+    slug: str,
+    cwd: str,
+    prompt: str,
+    *,
+    start_offset_hours: int = 1,
+    claude_session_id: str | None = None,
+):
     return session_registry.SessionRecord(
         session_slug=slug,
         status=session_registry.Status.EXITED,
@@ -189,6 +196,16 @@ def _spawn_record(slug: str, cwd: str, prompt: str, *, start_offset_hours: int =
         cwd=cwd,
         start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
         exit_code=0,
+        claude_session_id=claude_session_id,
+    )
+
+
+def _slash_expanded(command: str, args: str) -> str:
+    """The real on-disk first user turn of a slash-command session, as observed in ~/.claude/projects transcripts such as 2d479abe-dc83-4b50-8e36-2b13b0c2333c.jsonl."""
+    return (
+        f"<command-message>{command}</command-message>\n"
+        f"<command-name>/{command}</command-name>\n"
+        f"<command-args>{args}</command-args>"
     )
 
 
@@ -454,6 +471,81 @@ def test_find_missing_transcripts_no_false_positive_for_underscore_cwd(tmp_path)
     )
 
     assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# task 5873: bound claude_session_id is the exact join key
+# ---------------------------------------------------------------------------
+
+_DF_CWD = "/home/leo/src/dark-factory"
+_TEAM_ARGS = (
+    "Read the brief at /home/leo/.claude/spawn-briefs/steward-multiple-runs.md "
+    "and carry out what it specifies."
+)
+_TEAM_PROMPT = "/team " + _TEAM_ARGS
+_SPAWN_TRAILER = (
+    "\n\n---\nBefore you end this session (whether you finish, hand off, or get\n"
+    "blocked), write your outcome to: /x/result.md"
+)
+
+
+def test_find_matching_transcript_bound_session_id_resolves_exact_file(tmp_path):
+    projects = tmp_path / "projects"
+    session_id = "2d479abe-dc83-4b50-8e36-2b13b0c2333c"
+    rec = _spawn_record(
+        "sess-bound", _DF_CWD, _TEAM_PROMPT, claude_session_id=session_id,
+    )
+
+    bound_path = _write_transcript(
+        projects, _DF_CWD, f"{session_id}.jsonl",
+        "An opening turn unrelated to the recorded prompt.",
+    )
+    sibling = _write_transcript(
+        projects, _DF_CWD, "aaa-sibling.jsonl",
+        "You are a TDD implementer. A different first turn.",
+    )
+    _set_mtime(sibling, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == bound_path
+
+
+def test_find_missing_transcripts_no_false_positive_for_bound_slash_command_spawn(tmp_path):
+    projects = tmp_path / "projects"
+    session_id = "2d479abe-dc83-4b50-8e36-2b13b0c2333c"
+    rec = _spawn_record(
+        "sess-bound-team", _DF_CWD, _TEAM_PROMPT, claude_session_id=session_id,
+    )
+    _write_transcript(
+        projects, _DF_CWD, f"{session_id}.jsonl",
+        _slash_expanded("team", _TEAM_ARGS + _SPAWN_TRAILER),
+    )
+
+    findings = mod.find_missing_transcripts(
+        [rec], projects, [_DF_CWD],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert findings == []
+
+
+def test_find_matching_transcript_bound_session_id_absent_is_missing_even_with_prompt_match(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-bound-lost", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id="f1b732ad-572f-42bd-8720-1a219ff0d424",
+    )
+    respawn = _write_transcript(projects, _DF_CWD, "respawn.jsonl", _USABLE_PROMPT)
+    _set_mtime(respawn, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
 
 
 # ---------------------------------------------------------------------------
