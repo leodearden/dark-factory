@@ -1687,8 +1687,8 @@ class TestJudgeWriteAnthropicArm:
         `response_format` to one provider, so the asymmetry contradicts the
         module's stated contract as well as the openai arm.
 
-        It is not cosmetic. This is a classifier answering ONE word from a
-        closed vocabulary under a 64-token cap with no JSON mode on this arm,
+        It is not cosmetic. This is a classifier answering from a closed
+        vocabulary under a tight token cap with no JSON mode on this arm,
         so sampling buys nothing and raises the odds of a preamble or a
         truncated payload — each of which is a `JudgeOutputError`, and
         therefore a COUNTED fail-open on the write path rather than a bad
