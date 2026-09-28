@@ -1478,7 +1478,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 4
+DIGEST_INSTRUMENT_VERSION: int = 5
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1502,6 +1502,8 @@ keys do NOT bump it.
   4 -- the non-human-origin record rule (:func:`has_non_human_origin`,
        task 5956), consulted with the content classifier by the gold-turn
        filter and every dialogue carrier.
+  5 -- the merger's heading set (MERGER_HEADINGS) and the rescoped
+       memory-block markers, task 3659.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
