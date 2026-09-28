@@ -6923,3 +6923,39 @@ class TestOnTaskDoneRetiresFlagMarkers:
             await self._drive(reconciler, tmp_path, transition=transition)
 
         seam.assert_not_awaited()
+
+    @staticmethod
+    def _retire_rows(actions: list[dict]) -> list[dict]:
+        return [
+            a for a in actions
+            if a['action_type'] == 'retire' and a['target'] == 'flag_for_stage2'
+        ]
+
+    @staticmethod
+    def _retire_entries(result: dict) -> list[dict]:
+        return [a for a in result.get('actions', []) if a['type'] == 'flag_for_stage2_retired']
+
+    @pytest.mark.asyncio
+    async def test_a_retirement_is_recorded_durably(self, reconciler, journal, tmp_path):
+        with patch(_SEAM, new=AsyncMock(return_value=2)):
+            result = await self._drive(reconciler, tmp_path, transition='done')
+
+        run_id = await self._run_id_for(journal)
+        rows = self._retire_rows(await journal.get_run_actions(run_id))
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row['operation'] == 'delete'
+        assert row['causation_id'] == run_id
+        assert row['detail'] == {'task_id': '4376', 'retired': 2}
+        assert self._retire_entries(result) == [
+            {'type': 'flag_for_stage2_retired', 'task_id': '4376', 'count': 2},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_nothing_retired_writes_nothing(self, reconciler, journal, tmp_path):
+        with patch(_SEAM, new=AsyncMock(return_value=0)):
+            result = await self._drive(reconciler, tmp_path, transition='done')
+
+        run_id = await self._run_id_for(journal)
+        assert self._retire_rows(await journal.get_run_actions(run_id)) == []
+        assert self._retire_entries(result) == []
