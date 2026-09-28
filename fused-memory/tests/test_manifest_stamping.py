@@ -1048,9 +1048,10 @@ async def test_stamper_warn_tier_check_is_copied_and_reported(tmp_path):
 async def test_stamper_clean_sidecar_report_has_no_polarity_warnings_key(tmp_path):
     """A fully clean sidecar's report keeps its exact 4-key shape.
 
-    Protects the five exact-dict-equality assertions on this report
-    (test_manifest_stamping.py:182,:319; test_delivered_checks_e2e.py:435,:697;
-    test_task_tools.py:2514).
+    Protects the exact-dict-equality assertions on this report, e.g.
+    ``fused-memory/tests/test_manifest_stamping.py::test_happy_path_stamps_file_and_copies_mechanical_checks``,
+    ``fused-memory/tests/test_delivered_checks_e2e.py::_verify_row1_stamp`` and
+    ``fused-memory/tests/test_task_tools.py::test_commit_planning_stamps_manifest_and_copies_delivered_checks``.
     """
     root = _polarity_git_repo(tmp_path / 'proj')
     report, interceptor, _ = await _stamp_polarity(

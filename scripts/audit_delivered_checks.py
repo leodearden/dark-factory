@@ -95,7 +95,7 @@ from _task_db_scan import (
 # checkout's shared/src on sys.path for a bare `python3`, so without this a
 # copy of this script running from a worktree would evaluate descriptors using
 # the MAIN checkout's primitive. Same reasoning and same form as
-# audit_combine_gate_marker_loss.py:97-104. The shared.* imports below MUST
+# scripts/audit_combine_gate_marker_loss.py::_SHARED_SRC. The shared.* imports below MUST
 # stay after this insert.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:

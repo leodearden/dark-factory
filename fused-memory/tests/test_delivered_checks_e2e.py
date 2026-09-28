@@ -1063,7 +1063,7 @@ class TestPolarityRefusal:
 
         This is the majority case and the headline's own shape — the gate must
         be completely invisible on it, including leaving the stamping report's
-        exact four-key shape (asserted verbatim at line 435) untouched.
+        exact four-key shape (asserted verbatim in ``_verify_row1_stamp``) untouched.
         """
         server, _interceptor, project_root = backend_stack
 

@@ -401,7 +401,7 @@ class TestAuditProject:
 # main() — exercised as a REAL PROCESS, the way an operator runs it.
 #
 # Subprocess rather than in-process for the same reason the exemplar
-# (test_audit_combine_gate_marker_loss.py:1496-1502) does it: the flat-sibling
+# (scripts/tests/test_audit_combine_gate_marker_loss.py::_run_cli) does it: the flat-sibling
 # `from _task_db_scan import ...` contract and the `_SHARED_SRC` sys.path bind
 # are only genuinely exercised when sys.path[0] is scripts/ because the
 # interpreter put it there, not because a conftest did.
