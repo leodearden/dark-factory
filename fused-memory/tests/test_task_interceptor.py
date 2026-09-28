@@ -1929,11 +1929,17 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'raw_target_metadata',
+    ['{not json', [], 0, False],
+    ids=['corrupt-json', 'falsy-list', 'falsy-int', 'falsy-bool'],
+)
 async def test_curator_combine_refusal_names_an_unreadable_target_blob(
     curator_interceptor,
     taskmaster,
     audit_dir,
     caplog,
+    raw_target_metadata,
 ):
     """A gated candidate against a CORRUPT target blob says so in the refusal.
 
@@ -1945,13 +1951,13 @@ async def test_curator_combine_refusal_names_an_unreadable_target_blob(
     could not be read. Paired with
     ``test_curator_combine_refuses_gated_candidate_into_ungated_target``,
     which pins the other branch of the same conditional — without both, an
-    edit that collapses the branch (e.g. dropping the ``target_metadata and``
-    guard) ships green.
+    edit that collapses the branch ships green. The falsy cases pin that the
+    wording follows the shared tri-state, not the raw value's truthiness.
     """
     _set_target(taskmaster, None)
-    # _set_target json.dumps() whatever it is given; overwrite with a raw blob
-    # that cannot round-trip through json.loads at all.
-    taskmaster.get_task.return_value['metadata'] = '{not json'
+    # _set_target json.dumps() whatever it is given; overwrite with a raw
+    # value coerce_task_metadata classifies as present-but-unreadable.
+    taskmaster.get_task.return_value['metadata'] = raw_target_metadata
     curator_interceptor._curator = _mock_curator(_combine_decision('unreadable target'))
 
     with caplog.at_level(logging.WARNING):

@@ -2987,7 +2987,7 @@ class TaskInterceptor:
             # decision itself is unchanged either way. Re-checks the SAME
             # `target_metadata` the condition above consulted, deliberately.
             target_meta, _target_warnings = _parse_metadata_value(target_metadata)
-            if target_metadata and target_meta is None:
+            if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
                 target_reason = 'the target does not declare a gate'
