@@ -7,27 +7,32 @@ and fused_memory does not depend on orchestrator.
 
 Python sites call :func:`jcodemunch_server_config`.  Shell sites run
 ``PYTHONPATH=<repo>/shared/src python3 -m shared.jcodemunch_launch`` and read
-the same config as one line of JSON; the module is stdlib-only so that works
-outside the workspace venv.
+the same config as one line of JSON, or add the ``install-argv`` rendering to
+read the launcher's pinned install command one argument per line; the module
+is stdlib-only so that works outside the workspace venv.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from typing import TypedDict
 
 __all__ = [
     'JCODEMUNCH_COMMAND',
     'JCODEMUNCH_ENV',
+    'JCODEMUNCH_PYTHON',
+    'JCODEMUNCH_REQUIREMENT',
     'JcodemunchServerConfig',
+    'jcodemunch_install_argv',
     'jcodemunch_server_config',
 ]
 
-# Prebuilt, version-pinned launcher on PATH (installed via
-# `uv tool install --python 3.13 jcodemunch-mcp==<pin>`; see
-# reify scripts/setup-dev.sh).  Named constants centralise the launch contract
-# so every launch site references one definition and a regression test can
-# lock it against reverting to the unpinned uvx form.
+# Prebuilt, version-pinned launcher on PATH (installed from
+# jcodemunch_install_argv(), which scripts/setup-host.sh runs).  Named
+# constants centralise the launch contract so every launch site references
+# one definition and a regression test can lock it against reverting to the
+# unpinned uvx form.
 # Invoking the installed launcher on PATH avoids `uvx`'s per-launch re-resolve
 # + from-source build of tree-sitter C-extension sdists, which under host load
 # stalled agent startup past the 1200s wall — the 0-turn MCP-startup wedge
@@ -46,8 +51,8 @@ __all__ = [
 # jcodemunch-watcher systemd unit adopted this same lever on 2026-06-11 for
 # the same reason; this is the per-agent stdio path catching up.
 # Deprecated upstream ("will be removed in v2.0. Use config.jsonc instead."),
-# verified working at the installed 1.108.55 — a pin bump past v2.0 must
-# re-establish this lever via `"git_root_identity": false` in config.jsonc.
+# verified working at the JCODEMUNCH_REQUIREMENT pin — a pin bump past v2.0
+# must re-establish this lever via `"git_root_identity": false` in config.jsonc.
 # Note `"identity_mode": "local"` is NOT a substitute at 1.108.55: that key is
 # absent from the package's CONFIG_TYPES and is discarded silently despite
 # the shipped config template advertising it.
@@ -70,6 +75,11 @@ JCODEMUNCH_ENV: dict[str, str] = {
     'JCODEMUNCH_NO_VERSION_HINT': '1',
     'JCODEMUNCH_GIT_ROOT_IDENTITY': '0',
 }
+# The launcher factory hosts run today; `uv tool install` replaces on a spec
+# change, so a lower pin would downgrade them.  The interpreter is pinned
+# because an unpinned uv picks 3.14t, where a tree-sitter dependency has no wheel.
+JCODEMUNCH_PYTHON: str = '3.13'
+JCODEMUNCH_REQUIREMENT: str = 'jcodemunch-mcp==1.108.55'
 
 
 class JcodemunchServerConfig(TypedDict):
@@ -82,5 +92,24 @@ def jcodemunch_server_config() -> JcodemunchServerConfig:
     return {'command': JCODEMUNCH_COMMAND, 'env': dict(JCODEMUNCH_ENV)}
 
 
+def jcodemunch_install_argv() -> list[str]:
+    """The command that installs the prebuilt launcher JCODEMUNCH_COMMAND names, at the pin."""
+    return ['uv', 'tool', 'install', '--python', JCODEMUNCH_PYTHON, JCODEMUNCH_REQUIREMENT]
+
+
+def _main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog='python3 -m shared.jcodemunch_launch')
+    parser.add_argument(
+        'rendering',
+        nargs='?',
+        choices=('server-config', 'install-argv'),
+        default='server-config',
+    )
+    if parser.parse_args(argv).rendering == 'install-argv':
+        print('\n'.join(jcodemunch_install_argv()))
+    else:
+        print(json.dumps(jcodemunch_server_config()))
+
+
 if __name__ == '__main__':
-    print(json.dumps(jcodemunch_server_config()))
+    _main()
