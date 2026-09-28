@@ -52,8 +52,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
@@ -80,7 +80,7 @@ from fused_memory.server.grouped_read import (
 from fused_memory.server.near_duplicate_guard import _cosine_of
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import SearchResults
@@ -166,6 +166,20 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
 })
+
+
+class JudgeVerdict(NamedTuple):
+    """The middle-band judge's answer: a verdict and the candidate it is about.
+
+    This is the judge's return contract, so it lives beside the outcomes it is
+    drawn from. ``write_triage_judge`` imports it; this module never imports
+    the judge, so the import direction stays one-way.
+    """
+
+    #: A :data:`TRIAGE_OUTCOMES` member.
+    outcome: str
+    #: The id of the RETRIEVED record the verdict is about; ``None`` names none.
+    candidate_id: str | None = None
 
 
 def attach_write_landed(result: Any) -> bool:
@@ -316,13 +330,17 @@ class BandDecision:
 
     #: One of the outcome constants, or the internal :data:`OUTCOME_JUDGE`.
     outcome: str
-    #: The best comparable candidate's id, or ``None`` when nothing compared.
+    #: The id a write attaches to, or ``None`` when nothing is attached.
     canonical_id: str | None
-    #: That candidate's per-store cosine, or ``None``.
+    #: The band winner's per-store cosine — the number that routed this write.
+    #: On a judged attach it need not be the cosine of ``canonical_id``'s record.
     similarity: float | None
     #: The band edges this decision was made against, echoed as read.
     t_high: float | None
     t_low: float | None
+    #: The slate id the judge named, before hoisting; ``None`` on every
+    #: non-judged path and for a bare-word verdict.
+    judged_candidate_id: str | None = None
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -708,7 +726,9 @@ async def _stub_judge(
     The real judge (D3) is synchronous-in-``add_memory``, fail-open,
     closed-output over :data:`TRIAGE_OUTCOMES`, and DETECTS rather than
     adjudicates — it classifies the relationship between the write and the
-    candidate, it does not decide which text is true.
+    candidate, it does not decide which text is true. It answers a
+    :class:`JudgeVerdict` naming its candidate; a bare outcome word, like this
+    stub's, is a verdict naming no candidate.
 
     Storing is also the right stub answer on the merits: with no judge, the
     only alternative is to attach on a similarity the calibration explicitly
@@ -848,7 +868,7 @@ async def triage_write(
         return decision
 
     try:
-        verdict = await (judge or _stub_judge)(
+        answer = await (judge or _stub_judge)(
             memory_service=memory_service,
             content=content,
             project_id=project_id,
@@ -863,26 +883,54 @@ async def triage_write(
             # here -- one home for that decision.
             candidates=results,
         )
+        judged = _apply_judge_verdict(decision, answer, results)
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
-    if verdict not in TRIAGE_OUTCOMES:
+    if judged.outcome not in TRIAGE_OUTCOMES:
         # A closed output set (D3) means an unrecognised verdict is a BUG, not
         # an extension point — counted as a fail-open so it cannot pass as a
         # routing decision nobody notices.
         _record_fail_open(
             counter, project_id,
-            ValueError(f'judge returned {verdict!r}, not in TRIAGE_OUTCOMES'),
+            ValueError(f'judge returned {judged.outcome!r}, not in TRIAGE_OUTCOMES'),
             stage='judge',
         )
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+    return judged
 
-    # `stored` carries no canonical: nothing was attached, so naming one would
-    # invite a caller to attach to a candidate the judge declined to endorse.
-    canonical_id = None if verdict == OUTCOME_STORED else decision.canonical_id
-    return BandDecision(
-        verdict, canonical_id, decision.similarity, decision.t_high, decision.t_low,
+
+def _apply_judge_verdict(
+    decision: BandDecision,
+    answer: object,
+    results: Iterable[MemoryResult],
+) -> BandDecision:
+    """The judged band's attach rule: file the write against the candidate named.
+
+    *answer* is what the judge returned — a :class:`JudgeVerdict`, any
+    ``(outcome, candidate_id)`` pair, or a bare outcome word naming no
+    candidate. A verdict naming a candidate attaches to that retrieved record,
+    hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
+    naming none attaches to the band's winner. ``stored`` attaches nothing, so
+    it carries no canonical a caller could mistake for an endorsement.
+    """
+    if isinstance(answer, str):
+        verdict = JudgeVerdict(answer)
+    elif isinstance(answer, tuple) and len(answer) == 2:
+        verdict = JudgeVerdict._make(answer)
+    else:
+        raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
+    if verdict.outcome == OUTCOME_STORED:
+        return replace(decision, outcome=OUTCOME_STORED, canonical_id=None)
+    if verdict.candidate_id is None:
+        return replace(decision, outcome=verdict.outcome)
+    judged = next(result for result in results if result.id == verdict.candidate_id)
+    return replace(
+        decision,
+        outcome=verdict.outcome,
+        canonical_id=_canonical_id_of(judged),
+        judged_candidate_id=verdict.candidate_id,
     )
 
 
