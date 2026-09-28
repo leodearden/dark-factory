@@ -47,8 +47,8 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     BandDecision,
-    JudgeVerdict,
     TriageFailOpenCounter,
+    TriageJudgeVerdict,
     triage_write,
 )
 from fused_memory.server.write_triage_judge import (
@@ -412,22 +412,22 @@ class TestParseJudgeVerdict:
     @pytest.mark.parametrize(
         ('word', 'candidate_id', 'expected'),
         [
-            ('distinct', None, JudgeVerdict(OUTCOME_STORED)),
-            ('restates', 'm1', JudgeVerdict(OUTCOME_RESTATED, 'm1')),
-            ('amends', 'm1', JudgeVerdict(OUTCOME_AMENDED, 'm1')),
-            ('contests', 'm1', JudgeVerdict(OUTCOME_CONTESTED, 'm1')),
+            ('distinct', None, TriageJudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')),
         ],
         ids=['distinct', 'restates', 'amends', 'contests'],
     )
     def test_a_bare_json_object_round_trips(
-        self, word: str, candidate_id: str | None, expected: JudgeVerdict,
+        self, word: str, candidate_id: str | None, expected: TriageJudgeVerdict,
     ) -> None:
         """The happy path: exactly what `response_format=json_object` returns."""
         assert parse_judge_verdict(_payload(word, candidate_id), self._SLATE) == expected
 
     def test_distinct_may_name_its_candidate_as_an_explicit_null(self) -> None:
         raw = json.dumps({VERDICT_KEY: 'distinct', CANDIDATE_ID_KEY: None})
-        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_STORED)
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_STORED)
 
     @pytest.mark.parametrize(
         ('word', 'outcome'),
@@ -458,12 +458,12 @@ class TestParseJudgeVerdict:
         candidate_id = None if outcome == OUTCOME_STORED else 'm1'
         assert parse_judge_verdict(
             _payload(word, candidate_id), self._SLATE,
-        ) == JudgeVerdict(outcome, candidate_id)
+        ) == TriageJudgeVerdict(outcome, candidate_id)
 
     def test_a_fenced_json_block_parses(self) -> None:
         """A model that ignores the JSON mode and fences its answer still parses."""
         raw = f'```json\n{_payload("amends", "m1")}\n```'
-        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_AMENDED, 'm1')
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_json_surrounded_by_prose_parses(self) -> None:
         """`extract_json` brace-scans, so leading/trailing prose is tolerated."""
@@ -472,14 +472,14 @@ class TestParseJudgeVerdict:
             f'{_payload("amends", "m1")}\n'
             'That is my answer.'
         )
-        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_AMENDED, 'm1')
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_a_verdict_with_extra_keys_still_parses(self) -> None:
         """Extra keys are ignored; only the verdict and the candidate are contractual."""
         raw = json.dumps({
             VERDICT_KEY: 'restates', CANDIDATE_ID_KEY: 'm1', 'reasoning': 'same fact',
         })
-        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_RESTATED, 'm1')
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     def test_an_array_wrapped_object_reads_as_that_object(self) -> None:
         """Pinned deliberately, because it is a behaviour and not an accident.
@@ -497,7 +497,7 @@ class TestParseJudgeVerdict:
         said.
         """
         raw = f'[{_payload("restates", "m1")}]'
-        assert parse_judge_verdict(raw, self._SLATE) == JudgeVerdict(OUTCOME_RESTATED, 'm1')
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     @pytest.mark.parametrize(
         ('raw', 'label'),
@@ -1428,7 +1428,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_STORED)
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
         disabled = [
             r for r in caplog.records
             if r.levelno == logging.INFO and 'judge_enabled' in r.getMessage()
@@ -1466,7 +1466,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 content='c', project_id='p',
                 decision=_decision(None), candidates=[],
             )
-        assert verdict == JudgeVerdict(OUTCOME_STORED)
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
         assert not caplog.records, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
@@ -1481,7 +1481,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_STORED)
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1496,7 +1496,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision(None),
                 candidates=[],
             )
-        assert verdict == JudgeVerdict(OUTCOME_STORED)
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1511,7 +1511,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('pin0'),
                 candidates=[_result('pin0', None, omit_store_score=True)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_STORED)
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
         client.chat.completions.create.assert_not_awaited()
 
 
@@ -1548,15 +1548,15 @@ class TestJudgeWriteOpenAIArm:
     @pytest.mark.parametrize(
         ('word', 'candidate_id', 'expected'),
         [
-            ('distinct', None, JudgeVerdict(OUTCOME_STORED)),
-            ('restates', 'm1', JudgeVerdict(OUTCOME_RESTATED, 'm1')),
-            ('amends', 'm1', JudgeVerdict(OUTCOME_AMENDED, 'm1')),
-            ('contests', 'm1', JudgeVerdict(OUTCOME_CONTESTED, 'm1')),
+            ('distinct', None, TriageJudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')),
         ],
         ids=['distinct', 'restates', 'amends', 'contests'],
     )
     async def test_each_verdict_round_trips(
-        self, word: str, candidate_id: str | None, expected: JudgeVerdict,
+        self, word: str, candidate_id: str | None, expected: TriageJudgeVerdict,
     ) -> None:
         client = _openai_client(_payload(word, candidate_id))
         with patch('openai.AsyncOpenAI', return_value=client):
@@ -1581,7 +1581,7 @@ class TestJudgeWriteOpenAIArm:
                 decision=_decision('m0'),
                 candidates=[_result('m0', 0.90), _result('m1', 0.89), _result('m2', 0.88)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_AMENDED, 'm2')
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm2')
 
     @pytest.mark.asyncio
     async def test_an_id_trimmed_off_the_rendered_slate_is_refused(self) -> None:
@@ -1658,7 +1658,7 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_CONTESTED, 'm1')
+        assert verdict == TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')
 
     @pytest.mark.asyncio
     async def test_the_system_prompt_goes_via_the_system_parameter(self) -> None:
@@ -1718,7 +1718,7 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == JudgeVerdict(OUTCOME_RESTATED, 'm1')
+        assert verdict == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
 
 
 class TestTheClientIsReleased:

@@ -60,7 +60,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
-    JudgeVerdict,
+    TriageJudgeVerdict,
 )
 
 if TYPE_CHECKING:
@@ -203,8 +203,8 @@ def _reject(reason: str, payload: object) -> JudgeOutputError:
     return JudgeOutputError(f'judge output rejected ({reason}): {quoted}')
 
 
-def parse_judge_verdict(raw: str, slate_ids: Collection[str]) -> JudgeVerdict:
-    """Map one raw judge response onto a :class:`JudgeVerdict`.
+def parse_judge_verdict(raw: str, slate_ids: Collection[str]) -> TriageJudgeVerdict:
+    """Map one raw judge response onto a :class:`TriageJudgeVerdict`.
 
     Accepts a bare JSON object, a fenced ```json block, and JSON embedded in
     surrounding prose — via :func:`fused_memory.routing.json_extract.extract_json`,
@@ -259,7 +259,7 @@ def parse_judge_verdict(raw: str, slate_ids: Collection[str]) -> JudgeVerdict:
         raise _reject(
             f'{word!r} is not one of {sorted(JUDGE_VERDICTS)}', payload,
         )
-    return JudgeVerdict(outcome, _named_candidate(payload, outcome, slate_ids))
+    return TriageJudgeVerdict(outcome, _named_candidate(payload, outcome, slate_ids))
 
 
 def _named_candidate(
@@ -892,7 +892,7 @@ async def judge_write(
     project_id: str,
     decision: Any,
     candidates: Any = (),
-) -> JudgeVerdict:
+) -> TriageJudgeVerdict:
     """Adjudicate one middle-band write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
@@ -956,7 +956,7 @@ async def judge_write(
             '%r without an LLM call',
             OUTCOME_STORED,
         )
-        return JudgeVerdict(OUTCOME_STORED)
+        return TriageJudgeVerdict(OUTCOME_STORED)
 
     selected = select_judge_candidates(
         candidates,
@@ -964,7 +964,7 @@ async def judge_write(
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
-        return JudgeVerdict(OUTCOME_STORED)
+        return TriageJudgeVerdict(OUTCOME_STORED)
 
     raw = await _call_llm(
         provider=resolve_judge_provider(memory_service),

@@ -39,8 +39,8 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
-    JudgeVerdict,
     TriageFailOpenCounter,
+    TriageJudgeVerdict,
     triage_write,
 )
 from fused_memory.server.write_triage_judge import CANDIDATE_ID_KEY, VERDICT_KEY
@@ -115,7 +115,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
         counter = _counter()
 
         decision = await _triage(
-            _middle_band_slate(), _judge_answering(JudgeVerdict(outcome, 'm3')), counter,
+            _middle_band_slate(), _judge_answering(TriageJudgeVerdict(outcome, 'm3')), counter,
         )
 
         assert decision.outcome == outcome
@@ -129,7 +129,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
     async def test_the_similarity_stays_the_cosine_that_routed_the_write(self) -> None:
         decision = await _triage(
             _middle_band_slate(),
-            _judge_answering(JudgeVerdict(OUTCOME_AMENDED, 'm3')),
+            _judge_answering(TriageJudgeVerdict(OUTCOME_AMENDED, 'm3')),
             _counter(),
         )
 
@@ -139,7 +139,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
     async def test_a_judged_child_is_hoisted_to_its_parent(self) -> None:
         decision = await _triage(
             _middle_band_slate(kind=AMENDMENT_KIND, **{PARENT_ID_KEY: 'parent-P'}),
-            _judge_answering(JudgeVerdict(OUTCOME_AMENDED, 'm3')),
+            _judge_answering(TriageJudgeVerdict(OUTCOME_AMENDED, 'm3')),
             _counter(),
         )
 
@@ -176,7 +176,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
 
     @pytest.mark.asyncio
     async def test_the_deterministic_band_never_asks_the_judge(self) -> None:
-        judge = _judge_answering(JudgeVerdict(OUTCOME_AMENDED, 'm3'))
+        judge = _judge_answering(TriageJudgeVerdict(OUTCOME_AMENDED, 'm3'))
         slate = [_result('m1', 0.95), *_middle_band_slate()[1:]]
 
         decision = await _triage(slate, judge, _counter())
@@ -219,17 +219,17 @@ class TestABreachedVerdictFailsOpenOnce:
         ('answer', 'offending'),
         [
             pytest.param(
-                JudgeVerdict(OUTCOME_AMENDED, 'not-retrieved'), 'not-retrieved',
+                TriageJudgeVerdict(OUTCOME_AMENDED, 'not-retrieved'), 'not-retrieved',
                 id='an id naming no retrieved record',
             ),
             pytest.param(
-                JudgeVerdict(OUTCOME_STORED, 'm3'), 'm3',
+                TriageJudgeVerdict(OUTCOME_STORED, 'm3'), 'm3',
                 id='a stored verdict naming a candidate',
             ),
             pytest.param((OUTCOME_AMENDED, 7), 7, id='a non-str id'),
-            pytest.param(JudgeVerdict(OUTCOME_AMENDED, ''), '', id='an empty id'),
+            pytest.param(TriageJudgeVerdict(OUTCOME_AMENDED, ''), '', id='an empty id'),
             pytest.param(
-                JudgeVerdict('superseded', 'm3'), 'superseded',
+                TriageJudgeVerdict('superseded', 'm3'), 'superseded',
                 id='an outcome outside the vocabulary',
             ),
         ],

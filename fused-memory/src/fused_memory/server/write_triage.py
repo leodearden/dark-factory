@@ -168,7 +168,7 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
 })
 
 
-class JudgeVerdict(NamedTuple):
+class TriageJudgeVerdict(NamedTuple):
     """The middle-band judge's answer: a verdict and the candidate it is about.
 
     This is the judge's return contract, so it lives beside the outcomes it is
@@ -727,7 +727,7 @@ async def _stub_judge(
     closed-output over :data:`TRIAGE_OUTCOMES`, and DETECTS rather than
     adjudicates — it classifies the relationship between the write and the
     candidate, it does not decide which text is true. It answers a
-    :class:`JudgeVerdict` naming its candidate; a bare outcome word, like this
+    :class:`TriageJudgeVerdict` naming its candidate; a bare outcome word, like this
     stub's, is a verdict naming no candidate.
 
     Storing is also the right stub answer on the merits: with no judge, the
@@ -896,7 +896,7 @@ def _apply_judge_verdict(
 ) -> BandDecision:
     """The judged band's attach rule: file the write against the candidate named.
 
-    *answer* is what the judge returned — a :class:`JudgeVerdict`, any
+    *answer* is what the judge returned — a :class:`TriageJudgeVerdict`, any
     ``(outcome, candidate_id)`` pair, or a bare outcome word naming no
     candidate. A verdict naming a candidate attaches to that retrieved record,
     hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
@@ -935,12 +935,12 @@ def _apply_judge_verdict(
     )
 
 
-def _judge_verdict_of(answer: object) -> JudgeVerdict:
+def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
     """Read a judge's *answer* as a verdict: a bare word names no candidate."""
     if isinstance(answer, str):
-        return JudgeVerdict(answer)
+        return TriageJudgeVerdict(answer)
     if isinstance(answer, tuple) and len(answer) == 2:
-        return JudgeVerdict._make(answer)
+        return TriageJudgeVerdict._make(answer)
     raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
 
 
