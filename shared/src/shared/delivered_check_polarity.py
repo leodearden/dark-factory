@@ -98,8 +98,8 @@ One builder plus one interpreter per kind makes divergence structurally
 impossible.
 
 NEVER RAISES. :func:`lint_delivered_checks` returns findings for any
-input — malformed check entries, a non-repo root, a missing ``git``, a
-metadata blob that will not parse. Both wire points depend on that
+iterable of entries — malformed check entries, values no argv can carry
+(a NUL byte, a lone surrogate), a non-repo root, a missing ``git``. Both wire points depend on that
 unconditionally and for OPPOSITE reasons: ``commit_planning`` would turn
 an exception into a planning outage, and ``stamp_capability_manifests``
 is contractually never-raising, so an exception there would abort the
@@ -149,6 +149,13 @@ logger = logging.getLogger(__name__)
 #: slow disk delays a commit_planning call instead of rejecting a healthy
 #: batch.
 GIT_TIMEOUT_SECS: float = 30.0
+
+#: Everything ``subprocess.run`` can raise for one git probe, all of which mean
+#: "unevaluable", never a verdict: ``OSError`` (no ``git``, exec failure),
+#: ``SubprocessError`` (chiefly a timeout) and ``ValueError`` — an argv
+#: element carrying a NUL byte, or a lone surrogate that cannot be encoded
+#: (``UnicodeEncodeError`` is a ``ValueError``), both refused before git runs.
+_GIT_PROBE_FAILURES = (OSError, subprocess.SubprocessError, ValueError)
 
 
 class CheckOutcome(Enum):
@@ -333,6 +340,7 @@ def evaluate_grep_at_tree(
     * ``OSError`` — ``git`` not on ``PATH`` (``FileNotFoundError``), or
       the exec itself failing.
     * ``subprocess.SubprocessError`` — chiefly ``TimeoutExpired``.
+    * ``ValueError`` — a NUL byte or a lone surrogate in the argv.
     * ``rc >= 2`` — git ran and reported an error (rc 128 for a
       non-repo *repo_root*, a missing directory, or an unresolvable
       *ref*); :func:`interpret_grep_rc` already maps that to ERRORED.
@@ -347,7 +355,7 @@ def evaluate_grep_at_tree(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_PROBE_FAILURES:
         return CheckOutcome.ERRORED
     return interpret_grep_rc(completed.returncode, expect)
 
@@ -375,7 +383,7 @@ def evaluate_path_at_tree(
             completed = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_secs
             )
-        except (OSError, subprocess.SubprocessError):
+        except _GIT_PROBE_FAILURES:
             return CheckOutcome.ERRORED
         outcome = interpret_path_listing(completed.returncode, completed.stdout, expect)
         if outcome is not CheckOutcome.PASS:
@@ -415,8 +423,9 @@ def _vacuous_absent_message(name: str, pattern: str, ref: str) -> str:
 def _unevaluable_message(name: str, ref: str, repo_root: str | Path) -> str:
     return (
         f'delivered_check {name!r} could not be EVALUATED against {ref} in '
-        f'{repo_root} (git errored, timed out, or is unavailable; a non-repo root '
-        f'lands here too). Reported as unvalidated rather than accepted or '
+        f'{repo_root} (git errored, timed out, or is unavailable, or the check '
+        f'holds a value no command line can carry; a non-repo root lands here '
+        f'too). Reported as unvalidated rather than accepted or '
         f'rejected: an infrastructure failure must not block planning, but it must '
         f'not pass as a clean bill of health either.'
     )
@@ -720,7 +729,7 @@ def _grep_matches(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_PROBE_FAILURES:
         return None
     if completed.returncode >= 2:
         return None
@@ -755,7 +764,7 @@ def _tracked_paths(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_PROBE_FAILURES:
         return None
     if completed.returncode != 0:
         return None

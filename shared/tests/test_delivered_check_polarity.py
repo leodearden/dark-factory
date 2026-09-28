@@ -1364,6 +1364,28 @@ class TestLintImmunity:
 
         assert findings == []
 
+    @pytest.mark.parametrize(
+        'check',
+        [
+            pytest.param(_grep_check(pattern='foo\x00bar'), id='nul-in-pattern'),
+            pytest.param(_grep_check(paths=['src/pro\x00ducer.py']), id='nul-in-paths'),
+            pytest.param(_grep_check(pattern='foo\ud800'), id='lone-surrogate'),
+            pytest.param(
+                {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a\x00b']},
+                id='nul-in-path-kind',
+            ),
+        ],
+    )
+    def test_an_argv_the_os_cannot_carry_is_unevaluable_not_raised(
+        self, authoring_repo, check
+    ):
+        """``subprocess`` refuses a NUL byte (``ValueError``) and a lone
+        surrogate (``UnicodeEncodeError``) before git ever runs. That is an
+        unevaluable check, reported, never an exception."""
+        findings = lint_delivered_checks([check], files=[], repo_root=authoring_repo)
+
+        assert [(f.severity, f.code) for f in findings] == [('errored', 'unevaluable')]
+
     def test_checks_is_not_required_to_be_a_list(self, authoring_repo):
         """A tuple, a generator, anything iterable — the extractor's output
         is a list, but the lint is also called directly."""
