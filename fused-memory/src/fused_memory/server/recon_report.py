@@ -16,17 +16,22 @@ import inspect
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
+from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
+
+# The stage vocabulary the production factory passes as ``known_stages``;
+# ``StageId`` is its single source, so a new pipeline stage is accepted as-is.
+KNOWN_RECON_STAGES: frozenset[str] = frozenset(s.value for s in StageId)
 
 
 def _normalize_description(description: str) -> str:
@@ -528,6 +533,17 @@ _ERR_ALREADY_COMPLETED: dict[str, str] = {
 }
 
 
+def _unknown_stage_error(stage: str, known: frozenset[str]) -> dict[str, Any]:
+    """Build the unknown_stage error dict; the sorted vocabulary lets a
+    confused caller self-correct from the response alone."""
+    return {
+        'error': 'unknown_stage',
+        'error_type': 'ReconReportUnknownStage',
+        'stage': stage,
+        'known_stages': sorted(known),
+    }
+
+
 def _duplicate_finding_error(
     existing_id: str,
     warnings: list[str] | None = None,
@@ -672,6 +688,11 @@ class ReconReportState:
                         from it at startup. ``None`` (the default) makes
                         persistence a complete no-op — fresh in-process runs are
                         byte-identical whether or not a store is attached.
+        known_stages:   Keyword-only stage vocabulary (task 4865). When set,
+                        :meth:`start_report` rejects any stage outside it with
+                        an ``unknown_stage`` error. ``None`` (the default) means
+                        no vocabulary is configured — byte-identical to the
+                        pre-4865 behaviour, where every stage name is accepted.
     """
 
     def __init__(
@@ -683,6 +704,8 @@ class ReconReportState:
         task_interceptor: Any = None,
         store: Any = None,
         journal: Any = None,
+        *,
+        known_stages: Iterable[str] | None = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -732,6 +755,9 @@ class ReconReportState:
         # reconciliation-disabled server) keeps every other behaviour
         # byte-identical and makes that tool refuse with journal_unavailable.
         self._journal = journal
+        self._known_stages: frozenset[str] | None = (
+            None if known_stages is None else frozenset(known_stages)
+        )
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
@@ -1090,6 +1116,18 @@ class ReconReportState:
     ) -> dict[str, Any]:
         """Create a new in-progress report entry, or no-op on a repeat call.
 
+        Unknown-stage guard (task 4865), the FIRST check — ahead of the
+        existing-entry branch below: when the state was built with a
+        ``known_stages`` vocabulary and *stage* is outside it, the call logs a
+        WARNING and returns ``{error: 'unknown_stage', error_type:
+        'ReconReportUnknownStage', stage, known_stages}``. It creates no entry,
+        leaves ``self._active`` untouched and writes nothing to the store, so a
+        hallucinated stage name can neither open a phantom entry nor re-point
+        the run's live stage onto one. Because it precedes the existing-entry
+        branch, an out-of-vocabulary entry hydrated from a row persisted before
+        the vocabulary was configured is also left exactly as it was. With
+        ``known_stages is None`` there is no guard and every name is accepted.
+
         Idempotent per PRD §9.2/§9.4. A FIRST call for a given ``(run_id,
         stage)`` creates a fresh entry and returns ``{run_id, stage,
         already_started: False}``. A REPEAT call for an ``(run_id, stage)``
@@ -1138,21 +1176,34 @@ class ReconReportState:
         2's findings into stage 1's entry and close the wrong stage — the
         exact cross-stage corruption this guard closes elsewhere.
 
-        This guard is keyed solely on ``(run_id, stage)`` PRESENCE in
-        ``self._state`` — it deliberately does not (and cannot, without a
-        known-stage vocabulary) police a stage name that does not yet exist
-        for this run; that remains a legal fresh-create, matching a normal
-        stage transition within a run. Consequently the never-stolen
-        guarantee above LAPSES once the earlier stage's entry evicts from
-        ``self._state`` (TTL past :meth:`complete`, via :meth:`tick`): a
-        call naming that now-absent ``(run_id, stage)`` no longer matches
-        ``existing is not None`` below, so it takes the fresh-create path,
-        which unconditionally sets ``self._active[run_id] = stage`` — still
-        capable of stealing the pointer from a different, live stage of the
-        same run. Closing that residual needs the same known-stage
-        vocabulary this docstring already disclaims; it is an explicit scope
-        boundary of this guard (task 3988), not a guarantee made here.
+        This repeat-call guard is keyed solely on ``(run_id, stage)``
+        PRESENCE in ``self._state`` — it does not police a stage name that
+        does not yet exist for this run; that remains a legal fresh-create,
+        matching a normal stage transition within a run. Consequently the
+        never-stolen guarantee above LAPSES once the earlier stage's entry
+        evicts from ``self._state`` (TTL past :meth:`complete`, via
+        :meth:`tick`): a call naming that now-absent ``(run_id, stage)`` no
+        longer matches ``existing is not None`` below, so it takes the
+        fresh-create path, which unconditionally sets ``self._active[run_id]
+        = stage`` — still capable of stealing the pointer from a different,
+        live stage of the same run. The unknown-stage guard at the top closes
+        that residual for every name outside the configured vocabulary (the
+        orphaning a hallucinated stage name used to cause); the residual
+        remains in full only when ``known_stages is None``, and for an
+        in-vocabulary name it is a genuine stage transition, not a stray call.
         """
+        if self._known_stages is not None and stage not in self._known_stages:
+            logger.warning(
+                'recon_report: start_report rejected unknown stage run_id=%r '
+                'stage=%r project_id=%r active_stage=%r; no entry created, '
+                'active stage unchanged',
+                run_id,
+                stage,
+                project_id,
+                self._active.get(run_id),
+            )
+            return _unknown_stage_error(stage, self._known_stages)
+
         existing = self._state.get((run_id, stage))
         if existing is not None:
             warning = (
@@ -3442,6 +3493,9 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         report untouched and returns {run_id, stage, already_started: True,
         project_id, finding_count, completed, warning} describing the
         retained report instead of resetting it.
+        A stage outside the server's configured stage vocabulary returns
+        {error: unknown_stage, error_type, stage, known_stages} and opens
+        nothing; retry with one of known_stages.
         """
         return state.start_report(run_id=run_id, stage=stage, project_id=project_id)
 
