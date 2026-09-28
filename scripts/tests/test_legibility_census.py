@@ -6942,6 +6942,22 @@ def test_default_verify_fn_drops_a_remediation_path_outside_the_tree(tmp_path, a
     assert "remediation" not in cluster
 
 
+@pytest.mark.parametrize(
+    "path_of",
+    [
+        pytest.param(lambda root: ".", id="dot"),
+        pytest.param(lambda root: "./", id="dot-slash"),
+        pytest.param(lambda root: "docs/..", id="up-to-root"),
+        pytest.param(str, id="absolute"),
+    ],
+)
+def test_default_verify_fn_drops_a_remediation_naming_the_tree_root(tmp_path, path_of):
+    root = _tree_with_guide(tmp_path)
+    reply = _remediation_verdict({"path": path_of(root), "change": "Document X"})
+    [cluster] = _verify_one(root, reply)["verified"]
+    assert "remediation" not in cluster
+
+
 @pytest.mark.parametrize("path", ["docs/a\x00b.md", "x" * 5000], ids=["nul-byte", "too-long"])
 def test_default_verify_fn_drops_an_unresolvable_remediation_path(tmp_path, path):
     result = _verify_one(
