@@ -23,6 +23,7 @@ import pytest
 
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.enumeration_guard import (
+    X_ENUMERATION_SCOPE_KEY,
     X_LIVENESS_EXCEPTIONS_KEY,
     X_LIVENESS_REVERIFIED_AT_KEY,
     EnumerationGateResult,
@@ -837,3 +838,175 @@ class TestGateOwnedKeys:
         assert [r['outcome'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == (
             ['truncated'] * len(GATE_5533_FRAGMENTS)
         )
+
+
+# --------------------------------------------------------------------------- #
+# CHANGE 2: the structured x_enumeration_scope
+# --------------------------------------------------------------------------- #
+
+VALID_SCOPE = {
+    'stores': ['mem0'],
+    'categories': ['observations_and_summaries', 'procedural_knowledge'],
+    'exhaustive': False,
+    'note': 'Stage-1 search over two categories only',
+}
+
+# Gate 5533's real value: the legacy prose form.
+GATE_5533_SCOPE = (
+    'mem0_legacy_repeat_entries was enumerated over category=procedural_knowledge '
+    'ONLY; e9d9326a (preferences_and_norms) is a known cross-category sibling '
+    'teaching the same now-false rule, tracked separately in '
+    'mem0_cross_category_repeat_entries'
+)
+
+# name -> (scope value, fields the rejection must name)
+MALFORMED_SCOPES = {
+    'legacy-prose-string': (GATE_5533_SCOPE, {X_ENUMERATION_SCOPE_KEY}),
+    'missing-exhaustive': (
+        {k: v for k, v in VALID_SCOPE.items() if k != 'exhaustive'}, {'exhaustive'},
+    ),
+    'string-exhaustive': ({**VALID_SCOPE, 'exhaustive': 'false'}, {'exhaustive'}),
+    'empty-stores': ({**VALID_SCOPE, 'stores': []}, {'stores'}),
+    'unknown-store': ({**VALID_SCOPE, 'stores': ['mem0', 'qdrant']}, {'stores'}),
+    'empty-categories': ({**VALID_SCOPE, 'categories': []}, {'categories'}),
+    'unknown-category': (
+        {**VALID_SCOPE, 'categories': ['procedural_knowledge', 'how_tos']},
+        {'categories'},
+    ),
+    'non-string-note': ({**VALID_SCOPE, 'note': 7}, {'note'}),
+    'every-field-at-once': (
+        {'stores': 'mem0', 'categories': [], 'note': ['x']},
+        {'stores', 'categories', 'exhaustive', 'note'},
+    ),
+}
+
+
+def gate_5537_filing(**overrides: Any) -> dict[str, Any]:
+    """Gate 5537 as Stage 2 filed it: a four-entry enumeration, no scope."""
+    return {
+        'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, LIVE_23E, DELETED_0D5],
+        'stage1_finding_id': 'f11018d4-be96-456b-9ab9-cf6814155500',
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        **overrides,
+    }
+
+
+def gate_5537_service() -> AsyncMock:
+    return memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
+
+
+class TestEnumerationScope:
+    """Filing a gate that enumerates Mem0 entries must say what was searched."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mode', [{'operational_mode': 'gate'}, {}])
+    async def test_filing_an_enumerating_gate_without_a_scope_is_rejected(
+        self, project_root, mode,
+    ):
+        metadata = gate_5537_filing()
+        del metadata['operational_mode']
+        metadata.update(mode)
+
+        result = await run_gate(
+            project_root, metadata, service=gate_5537_service(), is_filing=True,
+        )
+
+        rejection = result.rejection
+        assert rejection is not None
+        assert rejection['error_type'] == 'EnumerationScopeMissing'
+        assert rejection['enumerations'] == ['mem0_falsified_entries']
+        assert set(rejection['expected_shape']) == {
+            'stores', 'categories', 'exhaustive', 'note',
+        }
+        assert 'mem0_falsified_entries' in rejection['error']
+
+    @pytest.mark.asyncio
+    async def test_the_same_gate_with_a_valid_scope_is_accepted(self, project_root):
+        metadata = gate_5537_filing(**{X_ENUMERATION_SCOPE_KEY: VALID_SCOPE})
+
+        result = await run_gate(
+            project_root, metadata, service=gate_5537_service(), is_filing=True,
+        )
+
+        assert result.rejection is None
+        assert result.metadata[X_ENUMERATION_SCOPE_KEY] == VALID_SCOPE
+        assert result.metadata['mem0_falsified_entries'] == [
+            LIVE_B3F, LIVE_21F, LIVE_23E,
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('case', sorted(MALFORMED_SCOPES))
+    @pytest.mark.parametrize('is_filing', [True, False])
+    @pytest.mark.parametrize('enumerating', [True, False])
+    async def test_a_present_scope_must_be_well_formed(
+        self, project_root, case, is_filing, enumerating,
+    ):
+        scope, fields = MALFORMED_SCOPES[case]
+        metadata = gate_5537_filing(**{X_ENUMERATION_SCOPE_KEY: scope})
+        if not enumerating:
+            del metadata['mem0_falsified_entries']
+        service = gate_5537_service()
+
+        result = await run_gate(
+            project_root, metadata, service=service, is_filing=is_filing,
+        )
+
+        rejection = result.rejection
+        assert rejection is not None
+        assert rejection['error_type'] == 'EnumerationScopeMalformed'
+        assert {problem['field'] for problem in rejection['problems']} == fields
+        assert set(rejection['expected_shape']) == {
+            'stores', 'categories', 'exhaustive', 'note',
+        }
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(gate_5537_filing(execution_class='code_tdd'), id='non-gate'),
+        pytest.param(
+            {
+                'origin_finding_ids': list(FINDING_IDS),
+                'x_deleted_before_gate_open': [DELETED_0D5],
+                'execution_class': 'operational',
+            },
+            id='gate-with-only-unproven-lists',
+        ),
+    ])
+    async def test_scope_is_not_required_outside_an_enumerating_gate_filing(
+        self, project_root, metadata,
+    ):
+        result = await run_gate(
+            project_root, metadata, service=gate_5537_service(), is_filing=True,
+        )
+
+        assert result.rejection is None
+
+    @pytest.mark.asyncio
+    async def test_scope_is_not_required_on_update(self, project_root):
+        result = await run_gate(
+            project_root, gate_5537_filing(), service=gate_5537_service(),
+            is_filing=False,
+        )
+
+        assert result.rejection is None
+        assert result.metadata['mem0_falsified_entries'] == [
+            LIVE_B3F, LIVE_21F, LIVE_23E,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_fragment_is_rejected_first_with_zero_lookups(
+        self, project_root,
+    ):
+        metadata = gate_5537_filing(
+            mem0_falsified_entries=[LIVE_B3F, LIVE_23E, DELETED_0D5, '21f78de1'],
+        )
+        service = gate_5537_service()
+
+        result = await run_gate(
+            project_root, metadata, service=service, is_filing=True,
+        )
+
+        assert result.rejection is not None
+        assert result.rejection['error_type'] == 'EnumeratedIdTruncated'
+        service.get_memory_by_id.assert_not_awaited()
