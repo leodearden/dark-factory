@@ -1665,13 +1665,19 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
         return seen
 
-    @staticmethod
-    def _env_the_census_would_get(launcher, monkeypatch):
-        """Resolve *launcher* the way evaluate_census_step does, run it with
-        subprocess.run spied, and return the env the census subprocess got."""
+    CAPS = TrickleCensusCaps(max_batches=7)
+
+    @classmethod
+    def _census_run_the_launcher_makes(cls, launcher, monkeypatch):
+        """Resolve *launcher* and call it the way evaluate_census_step does --
+        with caps, here the NON-default ``CAPS`` so a binding that drops them
+        cannot pass on the schema default -- and return the spied
+        subprocess.run call (``'args'``, ``'env'``)."""
         seen = _spy_subprocess_run(monkeypatch)
-        (launcher if launcher is not None else nightly._default_census_launcher)('/some/project')
-        return seen.get('env')
+        (launcher if launcher is not None else nightly._default_census_launcher)(
+            '/some/project', caps=cls.CAPS,
+        )
+        return seen
 
     def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
         self, tmp_path, monkeypatch, install_fake_httpx,
@@ -1698,7 +1704,8 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
             tmp_path, invoke=None,
         )
 
-        env = self._env_the_census_would_get(seen['launcher'], monkeypatch)
+        census_run = self._census_run_the_launcher_makes(seen['launcher'], monkeypatch)
+        env = census_run.get('env')
         assert env is not None, (
             'the census inherited the parent env -- after the account-pin '
             'drop-in is retired that means ~/.claude, and preflight_headroom '
@@ -1706,6 +1713,9 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         )
         assert env['CLAUDE_CODE_OAUTH_TOKEN'] == gate.token
         assert 'ANTHROPIC_API_KEY' not in env
+        assert _adjacent_pair(census_run['args'], '--max-batches') == [
+            '--max-batches', str(self.CAPS.max_batches),
+        ], 'the pool-bound launcher must still forward the caps it is called with'
 
     def test_a_run_with_no_pool_leaves_the_census_env_inherited(
         self, tmp_path, monkeypatch, install_fake_httpx,
@@ -1723,7 +1733,7 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
             tmp_path, invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
         )
 
-        assert self._env_the_census_would_get(seen['launcher'], monkeypatch) is None
+        assert self._census_run_the_launcher_makes(seen['launcher'], monkeypatch).get('env') is None
 
 
 # ---------------------------------------------------------------------------
