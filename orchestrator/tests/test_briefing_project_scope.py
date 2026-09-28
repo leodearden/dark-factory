@@ -1404,6 +1404,46 @@ class TestDegradationIsLoud:
             for r in caplog.records
         ), 'the error text is owed to the log even though it is kept out of the prompt'
 
+    async def test_a_search_reply_without_a_results_list_is_malformed_not_a_recall(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The server answers a rejected search with a NORMAL, non-isError JSON dict.
+
+        ``{"error": ..., "error_type": ...}`` parses cleanly but carries no
+        ``results`` list, so it recalled nothing; rendered as text it would put
+        raw JSON in the prompt and reset the outage streak.
+        """
+        import json
+
+        from orchestrator.agents.briefing import (
+            MEMORY_FAILURE_MALFORMED,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        rejection = json.dumps({
+            'error': "Invalid project_id 'foo-bar'", 'error_type': 'ValidationError',
+        })
+        with caplog.at_level(logging.DEBUG), patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'result': {
+                'content': [{'type': 'text', 'text': rejection}],
+            }}),
+        ):
+            prompt = await briefing.build_implementer_prompt(
+                {'steps': []}, task_id='3609',
+            )
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MEMORY_FAILURE_MALFORMED,
+        ) in prompt
+        assert 'error_type' not in prompt
+        assert '{' not in prompt
+        assert briefing._memory_outage_streak == 1
+        assert any(
+            r.levelno >= logging.WARNING and 'results' in r.getMessage()
+            for r in caplog.records
+        )
+
 
 @pytest.mark.asyncio
 class TestOutageStreakEscape:

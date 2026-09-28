@@ -601,6 +601,22 @@ def _memory_bullet(entry: dict, store: str, indent: str = '') -> str | None:
     return f'{indent}- [{_entry_category(entry)} · {_entry_date(entry)} · {store}] {body}'
 
 
+def _is_search_reply(text: str) -> bool:
+    """False only for text that parses as JSON yet is no ``{"results": [...]}`` reply.
+
+    The server reports a rejected search (``{"error": ..., "error_type": ...}``)
+    as a normal, non-``isError`` document, which recalled nothing. Text that
+    does not parse at all is left to the renderers' fail-open path, which
+    keeps the multi-text-block limitation :meth:`BriefingAssembler._scoped_search`
+    documents.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True
+    return isinstance(payload, dict) and isinstance(payload.get('results'), list)
+
+
 def render_memory_results(payload_text: str) -> str:
     """Distil a filtered ``search`` payload into markdown bullets (D5).
 
@@ -2331,7 +2347,15 @@ Handle this escalation, then call `resolve_issue` with a summary.
         ]
         # No text blocks is an honest empty answer, not a fault: the tool
         # replied, it simply recalled nothing.
-        return MemoryQueryOutcome(text='\n'.join(texts) if texts else None)
+        if not texts:
+            return MemoryQueryOutcome(text=None)
+        text = '\n'.join(texts)
+        if not _is_search_reply(text):
+            logger.warning(
+                f'Memory search for {query!r} answered without a results list: {text!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+        return MemoryQueryOutcome(text=text)
 
     def _format_prior_proposal(self, task: dict) -> str:
         """Format the most recent dry-run block-time proposal, if any.
