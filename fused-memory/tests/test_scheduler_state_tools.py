@@ -112,6 +112,9 @@ def _runs_db_path(project_root: Path) -> Path:
     return project_root / 'data' / 'orchestrator' / 'runs.db'
 
 
+_SNAPSHOT_READ_BUDGET_MS = 50
+
+
 # ===========================================================================
 # Step-19: get_scheduler_state tool
 # ===========================================================================
@@ -516,6 +519,31 @@ class TestGetSchedulerEventsTool:
 # ===========================================================================
 # Step-23: get_scheduler_state performance
 # ===========================================================================
+
+
+class TestMedianThreadCpuMs:
+    """The perf instrument charges a call's CPU work, not its time off-CPU."""
+
+    def test_time_spent_off_cpu_is_not_charged(self):
+        median_ms = _median_thread_cpu_ms(
+            lambda: time.sleep(0.06), warmup=0, samples=3,
+        )
+        assert median_ms < _SNAPSHOT_READ_BUDGET_MS, (
+            f'A 60ms sleep was charged {median_ms:.3f}ms; off-CPU time must '
+            f'not count against the {_SNAPSHOT_READ_BUDGET_MS}ms budget'
+        )
+
+    def test_cpu_work_is_charged(self):
+        def burn_60ms_of_cpu():
+            started = time.thread_time()
+            while time.thread_time() - started < 0.06:
+                pass
+
+        median_ms = _median_thread_cpu_ms(burn_60ms_of_cpu, warmup=0, samples=3)
+        assert median_ms >= _SNAPSHOT_READ_BUDGET_MS, (
+            f'60ms of CPU work was charged only {median_ms:.3f}ms; it must '
+            f'trip the {_SNAPSHOT_READ_BUDGET_MS}ms budget'
+        )
 
 
 class TestSnapshotPerformance:
