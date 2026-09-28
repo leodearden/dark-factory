@@ -18,6 +18,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 from legibility import config as mod
 from pydantic import ValidationError
 
@@ -451,6 +452,18 @@ class TestShippedDarkFactoryConfig:
         assert cfg.timeouts.census_mining_secs == 120
         assert cfg.timeouts.census_verify_secs == 900
         assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_shipped_config_trickle_caps_pinned_explicitly(self):
+        # Pinned in-file like timeouts:, so a change to TrickleCensusCaps'
+        # defaults cannot silently alter dark_factory's census bound. The
+        # structural assert is load-bearing: the values equal the schema
+        # defaults, so the loaded-value assert alone would pass without the block.
+        raw = yaml.safe_load(self.SHIPPED_CONFIG_PATH.read_text(encoding='utf-8'))
+        assert raw['census']['trickle_caps'] == {'max_batches': 50, 'max_verify_clusters': 150}
+
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.census.trickle_caps.max_batches == 50
+        assert cfg.census.trickle_caps.max_verify_clusters == 150
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
