@@ -2862,6 +2862,37 @@ async def test_commit_planning_rejects_vacuous_absent_check(
 
 
 @pytest.mark.asyncio
+async def test_commit_planning_rejects_a_check_naming_a_declared_file(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """MODE 3 as task 3536 measured it: the pattern is the name of a file the
+    task declares but has not created, so only metadata.files reveals it."""
+    declared = 'tests/test_zeta_strand.py'
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '46',
+            'metadata': {
+                'files': [declared],
+                'delivered_checks': [
+                    _grep_check('strand-suite-exists', 'test_zeta_strand', 'present', ['tests/']),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '46'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    assert [c['code'] for c in result.get('checks', [])] == ['filename_shaped']
+    assert declared in result['checks'][0]['message']
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_commit_planning_accepts_forward_looking_present_check(
     mcp_server_with_tasks, task_interceptor, polarity_repo,
 ):

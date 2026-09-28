@@ -240,6 +240,7 @@ async def _call(server, name: str, **arguments) -> dict:
 
 async def _file_planning_batch(
     server, project_root: Path, *, prd_path: str | None,
+    producer_files: tuple[str, ...] = (_MARKER_REL_PATH,),
 ) -> tuple[str, str]:
     """File a producer+dependent planning batch (both ``planning_mode=True``).
 
@@ -249,7 +250,7 @@ async def _file_planning_batch(
     (PRD row 2). The dependent depends on the producer via submit_task's
     ``dependencies`` kwarg. Returns ``(producer_id, dependent_id)``.
     """
-    producer_metadata: dict = {'files': [_MARKER_REL_PATH]}
+    producer_metadata: dict = {'files': list(producer_files)}
     if prd_path is not None:
         producer_metadata['prd_path'] = prd_path
         producer_metadata['prd_task_label'] = _PRODUCER_LABEL
@@ -1018,6 +1019,41 @@ class TestPolarityRefusal:
         assert [
             (c['name'], c['kind'], c['expect'], c['paths']) for c in checks
         ] == [('new_file_cap', 'path', 'present', ['src/not_created_yet.py'])]
+
+    @pytest.mark.asyncio
+    async def test_capability_naming_a_declared_file_is_refused(self, backend_stack):
+        """MODE 3 in the measured 3536 shape: the file the pattern names is
+        one the producer DECLARES but has not created, so only its
+        metadata.files can reveal the defect."""
+        server, _interceptor, project_root = backend_stack
+        declared = 'src/zeta_strand_module.py'
+
+        _write_sidecar(
+            project_root,
+            prd_path=_FILENAME_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name='declared_file_cap',
+            pattern='zeta_strand_module',
+            paths=['src/'],
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_FILENAME_PRD_PATH,
+            producer_files=(declared,),
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        joined = ' '.join(result['manifest_stamping']['errors'])
+        assert 'declared_file_cap' in joined, joined
+        assert 'filename_shaped' in joined, joined
+        assert declared in joined, joined
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f"a refused check must never be persisted; got "
+            f"{producer_task['metadata']!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_forward_looking_capability_keeps_the_exact_legacy_report(

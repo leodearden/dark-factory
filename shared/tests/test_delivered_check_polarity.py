@@ -1731,3 +1731,136 @@ class TestReferenceTreeIsTheGateRef:
         )
 
         assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# MODE 3 in its real shape: the pattern names a file the task DECLARES
+# ---------------------------------------------------------------------------
+
+#: Task 3536's own descriptor and metadata.files, verbatim. The check was
+#: authored at 2486d95548; the module it names was created later, by 3536
+#: itself (cf60e3b90e), so no tracked path could match at authoring.
+_T3536_FILES = [
+    'orchestrator/src/orchestrator/workflow.py',
+    'orchestrator/tests/test_workflow_merge_gating_strand.py',
+    'orchestrator/tests/test_repend_state_machine.py',
+    'orchestrator/tests/test_workflow_e2e.py',
+]
+_T3536_CHECK = {
+    'name': 'no-steward-less-escalated-exit-at-merge-entry',
+    'kind': 'grep',
+    'pattern': 'test_workflow_merge_gating_strand',
+    'expect': 'present',
+    'paths': ['orchestrator/tests/'],
+}
+
+
+class TestDeclaredFilenameShaped:
+    """The rule, exactly: a ``kind='grep'`` ``expect='present'`` check that
+    is healthy under the 2x2 is rejected as ``filename_shaped`` when its
+    pattern FULLY matches the basename or the stem of a file in the task's
+    ``metadata.files`` that lies inside the check's ``paths`` scope."""
+
+    @pytest.fixture
+    def pre_3536_repo(self, tmp_path: Path) -> Path:
+        """The authoring tree as 3536's author saw it: the test directory
+        exists, the strand module does not."""
+        return _init_git_repo(
+            tmp_path / 'repo',
+            {
+                'orchestrator/src/orchestrator/workflow.py': 'def run():\n    pass\n',
+                'orchestrator/tests/test_workflow_e2e.py': 'def test_e2e():\n    pass\n',
+            },
+        )
+
+    def test_the_3536_descriptor_is_rejected_at_its_authoring_tree(self, pre_3536_repo):
+        findings = lint_delivered_checks(
+            [_T3536_CHECK], files=_T3536_FILES, repo_root=pre_3536_repo
+        )
+
+        assert [(f.check_name, f.severity, f.code) for f in findings] == [
+            ('no-steward-less-escalated-exit-at-merge-entry', 'reject', 'filename_shaped')
+        ]
+        assert findings[0].detail == ('orchestrator/tests/test_workflow_merge_gating_strand.py',)
+        message = findings[0].message
+        assert "kind='path'" in message
+        assert "'orchestrator/tests/test_workflow_merge_gating_strand.py'" in message
+
+    def test_the_3536_descriptor_replayed_against_its_real_authoring_commit(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        probe = subprocess.run(
+            ['git', '-C', str(repo_root), 'cat-file', '-e', '2486d95548^{commit}'],
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            pytest.skip('task 3536 authoring commit is not in this clone')
+
+        findings = lint_delivered_checks(
+            [_T3536_CHECK], files=_T3536_FILES, repo_root=repo_root, ref='2486d95548'
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('reject', 'filename_shaped')]
+
+    def test_the_basename_with_its_suffix_is_the_same_defect(self, pre_3536_repo):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': r'test_workflow_merge_gating_strand\.py'}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+
+    @pytest.mark.parametrize(
+        'pattern',
+        [
+            pytest.param('TestNoStrandExitProperty', id='a-symbol-inside-the-file'),
+            pytest.param('merge_gating', id='a-substring-of-the-stem'),
+            pytest.param('test_workflow_merge_gating_strand_v2', id='a-longer-name'),
+        ],
+    )
+    def test_a_pattern_that_is_not_the_whole_name_is_healthy(self, pre_3536_repo, pattern):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': pattern}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert findings == []
+
+    def test_a_declared_file_outside_the_checks_scope_is_healthy(self, tmp_path):
+        """A wiring check: the grep reads another file for an import of the
+        declared module, which is content, not the module's existence."""
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {'fused-memory/src/fused_memory/server/tools.py': 'import os\n'},
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'guard-wired',
+                    'kind': 'grep',
+                    'pattern': 'recurring_gate_guard',
+                    'expect': 'present',
+                    'paths': ['fused-memory/src/fused_memory/server/tools.py'],
+                }
+            ],
+            files=['fused-memory/src/fused_memory/middleware/recurring_gate_guard.py'],
+            repo_root=repo,
+        )
+
+        assert findings == []
+
+    def test_an_unscoped_check_covers_every_declared_file(self, pre_3536_repo):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'paths': []}], files=_T3536_FILES, repo_root=pre_3536_repo
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+
+    def test_expect_absent_is_never_filename_shaped(self, pre_3536_repo):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'expect': 'absent'}], files=_T3536_FILES, repo_root=pre_3536_repo
+        )
+
+        assert [f.code for f in findings] == ['vacuous_absent']

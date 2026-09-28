@@ -544,7 +544,7 @@ gates):
 | `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
 | `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
-| `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches but names a tracked **filename** | task **3536**'s `test_workflow_merge_gating_strand` — the module is tracked, but a test module does not mention its own name, so `git grep` (which reads *contents*) can never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+| `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
 
 **Warn code** (reported, never blocking):
 

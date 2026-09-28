@@ -38,11 +38,12 @@ English or guessing at author intent from the check's NAME:
   - MODE 2 — over-broad ``expect=absent`` (task 3534's pattern matched
     inside the very file it owned). Genuinely undecidable at authoring
     time, so it lands as a WARN, not a reject.
-  - MODE 3 — a ``kind=grep`` ``expect=present`` pattern whose only repo
-    matches are FILENAMES rather than file contents (a test module that
-    never mentions its own name). Invisible to the vacuity rule (at
-    authoring time the file does not exist yet, so nothing matches and
-    the check looks healthy), so it gets its own structural rule, whose
+  - MODE 3 — a ``kind=grep`` ``expect=present`` pattern that names a
+    FILE rather than a symbol inside it (a test module that never
+    mentions its own name). Invisible to the vacuity rule (at authoring
+    time the file does not exist yet, so nothing matches and the check
+    looks healthy), so it gets its own structural rule, read against the
+    committed tree AND the task's declared ``metadata.files``, whose
     remedy is the ``kind='path'`` check that says what was meant.
 
 Comment-only and self-referential matches are not separate gates: at
@@ -123,6 +124,7 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 import re
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
@@ -601,7 +603,7 @@ def _lint_grep_check(
         if expect == 'present':
             return _filename_shaped_finding(
                 name, pattern, paths, repo_root=repo_root, ref=ref
-            )
+            ) or _declared_filename_finding(name, pattern, paths, files=files)
         if expect == 'absent':
             return _absent_overbroad_finding(
                 name, pattern, paths, files=files, repo_root=repo_root, ref=ref
@@ -946,6 +948,59 @@ def _filename_shaped_finding(
         ),
         detail=tuple(hits[:5]),
     )
+
+
+def _declared_filename_finding(
+    name: str,
+    pattern: str,
+    paths: Sequence[str],
+    *,
+    files: Sequence[str],
+) -> CheckFinding | None:
+    """MODE 3 in its real shape: the pattern IS the name of a file the task
+    declares but has not created yet.
+
+    :func:`_filename_shaped_finding` reads the committed tree, so it cannot
+    see a file the producer will CREATE — which is the measured specimen:
+    task 3536's check was authored before 3536 created the module it names.
+    The task's ``metadata.files`` can.
+
+    THE RULE, exactly: the pattern, compiled by Python ``re``, FULLY matches
+    the basename or the stem (basename minus its last suffix) of a declared
+    file that lies inside the check's ``paths`` (the whole tree when
+    ``paths`` is empty). Full match, not search, so a symbol that merely
+    shares text with a module name is not flagged; in-scope only, because a
+    grep cannot be about the existence of a file it does not read — a
+    declared module grepped for in ANOTHER file is a wiring check.
+    """
+    try:
+        matcher = re.compile(pattern)
+    except re.error:
+        return None
+    for declared in files:
+        if declared.endswith('/') or (
+            paths and not _covered_by_declared_files(declared, paths)
+        ):
+            continue
+        base = posixpath.basename(declared)
+        if matcher.fullmatch(base) or matcher.fullmatch(posixpath.splitext(base)[0]):
+            return CheckFinding(
+                check_name=name,
+                severity='reject',
+                code='filename_shaped',
+                message=(
+                    f'delivered_check {name!r} (expect=present, pattern {pattern!r}) is '
+                    f'the NAME of {declared!r}, a file this task declares, not a symbol '
+                    f'inside it. A grep check reads file CONTENTS and a module rarely '
+                    f'mentions its own name, so this check goes green only if some file '
+                    f"happens to. If the capability IS that file's existence, declare it "
+                    f"as kind='path', expect='present', paths=[{declared!r}]; otherwise "
+                    f'assert a symbol defined INSIDE the file (a class, function or '
+                    f'constant the producer adds).'
+                ),
+                detail=(declared,),
+            )
+    return None
 
 
 def _absent_overbroad_finding(
