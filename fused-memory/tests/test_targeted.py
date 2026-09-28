@@ -6861,3 +6861,56 @@ class TestContradictedEscalationWithoutTheEscalationPackage:
         assert not any('escalat' in m.lower() for m in msgs), (
             f'An absent optional package must not log a WARNING, got {msgs}'
         )
+
+
+_SEAM = 'fused_memory.reconciliation.targeted.retire_flag_markers_for_terminal_task'
+
+
+class TestOnTaskDoneRetiresFlagMarkers:
+    """The done-transition hook retires the closing task's flag_for_stage2
+    markers through the sweep's own seam (task 4376): scoped to that one task,
+    fired only on ``done``.
+    """
+
+    @staticmethod
+    async def _drive(reconciler, tmp_path, *, transition: str, task_id: str = '4376') -> dict:
+        return await reconciler.reconcile_task(
+            task_id=task_id,
+            transition=transition,
+            project_id='dark_factory',
+            project_root=str(make_git_root(tmp_path)),
+            task_before={
+                'id': task_id, 'title': 'Retire flags', 'status': 'in-progress',
+                'description': 'Latency layer',
+            },
+        )
+
+    @staticmethod
+    async def _run_id_for(journal, task_id: str = '4376') -> str:
+        runs = await journal.get_recent_runs('dark_factory', limit=10)
+        matching = [r.id for r in runs if r.trigger_reason == f'task_done:{task_id}']
+        assert len(matching) == 1, f'Expected one task_done run, got {runs}'
+        return matching[0]
+
+    @pytest.mark.asyncio
+    async def test_fires_on_done_scoped_to_the_closing_task(self, reconciler, journal, tmp_path):
+        with patch(_SEAM, new=AsyncMock(return_value=0)) as seam:
+            await self._drive(reconciler, tmp_path, transition='done')
+
+        seam.assert_awaited_once()
+        assert seam.await_args is not None
+        args, kwargs = seam.await_args.args, seam.await_args.kwargs
+        assert args[0] is reconciler.memory
+        project_id, run_id = args[1], args[2]
+        assert type(project_id) is str
+        assert project_id == 'dark_factory'
+        assert kwargs['task_id'] == '4376'
+        assert run_id == await self._run_id_for(journal)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('transition', ['blocked', 'cancelled', 'deferred'])
+    async def test_does_not_fire_on_other_transitions(self, reconciler, tmp_path, transition):
+        with patch(_SEAM, new=AsyncMock(return_value=0)) as seam:
+            await self._drive(reconciler, tmp_path, transition=transition)
+
+        seam.assert_not_awaited()
