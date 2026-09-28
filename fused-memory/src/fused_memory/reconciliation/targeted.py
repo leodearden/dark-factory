@@ -26,6 +26,9 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    retire_flag_markers_for_terminal_task,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     extract_batch_plan_task_ids,
@@ -610,6 +613,17 @@ class TargetedReconciler:
             )
         except Exception as e:
             logger.warning(f'Fast-path write failed for task {task_id}: {e}')
+
+        # 0.6. Retire this task's expired flag_for_stage2 markers now (task 4376),
+        #      rather than at the next per-cycle sweep, which stays primary.
+        #      Placed ahead of sections 1-3 for two reasons: latency is this
+        #      step's whole point, so it must not wait behind them (one measured
+        #      task_done run took 27s end to end); and an eligible marker is an
+        #      expired work-item marker whose continued presence in search is the
+        #      esc-3796-1 bug, so it should be gone before section 1 searches.
+        await retire_flag_markers_for_terminal_task(
+            self.memory, str(scope.project_id), run_id, task_id=task_id,
+        )
 
         # 1. Search for existing knowledge about this task
         #

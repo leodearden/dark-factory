@@ -3384,6 +3384,15 @@ def test_format_outcome_echo_no_mid_number_splice_regression():
     assert echo.endswith(' (commit abc123def)')
 
 
+def _authoritative_precheck_calls(memory_service) -> list:
+    """Section 0's per-task pre-check calls, told apart from section 0.6's
+    {'flag_for_stage2': True} pool scroll (task 4376) by their task_id filter."""
+    return [
+        call for call in memory_service.get_memories_by_metadata.await_args_list
+        if 'task_id' in (call.kwargs.get('filters') or {})
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'supersedes_value', ['cd09e261', ['cd09e261']], ids=['legacy_scalar', 'canonical_list'],
@@ -3424,9 +3433,9 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
     )
 
     # (a) the deterministic per-task metadata query was awaited correctly
-    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
-    query_call = mock_memory_service.get_memories_by_metadata.await_args
-    assert query_call is not None
+    precheck_calls = _authoritative_precheck_calls(mock_memory_service)
+    assert len(precheck_calls) == 1
+    query_call = precheck_calls[0]
     assert query_call.kwargs.get('project_id') == 'test-project'
     assert query_call.kwargs.get('filters') == {'task_id': '361'}
 
@@ -3485,9 +3494,9 @@ async def test_on_task_done_suppresses_when_stage2_suppress_guard_exists(
 
     # (a) the deterministic per-task metadata query was awaited once, and its
     # task_id-scoped filter is exactly what intersects the real Stage 2 writer.
-    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
-    query_call = mock_memory_service.get_memories_by_metadata.await_args
-    assert query_call is not None
+    precheck_calls = _authoritative_precheck_calls(mock_memory_service)
+    assert len(precheck_calls) == 1
+    query_call = precheck_calls[0]
     assert query_call.kwargs.get('project_id') == 'test-project'
     assert query_call.kwargs.get('filters') == {'task_id': '361'}
 
