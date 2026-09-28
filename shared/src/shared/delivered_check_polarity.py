@@ -950,6 +950,70 @@ def _filename_shaped_finding(
     )
 
 
+def _bracket_end(pattern: str, start: int) -> int:
+    """Index just past the ERE bracket expression opening at *start*, or -1.
+
+    A ``]`` first in the list (after an optional ``^``) is literal, and
+    ``[:class:]``, ``[.coll.]`` and ``[=equiv=]`` carry their own ``]``.
+    """
+    i = start + 1
+    if pattern.startswith('^', i):
+        i += 1
+    if pattern.startswith(']', i):
+        i += 1
+    while i < len(pattern):
+        if pattern[i] == ']':
+            return i + 1
+        if pattern[i] == '[' and pattern[i + 1 : i + 2] in (':', '.', '='):
+            close = pattern.find(pattern[i + 1] + ']', i + 2)
+            if close < 0:
+                return -1
+            i = close + 2
+            continue
+        i += 1
+    return -1
+
+
+def _top_level_arms(pattern: str) -> list[str] | None:
+    """The ERE alternatives of *pattern*: split on ``|`` outside groups,
+    bracket expressions and escapes, after unwrapping a group that encloses
+    the whole pattern. ``None`` when the pattern is not balanced.
+    """
+    arms: list[str] = []
+    depth = 0
+    start = 0
+    wholly_grouped = pattern.startswith('(')
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == '\\':
+            i += 2
+            continue
+        if char == '[':
+            i = _bracket_end(pattern, i)
+            if i < 0:
+                return None
+            continue
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth < 0:
+                return None
+            if depth == 0 and i != len(pattern) - 1:
+                wholly_grouped = False
+        elif char == '|' and depth == 0:
+            arms.append(pattern[start:i])
+            start = i + 1
+        i += 1
+    if depth:
+        return None
+    if wholly_grouped and not arms:
+        return _top_level_arms(pattern[1:-1])
+    arms.append(pattern[start:])
+    return arms
+
+
 def _declared_filename_finding(
     name: str,
     pattern: str,
@@ -965,16 +1029,25 @@ def _declared_filename_finding(
     task 3536's check was authored before 3536 created the module it names.
     The task's ``metadata.files`` can.
 
-    THE RULE, exactly: the pattern, compiled by Python ``re``, FULLY matches
-    the basename or the stem (basename minus its last suffix) of a declared
+    THE RULE, exactly: EVERY top-level alternative of the pattern (see
+    :func:`_top_level_arms`), compiled by Python ``re``, FULLY matches the
+    basename or the stem (basename minus its last suffix) of one declared
     file that lies inside the check's ``paths`` (the whole tree when
     ``paths`` is empty). Full match, not search, so a symbol that merely
-    shares text with a module name is not flagged; in-scope only, because a
-    grep cannot be about the existence of a file it does not read — a
-    declared module grepped for in ANOTHER file is a wiring check.
+    shares text with a module name is not flagged; every arm, so an
+    alternative naming a real symbol keeps the check a sound gate; in-scope
+    only, because a grep cannot be about the existence of a file it does not
+    read — a declared module grepped for in ANOTHER file is a wiring check.
+    A pattern the splitter cannot parse is judged whole, and only when it
+    carries no ``|`` at all.
     """
+    arms = _top_level_arms(pattern)
+    if arms is None:
+        if '|' in pattern:
+            return None
+        arms = [pattern]
     try:
-        matcher = re.compile(pattern)
+        matchers = [re.compile(arm) for arm in arms]
     except re.error:
         return None
     for declared in files:
@@ -983,7 +1056,8 @@ def _declared_filename_finding(
         ):
             continue
         base = posixpath.basename(declared)
-        if matcher.fullmatch(base) or matcher.fullmatch(posixpath.splitext(base)[0]):
+        names = (base, posixpath.splitext(base)[0])
+        if all(any(m.fullmatch(n) for n in names) for m in matchers):
             return CheckFinding(
                 check_name=name,
                 severity='reject',

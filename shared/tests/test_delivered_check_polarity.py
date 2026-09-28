@@ -1827,6 +1827,74 @@ class TestDeclaredFilenameShaped:
 
         assert findings == []
 
+    def test_an_alternation_with_a_symbol_arm_is_healthy(self, tmp_path):
+        """Task 5324's exact descriptor: one arm is the module's stem, the
+        other a class the producer defines, so the check is a sound 0->N gate."""
+        repo = _init_git_repo(
+            tmp_path / 'repo', {'escalation/src/escalation/server.py': 'import os\n'}
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'prefix-resolver-http-client-exists',
+                    'kind': 'grep',
+                    'pattern': 'prefix_resolver_client|class PrefixResolverClient',
+                    'expect': 'present',
+                    'paths': ['escalation/src/escalation/'],
+                }
+            ],
+            files=[
+                'escalation/src/escalation/server.py',
+                'escalation/src/escalation/prefix_resolver_client.py',
+                'fused-memory/src/fused_memory/reconciliation/harness.py',
+                'escalation/tests/test_uuid_prefix_guard_registration.py',
+            ],
+            repo_root=repo,
+        )
+
+        assert findings == []
+
+    @pytest.mark.parametrize(
+        'pattern',
+        [
+            pytest.param(r'test_workflow_merge_gating_strand|test_workflow_merge_gating_strand\.py',
+                         id='every-arm-names-the-file'),
+            pytest.param('(test_workflow_merge_gating_strand|test_workflow_merge_gating_strand.py)',
+                         id='a-group-wrapping-the-whole-pattern'),
+        ],
+    )
+    def test_an_alternation_whose_every_arm_names_the_file_is_rejected(
+        self, pre_3536_repo, pattern
+    ):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': pattern}], files=_T3536_FILES, repo_root=pre_3536_repo
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+
+    def test_a_symbol_arm_inside_a_wrapping_group_keeps_the_check_healthy(
+        self, pre_3536_repo
+    ):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': '(test_workflow_merge_gating_strand|TestNoStrand)'}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert findings == []
+
+    def test_a_bar_inside_a_bracket_is_not_an_alternation(self, pre_3536_repo):
+        """One arm, which still names the file: splitting inside the bracket
+        would have produced two unparseable halves and hidden the defect."""
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': 'test_workflow_merge_gating_stran[d|]'}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+
     def test_a_declared_file_outside_the_checks_scope_is_healthy(self, tmp_path):
         """A wiring check: the grep reads another file for an import of the
         declared module, which is content, not the module's existence."""
