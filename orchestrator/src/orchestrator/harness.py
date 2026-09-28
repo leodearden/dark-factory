@@ -505,6 +505,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
+    # archive-inclusive read for the drain (task 3999); get_pending_escalations is pending-only
+    'mcp__escalation__get_task_escalations',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__promote_to_l2',
     # Triage-ack annotation, ungated by level — lets the watcher stamp a
@@ -14312,6 +14314,10 @@ class Harness:
         members — a common steady state while a human is slow to resolve
         L2s — defeating the entire cost optimisation this precheck exists
         for.
+
+        A pending member of a RESOLVED or DISMISSED (archived) L2 stays
+        actionable: its L2's best-effort cascade missed it, and the rotation's
+        drain closes it (SKILL.md "Draining pending escalations").
 
         Scope: only L1 work counts.  A queue containing only L0s, or only
         pending L2s, is treated as non-actionable — L0->L1 promotion is
