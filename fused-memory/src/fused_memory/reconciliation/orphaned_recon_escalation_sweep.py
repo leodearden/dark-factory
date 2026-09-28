@@ -70,6 +70,9 @@ Design decisions (captured in plan.json):
 - Best-effort, and fail-SAFE in ONE direction: an errored read is never
   evidence of terminality.  A false ``terminal`` hands the sole closer a live
   record; a missed detection merely waits for the next cycle.
+- The in-cycle FLAGS are scoped to the running project, while the counts and
+  the operator reap stay fleet-wide; the rationale and trade-off live at
+  ``::sweep_orphaned_recon_escalations``.
 """
 
 from __future__ import annotations
@@ -386,35 +389,16 @@ def build_orphaned_escalation_flag(
     escalation id instead would make every re-file of the same subject look
     like a brand-new finding.
 
-    RESIDUAL, UNFIXED HERE: that key is NOT project-qualified, and the subject
-    frequently belongs to a project OTHER than the one running Stage 1 (live
-    subjects span seven projects — dark_factory 56, reify 48, autopilot_video
-    7, ...).  ``flag_dedup.dedup_flags`` keys the ledger row on
-    ``(project_id=the RUNNING project, task_id, flag_type)``, and task ids are
-    per-project counters that all start near 1, so two orphan records with the
-    same numeric subject id in DIFFERENT projects share one row: their
-    recurrence counts conflate, and a cross-project fix-task suppression
-    decision computed for one can suppress the other's flag.  Nothing in the
-    marker payload distinguishes them either — ``dedup_flags`` persists only
-    ``task_id``/``flag_type``/``run_id`` (task 4712 retired the ``cited_tasks``
-    payload write), so the conflation is not even auditable after the fact.
-
-    Two fixes were considered and BOTH rejected as worse than the residual.
-    (a) Adding ``cited_tasks=[{'project_id': subject, 'task_id': tid}]``: it
-    buys no auditability for the reason just given, and it is actively harmful
-    — ``_resolve_live_cross_project_fix_task`` is FOREIGN-ONLY and
-    ``_cited_fix_task_live`` counts a ``done`` task as live, so citing a
-    ``done`` subject in another project would make a carried-forward orphan
-    flag suppress ITSELF for up to ``_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES``
-    (8) cycles, silencing the largest class of true findings.  (b) A composite
-    ``'dark_factory:650'`` ``task_id``: ``_is_valid_marker_task_id`` rejects
-    it, which would make the flag bypass dedup entirely and re-emit unmarked
-    every cycle — the exact failure the placement-above-``dedup_flags``
-    comment in ``stages/memory_consolidator.py`` exists to avoid.  A real fix
-    means teaching ``flag_dedup`` a project-qualified marker shape, which is
-    that module's change to make, not this one's.  Until then the flag's
-    DESCRIPTION always names the subject's project, so a closer reading the
-    finding is never misled even when the recurrence row is shared.
+    That key carries no project: ``flag_dedup.dedup_flags`` keys the ledger
+    row on ``(project_id=the RUNNING project, task_id, flag_type)``.  For this
+    flag_type it is project-correct by construction, because
+    ``sweep_orphaned_recon_escalations`` emits a flag only when the subject's
+    project IS the running project.  A generic project-qualified marker
+    (task 5614, which also records why ``cited_tasks`` and a composite
+    ``task_id`` were rejected) remains ``flag_dedup``'s change to make, for
+    other producers.  The flag's DESCRIPTION always names the subject's
+    project regardless, so a closer reading the finding never has to infer
+    which store to check.
 
     Args:
         esc: The pending ``Escalation`` being reported.
@@ -699,7 +683,7 @@ async def classify_pending_escalations(
     THE SINGLE OWNER OF THE WHOLE DERIVATION, composition included — not just
     of the leaf predicates.  Both channels call exactly this coroutine: the
     in-cycle Stage-1 sweep (``sweep_orphaned_recon_escalations``, which then
-    only builds flags) and the operator reap
+    builds flags for the running project's records only) and the operator reap
     (``fused-memory/scripts/derive_orphaned_recon_escalations.py``, which then
     only adds the ``queue.resolve`` step).  Sharing only the leaf predicates
     was not enough: the two copies of this loop had already drifted in how
@@ -832,9 +816,10 @@ async def sweep_orphaned_recon_escalations(
     taskmaster,
     known_projects,
     *,
+    running_project_id: str,
     log = logger,
 ):
-    """Flag every pending recon stale record whose subject went terminal or vanished.
+    """Flag this project's pending recon stale records whose subject went terminal or vanished.
 
     DETECTION ONLY.  This function never calls ``escalation_queue.resolve()``:
     the A7b contract above
@@ -848,6 +833,17 @@ async def sweep_orphaned_recon_escalations(
     the derivation itself and the operator script consumes the very same pass,
     so the two channels cannot disagree about which records are safe to close.
 
+    FLAGS ARE SCOPED TO THE RUNNING PROJECT; COUNTS ARE NOT (task 5813).  The
+    recon queue is shared fleet-wide, so unscoped, every project's cycle
+    re-flagged every orphan under a bare numeric task id that names an
+    unrelated local task there (measured 2026-09-23: the same 17 orphans
+    flagged in 5 projects).  The whole queue is still classified, so the
+    counts stay fleet-wide; only the flags are filtered, on the subject
+    project ``escalation_project_id`` derived.  The trade-off: an orphan whose
+    subject project never runs a recon cycle is never FLAGGED.  It is still
+    CLOSED, because ``derive_orphaned_recon_escalations.py --apply`` stays
+    fleet-wide and the recon-escalation-watcher skill runs it every loop cycle.
+
     Args:
         escalation_queue: An ``EscalationQueue`` over the RECON queue dir.
             Only ``get_pending()`` (sync) is called — the queue root, which
@@ -857,12 +853,16 @@ async def sweep_orphaned_recon_escalations(
         known_projects: ``{project_id: project_root}``, i.e.
             ``BaseStage.known_projects``.  A record naming a project absent
             from this map is ``unresolvable``, never an orphan.
+        running_project_id: The project whose Stage-1 cycle is calling, i.e.
+            ``BaseStage.project_id``.  Required, with no "every project"
+            default, so no caller can silently restore the fleet-wide fan-out.
         log: Logger to use (default: this module's logger).
 
     Returns:
         dict with ``flags`` (Stage-1 flag dicts to append to
-        ``report.items_flagged``) and the always-present int counts
-        :data:`_CLASSIFICATION_COUNT_KEYS`, so a caller never needs a
+        ``report.items_flagged``, for *running_project_id*'s orphans only) and
+        the always-present int counts :data:`_CLASSIFICATION_COUNT_KEYS`,
+        which cover the WHOLE queue, so a caller never needs a
         ``.get(..., 0)`` fallback and can read the degraded-cycle signature
         (``errors > 0``) apart from the clean-but-empty one directly.
 
@@ -898,6 +898,7 @@ async def sweep_orphaned_recon_escalations(
                 subject_status=orphan.subject_status,
             )
             for orphan in orphans
+            if orphan.project_id == running_project_id
         ],
         **counts,
     }

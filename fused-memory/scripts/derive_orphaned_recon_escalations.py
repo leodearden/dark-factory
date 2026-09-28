@@ -23,6 +23,12 @@ warnings included, so this script adds only the ``queue.resolve`` step.  A
 second copy of that loop could drift and make the flag and the reap disagree
 about which records are safe to close.
 
+This reap is deliberately FLEET-WIDE, unlike the in-cycle flags, which are
+scoped to the running project
+(``orphaned_recon_escalation_sweep.py::sweep_orphaned_recon_escalations``).
+It is the only channel that reaches an orphan whose project never runs a
+recon cycle, so it must not be scoped.
+
 Closing here does not contradict A7b.  That invariant bans the HARNESS from
 resolving its own queue; an operator-run one-shot over the same queue is
 precedented by ``fused-memory/scripts/backfill_recon_escalations.py``, whose
