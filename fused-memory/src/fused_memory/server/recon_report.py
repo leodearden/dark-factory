@@ -295,6 +295,10 @@ _TRUNCATION_MARKER = '…[truncated]'
 # re-serializes every reachable entry of the run on EVERY mutation, so each
 # record's text is rewritten to SQLite again on every later write.
 _MAX_PURGED_TEXT_CHARS = 2_000
+# Records kept per entry before later purges only count as overflow.  Worst
+# case ~20 x 2 x 2_000 chars of text per entry, plus citation lists; the
+# fold's WARNING stays the unbounded channel, firing for every purge.
+_MAX_PURGED_FINDINGS = 20
 
 
 def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
@@ -388,6 +392,9 @@ class _ReportEntry:
     # ReconReportState._record_cite_task_fold_purge).  Persisted, but not
     # part of get_assembled_report's contract.
     purged_findings: list[dict] = field(default_factory=list)
+    # Folds whose structured copy the _MAX_PURGED_FINDINGS cap dropped: the
+    # operator's cue that the log is the only copy of that many purges.
+    purged_findings_overflow: int = 0
     # in-run dedup: (task_id, flag_type) → finding_id.  Mirrors the entries
     # this ONE stage contributed to the run-scoped ReconReportState._run_sig_index.
     # Not consulted for eviction teardown: since task-2088, run-level indices
@@ -475,6 +482,7 @@ def _serialize_entry(
         'completed_at': entry.completed_at,
         'created_at': entry.created_at,
         'purged_findings': [dict(r) for r in entry.purged_findings],
+        'purged_findings_overflow': entry.purged_findings_overflow,
         'signature_to_finding': _encode_sig_map(entry._signature_to_finding),
         'deschash_to_finding': dict(entry._deschash_to_finding),
         'sig_anchor_slice': _encode_sig_map(sig_anchor_slice),
@@ -2379,13 +2387,21 @@ class ReconReportState:
         recoverable, with different lifetimes:
 
         - the WARNING is the operator-VISIBLE, long-retention signal: it
-          lasts as long as the process log does;
+          fires for every purge and lasts as long as the process log does;
         - the record appended to ``record_entry.purged_findings`` is the
           machine-readable copy. It rides in the entry's persisted
           ``entry_json``, so it survives process restarts and does not depend
           on logging configuration — but only for the RUN's lifetime: it is
           GC'd with the run's rows at quiescence (:meth:`tick` ->
           ``store.delete_run``), so it does not outlive log retention.
+
+        The record is bounded: an entry keeps the FIRST
+        ``_MAX_PURGED_FINDINGS`` records, and each later purge only increments
+        ``record_entry.purged_findings_overflow`` — the count of folds for
+        which the log is the only copy. Not a ring buffer: keep-first-N is
+        deterministic and needs no shifting, and dropping a later copy loses
+        nothing unrecoverable, because the WARNING still fires and its
+        ``structural_copy`` field says whether this purge's copy was kept.
 
         *record_entry* is the CITING stage's entry (the one :meth:`cite_task`
         resolved through ``_active``), not *owning_entry*. The citing entry
@@ -2438,15 +2454,17 @@ class ReconReportState:
         has no other record to cross-check against. Keeping them named makes
         that class of mistake unrepresentable rather than merely untested.
         """
+        kept = len(record_entry.purged_findings) < _MAX_PURGED_FINDINGS
         logger.warning(
             'recon_report: cite_task fold purged finding %r (%s fold) — its content is '
-            'dropped from the report; a structured copy is kept in purged_findings on '
-            'the persisted entry of recorded_on_stage=%r. run_id=%r stage=%r '
+            'dropped from the report. structural_copy=%s (purged_findings on the '
+            'persisted entry of recorded_on_stage=%r). run_id=%r stage=%r '
             'surviving_finding_id=%r severity=%r category=%r flag_type=%r '
             'description=%r suggested_action=%r attempted_citation=%r '
             'cited_entities=%r cited_edges=%r cited_memories=%r cited_runs=%r',
             finding.finding_id,
             fold,
+            'kept' if kept else 'dropped: purged_findings cap reached',
             record_entry.stage,
             run_id,
             owning_entry.stage,
@@ -2462,6 +2480,9 @@ class ReconReportState:
             finding.cited_memories,
             finding.cited_runs,
         )
+        if not kept:
+            record_entry.purged_findings_overflow += 1
+            return
         snapshot = asdict(finding)
         truncated_fields: list[str] = []
         for name in ('description', 'suggested_action'):
