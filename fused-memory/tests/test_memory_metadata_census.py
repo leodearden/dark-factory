@@ -129,11 +129,11 @@ class TestUnknownKeyStormDetector:
     never identify the culprit.
     """
 
-    def _detector(self, clock, *, threshold=5, window_seconds=300):
+    def _detector(self, clock, *, threshold=5, window_seconds=300, **options):
         from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
 
         return UnknownKeyStormDetector(
-            threshold=threshold, window_seconds=window_seconds, time_fn=clock
+            threshold=threshold, window_seconds=window_seconds, time_fn=clock, **options
         )
 
     def test_below_threshold_never_fires(self):
@@ -260,6 +260,99 @@ class TestUnknownKeyStormDetector:
 
         assert detector.record('p', 'a', ['k', 'k2']) is True, 'must fire again'
 
+    def test_a_drained_writer_is_heard_again_when_its_recurrence_is_one_multi_key_call(
+        self,
+    ):
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
+            False,
+            False,
+            True,
+        ]
+
+        clock.advance(301)
+        assert detector.record('p', 'a', ['x', 'y', 'z']) is True, (
+            'the window fully drained, so this is a new crossing'
+        )
+        assert detector.record('p', 'a', ['k']) is False, (
+            'the refire re-latched: the crossing is the event, not the state'
+        )
+
+    def test_a_partially_drained_writer_that_re_crosses_in_one_call_is_heard(self):
+        """The t=1000 pair ages out by t=1301, leaving 3 of 5: below the line."""
+        clock = _FakeClock(now=1000.0)
+        detector = self._detector(clock, threshold=5, window_seconds=300)
+        assert detector.record('p', 'a', ['a', 'b']) is False
+        clock.now = 1100.0
+        assert detector.record('p', 'a', ['c', 'd', 'e']) is True
+
+        clock.now = 1301.0
+        assert detector.record('p', 'a', ['f', 'g']) is True
+        assert detector.record('p', 'a', ['h']) is False
+
+    def test_whether_an_unrelated_sweep_ran_never_changes_the_decision(self):
+        """Evicting a drained writer must not decide differently from keeping it.
+
+        ``other``'s record triggers the sweep when ``sweep_every=1``, evicting
+        the drained ``a``; at 256 no sweep runs and ``a`` keeps its counter.
+        """
+        recurrences = []
+        for sweep_every in (1, 256):
+            clock = _FakeClock()
+            detector = self._detector(
+                clock, threshold=3, window_seconds=300, sweep_every=sweep_every
+            )
+            assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+            clock.advance(301)
+            detector.record('p', 'other', ['k'])
+            recurrences.append(detector.record('p', 'a', ['x', 'y', 'z']))
+
+        assert recurrences == [True, True]
+
+    def _latched_at_1100_then_advanced(self, advance):
+        clock = _FakeClock(now=1000.0)
+        detector = self._detector(clock, threshold=4, window_seconds=300)
+        assert detector.record('p', 'a', ['k', 'k']) is False
+        clock.now = 1100.0
+        assert detector.record('p', 'a', ['k', 'k']) is True
+        clock.now = 1100.0 + advance
+        return detector
+
+    @pytest.mark.parametrize(
+        ('advance', 'n_keys', 'expected'),
+        [
+            # No drain: all 4 prior events remain, so nothing re-arms.
+            (0, 2, False),
+            (0, 3, False),
+            (0, 4, False),
+            # The t=1000 pair aged out: 2 remain, the first key re-arms.
+            (201, 2, True),
+            (201, 3, True),
+            (201, 4, True),
+            # Fully drained: only a call carrying the whole threshold crosses.
+            (301, 2, False),
+            (301, 3, False),
+            (301, 4, True),
+            (400, 2, False),
+            (400, 3, False),
+            (400, 4, True),
+        ],
+    )
+    def test_one_multi_key_call_decides_like_the_same_keys_as_single_key_calls(
+        self, advance, n_keys, expected
+    ):
+        as_one_call = self._latched_at_1100_then_advanced(advance)
+        as_single_key_calls = self._latched_at_1100_then_advanced(advance)
+
+        one_call = as_one_call.record('p', 'a', ['k'] * n_keys)
+        single_key_calls = any(
+            [as_single_key_calls.record('p', 'a', ['k']) for _ in range(n_keys)]
+        )
+
+        assert single_key_calls is expected
+        assert one_call is single_key_calls
+
     def test_defaults_to_monotonic_not_wall_clock(self):
         """Wall-clock would let an NTP step corrupt the window."""
         import time
@@ -359,55 +452,15 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
                 f'the crossing is the event, not the state (t={offset})'
             )
 
-    def test_a_latched_writer_is_not_re_reported_by_one_multi_key_call(self):
-        """CHARACTERIZATION of the migration's exact-equivalence guard.
-
-        This class's contract is one decision per CALL, while a StormCounter
-        decides per EVENT — and a call carries every ``unknown_key`` violation
-        from one write, so multi-key calls are routine (``memory_service.py``
-        passes a list). Within a call the count only rises, so a naive
-        per-key ``fired = fired or ...`` fold would let the FIRST key of a call
-        land below the threshold, re-arm the counter mid-loop, and let a later
-        key of the SAME call fire — reporting a writer that was already latched
-        on entry.
-
-        Pre-migration that call returned False, and this pins that it still
-        does. Whether the latch SHOULD survive a window that fully drained is a
-        real question, but it is a live-path behaviour change and not this
-        task's (task 4519 is INV-5 de-duplication) — filed as its own follow-up
-        under esc-4519-2. Do not "simplify" the ``was_latched`` guard away
-        without reading it: this test is what would go red.
-        """
-        clock = _FakeClock()
-        detector = self._detector(clock, threshold=3, window_seconds=300)
-
-        assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
-
-        clock.advance(301)
-        assert detector.record('p', 'a', ['x', 'y', 'z']) is False, (
-            'the writer was latched on entry, so this call is not a new crossing'
-        )
-        assert detector._warns[('p', 'a')].latched is True, (
-            'and it stays latched, exactly as the pre-migration _firing set did'
-        )
-
     def test_the_latch_re_arms_without_eviction_when_the_window_drains(self):
-        """The OTHER half of the ``was_latched`` guard's behaviour.
+        """The drained window re-arms the latch IN PLACE, not only by eviction.
 
         :meth:`UnknownKeyStormDetector.record`'s docstring promises "a writer
         that drifts, is fixed, and later drifts again is heard both times", but
-        the only detector-level test of that promise —
-        ``test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard`` —
-        goes through the sweep, so it proves the latch was cleared by DELETING
-        the counter, not by the re-arm. The re-arm itself was pinned only
-        inside StormCounter's own suite.
-
-        That gap matters because the guard makes the detector's behaviour on a
-        drained window genuinely non-obvious, and asymmetric: single-key calls
-        after a drain DO re-cross and fire (here), while ONE multi-key call
-        that crosses in a single call does NOT (the sibling above). Pinning
-        only the suppressed side would leave a future edit free to widen the
-        guard into a permanent latch and stay green.
+        ``test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard`` goes
+        through the sweep, so it proves the latch was cleared by DELETING the
+        counter, not by the re-arm. This pins the re-arm path itself, so a
+        future edit cannot widen the latch into a permanent one and stay green.
 
         No eviction runs: ``sweep_every`` defaults to 256 and this drives six
         records, which the closing identity assertion makes explicit rather
