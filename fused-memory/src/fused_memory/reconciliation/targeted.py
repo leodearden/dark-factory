@@ -621,9 +621,24 @@ class TargetedReconciler:
         #      task_done run took 27s end to end); and an eligible marker is an
         #      expired work-item marker whose continued presence in search is the
         #      esc-3796-1 bug, so it should be gone before section 1 searches.
-        await retire_flag_markers_for_terminal_task(
+        retired = await retire_flag_markers_for_terminal_task(
             self.memory, str(scope.project_id), run_id, task_id=task_id,
         )
+        if retired > 0:
+            # The durable record of this path's work. The shared sweep also
+            # writes a tombstone per victim, so the action is auditable from
+            # either end. Hook and sweep share the flag_for_stage2_gc_sweep
+            # deleter tag, but the tombstone carries the deleting run_id, and
+            # this run is a RunType.targeted row with trigger_reason
+            # task_done:<id> — a join on run_id tells them apart.
+            result['actions'].append(
+                {'type': 'flag_for_stage2_retired', 'task_id': task_id, 'count': retired}
+            )
+            await self.journal.add_run_action(
+                run_id, 'retire', 'flag_for_stage2', 'delete',
+                {'task_id': task_id, 'retired': retired},
+                causation_id=run_id,
+            )
 
         # 1. Search for existing knowledge about this task
         #
