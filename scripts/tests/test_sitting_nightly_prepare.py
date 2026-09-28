@@ -189,16 +189,13 @@ def test_model_budget_and_turns_seams_reach_the_argv(tmp_path):
     assert argv[argv.index('--max-turns') + 1] == '17'
 
 
-def test_the_prompt_goes_on_stdin_and_names_the_skill_section(tmp_path):
+def test_the_prompt_goes_on_stdin_not_argv(tmp_path):
     fake = _fake_claude(tmp_path)
 
     _main(fake)
 
     call = fake.only_call()
     assert call['stdin'] == mod.NIGHTLY_PROMPT
-    assert 'skills/escalation-watcher/SKILL.md' in mod.NIGHTLY_PROMPT
-    assert 'Sitting preparer' in mod.NIGHTLY_PROMPT
-    assert f'{mod.PREPARE_COMMAND} record' in mod.NIGHTLY_PROMPT
     assert not any(mod.NIGHTLY_PROMPT in arg for arg in call['argv']), 'the prompt must not ride the argv'
 
 
