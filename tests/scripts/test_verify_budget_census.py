@@ -1796,6 +1796,135 @@ class TestTheCliContract:
         assert '<none declared>' in text
 
 
+def _live_and_archived(
+    root: Path,
+    payload: dict[str, Any],
+    *,
+    task_id: str = '5199',
+    attempt: int = 1,
+    prefix: str = 'orchestrator',
+    stamp: str = _STAMP_US,
+) -> tuple[Path, Path]:
+    """One attempt as a live task leaves it: a worktree copy and its archive twin."""
+    worktree = _worktree_record(root, task_id, f'attempt-{attempt}.{prefix}.summary.json')
+    archive = _archive_record(
+        root, task_id, f'attempt-{attempt}.{prefix}.summary-{stamp}.json',
+    )
+    for path in (worktree, archive):
+        path.write_text(json.dumps(payload), encoding='utf-8')
+    return worktree, archive
+
+
+class TestALiveAttemptIsCountedOnce:
+    """A live task's attempt is one record, even though it sits in two corpora.
+
+    Task 5199 archives every task-path summary, so while a task's worktree
+    lives each attempt sits in BOTH corpora with identical content. The census
+    must count it once and account for the other copy as a counted skip.
+    """
+
+    def test_the_archived_twin_is_a_counted_skip_not_a_second_record(self, tmp_path):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        wt, ar = _live_and_archived(tmp_path, _summary(_leg()))
+
+        corpus = load_records([tmp_path])
+
+        assert [r.where.path for r in corpus.records] == [wt]
+        assert [(s.path, s.reason) for s in corpus.skipped] == [
+            (ar, 'duplicate_of_worktree_record'),
+        ]
+        assert len(corpus.records) + len(corpus.skipped) == 2
+
+    def test_a_role_filtered_census_still_sees_the_live_attempt(self, tmp_path):
+        from verify_budget_census import (  # noqa: PLC0415
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _live_and_archived(tmp_path, _summary(_leg()))
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]),
+            expected=_FULL_SUITE,
+            prefix='orchestrator',
+            role='task',
+        )
+
+        assert len(selection.legs) == 1
+        assert selection.rejected_records == {}
+
+    def test_a_default_census_reports_n_once_and_names_the_skip(
+        self, tmp_path, capsys,
+    ):
+        _module_yaml(tmp_path)
+        _live_and_archived(tmp_path, _summary(_leg(duration_secs=3300.0)))
+
+        rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+        report = json.loads(out)
+
+        assert rc == 0
+        assert report['overall']['durations']['n'] == 1
+        assert report['corpus']['records'] == 1
+        assert report['corpus']['skipped'] == {'duplicate_of_worktree_record': 1}
+
+    def test_an_earlier_run_of_the_same_attempt_still_counts(self, tmp_path):
+        """An infra retry reuses attempt_id and overwrites the worktree copy.
+
+        That is workflow.py::_run_scoped_verification_with_infra_retry. The
+        archive keeps both runs; only the rerun has a worktree twin, so twin
+        identity has to be content and not name.
+        """
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        first = _summary(
+            _leg(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
+        )
+        rerun = _summary(
+            _leg(started_at='2026-09-13T05:00:00+00:00', duration_secs=3400.0),
+        )
+        wt, rerun_archived = _live_and_archived(
+            tmp_path, rerun, stamp='20260913T050000_000001Z',
+        )
+        first_archived = _archive_record(
+            tmp_path, '5199', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+        )
+        first_archived.write_text(json.dumps(first), encoding='utf-8')
+
+        corpus = load_records([tmp_path])
+
+        assert {r.where.path for r in corpus.records} == {wt, first_archived}
+        assert [(s.path, s.reason) for s in corpus.skipped] == [
+            (rerun_archived, 'duplicate_of_worktree_record'),
+        ]
+
+    @pytest.mark.parametrize(
+        ('task_id', 'attempt', 'prefix'),
+        [('5422', 1, 'orchestrator'), ('5199', 2, 'orchestrator'), ('5199', 1, 'shared')],
+    )
+    def test_identical_content_under_another_task_attempt_or_module_is_not_a_twin(
+        self, tmp_path, task_id, attempt, prefix,
+    ):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        payload = _summary(_leg())
+        worktree = _worktree_record(
+            tmp_path, '5199', 'attempt-1.orchestrator.summary.json',
+        )
+        worktree.write_text(json.dumps(payload), encoding='utf-8')
+        archive = _archive_record(
+            tmp_path, task_id, f'attempt-{attempt}.{prefix}.summary-{_STAMP_US}.json',
+        )
+        archive.write_text(json.dumps(payload), encoding='utf-8')
+
+        corpus = load_records([tmp_path])
+
+        assert len(corpus.records) == 2
+        assert corpus.skipped == ()
+
+
 class TestTheExitCodeVocabulary:
     """0 / 1 / 2, as `merge_lane_throughput.main` documents."""
 
