@@ -883,22 +883,10 @@ async def triage_write(
             # here -- one home for that decision.
             candidates=results,
         )
-        judged = _apply_judge_verdict(decision, answer, results)
+        return _apply_judge_verdict(decision, answer, results)
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
-
-    if judged.outcome not in TRIAGE_OUTCOMES:
-        # A closed output set (D3) means an unrecognised verdict is a BUG, not
-        # an extension point — counted as a fail-open so it cannot pass as a
-        # routing decision nobody notices.
-        _record_fail_open(
-            counter, project_id,
-            ValueError(f'judge returned {judged.outcome!r}, not in TRIAGE_OUTCOMES'),
-            stage='judge',
-        )
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
-    return judged
 
 
 def _apply_judge_verdict(
@@ -914,24 +902,46 @@ def _apply_judge_verdict(
     hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
     naming none attaches to the band's winner. ``stored`` attaches nothing, so
     it carries no canonical a caller could mistake for an endorsement.
+
+    Every breach of that contract RAISES, naming the offending value, so
+    :func:`triage_write` counts it as exactly one fail-open. The output set is
+    closed (D3): an unrecognised verdict is a bug, not an extension point.
     """
-    if isinstance(answer, str):
-        verdict = JudgeVerdict(answer)
-    elif isinstance(answer, tuple) and len(answer) == 2:
-        verdict = JudgeVerdict._make(answer)
-    else:
-        raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
+    verdict = _judge_verdict_of(answer)
+    if verdict.outcome not in TRIAGE_OUTCOMES:
+        raise ValueError(f'judge returned {verdict.outcome!r}, not in TRIAGE_OUTCOMES')
     if verdict.outcome == OUTCOME_STORED:
+        if verdict.candidate_id is not None:
+            raise ValueError(
+                f'a stored verdict attaches nothing, yet names {verdict.candidate_id!r}',
+            )
         return replace(decision, outcome=OUTCOME_STORED, canonical_id=None)
     if verdict.candidate_id is None:
         return replace(decision, outcome=verdict.outcome)
-    judged = next(result for result in results if result.id == verdict.candidate_id)
+    if not isinstance(verdict.candidate_id, str) or not verdict.candidate_id:
+        raise ValueError(f'candidate_id {verdict.candidate_id!r} is not a non-empty str')
+    judged = next(
+        (result for result in results if result.id == verdict.candidate_id), None,
+    )
+    if judged is None:
+        raise ValueError(
+            f'judge named {verdict.candidate_id!r}, which is not a retrieved candidate',
+        )
     return replace(
         decision,
         outcome=verdict.outcome,
         canonical_id=_canonical_id_of(judged),
         judged_candidate_id=verdict.candidate_id,
     )
+
+
+def _judge_verdict_of(answer: object) -> JudgeVerdict:
+    """Read a judge's *answer* as a verdict: a bare word names no candidate."""
+    if isinstance(answer, str):
+        return JudgeVerdict(answer)
+    if isinstance(answer, tuple) and len(answer) == 2:
+        return JudgeVerdict._make(answer)
+    raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
 
 
 #: The exception classes the retired guard's call site re-raised as wiring
