@@ -42,6 +42,7 @@ from typing import Any, Literal, cast
 from pydantic import ValidationError
 from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
 from shared.delivered_check_polarity import (
+    GATE_REF,
     CheckOutcome,
     build_grep_argv,
     build_path_argv,
@@ -126,7 +127,7 @@ async def run_delivered_check(
     check: dict[str, Any],
     *,
     project_root: str | Path,
-    ref: str = 'main',
+    ref: str = GATE_REF,
     runner: _Runner = git_ops._run,
 ) -> DeliveredCheckResult:
     """Evaluate a single delivered-check descriptor. Never raises.

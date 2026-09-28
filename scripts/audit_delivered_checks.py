@@ -13,7 +13,7 @@ this report is never done by this script (the audit/repair split of tasks
 
 WHAT IT ANSWERS. ``shared.delivered_check_polarity`` gates NEW descriptors at
 authoring time, where the reference tree is free: ``commit_planning`` runs
-before the task is implemented, so HEAD *is* the pre-task tree and "already
+before the task lands, so ``main`` *is* the pre-task tree and "already
 green" is decisive. That gate cannot see the descriptors already committed.
 This script sweeps those, and it needs one extra input to do it.
 
@@ -99,6 +99,7 @@ if str(_SHARED_SRC) not in sys.path:
 
 from shared.capability_manifest import load_capability_manifest  # noqa: E402
 from shared.delivered_check_polarity import (  # noqa: E402
+    GATE_REF,
     CheckOutcome,
     evaluate_grep_at_tree,
     extract_delivered_checks,
@@ -254,7 +255,7 @@ def classify_descriptor(
     return DISPOSITION_HEALTHY
 
 
-def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = "HEAD") -> CheckOutcome:
+def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
     """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
 
     Deliberately a one-line delegation rather than its own grep:
@@ -592,7 +593,7 @@ def _load_statuses(db_path: str) -> tuple[dict[int, tuple[str, str]], dict[int, 
         conn.close()
 
 
-def audit_project(project_root: str, ref: str = "HEAD") -> ProjectAudit:
+def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     """Join tasks.db, the sidecars and the tree; classify every descriptor.
 
     Raises ``sqlite3.Error`` on an unreadable database, which is the contract
@@ -892,7 +893,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Project root to audit (resolves <root>/.taskmaster/tasks/tasks.db "
             "and the tracked *.capability-manifest.yaml sidecars, evaluated "
-            "against that checkout's HEAD). May be repeated."
+            "against its main). May be repeated."
         ),
     )
     parser.add_argument(

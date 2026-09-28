@@ -35,6 +35,7 @@ from pydantic import ValidationError
 
 from shared.capability_manifest import MECHANICAL_CHECK_KINDS, DeliveredCheckMeta
 from shared.delivered_check_polarity import (
+    GATE_REF,
     CheckFinding,
     CheckOutcome,
     build_grep_argv,
@@ -1654,3 +1655,79 @@ class TestEveryPolarityKindIsLinted:
                     'expect': 'present',
                 }
             )
+
+
+# ---------------------------------------------------------------------------
+# The reference tree is GATE_REF — the ref the runtime gate reads
+# ---------------------------------------------------------------------------
+
+
+def _commit_all(root: Path, message: str) -> None:
+    _run_git(root, 'add', '-A')
+    _run_git(root, 'commit', '--no-verify', '-q', '-m', message)
+
+
+class TestReferenceTreeIsTheGateRef:
+    """The authoring lint judges the tree the runtime gate judges.
+
+    The project checkout is machine-operated and can sit on another branch;
+    reading ``HEAD`` there measured a branch that already carried the
+    capability and falsely rejected a sound check. And a root where the gate
+    ref does not resolve cannot be judged at all, so it must be reported,
+    never rejected.
+    """
+
+    def test_the_gate_ref_is_main(self):
+        assert GATE_REF == 'main'
+
+    def test_a_checkout_sitting_on_a_branch_does_not_move_the_reference(
+        self, authoring_repo
+    ):
+        _run_git(authoring_repo, 'checkout', '-q', '-b', 'task/x')
+        (authoring_repo / 'src' / 'producer.py').write_text(
+            'def existing_symbol():\n    return 1\n\n\ndef new_fn():\n    pass\n',
+            encoding='utf-8',
+        )
+        _commit_all(authoring_repo, 'the branch already carries new_fn')
+
+        findings = lint_delivered_checks(
+            [_grep_check(pattern='new_fn')], files=['src/producer.py'], repo_root=authoring_repo
+        )
+
+        assert findings == []
+
+    def test_a_root_where_the_gate_ref_does_not_resolve_is_unevaluable(self, tmp_path):
+        root = tmp_path / 'repo'
+        root.mkdir()
+        subprocess.run(
+            ['git', 'init', '-q', '-b', 'trunk', str(root)], check=True, capture_output=True
+        )
+        _run_git(root, 'config', 'user.email', 'polarity-test@example.com')
+        _run_git(root, 'config', 'user.name', 'Polarity Test')
+        (root / 'src').mkdir()
+        (root / 'src' / 'producer.py').write_text('def existing_symbol():\n    return 1\n')
+        _commit_all(root, 'seed on trunk')
+
+        findings = lint_delivered_checks(
+            [_grep_check(), _path_check(name='path-cap')], files=[], repo_root=root
+        )
+
+        assert [(f.check_name, f.severity, f.code) for f in findings] == [
+            ('cap', 'errored', 'unevaluable'),
+            ('path-cap', 'errored', 'unevaluable'),
+        ]
+
+    def test_the_filename_rule_reads_the_refs_tree_not_the_index(self, authoring_repo):
+        """A file staged in the checkout but absent from the gate ref is not
+        part of the tree being judged."""
+        staged = authoring_repo / 'src' / 'zeta_strand.py'
+        staged.write_text('def run():\n    return None\n', encoding='utf-8')
+        _run_git(authoring_repo, 'add', 'src/zeta_strand.py')
+
+        findings = lint_delivered_checks(
+            [_grep_check(pattern='zeta_strand', paths=['src/'])],
+            files=[],
+            repo_root=authoring_repo,
+        )
+
+        assert findings == []

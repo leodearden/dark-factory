@@ -510,9 +510,13 @@ rather than a materialized `main` tree.
 A sound `delivered_check` **fails at the authoring tree and passes once its
 producer lands** — 0→N or N→0 across the task. That is the whole content of
 the check: it is a claim about a *change*, and a check that cannot observe a
-change observes nothing. Because `commit_planning` runs *before* the task is
-implemented, HEAD at that moment **is** the pre-task tree, so the property is
-decidable at authoring time with nothing but the manifest and git:
+change observes nothing. Because `commit_planning` runs *before* the task
+lands, `main` at that moment **is** the pre-task tree, so the property is
+decidable at authoring time with nothing but the manifest and git. The lint
+reads `main` — the ref the runtime gate reads
+(`shared/src/shared/delivered_check_polarity.py::GATE_REF`) — never the
+checkout's `HEAD`, which may sit on another branch; where `main` does not
+resolve, every check is reported `unevaluable` rather than judged:
 
 | | `expect: present` | `expect: absent` |
 |---|---|---|

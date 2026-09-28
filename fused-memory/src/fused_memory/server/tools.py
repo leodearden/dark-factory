@@ -17,6 +17,7 @@ import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 from shared.delivered_check_polarity import (
+    GATE_REF,
     extract_delivered_checks,
     lint_delivered_checks,
     polarity_error,
@@ -9284,7 +9285,8 @@ def create_mcp_server(
 
         DELIVERED-CHECK POLARITY GATE (task 3500). Every batch task's
         ``metadata.delivered_checks`` is linted against the authoring tree
-        (``HEAD`` of *project_root*) before anything is flipped. The invariant:
+        (``main`` of *project_root*, the ref the runtime gate reads) before
+        anything is flipped. The invariant:
         a sound delivered_check FAILS when it is written and PASSES once its
         producer lands. A check that is already green gates nothing; a check
         that can never go green wedges its dependent forever, and at runtime a
@@ -9378,10 +9380,10 @@ def create_mcp_server(
         # unnoticed. The invariant, enforced here: a sound delivered_check
         # FAILS at the authoring tree and PASSES once its producer lands.
         #
-        # The reference tree is simply HEAD, and needs no commit-ordering
-        # premise: commit_planning runs BEFORE the batch is implemented, so
-        # whatever HEAD points at IS the pre-task tree. (That does not
-        # generalize backwards to an already-landed task — see
+        # The reference tree is GATE_REF (main), the tree the runtime gate
+        # reads, and needs no commit-ordering premise: commit_planning runs
+        # BEFORE the batch lands, so main IS the pre-task tree. (That does
+        # not generalize backwards to an already-landed task — see
         # shared.delivered_check_polarity's module docstring and the
         # status-aware scripts/audit_delivered_checks.py.)
         #
@@ -9415,7 +9417,7 @@ def create_mcp_server(
                 checks,
                 files=extract_files(meta),
                 repo_root=project_root,
-                ref='HEAD',
+                ref=GATE_REF,
             )
             if any(f.severity == 'reject' for f in findings):
                 # All-or-nothing, before the flip — mirrors the lock-charter

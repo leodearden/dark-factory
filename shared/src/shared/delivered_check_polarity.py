@@ -14,14 +14,14 @@ them.
 THE ONE RULE. A sound delivered_check must FAIL at the authoring tree
 and PASS after its producer lands (a 0→N or N→0 transition across the
 task). At authoring time the reference tree is free — the task has not
-been implemented yet, so HEAD *is* the pre-task tree — which collapses
-the whole classification into a single measured predicate:
+landed yet, so ``main`` *is* the pre-task tree — which collapses the
+whole classification into a single measured predicate:
 
     ================  ===============  ==============
                       expect: present  expect: absent
     ================  ===============  ==============
-    matches HEAD      REJECT           healthy
-    no match at HEAD  healthy          REJECT
+    matches main      REJECT           healthy
+    no match at main  healthy          REJECT
     ================  ===============  ==============
 
 The rule is about POLARITY, so it covers every kind that carries an
@@ -49,11 +49,16 @@ Comment-only and self-referential matches are not separate gates: at
 authoring time they are sub-species of "a check that already matches",
 so they sharpen the REJECTION MESSAGE rather than adding a predicate.
 
-WHY THE REFERENCE TREE IS ``HEAD``, NOT A HISTORICAL SHA. The 2x2's axis
-is "matches at the AUTHORING tree", and at authoring time that tree is
-free: ``commit_planning``/stamping run BEFORE the task is implemented, so
-whatever HEAD points at *is* the pre-task tree. No history, no
-commit-ordering premise, no ``done``-time SHA to recover. That is the
+WHY THE REFERENCE TREE IS :data:`GATE_REF`, NOT ``HEAD`` OR A HISTORICAL
+SHA. The 2x2's axis is "matches at the AUTHORING tree", and at authoring
+time that tree is free: ``commit_planning``/stamping run BEFORE the task
+lands, so ``main`` *is* the pre-task tree. It is ``main`` and not
+``HEAD`` because ``main`` is what the runtime gate reads, and the project
+checkout is machine-operated and can sit on another branch: a branch that
+already carries the capability would make a sound check look vacuous. A
+root where ``main`` does not resolve yields ERRORED — reported, never a
+reject. No history, no commit-ordering premise, no ``done``-time SHA to
+recover. That is the
 whole reason a gate this cheap is sound, and it does not generalize
 backwards: for an ALREADY-LANDED task the same descriptor's verdict
 inverts — an ``expect=present`` check that matches is the SUCCESS state
@@ -127,6 +132,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 __all__ = [
+    'GATE_REF',
     'CheckFinding',
     'CheckOutcome',
     'build_grep_argv',
@@ -149,6 +155,13 @@ logger = logging.getLogger(__name__)
 #: slow disk delays a commit_planning call instead of rejecting a healthy
 #: batch.
 GIT_TIMEOUT_SECS: float = 30.0
+
+#: The ref every delivered_check is judged against: the runtime gate's
+#: (``orchestrator/src/orchestrator/scheduler.py::Scheduler._resolve_main_sha``
+#: rev-parses it, and ``orchestrator.delivered_checks.run_delivered_check``
+#: defaults to it). The authoring-time wire points evaluate against the same
+#: name so the two gates judge one tree.
+GATE_REF: str = 'main'
 
 #: Everything ``subprocess.run`` can raise for one git probe, all of which mean
 #: "unevaluable", never a verdict: ``OSError`` (no ``git``, exec failure),
@@ -320,7 +333,7 @@ def evaluate_grep_at_tree(
     *,
     expect: str | None,
     repo_root: str | Path,
-    ref: str = 'HEAD',
+    ref: str = GATE_REF,
     timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> CheckOutcome:
     """Run one grep check against *ref* in *repo_root*. Never raises.
@@ -365,7 +378,7 @@ def evaluate_path_at_tree(
     *,
     expect: str | None,
     repo_root: str | Path,
-    ref: str = 'HEAD',
+    ref: str = GATE_REF,
     timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> CheckOutcome:
     """Run one path check against *ref* in *repo_root*. Never raises.
@@ -448,7 +461,7 @@ def lint_delivered_checks(
     *,
     files: Sequence[str] | None,
     repo_root: str | Path,
-    ref: str = 'HEAD',
+    ref: str = GATE_REF,
 ) -> list[CheckFinding]:
     """Lint a whole ``metadata.delivered_checks`` list against the authoring tree.
 
@@ -586,7 +599,9 @@ def _lint_grep_check(
     # a malformed `expect` can never be relabelled by one of them.
     try:
         if expect == 'present':
-            return _filename_shaped_finding(name, pattern, paths, repo_root=repo_root)
+            return _filename_shaped_finding(
+                name, pattern, paths, repo_root=repo_root, ref=ref
+            )
         if expect == 'absent':
             return _absent_overbroad_finding(
                 name, pattern, paths, files=files, repo_root=repo_root, ref=ref
@@ -752,11 +767,14 @@ def _tracked_paths(
     paths: Sequence[str] | None,
     *,
     repo_root: str | Path,
+    ref: str,
     timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> list[str] | None:
-    """Tracked paths under *paths* (whole tree when empty). ``None`` on any
-    git failure — same never-guess contract as :func:`_grep_matches`."""
-    argv = ['git', '-C', str(repo_root), 'ls-files', '-z']
+    """Paths in *ref*'s tree under *paths* (whole tree when empty) — the
+    committed tree the verdict was reached against, never the index.
+    ``None`` on any git failure — same never-guess contract as
+    :func:`_grep_matches`."""
+    argv = ['git', '-C', str(repo_root), 'ls-tree', '-r', '-z', '--full-tree', '--name-only', ref]
     if paths:
         argv.append('--')
         argv.extend(paths)
@@ -877,6 +895,7 @@ def _filename_shaped_finding(
     paths: Sequence[str] | None,
     *,
     repo_root: str | Path,
+    ref: str,
 ) -> CheckFinding | None:
     """MODE 3: an ``expect='present'`` pattern that names a FILE, not a symbol.
 
@@ -901,7 +920,7 @@ def _filename_shaped_finding(
     pattern Python cannot compile yields ``None`` (no finding) rather than a
     guess. A verdict is never decided this way.
     """
-    tracked = _tracked_paths(paths, repo_root=repo_root)
+    tracked = _tracked_paths(paths, repo_root=repo_root, ref=ref)
     if not tracked:
         return None
     try:

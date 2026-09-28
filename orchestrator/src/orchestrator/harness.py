@@ -8300,9 +8300,9 @@ class Harness:
                 [parsed],
                 files=None,
                 repo_root=self.config.project_root,
-                # `main` — the same tree the gate itself evaluated against, so
-                # the diagnosis cannot disagree with the verdict it explains.
-                ref='main',
+                # The same tree the gate itself evaluated against, so the
+                # diagnosis cannot disagree with the verdict it explains.
+                ref=delivered_check_polarity.GATE_REF,
             )
             if f.severity == 'reject'
         ]

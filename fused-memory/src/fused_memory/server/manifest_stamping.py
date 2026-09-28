@@ -60,7 +60,7 @@ from shared.capability_manifest import (
     DeliveredCheckMeta,
     parse_capability_manifest,
 )
-from shared.delivered_check_polarity import lint_delivered_checks
+from shared.delivered_check_polarity import GATE_REF, lint_delivered_checks
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 
@@ -402,7 +402,7 @@ async def _stamp_capability_manifests_impl(
                 [{**check_meta, 'manifest_path': sidecar_rel} for check_meta in mechanical],
                 files=files_by_task_id.get(tid, []),
                 repo_root=str(root),
-                ref='HEAD',
+                ref=GATE_REF,
             )
             refused = {f.check_name: f for f in findings if f.severity == 'reject'}
             for finding in findings:
