@@ -122,6 +122,7 @@ and runtime call sites share code at all.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import posixpath
@@ -476,13 +477,46 @@ def lint_delivered_checks(
     carry an ``expect`` — ``grep`` and ``path``. A script check has none to
     invert and is skipped BEFORE any subprocess, so a script-only batch
     costs nothing.
+
+    *ref* is resolved to a commit ONCE, on the first check that needs git,
+    and every check in the call is judged at that one SHA. A ref that does
+    not resolve makes every such check unevaluable: handed to ``git grep``
+    unresolved, a name like ``main`` with no such branch would be read as a
+    PATHSPEC and answered from the working tree.
     """
+    tree = functools.cache(lambda: _resolve_commit(repo_root, ref))
     findings: list[CheckFinding] = []
     for check in checks:
-        finding = _lint_one_check(check, files=files, repo_root=repo_root, ref=ref)
+        finding = _lint_one_check(
+            check, files=files, repo_root=repo_root, ref=ref, tree=tree
+        )
         if finding is not None:
             findings.append(finding)
     return findings
+
+
+def _resolve_commit(
+    repo_root: str | Path, ref: str, timeout_secs: float = GIT_TIMEOUT_SECS
+) -> str | None:
+    """The commit *ref* names in *repo_root*, or ``None`` if it names none."""
+    argv = ['git', '-C', str(repo_root), 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}']
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_secs
+        )
+    except _GIT_PROBE_FAILURES:
+        return None
+    sha = completed.stdout.strip()
+    return sha if completed.returncode == 0 and sha else None
+
+
+def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFinding:
+    return CheckFinding(
+        check_name=name,
+        severity='errored',
+        code='unevaluable',
+        message=_unevaluable_message(name, ref, repo_root),
+    )
 
 
 def _lint_one_check(
@@ -491,6 +525,7 @@ def _lint_one_check(
     files: Sequence[str] | None,
     repo_root: str | Path,
     ref: str,
+    tree: Callable[[], str | None],
 ) -> CheckFinding | None:
     """Route one check to its kind's 2x2. ``None`` means healthy (or not
     our business).
@@ -519,7 +554,7 @@ def _lint_one_check(
     linter = _POLARITY_LINTERS.get(kind) if isinstance(kind, str) else None
     if linter is None:
         return None
-    return linter(check, name=name, files=files, repo_root=repo_root, ref=ref)
+    return linter(check, name=name, files=files, repo_root=repo_root, ref=ref, tree=tree)
 
 
 def _lint_grep_check(
@@ -529,12 +564,14 @@ def _lint_grep_check(
     files: Sequence[str] | None,
     repo_root: str | Path,
     ref: str,
+    tree: Callable[[], str | None],
 ) -> CheckFinding | None:
     """The 2x2 for a ``kind='grep'`` check, plus the two rules it cannot see.
 
     A grep check without a usable ``pattern`` is a SCHEMA defect, not a
     polarity defect, and there is nothing to grep for; the metadata
     validator owns that diagnosis, so it is skipped before any subprocess.
+    *ref* names the tree in messages; git reads the commit *tree* resolved.
     """
     pattern = check.get('pattern')
     if not isinstance(pattern, str) or not pattern:
@@ -547,17 +584,15 @@ def _lint_grep_check(
     paths = _strings_only(check.get('paths'))
     files = _strings_only(files)
 
+    sha = tree()
+    if sha is None:
+        return _unevaluable_finding(name, ref, repo_root)
     outcome = evaluate_grep_at_tree(
-        pattern, paths, expect=expect, repo_root=repo_root, ref=ref
+        pattern, paths, expect=expect, repo_root=repo_root, ref=sha
     )
 
     if outcome is CheckOutcome.ERRORED:
-        return CheckFinding(
-            check_name=name,
-            severity='errored',
-            code='unevaluable',
-            message=_unevaluable_message(name, ref, repo_root),
-        )
+        return _unevaluable_finding(name, ref, repo_root)
 
     if outcome is CheckOutcome.PASS:
         # The whole rule: a check that is ALREADY green at the authoring
@@ -575,7 +610,7 @@ def _lint_grep_check(
         # — never to a crash, and never to a dropped rejection.
         try:
             code, sites = _refine_vacuous_present(
-                _grep_matches(pattern, paths, repo_root=repo_root, ref=ref),
+                _grep_matches(pattern, paths, repo_root=repo_root, ref=sha),
                 manifest_path=check.get('manifest_path'),
             )
             message = _vacuous_present_refined_message(code, name, pattern, ref, sites)
@@ -602,11 +637,11 @@ def _lint_grep_check(
     try:
         if expect == 'present':
             return _filename_shaped_finding(
-                name, pattern, paths, repo_root=repo_root, ref=ref
+                name, pattern, paths, repo_root=repo_root, ref=sha
             ) or _declared_filename_finding(name, pattern, paths, files=files)
         if expect == 'absent':
             return _absent_overbroad_finding(
-                name, pattern, paths, files=files, repo_root=repo_root, ref=ref
+                name, pattern, paths, files=files, repo_root=repo_root, ref=sha
             )
     except Exception:  # noqa: BLE001 - these are advisory; never fail the lint
         # Degrading here loses only a diagnosis, never a rejection: the 2x2
@@ -646,6 +681,7 @@ def _lint_path_check(
     files: Sequence[str] | None,
     repo_root: str | Path,
     ref: str,
+    tree: Callable[[], str | None],
 ) -> CheckFinding | None:
     """The 2x2 for a ``kind='path'`` check, read as existence.
 
@@ -661,14 +697,12 @@ def _lint_path_check(
     if not paths:
         return None
     expect = check.get('expect')
-    outcome = evaluate_path_at_tree(paths, expect=expect, repo_root=repo_root, ref=ref)
+    sha = tree()
+    if sha is None:
+        return _unevaluable_finding(name, ref, repo_root)
+    outcome = evaluate_path_at_tree(paths, expect=expect, repo_root=repo_root, ref=sha)
     if outcome is CheckOutcome.ERRORED:
-        return CheckFinding(
-            check_name=name,
-            severity='errored',
-            code='unevaluable',
-            message=_unevaluable_message(name, ref, repo_root),
-        )
+        return _unevaluable_finding(name, ref, repo_root)
     if outcome is CheckOutcome.FAIL:
         return None
     return CheckFinding(

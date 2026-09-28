@@ -1717,6 +1717,37 @@ class TestReferenceTreeIsTheGateRef:
             ('path-cap', 'errored', 'unevaluable'),
         ]
 
+    def test_a_directory_named_like_the_gate_ref_is_not_mistaken_for_it(self, tmp_path):
+        """With no ``main`` branch, ``git grep -e pat main`` reads ``main`` as a
+        PATHSPEC and answers from the working tree. The lint resolves the ref
+        to a commit first, so this is unevaluable, never a verdict."""
+        root = tmp_path / 'mrepo'
+        root.mkdir()
+        subprocess.run(
+            ['git', 'init', '-q', '-b', 'master', str(root)], check=True, capture_output=True
+        )
+        _run_git(root, 'config', 'user.email', 'polarity-test@example.com')
+        _run_git(root, 'config', 'user.name', 'Polarity Test')
+        (root / 'main').mkdir()
+        (root / 'main' / 'x.txt').write_text('needle\n', encoding='utf-8')
+        (root / 'sub').mkdir()
+        (root / 'sub' / 'a.py').write_text('def f(): pass\n', encoding='utf-8')
+        _commit_all(root, 'seed on master')
+
+        findings = lint_delivered_checks(
+            [
+                {'name': 'present', 'kind': 'grep', 'pattern': 'needle', 'expect': 'present'},
+                {'name': 'absent', 'kind': 'grep', 'pattern': 'nowhere', 'expect': 'absent'},
+            ],
+            files=[],
+            repo_root=root,
+        )
+
+        assert [(f.check_name, f.severity, f.code) for f in findings] == [
+            ('present', 'errored', 'unevaluable'),
+            ('absent', 'errored', 'unevaluable'),
+        ]
+
     def test_the_filename_rule_reads_the_refs_tree_not_the_index(self, authoring_repo):
         """A file staged in the checkout but absent from the gate ref is not
         part of the tree being judged."""
