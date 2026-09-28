@@ -55,6 +55,7 @@ from legibility import (  # noqa: E402
 )
 from legibility.config import (  # noqa: E402
     LegibilityConfig,
+    TrickleCensusCaps,
     _require_absolute,
     configure_logging,
     load_config,
@@ -603,8 +604,22 @@ _RELATIVE_CENSUS_ARG_DETAIL = (
 )
 
 
+def _census_cap_args(caps: TrickleCensusCaps) -> list[str]:
+    """census.py's cost-control flags for *caps*; a ``None`` cap omits its flag."""
+    args: list[str] = []
+    if caps.max_batches is not None:
+        args += ['--max-batches', str(caps.max_batches)]
+    if caps.max_verify_clusters is not None:
+        args += ['--max-verify-clusters', str(caps.max_verify_clusters)]
+    return args
+
+
 def _default_census_launcher(
-    project_root: str | Path, *, config_path: str | Path | None = None, env=None,
+    project_root: str | Path,
+    *,
+    config_path: str | Path | None = None,
+    caps: TrickleCensusCaps | None = None,
+    env=None,
 ) -> None:
     """Best-effort subprocess launch of the census entrypoint (task η)
     against the project named by *project_root*.
@@ -632,7 +647,14 @@ def _default_census_launcher(
     unchanged", which is what this launcher did before the parameter existed
     and what it must keep doing whenever no account is available: a census
     launch is best-effort, so a pool problem must never be able to block one.
+
+    *caps* is the trickle's census bound (task 5900, task 5782's precondition
+    (b)), emitted as census.py's own ``--max-batches`` /
+    ``--max-verify-clusters`` flags, which remain the single cap mechanism.
+    Absent means the bounded ``TrickleCensusCaps`` schema default, never
+    uncapped; a ``None`` field is an explicit uncapped opt-out for that flag.
     """
+    caps = caps if caps is not None else TrickleCensusCaps()
     argv = [
         sys.executable,
         str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
@@ -646,6 +668,7 @@ def _default_census_launcher(
             str(config_path), field_name='census config_path',
             detail=_RELATIVE_CENSUS_ARG_DETAIL,
         )]
+    argv += _census_cap_args(caps)
     result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(
