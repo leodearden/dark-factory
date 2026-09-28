@@ -7,6 +7,7 @@ branch + worktree and submits a sibling task with ``force_full_path=True``.
 
 from __future__ import annotations
 
+import copy
 import json as _json
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, assert_update_wire_mode, pydantic_spec
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -48,6 +50,8 @@ def _make(
     rename_raises: Exception | None = None,
     worktree_exists: bool = True,
     seen_redo_costs: list[float] | None = None,
+    files: list[str] | None = None,
+    metadata_backend: FakeMetadataBackend | None = None,
 ) -> _Fixture:
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
@@ -91,11 +95,9 @@ def _make(
         return await dispatch_tool(name, args, timeout=timeout)
 
     dispatch_tool.return_value = submit_returns
-    update_task = AsyncMock(return_value=True)
 
     scheduler = MagicMock()
     scheduler.dispatch_tool = _dispatch
-    scheduler.update_task = update_task
     # Default: no prior auto-eval redo siblings. Tests exercising the
     # dedupe/supersede behaviour override this per-test.
     scheduler.get_tasks = AsyncMock(return_value=[])
@@ -122,12 +124,21 @@ def _make(
 
     metadata: dict = {
         'modules': ['mod_a'],
-        'files': ['mod_a/f.py'],
+        'files': list(files) if files is not None else ['mod_a/f.py'],
     }
     if optimistic_path:
         metadata['optimistic_path'] = optimistic_path
     if auto_eval_redo:
         metadata['auto_eval_redo'] = True
+
+    if metadata_backend is not None:
+        _, update_task = wire_metadata_backend(
+            scheduler, metadata_backend,
+            seed=copy.deepcopy(metadata), grants=True,
+        )
+    else:
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task
 
     assignment = TaskAssignment(
         task_id='orig-task',
