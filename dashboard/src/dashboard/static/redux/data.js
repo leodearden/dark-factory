@@ -190,7 +190,7 @@ window.DF_DATA = {
   // in_progress_live + in_progress_stranded band the in_progress census; the
   // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
   // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], forecast_low: null, forecast_high: null, parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
