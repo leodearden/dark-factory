@@ -257,11 +257,33 @@ def test_reconciliation_pseudo_tool_error_is_the_only_signal_for_7900():
 # harness_fix_surface — precision edge cases
 # ---------------------------------------------------------------------------
 
-def test_hosted_projects_own_fused_memory_named_files_do_not_match():
-    cluster = _synthetic(
-        cause="Agent edited fused-memory-config.yaml and crates/reify-audit/src/fused_memory_client.rs",
-    )
+@pytest.mark.parametrize(
+    "own_file",
+    [
+        "fused-memory-config.yaml",
+        "crates/reify-audit/src/fused_memory_client.rs",
+        "crates/reify-audit/src/fused_memory.rs",
+        "fused_memory.rs",
+        "tools/fused-memory/bridge.py",
+    ],
+)
+def test_hosted_projects_own_fused_memory_named_files_do_not_match(own_file):
+    cluster = _synthetic(cause=f"Agent edited {own_file} and the build broke")
     assert _components(cluster) == []
+
+
+@pytest.mark.parametrize(
+    "harness_text",
+    [
+        pytest.param("fused-memory/config/config.yaml sets a 30s MCP timeout", id="path-head"),
+        pytest.param(  # reify cand-20260926-2
+            "handling that only exists in dark-factory/fused-memory server code", id="path-tail",
+        ),
+        pytest.param("mcp-tool-call-serialization/fused-memory", id="area-tail"),  # cand-20260827-18
+    ],
+)
+def test_a_path_naming_the_harness_component_still_matches(harness_text):
+    assert _components(_synthetic(cause=harness_text)) == ["fused-memory"]
 
 
 def test_bare_dark_factory_and_orchestrator_words_do_not_match():

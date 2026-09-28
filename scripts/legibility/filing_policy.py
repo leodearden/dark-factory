@@ -57,7 +57,14 @@ class _Marker:
 _MARKERS: tuple[_Marker, ...] = (
     _Marker(
         "fused-memory",
-        re.compile(r"\bfused[-_]memory(?![-\w])", re.IGNORECASE),
+        re.compile(
+            r"""
+            (?<![\w.-])
+            (?: (?<!/) fused[-_]memory | fused[-_]memory (?!/) )
+            (?! [-\w] | \.\w )
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
         _Scope.DESCRIPTIVE,
     ),
     _Marker("fused-memory-mcp-tool", re.compile(r"\bmcp__fused-memory__\w+"), _Scope.DESCRIPTIVE),
@@ -86,6 +93,12 @@ _MARKERS: tuple[_Marker, ...] = (
     ),
 )
 """Harness fix-surface markers, in reporting order.
+
+The fused-memory marker skips a hosted project's own files and directories
+named after the harness component: the tail or head of a longer name, a file
+name, or an interior path segment. A path that merely ENDS in the component
+(``dark-factory/fused-memory``) or STARTS with it (``fused-memory/config/``)
+still names the harness.
 
 The pseudo-tool names are the reconciliation CodebaseVerifier's own tools,
 defined in fused-memory/src/fused_memory/reconciliation/verify.py. A bare
