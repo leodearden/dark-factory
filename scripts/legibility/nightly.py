@@ -702,9 +702,12 @@ def evaluate_census_step(
     best-effort subprocess launch) is called once.
 
     The *launcher* seam's contract is ``launcher(project_root, *,
-    config_path=None)``, always called with the CONFIG's ``project_root`` --
-    never argv-less, so the census target is never left to the process cwd
-    (task 3269). *config_path* is forwarded unchanged.
+    config_path=None, caps)``, always called with the CONFIG's
+    ``project_root`` AND the config's ``census.trickle_caps`` -- never
+    argv-less, so the census target is never left to the process cwd (task
+    3269), and the census bound is decided by the project's legibility.yaml
+    here, where config maps to launch, never by the launcher's own fallback
+    (task 5900). *config_path* is forwarded unchanged.
 
     This function never raises and never fails the run, and that guarantee is
     its OWN: both the *decide* call and the *launcher* call are guarded here,
@@ -784,7 +787,7 @@ def evaluate_census_step(
         return line, True
 
     try:
-        launcher(cfg.project_root, config_path=config_path)
+        launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
