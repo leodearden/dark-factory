@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -18,6 +19,10 @@ from fused_memory.models.reconciliation import VerificationResult, VerificationV
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    _sweep_stale_mem0_flag_for_stage2_markers,
+)
 from fused_memory.reconciliation.targeted import TargetedReconciler
 from fused_memory.reconciliation.verify import CodebaseVerifier
 
@@ -6875,36 +6880,54 @@ class TestContradictedEscalationWithoutTheEscalationPackage:
 _SEAM = 'fused_memory.reconciliation.targeted.retire_flag_markers_for_terminal_task'
 
 
+async def _drive_transition(reconciler, tmp_path, transition: str, task_id: str = '4376') -> dict:
+    return await reconciler.reconcile_task(
+        task_id=task_id,
+        transition=transition,
+        project_id='dark_factory',
+        project_root=str(make_git_root(tmp_path)),
+        task_before={
+            'id': task_id, 'title': 'Retire flags', 'status': 'in-progress',
+            'description': 'Latency layer',
+        },
+    )
+
+
+async def _task_done_runs(journal, task_id: str = '4376') -> list:
+    """This task's task_done runs, oldest first."""
+    runs = await journal.get_recent_runs('dark_factory', limit=10)
+    matching = [r for r in runs if r.trigger_reason == f'task_done:{task_id}']
+    return sorted(matching, key=lambda r: r.started_at)
+
+
+async def _only_task_done_run_id(journal, task_id: str = '4376') -> str:
+    runs = await _task_done_runs(journal, task_id)
+    assert len(runs) == 1, f'Expected one task_done run, got {runs}'
+    return runs[0].id
+
+
+async def _retire_rows(journal, run_id: str) -> list[dict]:
+    return [
+        a for a in await journal.get_run_actions(run_id)
+        if a['action_type'] == 'retire' and a['target'] == 'flag_for_stage2'
+    ]
+
+
+def _retire_entries(result: dict) -> list[dict]:
+    return [a for a in result.get('actions', []) if a['type'] == 'flag_for_stage2_retired']
+
+
 class TestOnTaskDoneRetiresFlagMarkers:
     """The done-transition hook retires the closing task's flag_for_stage2
     markers through the sweep's own seam (task 4376): scoped to that one task,
-    fired only on ``done``.
+    fired only on ``done``, recorded only when it did something, and never
+    allowed to fail the run.
     """
-
-    @staticmethod
-    async def _drive(reconciler, tmp_path, *, transition: str, task_id: str = '4376') -> dict:
-        return await reconciler.reconcile_task(
-            task_id=task_id,
-            transition=transition,
-            project_id='dark_factory',
-            project_root=str(make_git_root(tmp_path)),
-            task_before={
-                'id': task_id, 'title': 'Retire flags', 'status': 'in-progress',
-                'description': 'Latency layer',
-            },
-        )
-
-    @staticmethod
-    async def _run_id_for(journal, task_id: str = '4376') -> str:
-        runs = await journal.get_recent_runs('dark_factory', limit=10)
-        matching = [r.id for r in runs if r.trigger_reason == f'task_done:{task_id}']
-        assert len(matching) == 1, f'Expected one task_done run, got {runs}'
-        return matching[0]
 
     @pytest.mark.asyncio
     async def test_fires_on_done_scoped_to_the_closing_task(self, reconciler, journal, tmp_path):
         with patch(_SEAM, new=AsyncMock(return_value=0)) as seam:
-            await self._drive(reconciler, tmp_path, transition='done')
+            await _drive_transition(reconciler, tmp_path, 'done')
 
         seam.assert_awaited_once()
         assert seam.await_args is not None
@@ -6914,51 +6937,40 @@ class TestOnTaskDoneRetiresFlagMarkers:
         assert type(project_id) is str
         assert project_id == 'dark_factory'
         assert kwargs['task_id'] == '4376'
-        assert run_id == await self._run_id_for(journal)
+        assert run_id == await _only_task_done_run_id(journal)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('transition', ['blocked', 'cancelled', 'deferred'])
     async def test_does_not_fire_on_other_transitions(self, reconciler, tmp_path, transition):
         with patch(_SEAM, new=AsyncMock(return_value=0)) as seam:
-            await self._drive(reconciler, tmp_path, transition=transition)
+            await _drive_transition(reconciler, tmp_path, transition)
 
         seam.assert_not_awaited()
-
-    @staticmethod
-    def _retire_rows(actions: list[dict]) -> list[dict]:
-        return [
-            a for a in actions
-            if a['action_type'] == 'retire' and a['target'] == 'flag_for_stage2'
-        ]
-
-    @staticmethod
-    def _retire_entries(result: dict) -> list[dict]:
-        return [a for a in result.get('actions', []) if a['type'] == 'flag_for_stage2_retired']
 
     @pytest.mark.asyncio
     async def test_a_retirement_is_recorded_durably(self, reconciler, journal, tmp_path):
         with patch(_SEAM, new=AsyncMock(return_value=2)):
-            result = await self._drive(reconciler, tmp_path, transition='done')
+            result = await _drive_transition(reconciler, tmp_path, 'done')
 
-        run_id = await self._run_id_for(journal)
-        rows = self._retire_rows(await journal.get_run_actions(run_id))
+        run_id = await _only_task_done_run_id(journal)
+        rows = await _retire_rows(journal, run_id)
         assert len(rows) == 1, rows
         row = rows[0]
         assert row['operation'] == 'delete'
         assert row['causation_id'] == run_id
         assert row['detail'] == {'task_id': '4376', 'retired': 2}
-        assert self._retire_entries(result) == [
+        assert _retire_entries(result) == [
             {'type': 'flag_for_stage2_retired', 'task_id': '4376', 'count': 2},
         ]
 
     @pytest.mark.asyncio
     async def test_nothing_retired_writes_nothing(self, reconciler, journal, tmp_path):
         with patch(_SEAM, new=AsyncMock(return_value=0)):
-            result = await self._drive(reconciler, tmp_path, transition='done')
+            result = await _drive_transition(reconciler, tmp_path, 'done')
 
-        run_id = await self._run_id_for(journal)
-        assert self._retire_rows(await journal.get_run_actions(run_id)) == []
-        assert self._retire_entries(result) == []
+        run_id = await _only_task_done_run_id(journal)
+        assert await _retire_rows(journal, run_id) == []
+        assert _retire_entries(result) == []
 
     @pytest.mark.asyncio
     async def test_a_failing_retirement_is_best_effort(
@@ -6968,19 +6980,139 @@ class TestOnTaskDoneRetiresFlagMarkers:
             patch(_SEAM, new=AsyncMock(side_effect=RuntimeError('qdrant down'))),
             caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'),
         ):
-            result = await self._drive(reconciler, tmp_path, transition='done')
+            result = await _drive_transition(reconciler, tmp_path, 'done')
 
         assert 'error' not in result, result
-        run_id = await self._run_id_for(journal)
+        run_id = await _only_task_done_run_id(journal)
         run = await journal.get_run(run_id)
         assert run is not None
         assert run.status == 'completed'
         assert any(a['type'] == 'knowledge_captured_fast' for a in result['actions'])
         mock_memory_service.search.assert_awaited()
-        assert self._retire_rows(await journal.get_run_actions(run_id)) == []
-        assert self._retire_entries(result) == []
+        assert await _retire_rows(journal, run_id) == []
+        assert _retire_entries(result) == []
         warnings = [
             r.getMessage() for r in caplog.records
             if r.levelno == logging.WARNING and 'qdrant down' in r.getMessage()
         ]
         assert warnings, 'the swallowed failure must be logged at WARNING'
+
+
+_VICTIM_ID = 'victim-7f3a'
+_VICTIM_CONTENT = 'expired relay marker for task 4376'
+
+
+def _seeded_flag_pool() -> list[dict]:
+    """One eligible victim for task 4376, one too-young marker for the same
+    task, and one eligible-by-age marker for a DIFFERENT task."""
+    now = datetime.now(UTC)
+    stale = (now - timedelta(days=_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6)).isoformat()
+    fresh = (now - timedelta(days=1)).isoformat()
+    return [
+        {
+            'id': _VICTIM_ID, 'memory': _VICTIM_CONTENT, 'created_at': stale,
+            'metadata': {'flag_for_stage2': True, 'task_id': '4376'},
+        },
+        {
+            'id': 'fresh-4376', 'memory': 'young relay marker', 'created_at': fresh,
+            'metadata': {'flag_for_stage2': True, 'task_id': '4376'},
+        },
+        {
+            'id': 'stale-other', 'memory': 'another task relay marker', 'created_at': stale,
+            'metadata': {'flag_for_stage2': True, 'task_id': 'OTHER'},
+        },
+    ]
+
+
+class _LiveFlagPool:
+    """A Mem0 stand-in whose pool really shrinks on delete, so a second
+    done-transition sees what the first one did."""
+
+    def __init__(self, members: list[dict]):
+        self.members = {m['id']: m for m in members}
+        self.get_memories_by_metadata = AsyncMock(side_effect=self._scroll)
+        self.count_memories_by_metadata = AsyncMock(side_effect=self._count)
+        self.delete_memory = AsyncMock(side_effect=self._delete)
+        self.update_memory = AsyncMock()
+        self.add_memory = AsyncMock(return_value=AsyncMock(model_dump=lambda: {}))
+        self.search = AsyncMock(return_value=[])
+        self.recon_ledger = AsyncMock()
+
+    def _matching(self, filters: dict) -> list[dict]:
+        return [
+            m for m in self.members.values()
+            if all(m['metadata'].get(key) == value for key, value in filters.items())
+        ]
+
+    async def _scroll(self, *, project_id: str, filters: dict, limit: int) -> list[dict]:
+        return [dict(m) for m in self._matching(filters)][:limit]
+
+    async def _count(self, *, project_id: str, filters: dict) -> int:
+        return len(self._matching(filters))
+
+    async def _delete(self, *, memory_id: str, **_: object) -> None:
+        del self.members[memory_id]
+
+    def deleted_ids(self) -> list[str]:
+        return [c.kwargs['memory_id'] for c in self.delete_memory.await_args_list]
+
+
+class TestOnTaskDoneFlagRetirementIsIdempotent:
+    """done is not once-per-task (a task can close, reopen and close again),
+    so the hook's retirement must be keyed on the TASK, not the event: a repeat
+    firing finds nothing left to retire, and nothing is ever written back
+    (task 4376)."""
+
+    @pytest.fixture
+    def mock_memory_service(self):
+        return _LiveFlagPool(_seeded_flag_pool())
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_done_neither_double_retires_nor_resurrects(
+        self, reconciler, mock_memory_service, journal, tmp_path,
+    ):
+        pool = mock_memory_service
+
+        await _drive_transition(reconciler, tmp_path, 'done')
+        second = await _drive_transition(reconciler, tmp_path, 'done')
+
+        assert pool.deleted_ids() == [_VICTIM_ID]
+
+        first_run, second_run = await _task_done_runs(journal)
+        assert len(await _retire_rows(journal, first_run.id)) == 1
+        assert await _retire_rows(journal, second_run.id) == []
+
+        assert 'error' not in second, second
+        reread = await journal.get_run(second_run.id)
+        assert reread is not None
+        assert reread.status == 'completed'
+
+        pool.update_memory.assert_not_awaited()
+
+        assert _VICTIM_ID not in pool.members
+        assert 'fresh-4376' in pool.members
+        for call in pool.add_memory.await_args_list:
+            assert _VICTIM_ID not in repr(call)
+            assert _VICTIM_CONTENT not in repr(call)
+
+        pool.recon_ledger.upsert_many.assert_awaited_once()
+        assert pool.recon_ledger.upsert_many.await_args is not None
+        tombstones = pool.recon_ledger.upsert_many.await_args.args[0]
+        assert [t.task_id for t in tombstones] == [_VICTIM_ID]
+
+    @pytest.mark.asyncio
+    async def test_the_hook_never_retires_more_than_the_sweep(
+        self, reconciler, mock_memory_service, tmp_path,
+    ):
+        await _drive_transition(reconciler, tmp_path, 'done')
+        hook_deleted = set(mock_memory_service.deleted_ids())
+
+        sweep_pool = _LiveFlagPool(_seeded_flag_pool())
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            sweep_pool, 'dark_factory', 'cycle-run', terminal_task_ids={'4376', 'OTHER'},
+        )
+        sweep_deleted = set(sweep_pool.deleted_ids())
+
+        assert hook_deleted == {_VICTIM_ID}
+        assert hook_deleted <= sweep_deleted
+        assert sweep_deleted - hook_deleted == {'stale-other'}
