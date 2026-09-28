@@ -9,6 +9,7 @@ Covers:
 - TestCiteToolsViaFastMCP — tools registered, end-to-end via call_tool, P4 schema rejection
 - TestReconReportComponentsWiring — _build_recon_report_components service injection
 - TestCiteTaskFoldPurgeRecord — task-4865 structured record of fold-purged findings
+- TestCiteTaskFoldPurgeRecordPersistence — task-4865 record restart round-trip and report contract
 """
 
 from __future__ import annotations
@@ -2307,11 +2308,9 @@ def _persisted_purge_record_rows(store, run_id) -> dict[str, dict]:
     }
 
 
-class TestCiteTaskFoldPurgeRecord:
-    """A cite_task fold keeps a structured, persisted copy of the finding it
-    purges, on the CITING stage's entry (always resident, so always within
-    the run's persist reach), attributed to the stage that filed it.
-    """
+class _FoldPurgeRecordHarness:
+    """A real store on ``tmp_path`` and a state whose task interceptor knows
+    the external tasks these fold tests cite."""
 
     @pytest.fixture
     def store(self, tmp_path):
@@ -2357,6 +2356,13 @@ class TestCiteTaskFoldPurgeRecord:
         report = state.get_assembled_report('run-1', stage)
         assert report is not None, stage
         return [item['finding_id'] for item in report['flagged_items']]
+
+
+class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
+    """A cite_task fold keeps a structured, persisted copy of the finding it
+    purges, on the CITING stage's entry (always resident, so always within
+    the run's persist reach), attributed to the stage that filed it.
+    """
 
     @pytest.mark.asyncio
     async def test_project_scoped_fold_persists_a_structured_record(self, store, caplog):
@@ -2612,6 +2618,126 @@ class TestCiteTaskFoldPurgeRecord:
         row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
         assert len(row['purged_findings']) == 1
         assert row['purged_findings_overflow'] == 0
+
+class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
+    """The purge record survives a restart, including the first write after
+    it; rows persisted before the record existed still hydrate; and the
+    record never leaks into the assembled report.
+    """
+
+    async def _fold_both_ways(self, state):
+        """One project-scoped and one entity-scoped fold in 'reconciler' of
+        'run-1'. Returns ``(project_anchor_id, purged_finding_ids)``."""
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'project anchor')
+        project_loser_id = self._file_null_task_finding(state, 'project restatement')
+        survivor = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='entity survivor', suggested_action='a',
+            task_id='2406', flag_type='cross_project',
+        )
+        entity_loser_id = self._file_null_task_finding(
+            state, 'entity restatement', flag_type='cross_project',
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        project_fold = await state.cite_task('run-1', project_loser_id, 'dark_factory', '2405')
+        entity_fold = await state.cite_task('run-1', entity_loser_id, 'dark_factory', '2406')
+
+        assert project_fold.get('existing_finding_id') == anchor_id, project_fold
+        assert entity_fold.get('existing_finding_id') == survivor['finding_id'], entity_fold
+        return anchor_id, {project_loser_id, entity_loser_id}
+
+    @pytest.mark.asyncio
+    async def test_record_survives_a_restart_and_the_first_write_after_it(self, store):
+        state_a, _ = self._make_state(store)
+        await self._fold_both_ways(state_a)
+        before = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert [r['fold'] for r in before['purged_findings']] == ['project_scoped', 'entity_scoped']
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+
+        after = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert after['stats'] == {'k': 1}
+        assert after['purged_findings'] == before['purged_findings']
+        assert after['purged_findings_overflow'] == before['purged_findings_overflow']
+
+    @pytest.mark.asyncio
+    async def test_overflow_count_survives_a_restart(self, store):
+        from fused_memory.server.recon_report import _MAX_PURGED_FINDINGS
+
+        state_a, _ = self._make_state(store)
+        state_a.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state_a, 'anchor')
+        assert 'error' not in await state_a.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        for i in range(_MAX_PURGED_FINDINGS + 1):
+            loser_id = self._file_null_task_finding(state_a, f'restatement #{i}')
+            folded = await state_a.cite_task('run-1', loser_id, 'dark_factory', '2405')
+            assert folded.get('existing_finding_id') == anchor_id, folded
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+
+        after = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert after['stats'] == {'k': 1}
+        assert len(after['purged_findings']) == _MAX_PURGED_FINDINGS
+        assert after['purged_findings_overflow'] == 1
+
+    @pytest.mark.asyncio
+    async def test_row_persisted_before_the_record_existed_still_hydrates(self, store, caplog):
+        state_a, _ = self._make_state(store)
+        state_a.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        finding_id = self._file_null_task_finding(state_a, 'filed before task 4865')
+        (row,) = [r for r in store.load_all() if r['run_id'] == 'run-1']
+        legacy = json.loads(row['entry_json'])
+        del legacy['purged_findings']
+        del legacy['purged_findings_overflow']
+        store.upsert_many([{**row, 'entry_json': json.dumps(legacy)}])
+
+        state_b, _ = self._make_state(store)
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            state_b.hydrate_from_store()
+
+        assert self._flagged_ids(state_b, 'reconciler') == [finding_id]
+        assert [
+            r.getMessage() for r in caplog.records
+            if 'failed to deserialize persisted row' in r.getMessage()
+        ] == []
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+        rewritten = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert rewritten['purged_findings'] == []
+        assert rewritten['purged_findings_overflow'] == 0
+
+    @pytest.mark.asyncio
+    async def test_record_is_not_exposed_in_the_assembled_report(self, store):
+        state, _ = self._make_state(store)
+        await self._fold_both_ways(state)
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+
+        assert report is not None
+        assert set(report) == {'summary', 'stats', 'flagged_items', 'summary_warnings'}
+        assert all('purged_findings' not in item for item in report['flagged_items'])
+
+    @pytest.mark.asyncio
+    async def test_hydrated_run_keeps_folding_onto_the_same_survivor(self, store):
+        state_a, _ = self._make_state(store)
+        anchor_id, purged_ids = await self._fold_both_ways(state_a)
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+
+        assert purged_ids.isdisjoint(self._flagged_ids(state_b, 'reconciler'))
+        fresh_id = self._file_null_task_finding(state_b, 'post-restart restatement')
+        folded = await state_b.cite_task('run-1', fresh_id, 'dark_factory', '2405')
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
 
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
