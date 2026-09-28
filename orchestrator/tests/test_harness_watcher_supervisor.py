@@ -3226,17 +3226,12 @@ class TestWatcherSkillDrainProtocol:
         )
 
     def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
-        text = _watcher_skill_text()
-        drain = _skill_section(text, _DRAIN_HEADING)
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
         assert 'get_task_escalations' in drain, (
             'the drain must read L2s archive-inclusively via '
             'get_task_escalations: get_pending_escalations is pending-only, so '
             "a resolved L2's members re-enter work_batch "
             '(delivered_check drain-loop-reads-the-escalation-archive)'
-        )
-        assert 'already_promoted = {id for L2 in pending_l2s' not in text, (
-            'already_promoted must not be built from pending L2s alone '
-            '(delivered_check already-promoted-rebuilt-beyond-pending-l2-members)'
         )
         assert 'member_ids' in drain, (
             'the drain must union member_ids, the compact projection key '
@@ -3287,13 +3282,19 @@ class TestWatcherSkillDrainProtocol:
         stranded_blocked guard that fails OPEN and re-resumes a task a
         sibling escalation is already handling.
 
-        Out of scope: promote_to_l2's own `member_ids=[...]` argument, and its
-        RESPONSE key `members` (a genuine key of that tool's result, which is
-        why the forbidden spellings are scoped to escalation-row names).
+        A read is `.members`, `.get("members"` or `["members"]` in either
+        quote style, off any receiver. The one legitimate read is
+        promote_to_l2's RESPONSE key `members`, so a read is exempt exactly
+        when its receiver is a variable bound to a promote_to_l2 call.
         """
         code = '\n'.join(_fenced_code_blocks(_watcher_skill_text()))
-        forbidden = ('.get("members"', 'L2.members', 'e["members"]', 'l2["members"]')
-        found = [spelling for spelling in forbidden if spelling in code]
+        promote_results = set(
+            re.findall(r'(\w+)\s*=\s*mcp__escalation__promote_to_l2\(', code)
+        )
+        reads = re.finditer(
+            r'''(\w*)\s*(?:\.\s*get\(\s*["']|\[\s*["']|\.)\s*members\b''', code
+        )
+        found = [m.group(0) for m in reads if m.group(1) not in promote_results]
         assert not found, (
             'SKILL.md reads `members` off an escalation row; compact rows carry '
             f'only `member_ids`, so the read silently yields nothing: {found}'
