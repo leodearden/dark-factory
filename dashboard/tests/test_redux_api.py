@@ -1134,6 +1134,7 @@ def _served(minutes: float) -> datetime:
 
 _ALPHA = _nine_member_series([_label(0), _label(10), _label(20)], base=1)
 _BRAVO = _nine_member_series([_label(0), _label(10)], base=1000)
+_ZULU_UNPARSEABLE = _nine_member_series(['not-a-timestamp'], base=7)
 
 
 def _eight_daily(first_done: int) -> dict:
@@ -1156,6 +1157,8 @@ _PAYLOADS_OF_EVERY_STATE = {
     'carried': ({'alpha': _ALPHA, 'bravo': _BRAVO}, _served(25)),
     'empty-project': ({'alpha': _ALPHA, 'echo': _EMPTY}, _served(25)),
     'past-the-bound': ({'alpha': _ALPHA}, _served(20) + timedelta(seconds=_BOUND + 1)),
+    'clock-skew': ({'alpha': _ALPHA}, _served(10)),
+    'unparseable-label': ({'alpha': _ALPHA, 'zulu': _ZULU_UNPARSEABLE}, _served(25)),
     'forecastable': ({'alpha': _eight_daily(0), 'bravo': _eight_daily(50)}, _served(7 * 24 * 60)),
     'nothing-measured': ({'echo': _EMPTY}, _served(25)),
     'no-projects': ({}, _served(25)),
@@ -1247,6 +1250,27 @@ def test_shape_burndown_latest_goes_stale_past_the_freshness_bound():
         assert latest['state'] == 'stale'
         assert f'{_BOUND}s' in latest['reason']
         assert _label(20) in latest['reason']
+
+
+def test_shape_burndown_latest_is_stale_when_the_newest_sample_postdates_the_serving_instant():
+    """A sample stamped after served_at is doubted, never served as FRESH from the future."""
+    body = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(10))
+    for latest in (body['BURNDOWN']['latest'], body['BURNDOWN_BY_PROJECT']['alpha']['latest']):
+        assert latest['state'] == 'stale'
+        assert latest['as_of'] == _label(20)
+        assert 'clock skew' in latest['reason']
+        assert _label(20) in latest['reason']
+
+
+def test_shape_burndown_an_unparseable_label_makes_every_measured_block_unknown():
+    """With one newest label unreadable no block can say how old it is, so none claims to know."""
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'zulu': _ZULU_UNPARSEABLE}, served_at=_served(25),
+    )
+    for where, datum in _served_datums(body).items():
+        assert datum['state'] == 'unknown', where
+        assert datum['value'] is None, where
+        assert "'not-a-timestamp'" in datum['reason'], where
 
 
 def test_shape_burndown_aggregate_latest_is_unknown_when_nothing_was_measured():
