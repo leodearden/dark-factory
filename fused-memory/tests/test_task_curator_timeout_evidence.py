@@ -225,7 +225,9 @@ def _fixture_lines(name: str) -> list[str]:
 
 
 def _structured_output_lines(payload: Any) -> list[str]:
-    """A two-turn transcript whose second turn completed StructuredOutput(*payload*)."""
+    """A two-turn transcript whose second turn's StructuredOutput(*payload*) the
+    CLI accepted: tool_use, then the ``structured_output`` attachment, then the
+    success tool_result."""
     records = [
         {'type': 'user', 'message': {'role': 'user', 'content': 'prompt'}},
         {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
@@ -233,6 +235,13 @@ def _structured_output_lines(payload: Any) -> list[str]:
         ]}},
         {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'StructuredOutput', 'input': payload},
+        ]}},
+        {'type': 'attachment', 'attachment': {
+            'type': 'structured_output', 'data': payload, 'toolUseID': 'toolu_1',
+        }},
+        {'type': 'user', 'message': {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'toolu_1',
+             'content': 'Structured output provided successfully'},
         ]}},
     ]
     return [json.dumps(record) for record in records]
@@ -457,8 +466,8 @@ _NO_COMPLETED_VERDICT = [
 
 
 class TestCuratorTranscriptSalvage:
-    """A killed call whose transcript holds a completed StructuredOutput verdict
-    returns that verdict instead of raising.
+    """A killed call whose transcript holds a StructuredOutput verdict the CLI
+    accepted returns that verdict instead of raising.
 
     This is the transcript route, for a run whose stdout never arrived; the
     stdout route is ``TestCurateFallbacks::test_call_llm_salvages_schema_payload``.
@@ -568,7 +577,7 @@ class TestCuratorTranscriptSalvage:
         curator = TaskCurator(config=_make_config(), taskmaster=None, usage_gate=None)
         invoke = _scripted_invoker((None, _SALVAGEABLE_KILL))
         salvageable = TranscriptEvidence(
-            assistant_turns=2, schema_payload=_SALVAGEABLE_DROP, other_tool_uses=(),
+            assistant_turns=2, accepted_schema_payload=_SALVAGEABLE_DROP, other_tool_uses=(),
         )
 
         with patch(_EVIDENCE_READ, return_value=salvageable), pytest.raises(CuratorFailureError):
@@ -619,10 +628,10 @@ class TestCitedTranscriptCorpus:
 
         assert evidence.assistant_turns == turns
         if payload_keys is None:
-            assert evidence.schema_payload is None
+            assert evidence.accepted_schema_payload is None
         else:
-            assert evidence.schema_payload is not None
-            assert set(evidence.schema_payload) == payload_keys
+            assert evidence.accepted_schema_payload is not None
+            assert set(evidence.accepted_schema_payload) == payload_keys
         assert evidence.other_tool_uses == other_tools
 
     @pytest.mark.asyncio
@@ -641,7 +650,7 @@ class TestCitedTranscriptCorpus:
     @pytest.mark.asyncio
     async def test_esc_curator_33_verdict_is_salvaged(self, tmp_path):
         name = 'esc_curator_33_salvageable.jsonl'
-        verdict = transcript_evidence(_fixture_records(name)).schema_payload
+        verdict = transcript_evidence(_fixture_records(name)).accepted_schema_payload
         assert verdict is not None
         invoke = _scripted_invoker((_fixture_lines(name), _killed_run_for_fixture(name)))
 
