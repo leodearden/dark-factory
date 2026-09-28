@@ -258,43 +258,67 @@ def find_matching_transcript(
     dark-factory's own ``.eval-worktrees/df_task_<N>/`` sessions).
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
-    headless-agent transcripts share the encoded-cwd dir):
-      - STRONG (usable prompt): the record's prompt prefix is contained
-        (whitespace-normalized) in a candidate transcript's first-user-turn
-        text — read via the light :func:`_first_user_turn` helper, not the
-        full confusion-scorer. This is the dominant path — spawn records carry
-        a substantive prompt — so a usable-prompt session with only sibling
-        transcripts is correctly flagged MISSING (returns ``None``).
-      - WEAK (prompt too short/empty to match reliably): the first candidate
-        whose file mtime lies within ``[start_ts - skew, now + skew]``. Only
-        reached when the prompt is NOT usable, so a usable-prompt session
-        never falls through to this confound-tolerant path. An unparseable
-        ``start_ts`` cannot bound the window, so the fallback yields ``None``.
-
-    Candidates are scanned in sorted order; the first match's ``Path`` is
-    returned.
+    headless-agent transcripts share the encoded-cwd dir), in one of three
+    tiers:
+      - EXACT (bound ``record.claude_session_id``): ``<expected_dir>/<id>.jsonl``
+        is the transcript, or there is none. Authoritative, with NO fallback —
+        a same-prompt re-spawn or an in-window sibling would otherwise mask a
+        genuine loss.
+      - STRONG (unbound, usable prompt): :func:`_match_prompt_prefix`.
+      - WEAK (unbound, prompt too short/empty): :func:`_match_mtime_window`,
+        never reached for a usable prompt.
     """
     session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
+    if record.claude_session_id:
+        return _bound_transcript(session_dir, record.claude_session_id)
     if not session_dir.is_dir():
         return None
     candidates = sorted(session_dir.glob('*.jsonl'))
-
     prefix = _usable_prompt_prefix(record.prompt)
     if prefix is not None:
-        # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
-        # prompt, BEFORE appending its result-handback trailer, so the prompt
-        # prefix is genuinely a PREFIX of what claude received (the trailer is
-        # a suffix) — containment, not equality, is the right test. Both sides
-        # are whitespace-normalized so a reflowed transcript still matches.
-        needle = _normalize_ws(prefix)
-        for path in candidates:
-            text = _normalize_ws(sampling._first_user_turn_text(_first_user_turn(path)))
-            if needle in text:
-                return path
-        return None
+        return _match_prompt_prefix(prefix, candidates)
+    return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
-    # WEAK fallback — prompt too short/empty for a reliable content match.
-    start = _parse_start_ts(record.start_ts)
+
+def _bound_transcript(session_dir: Path, claude_session_id: str) -> Path | None:
+    """Return ``session_dir/<claude_session_id>.jsonl`` if that file exists, else None."""
+    path = session_dir / f'{claude_session_id}.jsonl'
+    return path if path.is_file() else None
+
+
+def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None:
+    """Return the first candidate whose first user turn contains *prefix*, or None.
+
+    Reads each candidate's first user turn via the light
+    :func:`_first_user_turn`, not the full confusion-scorer, so a usable-prompt
+    session with only sibling transcripts is correctly flagged MISSING.
+    """
+    # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
+    # prompt, BEFORE appending its result-handback trailer, so the prompt
+    # prefix is genuinely a PREFIX of what claude received (the trailer is
+    # a suffix) — containment, not equality, is the right test. Both sides
+    # are whitespace-normalized so a reflowed transcript still matches.
+    needle = _normalize_ws(prefix)
+    for path in candidates:
+        text = _normalize_ws(sampling._first_user_turn_text(_first_user_turn(path)))
+        if needle in text:
+            return path
+    return None
+
+
+def _match_mtime_window(
+    start_ts: str,
+    candidates: Sequence[Path],
+    *,
+    now: datetime,
+    skew: timedelta,
+) -> Path | None:
+    """Return the first candidate whose mtime lies in ``[start_ts - skew, now + skew]``.
+
+    An unparseable *start_ts* cannot bound the window, so this yields None; an
+    unstat-able candidate is skipped.
+    """
+    start = _parse_start_ts(start_ts)
     if start is None:
         return None
     window_start = start - skew
