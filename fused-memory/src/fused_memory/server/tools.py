@@ -76,6 +76,7 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
+from fused_memory.reconciliation.enumeration_guard import enumeration_liveness_gate
 from fused_memory.reconciliation.mem0_tombstone import (
     record_mem0_deletion_tombstones,
 )
@@ -8985,6 +8986,20 @@ def create_mcp_server(
         if _premise_err is not None:
             return _premise_err
 
+        # Enumeration liveness gate (task 3056) — see enumeration_guard's
+        # module docstring. Rebinds description/metadata to the cleaned payload.
+        _enumeration = await enumeration_liveness_gate(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+            is_filing=True,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         # Routing-intent lint (task 2563) — declaration-only: a
         # task_kind='normal' submission whose text DECLARES a different
         # execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic;
@@ -9043,6 +9058,8 @@ def create_mcp_server(
         # in result`).
         if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
             result.update(_op_warning)
+        if _enumeration.stats is not None and isinstance(result, dict) and 'error' not in result:
+            result['enumeration_liveness'] = _enumeration.stats
         return result
 
     @mcp.tool()
