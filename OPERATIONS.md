@@ -2156,8 +2156,10 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    ramifications, a recommendation or an explicit no-lean) with
    `prepare_sitting.py record`. It is read-only by construction: it runs
    under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`. It never
-   passes `--apply-closes`. Its account comes from the shared pool, as a
+   denylist of every apply verb, both in `nightly_prepare.py`, and its
+   environment sets `SITTING_NIGHTLY_CONFINED`, under which
+   `prepare_sitting.py` refuses anything but `brief` and `record` into
+   `data/sitting/`, including `--apply-closes` and `--ledger`. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
    is invisible to the gate. With nothing leasable, it inherits the unit's
    environment. It stops itself after 2700s.

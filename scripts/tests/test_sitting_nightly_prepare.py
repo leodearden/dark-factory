@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
-ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER')
+ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
 
@@ -241,13 +241,19 @@ def test_every_store_writing_apply_verb_is_denied(verb):
     assert verb in mod.NIGHTLY_DENIED_TOOLS
 
 
-def test_the_only_bash_allowed_is_git_show_git_log_and_the_prepare_script():
-    bash = [tool for tool in mod.NIGHTLY_ALLOWED_TOOLS if tool.startswith('Bash')]
+def test_the_only_bash_allowed_is_git_show_git_log_and_the_two_prepare_subcommands(tmp_path):
+    fake = _fake_claude(tmp_path)
 
+    _main(fake)
+
+    argv = fake.only_call()['argv']
+    allowed = argv[argv.index('--allowed-tools') + 1:]
+    bash = [tool for tool in allowed if tool.startswith('Bash')]
     assert sorted(bash) == sorted([
         'Bash(git show:*)',
         'Bash(git log:*)',
-        f'Bash({mod.PREPARE_COMMAND}:*)',
+        f'Bash({mod.PREPARE_COMMAND} brief --json:*)',
+        f'Bash({mod.PREPARE_COMMAND} record --from -:*)',
     ])
     assert mod.PREPARE_COMMAND.endswith(' scripts/sitting/prepare_sitting.py')
 
@@ -259,15 +265,14 @@ def test_every_allowed_mcp_tool_is_a_read():
     assert all(verb.startswith(('get_', 'search')) for verb in reads), reads
 
 
-def test_record_writes_only_under_data_sitting_and_closes_are_never_applied(tmp_path):
+def test_the_child_runs_the_prepare_script_confined_to_data_sitting(tmp_path):
+    """The confinement itself is prepare_sitting's; test_prepare_sitting_cli.py::TestNightlyConfinement covers it."""
     fake = _fake_claude(tmp_path)
 
     _main(fake)
 
+    assert fake.only_call()['env']['SITTING_NIGHTLY_CONFINED']
     assert prepare_sitting.DEFAULT_PREPARATION.parent == REPO_ROOT / 'data' / 'sitting'
-    assert '--preparation' not in mod.NIGHTLY_PROMPT
-    assert '--apply-closes' not in mod.NIGHTLY_PROMPT
-    assert '--apply-closes' not in fake.only_call()['argv']
 
 
 # ---------------------------------------------------------------------------

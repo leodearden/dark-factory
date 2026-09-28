@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -319,8 +320,27 @@ def classification_json(sitting: Sitting) -> dict[str, Any]:
     }
 
 
+NIGHTLY_COMMANDS = frozenset({'brief', 'record'})
+
+
+def nightly_confinement_breach(args: argparse.Namespace) -> str | None:
+    """Why *args* would write or close outside what an unattended run may touch, or None."""
+    if args.command not in NIGHTLY_COMMANDS:
+        return f'{args.command!r} is not a nightly subcommand ({", ".join(sorted(NIGHTLY_COMMANDS))})'
+    if args.preparation.resolve() != DEFAULT_PREPARATION.resolve():
+        return f'--preparation must be the default store {DEFAULT_PREPARATION}'
+    if getattr(args, 'apply_closes', False):
+        return '--apply-closes is never available to the unattended run'
+    if getattr(args, 'ledger', None) is not None:
+        return '--ledger is never available to the unattended run'
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if os.environ.get(preparations.NIGHTLY_CONFINEMENT_ENV) and (breach := nightly_confinement_breach(args)):
+        print(f'refused under {preparations.NIGHTLY_CONFINEMENT_ENV}: {breach}', file=sys.stderr)
+        return EXIT_CONFIG
     try:
         return args.handler(args)
     except ledgers.LedgerCorrupt as exc:

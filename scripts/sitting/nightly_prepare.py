@@ -7,11 +7,14 @@ judgement reaches the page only through ``prepare_sitting.py record``, which
 writes ``data/sitting/``. The render that follows re-measures every figure
 itself, so a failed night costs thinner recommendations, never a wrong page.
 
-Recommend-only regardless of flags. The prompt never passes ``--apply-closes``,
-and the CLI runs under ``--permission-mode dontAsk`` with ``NIGHTLY_ALLOWED_TOOLS``
-as the only tools it may use and ``NIGHTLY_DENIED_TOOLS`` naming every apply
-verb. A store write is therefore impossible rather than merely instructed
-against.
+Recommend-only regardless of flags. The CLI runs under ``--permission-mode
+dontAsk`` with ``NIGHTLY_ALLOWED_TOOLS`` as the only tools it may use (the
+prepare script only as ``brief --json`` and ``record --from -``) and
+``NIGHTLY_DENIED_TOOLS`` naming every apply verb. The child env also carries
+``NIGHTLY_CONFINEMENT_ENV``, under which ``prepare_sitting.py`` itself refuses
+any other subcommand, a non-default ``--preparation``, ``--ledger`` and
+``--apply-closes``. A write outside ``data/sitting/`` is therefore refused in
+code rather than merely instructed against.
 
 The account comes from the shared pool through ``account_pool.subprocess_env``
 and inherits its known limit: the lease is handed straight back, so this run's
@@ -51,6 +54,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv  # noqa: E402
+from sitting.preparation import NIGHTLY_CONFINEMENT_ENV  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
@@ -70,7 +74,8 @@ NIGHTLY_ALLOWED_TOOLS: tuple[str, ...] = (
     'Glob',
     'Bash(git show:*)',
     'Bash(git log:*)',
-    f'Bash({PREPARE_COMMAND}:*)',
+    f'Bash({PREPARE_COMMAND} brief --json:*)',
+    f'Bash({PREPARE_COMMAND} record --from -:*)',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__get_task_escalations',
@@ -183,6 +188,7 @@ def _child_env(gate: Any) -> dict[str, str]:
     env = account_pool.subprocess_env(gate)
     inherited = dict(os.environ) if env is None else env
     inherited.pop('ANTHROPIC_API_KEY', None)
+    inherited[NIGHTLY_CONFINEMENT_ENV] = '1'
     return inherited
 
 

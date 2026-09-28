@@ -497,6 +497,44 @@ class TestRecord:
         assert not fresh.exists()
 
 
+class TestNightlyConfinement:
+    @pytest.fixture
+    def confined(self, env, monkeypatch):
+        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, '1')
+        monkeypatch.setattr(mod, 'DEFAULT_PREPARATION', env.preparation)
+        return env
+
+    def test_record_into_the_default_store_is_allowed(self, confined, capsys, monkeypatch):
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps([_prep_payload(confined, 'esc-100-1')])))
+
+        rc, _, _ = _run(capsys, 'record', '--from', '-')
+
+        assert rc == 0
+        assert prep_mod.load(confined.preparation).get(escalation_key(normalize_escalations_dir(confined.queue), 'esc-100-1'))
+
+    def test_brief_json_is_allowed(self, confined, capsys):
+        _classify(capsys, confined)
+
+    @pytest.mark.parametrize('argv', [
+        ('record', '--preparation', '{elsewhere}', '--from', '{source}'),
+        ('brief', '--json', '--apply-closes'),
+        ('brief', '--json', '--ledger', '{elsewhere}'),
+        ('new-sitting', '--ledger', '{elsewhere}'),
+    ])
+    def test_every_other_write_is_refused_and_writes_nothing(self, confined, capsys, argv):
+        elsewhere = confined.tmp / 'elsewhere.json'
+        source = confined.state / 'in.json'
+        source.write_text(json.dumps([_prep_payload(confined, 'esc-100-1')]))
+        before = confined.preparation.read_bytes() if confined.preparation.exists() else None
+
+        rc, _, err = _run(capsys, *(arg.format(elsewhere=elsewhere, source=source) for arg in argv))
+
+        assert rc == 2
+        assert prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert not elsewhere.exists()
+        assert (confined.preparation.read_bytes() if confined.preparation.exists() else None) == before
+
+
 class TestResolveAnswers:
     def _brief(self, env, capsys):
         assert _run(capsys, 'brief', *env.args(), '--ledger', str(env.ledger))[0] == 0
