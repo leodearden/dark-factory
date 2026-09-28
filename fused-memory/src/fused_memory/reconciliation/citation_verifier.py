@@ -79,7 +79,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from enum import StrEnum
+from typing import Any, NamedTuple
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.models.reconciliation import StageId
@@ -110,6 +111,43 @@ REPOINT_AGENT_ID = 'recon-stage-memory_consolidator'
 # ``recon_write_policy.is_terminal_annotation_add`` already blesses ``x_``
 # annotation adds, so no blessed-key change is needed.
 X_CITATION_TOMBSTONE_KEY = 'x_memory_citation_tombstones'
+
+
+class MemoryLiveness(StrEnum):
+    """What one ``get_memory_by_id`` point read says about a memory id."""
+
+    LIVE = 'live'
+    ABSENT = 'absent'
+    INCONCLUSIVE = 'inconclusive'
+
+
+class LivenessVerdict(NamedTuple):
+    outcome: MemoryLiveness
+    error_type: str | None
+
+
+async def resolve_memory_liveness(
+    memory_service: Any,
+    project_id: str,
+    memory_id: Any,
+) -> LivenessVerdict:
+    """Resolve one Mem0 id to LIVE / ABSENT / INCONCLUSIVE. Never raises.
+
+    The single home of the verdict over ``MemoryService.get_memory_by_id``'s
+    three documented outcomes: a truthy record is LIVE, ``None`` is ABSENT, and
+    a RAISED lookup is INCONCLUSIVE carrying the exception's type name. A raised
+    backend error is 'unknown', not 'absent' — reading it as absence would drop
+    a live citation on a sick store, which is itself the silent-fail every
+    caller exists to prevent. Every caller asking "does this cited memory id
+    still resolve?" goes through here, so none can disagree about a timeout.
+    """
+    try:
+        record = await memory_service.get_memory_by_id(project_id, memory_id)
+    except Exception as exc:  # noqa: BLE001 — unknown is a verdict, not a crash
+        return LivenessVerdict(MemoryLiveness.INCONCLUSIVE, type(exc).__name__)
+    if record:
+        return LivenessVerdict(MemoryLiveness.LIVE, None)
+    return LivenessVerdict(MemoryLiveness.ABSENT, None)
 
 
 async def verify_cited_memories(
@@ -182,33 +220,27 @@ async def verify_cited_memories(
     errors_key = f'{stat_prefix}_citation_verification_errors'
     stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
 
-    # Per-call memo of each mem0 id's resolution OUTCOME, so an id cited by N
+    # Per-call memo of each mem0 id's resolution VERDICT, so an id cited by N
     # findings costs ONE Qdrant point read instead of N. get_memory_by_id is a
     # network round trip on the stage's critical path, and task 2979 put this
     # pass on ALL THREE stages, so the repeat-citation case is now three times
-    # as common as it was.  Values: ('found', None) | ('missing', None) |
-    # ('error', '<ExcTypeName>').
+    # as common as it was.
     #
     # Scoped to the CALL, never module-level: a longer-lived cache would
     # reintroduce exactly the stale-read TOCTOU this pass exists to close.
-    # Caching the 'error' outcome too is deliberate — a backend that just
+    # Caching the INCONCLUSIVE verdict too is deliberate — a backend that just
     # failed for this id will almost certainly fail again within the same
     # assembly, and re-raising it per citation only hammers a sick store while
     # producing the identical marker.
-    resolution_cache: dict[Any, tuple[str, str | None]] = {}
+    resolution_cache: dict[Any, LivenessVerdict] = {}
 
-    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
+    async def _resolve(memory_id: Any) -> LivenessVerdict:
         cached = resolution_cache.get(memory_id)
         if cached is not None:
             return cached
-        try:
-            record = await memory_service.get_memory_by_id(project_id, memory_id)
-        except Exception as exc:  # noqa: BLE001
-            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
-        else:
-            outcome = ('found', None) if record else ('missing', None)
-        resolution_cache[memory_id] = outcome
-        return outcome
+        verdict = await resolve_memory_liveness(memory_service, project_id, memory_id)
+        resolution_cache[memory_id] = verdict
+        return verdict
 
     for finding in findings:
         cited = finding.get('cited_memories') or []
@@ -239,12 +271,9 @@ async def verify_cited_memories(
             memory_id = entry.get('memory_id')
             store = entry.get('store')
             outcome, error_type = await _resolve(memory_id)
-            if outcome == 'error':
-                # A backend error is 'unknown', not 'absent': dropping the
-                # citation here would itself be a silent-fail (the exact
-                # anti-pattern this fix forbids). KEEP it, surface the
-                # uncertainty via a marker, and never propagate — the stage must
-                # not crash on a check error.
+            if outcome is MemoryLiveness.INCONCLUSIVE:
+                # Unknown is not absent (resolve_memory_liveness): KEEP the
+                # citation and surface the uncertainty via a marker.
                 kept.append(entry)
                 finding.setdefault('citation_failures', []).append(
                     {
@@ -256,7 +285,7 @@ async def verify_cited_memories(
                 )
                 stats[errors_key] += 1
                 continue
-            if outcome == 'found':
+            if outcome is MemoryLiveness.LIVE:
                 kept.append(entry)
                 stats[verified_key] += 1
             else:
