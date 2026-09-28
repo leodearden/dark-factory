@@ -28,10 +28,12 @@ from fused_memory.reconciliation.enumeration_guard import (
     X_LIVENESS_REVERIFIED_AT_KEY,
     EnumerationGateResult,
     enumeration_liveness_gate,
+    render_enumeration_guard_section,
 )
 from fused_memory.reconciliation.predicate_contradiction import (
     PROVENANCE_METADATA_KEY,
 )
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.utils.validation import validate_full_uuid
 
 FIXED_NOW = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
@@ -1010,3 +1012,29 @@ class TestEnumerationScope:
         assert result.rejection is not None
         assert result.rejection['error_type'] == 'EnumeratedIdTruncated'
         service.get_memory_by_id.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# The Stage-2 prompt section is rendered from this module's own constants
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderEnumerationGuardSection:
+    """Pins single-sourcing only — the names the gate enforces appear in the
+    rendered text, and the text is what Stage 2 sees — never prose wording."""
+
+    def test_names_every_key_field_and_error_type_the_gate_enforces(self):
+        text = render_enumeration_guard_section()
+
+        for token in (
+            X_ENUMERATION_SCOPE_KEY,
+            X_LIVENESS_REVERIFIED_AT_KEY,
+            X_LIVENESS_EXCEPTIONS_KEY,
+            'stores', 'categories', 'exhaustive',
+            'EnumeratedIdTruncated', 'EnumerationScopeMissing',
+            'EnumerationScopeMalformed',
+        ):
+            assert token in text, token
+
+    def test_the_stage2_system_prompt_carries_the_section_verbatim(self):
+        assert render_enumeration_guard_section() in STAGE2_SYSTEM_PROMPT
