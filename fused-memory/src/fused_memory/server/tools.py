@@ -6364,7 +6364,7 @@ def create_mcp_server(
         # writer's posture. The seed never raises.
         topic_cluster_seed: dict[str, Any] | None = None
         if topic_cluster_store is not None:
-            member_rows = topic_members if isinstance(topic_members, list) else []
+            member_rows = closure.members if isinstance(closure.members, list) else []
             member_texts = [
                 row.get('content')
                 for row in member_rows
