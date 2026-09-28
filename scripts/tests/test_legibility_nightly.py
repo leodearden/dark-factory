@@ -36,7 +36,7 @@ from legibility import (
 from legibility import (
     config as config_mod,
 )
-from legibility.config import load_config
+from legibility.config import TrickleCensusCaps, load_config
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -1364,6 +1364,83 @@ def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
 
     assert 'relative-proj' in str(excinfo.value)
     assert seen == {}, 'a refused target must never reach subprocess.run'
+
+
+# ---------------------------------------------------------------------------
+# task 5900 (5782's precondition (b)): the trickle-launched census is BOUNDED
+#
+# The launcher translates census.trickle_caps into census.py's EXISTING
+# --max-batches / --max-verify-clusters flags. An absent caps argument is the
+# bounded schema default, never uncapped; null fields are the explicit
+# per-project uncapped opt-out and omit their flag.
+# ---------------------------------------------------------------------------
+
+def test_default_census_launcher_argv_carries_the_given_caps(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=7, max_verify_clusters=9),
+    )
+
+    argv = seen['args']
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/project']
+
+
+def test_default_census_launcher_without_caps_uses_the_bounded_schema_default(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/project')
+
+    argv = seen['args']
+    defaults = TrickleCensusCaps()
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', str(defaults.max_batches)]
+    assert _adjacent_pair(argv, '--max-verify-clusters') == [
+        '--max-verify-clusters', str(defaults.max_verify_clusters),
+    ]
+
+
+def test_default_census_launcher_null_caps_omit_the_flags(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=None, max_verify_clusters=None),
+    )
+
+    argv = seen['args']
+    assert '--max-batches' not in argv
+    assert '--max-verify-clusters' not in argv
+
+
+def test_default_census_launcher_one_null_cap_omits_only_that_flag(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=None, max_verify_clusters=9),
+    )
+
+    argv = seen['args']
+    assert '--max-batches' not in argv
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+
+
+def test_default_census_launcher_composes_caps_config_path_and_pool_env(monkeypatch):
+    """Caps, the pinned config path and the pool env ride ONE launch."""
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
+    config_path = '/p/docs/legibility/legibility.yaml'
+
+    nightly._default_census_launcher(
+        '/p', config_path=config_path, caps=TrickleCensusCaps(max_batches=7), env=env,
+    )
+
+    argv = seen['args']
+    assert seen['env'] is env
+    assert seen['check'] is False
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/p']
+    assert _adjacent_pair(argv, '--config') == ['--config', config_path]
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
 
 
 def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path):
