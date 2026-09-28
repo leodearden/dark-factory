@@ -415,7 +415,9 @@ class _ReportEntry:
 #
 # entry_json's shape is an internal implementation detail of the persistence
 # write-through path (ReconReportState._persist_run / hydrate_from_store) and
-# ReconReportStore rows — never surfaced to MCP tool callers.
+# ReconReportStore rows — never surfaced to MCP tool callers.  Its
+# purged_findings / purged_findings_overflow keys (task 4865) are forensic-only:
+# an operator reads them from the row, and no tool returns them.
 
 
 def _encode_sig_map(
@@ -502,6 +504,8 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
     an older blob: the key is simply absent and the default supplies it.  A
     field added WITHOUT a default would instead raise ``TypeError`` on every
     pre-existing row — see :func:`_serialize_entry` for the other half.
+    Entry-level fields get the same no-migration property from a ``.get()``
+    default on their key (``purged_findings`` / ``purged_findings_overflow``).
     """
     data = json.loads(entry_json)
     findings = [_Finding(**fd) for fd in data['findings']]
@@ -515,6 +519,8 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
         summary_warnings=list(data['summary_warnings']),
         completed_at=data['completed_at'],
         created_at=data['created_at'],
+        purged_findings=[dict(r) for r in data.get('purged_findings', [])],
+        purged_findings_overflow=data.get('purged_findings_overflow', 0),
         _signature_to_finding=_decode_sig_map(data['signature_to_finding']),
         _deschash_to_finding=dict(data['deschash_to_finding']),
     )

@@ -697,7 +697,7 @@ class TestStartReportUnknownStageGuard:
     unqualified mutator lands there instead of in the real live stage.
     """
 
-    def _make_state(self, *, store=None, known_stages=_KNOWN_STAGES):
+    def _make_state(self, *, store=None, known_stages: frozenset[str] | None = _KNOWN_STAGES):
         from fused_memory.server.recon_report import ReconReportState
 
         t = [0.0]
