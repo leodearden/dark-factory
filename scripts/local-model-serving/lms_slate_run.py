@@ -55,7 +55,7 @@ from typing import Protocol
 
 import lms_fetch_weights
 import lms_vram
-from lms_ctl import DEFAULT_READY_TIMEOUT_S, EXIT_MANIFEST_ERROR
+from lms_ctl import DEFAULT_READY_TIMEOUT_S
 from lms_healthcheck import HealthReport
 from lms_manifest import load_arms
 from lms_serve import REPO_ROOT
@@ -389,22 +389,34 @@ def sweep_arms(
 
         print(f'\n=== {arm.arm_id} ===', flush=True)
         try:
-            started = runner(ctl_argv('start', arm.arm_id)).returncode
-            if started:
-                failures.append((arm.arm_id, 'start', started))
-                continue
+            # A PLACEHOLDER ARM IS HEALTHCHECKED WITHOUT BEING STARTED, and the
+            # trio is SKIPPED rather than allowed to fail (task 4992).
+            # `lms_ctl.preflight` refuses a placeholder as its first check,
+            # before the card is touched, so `start` is a guaranteed exit-4
+            # refusal -- and a recorded `start` failure `continue`s past the one
+            # stage that can produce this arm's row, leaving it absent from the
+            # merge, which is the state this change exists to end.  There is
+            # likewise no unit to wait for, and the `finally` release below
+            # exists to free arms THIS sweep started, which a placeholder never
+            # is.  The healthcheck is spelled ONCE, shared by both paths: it is
+            # what produces the PLACEHOLDER_ARM row that COVERS the arm.
+            if not arm.is_placeholder:
+                started = runner(ctl_argv('start', arm.arm_id)).returncode
+                if started:
+                    failures.append((arm.arm_id, 'start', started))
+                    continue
 
-            ready = runner(ctl_argv(
-                'wait-ready', arm.arm_id, '--timeout', str(ready_timeout),
-            )).returncode
-            if ready:
-                # Deliberately NOT probed.  A healthcheck against an arm that
-                # never came ready records a FAIL row blaming the model for
-                # never having loaded, which is worse than the absent row a
-                # skip leaves -- an absent row is what `merge_reports`'
-                # coverage check refuses on, loudly and by name.
-                failures.append((arm.arm_id, 'wait-ready', ready))
-                continue
+                ready = runner(ctl_argv(
+                    'wait-ready', arm.arm_id, '--timeout', str(ready_timeout),
+                )).returncode
+                if ready:
+                    # Deliberately NOT probed.  A healthcheck against an arm that
+                    # never came ready records a FAIL row blaming the model for
+                    # never having loaded, which is worse than the absent row a
+                    # skip leaves -- an absent row is what `merge_reports`'
+                    # coverage check refuses on, loudly and by name.
+                    failures.append((arm.arm_id, 'wait-ready', ready))
+                    continue
 
             probed = runner(healthcheck_argv(
                 '--arm', arm.arm_id,
@@ -424,7 +436,8 @@ def sweep_arms(
             # `stop` deliberately leaves this arm's VRAM baseline file behind.
             # Per-arm baselines accumulate in the runtime dir by design, and
             # the merge reads REPORTS, not baselines.
-            runner(ctl_argv('stop', arm.arm_id))
+            if not arm.is_placeholder:
+                runner(ctl_argv('stop', arm.arm_id))
 
     return failures
 
@@ -444,41 +457,6 @@ def existing_parts(parts_dir: str | Path) -> list[str]:
         for arm in load_arms().arms
         if part_path(parts, arm.arm_id).exists()
     ]
-
-
-def placeholder_arm_ids() -> list[str]:
-    """The manifest arms that still carry TBD placeholders, if any."""
-    return [arm.arm_id for arm in load_arms().arms if arm.is_placeholder]
-
-
-#: Why a placeholder arm makes the WHOLE slate unassemblable, measured on this
-#: branch rather than assumed.  Each leg was checked:
-#:
-#:   * `lms_ctl start` refuses a placeholder BEFORE touching the card
-#:     (`lms_ctl.preflight`'s first check) -- exit 4, nothing started.
-#:   * `lms_healthcheck --arm <placeholder>` cannot stand in for it either.
-#:     `run_healthcheck` reads the VRAM baseline for every arm it is given
-#:     BEFORE probing, and the only writer of a baseline is `lms_ctl start`.
-#:     With no start there is no baseline, so it raises `StaleBaselineError`
-#:     -> exit 8 and writes NO file -- confirmed by direct call.  So the
-#:     PLACEHOLDER_ARM refusal row `_placeholder_refusal` would produce never
-#:     reaches disk, and no part exists for the arm.
-#:   * `merge_reports` requires a row for every id in `load_arms().arm_ids()`,
-#:     placeholders included, and refuses without one.
-#:
-#: A hand-run `lms_healthcheck --all` hits the same baseline wall, so this is
-#: not a limitation the driver introduces -- it is one the driver can only
-#: report EARLY instead of after ~30 minutes of sweeping the other arms for an
-#: artifact that could never have been written.
-PLACEHOLDER_REFUSAL = (
-    'lms_slate_run: refusing to sweep: arms {arms} still carry TBD '
-    'placeholders, and no slate artifact can be assembled while they do. '
-    '`lms_ctl start` refuses a placeholder arm (exit 4), and '
-    '`lms_healthcheck --arm` cannot cover it either: with no start there is no '
-    'VRAM baseline, so it exits 8 having written nothing -- while the merge '
-    'requires a row for EVERY manifest arm. Resolve the PRD open question '
-    'that owns them, or drop them from arms.yaml, before running the slate.'
-)
 
 
 def run_slate(
@@ -511,32 +489,21 @@ def run_slate(
     recorded anywhere, and pre-empting a partial one is the duplicated coverage
     check the paragraph above rules out.
 
-    TWO things return before the merge, and NEITHER is a completeness check:
+    ONE thing returns before the merge, and it is NOT a completeness check: a
+    part the sweep DECIDED TO REPLACE that is still on disk, reported by
+    `sweep_arms` under `STALE_PART_STAGE`.  This is the one case where the
+    driver cannot vouch for the VINTAGE of a file it would hand `--merge`.  It
+    reads no manifest and judges no completeness -- with that file present the
+    merge has FULL coverage, so it succeeds and writes a row this run did not
+    measure into the committed artifact, reporting success.  Handing it over is
+    therefore strictly worse than refusing.
 
-      * A manifest still carrying TBD placeholders -- see `PLACEHOLDER_REFUSAL`
-        for why such a slate cannot be assembled by this driver OR by hand.
-        Sweeping anyway would spend the full ~30 minutes to arrive at a
-        coverage refusal that was decidable from the manifest alone, before the
-        card was touched.
-      * A part the sweep DECIDED TO REPLACE that is still on disk, reported by
-        `sweep_arms` under `STALE_PART_STAGE`.  This is the one case where the
-        driver cannot vouch for the VINTAGE of a file it would hand `--merge`.
-        It reads no manifest and judges no completeness -- with that file
-        present the merge has FULL coverage, so it succeeds and writes a row
-        this run did not measure into the committed artifact, reporting
-        success.  Handing it over is therefore strictly worse than refusing.
-
-    The distinction between them and a coverage check is what keeps the
+    The distinction between it and a coverage check is what keeps the
     neighbouring invariant intact: an empty or partial set still goes to the
     merge, because `merge_reports` records a refusal there in its own words and
     names the uncovered arms.  An unremovable part records one only if the
     driver stops.
     """
-    unresolved = placeholder_arm_ids()
-    if unresolved:
-        print(PLACEHOLDER_REFUSAL.format(arms=unresolved), file=sys.stderr)
-        return EXIT_MANIFEST_ERROR
-
     failures = sweep_arms(
         parts_dir, ready_timeout=ready_timeout, force=force, runner=runner,
     )

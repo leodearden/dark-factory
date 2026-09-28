@@ -48,11 +48,27 @@ def shape_orchestrators(
     optional ``{labels, values}`` time-series of the total running-orchestrator
     count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
 
-    ``offline`` and ``degraded`` are projected as an unconditional PAIR — an
-    absent key shapes to ``False`` rather than being omitted, so no consumer
-    has to branch on presence — and this shaper must never collapse one into
-    the other; the invariant and its cost are stated at
-    ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``.
+    ``summary`` is NOT projected. ``discover_orchestrators`` stopped reading a
+    task tree, so there is no count here to shape; ``dict(o.get('summary') or
+    {})`` would put a fabricated all-zero summary on the wire, which reads as
+    a measured "this orchestrator has no tasks". The real counts, each with
+    the instant it was measured, ride ``TASKS_SNAPSHOT`` on
+    ``/api/v2/dashboard/tasks``.
+
+    ``last_update``, ``offline``, ``degraded`` and ``error`` have had NO
+    PRODUCER since then. Discovery is a local ``ps`` scan that attempts no
+    read, so in production they are always ``None``, ``False``, ``False`` and
+    absent. ``timeago`` renders that ``None`` as unknown rather than as a
+    fabricated instant, and a constant ``False`` is honest for a discovery
+    that cannot fail. They stay projected because the PRD contract keeps
+    ``last_update``, ``offline`` and ``error`` on these entries, and because a
+    caller may still supply them. ``offline`` and ``degraded`` are projected
+    as an unconditional PAIR, an absent key shaping to ``False`` so that no
+    consumer branches on presence, and one is never collapsed into the other.
+    Leaf γ2 (task 5589) kept the fields and the OrchTab status pips that read
+    them, since the PRD contract keeps ``offline`` and ``error`` here. Those
+    pips no longer tell the counts' health: each count surface reads it off
+    its project's census Datum, whose state and reason travel with the count.
     """
     orchestrators = list(orchestrators)
     out_orchs: list[dict] = []
@@ -71,7 +87,6 @@ def shape_orchestrators(
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
             'last_update': o.get('last_update'),
-            'summary': dict(o.get('summary') or {}),
             'offline': bool(o.get('offline')),
             'degraded': bool(o.get('degraded')),
         }

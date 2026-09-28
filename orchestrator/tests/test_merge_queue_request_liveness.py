@@ -52,7 +52,9 @@ from _merge_lane_fakes import (
     fails,
     hangs_until,
     lane_finalizing,
+    lane_scene_config,
     lane_state,
+    main_health_probe_spawned,
     make_lane,
     passes,
     raises,
@@ -106,7 +108,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
@@ -142,7 +144,7 @@ def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
     """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
-    return OrchestratorConfig(project_root=git_repo, git=warm_git_config)
+    return lane_scene_config(git_repo, warm_git_config)
 
 
 def _make_request(
@@ -1652,6 +1654,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'path, not the busy-loop-capped path — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
+        assert not main_health_probe_spawned(result2.outcome), result2.outcome.reason
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
             'a completed (even failed) verify proves the subprocess was not '
             'hung -- it must clear the counter just like a pass'
@@ -2609,7 +2612,12 @@ class TestContendedLeaseDefers:
         _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = make_lane(warm_git_ops, q)
+        # The streak stamps are read off the worker's injected clock, so the
+        # seed and the final elapsed check must use that SAME clock: the real
+        # time.monotonic() only agrees with FakeClock's fixed base while host
+        # uptime happens to sit below it.
+        clock = FakeClock()
+        worker = make_lane(warm_git_ops, q, clock=clock)
         worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
         # A cap this task's seeded stamp is FAR past, so the only thing that can
         # keep this defer alive is recognising the streak as broken.
@@ -2625,7 +2633,7 @@ class TestContendedLeaseDefers:
         # with nothing since — a gap no defer cadence can explain (the raiser
         # here carries no wait at all and the throttle is 0, so the staleness
         # window is its 60s floor).
-        _long_ago = time.monotonic() - 3600.0
+        _long_ago = clock.monotonic() - 3600.0
         worker._contended_lease_requeues[task_id] = 1
         worker._contended_lease_first_defer_at[task_id] = _long_ago
         worker._contended_lease_last_defer_at[task_id] = _long_ago
@@ -2653,7 +2661,7 @@ class TestContendedLeaseDefers:
             f'continued; got {worker._contended_lease_requeues.get(task_id)!r}'
         )
         assert (
-            time.monotonic() - worker._contended_lease_first_defer_at[task_id]
+            clock.monotonic() - worker._contended_lease_first_defer_at[task_id]
             < worker.MAX_CONTENDED_LEASE_DEFER_SECS
         ), (
             'the new streak must date from THIS defer — a stamp still inside '
@@ -3039,6 +3047,7 @@ class TestContendedLeaseDefers:
             f'a completed-but-failed verify must be handed back as the blocked '
             f'outcome the lane built for it, got {result_b.outcome!r}'
         )
+        assert not main_health_probe_spawned(result_b.outcome), result_b.outcome.reason
         assert 'verify failed: 3 tests' in (result_b.outcome.reason or ''), (
             f'the blocked reason must carry the verify summary, got '
             f'{result_b.outcome.reason!r}'

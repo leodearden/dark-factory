@@ -31,6 +31,7 @@ scripts/orchestrator-watchdog.timer).
 
 import contextlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -210,6 +211,52 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
     "ORCH_FLEET_DEPLOY_CLOCK",
     os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
 )
+
+# Path to the IN-FLIGHT LEASE (task 4755), sibling of the clock above and
+# deliberately NOT the same file: the clock says "a sweep FINISHED and
+# verified", the lease says "a sweep is RUNNING RIGHT NOW". The clock alone
+# cannot express the second, because restart-all-orchestrators.sh stamps it
+# only on its verified-fresh exit-0 path (I2), so for the whole ~80-minute
+# duration of a --drain sweep every other tier sees a clock that is 8h stale
+# and concludes nothing is happening. Written by that script at sweep start,
+# removed on every catchable exit path.
+#
+# Mirrors orchestrator.service_restart.FLEET_LEASE_RELPATH. FOUR copies of this
+# literal exist — that module, this file, restart-all-orchestrators.sh
+# (LEASE_FILE) and df_pytest_isolation.py — because none of those four can
+# import any of the others (this script is stdlib-only; df_pytest_isolation is
+# stdlib+pytest only; the third is bash). They are pinned equal by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+# Env-overridable so tests can point every tier at a tmp file without touching
+# real data/.
+FLEET_LEASE_PATH = os.environ.get(
+    "ORCH_FLEET_LEASE",
+    os.path.join(REPO_DIR, "data", "orchestrator", "fleet_redeploy_lease.json"),
+)
+
+# How long a lease may go unrefreshed before every reader treats it as expired,
+# whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
+# reviewer can re-check it: the worst LEGITIMATE sweep is one permanently-busy
+# unit burning the full ORCH_RESTART_FORCE_FIRE_AFTER_SECS busy grace (4500s)
+# + ~6 stale/absent units at ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s each) + 7 x
+# (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS 120) = 4500 + 720 +
+# 1050 = 6270s ~= 1.74h. 7200 clears that with ~15% headroom while staying far
+# below the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
+# point: a leaked lease can therefore delay at most ONE redeploy window and can
+# never wedge the fleet indefinitely — the same reasoning that makes the pid
+# test alone insufficient. A sweep with TWO simultaneously-busy units does
+# exceed the bound and loses the lease mid-sweep, degrading to exactly the
+# pre-4755 collision; that is bounded and deliberate, never a new failure.
+#
+# Mirrors OrchestratorConfig.orchestrator_restart_lease_max_age_secs (this
+# stdlib script cannot import it), pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_max_age_matches_config_default.
+# Uses the module's env-with-default try/except idiom: a typo'd env var must
+# not crash the oneshot watchdog.
+try:
+    FLEET_LEASE_MAX_AGE_SECS = int(os.environ["ORCH_FLEET_LEASE_MAX_AGE_SECS"])
+except (KeyError, ValueError):
+    FLEET_LEASE_MAX_AGE_SECS = 7200
 
 # staleness_pass() is a stateless oneshot: every ~60s timer tick
 # (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
@@ -1288,6 +1335,140 @@ def _within_fleet_deploy_min_interval() -> bool:
     )
 
 
+def _pid_alive(pid) -> bool:
+    """Return True iff *pid* names a live process.
+
+    A deliberate COPY of
+    orchestrator/src/orchestrator/session_registry.py::_pid_alive, contract
+    preserved verbatim. The copy is FORCED, not a second opinion: this script
+    is a stdlib-only systemd oneshot that imports no first-party package — the
+    same constraint that forces the FLEET_LEASE_PATH literal above.
+
+    - Anything that is not a positive int (including bool, which IS an int in
+      Python) returns False WITHOUT reaching os.kill. That is a hazard guard,
+      not defensiveness: os.kill(0, 0) signals the CALLER'S ENTIRE process
+      group and os.kill(-N, 0) a foreign group, so a corrupt or zero pid read
+      off disk must be rejected before the syscall rather than by catching its
+      exception. session_registry.resolve_session_pid documents the same trap.
+    - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
+      treated as dead. The too-large case is the one input this predicate
+      lets REACH the syscall and still answers False for: unlike pid 0 or a
+      negative one, it carries no signalling hazard, and the platform's own
+      refusal is the answer.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+
+
+def _read_fleet_lease() -> dict | None:
+    """Return the in-flight fleet-redeploy lease body at FLEET_LEASE_PATH, or None.
+
+    The LEASE-layer read primitive, one level above _read_json_state (which
+    owns the missing/corrupt/non-object branches), so the lease inherits one
+    fail-open contract shared with the three clocks rather than introducing a
+    fourth. A MISSING file is the normal "no sweep running" case and is
+    deliberately SILENT — logging it would spam the journal every 60s tick;
+    corrupt/unreadable/non-object IS logged and swallowed.
+
+    Returns the RAW body, liveness unevaluated, so report() can distinguish
+    WHY a lease is not live (pid dead vs. past the bound) — a distinction
+    _live_fleet_lease below deliberately collapses.
+
+    Reads FLEET_LEASE_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work — the same requirement
+    _read_last_fleet_deploy_epoch states.
+    """
+    return _read_json_state(FLEET_LEASE_PATH)
+
+
+def _fleet_lease_age_secs(lease: dict) -> float | None:
+    """Wall-clock age of *lease* in seconds, or None when its started_ts is unusable.
+
+    THE single place a lease's age is derived, for _live_fleet_lease,
+    _describe_lease and _format_fleet_lease alike. Two independent parses of
+    one field are how the gate and --report came to disagree about the same
+    lease in the first place (heuristic 11).
+
+    Unusable means missing, non-numeric, OR non-finite. json.loads accepts
+    bare NaN / Infinity / -Infinity and hands back a float, so float() lets
+    them straight through and they then DEFEAT the bound rather than failing
+    it: every comparison against NaN is False, and an Infinity started_ts
+    gives an age of -inf, which is under any bound. A lease whose age cannot
+    be computed has no age, and saying so once here is what keeps every reader
+    of it in agreement.
+    """
+    try:
+        age = time.time() - float(lease["started_ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return age if math.isfinite(age) else None
+
+
+def _live_fleet_lease() -> dict | None:
+    """Return the lease body iff a fleet sweep is genuinely in flight, else None.
+
+    LIVE requires BOTH tests, and they fail in opposite directions so neither
+    alone suffices. Age alone would let a lease left behind by a SIGKILLed
+    sweep suppress every redeploy for the full bound — the exact hole the
+    stamp-on-verified-success clock (I2) exists to close, which a naive lease
+    would reintroduce. Pid alone would be defeated by pid reuse, where an
+    unrelated process inherits the number and the lease becomes immortal.
+    Requiring both means a crashed sweep costs at most ONE delayed window.
+
+    Any unusable pid or started_ts yields None: a lease that cannot be
+    evaluated must fail toward RELEASING, never toward holding the fleet. A
+    FUTURE-dated lease (negative age) is released for that same reason, and the
+    asymmetry is the one the bound itself rests on — honouring a negative age
+    makes the lease immortal, since no bound can expire it, while releasing it
+    costs at most one collision. Note the deliberate divergence from the repo's
+    OTHER lease (session_registry.LEASE_HEARTBEAT_TTL), which fails toward
+    KEEPING the lease — that one protects a holder against eviction, this one
+    suppresses fleet redeploys.
+
+    The AGE is tested before the pid deliberately: it is the cheaper test, and
+    it means a nonsense lease never reaches os.kill at all.
+
+    Both module globals are read INSIDE the body (not defaulted at def time)
+    so tests that monkeypatch them still work.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        return None
+    age = _fleet_lease_age_secs(lease)
+    if age is None or age < 0.0 or age >= FLEET_LEASE_MAX_AGE_SECS:
+        return None
+    if not _pid_alive(lease.get("pid")):
+        return None
+    return lease
+
+
+def _describe_lease(lease: dict) -> str:
+    """Render *lease* for a human: ``pid N, unit U, age Xs``.
+
+    Every tier that suppresses an action because of a lease says so in the
+    journal, and each needs the SAME three facts — they are exactly what
+    distinguishes a genuinely held lease from a leftover one without opening
+    the file. Rendering them in one place keeps those lines readable as a set.
+    """
+    age = _fleet_lease_age_secs(lease)
+    return (
+        f"pid {lease.get('pid')}, "
+        f"unit {lease.get('current_unit') or '-'}, "
+        f"age {'unknown' if age is None else f'{age:.0f}s'}"
+    )
+
+
 def _within_fleet_staleness_head_start() -> bool:
     """Return True iff the FLEET deploy min-interval window opened <STALENESS_GRACE_SECS ago.
 
@@ -1664,7 +1845,12 @@ def _record_fm_liveness_failure(
 
 
 def main() -> None:
-    """Probe each watched port; restart the unit if the port is not listening."""
+    """Probe each watched port; restart the unit if the port is not listening.
+
+    One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
+    sweep is currently restarting is skipped, because a unit mid-restart is
+    indistinguishable from a wedged one to a port probe.
+    """
     for port, unit in WATCHED:
         try:
             if not is_unit_enabled(unit):
@@ -1678,6 +1864,31 @@ def main() -> None:
                 )
                 continue
             if not probe_port(port):
+                # A down port means this unit is wedged, dead — or being
+                # restarted right now by an in-flight fleet sweep, which the
+                # probe cannot tell apart from the other two precisely BECAUSE
+                # the sweep is restarting it. Measured: the probe cancelled the
+                # sweep's own restart jobs ("Job for ... canceled"), twice
+                # escalating to code=killed status=9/KILL.
+                #
+                # The lease read is LAZY — it happens only HERE, after a probe
+                # has already come back down, so an all-healthy tick (the
+                # overwhelmingly common case) costs zero extra I/O, and the
+                # read is maximally fresh at the decision point.
+                #
+                # Scoped to current_unit and nothing else: I5 (liveness stays
+                # uncapped, non-clock-gated and non-stamping — brokenness is
+                # not a scheduled deploy) must survive for every OTHER unit. A
+                # blanket liveness disable for the ~80 minutes of a sweep would
+                # leave a genuinely wedged unit unattended for over an hour.
+                lease = _live_fleet_lease()
+                if lease is not None and lease.get("current_unit") == unit:
+                    log(
+                        f"{unit} escalation port {port} not listening, but an "
+                        f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+                        "is restarting this unit; skipping the liveness restart"
+                    )
+                    continue
                 # Covers both wedged-active and dead-enabled (boot-race
                 # cancelled, or StartLimit-exhausted): restart_unit's
                 # stop+reset-failed+start sequence revives either case.
@@ -2074,17 +2285,35 @@ def staleness_pass() -> None:
     event-driven coordinator" is true AT THE WINDOW BOUNDARY for the first
     time.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight --drain stamped the clock),
-    which needs in-flight state and is task 4755.
+    In-flight lease (task 4755): a THIRD clock-layer gate, checked after the
+    head start and still ahead of the commit-grace gate. The two gates above
+    order this tier against the OTHER tier at each window boundary; neither
+    can see THIS tier's own in-flight sweep, because the clock they read is
+    stamped only when a sweep FINISHES and verifies (I2). For the ~80 minutes
+    a --drain sweep takes, every gate above therefore sees an 8h-stale clock
+    and concludes nothing is happening — measured: the backstop delegated a
+    second redeploy into its own running sweep. restart-all-orchestrators.sh
+    now writes a lease for the duration, and this gate honours it. A lease is
+    live only while its pid is alive AND it is under FLEET_LEASE_MAX_AGE_SECS,
+    so a SIGKILLed sweep costs at most one delayed window rather than wedging
+    the fleet — see scripts/orchestrator-watchdog.py::_live_fleet_lease.
+
+    That gate and the min-interval cap are BOTH re-evaluated a second time
+    immediately before delegating (task 4755), because the unit probes between
+    the two points take multi-second wall clock — see the comment at that call
+    site for the measured width of the window and why the second read is not
+    rate-limited.
 
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
     _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
     (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
-    brokenness is not a scheduled deploy).
+    brokenness is not a scheduled deploy). Task 4755 added the single
+    exception, and it is deliberately as narrow as one: main() skips the
+    liveness restart of the ONE unit a live lease names as current_unit,
+    because a unit mid-restart is indistinguishable from a wedged one to a
+    port probe. Every other unit, and every other tick, is unchanged.
     """
     if _within_fleet_deploy_min_interval():
         # Bucket on wall-clock time (not elapsed-since-deploy) — see
@@ -2110,6 +2339,19 @@ def staleness_pass() -> None:
             log(
                 f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
                 "since the fleet-deploy min-interval opened"
+            )
+        return
+
+    lease = _live_fleet_lease()
+    if lease is not None:
+        # Same bucket idiom again. The skip line names the pid, the unit and
+        # the age because those are exactly what distinguishes a HELD lease
+        # from a stale one in the journal — an operator asking "why didn't the
+        # backstop fire?" must not have to hand-read JSON to find out.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: a fleet redeploy is already in flight "
+                f"(lease {_describe_lease(lease)})"
             )
         return
 
@@ -2154,6 +2396,33 @@ def staleness_pass() -> None:
             log(f"staleness probe error for {unit}: {exc}")
 
     if stale_found:
+        # READ-THEN-ACT (task 4755). The gates at the top of this pass were
+        # evaluated BEFORE a `git log` (_newest_watched_commit_epoch) and,
+        # per unit, an is_unit_enabled plus TWO `systemctl show` calls — a
+        # multi-second window, entered once every 60s. Both facts they read
+        # are written by OTHER processes at moments this pass does not
+        # control: the coordinator can fire, and a sweep can stamp the clock,
+        # at any point inside it. Re-evaluating here costs one small JSON read
+        # each on the rare ticks that actually reach a delegation, and makes
+        # the decision current as of the instant it is acted on.
+        #
+        # NOT rate-limited, unlike the top-of-pass skip lines: this path is
+        # reached only when a stale unit was genuinely found, so it is rare
+        # and highly actionable — and a race we declined to take is exactly
+        # the evidence an operator needs to explain a missing redeploy.
+        if _within_fleet_deploy_min_interval():
+            log(
+                "skip: the fleet-deploy clock was stamped while this pass was "
+                "probing units; another tier got there first"
+            )
+            return
+        lease = _live_fleet_lease()
+        if lease is not None:
+            log(
+                "skip: a fleet redeploy started while this pass was probing "
+                f"units (lease {_describe_lease(lease)})"
+            )
+            return
         log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
         _delegate_fleet_restart()
 
@@ -2195,10 +2464,19 @@ def fused_memory_staleness_pass() -> None:
     an orchestrator fleet redeploy does not open or reset fm's head-start
     window and vice-versa.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight redeploy stamped the clock),
-    which needs in-flight state and is task 4755.
+    SCOPE, and a RESIDUAL the orchestrator tier no longer has: this orders the
+    two TIERS at each clock-open only. It does NOT address the fm backstop
+    colliding with its OWN in-flight sweep (a tick whose min-interval check
+    passed before an in-flight redeploy stamped the clock), because fm has no
+    in-flight state. Task 4755 added a lease for the ORCHESTRATOR fleet only,
+    written by restart-all-orchestrators.sh and read by staleness_pass above;
+    this tier is a genuinely separate fleet — its own unit, its own
+    restart-fused-memory.sh, its own clock (deliberately never shared in
+    either direction, see the FM_DEPLOY_CLOCK_PATH module comment) and its own
+    transient unit name — so gating it on the orchestrator fleet's lease would
+    be exactly the cross-fleet coupling that two-clock design forbids, and no
+    writer ever creates a lease for fm anyway. Closing this needs an fm lease
+    of its own, on 4755's four-tier-mirror-plus-drift-test template.
 
     Stateless (I6): staleness is recomputed from live systemd + git each tick,
     so a successful restart (from this pass or the fm coordinator) advances
@@ -2274,6 +2552,53 @@ def _format_epoch(epoch: int | None) -> str:
     if epoch is None:
         return "unknown"
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
+
+
+def _format_fleet_lease() -> str:
+    """Render the in-flight fleet-redeploy lease for ``--report``, in one line.
+
+    Reads via _read_fleet_lease, NOT _live_fleet_lease, deliberately: the
+    latter collapses every not-live reason into None, and the not-live reasons
+    call for DIFFERENT operator actions. A dead holder means a sweep crashed
+    with its work unfinished; an overrun one means the sweep is probably still
+    running and merely past the bound; a future-dated one means a clock
+    stepped, and no sweep is implicated at all. An operator must be able to
+    tell which without opening the file — that is the whole reason the lease
+    is surfaced at all.
+
+    Distinguishing WHY is this function's purpose, but agreeing with
+    _live_fleet_lease about WHETHER is its contract: both derive the age from
+    _fleet_lease_age_secs and test it in the same order, so a lease the gate
+    treats as expired can never be rendered here as live.
+
+    Strictly read-only, like every other --report field (I7/I8): this never
+    creates, rewrites or removes the lease. The producer's lease_release is an
+    ``rm -f``, so doctor mode must be visibly not that.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        # _read_fleet_lease cannot distinguish absent from corrupt (both are
+        # None by its fail-open contract), so ask the filesystem directly.
+        return "none" if not os.path.exists(FLEET_LEASE_PATH) else "unreadable"
+    age = _fleet_lease_age_secs(lease)
+    if age is None:
+        return "unreadable"
+    pid = lease.get("pid")
+    # Arm order mirrors _live_fleet_lease's test order, which is what keeps
+    # the two from ever disagreeing about whether a lease is live.
+    if age < 0.0:
+        return f"future-dated (pid {pid}, stamped {-age / 60:.0f}m ahead of this clock)"
+    if not _pid_alive(pid):
+        return f"stale (pid {pid} not running, age {age / 60:.0f}m)"
+    if age >= FLEET_LEASE_MAX_AGE_SECS:
+        return (
+            f"expired (pid {pid}, age {age / 3600:.1f}h > "
+            f"{FLEET_LEASE_MAX_AGE_SECS / 3600:.1f}h bound)"
+        )
+    return (
+        f"live (pid {pid}, unit {lease.get('current_unit') or '-'}, "
+        f"age {age / 60:.0f}m)"
+    )
 
 
 def _render_age_hours(epoch: float | None) -> str:
@@ -2384,8 +2709,20 @@ def report() -> int:
     defers on; idle proceeds immediately and stale/absent proceed after the
     gate's short unknown-grace.
 
-    Read-only: report() never writes the fleet-deploy clock file and issues
-    zero mutating systemctl calls (I8).
+    FLEET-LEASE is a single fleet-wide LINE printed above the table (task
+    4755), not an eighth column: the lease is one fact about the whole fleet,
+    so a column would repeat it on every row for no gain — DEPLOY-AGE already
+    pays that cost and is the reason not to add a second. It renders six
+    distinguishable states — none / live / stale (holder not running) /
+    expired (past FLEET_LEASE_MAX_AGE_SECS) / future-dated (stamped ahead of
+    this clock) / unreadable — because the not-live reasons call for different
+    operator actions. It is the only way to see, without hand-reading JSON,
+    why the backstop and the coordinator are both declining to redeploy.
+
+    Read-only: report() never writes the fleet-deploy clock file, never
+    creates, rewrites or removes the in-flight lease, and issues zero mutating
+    systemctl calls (I8). The lease clause is explicit because the producer's
+    lease_release is an ``rm -f``: doctor mode must be visibly not that.
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
@@ -2399,6 +2736,7 @@ def report() -> int:
         "head-start / commit-grace restraint gates staleness_pass() applies "
         "before actually restarting a unit."
     )
+    print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
         f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
         f"{'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"

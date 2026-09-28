@@ -873,10 +873,13 @@ _TASK_TITLES_TTL_SECONDS = 10.0
 # ``asyncio.wait_for``. Bound to the shared default rather than restating the
 # literal, so the arithmetic lives in exactly one place; this site may later
 # TIGHTEN its own constant (the structural test enforces it can never widen
-# it). No whole-loop deadline is needed here as there is for
-# ``discover_orchestrators``: this is a single-root call whose fan-out happens
-# at the CALLER via ``asyncio.gather``, so the handler cost is max-of-N rather
-# than sum-of-N and one per-call budget already bounds the whole gather.
+# it). No whole-loop deadline is needed here: this is a single-root call whose
+# fan-out happens at the CALLER via ``asyncio.gather``, so the handler cost is
+# max-of-N rather than sum-of-N and one per-call budget already bounds the
+# whole gather. (``discover_orchestrators`` used to be the contrasting case —
+# a SEQUENTIAL per-root walk that needed a second, whole-loop bound. It reads
+# no task tree since task 5587, so there is no longer a sibling to contrast
+# with.)
 _TASK_TITLES_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
 
 _task_titles_cache: TTLCache[dict[str, str] | None] = TTLCache(

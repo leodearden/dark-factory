@@ -49,6 +49,7 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
+from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.candidate_key_escalation import (
@@ -2937,6 +2938,11 @@ class SqliteTaskBackend:
         tag: str | None = None,
         status: str = 'pending',
     ) -> AddTaskResult:
+        arguments_as_received = dict(
+            project_root=project_root, prompt=prompt, title=title,
+            description=description, details=details, dependencies=dependencies,
+            priority=priority, metadata=metadata, tag=tag, status=status,
+        )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         if status not in _VALID_STATUSES:
@@ -3030,6 +3036,10 @@ class SqliteTaskBackend:
 
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
+                refuse_leaked_task_text(
+                    {'title': title, 'description': description, 'details': details},
+                    arguments=arguments_as_received,
                 )
 
                 # Index-independent dedup guard (fm-task-dedup self-heal
@@ -3150,6 +3160,12 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
+        arguments_as_received = dict(
+            task_id=task_id, project_root=project_root, prompt=prompt,
+            metadata=metadata, append=append, tag=tag, metadata_mode=metadata_mode,
+            title=title, description=description, details=details,
+            priority=priority, status=status, dependencies=dependencies,
+        )
         # Write-authority floors mirroring the server/tools.py + interceptor
         # ceiling (2026-05-08 forensics). set_task_status is the only
         # sanctioned writer for status AND metadata.done_provenance — it
@@ -3278,6 +3294,7 @@ class SqliteTaskBackend:
 
             # details: explicit param wins over prompt. Both honor ``append``.
             existing_details = row['details'] or ''
+            new_details: str | None = None
             if details is not None:
                 new_details = (
                     f'{existing_details}\n\n{details}'
@@ -3292,6 +3309,14 @@ class SqliteTaskBackend:
                 )
                 set_columns.append('details = ?')
                 set_values.append(new_details)
+
+            # Only the columns this write supplies, judged on the values it
+            # would persist: a pre-gate corrupt column elsewhere in the row
+            # must not block the write that remediates it.
+            refuse_leaked_task_text(
+                {'title': title, 'description': description, 'details': new_details},
+                arguments=arguments_as_received,
+            )
 
             new_metadata: str | None = None
             if metadata is not None:

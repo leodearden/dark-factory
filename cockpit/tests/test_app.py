@@ -1616,7 +1616,7 @@ class TestEnterFocus:
             assert backend.focus_calls == []
 
 
-class TestHandlingPrunedOnQueueExit:
+class TestHandlingExpiresWithTheAsk:
     @pytest.mark.timeout(10)
     async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
         """self._handling is an in-memory 'already acted on' marker keyed by
@@ -1670,6 +1670,87 @@ class TestHandlingPrunedOnQueueExit:
             await pilot.pause()
 
             assert app._queue_items_by_key[key].handling is False
+
+    @pytest.mark.timeout(10)
+    async def test_handling_expires_on_a_same_session_reask_without_a_status_change(self, tmp_path):
+        """Queue exit (above) is only one way an ask ends. self._handling is
+        a slug-stable in-memory "already acted on" marker, so it must also
+        expire when the ask is REPLACED while the key never leaves the queue.
+
+        Reachability: orchestrator/src/orchestrator/session_hooks.py::run_notification
+        writes status=AWAITING_INPUT plus a fresh Question on every
+        Notification hook, with no required intervening Stop hook (->
+        IDLE), so AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) is a real
+        transition that never removes 'session:<slug>' from the queue.
+
+        The re-ask below deliberately repeats the question text verbatim --
+        the common production shape, for the reasons
+        test_dropped_session_key_expires_on_a_reask_with_identical_text
+        sets out (session_hooks._extract_question copies the hook message
+        into `text` and stamps a fresh `asked_at`). That puts the WHOLE
+        diff on registry_reader.build_snapshot's asked_at field, so this
+        also proves the wake-up trigger is strong enough for the prune to
+        run at all.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='reask title')
+        first_ask = _make_record(
+            session_slug='reask-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            key = 'session:reask-1'
+
+            # (a) Enter marks the row acknowledged.
+            await pilot.press('enter')
+            await pilot.pause()
+            assert key in app._handling
+
+            # (b) GUARD: a LIVE mark must survive an unrelated rebuild. This
+            # is the only clause that fails if action_focus_selected never
+            # records the ask identity -- without it every Enter's mark
+            # would evaporate on the next rebuild instead of on the re-ask.
+            other = _make_record(
+                session_slug='other-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=sr.Display(kind='wm', wm_title='other title'),
+                question=sr.Question(text='Unrelated ask?', asked_at='2026-07-07T01:00:00+00:00'),
+            )
+            sr.write_record(other, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert key in app._handling
+            assert app._queue_items_by_key[key].handling is True
+
+            # (c) The re-ask: still AWAITING_INPUT, same canned text, only a
+            # fresh asked_at. A genuinely new ask must not inherit the mark.
+            second_ask = _make_record(
+                session_slug='reask-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert key not in app._handling
+            assert app._queue_items_by_key[key].handling is False
+
+            # (d) The identity side-table is garbage-collected with the
+            # mark, rather than becoming the next leak.
+            assert app._overlay_asks == {}
 
 
 class TestBoostReordersAndPersists:
@@ -4381,6 +4462,185 @@ class TestStaleScanSequenceGuard:
             await pilot.pause()
 
             assert recorded_seqs == [issued]
+
+
+class TestInFlightScanCannotUndoAKeypressWrite:
+    """Task 5839: TestBoostReordersAndPersists's merge-gate red, replayed
+    deterministically.
+
+    _apply_boost and action_drop write a decision and then re-read
+    decisions, but a poll scan issued BEFORE that write, whose registry read
+    predates it, can land AFTER it. As in TestStaleScanSequenceGuard, the
+    poll pipeline's two halves are driven by hand, because racing the real
+    timer is what made the original test flaky: _next_scan_seq() plus
+    _scan_registry() stand in for _poll_registry issuing a seq and its worker
+    reading the registry, and _apply_scan(records, decisions, seq) stands in
+    for the late call_from_thread hand-off. poll_interval=60 keeps a real
+    tick from landing mid-test.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_a_boost_survives_a_scan_issued_before_it(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=60,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert {d.id: d.manual_boost for d in decisions}['dec-b'] == 0
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
+                "the late scan reverted the keypress's persisted boost in the view"
+            )
+
+            for _ in range(2):
+                await pilot.press('b')
+                await pilot.pause()
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 3, (
+                'a press built on the reverted boost and was lost'
+            )
+
+    @pytest.mark.timeout(10)
+    async def test_a_drop_survives_a_scan_issued_before_it(self, tmp_path):
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        first = sr.DecisionRecord(
+            id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        second = sr.DecisionRecord(
+            id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        for d in (first, second):
+            assert sr.write_decision(d, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert {d.id: d.state for d in decisions} == {
+                'dec-1': sr.DecisionState.OPEN,
+                'dec-2': sr.DecisionState.OPEN,
+            }
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 1
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert queue.row_count == 1, 'the late scan resurrected the dropped decision'
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-1')
+
+    @pytest.mark.timeout(10)
+    async def test_the_scan_issued_before_a_boost_still_lands_its_sessions(self, tmp_path):
+        """The keypress re-reads decisions only, so it may void only the late
+        scan's decisions: the scan's sessions are still the freshest read.
+        Voiding the whole scan froze the session table for as long as
+        keypresses kept landing mid-scan -- on a large fleet, whose scan
+        outlasts the gap between presses, a whole triage burst.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.priority import Priorities
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=60,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            sr.write_record(_make_record(session_slug='running-1'), root=tmp_path)
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert [r.session_slug for r in records] == ['running-1']
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert table.row_count == 0
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert table.row_count == 1, "the keypress's re-read voided the scan's sessions"
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
+                "the late scan's decisions reverted the keypress's persisted boost"
+            )
 
 
 class TestDecisionQueueDetail:

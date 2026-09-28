@@ -47,6 +47,14 @@ tasks:
           script: scripts/check_alpha.sh
           args: ['--strict']
           timeout_secs: 30
+      - name: path_check
+        binding: 'the strand test module exists'
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths:
+            - orchestrator/tests/test_workflow_merge_gating_strand.py
       - name: manual_check
         binding: 'eyeball the UI'
         verdict: PASS
@@ -182,7 +190,8 @@ async def test_no_prd_metadata_returns_none(tmp_path):
 
 @pytest.mark.asyncio
 async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
-    """Valid sidecar: task_id is stamped to disk; only grep+script checks copy to metadata."""
+    """Valid sidecar: task_id is stamped to disk; every MECHANICAL check copies
+    to metadata (grep + script + path) and only manual is dropped."""
     plans_dir = tmp_path / 'plans'
     plans_dir.mkdir()
     sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
@@ -236,9 +245,12 @@ async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
 
     payload = json.loads(call.kwargs['metadata'])
     checks = payload['delivered_checks']
-    assert len(checks) == 2
+    # Deliberately updated from 2/{grep,script} when kind='path' was added
+    # (task 4743): leaving them would silently assert that path checks are
+    # NOT stamped, and an unstamped check is one the delta gate never sees.
+    assert len(checks) == 3
     by_kind = {c['kind']: c for c in checks}
-    assert set(by_kind) == {'grep', 'script'}
+    assert set(by_kind) == {'grep', 'script', 'path'}
     assert by_kind['grep']['name'] == 'grep_check'
     assert by_kind['grep']['pattern'] == 'TODO(alpha)'
     assert by_kind['grep']['expect'] == 'absent'
@@ -247,6 +259,11 @@ async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
     assert by_kind['script']['script'] == 'scripts/check_alpha.sh'
     assert by_kind['script']['args'] == ['--strict']
     assert by_kind['script']['timeout_secs'] == 30
+    assert by_kind['path']['name'] == 'path_check'
+    assert by_kind['path']['expect'] == 'present'
+    assert by_kind['path']['paths'] == [
+        'orchestrator/tests/test_workflow_merge_gating_strand.py'
+    ]
 
 
 @pytest.mark.asyncio

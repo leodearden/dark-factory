@@ -16,7 +16,10 @@ which this codebase had minted independently across 55 tracked files
 it grows as citations accrue) and cited as if canonical while no
 heading defined it (task 3803; rehearsal walked 2026-08-20); INV-12
 was added 2026-09-18 from the exception-register PRD's own incident
-evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`). They gate `/prd`
+evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`); INV-13 was
+added 2026-09-25 from the two-empty-ledgers investigation — four
+never-written ledgers, each with a live reader rendering emptiness as
+healthy (tasks 3790, 4863, 4718, 5890). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -448,6 +451,58 @@ live, or it is explicitly ratified. A walker facing a park/wait/hold state
 checks INV-7; a walker facing an exception list or inline suppression checks
 INV-12.
 
+## INV-13 `readers-prove-their-producer`
+
+**Rule**: A reader over a store — a report, a gate, a health counter, a
+judge-prompt section, a dashboard view — lands only with evidence that its
+producer has written to that store in production: a row observed in the live
+store under the producer's real trigger, not a row a test seeded. If the
+producer lands in a later slice, the reader must render "no producer has
+written here" as a state distinct from "nothing happened", never as healthy.
+A cutover that moves a read source states its backfill decision per record
+kind: self-repopulating, migrated, or abandoned.
+
+**Checkable design question(s)**: Does this feature add or move a reader
+over a ledger, table or store? Name the producer and the trigger that fires
+it. Has that trigger fired in production, and did a row appear — measured,
+not assumed? If the producer is a different slice, what does the reader
+print until it lands, and can an operator tell "no producer wired" from "no
+events"? If a read source is cut over, does each record kind carry its own
+backfill decision, or is one kind's reasoning ("markers self-repopulate")
+silently applied to a kind it does not describe?
+
+**Evidence**: measured 2026-09-23 across every zero-row table under `data/`:
+six were healthy transient queues and four were never-written ledgers whose
+readers reported healthy. `recon_ledger` held zero `stage1_flag_suppression`
+rows fleet-wide since the task-2227 read-side cutover, whose no-backfill
+reasoning named only markers; `filter_suppressed` passed everything through
+while 41 stage-authored Mem0 records sat inert (task 4863). `runs.db::flake_debt`
+had zero rows while five tests had been suppressed; `orchestrator flake-ledger`
+printed `OPEN DEBT (no open debt)` and `unowned=0 status ok`, because "unowned"
+was derived from debt rows and a suppression without a row was invisible
+(task 3790). `reconciliation.db::journal_entries` was built by an agent loop
+whose sole caller discards the list, and the judge summarised the empty
+result into every review prompt (task 5890).
+`curator_events.db::invocations` had no `sqlite_sequence` row at all — never
+one insert — while a three-day curator outage went untraced (task 4718). In
+every case each call succeeded and the emptiness was honest; the healthy
+rendering was the defect.
+
+**House pattern**: `orchestrator/src/orchestrator/flake_report.py::compute_non_convergence`
+renders an open row without an owner as `*** NO OWNER (invariant breach) ***`
+rather than folding it into the healthy count; `orchestrator/src/orchestrator/flake_ledger.py::UNKNOWN_TEST_ID`
+counts an observation that names no test instead of dropping it. For the
+producer-has-written check, an AUTOINCREMENT table's `sqlite_sequence` row is
+the cheap probe: absent means never inserted, not merely empty now.
+
+**Family boundary**: INV-11 `no-silent-fail-soft` governs a failure a caller
+cannot tell from success at one call; INV-13 governs a reader whose producer
+never ran — no call fails anywhere. INV-10 `guards-exercise-behaviour`
+governs a guard that asserts prose instead of behaviour; INV-13's rejected
+proof is the fixture-seeded row, a guard-shaped mistake made by a reader. A
+walker facing a swallowed exception checks INV-11; facing a test of a check,
+INV-10; facing a report, gate or counter over a store, INV-13.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -466,4 +521,5 @@ INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
 INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
 INV-11 fixtures added with the `no-silent-fail-soft` promotion; INV-12
 fixtures added 2026-09-18 with the `exceptions-owned-or-ratified`
-invariant).
+invariant; INV-13 fixtures added 2026-09-25 with the
+`readers-prove-their-producer` invariant).

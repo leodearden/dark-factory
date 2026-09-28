@@ -23,6 +23,9 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 
 `install_fake_httpx` (task 3376) follows the same convention, collapsing six
 copies of one fake-httpx idiom spread across four of this directory's files.
+
+So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
+shared by the model-admission audit and review suites.
 """
 import json
 import sqlite3
@@ -86,6 +89,50 @@ def pytest_configure(config):
 # can still take the resolved path by fixture rather than reading os.environ
 # bare. See df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the
 # full history.
+
+
+# ---------------------------------------------------------------------------
+# Legibility trickle state isolation (task 4514).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
+    """Point the legibility trickle state root at a per-test tmp dir.
+
+    WHAT IT PREVENTS. The operator's LIVE state files for two running
+    pipelines sit at ``~/.local/state/dark-factory/legibility/{dark_factory,
+    reify}/trickle-state.json``, carrying real ``last_productive_at`` stamps
+    and streak history. Before task 4514 this directory isolated itself from
+    them ONLY through ``XDG_STATE_HOME`` — ``test_legibility_nightly.py::
+    _isolate_trickle_state``, ``test_check_trickle_progress.py::_run_probe``
+    and ``::_seed`` (whose default ``project_id`` is the literal
+    ``"dark_factory"``), and ~15 sites in ``test_trickle_state.py``. Task 4514
+    makes ``scripts/legibility/trickle_state.py::trickle_state_path`` stop
+    honouring ``XDG_STATE_HOME`` and ``HOME`` entirely, at which instant every
+    one of those isolations becomes a silent no-op. Each is migrated to the
+    variable set here in the same commit as that change; this autouse fixture
+    is the belt to that pair of braces, catching any site the migration missed
+    and any test added later that forgets.
+
+    Directory-wide and autouse rather than opt-in, because the failure mode is
+    a test that never says it touches trickle state — a plain ``pytest`` run
+    overwriting the operator's live streak history is data loss, not a dirty
+    tmp dir.
+
+    A test that deliberately exercises the DEFAULT (passwd-anchored)
+    resolution must ``monkeypatch.delenv('DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+    raising=False)`` first, and must then assert on the RESOLVED PATH only —
+    never call ``record_run``, which would write to the real file.
+
+    The literal is spelled out rather than imported because this fixture
+    predates the constant it mirrors and must stay inert until that
+    constant exists: ``scripts/legibility/trickle_state.py::STATE_ROOT_ENV``.
+    """
+    monkeypatch.setenv(
+        'DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+        str(tmp_path_factory.mktemp('legibility-state')),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,3 +324,211 @@ def install_fake_httpx(monkeypatch):
         return fake
 
     return _make
+
+
+# ---------------------------------------------------------------------------
+# Shared synthetic runs.db fixtures (task 5441).
+#
+# Moved here from test_audit_model_admission.py so the model-admission audit
+# and review suites seed ONE schema copy through one set of helpers. Fixtures
+# for the same importlib-mode reason as the tasks.db fixtures above.
+#
+# RUNS_DB_SCHEMA is a VERBATIM copy of the three tables those scripts read,
+# captured with
+#
+#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
+#
+# Copied rather than imported because this directory is collected by
+# `uv run --project shared pytest` and imports NO first-party package (the
+# comment on dark-factory-orchestrator.yaml::test_command says so), so the
+# orchestrator's event store, which owns this DDL, is out of reach. Re-capture
+# with that command rather than hand-editing if the writer's schema moves.
+# ---------------------------------------------------------------------------
+
+RUNS_DB_SCHEMA = """
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    run_id      TEXT    NOT NULL,
+    task_id     TEXT,
+    event_type  TEXT    NOT NULL,
+    phase       TEXT,
+    role        TEXT,
+    data        TEXT    DEFAULT '{}',
+    cost_usd    REAL,
+    duration_ms INTEGER
+);
+CREATE TABLE invocations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT NOT NULL,
+    task_id             TEXT,
+    project_id          TEXT NOT NULL,
+    account_name        TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    cost_usd            REAL NOT NULL DEFAULT 0.0,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    capped              INTEGER NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT NOT NULL
+);
+CREATE TABLE account_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    project_id   TEXT,
+    run_id       TEXT,
+    details      TEXT,
+    created_at   TEXT NOT NULL
+);
+"""
+
+
+def _payload(value):
+    """JSON-encode a dict/list payload; pass a str or None through VERBATIM.
+
+    The pass-through is what lets a test seed a deliberately malformed payload
+    — the live store holds an ``account_events.details`` of the bare string
+    ``'Escalation watcher (auto)'`` — so tolerant-parse paths are exercised
+    against the real shape rather than a hypothetical one. Same convention as
+    ``make_tasks_db``'s ``metadata`` handling above.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+class SeedingConnection(sqlite3.Connection):
+    """A real, writable ``sqlite3.Connection`` that can also seed scenario rows.
+
+    Still a Connection, so a test seeds through it and hands the SAME object
+    straight to the scan under test. Each ``seed_*`` inserts one row and
+    commits.
+    """
+
+    def seed_event(
+        self,
+        timestamp,
+        event_type,
+        *,
+        run_id='run-1',
+        task_id=None,
+        phase=None,
+        role=None,
+        data=None,
+        cost_usd=None,
+        duration_ms=None,
+    ):
+        """Insert one `events` row, stating its payload as a dict rather than JSON text."""
+        self.execute(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
+            'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                timestamp,
+                run_id,
+                task_id,
+                event_type,
+                phase,
+                role,
+                _payload({} if data is None else data),
+                cost_usd,
+                duration_ms,
+            ),
+        )
+        self.commit()
+
+    def seed_invocation(
+        self,
+        *,
+        model,
+        role,
+        started_at,
+        completed_at,
+        run_id='run-1',
+        task_id=None,
+        project_id='dark_factory',
+        account_name='max-a',
+        cost_usd=0.0,
+        input_tokens=None,
+        output_tokens=None,
+        cache_read_tokens=None,
+        cache_create_tokens=None,
+        duration_ms=0,
+        capped=0,
+    ):
+        """Insert one `invocations` row."""
+        self.execute(
+            'INSERT INTO invocations (run_id, task_id, project_id, account_name, model, '
+            'role, cost_usd, input_tokens, output_tokens, cache_read_tokens, '
+            'cache_create_tokens, duration_ms, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                run_id,
+                task_id,
+                project_id,
+                account_name,
+                model,
+                role,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_create_tokens,
+                duration_ms,
+                capped,
+                started_at,
+                completed_at,
+            ),
+        )
+        self.commit()
+
+    def seed_account_event(
+        self,
+        *,
+        account_name,
+        event_type,
+        created_at,
+        details=None,
+        project_id='dark_factory',
+        run_id='run-1',
+    ):
+        """Insert one `account_events` row; *details* follows :func:`_payload`."""
+        self.execute(
+            'INSERT INTO account_events (account_name, event_type, project_id, run_id, '
+            'details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (account_name, event_type, project_id, run_id, _payload(details), created_at),
+        )
+        self.commit()
+
+
+@pytest.fixture
+def runs_db_path(tmp_path):
+    """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
+    path = tmp_path / 'runs.db'
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(RUNS_DB_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+@pytest.fixture
+def runs_db(runs_db_path):
+    """A WRITABLE :class:`SeedingConnection` on :func:`runs_db_path`.
+
+    The scans under test take an open connection, so a test normally seeds
+    through this fixture and hands the same connection straight to the function
+    under test. Tests that exercise a read-only connection factory or a CLI take
+    ``runs_db_path`` instead — both name the same file.
+    """
+    conn = sqlite3.connect(runs_db_path, factory=SeedingConnection)
+    try:
+        yield conn
+    finally:
+        conn.close()

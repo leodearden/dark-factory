@@ -107,18 +107,24 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # UNBOUNDED wedge (19.8h measured) into a bounded one.
 #
 # This bound is UNREACHABLE from active_tasks.collect_tasks_with_counts's
-# per-project path (the Tasks tab): _shape_one_project — which calls
-# fetch_tasks/fetch_statuses, i.e. THIS bound's own _fetch_tasks_cache /
-# _fetch_statuses_cache — runs under
-# ``asyncio.wait_for(..., timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET))``
-# with active_tasks._TASKS_PER_PROJECT_BUDGET == 7.0, itself inside
-# active_tasks._TASKS_TOTAL_BUDGET == 20.0. A caller on THAT path is
-# cancelled at <= 7s, well before this 15s bound could ever fire, so a wedge
-# there still surfaces exactly as it did before this module's fix: as a
-# per-project "degraded" WARNING (rows/done-count UNKNOWN), never as a
-# bypass. That is acceptable — collect_tasks_with_counts already has its own
-# adequate degradation story for exactly this case, and this fix does not
-# need to duplicate it; the fix is chosen for the callers below instead.
+# per-project path (the Tasks tab), for a STRUCTURAL reason rather than a
+# timing one: that path takes no per-key lock this bound could apply to.
+# Its reads go through task_snapshot.acquire_snapshot, which calls
+# tasks.fetch_statuses (uncached — live paged reads) and
+# tasks.fetch_tasks(cached=False), which awaits its refresh directly instead
+# of going through get_or_refresh. No get_or_refresh means no
+# ``async with lock:``, so this timeout has nothing to bound there. The one
+# get_or_refresh that path can still reach is the offline-MARKER store on
+# tasks._cached_fanout's failure branch, whose refresh returns an
+# already-computed value without awaiting anything and so cannot be the
+# parked holder this bound exists to escape. A wedge on that path surfaces
+# as the snapshot unit's own stale/unknown state instead, which is its
+# documented degradation story — never as a bypass.
+#
+# (Before task 5587 the reason was a timing one: _shape_one_project fetched
+# for itself, under an enclosing asyncio.wait_for bounded by
+# active_tasks._TASKS_PER_PROJECT_BUDGET, and was cancelled before this bound
+# could fire. It is now pure and issues no MCP call.)
 #
 # The bound IS reachable from every OTHER live call site, because none of
 # them has an enclosing deadline: app._task_cards_cache (which also reaches

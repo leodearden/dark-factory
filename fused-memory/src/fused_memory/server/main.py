@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -122,6 +123,21 @@ _CHECKPOINT_INTERVAL = 300.0
 # ``_CHECKPOINT_STATUS``) so both this module (writer — periodic loop)
 # and ``tools.py`` (reader — the ``get_wal_status`` MCP tool) share
 # state without a circular import.
+
+# Event-loop lag heartbeat sampling interval (task 3778). Deliberately much
+# shorter than _thread_monitor's 60s: the signal is how late a timer actually
+# ran, so a stall is only measured when it OVERLAPS a deadline. At 5s, a 15-43s
+# wedge overlaps several deadlines and is reported at close to full magnitude;
+# at 60s it would be caught roughly half the time and under-reported.
+_LOOP_LAG_INTERVAL = 5.0
+
+# How many consecutive BELOW-threshold samples pass before one routine INFO
+# heartbeat is emitted (12 x 5s ≈ 60s, matching _thread_monitor's cadence).
+# Frequent sampling is what makes a stall observable; logging every one of
+# those samples would be ~17k INFO lines a day. Threshold CROSSINGS bypass
+# this entirely and are always reported on the sample they occur (INV-4
+# loud-over-silent) — the throttle only bounds routine chatter.
+_LOOP_LAG_INFO_EVERY = 12
 
 
 def _sd_notify(state: str) -> None:
@@ -734,6 +750,7 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    topic_cluster_store: TopicClusterStore | None = None
     # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
     # populate recon_report_state before the harness is constructed, threading the
     # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
@@ -980,6 +997,12 @@ async def run_server():
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
 
+    # Machine-derived topic clusters (task 3135). Built in both branches above
+    # and never gated on reconciliation.enabled or the autoseed leaf: both of
+    # its consumers (consolidate_memories and the add_memory guard) run either
+    # way, and the leaf is read live at each of them.
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
+
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
@@ -988,6 +1011,7 @@ async def run_server():
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
+        topic_cluster_store=topic_cluster_store,
     )
 
     # Both ToolManager.call_tool wrappers, in the ONE order that works. The
@@ -1011,6 +1035,15 @@ async def run_server():
             prev = _thread_monitor_iteration(prev, _warn_threshold)
 
     asyncio.create_task(_thread_monitor())
+
+    # Event-loop lag heartbeat (task 3778) — the ON-loop complement to the
+    # off-loop _watchdog_thread_loop. That thread keeps pinging systemd even
+    # when the loop is wedged, which is exactly why a 15-43s stall could run
+    # for days looking healthy. This probe measures whether the loop is still
+    # being scheduled and WARNs when it is not. Handle retained (unlike
+    # _thread_monitor above) so teardown can cancel it — see
+    # _start_loop_lag_monitor.
+    loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
     # orchestrator as info-severity ticket_failure escalations. Replaces the
@@ -1239,6 +1272,9 @@ async def run_server():
             # so a close hiccup can't mask the original shutdown cause.
             with contextlib.suppress(BaseException):
                 recon_report_state.stop_persistence()
+        if topic_cluster_store is not None:
+            with contextlib.suppress(BaseException):
+                topic_cluster_store.close()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1263,6 +1299,9 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        loop_lag_task.cancel()
+        with contextlib.suppress(BaseException):
+            await loop_lag_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -1416,6 +1455,121 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
         # omitted from the message to avoid a misleading constant "delta=+0" token.
         logger.info('thread_monitor: threads=%d transient=true', count)
     return count
+
+
+def _loop_lag_iteration(overshoot_ms: float, threshold_ms: float) -> None:
+    """Log one event-loop-lag sample: INFO below *threshold_ms*, WARNING at/above.
+
+    *overshoot_ms* is how much LATER than requested a timer callback actually
+    ran — i.e. how long the loop thread was occupied by something that did not
+    yield. It is the on-loop counterpart to :func:`_watchdog_thread_loop`,
+    which pings systemd from a dedicated OS thread precisely so a wedged loop
+    cannot suppress the heartbeat. That off-loop design is what let task 3778's
+    defect run for days: the watchdog kept pinging, the process stayed alive,
+    and the only visible symptom was ``/health`` timing out for 15-43s while
+    the reconciliation renderer fanned ~500 synchronous ``git`` probes out on
+    the loop thread. This function is the missing half — it reports that the
+    loop itself stopped being scheduled.
+
+    The measured lag is rendered INTO the message rather than only exposed as a
+    queryable field: the failure mode was that nobody was told, so the signal
+    has to be loud at the moment it occurs (INV-4 loud-over-silent).
+
+    At/above (not merely above) the threshold warns, so a lag sitting exactly
+    on an operator's configured bar is not silently rounded into the quiet
+    branch.
+
+    Extracted from the :func:`_loop_lag_monitor` coroutine for the same reason
+    :func:`_thread_monitor_iteration` was extracted from ``_thread_monitor`` —
+    so unit tests can exercise the logging logic without mocking
+    ``asyncio.sleep``.
+    """
+    if overshoot_ms >= threshold_ms:
+        logger.warning(
+            'loop_lag: lag=%.1fms threshold=%.0fms — event loop was blocked '
+            '(on-loop heartbeat; see _watchdog_thread_loop for the off-loop one)',
+            overshoot_ms, threshold_ms,
+        )
+    else:
+        logger.info(
+            'loop_lag: lag=%.1fms threshold=%.0fms', overshoot_ms, threshold_ms,
+        )
+
+
+async def _loop_lag_monitor(threshold_ms: float, interval: float | None = None) -> None:
+    """Sample event-loop scheduling delay forever, reporting via _loop_lag_iteration.
+
+    Each pass records ``loop.time()``, sleeps *interval*, and measures how far
+    past the deadline the callback actually ran. A healthy loop overshoots by
+    microseconds-to-milliseconds; a loop occupied by blocking work overshoots
+    by however long that work took.
+
+    *interval* defaults to the module-level :data:`_LOOP_LAG_INTERVAL` at CALL
+    time (not as a bound default argument) so a test can move the constant.
+
+    Reporting policy: every at/above-threshold sample is reported immediately —
+    a crossing is never deferred or aggregated away — while below-threshold
+    samples are throttled to one INFO per :data:`_LOOP_LAG_INFO_EVERY` samples
+    so the routine heartbeat matches ``_thread_monitor``'s ~60s cadence instead
+    of logging every sample.
+
+    A raising :func:`_loop_lag_iteration` is caught and logged rather than
+    allowed to end the loop, for the same reason :func:`_watchdog_thread_loop`
+    guards its ping (task 1731): a dead heartbeat is indistinguishable from a
+    healthy one, which is exactly the failure class this probe exists to close.
+    """
+    loop = asyncio.get_running_loop()
+    quiet_samples = 0
+    while True:
+        sample_interval = _LOOP_LAG_INTERVAL if interval is None else interval
+        started = loop.time()
+        await asyncio.sleep(sample_interval)
+        overshoot_ms = max(0.0, (loop.time() - started - sample_interval) * 1000)
+        crossed = overshoot_ms >= threshold_ms
+        quiet_samples += 1
+        if crossed or quiet_samples >= _LOOP_LAG_INFO_EVERY:
+            quiet_samples = 0
+            try:
+                _loop_lag_iteration(overshoot_ms, threshold_ms)
+            except Exception:
+                logger.exception(
+                    'loop_lag: heartbeat report failed (lag=%.1fms); continuing',
+                    overshoot_ms,
+                )
+
+
+def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
+    """Spawn the loop-lag heartbeat and RETURN its handle for teardown.
+
+    Returning the task is the load-bearing difference from the adjacent
+    ``_thread_monitor``, which is spawned with a bare unreferenced
+    ``asyncio.create_task``: an un-referenced task can be garbage-collected
+    mid-flight and emits a "Task was destroyed but it is pending" line on
+    shutdown. ``checkpoint_task`` is the correct in-file precedent — retain the
+    handle, then ``cancel()`` + ``await`` it in ``run_server``'s teardown.
+
+    The threshold is read from :class:`ServerConfig` (``loop_lag_warn_ms``)
+    rather than hardcoded, so an operator can tune it per box — across a
+    RESTART, exactly like the adjacent ``thread_warn_threshold``, which is
+    captured into a local the same way ``threshold_ms`` is below.
+
+    It is deliberately NOT hot-reloadable, and saying so here is the point:
+    ``server.loop_lag_warn_ms`` is absent from
+    :data:`fused_memory.config.reload.RELOADABLE_FIELDS`, so ``reload_config``
+    reports the leaf ``restart_required`` and leaves the running monitor
+    alone. It could not simply be allowlisted either — the value is captured BY
+    VALUE here and closed over by a task that runs for the process lifetime,
+    which is the "captured at construction" shape ``reload.py``'s docstring
+    names as the disqualifying condition. Promoting it to the green tier means
+    BOTH halves: pass the config object down and re-read the leaf per sample,
+    then add the allowlist entry with the live-consumer test its neighbours
+    carry.
+    """
+    threshold_ms = float(config.server.loop_lag_warn_ms)
+    return asyncio.create_task(
+        _loop_lag_monitor(threshold_ms=threshold_ms),
+        name='loop_lag_monitor',
+    )
 
 
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
@@ -1587,6 +1741,23 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
 
     store = TicketStore(data_dir / 'tickets.db')
     await store.initialize()
+    return store
+
+
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+    """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
+
+    Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the
+    store is. A :class:`~fused_memory.server.topic_cluster_store.TopicClusterStoreError`
+    from a corrupt row propagates on purpose, failing startup the way an
+    invalid config cluster does.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+
+    store = TopicClusterStore(data_dir / 'topic_clusters.db')
+    store.open()
     return store
 
 

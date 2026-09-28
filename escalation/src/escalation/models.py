@@ -679,6 +679,17 @@ class Escalation:
     # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
     pin_declared_by: list[str] = field(default_factory=list)
     pin_declared_reason: str = ''
+    # SUBJECT PROJECT (task 4951) — which project this record is ABOUT, on a
+    # queue shared across every project the factory operates: a structured
+    # fact instead of a `detail` line readers must parse back out (INV-2).
+    # `None` means UNSTAMPED — a legacy record, or a producer that does not
+    # set it — never "no project", so a reader must fall back rather than
+    # conclude anything from it.  The field-first reader is
+    # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
+    # Zero migration by the same from_dict __dataclass_fields__ filter as
+    # every field above.  Deliberately NOT added to
+    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
+    project_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

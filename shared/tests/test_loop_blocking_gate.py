@@ -1067,62 +1067,65 @@ class TestSweepIsNotVacuous:
         )
 
 
-class TestKnownSiteFloor:
-    """The four ``task_curator.py`` sites task 4484 confirmed by hand."""
+class TestScanHelperStaysInGateScope:
+    """The extracted archive scan must stay where this sweep can still see it.
 
-    # (qualname, callee) pairs, all in
-    # fused-memory/src/fused_memory/middleware/task_curator.py.
-    _CURATOR = 'fused-memory/src/fused_memory/middleware/task_curator.py'
+    Task 5550 moved the escalation-archive walk out of
+    ``reconciliation/harness.py`` into
+    ``fused_memory/reconciliation/escalation_archive.py``, and the ten
+    ``_escalate`` rows in the ledger survive only because the scanner can
+    follow ``_escalate -> _finding_recently_resolved -> ... -> read_text``
+    across that module boundary.  It can do so ONLY because the new module
+    sits under ``_SCOPE_PREFIX``: cross-module resolution sees nothing outside
+    the sweep's ``sources``.
 
-    # No in-flight task removes these two, so they are asserted unconditionally.
-    # Both are `async def _maybe_*` guards lazily loading a YAML registry off
-    # disk on the loop thread -- the same shape as their two siblings below,
-    # and NEITHER had a task filed before task 4484 found them.
-    _UNFILED = {
-        ('TaskCurator._maybe_blocklist_drop', 'load_blocklist'),
-        ('TaskCurator._maybe_route_deterministic', 'load_operational_registry'),
-    }
+    Relocating the helper into the ``escalation`` package -- its otherwise
+    natural home, right next to ``iter_all_escalation_paths`` -- would
+    therefore take that reach out of view entirely.  Nothing would break
+    loudly: the ten rows would go stale, ``test_no_stale_blessings`` would
+    demand their deletion as fixed, and the ledger would quietly lose coverage
+    of a defect (task 5270's) that nobody had fixed.  Moving blocking code out
+    of a guard's field of view is precisely the failure this guard exists to
+    catch, so the constraint is asserted rather than left in a comment.
 
-    # Task 4201 owns these two; when it lands they disappear, which must NOT
-    # turn this gate red.  Hence a subset check, never an equality.
-    _FILED_4201 = {
-        ('TaskCurator._maybe_premise_refuted_drop', 'load_premise_registry'),
-        ('TaskCurator._maybe_premise_refuted_drop', 'premise_refuted_entry'),
-    }
+    Asserted on ``(qualname, callee)`` pairs -- never a hash or a count -- so
+    that task 5270 legitimately removing these sites cannot turn the gate red
+    on success.
+    """
 
-    def _curator_sites(self, tree_scan):
+    _HARNESS = 'fused-memory/src/fused_memory/reconciliation/harness.py'
+
+    def _escalate_sites(self, tree_scan):
         return {
             (f.qualname, f.callee)
             for f in tree_scan.findings
-            if f.filename == self._CURATOR
+            if f.filename == self._HARNESS and f.callee == '_escalate'
         }
 
-    def test_unfiled_curator_sites_are_found(self, tree_scan):
-        """The two previously-UNFILED sites must be found by the live sweep.
+    def test_escalate_still_reaches_a_blocking_primitive(self, tree_scan):
+        """At least one coroutine must still reach a primitive via ``_escalate``."""
+        found = self._escalate_sites(tree_scan)
 
-        These are the ones that make task 4484's case: task 3778's census read
-        ``task_curator.py``'s neighbourhood as covered, task 4091 fixed one
-        sibling and task 4201 filed two more, and these two still had no task
-        at all.  A caller-side sweep names all four at once.
-        """
-        found = self._curator_sites(tree_scan)
-
-        assert found >= self._UNFILED, (
-            f'missing {sorted(self._UNFILED - found)} from {sorted(found)} -- '
-            f'the caller-side property regressed, or the sites were fixed '
-            f'without updating this floor.'
+        assert found, (
+            'no coroutine in reconciliation/harness.py is reported as reaching a '
+            'blocking primitive through _escalate. TWO VERY DIFFERENT CAUSES: if '
+            'task 5270 landed and offloaded _escalate, DELETE this floor entry '
+            'with it. If the reach vanished for any OTHER reason, the archive '
+            'scan helper has been moved out of _SCOPE_PREFIX (fused-memory/src/) '
+            '-- most likely into the escalation package next to '
+            'iter_all_escalation_paths -- the scanner can no longer follow into '
+            "it, and the ledger's ten _escalate rows are now lying about a "
+            'defect that is still live.'
         )
 
-    def test_surviving_4201_sites_are_still_dispositioned_filed(self, tree_scan):
-        """Whichever of 4201's sites remain must still be blessed as ``filed``.
+    def test_surviving_escalate_sites_are_still_dispositioned_filed(self, tree_scan):
+        """Whichever ``_escalate`` sites remain must still be blessed ``filed``.
 
-        A subset check is right -- when 4201 lands its sites disappear and this
-        gate must not go red -- but ``remaining <= found`` on an intersection is
-        a tautology and asserts nothing.  The falsifiable property is the one
-        that actually matters while 4201 is in flight: a site 4201 owns must
-        keep a ledger row saying so, rather than being quietly re-blessed as
-        ``accepted`` (a permanent waiver for a defect somebody is fixing) or
-        losing its row.
+        Same falsifiable property as the 4201 floor above: a site an in-flight
+        task owns must keep a row saying so, rather than being re-blessed as
+        ``accepted`` -- a permanent waiver for a defect somebody is fixing.
+        Task 5550 memoised their archive walk per run but left every miss
+        blocking, so they stay ``filed`` and stay 5270's.
         """
         filed_keys = {
             (relpath, qualname, content_hash)
@@ -1132,15 +1135,15 @@ class TestKnownSiteFloor:
 
         surviving = [
             f for f in tree_scan.findings
-            if f.filename == self._CURATOR and (f.qualname, f.callee) in self._FILED_4201
+            if f.filename == self._HARNESS and f.callee == '_escalate'
         ]
         undispositioned = sorted(
             (f.qualname, f.callee) for f in surviving if site_key(f) not in filed_keys
         )
 
         assert undispositioned == [], (
-            f'task 4201 owns {undispositioned}, but the ledger no longer carries '
-            f'a "filed" row for them. If 4201 landed, DELETE the rows (and this '
+            f'task 5270 owns {undispositioned}, but the ledger no longer carries '
+            f'a "filed" row for them. If 5270 landed, DELETE the rows (and this '
             f'floor entry); do not downgrade them to "accepted", which turns a '
             f'defect someone is fixing into a permanent waiver.'
         )

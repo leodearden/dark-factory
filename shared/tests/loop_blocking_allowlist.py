@@ -82,7 +82,9 @@ blindness that produced the misses above.
 ROW PER SITE, TRIAGE PER CAUSE.  Where a cluster shares one root cause -- the
 22 MCP handlers reaching the cached ``resolve_main_checkout``, every async
 caller of ``ReconciliationHarness._escalate`` -- every row carries the SAME
-justification naming that shared cause and its single follow-up.  The ledger
+justification naming that shared cause and its single follow-up -- held in
+one named constant where a cluster's text has had to change after filing
+(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  The ledger
 stays row-per-site so a 23rd handler cannot be added silently under a blessed
 22; the triage stays cluster-per-defect so the follow-ups are one task per
 defect rather than one per line.
@@ -118,6 +120,37 @@ DISPOSITIONS = frozenset({
     'to_file',   # confirmed defect; a task 4484 step-9 ticket is named
 })
 
+#: The shared justification of every ``ReconciliationHarness._escalate`` row.
+_ESCALATE_ARCHIVE_SCAN_WHY = (
+    'ROOT CAUSE (one defect, 10 rows): the sync '
+    'ReconciliationHarness._escalate reaches '
+    '_finding_recently_resolved, which read_texts EVERY escalation '
+    'record under the queue root AND its archive -- a fan-out on '
+    'the loop thread whose cost grows with queue history, so this '
+    'trips INV-8\'s fan-out limb as well as its blocking limb. '
+    '10 async callers, one fix (offload _escalate, or pre-fetch '
+    'resolved_fps once per cycle -- the resolved_fps kwarg already '
+    'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550: '
+    '_run_remediation_pass builds its per-pass resolved_fps in a '
+    'worker thread, and the fallback scan moved into '
+    'reconciliation/escalation_archive.py behind a one-slot memo '
+    'keyed on run_id, so consecutive _escalate calls within one run '
+    'share one walk. That bounds REPETITION only while no other '
+    "run's _escalate interleaves (another key evicts the slot), and "
+    'every miss still walks the whole archive inline: _escalate is '
+    'still sync -- which is why these ten rows stay `filed` with '
+    'their original hashes rather than being deleted as fixed. '
+    'The helper deliberately '
+    'lives under fused-memory/src/ so the scanner can still follow '
+    'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
+    'BY TASK 5270, which owns the full offload -- do not file '
+    'again: task 4484 step-9\'s ticket '
+    'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
+    'into 5270. 5072\'s text counts 9 callers; the 10th, '
+    '_maybe_remediate\'s phantom-citation storm alarm, landed later '
+    'with task 4781.'
+)
+
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
 AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
 
@@ -136,46 +169,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
         'never enumerated. Follow-up filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
-    ),
-
-    # ---- middleware/task_curator.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/task_curator.py',
-        'TaskCurator._maybe_blocklist_drop',
-        '8e71fbf93a3e',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the two SIBLING async def '
-        '_maybe_* guards in this file lazily load a YAML registry off disk '
-        'on the loop thread with no asyncio.to_thread hop -- '
-        '_maybe_blocklist_drop -> load_blocklist '
-        '(cancelled_premise_blocklist.read_text + yaml.safe_load) and '
-        '_maybe_route_deterministic -> load_operational_registry '
-        '(operational_ask_registry.read_text + yaml.safe_load). Identical '
-        'shape to the two task 4201 owns, three lines apart, under the same '
-        'curator write lock -- and NEITHER had a task filed before task '
-        '4484 found them, which is the concrete cost of task 3778\'s '
-        'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).'
-        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
-    ),
-    (
-        'fused-memory/src/fused_memory/middleware/task_curator.py',
-        'TaskCurator._maybe_route_deterministic',
-        '0f0498be8607',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the two SIBLING async def '
-        '_maybe_* guards in this file lazily load a YAML registry off disk '
-        'on the loop thread with no asyncio.to_thread hop -- '
-        '_maybe_blocklist_drop -> load_blocklist '
-        '(cancelled_premise_blocklist.read_text + yaml.safe_load) and '
-        '_maybe_route_deterministic -> load_operational_registry '
-        '(operational_ask_registry.read_text + yaml.safe_load). Identical '
-        'shape to the two task 4201 owns, three lines apart, under the same '
-        'curator write lock -- and NEITHER had a task filed before task '
-        '4484 found them, which is the concrete cost of task 3778\'s '
-        'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).'
-        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
     ),
 
     # ---- middleware/ticket_janitor.py ----
@@ -264,7 +257,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
-        '1939296ee9cb',
+        '0d761c10e563',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
         'its escalation records on the loop thread -- on_judge_unhalt '
@@ -341,195 +334,74 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_stale_runs',
         '0787c60051a4',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_stale_runs',
         'cc7999e2d4b6',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._resume_interrupted_runs',
         'bc3672ec502c',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness.run_full_cycle',
         '6770f1ceabc5',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_escalate_stale_task_count_snapshot',
         '560696057da1',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '1fbc50761be3',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '51ec3ffac666',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '82d9ae32fa2a',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        'ae4cd95f45ad',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
-        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
         'c5a47e52ad4b',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
+        'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
+        'orchestrator state files inline on the loop thread '
+        '(read_scheduler_state -> read_bytes and orchestrator_started_at '
+        '-> read_text). Filesystem, the limb task 3778\'s subprocess-only '
+        'vocabulary omitted; distinct from the _escalate cluster in the '
+        'same file. Follow-up filed by task 4484 step-9. A third row '
+        '(ae4cd95f45ad) was counted here until task 5550 and did not '
+        'belong: the scanner placed it at the escalation-archive read_text '
+        'in the resolved_fps build, not at an orchestrator state file. '
+        '5550 offloaded that scan via asyncio.to_thread, the finding went '
+        'stale, and the row was deleted with the fix -- these two survive '
+        'unfixed.'
         ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
@@ -537,64 +409,19 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         '9e5ae6eb2503',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
+        'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
+        'orchestrator state files inline on the loop thread '
+        '(read_scheduler_state -> read_bytes and orchestrator_started_at '
+        '-> read_text). Filesystem, the limb task 3778\'s subprocess-only '
+        'vocabulary omitted; distinct from the _escalate cluster in the '
+        'same file. Follow-up filed by task 4484 step-9. A third row '
+        '(ae4cd95f45ad) was counted here until task 5550 and did not '
+        'belong: the scanner placed it at the escalation-archive read_text '
+        'in the resolved_fps build, not at an orchestrator state file. '
+        '5550 offloaded that scan via asyncio.to_thread, the finding went '
+        'stale, and the row was deleted with the fix -- these two survive '
+        'unfixed.'
         ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        'c65b42126493',
-        'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
-        'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
-        'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
-        'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
-        'its Part 2 makes is_workflow_live_for_task async and '
-        'propagates that to every consumer, naming '
-        '_render_live_workflow_section, '
-        'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
-        'consumers still block but carry no row: task 4708 routed them '
-        'through getattr(self, section.renderer)() in '
-        '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        'a6c8a890e63e',
-        'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
-        'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
-        'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
-        'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
-        'its Part 2 makes is_workflow_live_for_task async and '
-        'propagates that to every consumer, naming '
-        '_render_live_workflow_section, '
-        'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
-        'consumers still block but carry no row: task 4708 routed them '
-        'through getattr(self, section.renderer)() in '
-        '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -619,42 +446,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         'dbf8ae2eb1dc',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
         '1812aa52aaca',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive via '
-        'iter_all_escalation_paths -- an UNBOUNDED per-call fan-out on '
-        'the loop thread, so this trips INV-8\'s fan-out limb as well '
-        'as its blocking limb, and the cost grows with queue history '
-        'rather than staying constant. 10 async callers, one fix '
-        '(offload _escalate, or pre-fetch resolved_fps once per cycle '
-        '-- the resolved_fps kwarg already exists for exactly that). '
-        'OWNED BY TASK 5270 -- do not file again: task 4484 step-9\'s '
-        'ticket tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, '
-        'coalesced into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
 
     # ---- reconciliation/stages/task_knowledge_sync.py ----
@@ -669,31 +468,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'makes it cold-miss-only. Filed together with that cluster by task '
         '4484 step-9, since one fix closes both.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
-        'TaskKnowledgeSync.assemble_payload',
-        '999e4ab43b34',
-        'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
-        'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
-        'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
-        'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
-        'its Part 2 makes is_workflow_live_for_task async and '
-        'propagates that to every consumer, naming '
-        '_render_live_workflow_section, '
-        'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
-        'consumers still block but carry no row: task 4708 routed them '
-        'through getattr(self, section.renderer)() in '
-        '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
     ),
 
     # ---- reconciliation/stale_priority_override_edge_sweep.py ----
@@ -736,6 +510,25 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'tool call the model chooses to make -- an LLM-driven, unbounded '
         'call count. Follow-up filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ.',
+    ),
+
+    # ---- services/live_workflow_detector.py ----
+    (
+        'fused-memory/src/fused_memory/services/live_workflow_detector.py',
+        'detect_live_workflow',
+        'b9609c7cf5b4',
+        'accepted',
+        'ACCEPTED, measured cheap: is_orchestrator_live_for is one '
+        'read_text of the small data/orchestrator/orchestrator.lock file '
+        'plus an os.kill(pid, 0) probe -- no subprocess -- measured at '
+        '~41us/call (2000 calls against the live dark-factory lock, task '
+        '3778 merge resolution). It is reached only as the fallback when '
+        'the caller did not hoist the project-wide signal: the Live-'
+        'Workflow Signals renderer threads it once per render, so this '
+        'runs at most once per per-call detector use (harness gate, '
+        'recon_write_policy Gate 2), not once per task in a fan-out. The '
+        'row surfaced only because task 3778 made detect_live_workflow a '
+        'coroutine; its git probes, the real cost, are awaited.',
     ),
 
     # ---- server/main.py ----

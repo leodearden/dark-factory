@@ -317,13 +317,16 @@ class TestBurnTabSmoothingChip:
 
 class TestVelocitySparkWiring:
     def test_net_velocity_tile_uses_derive(self, tabs_jsx_body):
-        """Net velocity StatTile spark must use deriveVelocitySeries, not raw b.done.
+        """Net velocity StatTile history must use deriveVelocitySeries, not raw b.done.
 
-        The regex ties the tile's label attribute to its spark attribute within the
-        same element, so the test fails if the Net velocity tile reverts to spark={b.done}.
+        The regex ties the tile's label attribute to its history attribute within the
+        same element, so the test fails if the Net velocity tile reverts to
+        history={b.done}.  The prop was named `spark` until task 5588 renamed it
+        `history` — the series is the tile's PAST, and `spark` named the drawing
+        rather than the data beside a `datum` that carries the present value.
         """
         assert re.search(
-            r'label=["\']Net velocity["\'].*?spark=\{deriveVelocitySeries\(',
+            r'label=["\']Net velocity["\'].*?history=\{deriveVelocitySeries\(',
             tabs_jsx_body,
             re.DOTALL,
         )
@@ -381,13 +384,14 @@ class TestVelocitySparkWiring:
             )
 
     def test_completed_window_tile_stays_cumulative(self, tabs_jsx_body):
-        """'Completed (window)' tile spark must remain on raw b.done.
+        """'Completed (window)' tile history must remain on raw b.done.
 
-        Ties the label and spark attributes within the same element so that
+        Ties the label and history attributes within the same element so that
         a regression swapping this tile to deriveVelocitySeries is caught.
+        (`spark` -> `history`: see the Net velocity test above.)
         """
         assert re.search(
-            r'label=["\']Completed \(window\)["\'].*?spark=\{b\.done\}',
+            r'label=["\']Completed \(window\)["\'].*?history=\{b\.done\}',
             tabs_jsx_body,
             re.DOTALL,
         )

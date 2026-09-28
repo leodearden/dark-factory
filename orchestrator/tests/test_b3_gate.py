@@ -167,7 +167,7 @@ class TestStateLoadSave:
 
     def test_save_uses_atomic_replace(self, tmp_path, monkeypatch):
         """Verify os.replace is called (atomic swap), not a direct write."""
-        from orchestrator import b3_gate
+        from orchestrator.b3_gate import _save_state
         replaced = []
         real_replace = os.replace
 
@@ -177,7 +177,7 @@ class TestStateLoadSave:
 
         monkeypatch.setattr(os, 'replace', mock_replace)
         path = tmp_path / 'b3-state.json'
-        b3_gate._save_state(path, {'launches': [], 'charges': []})
+        _save_state(path, {'launches': [], 'charges': []})
         assert len(replaced) == 1, 'expected exactly one os.replace call'
         src, dst = replaced[0]
         assert dst == str(path) or Path(dst) == path

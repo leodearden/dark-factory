@@ -49,7 +49,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from shared.cli_invoke import transcript_exists
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -169,17 +169,29 @@ def _attach_pool(harness: Harness, size: int = 2) -> WarmLanePool:
     return pool
 
 
-def _make_transcript(base: Path, session_id: str) -> Path:
-    """Create ``<base>/claude-config-<sid>/projects/<slug>/<sid>.jsonl`` and
-    return the ``claude-config-<sid>`` dir.
+def _make_transcript(base: Path, session_id: str, *, task_id: str) -> Path:
+    """Create ``<base>/<CONFIG_DIR_PREFIX><task_id>/projects/<slug>/<sid>.jsonl``
+    and return the config dir.
 
-    Mirrors test_crash_recovery.py. Recovery globs
-    ``<entry>/.task/claude-config-*`` at boot and ``transcript_exists`` re-globs
-    ``<cfg>/projects/*/<sid>.jsonl`` at dispatch — placing the transcript under
-    the lane's ``.task/`` satisfies BOTH the boot glob and the dispatch re-glob,
-    so a composed recover→dispatch reaches the EMPTY reason set (task 3728
-    replaced the predicate's ``(True, 'eligible')`` tuple with a composite
-    ``frozenset``; ``not reasons`` is now the eligibility predicate itself).
+    The dir stem and the transcript filename are DIFFERENT IDENTITIES and must
+    not be conflated: the dir is named after the TASK, the ``.jsonl`` inside it
+    after the SESSION. That is what production creates —
+    ``shared/src/shared/config_dir.py::TaskConfigDir.__init__`` builds
+    ``base / f'{CONFIG_DIR_PREFIX}{task_id}'``, reached from
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+    ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
+
+    Recovery resolves that dir by DERIVING it from the adopted task id, and
+    ``transcript_exists`` re-globs ``<cfg>/projects/*/<sid>.jsonl`` at dispatch
+    — so placing the transcript under the lane's ``.task/`` with the
+    production dir name satisfies BOTH the boot resolution and the dispatch
+    re-glob, and a composed recover→dispatch reaches the EMPTY reason set
+    (task 3728 replaced the predicate's ``(True, 'eligible')`` tuple with a
+    composite ``frozenset``; ``not reasons`` is now the eligibility predicate
+    itself).
+
+    ``CONFIG_DIR_PREFIX`` is imported rather than restated so the creator and
+    this fixture provably share one string (INV-5).
 
     NOTE WHAT THIS SHAPE IS AND IS NOT (task 3730). It is a LIVE config dir,
     which production DELETES on every crash-recovery path —
@@ -190,7 +202,7 @@ def _make_transcript(base: Path, session_id: str) -> Path:
     fleet actually presents; the ``delta_`` rows below deliberately do NOT call
     it, and corroborate from the durable archive instead.
     """
-    cfg = base / f'claude-config-{session_id}'
+    cfg = base / f'{CONFIG_DIR_PREFIX}{task_id}'
     proj = cfg / 'projects' / 'some-slug'
     proj.mkdir(parents=True, exist_ok=True)
     (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
@@ -298,7 +310,7 @@ def _setup_warm_lane_session(
             age_secs=age_secs,
         )))
     if with_transcript:
-        _make_transcript(task_dir, session_id)
+        _make_transcript(task_dir, session_id, task_id=task_id)
     return wt
 
 
@@ -367,6 +379,21 @@ async def _dispatch_capture(
         initial_plan=kwargs['initial_plan'],
         emits=_session_resume_emits(harness),
     )
+
+
+def _adopt_side(harness: Harness, task_id: str) -> tuple[dict, str | None]:
+    """The ADOPT-side (β) state a B-family test reads back after recovery.
+
+    Asserts the session and its plan were recovered, and returns
+    ``(recovered_plan, stashed_config_dir)`` — the stash being ``None`` when
+    boot corroborated no transcript for *task_id*. One named seam for the three
+    internal maps the family reads, so a new member of the family restates none
+    of them and a change to that state has one place to follow.
+    """
+    plans = harness._recovered_plans
+    assert task_id in harness._recovered_sessions
+    assert task_id in plans
+    return plans[task_id], harness._recovered_session_config_dirs.get(task_id)
 
 
 def _seed_lane_record(
@@ -444,7 +471,7 @@ async def _make_real_git_lane(
         session_id, role, task_id=task_id, fresh=True,
         sidecar_version=2, resume_count=0,
     )))
-    _make_transcript(task_dir, session_id)
+    _make_transcript(task_dir, session_id, task_id=task_id)
     # Durable ASSIGNED record → record-driven adopt path (branchless).
     _seed_lane_record(
         harness.git_ops._lane_lifecycle, lane, task_id=task_id, branch=None,
@@ -1500,10 +1527,8 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     await harness._recover_crashed_tasks()
 
     # ── ADOPT side (β): session + plan recovered; NO config-dir corroboration ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_plans
-    assert task_id not in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is None
 
     # ── INJECT side (γ): corroboration fails → fallback, plan kept ──
     cap = await _dispatch_capture(harness, task_id)
@@ -1541,17 +1566,18 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
     _arm_storm_queue(harness)
 
+    # No archive: since δ 'reseeded' is the no-archive arm — see B5's control note.
+    harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
     await harness._recover_crashed_tasks()
 
     # ── ADOPT side (β): the transcript corroborated, so a config dir IS stashed ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is not None
 
     # The next acquire re-seeds the lane from base, wiping .task/ wholesale —
     # the stashed config dir now points at a path that no longer exists.
     shutil.rmtree(lane / '.task')
-    assert not Path(harness._recovered_session_config_dirs[task_id]).exists()
+    assert not Path(stashed).exists()
 
     # ── INJECT side (γ): expected fallback — event yes, escalation no ──
     cap = await _dispatch_capture(harness, task_id)
@@ -1562,6 +1588,100 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reasons'] == ['reseeded']
     assert _filed(harness) == []
+
+
+# ── B4'': a FOREIGN config dir is the only candidate → accounted-for loss ────
+@pytest.mark.asyncio
+async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
+    harness: Harness,
+):
+    """B4'' — the lane holds a config dir that is NOT this session's, and the
+    loss is now ACCOUNTED FOR instead of silent (task 3620).
+
+    The third member of the B4 family, and the one that used to be invisible.
+    B4 has NO candidate (nothing stashed, quiet by design); B4' has the RIGHT
+    candidate, later wiped (`reseeded`, quiet by design). Here exactly one
+    candidate exists and it belongs to someone else —
+    ``claude-config-<task_id>-unblock``, the real name produced by
+    ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``. That
+    is the ``.worktrees/3464`` shape, reproduced as a fixture because the live
+    dir has since been reaped (measured 2026-09-03).
+
+    Before task 3620 the resolver globbed ``claude-config-*``, found exactly
+    one, and stashed it — no ``> 1`` warning fired, the dispatch-time re-glob
+    found nothing, and the session degraded to ``no_transcript`` with ZERO
+    operator signal.
+
+    The ``-unblock`` dir deliberately CONTAINS a real transcript for this very
+    session id. That is what makes the gate non-vacuous: it proves the resolver
+    refuses on the NAME, not merely because no transcript existed anywhere. A
+    resolver that always returned "not found" would pass the assertions below
+    without it.
+
+    Two-way, across the real boot→dispatch seam: adoption genuinely happened
+    (the session and plan are recovered and the plan flows through as
+    ``initial_plan``), the boot side refused to stash and SAID SO — one
+    structured event plus one L1 under its own sentinel — and the dispatch side
+    independently degraded to ``no_transcript``. D7 is pinned end-to-end: the
+    fallback-storm streak is untouched and nothing was filed under the storm
+    sentinel, because the ambiguity is detected at BOOT while the streak is only
+    touched at DISPATCH.
+    """
+    task_id, session_id = '3464', 'uuid-b4c-foreign-dir'
+    lane = _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_transcript=False,
+    )
+    # A dir that HOLDS a real transcript for this session, under a name that is
+    # not this session's — built via the real creator, so the refusal is proven
+    # against a genuine non-owner rather than a hand-spelled string.
+    unblock = TaskConfigDir(f'{task_id}-unblock', base_dir=lane / '.task')
+    proj = unblock.path / 'projects' / 'some-slug'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
+    assert transcript_exists(unblock.path, session_id)
+    expected_dir = lane / '.task' / f'{CONFIG_DIR_PREFIX}{task_id}'
+    assert not expected_dir.exists()
+
+    harness.config.session_resume = SessionResumeConfig()
+    queue = harness._escalation_queue = _storm_queue()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session adopted, but NOTHING stashed ──
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is None
+
+    # ── The signal that used to be missing ──
+    # Read off event_store directly: `_session_resume_emits` filters to the
+    # three dispatch-guard members, so the ambiguity event never appears in
+    # `cap.emits` and this module's existing `len(cap.emits) == 1` assertions
+    # are unaffected.
+    ambiguous = [
+        call.kwargs for call in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
+        if call.args and call.args[0] == EventType.session_config_dir_ambiguous
+    ]
+    assert len(ambiguous) == 1
+    assert ambiguous[0]['data']['expected'] == str(expected_dir)
+    assert ambiguous[0]['data']['found'] == [str(unblock.path)]
+    assert queue.submit.call_count == 1
+    filed = queue.submit.call_args.args[0]
+    assert filed.task_id == Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
+
+    # ── INJECT side (γ): the degradation still happens, now accounted for ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    assert 'no_transcript' in kwargs['data']['reasons']
+
+    # ── D7 end-to-end: the boot-time signal never feeds the dispatch streak ──
+    assert harness._session_resume_fallback_streak == 0
+    filed_under = [
+        c.args[0].task_id for c in queue.submit.call_args_list
+    ]
+    assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
 
 
 # ── B5: stale sidecar beyond the freshness window ────────────────────────────
@@ -1583,6 +1703,12 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
         harness, task_id, session_id, role='implementer', fresh=False,
     )
     harness.config.session_resume = SessionResumeConfig()
+
+    # The NO-ARCHIVE control (test_delta_b8 names this row as exactly that).
+    # Since δ (task 3730) 'stale' is the old-AND-unreachable arm, and with the
+    # production dir name (task 3620) the boot sweep would otherwise archive
+    # this live transcript under the task key and redeem the session.
+    harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
 
     rec = await _recover(harness, task_id)
 
@@ -1835,6 +1961,8 @@ async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
     _arm_storm_queue(harness)
 
+    # No archive: since δ 'stale' is the no-archive arm — see B5's control note.
+    harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
     # 1st stale dispatch — REAL recovery → adopt → stale fallback.
     _setup_warm_lane_session(harness, 'st0', 'uuid-st0', fresh=False)
     await harness._recover_crashed_tasks()
@@ -2472,6 +2600,10 @@ async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
     """
     base = SessionResumeConfig(fallback_storm_threshold=1)
     _arm_storm_queue(harness)
+    # No archive, for BOTH loops: 'stale'/'reseeded' are δ's no-archive arms and
+    # the arm site's 'miss' needs an archive that genuinely holds nothing — see
+    # B5's control note.
+    harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
 
     # ── the HARNESS guard: one cold worktree per by-design reason ──
     day = 86400

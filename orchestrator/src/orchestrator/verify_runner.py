@@ -81,6 +81,7 @@ __all__ = [
     # INV-2 (task 2884) — contract-currency auto-sync at dispatch
     "SyncOutcome",
     "REMOTE_LIVENESS_CMD",
+    "REMOTE_TOOL_PATH_PRELUDE",
     "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -1029,6 +1030,11 @@ _SSH_BASE_OPTS = [
 # git, or a worktree — so the probe is side-effect-free and cheap.
 REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
 
+# A plain (non-login) ssh shell gets sshd's default PATH, which omits the uv
+# installer's ~/.local/bin (and its older ~/.cargo/bin).  $HOME expands on the
+# REMOTE side, so this is never passed through shlex.quote.
+REMOTE_TOOL_PATH_PRELUDE = 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+
 
 def _sanitize_runner_name(name: str) -> str:
     """Sanitize a runner name for filesystem use in archive filenames.
@@ -1403,7 +1409,9 @@ class RemoteRunner:
         bb834dd42a).  Different AND the remote does not match origin ⇒ emit
         ``runner_stale`` and, serialised on the per-runner lock and only when NO
         verify is in flight (never ``git pull`` under a live verify), run ``git
-        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout,
+        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout
+        (prefixed with ``REMOTE_TOOL_PATH_PRELUDE`` so the non-login ssh shell
+        finds ``uv``),
         then ASSERT the checkout is still runnable via ``REMOTE_LIVENESS_CMD``
         over ssh, emitting ``runner_synced`` (kind='df_checkout') on success.
 
@@ -1549,7 +1557,8 @@ class RemoteRunner:
                 # uses in dark-factory-orchestrator.yaml.
                 uv_rc, _, uv_err = await self._run(
                     ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                     f'cd {shlex.quote(df_remote)} && uv sync --all-packages'],
+                     f'cd {shlex.quote(df_remote)} && '
+                     f'{REMOTE_TOOL_PATH_PRELUDE} uv sync --all-packages'],
                 )
                 if uv_rc != 0:
                     return SyncOutcome(

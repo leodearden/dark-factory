@@ -126,9 +126,12 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_retired_derived_topic_ids,
+    resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
+from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
 from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
@@ -161,6 +164,12 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
     make_commit_probe,
     verify_claims,
+)
+from fused_memory.services.consolidation_ops import (
+    RetainArmRefused,
+    apply_retain_arm,
+    patch_memory_metadata,
+    read_topic_closure,
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.read_telemetry import (
@@ -607,16 +616,6 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 
 
 _UPDATE_MEMORY_MODES = ('merge', 'replace')
-
-#: How many topic members ``consolidate_memories`` lists back as the
-#: post-consolidation closure.
-#:
-#: A topic is a duplicate CLUSTER, so a conforming one is single digits and
-#: this bound is never reached; it exists so a topic that has become a
-#: dumping ground cannot return an unbounded payload. Reaching it is itself
-#: a finding, which is why the envelope discloses ``topic_members_truncated``
-#: rather than letting a capped listing read as the whole closure.
-_TOPIC_MEMBER_LIMIT = 200
 
 #: ``consolidate_memories``' audit tag, used as BOTH the delete's ``_source``
 #: and the tombstone's ``deleter`` — the idiom the two recon sweeps follow
@@ -1165,6 +1164,7 @@ def create_mcp_server(
     event_queue: EventQueue | None = None,
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
+    topic_cluster_store: TopicClusterStore | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -3684,7 +3684,9 @@ def create_mcp_server(
             # TOPIC-keyed rather than category-keyed: unlike the cosine guard
             # below, this check is not scoped to a single category — it covers
             # every category in _TOPIC_GUARD_GATED_CATEGORIES.
-            topic_clusters = resolve_topic_guard_clusters(memory_service)
+            topic_clusters = resolve_topic_guard_clusters(
+                memory_service, runtime_store=topic_cluster_store, project_id=project_id
+            )
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
@@ -5656,6 +5658,13 @@ def create_mcp_server(
             would invite a retry of a COMPLETED merge — re-writing a
             canonical whose supersedes are already gone, the exact ratchet
             this op ends.
+
+            ``topic_cluster_seed`` is present only when a topic-cluster store
+            is wired: the outcome (``seeded``/``skipped``/``failed``/
+            ``disabled``) of teaching the write-time topic guard this topic,
+            outside the status rule for the tombstone counts' reason.
+            ``disabled`` covers both the global switch and a topic retired
+            for this project.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
@@ -5707,7 +5716,7 @@ def create_mcp_server(
         if err:
             return err
         # LOAD-BEARING, unlike add_episode's defensive strip: `cleaned_meta` is
-        # the BASE of `canonical_meta` below, so without this the write-time
+        # the BASE of the canonical's own metadata, so without this the write-time
         # control flag is written into the one record this IRREVERSIBLE op
         # creates to outlive the whole cluster it folds. The boundary guard
         # cannot do this for us — MarkupGuardMiddleware._apply_override
@@ -5721,58 +5730,6 @@ def create_mcp_server(
         # another persistence path off `cleaned_meta`.
         metadata = strip_markup_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
-
-        # ONE call-and-classify block for EVERY metadata patch this op makes:
-        # the retain-arm tag, the child reparent, and the canonical's
-        # supersedes correction. Extracted rather than copied because the
-        # contract it encodes is non-obvious and identical at all three sites
-        # (INV-5: two copies would have to stay in lockstep, and a drift
-        # between them would be silent, since both halves would still
-        # "work").
-        #
-        # THE CONTRACT, in one place: `update_memory` reports MemoryNotFound
-        # and its authorization refusals by RETURNING {'error_type': ...},
-        # while every OTHER failure goes through `_journaled_backend_call`,
-        # which logs and RE-RAISES. Code that guarded only exceptions would
-        # record a refusal as a success; code that guarded only the returned
-        # shape would let one Qdrant timeout escape to `@mcp_tool_errors`,
-        # which flattens the whole envelope to {'error', 'error_type'} —
-        # destroying the per-id dispositions of records that are ALREADY
-        # IRREVERSIBLY DELETED and skipping their tombstone write. So both
-        # shapes are handled, and they collapse to the same per-id verdict.
-        #
-        # Returns None on success, or the normalized {'error', 'error_type'}
-        # failure dict each arm decorates with its own keys (`id`, or
-        # `child_id`/`from`/`to`).
-        async def _patch_metadata(
-            memory_id: str, patch: dict[str, Any]
-        ) -> dict[str, Any] | None:
-            try:
-                outcome = await memory_service.update_memory(
-                    memory_id=memory_id,
-                    project_id=project_id,
-                    # No content, ever: this op stamps metadata and writes new
-                    # records; it never rewrites an existing record's text, so
-                    # nothing is re-embedded and no vector moves.
-                    content=None,
-                    metadata_patch=patch,
-                    metadata_mode='merge',
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    causation_id=causation_id,
-                    _source=source,
-                )
-            except Exception as exc:
-                # `Exception`, not `BaseException`: a process going away
-                # (CancelledError/KeyboardInterrupt/SystemExit) must never be
-                # recorded as a per-id disposition.
-                return {'error': str(exc), 'error_type': type(exc).__name__}
-            if isinstance(outcome, dict) and outcome.get('error_type'):
-                return {
-                    'error': outcome.get('error'),
-                    'error_type': outcome.get('error_type'),
-                }
-            return None
 
         # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
         # `delete_memory` runs, in its non-mutating `scan_only` mode, reached
@@ -5823,57 +5780,34 @@ def create_mcp_server(
                 'hint': _CONSOLIDATE_GATE_HINT,
             }
 
-        # (4) The canonical FIRST, and NO delete or metadata patch may appear
-        # above this point in the body. The ordering IS the anti-ratchet
-        # property, and it is asymmetric on purpose:
+        # (4)+(5a) THE RETAIN ARM's writes: mint the canonical, tag the
+        # retained peers. The auto-consolidation executor reaches the same
+        # function through `execute_retain_consolidation`, so the two
+        # callers cannot drift.
         #
-        #   delete-then-write, on a failed write  -> net LOSS, unrecoverable
-        #                                            (no write path reaches a
-        #                                            deleted point id)
-        #   write-then-delete, on a failed delete -> net ADD, reportable in
-        #                                            `failed_deletes` and
-        #                                            re-runnable
-        #
-        # This order makes the first outcome impossible and the second
-        # visible. `CanonicalUniquenessViolation` and
-        # `MemoryMetadataValidationError` are left to propagate to
-        # `@mcp_tool_errors`: the op refused before touching anything, so
-        # there is no partial state to describe and the flattened
-        # {'error', 'error_type'} envelope is the whole truth.
-        canonical_meta = dict(cleaned_meta or {})
-        canonical_meta.update({
-            'topic': topic,
-            'canonical': True,
-            'supersedes': list(supersedes_ids),
-        })
-        written = await memory_service.add_memory(
-            content=canonical_content,
-            category=category,
+        # A refusal is returned UNCHANGED: every one is decided before any
+        # peer is read or patched, so there is no partial state for this
+        # body to describe.
+        retain_arm = await apply_retain_arm(
+            memory_service,
             project_id=project_id,
+            topic=topic,
+            canonical_content=canonical_content,
+            retain_ids=retain_ids,
+            category=category,
             agent_id=agent_id,
-            session_id=session_id,
-            metadata=canonical_meta,
-            causation_id=causation_id,
-            _source=source,
-        )
-        # `AddMemoryResponse` is a pydantic model whose `memory_ids` can come
-        # back EMPTY without raising — a write that landed nothing while
-        # reporting no failure. Indexing it blindly would either raise an
-        # IndexError flattened into an unreadable error, or (worse, had this
-        # been a dict lookup) carry a None canonical id into the delete loop
-        # and reap a live cluster in favour of a record that does not exist.
-        canonical_id = written.memory_ids[0] if written.memory_ids else None
-        if not canonical_id:
-            return {
-                'error': (
-                    'consolidate_memories: the canonical write returned no memory '
-                    'id, so nothing was deleted. The supersedes are untouched — '
-                    're-run once the write path is healthy.'
-                ),
-                'error_type': 'CanonicalWriteFailed',
-                'topic': topic,
+            run_id=run_id,
+            extra_canonical_meta={
+                **(cleaned_meta or {}),
                 'supersedes': list(supersedes_ids),
-            }
+            },
+            session_id=session_id,
+            causation_id=causation_id,
+            source=source,
+        )
+        if isinstance(retain_arm, RetainArmRefused):
+            return retain_arm.response
+        canonical_id = retain_arm.canonical_id
 
         # (3b) The MUTATING repoint pass, now that the replacement EXISTS.
         # The canonical satisfies the gate's "the replacement must not be a
@@ -5910,103 +5844,6 @@ def create_mcp_server(
                 # dangling override — it always has a replacement.
                 citation_repoint[supersede_id] = {**stats, 'outcome': 'repointed'}
 
-        # (5a) THE RETAIN ARM — the ratified default (gate 3200). Each peer
-        # is TAGGED IN PLACE: it keeps its Qdrant point id, so every citation,
-        # parent pointer and supersedes edge already aimed at it stays valid.
-        # That id stability is the entire reason the arm exists; a
-        # delete-and-rewrite peer would drop every inbound reference and
-        # could not be restored, since no write path reaches a deleted point.
-        #
-        # `content=None` is the same property one level down: a peer whose
-        # claim did not change must not be re-embedded, so its vector does
-        # not move either. Metadata is MERGED and nothing is deleted — the
-        # peer's own source/run_id/parent are not this op's to discard.
-        #
-        # `topic` ONLY. Never `canonical` (exactly one per (project, topic) —
-        # a second claimant would make the next consolidation of this topic
-        # refuse outright) and never `parent_id` (these are PEERS of the
-        # canonical, not children of it).
-        #
-        # Task 3523 is the live seam here: `update_memory` does not run
-        # `_apply_memory_metadata_validation`, so this slug is not
-        # re-validated at the patch seam. It is validated at op entry
-        # instead, which bounds the hole for this caller without closing it.
-        #
-        # THAT SAME SEAM IS WHY NOT SETTING `canonical` IS NOT ENOUGH. The
-        # patch is a server-side Qdrant payload MERGE, so a peer that ALREADY
-        # carries `canonical: True` keeps it and is now paired with the new
-        # `topic` — a second claimant for (project, T), minted without a
-        # rejection, a census line, or a `retain_failures` entry, because
-        # `_apply_canonical_uniqueness` is reached only from the `add_memory`
-        # path. Not setting a key and ensuring it is unset are different
-        # claims, and only the second one holds the invariant.
-        #
-        # This is REACHABLE THROUGH THE DEFAULT ARM, not through misuse: the
-        # ratchet this op exists to end is precisely "a cluster ends up
-        # containing the consolidator's own prior canonicals", so a cluster
-        # under consolidation routinely contains one, and retaining it is the
-        # natural call when its content is still correct and cited. The damage
-        # lands on the NEXT pass, which is the worst time to find it: the
-        # follow-up consolidation of T fails its own canonical write.
-        retained: list[str] = []
-        retain_failures: list[dict[str, Any]] = []
-        for retain_id in retain_ids:
-            # (5a-i) PROVE THE PEER IS NOT ALREADY A CANONICAL, and FAIL
-            # CLOSED — the same posture as the child listing, for the same
-            # reason: a check that did not ANSWER is not a check that said
-            # "not canonical". Refusing costs one peer's tag, which a caller
-            # can retry; tagging on an unproven check mints a duplicate
-            # canonical that nothing downstream will catch.
-            #
-            # REFUSE rather than demote. Patching `canonical: False` would
-            # also hold the invariant, but it would silently rewrite a claim
-            # this op was not asked to touch — and a prior canonical in the
-            # retain list is usually an AUTHORING MISTAKE: that record is what
-            # the caller should have put in `supersedes`. Surfacing it as a
-            # named failure is the recoverable outcome; quietly demoting it
-            # is not.
-            try:
-                peer_record = await memory_service.get_memory_by_id(
-                    project_id=project_id, memory_id=retain_id
-                )
-            except Exception as exc:
-                retain_failures.append({
-                    'id': retain_id,
-                    'error': (
-                        f'refused to tag {retain_id}: it could not be read '
-                        f'({exc}), so it cannot be shown to be a non-canonical '
-                        'peer'
-                    ),
-                    'error_type': 'RetainCheckFailed',
-                })
-                continue
-            # A peer that does not resolve is NOT refused here: it falls
-            # through to `update_memory`, which reports MemoryNotFound in the
-            # structured shape below. One vocabulary for one condition.
-            if (peer_record or {}).get('metadata', {}).get('canonical') is True:
-                retain_failures.append({
-                    'id': retain_id,
-                    'error': (
-                        f'refused to tag {retain_id}: it is already the '
-                        f'canonical for its topic, and tagging it with '
-                        f'{topic!r} would make a second canonical for that '
-                        'topic — supersede it instead of retaining it'
-                    ),
-                    'error_type': 'RetainedPeerIsCanonical',
-                })
-                continue
-            # `topic` ONLY, through the shared classifier above: a raise and a
-            # returned rejection are THE SAME EVENT here (this peer was not
-            # tagged) and are recorded identically. One failure costs one
-            # peer, never the arm — the peers that CAN be tagged are, because
-            # re-running to catch the rest would re-write the canonical, the
-            # +1-per-pass ratchet.
-            failure = await _patch_metadata(retain_id, {'topic': topic})
-            if failure:
-                retain_failures.append({'id': retain_id, **failure})
-                continue
-            retained.append(retain_id)
-
         deleted: list[str] = []
         failed_deletes: list[dict[str, Any]] = []
         survivors: list[str] = []
@@ -6015,6 +5852,9 @@ def create_mcp_server(
         # Pre-delete snapshots, keyed by id. Populated BEFORE each delete and
         # consumed only for the ids the re-read confirms gone.
         victims_by_id: dict[str, dict[str, Any]] = {}
+        # The superseded texts, for the topic-guard seed at (7c). Kept apart
+        # from `victims_by_id`, which feeds tombstone rows.
+        superseded_texts: list[str] = []
         for supersede_id in supersedes_ids:
             rejection = citation_blocked.get(supersede_id)
             if rejection:
@@ -6076,6 +5916,9 @@ def create_mcp_server(
             # The two recon sweeps are unaffected — they source victims from
             # the scroll, which lifts it.
             victim_payload = (victim_record or {}).get('metadata')
+            victim_content = (victim_record or {}).get('content')
+            if isinstance(victim_content, str) and victim_content:
+                superseded_texts.append(victim_content)
             victims_by_id[supersede_id] = {
                 'id': supersede_id,
                 'metadata': victim_payload,
@@ -6177,8 +6020,15 @@ def create_mcp_server(
                 # gone with no forward pointer and no tombstone: exactly the
                 # indistinguishable-from-silent-data-loss hole the delete arm's
                 # tombstone contract exists to close.
-                failure = await _patch_metadata(
-                    child_id, {'parent_id': canonical_id}
+                failure = await patch_memory_metadata(
+                    memory_service,
+                    memory_id=child_id,
+                    project_id=project_id,
+                    patch={'parent_id': canonical_id},
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    source=source,
                 )
                 if failure:
                     stranded_children.append(child_id)
@@ -6339,47 +6189,12 @@ def create_mcp_server(
             if still_there:
                 survivors.append(supersede_id)
 
+        # (6) The topic's closure, read once the fold is done — see
+        # `read_topic_closure` for why the placement matters.
+        closure = await read_topic_closure(
+            memory_service, project_id=project_id, topic=topic, run_id=run_id
+        )
 
-        # (6) The closure listing comes from the deterministic scroll, NOT
-        # `search`. A ranked top-N read can silently omit the canonical this
-        # call just wrote — the exact failure that made the original
-        # incident's "re-derive via search" correction route dispatch back
-        # into the superseded members it was collapsing.
-        #
-        # A scroll that could not be read degrades to NOT AVAILABLE rather
-        # than to an empty list, because `[]` alone reads as "this topic has
-        # no members" — the overclaim this op exists to eliminate, and
-        # doubly wrong on a call that just wrote a canonical into that very
-        # topic. The count is inside the same guard: it only runs when the
-        # listing was already capped, so losing it leaves rows that cannot be
-        # qualified, and publishing them with `truncated=False` would assert
-        # completeness this call cannot support.
-        topic_members_available = True
-        try:
-            topic_members = await memory_service.get_memories_by_metadata(
-                project_id=project_id,
-                filters={'topic': topic},
-                limit=_TOPIC_MEMBER_LIMIT,
-            )
-            returned = len(topic_members) if isinstance(topic_members, list) else 0
-            if returned >= _TOPIC_MEMBER_LIMIT:
-                total = await memory_service.count_memories_by_metadata(
-                    project_id=project_id, filters={'topic': topic}
-                )
-            else:
-                total = returned
-        except Exception:
-            logger.warning(
-                'consolidate_memories: the topic-closure listing for %r could '
-                'not be read; the fold itself stands and is reported in full',
-                topic,
-                exc_info=True,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
-            topic_members = []
-            returned = 0
-            total = 0
-            topic_members_available = False
         # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
         # stamped HERE rather than from each delete's success branch as the
         # two recon sweeps do. Those sweeps satisfy the writer's "only after
@@ -6510,8 +6325,15 @@ def create_mcp_server(
                 'from': list(supersedes_ids),
                 'to': list(confirmed_gone),
             }
-            failure = await _patch_metadata(
-                canonical_id, {'supersedes': list(confirmed_gone)}
+            failure = await patch_memory_metadata(
+                memory_service,
+                memory_id=canonical_id,
+                project_id=project_id,
+                patch={'supersedes': list(confirmed_gone)},
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                source=source,
             )
             if failure:
                 # DISCLOSED, not swallowed: the canonical is still claiming
@@ -6536,6 +6358,37 @@ def create_mcp_server(
                 canonical_supersedes = list(confirmed_gone)
                 supersedes_correction = {'outcome': 'corrected', **correction}
 
+        # (7c) TEACH THE TOPIC GUARD. Last, once the closure is known, so the
+        # derived hint names a canonical that landed and a failure cannot
+        # strand the fold between its write and its deletes: the tombstone
+        # writer's posture. The seed never raises.
+        topic_cluster_seed: dict[str, Any] | None = None
+        if topic_cluster_store is not None:
+            member_rows = closure.members if isinstance(closure.members, list) else []
+            member_texts = [
+                row.get('content')
+                for row in member_rows
+                if isinstance(row, dict) and row.get('id') != canonical_id
+            ]
+            topic_cluster_seed = seed_topic_cluster(
+                topic_cluster_store,
+                enabled=(
+                    resolve_topic_cluster_autoseed_enabled(memory_service)
+                    and topic not in resolve_retired_derived_topic_ids(memory_service, project_id)
+                ),
+                texts=[
+                    text
+                    for text in (canonical_content, *superseded_texts, *member_texts)
+                    if isinstance(text, str) and text
+                ],
+                topic=topic,
+                canonical_id=canonical_id,
+                project_id=project_id,
+                category=category,
+                run_id=run_id,
+                source=_CONSOLIDATE_SOURCE,
+            )
+
         # (8) Anything that did not happen is NAMED, and the status rule that
         # decides `consolidated` vs `partial` lives in ONE pure place rather
         # than being re-expressed at each return.
@@ -6550,20 +6403,21 @@ def create_mcp_server(
             failed_deletes=failed_deletes,
             survivors=survivors,
             survivor_check_failed=survivor_check_failed,
-            retained=retained,
-            retain_failures=retain_failures,
+            retained=retain_arm.retained,
+            retain_failures=retain_arm.retain_failures,
             reparented=reparented,
             reparent_failures=reparent_failures,
-            topic_members=topic_members,
-            topic_members_total=total,
-            topic_members_truncated=total > returned,
-            topic_members_available=topic_members_available,
+            topic_members=closure.members,
+            topic_members_total=closure.total,
+            topic_members_truncated=closure.truncated,
+            topic_members_available=closure.available,
             citation_repoint=citation_repoint,
             tombstones_written=tombstones_written,
             # What was OWED — the confirmed-gone set, not every supersede.
             # An id whose delete failed was never owed a tombstone, so
             # counting it would report a phantom shortfall on a correct run.
             tombstones_expected=len(confirmed_gone),
+            topic_cluster_seed=topic_cluster_seed,
         )
 
     @mcp.tool()
@@ -6995,9 +6849,16 @@ def create_mcp_server(
 
         When the same real-world concept exists as two separate Entity nodes (e.g.,
         'Anthropic' and 'Anthropic Inc'), use this tool to merge them. All RELATES_TO
-        edges from the deprecated node are redirected to the surviving node. The
-        deprecated node is then deleted and the surviving node's summary is rebuilt
-        from its (now-combined) edges.
+        edges from the deprecated node are redirected to the surviving node, and its
+        Episodic MENTIONS provenance is relocated onto the survivor as well — an
+        episode already linked to the survivor is left alone rather than linked
+        twice. The deprecated node is then deleted and the surviving node's summary
+        is rebuilt from its (now-combined) edges.
+
+        Every redirected edge and relocated mention carries a
+        `reassigned_from_node_uuid` audit stamp naming the node it left, and the
+        returned audit dict carries the deprecated node's summary TEXT — which the
+        rebuild above cannot reconstruct, since it reads edges only.
 
         This operation is irreversible. Always verify both UUIDs before calling.
 
@@ -7788,6 +7649,8 @@ def create_mcp_server(
                     'error': row.get('error'),
                     'timestamp': row.get('created_at'),
                     'attempts': row.get('attempts'),
+                    # Three-valued; see services/durable_queue.py::DurableWriteQueue.get_dead_items
+                    'executed': row.get('executed'),
                 }
                 if truncated:
                     item['payload_truncated'] = True

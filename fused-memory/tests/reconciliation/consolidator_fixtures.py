@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+from _fm_helpers import complete_paged_read
+
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
@@ -76,6 +78,17 @@ def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     memory_mock.mem0 = AsyncMock()
     memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
     memory_mock.get_status = AsyncMock(return_value={})
+    # EXPLICIT, not auto-mocked. `memory_mock` is a bare AsyncMock, so
+    # `graphiti.enumerate_all_valid_edges` would otherwise be an auto-created
+    # child whose return value unpacks as `grouped, paged = <AsyncMock>` and
+    # raises ValueError — which both sweeps silently tally as errors += 1.
+    # That would change behaviour for EVERY test reaching the sweeps without
+    # an explicit stub, in the direction hardest to notice. Stubbing an empty,
+    # proven-complete read reproduces the pre-task-4386 outcome (0 scanned, no
+    # error) deterministically instead of depending on auto-mock semantics.
+    memory_mock.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
 
     stage = MemoryConsolidator(
         StageId.memory_consolidator,

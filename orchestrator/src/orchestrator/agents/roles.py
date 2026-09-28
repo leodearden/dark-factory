@@ -402,9 +402,11 @@ half-done tree that is falsely recorded as a completed, successful run.
   below, past which you must background it and poll instead. A foreground
   command that legitimately runs that long is fine; an abandoned background one
   never is.
-- If you genuinely must use `run_in_background=true`, you MUST poll it to
-  completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
-  your turn. Never end the turn with a background command still pending.
+- If you genuinely must use `run_in_background=true`, you MUST see it through
+  BEFORE ending your turn. The launch hands you an output FILE PATH; `Read` on
+  that path is how you collect the result, so read it until the command has
+  actually finished — or terminate the task outright. Never end the turn with a
+  background command still pending.
 """
 
 
@@ -430,19 +432,46 @@ half-done tree that is falsely recorded as a completed, successful run.
 #       prohibition without the pattern breeds busy-loops, the pattern without
 #       the prohibition breeds abandoned background work.
 #
-# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
-# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
-# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
-# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
-# allowlist -- what may run without a prompt -- not a tool-registry filter.
-# Built-in harness tools remain present and callable regardless.  Verified from
-# inside a dispatched implementer session whose cmdline was exactly
-# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
-# `ScheduleWakeup` were live in that session's tool list, and
-# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
-# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
-# since task 2761.  So do NOT "fix" this block by trimming those tools out of
-# it on the theory that the roles cannot reach them -- they can.
+# TOOL AVAILABILITY -- read what this block does and does not establish.  It
+# records that built-ins are REACHABLE.  It is NOT, and cannot be, an inventory
+# of WHICH built-ins exist -- see the retraction below, which this block has
+# now earned twice.  For that, re-derive with `ToolSearch`.
+#
+# REACHABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named below
+# (`Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent from every role's
+# `allowed_tools`, and that is CORRECT, not a bug: the `--allowed-tools` flag
+# cli_invoke passes (cli_invoke.py:1830) is a PERMISSION allowlist -- what may
+# run without a prompt -- not a tool-registry filter.  Built-in harness tools
+# remain present and callable regardless.  Verified from inside a dispatched
+# implementer session whose cmdline was exactly `--allowed-tools Read Edit
+# Write Bash Glob Grep mcp__...`: `ToolSearch` and `ScheduleWakeup` were live
+# in that session's tool list, and a `ToolSearch` select query for deferred
+# tools returned their schemas.  So do NOT "fix" this block by trimming those
+# tools out of it on the theory that the roles cannot reach them -- they can.
+#
+# RETRACTED 2026-09-20 (task 5332), in place rather than deleted, so the next
+# editor can tell which of this block's claims rest on what.  The block used to
+# continue: "The same holds for the `BashOutput`/`KillShell` that
+# BACKGROUND_TASK_WARNING has named since task 2761."  That sentence was never
+# measured -- it inherited the authority of the genuine measurement above it
+# through the words "The same holds for", and later edits then cited the whole
+# block as settled.  It is false: neither name has ever resolved from the
+# registry, and no transcript in the fleet census ever shows one being called.
+# THE MEASUREMENT AND ITS DATES ARE NOT RESTATED HERE -- they live once, at
+# tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS, for the
+# same reason the size figures below live at exactly one site.
+#
+# The retraction GENERALISES, and that is the part worth carrying forward: this
+# block has now aged wrong TWICE in the same way.  Its own worked example above
+# used to cite a `ToolSearch` select query returning a `TaskOutput` schema --
+# and ten days later that name no longer resolved at all (both measurements at
+# the citation above).  Reachability is durable; the roster is not.  So the
+# guidance below is deliberately built on the things that do not churn --
+# `Bash`'s own `run_in_background` parameter, `Read` on the output file path it
+# returns, and `ToolSearch` as the way to DISCOVER the current termination tool
+# -- and names a concrete tool only where unavoidable, stamped with its
+# measurement date.  tests/test_roles_harness_tool_inventory.py now holds the
+# "a named built-in must be a real built-in" invariant mechanically.
 #
 # THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
 # cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
@@ -456,7 +485,8 @@ half-done tree that is falsely recorded as a completed, successful run.
 #     so extension_engaged latches True and the watchdog measures IDLE time: it
 #     kills only after no NEW transcript turn for
 #     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
-#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     genuinely resets that clock, since each read of the background task's
+#     output file is a new turn.
 #     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
 #     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
 #   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
@@ -505,20 +535,40 @@ SANCTIONED
   - architect, implementer, debugger, merger, simple_task are watched on IDLE
     time — the kill fires only after no new transcript turn for
     max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
-    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
-    that clock, which is what makes a long backgrounded run survivable.
+    polling genuinely helps: any tool call that engages the background task —
+    a `Read` of its output file — IS a new turn and resets that clock, which is
+    what makes a long backgrounded run survivable.
   - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
     session start — and NOTHING resets it. Polling does not extend it. Work
     that cannot finish inside that window must be sized down or handed off; no
     wait strategy rescues it, so do not start a 40-minute job and plan to poll.
   - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
     cap binds you. The don't-end-your-turn rule above still applies in full.
-  So: `Bash` with `run_in_background=true`, then poll it to completion with
-  `BashOutput` and READ the result BEFORE ending your turn. Launching it
-  detached with `setsid` and polling its log file is the same sanctioned shape;
-  so is backgrounding a wait command that EXITS on its own when the condition
-  holds. Polling something you launched is NOT the ad-hoc wait prohibited
-  below: you have a real completion signal, and you stay until you have it.
+  So: `Bash` with `run_in_background=true`. The launch returns a task ID AND
+  an output FILE PATH, and says it will notify you. `Read` that path — it is
+  the entire collection mechanism, and there is NO poll tool in this build to
+  go hunting for. While the command runs the file holds the output so far;
+  once it finishes the file holds the full output plus an "[exited with code
+  N]" trailer carrying the real exit status, so a single Read gives you both
+  the result and whether it passed (measured 2026-09-20 on a probe that exited
+  7). Keep reading until you have that trailer, BEFORE ending your turn. To
+  terminate instead, find the build's termination tool with `ToolSearch`
+  first — it is DEFERRED, so calling it cold is the `InputValidationError`
+  described below; today that tool is `TaskStop` (measured 2026-09-20), and if
+  `ToolSearch` stops returning that name it has been renamed, so discover the
+  current one rather than improvising. If a tool you reach for is absent, do
+  NOT fall back to a `ps`/`pgrep` liveness loop — that improvisation is the
+  failure this guidance exists to prevent; read the output file instead.
+  Launching it detached with `setsid` and reading its log file is the same
+  sanctioned shape; so is backgrounding a wait command that EXITS on its own
+  when the condition holds. A pid-based foreground wait
+  (`timeout N tail --pid=<pid> -f /dev/null`) is a LAST resort, and only if you
+  captured the pid AT LAUNCH: `run_in_background` hands you a task ID and a
+  path, never a pid, and a pid guessed with `pgrep -f` matched a wrapper
+  process in measurement, so the wait blocked its full timeout and exited 124
+  though the job had finished long before. Reading something you launched is
+  NOT the ad-hoc wait prohibited below: you have a real completion signal, and
+  you stay until you have it.
 - `Monitor` streams ONE notification per matching output line, so it fits a
   recurring event feed, not a single "tell me when this finishes" — for that,
   background a command that exits when done. If you do reach for it, load its
@@ -557,11 +607,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~15% of the block's bytes.
+# that for ~11% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
-# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -569,9 +619,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
 # An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
 # file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
-# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
-# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
-# the string they describe does.  Do not reintroduce a number anywhere else --
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against the
+# then-real ~15% -- a 7x error (task 3607 review).  Those are the figures as
+# that review found them; both constants have grown since, which is exactly
+# why the live numbers above are re-derived rather than carried forward.
+# Prose copies do not move when the string they describe does.  Do not reintroduce a number anywhere else --
 # cite this comment instead.
 #
 # Use this ONLY where the receiving role is statically known to carry
@@ -590,7 +642,7 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 #
 # Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
 # rules at the failure site -- foreground with an explicit `timeout`, or else
-# background it and poll `BashOutput` to completion before ending the turn --
+# background it and read its output file to completion before ending the turn --
 # because that adjacency is the whole reason for the injection.  Do not let it
 # decay into a bare "see the rule above" cross-reference; a reader who follows
 # no cross-reference gets nothing.  This is an editorial expectation, so it
@@ -600,12 +652,13 @@ WAIT_PATTERN_REMINDER = """
 Reminder — verification is exactly where the wait rules above bite. If it will
 finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
 `timeout` (milliseconds; 120000 default). If it will run longer than that
-WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
-completion before you end your turn — the deciding limit is the working-regime
-watchdog, which kills this SESSION after ~30 minutes with no new turn, well
-short of the 3900000 harness ceiling, and each poll resets that clock. Never
-end this turn with verification still pending: this session is one-shot, and
-abandoned work is recorded as a successful run."""
+WITHOUT emitting a new assistant turn, background it and collect the result by
+reading the output file path the launch returns, until that file shows the
+command has exited, before you end your turn — the deciding limit is the
+working-regime watchdog, which kills this SESSION after ~30 minutes with no new
+turn, well short of the 3900000 harness ceiling, and each read is a new turn
+that resets that clock. Never end this turn with verification still pending:
+this session is one-shot, and abandoned work is recorded as a successful run."""
 
 
 # Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
@@ -1067,6 +1120,175 @@ GREP_LOOKAROUND_GUIDANCE = _GREP_ENGINE_LIMITS + _GREP_PCRE_BASH_RECOURSE
 GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_RECOURSE
 
 
+# Census finding, task 5683 (`metadata.source: legibility_census`) -- census
+# 2026-09-20 section 1.1, codebook candidate `entry-cand-20260918-19`, whose
+# umbrella entry `entry-cand-20260722-6` records the mechanism.
+#
+# MEASURED against skim 2.3.1 on 2026-09-22, and how to re-measure: pipe a
+# PreToolUse payload for each command into the host hook below and read
+# `hookSpecificOutput.updatedInput.command` from its stdout -- no output
+# means the command passes through untouched -- then confirm the key rows
+# live through the Bash tool. The script is the same two-line `import sys` /
+# indented `print` in every row:
+#
+#     git log --oneline -1 && python3 -c "<script>"
+#         -> rewritten to `skim git log ...` with the script joined onto one
+#            line; live: `SyntaxError: invalid syntax` at line 1, or
+#            `IndentationError: unexpected indent` when the script opens
+#            with a newline
+#     echo "git status" && python3 -c "<script>"
+#         -> passed through; live: ran
+#     head -1 NO_SUCH_FILE_XYZ_5683.md && python3 -c "<script>"
+#         -> rewritten although the file does not exist; live: skim's
+#            `Error: No such file or directory (os error 2)`, and python
+#            never ran
+#     head -1 /etc/hostname && python3 -c "<script>"
+#     head -1 NO_SUCH_FILE_XYZ_5683.txt && python3 -c "<script>"
+#         -> both passed through: `cat` and `head` gate on the operand's
+#            extension, never on whether it exists
+#     git log --oneline -1 && python3 - <<'PY' <script> PY
+#         -> passed through, git output raw: the hook declines the whole
+#            command, which is why the escape works
+#
+# Also rewritten when chained to the script: `git status`, `git diff` (not
+# `git diff --stat`), `tail` of a source file, `ls -la` (not `ls -l`),
+# `grep -rn` (not `grep -n`), `rg`, `find`, `tree`, `pytest`,
+# `python3 -m pytest`, `ruff check`, `mypy`, `cargo test`, `go test` -- far
+# wider than the four commands the codebook entry names. Passed through:
+# `uv run ... pytest`, `pyright`, `make`, `jq`, a target inside `$(...)`,
+# and a target on any line but the first. A heredoc nested in `$(...)` gets
+# no immunity of its own: beside `git status` it is flattened. Because the
+# set is broad, turns on flags, and belongs to a third-party binary that can
+# change under us, the prose describes it by category and makes the rule
+# independent of it.
+#
+# An earlier revision, following the frozen plan, called the match TEXTUAL,
+# gave `git status`, `git log`, `head` and `cat` as the whole trigger set, and
+# named only the IndentationError. The measurements above refute all three;
+# see esc-5683-4.
+#
+# THE HOST LAYER, identified so nobody searches this repo for it.
+# ~/.claude/settings.json carries a PreToolUse hook with matcher `Bash`
+# running ~/.claude/hooks/skim-rewrite.sh, whose body is
+# `exec ~/.cargo/bin/skim rewrite --hook`; a dispatched agent's config dir
+# carries the same hook. When it rewrites any part of a command it
+# re-serialises the WHOLE command with every newline turned into a space.
+#
+# RETIRE THIS BLOCK when no host running the factory wires that hook, or when
+# re-running the first row above keeps the script's newlines. The rule it
+# gives is harmless under any rewriter, so outliving the hook costs only its
+# tokens on every invocation of the seven roles that carry it.
+#
+# WHAT IS AND IS NOT ADDRESSED. The cause is a third-party binary wired in by
+# host-level operator config under ~/.claude/, outside this repository and any
+# worktree's scope, so nothing here can stop the rewrite. Only the
+# told-upfront/recovery facet is in scope -- the same carve-out tasks 4273,
+# 4578, 4964 and 5331 documented for the four findings above.
+#
+# DISCRIMINATION, NOT DUPLICATION -- a FIFTH shape against three neighbours,
+# and the discriminator is WHERE the defect sits relative to the tool call.
+# TOOL_CALL_REJECTION_GUIDANCE covers a MALFORMED call, rejected before it
+# runs, with an `InputValidationError` naming it as such.
+# ERROR_REMEDY_HINT_GUIDANCE covers a well-formed call that failed on CONTENT
+# and printed a remedy naming a real PARAMETER of the erroring tool.
+# _GREP_ENGINE_LIMITS covers a well-formed call whose printed remedy is
+# UNREACHABLE through the tool that printed it. This is none of the three: the
+# call was well-formed AND accepted, and what reached the shell is not what
+# was sent. The command was SILENTLY ALTERED between the tool call and the
+# shell, no error names the alteration, and the error that does surface (a
+# `SyntaxError` or `IndentationError`) accuses the agent's own script --
+# which is exactly why the census records a session rewriting that script
+# repeatedly without ever diagnosing it. None of the four blocks may be
+# deleted as redundant with another.
+#
+# ONE VARIANT, not two, unlike GREP_LOOKAROUND_GUIDANCE directly above. There
+# the LIMITATION applied to every role and only the RECOURSE had to be varied
+# for JUDGE. Here the whole block is inapplicable to JUDGE: its grant is
+# `Bash(git:*)`, so it can run neither `python3 -c` nor the heredoc escape,
+# and a splice there would be dead weight rather than a fix. The carrier set
+# is the seven roles with a literal system_prompt and unqualified `Bash`,
+# pinned against that capability rather than against a sibling constant by
+# orchestrator/tests/test_roles_compound_command_rewrite.py::test_role_set_matches_its_bash_capability.
+#
+# HARD CONSTRAINTS: the four stated above _GREP_ENGINE_LIMITS bind this
+# constant too.
+COMPOUND_COMMAND_REWRITE_GUIDANCE = """
+## A compound Bash command can silently flatten a multi-line script
+
+THE RULE: a multi-line script — a `python3 -c` whose argument spans lines —
+goes in a `Bash` call of its own. Do not chain it to any other command: not
+with `&&`, `;` or `|`, and not on another line of the same call. That costs
+one extra tool call; the alternative costs a turn and a misdiagnosis.
+
+THE SYMPTOM, so you recognise it instead of rewriting a script that was
+already correct. The interpreter reports your whole script as ONE line —
+line 1 of `<string>` — with the statements space-joined, and raises
+"SyntaxError: invalid syntax", or "IndentationError: unexpected indent" if
+the script opened with a newline. Nothing reports that the command was
+altered, so the natural reading is that your script is malformed. It is not.
+Re-issuing the same script ALONE runs it unchanged, and that is the
+one-command diagnostic: passes by itself, fails when chained, means you are
+looking at this and not at your code. Do not start editing the script.
+
+THE TRIGGER: a host PreToolUse hook on `Bash` rewrites many common
+commands into another tool's equivalents, and when it rewrites ANY part of a
+command it re-serialises the WHOLE command onto one physical line, turning
+the newlines inside your `-c` argument into spaces. What it rewrites is
+broad — `git status` and `git log`, `cat` or `head` of a source file, search
+and listing commands, test runners and linters among them — and even turns
+on which flags you pass, so do not try to predict it. Follow the rule
+instead.
+
+Whether a file EXISTS does not protect you. A `head` of a missing `.md` file
+is rewritten exactly as a present one is; it then fails with
+"Error: No such file or directory (os error 2)" instead of `head`'s own
+message, and that non-zero exit short-circuits the `&&`, so your script never
+runs at all and you get no interpreter diagnostic.
+
+THE ESCAPE, when you genuinely need one command: pass the script on stdin via
+a heredoc redirect rather than as a `-c` argument.
+
+    python3 - <<'PY'
+    import sys
+    if sys.version_info >= (3, 12):
+        print('newlines survived')
+    PY
+
+The hook declines to process a command carrying shell syntax it cannot
+statically analyse, so this form passes through with its newlines intact even
+alongside `git log`. Measurably declined, not merely tolerated: chained to
+`-c`, the `git log` output comes back in the hook's rewritten shape; in the
+heredoc form that same `git log` comes back raw.
+
+Scope that escape narrowly. It covers a heredoc REDIRECT SUPPLYING THE SCRIPT.
+A heredoc nested inside a `$(...)` substitution to build an argument is NOT
+covered, and has been observed destroyed.
+"""
+
+
+# The harness guidance every role with a literal system_prompt and unqualified
+# `Bash` carries, spliced straight after its one-line role statement. One
+# composite, so a new block is one edit here rather than one per carrier. Each
+# block's own test module still pins its carrier set against a capability, so
+# a role for which some block stops applying builds its own chain rather than
+# dropping that block from this one -- JUDGE already does: no wait block, the
+# read-only grep variant, and no compound-command block.
+#
+# APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
+# own test module (each asserts it starts exactly where its predecessor ends),
+# and BACKGROUND_WAIT_GUIDANCE's heading must stay the prompt's first `##`.
+# _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
+# section just above". Inserting anywhere but the end breaks a pin, or
+# silently redirects that pointer.
+_BASH_CAPABLE_ROLE_PREAMBLE = (
+    BACKGROUND_WAIT_GUIDANCE
+    + TOOL_CALL_REJECTION_GUIDANCE
+    + ERROR_REMEDY_HINT_GUIDANCE
+    + GREP_LOOKAROUND_GUIDANCE
+    + COMPOUND_COMMAND_REWRITE_GUIDANCE
+)
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
@@ -1385,7 +1607,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -1497,7 +1719,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1561,7 +1783,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -1830,7 +2052,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -2193,7 +2415,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -2470,7 +2692,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## What You Do
 
 You receive:
@@ -2590,7 +2812,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

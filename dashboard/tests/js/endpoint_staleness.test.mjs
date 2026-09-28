@@ -192,10 +192,18 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
 // window/fetch FIRST and only then load via createRequire, exactly as
 // data_poll.test.mjs::loadDataJs documents. `document` is deliberately NOT
 // shimmed, so data.js's auto-start guard stays inert under node.
+//
+// data.js also destructures window.DF_DATUM at module scope (task 5588), and
+// datum.js in turn destructures THIS module's formatAge, so the shim carries
+// DF_ENDPOINT_STALENESS and datum.js is loaded first — index.html's order,
+// endpoint_staleness.js -> datum.js -> data.js, reproduced under node.
 function loadDataJs() {
-  globalThis.window = { dispatchEvent: () => {} };
+  globalThis.window = { dispatchEvent: () => {}, DF_ENDPOINT_STALENESS: staleness };
   globalThis.fetch = () => Promise.resolve({ ok: true, json: async () => ({}) });
   const require = createRequire(import.meta.url);
+  const datumSpecifier = '../../src/dashboard/static/redux/datum.js';
+  delete require.cache[require.resolve(datumSpecifier)];
+  require(datumSpecifier);
   const specifier = '../../src/dashboard/static/redux/data.js';
   delete require.cache[require.resolve(specifier)];
   return require(specifier);

@@ -3201,6 +3201,278 @@ def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path
 
 
 # ---------------------------------------------------------------------------
+# A TBD placeholder arm, through a REPORT-PRODUCING path (task 4992)
+#
+# `_placeholder_refusal` had coverage only through `probe_llm_arm` (see
+# `test_a_placeholder_arm_is_refused_before_any_request` above), which made the
+# refusal look handled.  It was not reachable from any caller that WRITES a
+# report: `run_healthcheck` reads a baseline for every arm BEFORE it probes any
+# of them, and a placeholder can never have one -- `lms_ctl.preflight` refuses
+# it as its first check, before the card is touched, and `lms_ctl.start` is the
+# only writer of a per-arm baseline.  So the run raised `StaleBaselineError`,
+# the CLI exited 8 having written nothing, and the row that COVERS this arm for
+# `merge_reports` was never produced at all (esc-4301-2).
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_ARM_ID = 'tbd-arm'
+
+
+def _placeholder_arm(**overrides) -> lms_manifest.ArmEntry:
+    return _moe_arm(**{
+        'arm_id': PLACEHOLDER_ARM_ID,
+        'served_model_name': PLACEHOLDER_ARM_ID,
+        'model_ref': 'TBD-Q3-pick-a-gguf',
+        'image': 'TBD-Q3',
+        'quant': 'TBD-Q3',
+        'port': 8416,
+        **overrides,
+    })
+
+
+@pytest.fixture
+def placeholder_manifest_env(monkeypatch, tmp_path):
+    """A manifest carrying one TBD placeholder beside two real arms.
+
+    The baseline store is a real directory populated for the NON-placeholder
+    arms ONLY, which is exactly the on-disk state `lms_ctl.start` leaves.  The
+    placeholder's absence from it is not a fixture shortcut: it is the state
+    the tools guarantee, and the one the defect turns on.
+    """
+    manifest = lms_manifest.ArmManifest(
+        port_block=(8410, 8417),
+        arms=[
+            _arm(),
+            _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+            _placeholder_arm(),
+        ],
+    )
+    monkeypatch.setattr(lms_healthcheck, 'load_arms', lambda *a, **k: manifest)
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
+    for arm in manifest.arms:
+        if arm.is_placeholder:
+            continue
+        record = _baseline()
+        lms_vram.record_baseline(arm.arm_id, record.reading, consumers=record.consumers)
+    monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
+    return manifest
+
+
+def test_the_cli_reports_on_a_placeholder_arm_instead_of_refusing_to_write(
+    placeholder_manifest_env, tmp_path, capsys,
+):
+    """The headline: `lms_healthcheck --arm <tbd>` produces the refusal ROW.
+
+    `probe_arm` is deliberately NOT patched, so the real dispatch runs and
+    `_placeholder_refusal` is what produces the row -- if the arm were probed
+    for real it would 404 on a literal `TBD-Q3` model id, which is the burial
+    that refusal exists to prevent.  Before this change the run never reached
+    the prober at all: it exited 8 (EXIT_STALE_BASELINE) with no file on disk.
+    """
+    part = tmp_path / 'tbd-arm.json'
+
+    code = lms_healthcheck.main(['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)])
+
+    assert code == lms_healthcheck.EXIT_ARM_FAILED
+    assert part.exists()
+    report = lms_healthcheck.HealthReport.model_validate_json(part.read_text())
+    assert [row.arm_id for row in report.arms] == [PLACEHOLDER_ARM_ID]
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.overall == 'FAIL'
+
+
+def test_a_placeholder_part_covers_its_arm_in_the_merged_slate(
+    placeholder_manifest_env, tmp_path,
+):
+    """The coverage claim the whole task turns on.
+
+    `merge_reports` refuses a set that does not COVER the manifest, so with no
+    part for the placeholder the slate could not be assembled AT ALL -- one
+    unresolved PRD Open Question made every other arm's measurement
+    unpublishable.  With the row present the slate assembles RED BUT COMPLETE.
+    """
+    part = tmp_path / 'tbd-arm.json'
+    assert lms_healthcheck.main(
+        ['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)]
+    ) == lms_healthcheck.EXIT_ARM_FAILED
+    placeholder_part = lms_healthcheck.HealthReport.model_validate_json(
+        part.read_text()
+    )
+    real_parts = [
+        _single(arm) for arm in placeholder_manifest_env.arms
+        if not arm.is_placeholder
+    ]
+
+    merged = lms_healthcheck.merge_reports(
+        [*real_parts, placeholder_part],
+        expected_arm_ids=placeholder_manifest_env.arm_ids(),
+    )
+
+    assert set(placeholder_manifest_env.arm_ids()) == {
+        row.arm_id for row in merged.arms
+    }
+    assert merged.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+def test_a_placeholder_only_run_reports_on_a_card_a_stranger_is_holding(
+    tmp_path, monkeypatch,
+):
+    """The refusal row must not be held hostage to whoever holds the card.
+
+    Measured on this worktree: `lms_vram.unexpected_baseline_consumers([whisper
+    4050 MiB, ollama 10314 MiB])` returns the ollama entry, so feeding the LIVE
+    probe inventory to the BASELINE guard raises `PollutedBaselineError` and the
+    CLI exits 7 having written nothing.  That refusal is spurious here.  Both
+    the baseline guard and `classify_pollution` exist to protect the
+    attribution of `used - baseline` to an arm; nothing was started, so there is
+    no such attribution and no footprint for a dirty baseline to corrupt.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(
+            consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]
+        ),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.vram.pollution == lms_vram.PollutionState.CLEAN
+    assert report.vram.arm_footprint_mib == 0
+
+
+def test_a_placeholder_only_run_does_not_consult_a_supplied_baseline(
+    tmp_path, monkeypatch,
+):
+    """A parameter honoured on one branch and ignored on the other needs a pin.
+
+    `run_healthcheck`'s docstring says no baseline is consulted when nothing is
+    measurable, "not even one supplied through *baseline*" -- but nothing held
+    that.  A refactor hoisting the `baseline is not None` fallback above the
+    `if not measurable` check would keep every other test green (the
+    StaleBaselineError path stays closed either way) while reintroducing a
+    pre-start reading for a run that started nothing, so the block would report
+    a footprint no row can explain.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=lms_healthcheck.probe_arm,
+        baseline=_baseline(),
+    )
+
+    # The snapshot IS the pre-start card; the supplied 3312 MiB never lands.
+    assert report.vram.baseline_mib == MEASURED_USED_MIB
+    assert report.vram.baseline_mib != BASELINE_USED_MIB
+    assert report.vram.arm_footprint_mib == 0
+
+
+def test_a_placeholder_only_run_never_emits_the_unmeasured_sentinel(
+    tmp_path, monkeypatch,
+):
+    """CLEAN here means "there is nothing to pollute", and it has to be CLEAN.
+
+    UNMEASURED is the more literal reading of a branch that skipped the
+    classifier, but it is precisely the value `merge_reports` REFUSES to
+    combine -- so emitting it would restore the unassemblable slate by another
+    route, which is the whole thing this change removes.  Mirrors
+    `test_this_producer_never_emits_the_unmeasured_sentinel`.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.vram.pollution != lms_vram.PollutionState.UNMEASURED
+    assert lms_healthcheck.merge_reports([report]).arms[0].arm_id == (
+        PLACEHOLDER_ARM_ID
+    )
+
+
+def _mixed_probe(arm, *, warmup: bool = False):
+    """The real dispatch for a placeholder, a canned PASS for anything else.
+
+    A mixed run has to reach `_placeholder_refusal` for one arm without issuing
+    a request for the other, and patching `probe_arm` wholesale would take the
+    refusal out of the path under test.
+    """
+    return lms_healthcheck.probe_arm(arm) if arm.is_placeholder else _passing_probe(arm)
+
+
+def test_a_placeholder_row_is_charged_no_footprint_beside_a_real_arm():
+    """A placeholder loaded nothing, so its row's footprint is 0, not the block's.
+
+    `run_healthcheck` used to write `budget.arm_footprint_mib` into EVERY row
+    uniformly, which in a mixed `--all` run puts "this TBD arm took 4050 MiB"
+    into the artifact -- a number that only became WRONG once the row became
+    reachable, and one a downstream reader has no way to discount, because the
+    merged slate keeps just ONE vram block and the per-row figure is the only
+    place an arm's own footprint survives.
+    """
+    report = lms_healthcheck.run_healthcheck(
+        [_arm(), _placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_mixed_probe,
+        baseline=_baseline(),
+    )
+
+    rows = {row.arm_id: row for row in report.arms}
+    assert set(rows) == {'qwen3.5-9b', PLACEHOLDER_ARM_ID}
+    assert rows['qwen3.5-9b'].arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+    assert rows[PLACEHOLDER_ARM_ID].arm_footprint_mib == 0
+    assert rows[PLACEHOLDER_ARM_ID].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    # The BLOCK still reports what the card actually did, which the real arm
+    # explains; only the placeholder's own row declines to claim any of it.
+    assert report.vram.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+
+
+def test_a_real_arm_without_a_baseline_still_refuses_beside_a_placeholder(
+    tmp_path, monkeypatch,
+):
+    """The partition narrows WHICH ids are looked up; it never weakens the guard.
+
+    Without this pin a placeholder sibling could launder a real arm's missing
+    baseline: the run would find nothing to look up for the placeholder, and an
+    over-eager branch would take the unstarted path for a run that genuinely
+    started something and report its footprint as 0.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    with pytest.raises(lms_vram.StaleBaselineError, match='qwen3.5-9b'):
+        lms_healthcheck.run_healthcheck(
+            [_arm(), _placeholder_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_mixed_probe,
+        )
+
+
+def test_a_run_over_zero_arms_is_refused_rather_than_reported_green():
+    """The partition displaced a refusal; it must not have deleted it.
+
+    `lms_vram.read_baseline_records` caught the empty case ("a budget verdict
+    over zero arms would describe nothing") back when every arm id reached it.
+    With placeholders partitioned out, an empty run reaches the unstarted branch
+    instead, which has no reason to object to anything -- and would answer with
+    a rowless report reading PASS/PASS/EXIT_OK, a green "the slate was checked"
+    assembled from nothing.  The CLI cannot produce this today
+    (`ArmManifest.arms` has `min_length=1`, and `--active` over an empty
+    selection exits EXIT_NO_ACTIVE_ARMS), which is exactly why the library-level
+    contract needs its own guard.
+    """
+    with pytest.raises(lms_vram.VramProbeError, match='zero arms'):
+        lms_healthcheck.run_healthcheck(
+            [], gpu_probe=lambda: _snapshot(), probe=_passing_probe,
+        )
+
+
+# ---------------------------------------------------------------------------
 # The extraction floor, and the reasoning-mode contract (esc-3713-10).
 #
 # Everything below exists because the two checks above it were each passing

@@ -88,6 +88,42 @@ class TestReadCreatedAt:
         (ta.root / 'metadata.json').write_text(json.dumps({'task_id': 'x'}))
         assert ta.read_created_at() is None
 
+    def test_undecodable_metadata_json_returns_none(self, worktree: Path):
+        """A metadata.json that isn't valid UTF-8 raises UnicodeDecodeError
+        (a ValueError, not a json.JSONDecodeError) out of
+        ``Path.read_text()`` before ``json.loads`` ever runs. The "never
+        raises" contract must catch that too, not just malformed JSON.
+
+        ``read_created_at`` reads with ``encoding='utf-8'`` explicitly (matching
+        ``atomic_write_text``'s writer default), so these bytes — an invalid
+        UTF-8 lead byte — are guaranteed to fail decoding rather than json
+        parsing on every platform, regardless of the process locale.
+        """
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.root.mkdir(parents=True, exist_ok=True)
+        (ta.root / 'metadata.json').write_bytes(b'\xff\xfe{"created_at": "x"}')
+        assert ta.read_created_at() is None
+
+    def test_malformed_json_metadata_returns_none(self, worktree: Path):
+        """The pre-existing ``json.JSONDecodeError`` branch (syntactically
+        invalid but validly-encoded JSON) stays covered alongside the
+        undecodable-bytes branch above."""
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.root.mkdir(parents=True, exist_ok=True)
+        (ta.root / 'metadata.json').write_text('{not json')
+        assert ta.read_created_at() is None
+
+    def test_non_object_metadata_json_returns_none(self, worktree: Path):
+        """Valid JSON that isn't an object (e.g. a bare list) must not reach
+        ``metadata.get(...)`` and raise AttributeError."""
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.root.mkdir(parents=True, exist_ok=True)
+        (ta.root / 'metadata.json').write_text('[]')
+        assert ta.read_created_at() is None
+
 
 class TestPlan:
     def test_write_and_read_plan(self, artifacts: TaskArtifacts):

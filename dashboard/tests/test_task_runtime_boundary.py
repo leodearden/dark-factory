@@ -3,7 +3,7 @@
 Task 2638 (epsilon), PRD ``plans/dashboard-task-runtime-endpoint-prd.md``.
 Feeds a DECODED producer-shaped wire payload —
 ``TaskRuntimeSnapshot.model_validate`` of the exact ``get_task_runtime_state``
-envelope shape — into ``_shape_one_project``, roping the SAME shared contract
+envelope shape — into the row shaper, roping the SAME shared contract
 (``shared.task_runtime_state``) the producer side
 (``orchestrator/tests/test_task_runtime_snapshot.py``) emits onto the wire.
 Existing consumer unit tests (``test_active_tasks.py``) construct
@@ -29,7 +29,16 @@ import pytest
 from shared.task_runtime_state import TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import _shape_one_project
+from dashboard.data.active_tasks import _acquire_and_shape
+from dashboard.data.task_snapshot import SnapshotFailure
+
+_NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
+"""The instant these tests stamp against.
+
+Threaded in rather than left to the clock: ``_acquire_and_shape`` stamps both
+halves of the unit with the caller's instant, and a test that cannot say what
+that instant is cannot check a row's derived age.
+"""
 
 # ---------------------------------------------------------------------------
 # Scaffolding
@@ -51,53 +60,50 @@ def _shape_task(task_id: int, title: str, status: str) -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _clear_the_snapshot_unit():
+    """The unit caches per root for 15 s — no test may inherit another's."""
+    import dashboard.data.task_snapshot as snapshot_mod
+
+    snapshot_mod._snapshot_cache_clear()
+    yield
+    snapshot_mod._snapshot_cache_clear()
+
+
 def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
-    """Monkeypatch fetch_tasks (and its compact map) to a fixed shaped task list.
+    """Monkeypatch the snapshot unit's two reads to a fixed shaped task list.
 
-    ``_shape_one_project`` narrows its fetch server-side and reads its counts
-    from ``fetch_statuses`` (task 3857), so the fakes honour ``statuses`` —
-    emulating the substrate's row filter and ascending-id order — and derive
-    the compact map from the same list.  Ignoring the narrowing would hand the
-    whole list to both fetch calls and duplicate every row; leaving
-    ``fetch_statuses`` unpatched would reach for the network.
+    The reads live in ``dashboard.data.task_snapshot`` since task 5587, so
+    that is where the fakes are registered; ``active_tasks`` holds no fetch
+    name to patch.  Each fake honours its real contract — ``fetch_tasks``
+    applies ``statuses`` as a server-side row filter and answers in ascending
+    id order, ``fetch_statuses`` answers over the WHOLE tree — because a fake
+    laxer than the real signature is how a call-site regression passes.
 
-    TWO fakes: ``fetch_tasks`` returns the COMPLETE set and has no window,
-    ``fetch_task_page`` returns ONE page and REQUIRES ``page_size``/``offset``.
-    Each matches its real signature exactly — a laxer fake would let a
-    call-site regression pass.
+    ``timeout``/``cached`` are accepted-and-ignored: the unit threads its own
+    per-call budget into both reads and asks the row read for an uncached
+    answer, so a stub missing either keyword raises TypeError.
     """
 
-    def _filtered(statuses):
+    async def _fake_fetch_tasks(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None, cached=True,
+    ):
         rows = list(tasks)
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
         rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
         return rows
 
-    # ``timeout`` accepted-and-ignored by all three fakes: _shape_one_project
-    # threads active_tasks._TASKS_PER_CALL_TIMEOUT into every call it makes.
-    async def _fake_fetch_tasks(
-        client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None,
-    ):
-        return _filtered(statuses)
-
-    async def _fake_fetch_task_page(
-        client, config, project_root, *,
-        page_size, offset, statuses=None, timeout=None,
-    ):
-        return _filtered(statuses)[offset:offset + page_size]
-
     async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {
             r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
         }
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr('dashboard.data.task_snapshot.fetch_tasks', _fake_fetch_tasks)
     monkeypatch.setattr(
-        'dashboard.data.active_tasks.fetch_task_page', _fake_fetch_task_page,
+        'dashboard.data.task_snapshot.fetch_statuses', _fake_fetch_statuses,
     )
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
 
 
 def _producer_wire_entry(
@@ -172,11 +178,11 @@ async def test_b5_producer_wire_entry_populates_row_via_join(dummy_client, monke
     root = _project_root(tmp_path, 'warmlane')
     config = DashboardConfig(project_root=root)
 
-    active, offline, _ = await _shape_one_project(
-        dummy_client, config, root, runtime=snapshot, now=fixed,
+    active, snapshot_unit = await _acquire_and_shape(
+        dummy_client, config, root, now=fixed, runtime=snapshot,
     )
 
-    assert offline is False
+    assert snapshot_unit.failure is SnapshotFailure.NONE
     assert len(active) == 1
     row = active[0]
     assert row['loops'] == 3
@@ -204,8 +210,8 @@ async def test_b6_offline_snapshot_yields_none_not_zero(dummy_client, monkeypatc
     root = _project_root(tmp_path, 'downlane')
     config = DashboardConfig(project_root=root)
 
-    active, _, _ = await _shape_one_project(
-        dummy_client, config, root, runtime=TaskRuntimeSnapshot(offline=True),
+    active, _snapshot_unit = await _acquire_and_shape(
+        dummy_client, config, root, now=_NOW, runtime=TaskRuntimeSnapshot(offline=True),
     )
 
     assert len(active) == 1
@@ -234,8 +240,8 @@ async def test_b6_wire_offline_reason_reaches_the_row(dummy_client, monkeypatch,
     root = _project_root(tmp_path, 'starvedlane')
     config = DashboardConfig(project_root=root)
 
-    active, _, _ = await _shape_one_project(
-        dummy_client, config, root, runtime=snapshot,
+    active, _snapshot_unit = await _acquire_and_shape(
+        dummy_client, config, root, now=_NOW, runtime=snapshot,
     )
 
     assert len(active) == 1
@@ -260,8 +266,8 @@ async def test_b6_online_but_task_absent_gets_honest_zero_contrast(dummy_client,
     root = _project_root(tmp_path, 'downlane-online')
     config = DashboardConfig(project_root=root)
 
-    active, _, _ = await _shape_one_project(
-        dummy_client, config, root, runtime=TaskRuntimeSnapshot(tasks=[]),
+    active, _snapshot_unit = await _acquire_and_shape(
+        dummy_client, config, root, now=_NOW, runtime=TaskRuntimeSnapshot(tasks=[]),
     )
 
     assert len(active) == 1
@@ -304,8 +310,8 @@ async def test_b6_online_per_task_read_failure_yields_none_started(
     root = _project_root(tmp_path, 'flakylane')
     config = DashboardConfig(project_root=root)
 
-    active, _, _ = await _shape_one_project(
-        dummy_client, config, root, runtime=snapshot,
+    active, _snapshot_unit = await _acquire_and_shape(
+        dummy_client, config, root, now=_NOW, runtime=snapshot,
     )
 
     assert len(active) == 1

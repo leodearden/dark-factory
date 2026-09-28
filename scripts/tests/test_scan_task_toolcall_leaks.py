@@ -449,6 +449,12 @@ class TestDetectorIsTheSharedDefinition:
 
         assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
 
+    def test_scanned_columns_is_the_shared_tuple_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.SCANNED_COLUMNS is toolcall_xml_leak.SCANNED_COLUMNS
+
     def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
         """Delegation is real, not a same-valued copy captured at import."""
         import scan_task_toolcall_leaks

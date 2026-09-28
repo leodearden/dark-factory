@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import _make_rate_limit_error
+from _mem0_record_shapes import mem0_record
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
@@ -4789,17 +4790,25 @@ class TestDedupEpisodeNodes:
 
 # The fixture family every family-keyed test below is built on: three spellings
 # of task 605, in the survivor-first order the backend's substring probe returns
-# them (most valid edges, then oldest, then uuid).
+# them (highest provenance_rank, then oldest, then uuid — where provenance_rank
+# is edge_count + mentions_count, task 4986).
 #
-# The 13-edge node is the LOWERCASE one, not the canonically-named one. That
+# The richest node is the LOWERCASE one, not the canonically-named one. That
 # inversion is deliberate and is the tracked motivating case: it is exactly
 # where the uniform family[0] survivor rule differs from the old
-# "a canonically-named node wins regardless of edge count" policy, and it is
+# "a canonically-named node wins regardless of provenance" policy, and it is
 # why the rewrite moves 2 edges instead of 13.
+#
+# The mentions values are chosen so 'u-lower' still survives: task 4986 changed
+# what RANKS a survivor, and re-deciding this tracked case while doing so would
+# have silently retired the very scenario these tests exist to hold.
 _FAMILY_605 = [
-    {'uuid': 'u-lower', 'name': 'task 605', 'created_at': 100, 'edge_count': 13},
-    {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': 50, 'edge_count': 2},
-    {'uuid': 'u-plural', 'name': 'tasks 605', 'created_at': 150, 'edge_count': 1},
+    {'uuid': 'u-lower', 'name': 'task 605', 'created_at': 100,
+     'edge_count': 13, 'mentions_count': 2, 'provenance_rank': 15},
+    {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': 50,
+     'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
+    {'uuid': 'u-plural', 'name': 'tasks 605', 'created_at': 150,
+     'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
 ]
 
 
@@ -4837,7 +4846,7 @@ class TestNormalizeTaskNodeNames:
     Survivor policy is now ONE rule: the family's first member under the
     backend's survivor-first ordering survives, every other member is merged
     into it, and it is renamed onto the canonical name last. The old "a
-    canonically-named node wins regardless of edge count" special case is gone
+    canonically-named node wins regardless of provenance" special case is gone
     — it existed to avoid recreating the exact-name duplicate
     _dedup_episode_nodes resolves, and what rules that duplicate out now is the
     merge-before-rename ORDER rather than family-keying on its own.
@@ -4963,7 +4972,8 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'700': [
-            {'uuid': 'u-solo', 'name': 'Task 700', 'created_at': 10, 'edge_count': 4},
+            {'uuid': 'u-solo', 'name': 'Task 700', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='Task 700')])
@@ -4984,7 +4994,8 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'800': [
-            {'uuid': 'u-solo', 'name': 'task 800', 'created_at': 10, 'edge_count': 4},
+            {'uuid': 'u-solo', 'name': 'task 800', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='task 800')])
@@ -5022,7 +5033,8 @@ class TestNormalizeTaskNodeNames:
         normalization hook causing the very bug the split hook repairs."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        foreign = {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20, 'edge_count': 7}
+        foreign = {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20,
+             'edge_count': 7, 'mentions_count': 0, 'provenance_rank': 7}
         _install_family_probe(service, {'605': [_FAMILY_605[0], foreign, *_FAMILY_605[1:]]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
@@ -5050,12 +5062,15 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'605': [
-            {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 5, 'edge_count': 99},
+            {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 5,
+             'edge_count': 99, 'mentions_count': 0, 'provenance_rank': 99},
             _FAMILY_605[0],
             _FAMILY_605[1],
-            {'uuid': 'u-notes', 'name': 'release 605 notes', 'created_at': 7, 'edge_count': 2},
+            {'uuid': 'u-notes', 'name': 'release 605 notes', 'created_at': 7,
+             'edge_count': 2, 'mentions_count': 0, 'provenance_rank': 2},
             _FAMILY_605[2],
-            {'uuid': 'u-1605', 'name': 'Task 1605', 'created_at': 9, 'edge_count': 1},
+            {'uuid': 'u-1605', 'name': 'Task 1605', 'created_at': 9,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 605')])
@@ -5130,8 +5145,10 @@ class TestNormalizeTaskNodeNames:
         _install_family_probe(service, {
             '605': _FAMILY_605,
             '700': [
-                {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 10, 'edge_count': 5},
-                {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 20, 'edge_count': 1},
+                {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 10,
+             'edge_count': 5, 'mentions_count': 0, 'provenance_rank': 5},
+                {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 20,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
             ],
         })
 
@@ -11069,6 +11086,195 @@ class TestStoreFailureDiagnosticsHelper:
         mem0_diag = next(d for d in res.failure_diagnostics if d['store'] == 'mem0')
         assert mem0_diag['reason'] == 'exception'
         assert mem0_diag['error_type'] == 'RuntimeError'
+
+
+class TestGetMemoryMem0Fingerprint:
+    """MemoryService.get_memory must read each field from the level mem0 puts it at.
+
+    The record shapes below are not guessed — they are exactly what installed
+    mem0 1.0.11 builds in ``mem0/memory/main.py::Memory.get`` /
+    ``::AsyncMemory.get``:
+
+      * ``promoted_payload_keys`` (``user_id``, ``agent_id``, ``run_id``,
+        ``actor_id``, ``role``) are copied to the record's TOP LEVEL and are
+        EXCLUDED from ``metadata`` via ``core_and_promoted_keys``;
+      * every other payload key — ``category`` among them — STAYS inside
+        ``metadata``;
+      * ``created_at`` is top level, normalised through
+        ``_normalize_iso_timestamp_to_utc``.
+
+    The measured harm this pins: 5/5 real ``cite_memory`` calls returned
+    ``{category: None, agent_id: None, created_at: <real>}`` against records
+    whose raw payloads carried non-null values for both.
+    """
+
+    _UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    #: One stored Qdrant payload; the record below is DERIVED from it by
+    #: mem0's own promotion rule rather than hand-written, so this module
+    #: cannot drift from the two other test modules that need the same shape.
+    _PAYLOAD = {
+        'data': 'some text',
+        'hash': 'h',
+        'created_at': '2026-09-09T12:00:00+00:00',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'claude-review-df-3200',
+        'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'category': 'observations_and_summaries',
+        'topic': 't',
+    }
+
+    @classmethod
+    def _mem0_record(cls, **overrides) -> dict:
+        """A record shaped exactly as installed mem0 1.0.11's get() returns it.
+
+        See ``tests/_mem0_record_shapes.py`` for the promotion rule and why it
+        is applied rather than transcribed.
+        """
+        record = mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
+        record.update(overrides)
+        return record
+
+    @pytest.mark.asyncio
+    async def test_reads_every_field_from_the_level_mem0_puts_it_at(self, service):
+        """The fingerprint is fully populated — no field is structurally None."""
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result == {
+            'category': 'observations_and_summaries',
+            'agent_id': 'claude-review-df-3200',
+            'created_at': '2026-09-09T12:00:00+00:00',
+        }, (
+            f'category must be read out of metadata and agent_id off the top level '
+            f'(mem0 promotes it); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_literally_none_does_not_raise(self, service):
+        """mem0 emits ``metadata: None``, not an absent key — handle it.
+
+        ``MemoryItem.model_dump()`` ALWAYS emits ``metadata: None`` and
+        ``result_item['metadata']`` is overwritten only ``if
+        additional_metadata:``, so a record whose payload carried nothing but
+        core and promoted keys arrives with ``metadata`` literally ``None``.
+        This is why ``rec.get('metadata') or {}`` must be preserved over
+        ``rec['metadata']`` — the ``or {}`` is load-bearing, not defensive
+        decoration.
+        """
+        service.mem0.get = AsyncMock(return_value=self._mem0_record(metadata=None))
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result['category'] is None
+        assert result['agent_id'] == 'claude-review-df-3200', (
+            'a promoted key lives at the top level and must survive metadata being None'
+        )
+        assert result['created_at'] == '2026-09-09T12:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_absent_promoted_key_does_not_raise(self, service):
+        """mem0 copies a promoted key only ``if key in memory.payload``.
+
+        So ``agent_id`` can be absent from the record ENTIRELY — the read must
+        be ``.get()``, never a subscript.
+        """
+        record = self._mem0_record()
+        del record['agent_id']
+        service.mem0.get = AsyncMock(return_value=record)
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result['agent_id'] is None
+        assert result['category'] == 'observations_and_summaries'
+        assert result['created_at'] == '2026-09-09T12:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_shape_is_not_widened(self, service):
+        """The returned keys are EXACTLY {category, agent_id, created_at}.
+
+        Contract guard.  The three-key shape is consumed by
+        ``ReconReportState.cite_memory``, ``reconciliation/prompts/__init__.py``
+        and ``cli_stage_runner``'s JSON schema.  The audit of mem0's
+        ``promoted_payload_keys`` shows ``user_id`` / ``run_id`` / ``actor_id``
+        / ``role`` also sit at the top level of the record, and ``agent_id`` is
+        the only one this fingerprint touches — availability is not a reason to
+        widen a downstream contract.
+        """
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert set(result) == {'category', 'agent_id', 'created_at'}, (
+            f'fingerprint shape is a downstream contract; got keys {sorted(result)!r}'
+        )
+
+
+class TestGetMemoryTimeoutNotCoercedToNotFound:
+    """MemoryService.get_memory must PROPAGATE a mem0 read timeout, never coerce it.
+
+    ``get_memory`` distinguishes exactly two outcomes on the mem0 path: a
+    genuine miss (``rec is None`` -> ``MemoryNotFoundError``) and a fingerprint.
+    A read timeout is NEITHER, and conflating it with the miss puts a FALSE
+    ABSENCE into a durable reconciliation report via
+    ``ReconReportState.cite_memory``'s ``memory_not_found``.  The full chain,
+    and the corroboration gate in ``citation_repair`` that keeps it from
+    becoming a deletion, are stated once at
+    ``backends/mem0_client.py::Mem0Backend.get``.
+
+    This is the pin that ``get_memory`` must never grow a ``try/except
+    TimeoutError`` of its own, now that ``Mem0Backend.get`` propagates instead
+    of returning ``None``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mem0_read_timeout_propagates(self, service):
+        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        service.mem0.get = AsyncMock(
+            side_effect=TimeoutError('Mem0 get timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await service.get_memory(uuid, 'mem0', 'dark_factory')
+
+        assert not isinstance(excinfo.value, MemoryNotFoundError), (
+            'a read timeout must never surface as MemoryNotFoundError — that is the '
+            'signal repair_memory_citation deletes citations on'
+        )
+        assert 'timed out' in str(excinfo.value), (
+            f'the backend message must survive to the caller; got {str(excinfo.value)!r}'
+        )
+
+
+class TestReplayFromStoreTimeoutIsNotAZero:
+    """A mem0 ``get_all`` timeout must reach the caller, never read as "nothing".
+
+    ``replay_from_store`` calls ``get_all`` unguarded and returns the count it
+    queued, so under the old swallow a timeout produced ``{}`` -> no results ->
+    a clean ``0``, and the ``replay_to_graphiti`` MCP tool reported "0 queued"
+    for a replay that never ran.  That false-zero-to-loud-error transition is
+    half the justification for making ``Mem0Backend.get_all`` propagate, and
+    it was asserted nowhere: the behaviour is correct today only because no
+    handler stands between the two, and an ``except Exception: return 0``
+    added later for "robustness" would restore the false zero in silence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_all_timeout_propagates_rather_than_returning_zero(self, service):
+        service.mem0.get_all = AsyncMock(
+            side_effect=TimeoutError('Mem0 get_all timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await service.replay_from_store('dark_factory')
+
+        assert 'timed out' in str(excinfo.value), (
+            f'the backend message must survive to the caller; got {str(excinfo.value)!r}'
+        )
 
 
 class TestGetMemoryById:

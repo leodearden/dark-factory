@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -887,29 +890,103 @@ class TestAsyncSqliteBaseCheckpoint:
 # AtomicConnection — per-connection atomic access (task 5560)
 # ---------------------------------------------------------------------------
 
-# Filler rows the collision scan must step through before its first match.
-# Sized from the measured production regression this primitive exists to fix:
-# ~24k `completed` rows sitting ahead of the one `running` row the reaper query
-# is looking for, which is what makes the *execute* hop slow enough for another
-# coroutine's write to be queued into the gap before the fetch hop.
-_SCAN_FILLER_ROWS = 24_000
+# A hang guard only: never elapses on a passing run.  It turns a harness bug
+# into a legible failure instead of a wedged worker thread.
+_GATE_HANG_GUARD_SECS = 30.0
 
-# A scan whose FIRST row is only reachable after stepping every filler row, so
-# the legacy shape's execute hop holds the WAL snapshot open for milliseconds.
-_SLOW_SCAN = 'SELECT id, v FROM items WHERE flag = ? AND n < ?'
-_SLOW_SCAN_PARAMS = ('live', 10)
+# The WHERE term depends on a column, so SQLite calls scan_gate once per row
+# scanned; the FIRST row parks.
+_GATED_SCAN = "SELECT id, v FROM items WHERE scan_gate(flag) = 'live'"
+
+_COLLIDING_UPDATE = "UPDATE items SET v = 'owner' WHERE id = 'live'"
 
 
-async def _seed_scan_table(conn: aiosqlite.Connection) -> None:
-    """Create ``items`` with the filler prefix, one 'live' row and one foreign-writer row."""
-    await conn.execute('CREATE TABLE items (id TEXT PRIMARY KEY, flag TEXT, n INTEGER, v TEXT)')
-    await conn.executemany(
-        'INSERT INTO items (id, flag, n, v) VALUES (?, ?, ?, ?)',
-        [(f'filler-{i}', 'dead', 0, '0') for i in range(_SCAN_FILLER_ROWS)],
-    )
-    await conn.execute("INSERT INTO items VALUES ('live', 'live', 1, '0')")
-    await conn.execute("INSERT INTO items VALUES ('foreign', 'dead', 0, '0')")
+class _ScanGate:
+    """The ``scan_gate(value)`` SQL function: parks the first row until released.
+
+    It runs on the connection's worker thread in the middle of
+    ``sqlite3_step``, so the read's snapshot stays pinned while it is parked.
+    Every call comes from that one thread, so ``_has_parked`` needs no lock.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.parked = asyncio.Event()
+        self._loop = loop
+        self._released = threading.Event()
+        self._has_parked = False
+
+    def __call__(self, value: object) -> object:
+        if not self._has_parked:
+            self._has_parked = True
+            self._loop.call_soon_threadsafe(self.parked.set)
+        if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
+            raise TimeoutError('scan_gate was never released')
+        return value
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def _open_collision_pair(
+    open_conn: Callable[[Path], Awaitable[aiosqlite.Connection]], db_path: Path
+) -> tuple[aiosqlite.Connection, aiosqlite.Connection, _ScanGate]:
+    """Open ``owner`` (with ``scan_gate`` registered) and ``foreign`` on one seeded file."""
+    owner = await open_conn(db_path)
+    foreign = await open_conn(db_path)
+    await owner.execute('CREATE TABLE items (id TEXT PRIMARY KEY, flag TEXT, v TEXT)')
+    await owner.execute("INSERT INTO items VALUES ('live', 'live', '0')")
+    await owner.execute("INSERT INTO items VALUES ('foreign', 'dead', '0')")
+    await owner.commit()
+    gate = _ScanGate(asyncio.get_running_loop())
+    await owner.create_function('scan_gate', 1, gate)
+    return owner, foreign, gate
+
+
+async def _sqlite_error_name(op: Callable[[], Awaitable[None]]) -> str | None:
+    """Await ``op`` and return its SQLite error name, or None if it raised nothing."""
+    try:
+        await op()
+    except sqlite3.OperationalError as exc:
+        return exc.sqlite_errorname
+    return None
+
+
+async def _raw_colliding_write(conn: aiosqlite.Connection) -> None:
+    """The colliding write, issued straight on ``conn`` past any lock."""
+    await conn.execute(_COLLIDING_UPDATE)
     await conn.commit()
+
+
+async def _collide_with_a_pinned_read(
+    foreign: aiosqlite.Connection,
+    gate: _ScanGate,
+    *,
+    read: Callable[[], Coroutine[Any, Any, list[aiosqlite.Row]]],
+    write: Callable[[], Awaitable[None]],
+) -> tuple[list[aiosqlite.Row], str | None]:
+    """Issue ``write`` into ``read``'s pinned-snapshot window after a foreign commit.
+
+    Returns the read's rows and the write's SQLite error name (None if it
+    raised nothing).  The order is constructed, not raced:
+
+    1. ``read`` parks inside ``scan_gate`` with its snapshot pinned.
+    2. The writer task is created, then the test suspends on ``foreign``'s
+       statement.  asyncio's FIFO ready queue runs the writer's first step
+       during that suspension, which either queues its statement behind the
+       parked hop or parks it on :class:`AtomicConnection`'s lock.
+    3. ``foreign`` commits, so the owner's pinned snapshot is now stale.
+    4. Only then is the gate released.
+    """
+    async with asyncio.TaskGroup() as tasks:
+        reader = tasks.create_task(read())
+        try:
+            await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+            writer = tasks.create_task(_sqlite_error_name(write))
+            await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
+            await foreign.commit()
+        finally:
+            gate.release()
+    return reader.result(), writer.result()
 
 
 @pytest.fixture
@@ -981,71 +1058,84 @@ class TestAtomicConnectionReads:
 class TestAtomicConnectionSnapshotPin:
     """A write queued into a multi-hop read's snapshot window fails at once; one hop does not.
 
-    Measured on this base before the fix: the legacy ``async with
-    conn.execute(...) as cur: await cur.fetchall()`` shape loses 39 of 40
-    iterations to ``SQLITE_BUSY_SNAPSHOT``.  SQLite pins the read snapshot from
-    the execute hop until the statement completes; a write queued into that gap
-    fails immediately once a DIFFERENT connection to the same file has
+    SQLite pins the read snapshot from the execute hop until the statement
+    completes; a write queued into that gap fails immediately with
+    ``SQLITE_BUSY_SNAPSHOT`` once a DIFFERENT connection to the same file has
     committed, and ``busy_timeout`` cannot help because the busy handler is
-    never invoked while a transaction is already open.
+    never invoked while a transaction is already open.  Both arms CONSTRUCT
+    that collision by parking the read inside ``scan_gate`` rather than racing
+    threads for it, so each arm is a single deterministic run.
     """
 
     async def test_read_all_leaves_no_window_for_a_colliding_write(self, tmp_path, open_conn):
-        """40 iterations of read-then-write across a foreign commit raise nothing."""
-        db_path = tmp_path / 'scan.db'
-        owner = await open_conn(db_path)
-        foreign = await open_conn(db_path)
-        await _seed_scan_table(owner)
+        """One constructed collision raises nothing, and the write lands.
+
+        The read is parked mid-step with its snapshot pinned, a foreign
+        connection commits, and a write unit is issued into that window.
+        This pins the production pairing, the lock and the single hop
+        together: either one alone keeps it green.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
         access = AtomicConnection(owner)
 
-        errors: list[str] = []
-        for i in range(40):
-            reader = asyncio.create_task(access.read_all(_SLOW_SCAN, _SLOW_SCAN_PARAMS))
-            await asyncio.sleep(0)
-            await foreign.execute("UPDATE items SET v = ? WHERE id = 'foreign'", (str(i),))
-            await foreign.commit()
-            try:
-                async with access.write() as db:
-                    await db.execute("UPDATE items SET v = ? WHERE id = 'live'", (str(i),))
-            except sqlite3.OperationalError as exc:
-                errors.append(f'{getattr(exc, "sqlite_errorname", "?")}: {exc}')
-            rows = await reader
-            assert len(rows) == 1
+        async def unit_write() -> None:
+            async with access.write() as db:
+                await db.execute(_COLLIDING_UPDATE)
 
-        assert errors == []
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=lambda: access.read_all(_GATED_SCAN), write=unit_write
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
+
+    async def test_read_all_single_hop_survives_a_write_that_bypasses_the_lock(
+        self, tmp_path, open_conn
+    ):
+        """The single hop alone closes the window: a raw write past the lock lands too.
+
+        It issues the control's exact write, so the two arms differ only in
+        the read's shape.  This is the arm that goes red if ``read_all``
+        regresses to execute + fetch.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
+        access = AtomicConnection(owner)
+
+        rows, error = await _collide_with_a_pinned_read(
+            foreign,
+            gate,
+            read=lambda: access.read_all(_GATED_SCAN),
+            write=lambda: _raw_colliding_write(owner),
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
 
     async def test_legacy_multi_hop_read_still_loses_the_race(self, tmp_path, open_conn):
-        """CONTROL: the shape being replaced still raises SQLITE_BUSY_SNAPSHOT here.
+        """CONTROL: the replaced shape raises SQLITE_BUSY_SNAPSHOT in the same collision.
 
-        This arm is what proves the harness above still exercises the pin after
-        the fix rather than passing vacuously — measured 39/40 iterations
-        failing on this base, so a false green is ~0.
+        The single-hop arm survives this exact collision, with the same raw
+        write and only the read differing, so the replaced shape losing it
+        proves that arm discriminates rather than passing vacuously.
         """
-        db_path = tmp_path / 'scan.db'
-        owner = await open_conn(db_path)
-        foreign = await open_conn(db_path)
-        await _seed_scan_table(owner)
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
 
-        async def legacy_read():
-            async with owner.execute(_SLOW_SCAN, _SLOW_SCAN_PARAMS) as cur:
-                return await cur.fetchall()
+        async def legacy_read() -> list[aiosqlite.Row]:
+            async with owner.execute(_GATED_SCAN) as cur:
+                return list(await cur.fetchall())
 
-        names: list[str | None] = []
-        for i in range(40):
-            reader = asyncio.create_task(legacy_read())
-            await asyncio.sleep(0)
-            await foreign.execute("UPDATE items SET v = ? WHERE id = 'foreign'", (str(i),))
-            await foreign.commit()
-            try:
-                await owner.execute("UPDATE items SET v = ? WHERE id = 'live'", (str(i),))
-                await owner.commit()
-            except sqlite3.OperationalError as exc:
-                names.append(getattr(exc, 'sqlite_errorname', None))
-            await reader
-            with suppress(Exception):
-                await owner.rollback()
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=legacy_read, write=lambda: _raw_colliding_write(owner)
+        )
 
-        assert 'SQLITE_BUSY_SNAPSHOT' in names
+        assert error == 'SQLITE_BUSY_SNAPSHOT'
+        assert [r['id'] for r in rows] == ['live']
 
 
 @pytest.mark.asyncio

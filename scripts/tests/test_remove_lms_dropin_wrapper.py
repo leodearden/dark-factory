@@ -124,9 +124,8 @@ def _systemd_user_manager_skip_reason() -> str | None:
     unit_dir = _unit_dir()
     try:
         unit_dir.mkdir(parents=True, exist_ok=True)
-        # The probe name carries _SELFTEST_PREFIX and a `.service` suffix on
-        # purpose: those are the two things _prune_stale_selftest_units keys
-        # on, so a run SIGKILLed in the microseconds between the write and the
+        # The probe name satisfies _is_prunable_selftest_residue on purpose,
+        # so a run SIGKILLed in the microseconds between the write and the
         # unlink strands a file the existing sweep can still reap.  An
         # unprefixed name (or a bare tempfile) would strand residue nothing
         # could ever collect -- the exact accumulation the prune was written
@@ -201,12 +200,34 @@ def _require_systemd_user_manager() -> None:
 # Per-invocation isolation: a unique throwaway template name
 # ---------------------------------------------------------------------------
 
-# The single shared constant.  _unique_template() GENERATES names with this
-# prefix and _prune_stale_selftest_units() only ever DELETES names with it, so
-# "the prune can never touch a real unit" is structural rather than a pair of
-# string literals free to drift apart.  It cannot prefix-match `lms-arm@` (the
-# real unit the script under test targets) or any dark-factory unit.
-_SELFTEST_PREFIX = "lms-dropin-selftest-"
+# The single shared stem.  _unique_template() GENERATES names with
+# _SELFTEST_PREFIX and _prune_stale_selftest_units() DELETES names with
+# _SELFTEST_PREFIX or exactly equal to _DEFAULT_TEMPLATE, so "the prune can
+# never touch a real unit" is structural rather than a set of string literals
+# free to drift apart.  Neither can prefix-match `lms-arm@` (the real unit the
+# script under test targets) or any dark-factory unit.
+#
+# Two names rather than one widened prefix, on purpose: the generator binds
+# ONLY _SELFTEST_PREFIX, so a real unit can never be generated into pruning
+# scope; the prune additionally recognises the ONE fixed default name a
+# by-hand run falls back to (see the .sh's TEMPLATE= line, pinned below, in
+# the step-5 section, by test_default_template_constant_matches_the_shell_default).
+# Both descend from _SELFTEST_STEM so they cannot drift apart from each other.
+#
+# That sharing has one operational consequence, not a correctness one: it
+# couples two independently-owned values -- the prefix _unique_template()
+# GENERATES, and the literal the .sh happens to default to.  Changing
+# _SELFTEST_STEM moves _SELFTEST_PREFIX and _DEFAULT_TEMPLATE TOGETHER, so a
+# future rename cannot reap residue already stranded under the OLD stem in an
+# operator's live ~/.config/systemd/user -- the predicate would no longer
+# recognise either the old prefix or the old default name.
+# test_default_template_constant_matches_the_shell_default only pins
+# _DEFAULT_TEMPLATE against the .sh's CURRENT literal; it says nothing about
+# residue a past rename left behind.  Treat any future _SELFTEST_STEM edit as
+# needing a paired one-off sweep of pre-existing residue under the old stem.
+_SELFTEST_STEM = "lms-dropin-selftest"
+_SELFTEST_PREFIX = f"{_SELFTEST_STEM}-"  # what _unique_template() generates
+_DEFAULT_TEMPLATE = f"{_SELFTEST_STEM}@"  # what the .sh falls back to by hand
 
 
 def _unique_template() -> str:
@@ -245,6 +266,48 @@ def _unique_template() -> str:
 _STALE_AFTER_S = 3600.0
 
 
+def _is_prunable_selftest_residue(name: str) -> bool:
+    """Whether *name* is selftest residue that ``_prune_stale_selftest_units``
+    may reap, gated by TWO independent properties:
+
+    * THE SUFFIX GATE, evaluated FIRST.  Only a ``.service`` or
+      ``.service.d`` name can be residue at all; anything else returns False
+      immediately.  This is what keeps the sweep away from ``_LOCK_NAME`` and
+      from any future selftest-prefixed bookkeeping file -- it is not
+      cosmetic, see the rationale in ``_systemd_user_manager_skip_reason``
+      (declining to widen this filter to cover a dot-file) and above
+      ``_LOCK_NAME`` itself, and the ``non_units`` half of
+      ``test_prune_never_touches_a_non_selftest_unit``.
+    * THE NAME GATE.  The remaining stem must either start with
+      ``_SELFTEST_PREFIX`` (a unique name ``_unique_template()`` generated)
+      or equal ``_DEFAULT_TEMPLATE`` exactly (the ONE fixed name the .sh
+      falls back to, pinned to the .sh's actual literal by
+      ``test_default_template_constant_matches_the_shell_default``).  Real
+      units (``lms-arm@``, ``fused-memory``, ``dark-factory-dashboard``) are
+      excluded structurally, at any age, by this gate alone.
+
+      The default arm is what this task adds, and is EXACT EQUALITY rather
+      than a widened prefix: ``"lms-dropin-selftest@"`` does not start with
+      ``"lms-dropin-selftest-"``, which is why the old prefix-only filter
+      could never reach it.  Equality (rather than
+      ``startswith(_SELFTEST_STEM)``) is what keeps the near-misses pinned by
+      ``test_prune_match_predicate_admits_selftest_residue_and_nothing_else``
+      excluded.
+    """
+    # 1. Suffix gate first.  "x.service.d".endswith(".service") is already
+    #    False, so checking ".service.d" ahead of ".service" doesn't change
+    #    which names match -- it just makes the two-suffix intent explicit
+    #    rather than incidental.
+    for suffix in (".service.d", ".service"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        return False
+    # 2. Name gate: a unique generated name, or exactly the bare default.
+    return stem.startswith(_SELFTEST_PREFIX) or stem == _DEFAULT_TEMPLATE
+
+
 def _prune_stale_selftest_units(
     unit_dir: Path,
     *,
@@ -261,12 +324,18 @@ def _prune_stale_selftest_units(
     TWO SAFETY PROPERTIES, each with its own test above, because this deletes
     files out of the operator's LIVE unit directory:
 
-    * Only ``_SELFTEST_PREFIX``-named units are ever considered -- the same
-      constant ``_unique_template()`` generates with, so a real ``lms-arm@``
-      or fleet unit is out of scope structurally, at any age.
+    * Only names ``_is_prunable_selftest_residue`` admits are ever
+      considered -- a ``_SELFTEST_PREFIX``-generated name (the same constant
+      ``_unique_template()`` generates with) PLUS exactly
+      ``_DEFAULT_TEMPLATE`` (the one fixed name a by-hand run falls back to),
+      both suffix-gated to ``.service``/``.service.d``.  See that function
+      for the full inclusion/exclusion table; a real ``lms-arm@`` or fleet
+      unit is out of scope structurally, at any age.
     * Anything NEWER than max_age_s is left alone.  Under 48-way concurrency a
       fresh selftest unit is a running sibling's fixture, and deleting it
-      would destroy that run.
+      would destroy that run -- and since the name gate above now also admits
+      the shared ``_DEFAULT_TEMPLATE`` name, this guard is what protects a
+      live BY-HAND run too, not just a concurrent pytest sibling.
 
     ``now`` and ``max_age_s`` are parameters rather than clock reads so the
     tests can drive this deterministically without sleeping or patching time.
@@ -277,9 +346,7 @@ def _prune_stale_selftest_units(
         if not unit_dir.is_dir():
             return
         for path in sorted(unit_dir.iterdir()):
-            if not path.name.startswith(_SELFTEST_PREFIX):
-                continue
-            if not path.name.endswith((".service", ".service.d")):
+            if not _is_prunable_selftest_residue(path.name):
                 continue
             try:
                 if now - path.stat().st_mtime <= max_age_s:
@@ -536,9 +603,13 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
           multiplied the daemon-reload contention it was meant to model, while
           its three threads shared one PID -- so it modelled the SAME-process
           case, not the fleet's cross-process one.  Removed under esc-4200-2.)
-      (c) The shared _SELFTEST_PREFIX.  The generator and the prune bind the
-          SAME constant, so the prune's "never touch a real unit" property is
-          structural rather than a pair of string literals free to drift.
+      (c) The shared _SELFTEST_STEM.  The generator binds _SELFTEST_PREFIX;
+          the prune's predicate binds both _SELFTEST_PREFIX and
+          _DEFAULT_TEMPLATE -- and all three descend from the one
+          _SELFTEST_STEM constant, so the prune's "never touch a real unit"
+          property stays structural rather than a set of string literals
+          free to drift, even though it is now delivered by two sibling
+          constants instead of one.
       (d) A legal systemd unit-name charset.  Verified viable at plan time:
           PID-suffixed template names resolve correctly against a real
           manager.
@@ -566,6 +637,131 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
 # ---------------------------------------------------------------------------
 # step-5: RED -- the stale-residue prune
 # ---------------------------------------------------------------------------
+
+def test_default_template_constant_matches_the_shell_default() -> None:
+    """_DEFAULT_TEMPLATE must equal the .sh's actual fallback literal.
+
+    Lives here, ahead of the predicate/prune tests below, rather than beside
+    _unique_template() where the .sh's default template plays no role: every
+    test in this section either asserts on _DEFAULT_TEMPLATE directly
+    (test_prune_match_predicate_admits_selftest_residue_and_nothing_else,
+    test_prune_reaps_bare_default_template_residue_but_only_when_stale) or
+    exercises the predicate that keys on it, so this pin belongs beside its
+    dependents rather than in the "Per-invocation isolation" section above,
+    which is about _unique_template()'s generated names only.
+
+    This is a VALUE contract between two files -- the functional default the
+    prune's bare-default arm must match -- NOT an assertion on prose,
+    comments or docstrings.  Same-shaped precedent:
+    tests/scripts/test_dashboard_service_template.py::
+    _assert_known_project_roots_comma_separated, which parses a systemd unit
+    file's Environment= line the same way: read the file, ``re.search`` an
+    ANCHORED ``^...$`` pattern under ``re.MULTILINE``, assert the match
+    exists, then assert on the extracted group.
+
+    Anchored rather than a substring/``in`` check on purpose -- MEASURED: the
+    literal ``lms-dropin-selftest@`` also appears in the .sh's own header
+    comment ("(lms-dropin-selftest@) plus a drop-in") and
+    ``LMS_SELFTEST_TEMPLATE=`` appears again in the Usage comment.  A naive
+    ``"lms-dropin-selftest@" in sh_text`` check stays True even after the
+    default on the ``TEMPLATE=`` line itself is changed to something else
+    entirely, so it would silently pass through the exact drift this test
+    exists to catch.
+
+    The pattern tolerates incidental formatting -- leading indentation,
+    dropped quotes around the ``${...}`` expansion, a trailing inline
+    comment -- WITHOUT weakening the anchor: it still requires the
+    (whitespace-trimmed) line to open with the literal ``TEMPLATE=``, which is
+    what keeps it from matching the header/Usage comments above and is the
+    property the anchoring exists for.  What it deliberately does NOT
+    tolerate is the default being split across a separate variable -- that
+    would be a structurally different assignment, and this module already
+    declines to auto-derive this kind of cross-file value contract (see
+    _DEFAULT_TEMPLATE's definition above and the analogous reasoning for
+    _TEMPLATE_ENV_VAR below).
+
+    The variable-name half of the pattern is built from ``_TEMPLATE_ENV_VAR``
+    (``re.escape``d) rather than re-typed, so the two bind.  The forward
+    reference to ``_TEMPLATE_ENV_VAR`` (defined below, near the .sh-driving
+    helpers) is safe: globals resolve at CALL time, the same pattern this
+    module already documents for the forward reference to ``_SELFTEST_PREFIX``
+    in ``_systemd_user_manager_skip_reason``.
+    """
+    sh_text = SELFTEST_SH.read_text(encoding="utf-8")
+    pattern = (
+        r'^\s*TEMPLATE="?\$\{'
+        + re.escape(_TEMPLATE_ENV_VAR)
+        + r':-([^"}]+)\}"?\s*(?:#.*)?$'
+    )
+    match = re.search(pattern, sh_text, re.MULTILINE)
+    assert match is not None, (
+        f"{SELFTEST_SH} no longer has a line of the shape "
+        f'TEMPLATE="${{{_TEMPLATE_ENV_VAR}:-<default>}}" -- this test cannot '
+        "pin the .sh's default template without it."
+    )
+    assert match.group(1) == _DEFAULT_TEMPLATE, (
+        f"the .sh's default template ({match.group(1)!r}) has drifted from "
+        f"_DEFAULT_TEMPLATE ({_DEFAULT_TEMPLATE!r}).  The prune's bare-default "
+        "arm keys on _DEFAULT_TEMPLATE, so this drift makes a killed hand-run's "
+        "residue permanently unreapable again -- while every other assertion "
+        "in this module stays green."
+    )
+
+
+def test_prune_match_predicate_admits_selftest_residue_and_nothing_else() -> None:
+    """_is_prunable_selftest_residue must admit exactly the reapable residue.
+
+    Table-driven, and written BEFORE the predicate exists: the near-miss rows
+    below are what FORCE the default arm to be a tight ``stem ==
+    _DEFAULT_TEMPLATE`` equality check rather than a widened bare-stem prefix
+    match.  Nothing else in this module would catch that sloppier widening --
+    the existing test_prune_never_touches_a_non_selftest_unit only plants
+    ``lms-arm@``, the fleet units, ``_LOCK_NAME`` and a prefixed ``.conf``,
+    none of which are near-misses of the DEFAULT arm this task adds.
+
+    The ``.service``/``.service.d`` suffix gate must be evaluated FIRST
+    inside the predicate and must never be weakened: it is the only thing
+    standing between this sweep and ``_LOCK_NAME`` (see that case below).
+    """
+    cases: list[tuple[str, bool, str]] = [
+        # MUST MATCH -- today's unique generated names.
+        (f"{_SELFTEST_PREFIX}999-deadbeef@.service", True, "a unique generated unit"),
+        (f"{_SELFTEST_PREFIX}999-deadbeef@.service.d", True, "a unique generated drop-in dir"),
+        # MUST MATCH -- THE DEFECT this task fixes: the bare default a killed
+        # hand-run strands, unreapable before this predicate existed.
+        (f"{_DEFAULT_TEMPLATE}.service", True, "the bare-default unit a hand-run strands"),
+        (f"{_DEFAULT_TEMPLATE}.service.d", True, "the bare-default drop-in dir a hand-run strands"),
+        # MUST NOT MATCH -- real units, at any age.
+        ("lms-arm@.service", False, "the real unit the script under test targets"),
+        ("lms-arm@.service.d", False, "the real unit's drop-in dir"),
+        ("fused-memory.service", False, "a real fleet unit"),
+        ("dark-factory-dashboard.service", False, "a real fleet unit"),
+        ("dark-factory-dashboard.service.d", False, "a real fleet unit's drop-in dir"),
+        # MUST NOT MATCH -- the serialization lock: fails the suffix gate.
+        # fcntl.flock lives on the open file DESCRIPTION, so unlinking the
+        # path releases nothing -- it lets the next session create a fresh
+        # inode and take a second "exclusive" slot, silently unserializing
+        # the one real-systemd leg (seam added in commit fabf652c83).
+        (_LOCK_NAME, False, "the host-wide serialization lock"),
+        # MUST NOT MATCH -- selftest-prefixed/stemmed non-unit files.
+        (f"{_SELFTEST_PREFIX}x@.conf", False, "a selftest-prefixed non-unit file"),
+        (f"{_SELFTEST_STEM}.log", False, "a selftest-stemmed non-unit file"),
+        # MUST NOT MATCH -- near-misses of the widened default arm that a
+        # sloppy `startswith(_SELFTEST_STEM)` widening would wrongly admit,
+        # and which nothing else in the module can catch.
+        (f"{_SELFTEST_STEM}.service", False, "no '@' -- not a template at all"),
+        (f"{_SELFTEST_STEM}ZZZ@.service", False, "stem is a PREFIX of, not equal to, the default"),
+        (f"{_SELFTEST_STEM}@probe.service", False, "a resolved instance name, not the template file"),
+        # MUST NOT MATCH -- degenerate.
+        (".service", False, "empty stem"),
+        ("", False, "empty name"),
+    ]
+    for name, expected, why in cases:
+        assert _is_prunable_selftest_residue(name) is expected, (
+            f"{name!r} ({why}): expected _is_prunable_selftest_residue(name) is "
+            f"{expected!r}"
+        )
+
 
 def _write_unit(unit_dir: Path, template: str, *, age_s: float, now: float) -> tuple[Path, Path]:
     """Install a <template>.service + <template>.service.d/ pair aged age_s.
@@ -632,6 +828,63 @@ def test_prune_leaves_a_fresh_selftest_unit_alone(tmp_path: Path) -> None:
     assert dropin_dir.exists(), "a FRESH selftest drop-in dir must survive"
 
 
+def test_prune_reaps_bare_default_template_residue_but_only_when_stale(tmp_path: Path) -> None:
+    """THE DEFECT this task fixes, plus the freshness guard that makes it safe.
+
+    (a) THE DEFECT, expected RED before step-6 wires the predicate in: a
+    STALE bare-default unit -- what a hand-run SIGKILLed before its
+    ``trap cleanup EXIT`` fires strands in the operator's live unit dir --
+    must be reaped.  Measured before this fix: both the unit and its
+    drop-in dir survive, because ``"lms-dropin-selftest@.service"`` does not
+    start with ``_SELFTEST_PREFIX``.
+
+    (b) SAFETY, expected green before and after -- a regression pin in this
+    module's "Expected GREEN on arrival" idiom.  This half is mandatory, not
+    decorative: the default template name is SHARED across every hand-run,
+    unlike ``_unique_template()``'s per-invocation names, so once the prune
+    can match it at all, ``_STALE_AFTER_S`` becomes the ONLY thing
+    separating "my abandoned residue" from "an operator's live hand-run
+    fixture".  Deleting a fresh one would tear that run down mid-test,
+    re-introducing from the cleanup side exactly the collision uniquification
+    was introduced to remove.  The margin is large and measured: a solo .sh
+    run is 5.2s against ``_STALE_AFTER_S = 3600.0`` (~690x).  This matters
+    most on the one path where the sweep runs UNSERIALIZED:
+    test_shell_selftest_passes calls ``_prune_stale_selftest_units`` BEFORE
+    entering ``_serialized_selftest_slot()``, so the freshness guard is the
+    ENTIRE protection there -- which is why this gets its own assertion
+    rather than riding on test_prune_leaves_a_fresh_selftest_unit_alone,
+    which covers only the unique-name arm.
+
+    Both halves use ``_DEFAULT_TEMPLATE`` -- never a re-typed literal, since
+    step-1 pins that constant to the .sh's actual default -- and separate tmp
+    unit dirs, so a bug that makes (a) pass by accident cannot also make (b)
+    pass by accident.
+    """
+    now = 1_000_000.0
+
+    stale_unit_dir = tmp_path / "stale" / "systemd" / "user"
+    stale_unit, stale_dropin_dir = _write_unit(
+        stale_unit_dir, _DEFAULT_TEMPLATE, age_s=7200.0, now=now
+    )
+
+    fresh_unit_dir = tmp_path / "fresh" / "systemd" / "user"
+    fresh_unit, fresh_dropin_dir = _write_unit(
+        fresh_unit_dir, _DEFAULT_TEMPLATE, age_s=5.0, now=now
+    )
+
+    _prune_stale_selftest_units(stale_unit_dir, now=now, max_age_s=3600.0)
+    _prune_stale_selftest_units(fresh_unit_dir, now=now, max_age_s=3600.0)
+
+    assert not stale_unit.exists(), f"stale {stale_unit.name} should have been pruned"
+    assert not stale_dropin_dir.exists(), (
+        f"stale {stale_dropin_dir.name}/ should have been pruned"
+    )
+    assert fresh_unit.exists(), (
+        "a FRESH bare-default unit belongs to a live hand-run and must survive"
+    )
+    assert fresh_dropin_dir.exists(), "a FRESH bare-default drop-in dir must survive"
+
+
 def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
     """(c) SAFETY -- a real unit is never swept up, at ANY age.
 
@@ -643,13 +896,14 @@ def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
     written to prevent.
 
     Second half: the SUFFIX filter, which neither the prefix case above nor
-    the age case in the previous test can reach.  The prune requires BOTH
-    _SELFTEST_PREFIX and a .service/.service.d suffix, and the suffix half is
-    load-bearing on its own -- see the rationale in
+    the age case in the previous test can reach.  The prune requires a name
+    _is_prunable_selftest_residue admits -- a _SELFTEST_PREFIX-generated name,
+    or exactly _DEFAULT_TEMPLATE -- AND a .service/.service.d suffix, and the
+    suffix half is load-bearing on its own -- see the rationale in
     _systemd_user_manager_skip_reason, which declines to widen it precisely
     because it is what keeps this sweep away from _LOCK_NAME.  Without a test,
-    widening the filter to the prefix alone would delete a live lock file with
-    every other prune assertion still green.
+    widening the filter to the name gate alone would delete a live lock file
+    with every other prune assertion still green.
     """
     now = 1_000_000.0
     unit_dir = tmp_path / "systemd" / "user"
@@ -738,10 +992,10 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
 
 # The rendezvous file, in ~/.config/systemd/user because that (via $HOME) is
 # the one thing all 48 concurrent worktrees demonstrably share -- the same
-# reason the collision existed at all.  The leading dot and the absent unit
-# suffix keep systemd from ever parsing it, and _prune_stale_selftest_units
-# cannot reach it: that sweep requires BOTH the _SELFTEST_PREFIX prefix and a
-# .service/.service.d suffix, and this name has neither.
+# reason the collision existed at all.  The leading dot keeps systemd from
+# ever parsing it, and _prune_stale_selftest_units cannot reach it either:
+# _is_prunable_selftest_residue gates on a .service/.service.d suffix FIRST,
+# and this name has none.
 _LOCK_NAME = ".lms-dropin-selftest.lock"
 
 # Budget, sized against the suite's per-test --timeout=300
@@ -1035,9 +1289,12 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     failing because all three runs silently fell back to the shared default;
     that test is gone, so without this one a dropped seam degrades SILENTLY to
     `lms-dropin-selftest@` -- re-opening the measured collision defect, and
-    stranding that default unit in the live dir permanently, since both
-    _remove_template_residue and _prune_stale_selftest_units key on the
-    unique, hyphenated name.
+    stranding that default unit in the live dir for that run: cleanup's
+    _remove_template_residue still keys on the unique, hyphenated name, so it
+    will not touch a default-named unit.  _prune_stale_selftest_units now
+    also admits _DEFAULT_TEMPLATE, so the strand is bounded to
+    _STALE_AFTER_S rather than permanent -- but that is an hour-later mop-up,
+    not a substitute for the seam actually propagating.
 
     Driven through ``_run_selftest``, the SAME helper the real gate uses, so
     both halves of the seam are covered by one assertion.  An earlier version

@@ -19,12 +19,14 @@ import ast
 import asyncio
 import dataclasses
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, wait_responsive
 from escalation.pins import PinReport, _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
 
@@ -152,6 +154,60 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
 # step-15/16: heartbeat loop
 # ---------------------------------------------------------------------------
 
+# Loop-responsive seconds; bounds only a real hang. The wall cap that
+# _orch_helpers.py::wait_responsive derives from it must stay under
+# _orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT, the merge gate's per-test budget.
+_HEARTBEAT_REFRESH_BUDGET_SECS = 5
+
+
+async def _await_heartbeat_refreshes(wf: TaskWorkflow, count: int = 1) -> None:
+    """Wait for the loop's *count*-th refresh itself, not for a wall-clock window.
+
+    Give-up is ``wait_responsive``'s labelled ``pytest.fail``, whose message tells a
+    starved worker apart from a real hang.
+    """
+    refreshes = cast(AsyncMock, wf.scheduler.set_task_claimant)
+
+    async def _poll() -> None:
+        while refreshes.await_count < count:
+            await asyncio.sleep(0.005)
+
+    await wait_responsive(
+        _poll(),
+        timeout=_HEARTBEAT_REFRESH_BUDGET_SECS,
+        label=f'task {wf.task_id} heartbeat loop reaching {count} refresh(es)',
+    )
+
+
+async def _stop_heartbeat_after_first_refresh(wf: TaskWorkflow) -> None:
+    await _await_heartbeat_refreshes(wf)
+    await wf._stop_claimant_heartbeat()
+
+
+# A fixed 50 ms wait survives a stall of at most 50 - 10 = 40 ms (35 ms: 1 refresh, 45 ms: 0).
+_DISPATCH_STALL_SECS = 0.06
+
+
+def _stall_loop_at_dispatch(wf: TaskWorkflow, stall_secs: float) -> asyncio.Event:
+    """Freeze the loop thread for *stall_secs*, the way a descheduled xdist worker is frozen.
+
+    The dispatch write is the seam: the heartbeat task is created right after it, so the
+    stall runs AHEAD of the heartbeat's first step, once the test is already waiting.
+    Returns an event set once the stall has run, so a caller can check it landed there.
+    """
+    dispatch_write = cast(AsyncMock, wf.scheduler.set_task_status)
+    stall_ran = asyncio.Event()
+
+    def _stall() -> None:
+        time.sleep(stall_secs)
+        stall_ran.set()
+
+    def _queue_stall(*_args, **_kwargs) -> None:
+        asyncio.get_running_loop().call_soon(_stall)
+
+    dispatch_write.side_effect = _queue_stall
+    return stall_ran
+
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_starts_after_dispatch_stamp(tmp_path: Path):
@@ -173,9 +229,7 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
     wf = _make_workflow(project_root=tmp_path, task_id='303', claimant_heartbeat_interval_secs=0.01)
 
     await _setup(wf)
-    # Let the loop tick at least once (interval=0.01s).
-    await asyncio.sleep(0.05)
-    await wf._stop_claimant_heartbeat()
+    await _stop_heartbeat_after_first_refresh(wf)
 
     assert wf.scheduler.set_task_claimant.await_count >= 1  # type: ignore[attr-defined]
     args, kwargs = wf.scheduler.set_task_claimant.call_args  # type: ignore[attr-defined]
@@ -185,14 +239,34 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_loop_still_refreshes_after_a_loop_stall_at_dispatch(tmp_path: Path):
+    """Regression guard for this file's heartbeat waits (task 5837): they wait for the
+    refresh itself, not a fixed wall-clock window, so a worker stall cannot cancel a
+    healthy loop before its first tick."""
+    wf = _make_workflow(project_root=tmp_path, task_id='404', claimant_heartbeat_interval_secs=0.01)
+    stall_ran = _stall_loop_at_dispatch(wf, _DISPATCH_STALL_SECS)
+
+    await _setup(wf)
+    assert not stall_ran.is_set(), (
+        'the stall ran inside _setup, so it no longer lands between the test starting '
+        "its wait and the heartbeat loop's first step"
+    )
+    await _stop_heartbeat_after_first_refresh(wf)
+
+    assert stall_ran.is_set(), 'the dispatch write never queued the stall, so none was exercised'
+    assert cast(AsyncMock, wf.scheduler.set_task_claimant).await_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_stop_claimant_heartbeat_halts_further_refreshes(tmp_path: Path):
     """After _stop_claimant_heartbeat, no further set_task_claimant calls occur."""
     wf = _make_workflow(project_root=tmp_path, claimant_heartbeat_interval_secs=0.01)
 
     await _setup(wf)
-    await asyncio.sleep(0.05)
+    await _await_heartbeat_refreshes(wf)
     await wf._stop_claimant_heartbeat()
     count_after_stop = wf.scheduler.set_task_claimant.await_count  # type: ignore[attr-defined]
+    assert count_after_stop >= 1
 
     # Give the (now-cancelled) loop plenty of time to have ticked again if it
     # were still alive.

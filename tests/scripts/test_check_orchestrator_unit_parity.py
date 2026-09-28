@@ -146,25 +146,42 @@ def test_shared_parser_module_importable_and_exposes_the_parser():
     """``import systemd_unit_parity`` resolves and exposes both parser functions.
 
     Import by NAME, not by path: this is the exact import
-    check_orchestrator_unit_parity.py performs, and it resolves in both
-    contexts the checker runs in — at CLI runtime python puts the script's own
-    directory (scripts/) at sys.path[0], and under pytest
-    tests/scripts/conftest.py explicitly inserts scripts/ onto sys.path
-    (pyproject's ``--import-mode=importlib`` deliberately does NOT).
+    ``scripts/check_orchestrator_unit_parity.py`` performs, and it resolves in
+    both contexts the checker runs in — at CLI runtime python puts the
+    script's own directory (``scripts/``) at ``sys.path[0]``, and under pytest
+    ``tests/scripts/conftest.py`` explicitly inserts ``scripts/`` onto
+    ``sys.path`` (pyproject's ``--import-mode=importlib`` deliberately does
+    NOT).
 
-    The ``# pyright: ignore[reportMissingImports]`` on the import is a
-    STATIC-ANALYSIS artifact, not a papering-over: pyright never executes
-    conftest.py, so it cannot see that sys.path insertion, and the root
-    pyproject's ``[tool.pyright] extraPaths`` deliberately omits ``scripts/``.
-    Do NOT "fix" this by adding scripts/ to extraPaths — scripts/ is knowingly
-    not yet pyright-clean, which is exactly why scripts/orchestrator.yaml
-    declines to declare a ``type_check_command``; widening extraPaths would
-    pull that whole tree into resolution for every consumer. The suppression
-    is the convention already in force at three sibling sites here
-    (test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py).
+    NO SUPPRESSION IS NEEDED IN EITHER CONTEXT, because two INDEPENDENT
+    mechanisms cover the two of them. STATICALLY, the root pyproject's
+    ``[tool.pyright] extraPaths`` carries ``"scripts"`` (task 3456), so pyright
+    resolves this name without ever executing ``conftest.py`` — which it
+    cannot do, and which is why the runtime insertion alone would not serve
+    it. AT RUNTIME, ``tests/scripts/conftest.py`` performs that insertion,
+    which is precisely what pytest itself declines to do under importlib
+    import mode.
+
+    This import used to carry a ``reportMissingImports`` suppression, on the
+    then-true premise that ``extraPaths`` omitted ``scripts/``. Task 3456
+    falsified that premise; task 4516 deleted the pragma as vestigial. It had
+    stopped suppressing anything while standing ready to mask a REAL missing
+    import if one ever appeared on this line.
+
+    IF THIS EVER STOPS RESOLVING, RE-ADDING A PRAGMA IS NOT THE REMEDY —
+    restoring the ``extraPaths`` entries is. Removing one is a TWO-gate
+    outage: ``uv run --project shared pyright scripts/`` and
+    ``uv run --project shared pyright tests/scripts/`` are both declared, and
+    both run from the repo root against that same root table. Which is why
+    ``tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports``
+    pins those entries, and
+    ``tests/scripts/test_no_vestigial_import_pragmas.py::test_no_missing_imports_pragma_on_resolvable_import``
+    pins the converse — that no import they already resolve may carry a
+    suppression.
+
     The runtime import is the assertion; these tests passing IS its proof.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     assert callable(systemd_unit_parity.parse_unit_directives)
     assert callable(systemd_unit_parity._join_continuations)
@@ -180,7 +197,7 @@ def test_shared_parser_parses_sections_keys_and_values():
     dropped rather than attributed, and the split taken on the FIRST ``=``
     only so ``Environment=A=1`` yields value ``A=1``.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
@@ -219,7 +236,7 @@ def test_dashboard_checker_consumes_the_lifted_parser():
     apart, which is precisely the failure mode these parity checkers exist to
     catch. Asserting object identity is the only check that fires on that.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     dashboard = _load_dashboard_checker()
 
@@ -242,7 +259,7 @@ def test_find_dropins_is_shared_not_duplicated():
     test in both suites green while the implementations quietly diverged.
     Object identity is the only check that fires on that.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     checker = _load_checker()
     dashboard = _load_dashboard_checker()
@@ -262,7 +279,7 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
     ``is_file()``). Counting a stray ``override.conf.bak`` would report an
     override that has no effect at all.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     installed_dir = tmp_path / "user"
     installed_dir.mkdir()
@@ -2771,7 +2788,7 @@ def test_orchestrator_reuses_the_shared_drift_and_absent():
     the tooling built to report silent duplication is the failure this family
     exists to catch, one level up.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     mod = _load_checker()
 

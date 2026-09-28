@@ -175,8 +175,9 @@ SKILLS_PY_RUFF_PROBE = "tests/scripts/test_root_lint_covers_nonmember_py.py"
 # already stale at HEAD). Membership and coverage are asserted; the total
 # never is.
 #
-# The three uv projects this spans are the whole reason the DECIDED block
-# rejects option (b): an honest skills/ test_command would be their UNION,
+# The uv projects this spans (orchestrator, shared, fused-memory) are the
+# whole reason the DECIDED block rejects option (b): an honest skills/
+# test_command would be their UNION,
 # including orchestrator/tests/ — the fleet's largest suite — duplicated on
 # every review checkpoint, main-tip sweep and merge full-verify.
 #
@@ -211,6 +212,16 @@ SKILLS_CONSUMING_TESTS = (
     # Reads skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
     # payload literals against the live parser (task 5374).
     "tests/scripts/test_shadow_ruling_doc_contract.py",
+    # Reads skills/prd/references/gates.md live via GATES_DOC.read_text() (the
+    # gates-family-inventory-row and inv-trigger-shapes marked-span checks).
+    # _enumeration_scan_files() (.md) and _citation_scan_files() (.py + .md)
+    # both walk the repo with no skills/ prune, feeding
+    # test_every_enumeration_site_is_pinned and the citation-drift checks —
+    # the single broadest skills/ consumer in the repo (task 4941).
+    "scripts/tests/test_design_invariants_consistency.py",
+    # Reads skills/reflect/SKILL.md to execute its `entities=` examples against
+    # the live entities_gate (task 3675).
+    "fused-memory/tests/test_referent_declaration_examples.py",
 )
 
 
@@ -781,8 +792,8 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
     """Each skills/-consuming test must still exist and still be collected by a gated dir.
 
     CORRECTION 1 of the DECIDED block rests on this inventory: the coverage
-    skills/ actually has is held by its CONSUMERS' suites, spread across three
-    uv projects, which is why an honest skills/ ``test_command`` would be their
+    skills/ actually has is held by its CONSUMERS' suites, spread across the
+    orchestrator, shared and fused-memory uv projects, which is why an honest skills/ ``test_command`` would be their
     union and why option (b) was rejected on cost. Two ways that premise can
     rot silently, both asserted here:
 

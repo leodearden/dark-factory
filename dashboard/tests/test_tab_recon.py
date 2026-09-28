@@ -306,10 +306,14 @@ class TestReconSuccessRateWiring:
         """The rate the tile renders must be the module's, traced in two hops.
 
         The tile reads a local, and that local is bound to reconSuccessPct —
-        deliberately not inlined into the tile, because `value` and `unit`
-        both branch on it and inlining would call it twice. Asserting the two
+        deliberately not inlined into the tile, because `datum` and `unit`
+        both read it and inlining would call it twice. Asserting the two
         hops separately pins the provenance without dictating which of the
         two spellings the component uses.
+
+        The prop is `datum=` since task 5588: the tile is handed the value
+        wrapped in its provenance (plainDatum) rather than bare, so that a
+        rate which has not been fetched renders an em-dash instead of a zero.
         """
         tile = _extract_stat_tile(recon_tab_code, 'Run success rate')
 
@@ -321,7 +325,7 @@ class TestReconSuccessRateWiring:
             'come from the module the node suite covers, computed over the '
             'same counts object every other tile reads.'
         )
-        assert re.search(r'value=\{[^}]*\b' + bound.group(1) + r'\b', tile), (
+        assert re.search(r'datum=\{[^}]*\b' + bound.group(1) + r'\b', tile), (
             f'the Run success rate tile does not render {bound.group(1)!r}, the '
             f'local bound to reconSuccessPct(counts): {tile!r}'
         )
@@ -423,9 +427,13 @@ class TestReconInProgressTile:
         Re-deriving it with a local filter would put a second status
         vocabulary back into this file — the exact condition that let the tile
         and the badge disagree.
+
+        Read through `datum=` since task 5588: the count is handed over wrapped
+        in its provenance (plainDatum) rather than bare, so a tab whose recon
+        endpoint has not answered shows an em-dash rather than a confident 0.
         """
         tile = _extract_stat_tile(recon_tab_code, 'In progress')
-        assert re.search(r'value=\{\s*counts\.inFlight\s*\}', tile), (
+        assert re.search(r'datum=\{\s*plainDatum\(\s*counts\.inFlight\s*,', tile), (
             f'the In progress tile does not render counts.inFlight: {tile!r}'
         )
 

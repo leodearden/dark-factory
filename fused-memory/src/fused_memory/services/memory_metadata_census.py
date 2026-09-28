@@ -30,26 +30,11 @@ import logging
 import re
 import time
 from collections.abc import Callable, Iterable, Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
 
 from shared.storm_counter import StormCounter
 
 from fused_memory.memory_metadata import MetadataViolation
-
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-# Defensive import of the optional ``escalation`` workspace package, mirroring
-# ``middleware/candidate_key_escalation.py``.  When it is missing (minimal CI
-# envs, deployments that have not installed it) this module degrades to a
-# logged no-op rather than breaking the memory write path that calls it.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +282,6 @@ class UnknownKeyStormDetector:
 # The escalation filer
 # ---------------------------------------------------------------------------
 
-_QUEUE_DIRNAME: str = 'data/escalations'
-
 #: Stable PREFIX of the anchor task id, so every escalation in this series
 #: (``esc-memory-metadata-unknown-key-storm-<project>-<agent>-N``) is greppable
 #: as one family and distinct from every other fused-memory series.  The full
@@ -377,48 +360,6 @@ def file_unknown_key_storm_escalation(
     writer = agent_id if agent_id else UNSET_AGENT_ID
     anchor = writer_anchor_task_id(project_id, agent_id)
 
-    if not HAS_ESCALATION:
-        logger.debug(
-            'memory_metadata_census: escalation package unavailable; '
-            'unknown-key storm from project_id=%r agent_id=%r (%d key(s)) '
-            'will not be escalated',
-            project_id, writer, len(keys),
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: could not open the escalation queue at '
-            'project_root=%r; unknown-key storm from project_id=%r '
-            'agent_id=%r not escalated',
-            project_root, project_id, writer,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # suppressing. Failing closed here would let a broken queue read swallow
-    # the storm signal entirely, which is the outcome this escape exists to
-    # prevent.
-    try:
-        existing = queue.get_by_task(anchor, status='pending')
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: failed to check for an existing open '
-            'storm escalation at project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'memory_metadata_census: %s already open for this writer; '
-            'unknown-key storm from project_id=%r agent_id=%r (%d key(s)) '
-            'folded into it',
-            existing[0].id, project_id, writer, len(keys),
-        )
-        return existing[0].id
-
     key_list = ', '.join(repr(k) for k in keys)
     detail = '\n'.join([
         f'project_id={project_id!r}',
@@ -442,35 +383,25 @@ def file_unknown_key_storm_escalation(
         'fused-memory config.',
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(anchor),
-            task_id=anchor,
-            agent_role=_AGENT_ROLE,
-            severity='info',
-            category=_CATEGORY,
-            summary=(
-                f'unknown metadata-key storm from project_id={project_id} '
-                f'agent_id={writer} ({len(keys)} key(s): {key_list})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'bless, x_-prefix, or fix the drifting writer'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        logger.exception(
-            'memory_metadata_census: failed to submit the unknown-key storm '
-            'escalation for project_id=%r agent_id=%r (%d key(s))',
-            project_id, writer, len(keys),
-        )
-        return None
-
-    logger.warning(
-        'memory_metadata_census: filed %s for an unknown-key storm from '
-        'project_id=%r agent_id=%r (%d key(s): %s)',
-        esc_id, project_id, writer, len(keys), key_list,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='info',
+        summary=(
+            f'unknown metadata-key storm from project_id={project_id} '
+            f'agent_id={writer} ({len(keys)} key(s): {key_list})'
+        ),
+        detail=detail,
+        suggested_action=(
+            'bless, x_-prefix, or fix the drifting writer'
+        ),
+        logger=logger,
+        log_label='memory_metadata_census',
+        context=(
+            f'unknown-key storm from project_id={project_id!r} '
+            f'agent_id={writer!r} ({len(keys)} key(s): {key_list})'
+        ),
+        level=1,
     )
-    return esc_id

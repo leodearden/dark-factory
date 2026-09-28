@@ -5,7 +5,10 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 """
 from __future__ import annotations
 
+import errno
 import json
+import logging
+import sys
 import types
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +21,7 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.testing_streams import StdoutWithAFailingFlush
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
@@ -4085,6 +4089,95 @@ class TestRunApplyGuards:
         assert service.deleted == []
 
 
+class _UnopenableFakeMemoryService(_FakeMemoryService):
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+
+def _abort_messages(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.ERROR and r.getMessage().startswith('ABORT:')
+    ]
+
+
+@pytest.mark.asyncio
+class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
+    """A failure that is not stdout's is attributed at its seam, and a stdout
+    failure surfaces before the metrics artifact and before any --apply delete.
+
+    The stdout JSON plan is task 3136's report contract and it is printed
+    BEFORE every side effect, so a reader-closed or full stdout must stop the
+    run there. A block-buffered short plan used to fail only at interpreter
+    shutdown, after irreversible deletions whose report was lost.
+    """
+
+    _CLUSTER = {_PK: [
+        _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+        _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+    ]}
+
+    def _apply_args(self, metrics_root: Path):
+        return _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(metrics_root),
+        ])
+
+    async def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, caplog):
+        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        monkeypatch.setattr(service_mod, 'MemoryService', _UnopenableFakeMemoryService)
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(tmp_path))
+
+        assert rc == _mod.EXIT_RUN_FAILED == 1
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert 'store' in aborts[0]
+        assert 'stdout' not in aborts[0]
+        assert _FakeMemoryService.instances[-1].closed
+        assert not list(tmp_path.rglob('metrics-*.json'))
+
+    async def test_an_unwritable_metrics_root_deletes_nothing(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        metrics_root = blocker / 'metrics'
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(metrics_root))
+
+        assert rc == _mod.EXIT_RUN_FAILED
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert str(metrics_root) in aborts[0]
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    @pytest.mark.parametrize('exc', [
+        BrokenPipeError(errno.EPIPE, 'Broken pipe'),
+        OSError(errno.ENOSPC, 'No space left on device'),
+    ], ids=['closed-reader', 'full-disk'])
+    async def test_a_deferred_stdout_failure_stops_before_metrics_and_deletes(
+        self, monkeypatch, tmp_path, exc,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        metrics_root = tmp_path / 'metrics'
+
+        with monkeypatch.context() as scoped, pytest.raises(type(exc)):
+            scoped.setattr(sys, 'stdout', StdoutWithAFailingFlush(exc))
+            await _run(self._apply_args(metrics_root))
+
+        assert _FakeMemoryService.instances[-1].deleted == []
+        assert not list(metrics_root.rglob('metrics-*.json'))
+
+
 @pytest.mark.asyncio
 class TestRunApplyAnnOnlyClusters:
     """End-to-end: what --apply does with deletions the ANN path alone produced.
@@ -5249,15 +5342,11 @@ class TestLivenessSubjectFactsFallback:
     carrying no readable assignment, and a clause boundary landing inside a
     quoted value.
 
-    An earlier reading of this class claimed the rescope "can only ADD recall
-    if a subject the clauses say nothing about keeps exactly the key it had
-    BEFORE the rescope". That condition is real but NOT sufficient, and
-    believing it shipped a regression: a subject whose clause named only SOME
-    of the record's fields keyed on a partial fact instead, silently vacating
-    the whole-record bucket it used to share -- an empty-set-only fallback
-    never fires for it. The invariant that actually holds is the unconditional
-    one above; `TestLivenessSubjectFactsIsAdditive` pins the
-    non-empty-but-incomplete half this class does not reach.
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. `TestLivenessSubjectFactsIsAdditive` pins
+    that non-empty-but-incomplete half.
 
     Because every pre-rescope bucket membership therefore survives, nothing is
     lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
@@ -5383,14 +5472,14 @@ class TestLivenessSubjectFactsIsAdditive:
     covers the strictly harder one they do not reach -- clause evidence that
     is non-empty but INCOMPLETE.
 
-    Measured against the shipped module before this class landed: record B
-    below names task 94 in its first clause and puts the other two fields in a
-    second clause naming no task, so the subject keyed on the partial
-    `status=in-progress`, matched nothing, and the whole-record bucket it had
-    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
-    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
-    the empty set cannot catch that; a non-empty-but-incomplete set wins
-    outright.
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` ALONE would match nothing, vacating the whole-record
+    bucket it shares with A and making `find_liveness_snapshot_recurrences`
+    return `[]` with an ALL-ZERO disclosure -- the outcome the unconditional
+    seed prevents, pinned below. A fallback that fires only on the empty set
+    cannot catch that; a non-empty-but-incomplete set wins outright.
 
     The invariant that closes it: every subject buckets under *core_fact*
     unconditionally, with the clause-scoped fact ADDED beside it. Every bucket

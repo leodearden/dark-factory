@@ -66,6 +66,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
+from shared.git_async import run_git
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -73,6 +74,7 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
+from orchestrator import rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
@@ -92,6 +94,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
+from orchestrator.verify_classify import _ENOSPC_MARKERS
 from orchestrator.warm_lane_pool import WarmLanePoolCensus
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
@@ -231,6 +234,35 @@ _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 # They must never drift: a short-circuit at a lower bar than the advice bar
 # would skip the wait and then NOT explain why.
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
+
+
+# Bounded attempt budget for `git worktree add`, shared by the three sites
+# that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
+_WORKTREE_ADD_MAX_ATTEMPTS = 3
+
+# `_ENOSPC_MARKERS` is imported from verify_classify (see the import block
+# above) rather than re-declared here; extend that constant when a new
+# grounded ENOSPC sample appears. merge_queue.py::_ENOSPC_MARKERS is still a
+# separate verbatim copy — consolidating all three is not this module's call.
+
+
+def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
+    """Is a failed ``git worktree add`` worth retrying?
+
+    The shape is deliberately NEGATIVE — retry by default, fail fast only on
+    a known non-transient cause — rather than a positive "is this
+    contention?" allow-list. The archived transient samples share no token
+    (a ``fatal: Invalid path`` on an ADMINISTRATIVE registration dir — the
+    add's own, or in 4777 a concurrently-removed sibling's — and a bare
+    ``Preparing worktree`` progress line with no cause at all), so an
+    allow-list built from either would silently stop retrying the other,
+    and stop retrying whatever shape appears next.
+
+    ENOSPC is the counter-case: a full disk does not heal in 1.5s of
+    backoff, so retrying there only delays the operator signal.
+    """
+    haystack = f'{out}\n{err}'.lower()
+    return not any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
 class MergeParkError(Exception):
@@ -528,7 +560,7 @@ _STEAL_RETRYABLE: frozenset['WarmLaneUnavailable'] = frozenset()  # populated be
 # The seed-warm-lane.sh opt-in flag under which BOTH of the script's lane-lock
 # refusal arms — the ``flock -n`` immediate refusal and the ``flock -w`` queue
 # timeout — exit 77 with a ``LANE_LOCK_CONTENDED:`` stderr marker instead of the
-# shared 75.  Passed UNGATED by ``take_lane_lock``; see
+# shared 75.  Passed for every :class:`SeedLaneLock` mode; see
 # :meth:`GitOps._seed_warm_lane` for why.
 _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG = '--distinct-lock-refusal-rc'
 
@@ -1007,6 +1039,25 @@ class WarmBaseHealth(Enum):
     INDETERMINATE = 'indeterminate'
 
 
+class SeedLaneLock(Enum):
+    """Who holds ``<lane_dir>.lock`` while seed-warm-lane.sh runs — the one
+    axis :meth:`GitOps._seed_warm_lane`'s locking varies on (task 4913).
+
+    * ``TAKE`` — ``_seed_warm_lane`` takes the lock itself with its bounded
+      outer ``flock -x`` and tells the script it is held.  The default, and
+      the pool-acquire path.
+    * ``HELD_BY_CALLER`` — the caller already holds it for the whole call.  No
+      outer flock (re-taking it would self-deadlock into rc 124), but the
+      script is still told it is held, otherwise a self-locking script refuses
+      against the caller's own lock.
+    * ``LEFT_TO_SCRIPT`` — nobody holds it.  No outer flock and no assertion;
+      a self-locking script takes it itself.  No production caller uses it.
+    """
+    TAKE = 'take'
+    HELD_BY_CALLER = 'held_by_caller'
+    LEFT_TO_SCRIPT = 'left_to_script'
+
+
 class WarmLaneUnavailable(Enum):
     """Discriminated failure result from :meth:`acquire_warm_lane`.
 
@@ -1404,14 +1455,34 @@ def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
     format.
 
     The capture is ``\\S+`` because a git branch name can never contain
-    whitespace, and the pattern is deliberately UNANCHORED to mirror
-    ``git log --fixed-strings --grep=...``, which matches anywhere in the commit
-    message rather than only at the start of the subject.
+    whitespace.  The pattern is ANCHORED: a commit is a marker only when its
+    SUBJECT is exactly the merge subject, so a body quote, a ``Revert "..."``
+    subject or a suffixed subject is not a marker (task 5765).
     """
     sentinel = '\x00BRANCH\x00'
     template = _merge_subject(sentinel, main_branch)
     prefix, _, suffix = template.partition(sentinel)
-    return re.compile(re.escape(prefix) + r'(\S+)' + re.escape(suffix))
+    return re.compile(r'\A' + re.escape(prefix) + r'(\S+)' + re.escape(suffix) + r'\Z')
+
+
+#: The ``git log`` output shape :func:`_merge_markers_by_branch` parses.
+_MERGE_MARKER_LOG_FORMAT: tuple[str, ...] = ('-z', '--format=%H%x1f%s')
+
+
+def _merge_markers_by_branch(log_output: str, main_branch: str) -> dict[str, str]:
+    """Map each branch to its marker sha, from ``git log`` run with
+    :data:`_MERGE_MARKER_LOG_FORMAT`.  ``git log`` walks newest-first, so
+    ``setdefault`` keeps the most recent marker of a branch merged more than
+    once (measured: ``task/958``, ``task/924`` and ``task/791`` each twice).
+    """
+    pattern = _merge_marker_pattern(main_branch)
+    markers: dict[str, str] = {}
+    for record in log_output.split('\0'):
+        sha, _, subject = record.partition('\x1f')
+        match = pattern.match(subject)
+        if match:
+            markers.setdefault(match.group(1), sha.strip())
+    return markers
 
 
 @dataclass(frozen=True)
@@ -2524,72 +2595,42 @@ async def _run(
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
 
-    Stdin feeding (``input_text``): when provided, the child is spawned with
-    ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
-    ``communicate(input=...)``.  This is what lets callers pipe a diff into a
-    stdin-only filter such as ``git patch-id`` (see
-    :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
-    behaviour is exactly as before — stdin is not piped and the child inherits
-    the parent's — so no existing caller is affected.  The capability is inert
-    unless ``input_text`` is passed.
+    A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
+    owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
+    :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
+    task-2608 cancellation kill+reap.  What stays here is orchestrator-
+    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
+    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
+    patchable spawn seam.
 
-    Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
-    that git (and other tools) always emit English-locale diagnostics.  This is
-    required for :func:`_git_clean_failure_is_benign`, which substring-matches
-    English warning text; a non-C locale would produce translated output that
-    the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
-    fix for the 4892-class warm-lane FAULT.
+    ``input_text``, when given, is piped to the child's stdin, e.g. a diff
+    into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
 
-    Cancellation safety (task 2608): if the ``await proc.communicate()`` below
-    is cancelled — e.g. by a caller wrapping ``_run`` in
-    ``asyncio.wait_for(..., timeout=...)``, as delivered_checks.py's
-    ``_run_script_check`` does for script-kind delivered checks — the spawned
-    child would otherwise keep running as an orphan with its stdout/stderr
-    pipes open. For a persistently-hung script this recurred every scheduler
-    sweep, leaking a process and file descriptors. The child is now
-    best-effort killed and reaped before the triggering exception (including
-    ``asyncio.CancelledError``) is re-raised.
+    No ``timeout`` is passed: callers that want one wrap this call in their
+    own ``asyncio.wait_for``, whose cancellation the kill+reap covers.
+
+    Deliberately UNBOUNDED (``bounded=False``): this runs operator scripts
+    and oracle commands as well as git, and a caller-side ``wait_for`` would
+    otherwise count queue time as a verdict.  The shared module's "WHO SHOULD
+    OPT OUT OF THE BOUND" section is the full argument;
+    ``test_a_long_running_script_cannot_delay_a_concurrent_git_call`` pins it.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
     # can raise a typed exception consumers can pattern-match on.
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
-    # Force a stable C locale so git output is always in English and amenable
-    # to substring matching (see docstring above).
-    _env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd) if cwd else None,
-            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_env,
-        )
+        result = await run_git(cmd, cwd, input_text=input_text, bounded=False)
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
         # Re-classify as WorktreeMissing if cwd is now gone; otherwise the
-        # error is about the binary itself.
+        # error is about the binary itself.  This is precisely why the shared
+        # helper must NOT swallow FileNotFoundError.
         if cwd is not None and not Path(cwd).is_dir():
             raise WorktreeMissing(cwd) from e
         raise
-    try:
-        stdout, stderr = await proc.communicate(
-            input=input_text.encode() if input_text is not None else None,
-        )
-    except BaseException:
-        # The await was interrupted (most commonly asyncio.CancelledError from
-        # a caller-side asyncio.wait_for(..., timeout=...)) before the child
-        # exited. Best-effort kill + reap it so it doesn't leak as an orphan
-        # process with dangling stdout/stderr pipes, then propagate the
-        # original exception unchanged.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()  # already exited
-        with contextlib.suppress(BaseException):
-            await proc.wait()  # reap is best-effort; never let it mask the original error
-        raise
-    return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
+    return result.returncode, result.stdout, result.stderr
 
 
 def _git_clean_failure_is_benign(stderr: str) -> bool:
@@ -2963,7 +3004,7 @@ class GitOps:
         # Replaces a full-history `git log --grep` PER CANDIDATE — measured on
         # this repo at ~2.0s a miss against 62,942 commits, x ~721 branch-absent
         # candidates a tick, i.e. the whole ~14min scheduler tick.  One index
-        # build costs ~6.3s and serves every lookup at that main sha.
+        # build serves every lookup at that main sha.
         #
         # Unbounded by design, unlike _effect_probe_memo above: its size is the
         # number of merge markers in history (~3,000 here), not a function of
@@ -3073,6 +3114,79 @@ class GitOps:
         """
         return self._refuse_foreign_band(path, owned, context)
 
+    async def _worktree_add_with_retry(
+        self, path: Path, ref: str, *, label: str, detach: bool = True,
+    ) -> tuple[int, str, str, int]:
+        """Run ``git worktree add [--detach] <path> <ref>`` with bounded retry.
+
+        The only retrying add in this module: the three sites that retry a
+        ``git worktree add`` — git_ops.py::GitOps._create_merge_worktree,
+        git_ops.py::GitOps.ephemeral_worktree and
+        git_ops.py::GitOps.create_worktree — all mint through here, so
+        exactly one retry loop and one retryability predicate
+        (git_ops.py::_worktree_add_failure_is_retryable) exist. Every
+        attempt targets the SAME *path*.
+
+        Returns ``(rc, stdout, stderr, attempts)`` from the LAST attempt
+        made, and NEVER raises on a failed add. The callers raise
+        different exception types (``RuntimeError`` for the merge and task
+        worktrees, whose callers catch broadly on it, vs the typed
+        :class:`EphemeralWorktreeError` that verify.py's two probes
+        pattern-match on and that has a :class:`BlockDisposition` row), so a
+        driver that raised would force one of them to catch-and-retranslate,
+        losing the rc and streams it needs to build its own message.
+
+        :class:`WorktreeMissing` and any bare ``OSError`` from ``_run``
+        propagate UNRETRIED: the child never ran, so neither is an add
+        failure, and both are typed signals already handled upstream.
+
+        Args:
+            path: The worktree path to mint. Reused across every attempt.
+                A directory already there before the first attempt is never
+                removed; only what a failed attempt left behind is.
+            ref: With *detach*, the commit-ish to pin the worktree at;
+                without it, an EXISTING branch to check out.
+            label: Diagnostic prefix naming the calling site in the WARNING
+                emitted for each absorbed retry, so an operator can grep
+                which one flaked.
+            detach: Whether the worktree gets a detached HEAD.
+
+        Note:
+            Issues NO other git subprocess between attempts — in particular
+            never ``git worktree prune``, categorically forbidden under DD5
+            because a broad prune deregisters every concurrently-active
+            sibling worktree, and never a scoped ``git worktree remove
+            --force``, since nothing was successfully registered from this
+            call's perspective.
+        """
+        argv = ['git', 'worktree', 'add', *(['--detach'] if detach else []), str(path), ref]
+        path_predates_call = path.exists()
+        rc, out, err, attempt = 1, '', 'not attempted', 0
+        for attempt in range(1, _WORKTREE_ADD_MAX_ATTEMPTS + 1):
+            rc, out, err = await _run(argv, cwd=self.project_root)
+            if rc == 0:
+                return rc, out, err, attempt
+            if not _worktree_add_failure_is_retryable(rc, out, err):
+                break
+            if attempt < _WORKTREE_ADD_MAX_ATTEMPTS:
+                # An absorbed flake must stay greppable — otherwise the
+                # retry silently hides the very recurring failure rate
+                # this driver exists to measure.
+                logger.warning(
+                    '%s: git worktree add failed (rc=%d, attempt %d/%d) for %s '
+                    'at %s; retrying after backoff. stderr=%r stdout=%r',
+                    label, rc, attempt, _WORKTREE_ADD_MAX_ATTEMPTS, path, ref,
+                    err, out,
+                )
+                # git creates the target directory before it can fail.
+                # Leaving that residue would make the next attempt fail
+                # deterministically with "'<path>' already exists", naming a
+                # self-inflicted cause instead of the real one.
+                if not path_predates_call:
+                    shutil.rmtree(path, ignore_errors=True)
+                await asyncio.sleep(0.5 * attempt)
+        return rc, out, err, attempt
+
     @contextlib.asynccontextmanager
     async def ephemeral_worktree(
         self, kind: WorktreeKind, sha: str, *, warm_seed: bool = False,
@@ -3086,9 +3200,14 @@ class GitOps:
         ``worktree_base/<kind.value><hex>`` (*kind*'s value IS both the
         directory-name prefix and its :data:`PROTECTED_PREFIXES` registry
         key — see :class:`WorktreeKind`), retry ``git worktree add
-        --detach`` up to 3 times with ``0.5 * (attempt + 1)``\\ s linear
-        backoff on transient lock contention (concurrent sibling probes
-        serialise on git's repo-level metadata lock), then yield the path.
+        --detach`` up to :data:`_WORKTREE_ADD_MAX_ATTEMPTS` times with
+        ``0.5 * attempt``\\ s linear backoff on a transient failure such as
+        lock contention (concurrent sibling probes serialise on git's
+        repo-level metadata lock), then yield the path.  That retry is NOT
+        spelled here: it is delegated to
+        git_ops.py::GitOps._worktree_add_with_retry (task 5140).  A
+        NON-retryable add failure (ENOSPC) is not retried at all — see (c) under
+        ``Raises`` below.
 
         On exit — normal return OR an exception raised in the ``async
         with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
@@ -3111,8 +3230,8 @@ class GitOps:
                 :attr:`WarmBaseHealth.OK`), CoW-seeds the minted
                 worktree's ``target/`` from the shared warm base via
                 :meth:`_seed_warm_lane` (mode ``'--fresh-checkout'``,
-                ``take_lane_lock=False`` since this CM already holds
-                ``<lane_dir>.lock`` for its own lifetime — see the Note
+                ``lane_lock=SeedLaneLock.HELD_BY_CALLER``, since this CM
+                holds ``<lane_dir>.lock`` for its lifetime — see the Note
                 below) after a successful add and BEFORE the body runs,
                 turning a cold from-scratch build into a warm incremental
                 one. Any non-zero seed rc (absent script, disk pressure,
@@ -3140,9 +3259,13 @@ class GitOps:
                 consumer (``fcntl.flock(LOCK_EX|LOCK_NB)`` denied) — raised
                 BEFORE ``git worktree add`` is even attempted, so no
                 worktree is minted and no add argv is issued; or (b)
-                ``git worktree add`` itself failed on all 3 attempts.  In
-                both cases the caller's ``async with`` body never runs.
-                For (b), because the add never succeeded, no cleanup ``git
+                ``git worktree add`` itself failed on all
+                :data:`_WORKTREE_ADD_MAX_ATTEMPTS` attempts; or (c) the add
+                failed with a NON-retryable cause (ENOSPC — a full disk
+                does not heal in 1.5s of backoff), in which case only ONE
+                attempt was made and no backoff was slept.  In all three
+                cases the caller's ``async with`` body never runs.
+                For (b) and (c), because the add never succeeded, no cleanup ``git
                 worktree remove`` is issued (there is nothing registered to
                 remove) — but a belt-and-suspenders ``shutil.rmtree`` of
                 *tmp_path* still runs before the exception propagates, in
@@ -3172,11 +3295,9 @@ class GitOps:
         # contender (gc.sh:564-574) sees a live consumer and preserves this
         # worktree instead of force-removing it out from under a still-
         # running probe/sweep (task 2507).
-        lock_path = base / f'{tmp_path.name}.lock'
+        lock_path = lane_lock_path(tmp_path)
 
-        _MAX_ADD_RETRIES = 3
         worktree_added = False
-        rc, _, err = 1, '', 'not attempted'
 
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         acquired = False
@@ -3205,20 +3326,15 @@ class GitOps:
                 ) from e
 
             try:
-                for attempt in range(_MAX_ADD_RETRIES):
-                    rc, _, err = await _run(
-                        ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
-                        cwd=self.project_root,
-                    )
-                    if rc == 0:
-                        worktree_added = True
-                        break
-                    if attempt < _MAX_ADD_RETRIES - 1:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                rc, out, err, attempts = await self._worktree_add_with_retry(
+                    tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+                )
+                worktree_added = rc == 0
                 if not worktree_added:
                     raise EphemeralWorktreeError(
                         f'ephemeral_worktree({kind.name}): git worktree add failed '
-                        f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
+                        f'after {attempts} attempt(s) (rc={rc}); '
+                        f'stderr={err!r}; stdout={out!r}'
                     )
             except EphemeralWorktreeError:
                 # Belt-and-suspenders: a failed `git worktree add` may still have
@@ -3237,11 +3353,8 @@ class GitOps:
             # so a probe/sweep opted into warm_seed starts from a pre-built
             # main instead of a cold from-scratch recompile. Fail-soft: any
             # non-zero seed rc just logs and proceeds COLD — never raises,
-            # never removes the worktree. take_lane_lock=False because this
-            # CM already holds <lane_dir>.lock (above) for its entire
-            # lifetime; re-taking it inside _seed_warm_lane would
-            # self-deadlock against the identical path (see that method's
-            # take_lane_lock docstring note).
+            # never removes the worktree. HELD_BY_CALLER because this CM
+            # holds <lane_dir>.lock (above) for its entire lifetime.
             #
             # task 2567 amendment: the whole gate is wrapped in a broad
             # except so the never-raise contract is structural rather than
@@ -3256,30 +3369,10 @@ class GitOps:
                 try:
                     if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
                         seed_rc = await self._seed_warm_lane(
-                            tmp_path, '--fresh-checkout', take_lane_lock=False,
+                            tmp_path, '--fresh-checkout',
+                            lane_lock=SeedLaneLock.HELD_BY_CALLER,
                         )
-                        _seed_self_refused = seed_rc != 0 and (
-                            _seed_rc_to_unavailable(seed_rc)
-                            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
-                        )
-                        if _seed_self_refused:
-                            # --assume-lane-lock-held is gated on
-                            # take_lane_lock, so this take_lane_lock=False
-                            # caller never sends it and a self-locking seed
-                            # script refuses against OUR OWN lock every time
-                            # (flock is not re-entrant across a process tree,
-                            # so the "other live consumer" is this process).
-                            # rc 77 makes that legible; it does not prevent it.
-                            logger.info(
-                                'ephemeral_worktree(%s): warm seed SELF-refused '
-                                'on %s.lock (rc=%d, lane-lock contention) — this '
-                                'CM holds that lock itself and cannot assert it '
-                                'to seed, so the seed is a no-op against a '
-                                'self-locking script; proceeding COLD '
-                                '(fail-soft)',
-                                kind.name, tmp_path, seed_rc,
-                            )
-                        elif seed_rc != 0:
+                        if seed_rc != 0:
                             logger.info(
                                 'ephemeral_worktree(%s): warm seed failed (rc=%d) '
                                 'for %s — proceeding COLD (fail-soft)',
@@ -4811,13 +4904,26 @@ class GitOps:
             else:
                 await self._cleanup_leftover_branch(full_branch, branch_name)
 
-        # Create worktree with new branch from the freshened ref
+        # Branch first, then a retried add of it: `git worktree add -b` creates
+        # its branch BEFORE the step that races concurrent `.git/worktrees/`
+        # churn, so retrying `-b` itself would fail on its own leftover branch.
         rc, out, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), start_ref],
-            cwd=self.project_root,
+            ['git', 'branch', full_branch, start_ref], cwd=self.project_root,
         )
         if rc != 0:
-            raise RuntimeError(f'Failed to create worktree: {err}')
+            raise RuntimeError(
+                f'Failed to create worktree: git branch {full_branch} '
+                f'{start_ref} failed (rc={rc}); stderr={err!r}; stdout={out!r}'
+            )
+        rc, out, err, attempts = await self._worktree_add_with_retry(
+            worktree_path, full_branch, label='create_worktree', detach=False,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'Failed to create worktree: git worktree add {worktree_path} '
+                f'{full_branch} failed after {attempts} attempt(s) (rc={rc}); '
+                f'stderr={err!r}; stdout={out!r}'
+            )
 
         logger.info(
             'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
@@ -5255,7 +5361,8 @@ class GitOps:
             )
 
     async def _seed_warm_lane(
-        self, lane_dir: Path, mode: str, *, take_lane_lock: bool = True,
+        self, lane_dir: Path, mode: str, *,
+        lane_lock: SeedLaneLock = SeedLaneLock.TAKE,
     ) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
@@ -5291,19 +5398,12 @@ class GitOps:
         ``target/`` at once — see that method's "Lane-lock coupling gap"
         docstring note for the full race analysis (now closed).
 
-        **``take_lane_lock`` (task 2567)**: when ``False``, the OUTER
-        ``flock -x <lane_dir>.lock`` wrapper described above is omitted
-        entirely — only the INNER per-gen-dir ``flock -s <gen>.lock``
-        (symlink branch only; a different path) is still taken. Callers
-        that already hold ``<lane_dir>.lock`` themselves for the whole
-        call (e.g. :meth:`GitOps.ephemeral_worktree`'s CM-lifetime flock,
-        task 2507) MUST pass ``take_lane_lock=False`` — re-acquiring the
-        IDENTICAL path from the same process would self-deadlock against
-        the bounded wait below, timing out at
-        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC`` after
-        ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` on every call. Default ``True``
-        keeps every other existing caller (``acquire_warm_lane``,
-        ``create_interactive_worktree``, recycle) byte-identical.
+        **``lane_lock``**: who holds ``<lane_dir>.lock`` during the seed —
+        see :class:`SeedLaneLock`.  Only ``TAKE`` (the default:
+        ``acquire_warm_lane``, ``create_interactive_worktree``, recycle)
+        builds the OUTER wrapper above; the INNER per-gen-dir
+        ``flock -s <gen>.lock`` (symlink branch only; a different path) is
+        taken in every mode.
 
         **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
         on the latency-sensitive warm-lane acquisition hot path, so the
@@ -5367,25 +5467,26 @@ class GitOps:
             # note — so a live-but-wedged holder fails closed with a
             # distinct, diagnosable rc instead of stalling this hot path
             # forever.
-            lane_lock = lane_lock_path(lane_dir)
+            lane_lock_file = lane_lock_path(lane_dir)
             lane_lock_flock = (
                 [
                     'flock', '-x',
                     '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
                     '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
-                    str(lane_lock),
+                    str(lane_lock_file),
                 ]
-                if take_lane_lock
+                if lane_lock is SeedLaneLock.TAKE
                 else []
             )
-            # reify 5556: when WE hold the outer lane lock above, seed must NOT
-            # re-open+flock the same file. reify's seed-warm-lane.sh acquires
-            # ${LANE_DIR}.lock by DEFAULT under --fresh-checkout as of reify
-            # 7b20d010c6 (task 5354) — previously opt-in via --lane-lock — and
-            # flock is not re-entrant across a process tree, so the script's
-            # own flock -n self-refuses against this method's lock and exits
-            # 75. That 75 WAS indistinguishable from genuine disk pressure at
-            # _seed_rc_to_unavailable, so every dispatch requeued as
+            # reify 5556: whenever the lane lock is already held — by the outer
+            # wrapper above (TAKE) or by our caller (HELD_BY_CALLER) — seed
+            # must NOT re-open+flock the same file. reify's seed-warm-lane.sh
+            # acquires ${LANE_DIR}.lock by DEFAULT under --fresh-checkout as of
+            # reify 7b20d010c6 (task 5354) — previously opt-in via --lane-lock
+            # — and flock is not re-entrant across a process tree, so the
+            # script's own flock -n self-refuses against the held lock and
+            # exits 75. That 75 WAS indistinguishable from genuine disk
+            # pressure at _seed_rc_to_unavailable, so every dispatch requeued as
             # WarmLaneDiskPressure with agent_invocations=0, released the lane,
             # and re-picked the same lowest-index free lane: a fleet-wide
             # dispatch livelock (349 requeues / 4 completions per day).
@@ -5400,7 +5501,10 @@ class GitOps:
             # working seed into a hard fault. Probe absent → omit the flag and
             # keep the pre-5354 behaviour, where the script never self-locks.
             seed_flags: list[str] = []
-            if take_lane_lock and _seed_script_supports_assume_lane_lock_held(script):
+            if (
+                lane_lock is not SeedLaneLock.LEFT_TO_SCRIPT
+                and _seed_script_supports_assume_lane_lock_held(script)
+            ):
                 seed_flags.append(_SEED_ASSUME_LANE_LOCK_HELD_FLAG)
             # Opt in to the distinct lane-lock refusal code so a refusal
             # arrives as 77 instead of 75 (see
@@ -5408,13 +5512,12 @@ class GitOps:
             # same per-lane-vintage reason as the flag above, failing CLOSED to
             # today's rc-75 behaviour.
             #
-            # Deliberately NOT gated on take_lane_lock, unlike the flag above:
-            # that one matters only when WE hold the outer lock, whereas the
-            # refusal arms this one names are reachable precisely in the
-            # take_lane_lock=False shape (the ephemeral_worktree CM, which locks
-            # for itself).  Gating it would make it inert in the cases it exists
-            # for; passing it always is safe because the script accepts it as
-            # inert wherever no refusal is reachable, never as a usage error.
+            # Deliberately NOT gated on lane_lock, unlike the flag above: the
+            # refusal arms it names are reachable whenever the SCRIPT
+            # self-locks (LEFT_TO_SCRIPT, or a script that cannot be told the
+            # lock is held), so gating it would make it inert in the cases it
+            # exists for; passing it always is safe because the script accepts
+            # it as inert wherever no refusal is reachable, never as a usage error.
             if _seed_script_supports_distinct_lock_refusal_rc(script):
                 seed_flags.append(_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
             base_path = self.warm_lane_base_target_path
@@ -5458,7 +5561,7 @@ class GitOps:
                     '%s — a concurrent holder (thin rm -rf / GC reclaim / '
                     'another seed) is still live; failing closed rather '
                     'than risk a torn target/ (rc=%d)',
-                    _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock, rc,
+                    _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock_file, rc,
                 )
             elif rc == 77:
                 # Its own branch, beside the 124 outer-lock-timeout branch
@@ -9361,24 +9464,23 @@ class GitOps:
         marker is robust when ``task_id != branch`` (the merge subject is keyed
         off the branch, not the task id).
 
-        **Subject pattern**: the exact output of ``_merge_subject(branch,
-        self.config.main_branch)`` matched with ``--fixed-strings`` (literal
-        match — no BRE metacharacter interpretation, so branch names like
-        ``task/v1.0`` are safe).  Because ``_merge_subject`` is also called
-        by ``merge_to_main`` and the retry path in ``advance_main``, writer
-        and reader share the same derivation and can never silently drift
-        apart.  Substring-safety is preserved: ``'Merge task/1 into main'``
-        cannot appear inside ``'Merge task/10 into main'`` because the ``0``
-        after ``task/1`` falls where the pattern has a space.
+        **Marker rule**: a marker is a commit on main whose git subject
+        (``%s``) EQUALS ``_merge_subject(branch, self.config.main_branch)``.
+        The body is never read, so prose quoting a marker is not a landing
+        (task 5765).  The parent count is not checked, because a real landing
+        can be single-parent.  ``merge_to_main`` and ``advance_main``'s retry
+        path write that same ``_merge_subject``, so writer and reader cannot
+        drift apart, and substring safety (``task/1`` vs ``task/10``) follows
+        from equality.
 
         **Lookup is indexed, not re-scanned.** The search half delegates to
         :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
         sha (:meth:`_build_merge_marker_index`) and answers from it.  The
         per-call ``git log`` this replaces cost ~2.0s against 62,942 commits
         and ran once per candidate on every scheduler dispatch tick;
-        :meth:`_scan_merge_marker` retains it verbatim as the fallback for when
-        an index cannot be built.  Verdicts are unchanged by construction — the
-        index reads full commit messages, exactly as ``--grep`` does.
+        :meth:`_scan_merge_marker` is the fallback for when an index cannot be
+        built.  Verdicts are unchanged by construction — both paths share
+        :func:`_merge_markers_by_branch`.
 
         Args:
             branch: Full prefixed branch name, e.g. ``'task/123'``.
@@ -9399,31 +9501,31 @@ class GitOps:
         return await self._lookup_merge_marker(branch)
 
     async def _scan_merge_marker(self, branch: str) -> str | None:
-        """Direct, uncached full-history scan for *branch*'s merge marker.
+        """Direct, uncached scan for *branch*'s merge marker.
 
-        The original implementation of :meth:`find_merge_marker`'s search half,
-        preserved verbatim as the authoritative fallback whenever the index in
-        :meth:`_lookup_merge_marker` cannot be built (a git failure, or main
-        refusing to resolve).  Answers must agree exactly — the index is a
-        performance change, never a semantic one — so this is also what the
-        equivalence tests compare against.
+        The fallback whenever :meth:`_lookup_merge_marker` cannot build its
+        index (a git failure, or main refusing to resolve), and the equivalence
+        tests' oracle.  It parses through the index's own
+        :func:`_merge_markers_by_branch`, so the two agree by construction.
+
+        ``--grep`` is only a coarse, uncapped pre-filter on the bare branch
+        name.  A branch name has no whitespace, so it survives git's
+        line-by-line matching even when ``%s`` joins a wrapped first paragraph;
+        the full subject would not.  A capped walk would let a newer
+        body-quoting commit hide the real marker — the same accepted tradeoff
+        as :meth:`find_task_citation_commit`.
         """
-        # Pattern derivation shared with merge_to_main — see find_merge_marker's
-        # docstring for the substring-safety argument.
-        grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [
                 'git', 'log', self.config.main_branch,
-                '--fixed-strings',
-                f'--grep={grep_pattern}',
-                '--max-count=1',
-                '--format=%H',
+                '--fixed-strings', f'--grep={branch}',
+                *_MERGE_MARKER_LOG_FORMAT,
             ],
             cwd=self.project_root,
         )
-        if rc != 0 or not out:
+        if rc != 0:
             return None
-        return out
+        return _merge_markers_by_branch(out, self.config.main_branch).get(branch)
 
     async def _build_merge_marker_index(self) -> dict[str, str] | None:
         """Scan main once and map every merged branch to its merge-commit sha.
@@ -9434,36 +9536,14 @@ class GitOps:
         :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`, and for the same reason: a
         cached empty index would pin a spurious marker-absent verdict for the
         life of the current HEAD.
-
-        Reads the FULL commit message (``%B``), not just the subject, because
-        ``git log --grep`` matches anywhere in the message.  Measured on this
-        repo: 19 of 62,950 commits carry a marker only in the body, so a
-        subject-only index would silently change 19 verdicts.
-
-        ``git log`` walks newest-first and :meth:`find_merge_marker` passes
-        ``--max-count=1``, so the first match wins — ``setdefault`` reproduces
-        that for a branch merged more than once (measured: ``task/958``,
-        ``task/924`` and ``task/791`` each appear twice).
         """
         rc, out, _ = await _run(
-            [
-                'git', 'log', self.config.main_branch,
-                '--format=%H%x1f%B%x00',
-            ],
+            ['git', 'log', self.config.main_branch, *_MERGE_MARKER_LOG_FORMAT],
             cwd=self.project_root,
         )
         if rc != 0:
             return None
-        pattern = _merge_marker_pattern(self.config.main_branch)
-        index: dict[str, str] = {}
-        for record in out.split('\x00'):
-            sha, sep, message = record.partition('\x1f')
-            sha = sha.strip()
-            if not sep or not sha:
-                continue
-            for match in pattern.finditer(message):
-                index.setdefault(match.group(1), sha)
-        return index
+        return _merge_markers_by_branch(out, self.config.main_branch)
 
     async def _lookup_merge_marker(self, branch: str) -> str | None:
         """Resolve *branch*'s merge marker from the per-main-sha index.
@@ -9606,8 +9686,8 @@ class GitOps:
         rebases the branch in *worktree* onto that ref instead.  This is used
         by ``stack_train_branches`` to chain members into a linear stack.
 
-        Returns True on success.  On failure, aborts the rebase so the
-        worktree is left in a clean state, and returns False.
+        Returns True on success.  On failure, ATTEMPTS a guarded abort and
+        returns False — which does NOT imply a clean worktree: aborts fail.
 
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
@@ -9619,7 +9699,7 @@ class GitOps:
             cwd=worktree,
         )
         if rc != 0:
-            await _run(['git', 'rebase', '--abort'], cwd=worktree)
+            await rebase_recovery.guarded_abort('rebase', worktree, _run)
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
@@ -9891,8 +9971,8 @@ class GitOps:
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
-        survivor (re-link invariant).  The conflicting branch is left clean by
-        rebase_onto_main's ``git rebase --abort``.
+        survivor (re-link invariant).  rebase_onto_main ATTEMPTS a guarded
+        abort on the conflicting branch; a clean tree is not guaranteed.
 
         A missing worktree directory is treated as an eject (defensive;
         logged at WARNING level).
@@ -10013,8 +10093,7 @@ class GitOps:
             cwd=solo_wt,
         )
         if rc != 0:
-            # Abort the rebase and clean up both the worktree and temp branch.
-            await _run(['git', 'rebase', '--abort'], cwd=solo_wt)
+            await rebase_recovery.guarded_abort('rebase', solo_wt, _run)
             logger.info(
                 'materialize_member_solo: rebase conflict for member %s '
                 '(predecessor=%s): %s — cleaning up',
@@ -12113,6 +12192,13 @@ class GitOps:
         (normal case).  When *base_sha* is provided the worktree is created
         at that exact commit, supporting speculative merges where N+1 is
         merged against N's merge commit.
+
+        The ``git worktree add --detach`` is retried on a TRANSIENT failure
+        and fails IMMEDIATELY on a non-retryable one (ENOSPC), via
+        git_ops.py::GitOps._worktree_add_with_retry.  The retry is grounded,
+        not defensive: five archived occurrences under ``data/verify-logs``
+        (tasks 3692, 3420, 3869, 4215, 4545) blocked a merge outright on a
+        single non-zero rc here.
         """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
@@ -12136,12 +12222,31 @@ class GitOps:
             checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '--detach', str(merge_wt), checkout_ref],
-            cwd=self.project_root,
+        rc, out, err, attempts = await self._worktree_add_with_retry(
+            merge_wt, checkout_ref, label='_create_merge_worktree',
         )
         if rc != 0:
-            raise RuntimeError(f'Failed to create merge worktree: {err}')
+            # The `Failed to create merge worktree: ` PREFIX is load-bearing
+            # beyond this module: other test modules construct it verbatim to
+            # simulate this failure and docs/legibility/confusion-codebook.yaml
+            # keys two entries on it. Only the suffix is free to change.
+            #
+            # `!r` on both streams so an EMPTY stream renders as a visible ''
+            # rather than collapsing into whitespace — distinguishing "git said
+            # nothing" from "we never captured it", the ambiguity the archived
+            # occurrences left unresolved.
+            #
+            # git created the target directory before failing, `_merge-` is a
+            # PROTECTED_PREFIXES band the reaper never reclaims, and no caller
+            # can clear a path this call never returned — so without this
+            # rmtree every failure here accretes one permanent directory under
+            # worktree_base, feeding the disk pressure ENOSPC reports.
+            shutil.rmtree(merge_wt, ignore_errors=True)
+            raise RuntimeError(
+                f'Failed to create merge worktree: git worktree add --detach '
+                f'{merge_wt} {checkout_ref} failed after {attempts} attempt(s) '
+                f'(rc={rc}); stderr={err!r}; stdout={out!r}'
+            )
 
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
         return merge_wt, pre_merge_sha.strip()
@@ -13760,7 +13865,7 @@ class GitOps:
             logger.warning(
                 f'Rebase failed (attempt {attempt + 1}): {rebase_err}'
             )
-            await _run(['git', 'rebase', '--abort'], cwd=merge_worktree)
+            await rebase_recovery.guarded_abort('rebase', merge_worktree, _run)
 
             if full_branch is None:
                 # No branch to re-merge from — cannot recover
@@ -14994,7 +15099,7 @@ class GitOps:
 
     async def abort_merge(self, cwd: Path) -> None:
         """Abort an in-progress merge."""
-        await _run(['git', 'merge', '--abort'], cwd=cwd)
+        await rebase_recovery.guarded_abort('merge', cwd, _run)
         logger.info('Merge aborted')
 
     async def rename_worktree(

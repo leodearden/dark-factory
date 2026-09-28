@@ -516,6 +516,42 @@ def convert(value):
 {"invariant": "exceptions-owned-or-ratified", "file": "orchestrator/src/orchestrator/coerce.py", "line": 2, "issue": "the type: ignore[arg-type] suppression carries no debt or ratified disposition in its trailing comment — no owning task/ticket, no ratification-table id — so nothing notices if this exemption should already have expired", "severity": "warning"}
 ```
 
+## INV-13 `readers-prove-their-producer`
+
+### PRD-leaf-shaped (`INV-13-PRD`)
+
+> Add the `orchestrator debt-report` command, which prints every open debt
+> row with its owner and age and a health line (`open=N unowned=N status`).
+> Signal: the command prints the health line; verified by a test that seeds
+> three rows with raw `sqlite3` and asserts the rendered counts. The writer
+> that opens debt rows lands in task ζ, two rows down the plan.
+
+**Expected disposition**: `flag: readers-prove-their-producer`
+
+**Redesign that clears it**: Either land the reader in the slice that
+lands its producer, with the signal "after one real suppression the command
+prints that test's row", or make the command render the absence of a
+producer as its own state — "no producer has written to this ledger
+(0 rows; N suppressions observed)" — so an operator cannot read an unwired
+ledger as `status ok`. A row the test seeded proves the renderer, never the
+ledger.
+
+### Code-snippet-shaped (`INV-13-CODE`)
+
+```python
+def render_health(open_rows: list[DebtRow]) -> str:
+    unowned = sum(1 for r in open_rows if r.owner_task_id is None)
+    if not open_rows:
+        return 'non-convergence: open=0 unowned=0 status=ok'
+    return f'non-convergence: open={len(open_rows)} unowned={unowned}'
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "readers-prove-their-producer", "file": "orchestrator/src/orchestrator/debt_report.py", "line": 3, "issue": "an empty debt table renders as status=ok, but nothing in this package writes a debt row — the counter is derived from rows that no producer creates, so a ledger with no producer is indistinguishable from a healthy one", "severity": "warning"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -739,6 +775,39 @@ INV-3 `corroborate-before-acting`). The entries are tree-resident exception
 lists rather than held runtime states, which is the family-boundary
 distinction the normative doc's INV-12 section draws against INV-7
 `holds-owned-and-bounded`.
+
+### Addendum — INV-13 walk (2026-09-25)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-13 rather than from the drafting context. Both G7 paths were
+walked, as in the 2026-09-18 addendum: the normative path (which Reads the
+doc at run time and auto-extended to INV-13 with no edit) and the
+no-invariants-file fallback path (the trigger-shape list, which does NOT
+auto-extend and gained an INV-13 entry in the same commit).
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-09-25, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-13-PRD` | PRD | INV-13 readers-prove-their-producer | `readers-prove-their-producer` | Normative path: G7's walk of the checkable question ("has that trigger fired in production, and did a row appear?", "what does the reader print until the producer lands?") fires — the row's only signal is a seeded-row test and the producer is two tasks away. Fallback path: the new trigger-shape entry ("a reader, report, gate or counter landed over a store whose producer has not yet written in production, rendering an empty store as healthy") fires on the same row → `flag: readers-prove-their-producer` | Y |
+| `INV-13-CODE` | CODE | INV-13 readers-prove-their-producer | `readers-prove-their-producer` | Step 5.5 (unchanged — Reads the doc generically) applies INV-13's question to `render_health`: `status=ok` is produced by the absence of rows, and the package holds no writer of those rows, so an unwired ledger and a healthy one render identically → `invariant_findings` entry with `invariant="readers-prove-their-producer"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 26/26). No wording change to
+G7's walk instruction or to Step 5.5 was needed. The two gate-text edits
+this change did require (G7's trigger-shape entry and the family-inventory
+row) are not rehearsal misses: neither enumeration auto-extends, which is
+why `scripts/tests/test_design_invariants_consistency.py` fails the moment
+a heading lands without them.
+
+Isolation re-checked while walking: no other trigger shape fires on either
+INV-13 fixture. Nothing fails or falls back (not INV-11
+`no-silent-fail-soft`), no emitter knows a fact the reader must scrape (not
+INV-2 `structured-facts-at-failure`), and the seeded-row test is a test of
+a reader rather than a guard asserting prose (not INV-10
+`guards-exercise-behaviour`) — the family-boundary distinctions the
+normative doc's INV-13 section draws.
 
 ## Reconciliation — 2026-07-14 base walk
 

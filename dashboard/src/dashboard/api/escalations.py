@@ -48,8 +48,9 @@ _TASK_CARDS_TTL_SECONDS = 10.0
 # TIGHTEN its own constant (the structural test enforces it can never widen
 # it). Single-root call whose fan-out happens at the CALLER via
 # ``asyncio.gather`` over root ids, so the handler cost is max-of-N rather
-# than sum-of-N — no whole-loop deadline is needed as it is for
-# ``orchestrator.discover_orchestrators``' sequential walk.
+# than sum-of-N — no whole-loop deadline is needed. (``discover_orchestrators``
+# used to be the contrasting case, a sequential per-root walk that needed one.
+# It reads no task tree since task 5587.)
 _TASK_CARDS_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
 
 _task_cards_cache: TTLCache[list[dict] | dict] = TTLCache(

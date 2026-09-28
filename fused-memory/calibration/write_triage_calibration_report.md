@@ -32,24 +32,30 @@
 
 | k | hits | total | recall |
 |---|---|---|---|
-| 1 | 17 | 63 | 0.2698412698412698 |
-| 3 | 25 | 63 | 0.3968253968253968 |
-| 5 | 32 | 63 | 0.5079365079365079 |
-| 10 | 45 | 63 | 0.7142857142857143 |
+| 1 | 16 | 84 | 0.19047619047619047 |
+| 3 | 23 | 84 | 0.27380952380952384 |
+| 5 | 32 | 84 | 0.38095238095238093 |
+| 10 | 46 | 84 | 0.5476190476190477 |
+| 20 | 66 | 84 | 0.7857142857142857 |
+| 50 | 73 | 84 | 0.8690476190476191 |
 
-Canonicals absent from the corpus (excluded from the denominator): 21
+Canonicals absent from the corpus (counted in the denominator; each is a miss unless an alias or a hoisted child reaches it): 21
 
 ## Provenance
 
 - `fixture_path`: `tests/fixtures/write_triage_calibration.jsonl`
-- `project_id`: `reify`
 - `embedder_model`: `text-embedding-3-small`
 - `embedder_dimensions`: `1536`
-- `search_stores`: `mem0 (MemoryService.search, stores=[mem0])`
-- `search_categories`: `all`
 - `record_count`: `104`
 - `cluster_count`: `20`
 - `per_category_record_counts`: `{'procedural_knowledge': 85, 'observations_and_summaries': 11, 'preferences_and_norms': 8}`
 - `cross_category_dropped`: `1703`
 - `pair_counts`: `{'true_dup': 301, 'unrelated': 5037, 'hard_negative': 18}`
 - `per_category_pair_counts`: `{'procedural_knowledge': {'true_dup': 242, 'unrelated': 3316, 'hard_negative': 12}, 'observations_and_summaries': {'true_dup': 4, 'unrelated': 45, 'hard_negative': 6}, 'preferences_and_norms': {'true_dup': 28, 'unrelated': 0, 'hard_negative': 0}}`
+- `project_id`: `reify`
+- `retrieval_mode`: `production`
+- `retrieval_call`: `fused_memory.server.write_triage::retrieve_candidates`
+- `canonical_aliases_path`: `tests/fixtures/write_triage_calibration.canonical_aliases.json`
+- `canonical_aliases_count`: `3`
+- `degraded_retrievals`: `0`
+- `bands_from`: `calibration/write_triage_calibration_report.json`

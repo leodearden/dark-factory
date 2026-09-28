@@ -441,57 +441,25 @@ class SpawnBudget(NamedTuple):
 # spawn count multiplied by per-spawn latency -- and per-spawn latency is
 # exactly what host CPU oversubscription inflates.
 #
-# WHAT IS OBSERVED, AND WHAT IS ONLY HYPOTHESISED (task 5333 reviewer
-# amendment -- stated separately so a later reader does not inherit a guess as
-# a finding).  OBSERVED: this class is 5 of the 7 recorded crash-census
-# events; at 234 spawns it is the heaviest thing in that file; it shared an
-# identical 300s marker with classes a third its size; and every recorded run
-# of it, at every load, finished far under 300s (see the wall clocks below --
-# the largest is 22.81s for all three tests together).  HYPOTHESIS: that the
-# 300s marker is what fired in those crashes, via a load excursion larger than
-# any yet recorded.  NOT OBSERVED, and the gap matters: no recorded run shows
-# this class approaching 300s, so nothing here demonstrates the old marker
-# firing.  Another cause would fit the same census -- git_ops.py documents
-# EMFILE/ENOMEM paths on `create_subprocess_exec`, and a bare xdist worker
-# death looks identical from the outside whichever killed it.  A widened
-# marker is therefore a HEDGE against the timeout cause, not a proven repair;
-# the budget fixture below is what this change contributes unconditionally,
-# since it reports scene growth whatever the crash mechanism turns out to be.
-# If Row 7 crashes again with this marker in place, the timeout hypothesis is
-# falsified -- look at fd and memory limits next, and do not widen further.
-#
-# THAT FALSIFIER HAS NOW TRIGGERED ONCE (2026-09-15, task 5333 amendment pass,
-# recorded here because a hedge whose test has been run is worth more than one
-# still waiting for it).  OBSERVED, full `pytest tests/` at this marker:
-#   * 1 failed, 16975 passed, 16 skipped in 2484s -- the single failure being
-#     "worker 'gw2' crashed while running ...TestRow7KillSwitchByteIdentity::
-#     test_the_same_sequence_at_cap_six_moves_every_deep_field";
-#   * NO `+++ Timeout +++` banner anywhere in that log, which pytest-timeout
-#     writes before its `os._exit()`.  NOT EVIDENCE, measured after this block
-#     was written: under xdist the banner goes to the WORKER's own terminal,
-#     which the master never forwards, so a genuine timeout kill looks exactly
-#     like this.  See the falsifier paragraph under
-#     DEEP_LANDING_SCENE_TEST_TIMEOUT below;
-#   * the same suite at the same marker had passed 21216 tests, rc=0, in this
-#     lane's own verify attempt-1 (2026-09-14T21:25, 2445s).  So: one crash in
-#     two full-suite runs, not a reproducible failure;
-#   * the shortfall between those counts is the crash's real cost -- under
-#     `--max-worker-restart=0` the dead worker is not replaced, so ~4200 tests
-#     assigned to it never ran, and the run reported green-ish anyway.
-# HYPOTHESIS (unproven, and now the LEADING one): the worker is not dying of
-# this timeout.  Reaching 1260s needs a ~150x slowdown on a test measured at
-# 8.28s, where the worst contention ever recorded here cost 2.8x, and no
-# timeout banner was emitted.  ONE LEG OF THAT HAS SINCE BEEN KNOCKED OUT --
-# the missing banner carries no weight (see the bullet above) -- leaving the
-# ~150x slowdown as the whole of the argument.  The conclusion is left
-# standing because that leg alone may still carry it; what must not be
-# inherited is the banner premise.  NOT INVESTIGATED: fd and memory ceilings
-# at the moment of death -- the next place to look, per the line above.
+# WHAT THE CRASHES WERE (settled 2026-09-23, task 5811; the crash census, the
+# fd/memory hypotheses the reproduction falsified and the sizing debate before
+# it are in git history, not here).  The worker was never slow: it was HUNG at
+# teardown.  Every red verdict this scene rendered through the real post-merge
+# verify spawned a detached `main-health-probe-*` task that no scene stopped;
+# pytest-asyncio's loop close cancelled it once, and a task cancelled between
+# spawning a git child and connecting its pipes survives one cancel inside
+# asyncio.  pytest-timeout then ended the worker AT THIS MARKER, which is why no
+# widening could close it.  The scene now runs with the probe switched off
+# (`escalate_preexisting_main_break=False` in `_make_config`), and conftest's
+# `_drain_leaked_tasks` delivers the first cancel before any loop closes.
+# Why the `+++ Timeout +++` banner's absence from a log proved nothing, and
+# what now reaches the log instead: test_whole_tree_scan_timeout_guard.py::
+# TestTimeoutConstants.
 # WHAT THIS DOES NOT OVERTURN: the marker is still correctly sized for what it
 # covers, and it is genuinely in force under verify -- measured directly, a
 # `@pytest.mark.timeout` marker overrides verify's CLI `--timeout=300`
 # (pytest-timeout resolves the marker first and falls back to ini/CLI only in
-# its absence).  What is in doubt is whether a timeout was ever the cause.
+# its absence).
 #
 # THE COUNTS ARE DETERMINISTIC AND THE WALL CLOCK IS NOT, which IS the
 # load-sensitivity these constants exist to absorb.  Five runs of the same
@@ -674,36 +642,15 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 #     -- a per-test backstop larger than the whole verify run's own budget
 #     could never fire, so it would be no backstop at all.
 #
-# WHAT IS OBSERVED, AND WHAT IS ONLY HYPOTHESISED (stated separately, as the
-# Row 7 block above does, so a later reader does not inherit a guess as a
-# finding).  OBSERVED: all nine markers sat at 180, inside the inversion band
+# OBSERVED: all nine markers sat at 180, inside the inversion band
 # `DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT`, so under
 # verify's `--timeout=300` they ran TIGHTER than the run gating the merge; the
 # module is spawn-bound with 0.00s of sleep; the per-class maxima above; one
-# class's bounded waits alone consume its whole former marker.  HYPOTHESIS:
-# that the 180s marker is what fired in the two recorded crashes
-# (data/verify-logs/5440/attempt-1 and data/verify-logs/4039/attempt-1).  NOT
-# OBSERVED: the worker's fd or memory state at death.  The widened marker is
-# therefore a measurement-sized HEDGE against the timeout cause; the ENFORCED
-# spawn budget below is what this change contributes unconditionally, because
-# it reports scene growth whatever the mechanism turns out to be.  If a class
-# in this module crashes again at 1080s the timeout hypothesis is falsified --
-# look at fd and memory ceilings next, and do not widen further.
-#
-# A FALSIFIER THE ROW 7 BLOCK ABOVE RELIES ON DOES NOT HOLD, and it is
-# corrected here rather than inherited.  That block reads "NO `+++ Timeout +++`
-# banner anywhere in that log" as evidence the worker was not dying of its
-# timeout.  MEASURED with a purpose-built probe -- a `@pytest.mark.timeout(3)`
-# test sleeping 30s, run under `-n 2 --dist loadgroup --max-worker-restart=0
-# --timeout-method=thread` -- a GENUINE pytest-timeout kill under xdist prints
-# exactly `[gw0] node down: Not properly terminated` plus `worker 'gw0'
-# crashed while running '<nodeid>'` and NO banner: pytest-timeout writes the
-# banner to the WORKER's own terminal, which xdist does not forward to the
-# master.  That is byte-for-byte the signature in both crash logs above, so
-# banner-absence is the EXPECTED shape of a timeout kill rather than evidence
-# against it.  Row 7's own conclusions are deliberately left untouched -- its
-# leading hypothesis may still be right for other reasons -- but the mistaken
-# inference stops being inherited here.
+# class's bounded waits alone consume its whole former marker.  The crashes
+# recorded against this module were the teardown hang the Row 7 block above
+# describes, not a slow scene: the same detached probe, the same one-shot
+# cancel, the same kill at the marker.  The ENFORCED spawn budget below keeps
+# this pair honest either way, because it reports scene growth in-process.
 #
 # SIZED AGAINST THE BUDGET, NOT AGAINST THE RAW 169, for the reason the Row 7
 # block argues at length and this one does not restate: the marker can only be
@@ -2423,6 +2370,35 @@ def require_orchestrator_inifile(pytestconfig, *, subject: str) -> None:
     )
 
 
+def mcp_tool_envelope(payload: object) -> dict:
+    """The JSON-RPC body ``Scheduler.dispatch_tool`` ACTUALLY returns for a
+    successful ``tools/call``, wrapping *payload* — the tool's own return value.
+
+    ``dispatch_tool`` hands back ``McpSession._raw_call``'s parsed response
+    verbatim (``mcp_lifecycle.py::McpSession.call_tool`` returns it unmodified),
+    so a fake that answers with a bare ``{'statuses': …}`` is speaking a shape the
+    transport never emits.  That substitution is not a harmless simplification: it
+    is what let a one-level envelope unwrapper in
+    ``chronic_flake.py::_unwrap_dispatch_envelope`` ship while ~30 tests stayed
+    green over it, because a bare payload needs zero unwrap steps and the real
+    body needs two.
+
+    Build every ``dispatch_tool`` fake response through this helper so the fakes
+    speak the production shape BY CONSTRUCTION, and keep the bare-dict spellings
+    only as explicitly-labelled legacy/tolerated cases.
+
+    Both ``structuredContent`` and the ``content`` text block are populated,
+    which is what a real server sends when the tool declares an output schema.
+    """
+    return {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(payload)}],
+            'structuredContent': payload,
+            'isError': False,
+        },
+    }
 def make_prompt_resolution_workflow(
     *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
 ) -> TaskWorkflow:

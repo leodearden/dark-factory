@@ -28,6 +28,7 @@ through it and the test content needs no markup-proofing.)
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 import types
@@ -1181,7 +1182,7 @@ def _filed_escalations(root) -> list[dict]:
 
 
 @pytest.mark.skipif(
-    not write_triage.HAS_ESCALATION,
+    importlib.util.find_spec('escalation') is None,
     reason='the escalation package is not installed in this environment',
 )
 class TestTheFailOpenStormReachesAnOperator:

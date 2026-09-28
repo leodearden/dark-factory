@@ -97,7 +97,15 @@ from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, VerifyScript, fails, passes
+from _merge_lane_fakes import (
+    FakeClock,
+    FakeVerifier,
+    VerifyScript,
+    fails,
+    lane_scene_config,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
@@ -172,7 +180,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Request builder ───────────────────────────────────────────────────────────
@@ -440,6 +448,7 @@ class TestScenario1SpeculativeCascade:
                 f'Expected N to fail (genuine VerifyResult failure, not '
                 f'RunnerUnavailable), got {outcome_a!r}.'
             )
+            assert not main_health_probe_spawned(outcome_a), outcome_a.reason
             assert outcome_b.status == 'done', (
                 f'Expected N+1 (speculative downstream) to resolve "done" after '
                 f'cascade re-merge re-dispatch, got {outcome_b!r}. If the cascade '

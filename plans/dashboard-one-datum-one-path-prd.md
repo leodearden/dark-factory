@@ -133,9 +133,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 3. **Named views.** The partition of `TaskStatus` is three views: `in_flight` =
    in-progress + blocked + merge-deferred + review + infra-hold; `backlog` = pending
    + deferred; `terminal` = done + cancelled. `running` = in-progress is a **sub-view**
-   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight"),
-   and is the only number an operator compares against `max_concurrent_tasks`. A
-   test asserts the three views partition `TaskStatus` and `running ⊆ in_flight`.
+   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight").
+   `max_concurrent_tasks` is compared against the rows' live count, not `running`
+   (decision 9). A test asserts the three views partition `TaskStatus` and
+   `running ⊆ in_flight`.
    **Amendment vs the first draft**: `infra-hold` moved from `backlog` to `in_flight`
    on the reviewer's evidence — it is entered from in-progress via
    `orchestrator/src/orchestrator/workflow.py::_mark_blocked(block_status='infra-hold')`
@@ -147,7 +148,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    renders `dashboard/src/dashboard/static/redux/task_vocab.js` (members, view
    membership, display tones) from `shared.task_statuses`; the parity test lives in
    root `tests/scripts/` beside the existing generator precedent
-   (`scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
+   (`scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
    where `scripts/` is on `sys.path` by design. Rejected: the hand-maintained-twin
    pattern of `recon_status.js` (kept there as landed) and views-only.
 5. **The task snapshot is one acquisition unit.** `dashboard/data/task_snapshot.py`
@@ -253,9 +254,11 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    split and a new `in_progress_rows` column come from the rows and carry the rows'
    `as_of`, so `_SPLIT_KEYS`' invariant is restated as `live + stranded ==
    in_progress_rows`, not `== in_progress`. `running` everywhere is the census's
-   in-progress; the task-3543 parity alarm compares the rows-derived
-   `in_progress_live` against the cap, as it does today, and the two numbers sit in
-   one row with their skew visible. `redux_api.py::shape_burndown` builds the aggregate by
+   in-progress; the task-3543 parity alarm and the sampler's cap-breach WARNING
+   compare the rows-derived `in_progress_live` against the cap (a stranded row holds
+   no scheduler slot, so counting it would alarm on a strand pile-up rather than
+   over-dispatch), and the two numbers sit in one row with their skew visible.
+   `redux_api.py::shape_burndown` builds the aggregate by
    carrying each project's last **measured** row forward with its age, and emits
    per-project `as_of`, `state`. `burndown.py::compute_parity_alarm`,
    `redux_api.py::_aggregate_parity` and `compute_forecast_confidence` evaluate
@@ -387,7 +390,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 | `scheduler_utils.jsx::lockChipState`, `scheduler_heatmap.jsx::cellStateFor`, `tabs.jsx::LocksCell` | present |
 | `data.js::applyKey` + `__loaded` marker; `DEFAULT_POLL_DEPS` | present — the registry extension point |
 | node `--test` harness in the merge gate | `dashboard/tests/test_graph_layout_js.py::test_graph_layout_js_suite_passes` (subprocess + TAP count), collected by `cd dashboard && uv run pytest tests/` |
-| generator + parity-test precedent | `scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
+| generator + parity-test precedent | `scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
 | AST guard precedent with exemption apparatus | `dashboard/tests/test_clock_discipline.py::find_clock_violations` |
 | root `.venv` carries every workspace member | `CLAUDE.md` § Locating installed code |
 
