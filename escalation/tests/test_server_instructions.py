@@ -31,6 +31,7 @@ async def handshake(tmp_path: Path) -> tuple[str | None, set[str]]:
     """The served instructions and registered tool names, as a client sees them."""
     server = create_server(EscalationQueue(tmp_path / 'esc'), startup_sweep=False)
     async with Client(server) as client:
+        assert client.initialize_result is not None, 'the MCP handshake did not complete'
         instructions = client.initialize_result.instructions
         tool_names = {tool.name for tool in await client.list_tools()}
     return instructions, tool_names
