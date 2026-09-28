@@ -3379,6 +3379,35 @@ class TestWatcherHasActionableL1:
         _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
         assert h._watcher_has_actionable_l1() is True
 
+    def test_member_missed_by_a_dispositioned_l2_cascade_returns_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pending L1 whose resolved L2's cascade missed it — actionable.
+
+        The rotation's drain closes such a stranded member (SKILL.md
+        "Draining pending escalations"), so launching for it is how it leaves
+        the queue. Excluding archived L2s' members here would strand it.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-stranded')
+        l2_id = _submit_sample_l2(queue, 'task-stranded', members=[l1_id])
+        resolve = EscalationQueue.resolve
+
+        def resolve_missing_the_member(
+            self: EscalationQueue, escalation_id: str, *args, **kwargs,
+        ):
+            if escalation_id == l1_id:
+                raise OSError('simulated cascade failure')
+            return resolve(self, escalation_id, *args, **kwargs)
+
+        with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
+            queue.resolve(l2_id, 'human answered the cluster')
+
+        l2, l1 = queue.get(l2_id), queue.get(l1_id)
+        assert l2 is not None and l2.status == 'resolved'
+        assert l1 is not None and l1.status == 'pending'
+        assert h._watcher_has_actionable_l1() is True
+
     def test_only_l0_returns_false(self, tmp_path: Path) -> None:
         """Only a pending level-0 escalation — not actionable at L1.
 

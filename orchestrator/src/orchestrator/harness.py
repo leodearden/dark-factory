@@ -14315,6 +14315,10 @@ class Harness:
         L2s — defeating the entire cost optimisation this precheck exists
         for.
 
+        A pending member of a RESOLVED or DISMISSED (archived) L2 stays
+        actionable: its L2's best-effort cascade missed it, and the rotation's
+        drain closes it (SKILL.md "Draining pending escalations").
+
         Scope: only L1 work counts.  A queue containing only L0s, or only
         pending L2s, is treated as non-actionable — L0->L1 promotion is
         owned by the separate ``_reap_orphan_l0_escalations`` loop, so
