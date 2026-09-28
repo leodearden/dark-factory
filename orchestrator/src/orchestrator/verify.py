@@ -2533,7 +2533,8 @@ def _archive_attempt_summary(
     attempt passed, failed or ran a narrower scope, and it is small.  *stamp*
     keeps a re-run of the same attempt and prefix from overwriting the earlier
     record.  The name is the one ``scripts/verify_budget_census.py::ARCHIVE_GLOB``
-    selects.
+    selects; while the worktree lives, the census counts this and the worktree
+    copy as one record (``scripts/verify_budget_census.py::load_records``).
     """
     if archive_root is None:
         return None
