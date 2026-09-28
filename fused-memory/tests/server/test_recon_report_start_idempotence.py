@@ -14,6 +14,7 @@ Covers:
 - TestStartReportResultIsUnambiguous — step-3 (RED until step-4)
 - TestStartReportActivePointerAndPersistence — step-5 (RED until step-6)
 - TestStartReportUnknownStageGuard — task 4865 step-1 (RED until step-2)
+- TestStartReportUnknownStageGuardIsWiredInProduction — task 4865 step-3 (RED until step-4)
 """
 
 import logging
@@ -804,3 +805,55 @@ class TestStartReportUnknownStageGuard:
             assert {r['stage'] for r in real_store.load_all()} == {'memory_consolidator'}
         finally:
             real_store.close()
+
+
+# ---------------------------------------------------------------------------
+# task 4865 step-3: the production factory turns the guard ON — RED until
+# step-4 passes the vocabulary in `_build_recon_report_components`.
+# ---------------------------------------------------------------------------
+
+
+def _production_state():
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig, ServerConfig
+    from fused_memory.server.main import _build_recon_report_components
+
+    config = FusedMemoryConfig(
+        server=ServerConfig(recon_report_port=8003, host='127.0.0.1'),
+        reconciliation=ReconciliationConfig(
+            recon_report_state_ttl_seconds=300, recon_report_persist_enabled=False,
+        ),
+    )
+    state, _mcp, _uv = _build_recon_report_components(config)
+    return state
+
+
+class TestStartReportUnknownStageGuardIsWiredInProduction:
+    """The guard is enforced where the hole exists, not merely available."""
+
+    @pytest.mark.asyncio
+    async def test_production_state_rejects_a_misspelled_stage(self):
+        state = _production_state()
+
+        result = state.start_report(run_id='r', stage='memory-consolidator', project_id='dark_factory')
+
+        assert result['error'] == 'unknown_stage', result
+
+    @pytest.mark.asyncio
+    async def test_production_state_accepts_the_real_stage(self):
+        state = _production_state()
+
+        result = state.start_report(run_id='r', stage='memory_consolidator', project_id='dark_factory')
+
+        assert result['already_started'] is False, result
+
+    @pytest.mark.asyncio
+    async def test_production_state_accepts_every_pipeline_stage(self):
+        from fused_memory.models.reconciliation import StageId
+
+        state = _production_state()
+
+        for stage in StageId:
+            result = state.start_report(
+                run_id=f'run-{stage.value}', stage=stage.value, project_id='dark_factory',
+            )
+            assert result['already_started'] is False, (stage, result)
