@@ -1919,6 +1919,58 @@ class TestDeclaredFilenameShaped:
 
         assert findings == []
 
+    def test_a_multi_path_wiring_check_is_healthy(self, tmp_path):
+        """Task 3659's exact descriptor and files: the declared module sits
+        under ONE of the two paths, and the check went green through a real
+        import in the OTHER (agents/briefing.py) — a wiring check."""
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {
+                'orchestrator/src/orchestrator/agents/briefing.py': 'import os\n',
+                'shared/src/shared/__init__.py': '',
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'templates-single-home-in-shared',
+                    'kind': 'grep',
+                    'pattern': 'briefing_queries',
+                    'expect': 'present',
+                    'paths': ['orchestrator/src/orchestrator/agents/', 'shared/src/shared/'],
+                }
+            ],
+            files=[
+                'shared/src/shared/briefing_queries.py',
+                'shared/tests/test_briefing_queries.py',
+                'shared/tests/silent_fallthrough_allowlist.py',
+                'orchestrator/src/orchestrator/agents/briefing.py',
+                'orchestrator/src/orchestrator/mcp_lifecycle.py',
+                'orchestrator/src/orchestrator/workflow.py',
+                'orchestrator/tests/_workflow_helpers.py',
+                'orchestrator/tests/test_briefing.py',
+                'orchestrator/tests/test_briefing_project_scope.py',
+                'orchestrator/tests/test_mcp_retry.py',
+                'orchestrator/tests/test_reviewer_verdict_routing.py',
+                'orchestrator/tests/test_merger_disposition_verdict.py',
+                'scripts/legibility/digest.py',
+                'scripts/tests/test_legibility_digest.py',
+            ],
+            repo_root=repo,
+        )
+
+        assert findings == []
+
+    def test_every_path_containing_the_declared_file_is_still_mode_3(self, pre_3536_repo):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'paths': ['orchestrator/', 'orchestrator/tests/']}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+
     def test_an_unscoped_check_covers_every_declared_file(self, pre_3536_repo):
         findings = lint_delivered_checks(
             [{**_T3536_CHECK, 'paths': []}], files=_T3536_FILES, repo_root=pre_3536_repo

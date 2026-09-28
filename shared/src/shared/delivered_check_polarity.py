@@ -818,9 +818,12 @@ def _covered_by_declared_files(path: str, declared: Sequence[str]) -> bool:
     beneath it. Treating a directory as covering nothing would warn on the
     common shape.
     """
-    return any(
-        path == entry or path.startswith(entry.rstrip('/') + '/') for entry in declared
-    )
+    return any(_is_under(path, entry) for entry in declared)
+
+
+def _is_under(path: str, entry: str) -> bool:
+    """*path* is *entry* itself, or lies beneath it as a directory."""
+    return path == entry or path.startswith(entry.rstrip('/') + '/')
 
 
 def _format_sites(matches: Sequence[_GrepMatch], *, limit: int = 5) -> tuple[str, ...]:
@@ -1032,12 +1035,13 @@ def _declared_filename_finding(
     THE RULE, exactly: EVERY top-level alternative of the pattern (see
     :func:`_top_level_arms`), compiled by Python ``re``, FULLY matches the
     basename or the stem (basename minus its last suffix) of one declared
-    file that lies inside the check's ``paths`` (the whole tree when
-    ``paths`` is empty). Full match, not search, so a symbol that merely
-    shares text with a module name is not flagged; every arm, so an
-    alternative naming a real symbol keeps the check a sound gate; in-scope
-    only, because a grep cannot be about the existence of a file it does not
-    read — a declared module grepped for in ANOTHER file is a wiring check.
+    file that EVERY entry of the check's ``paths`` contains (the whole tree
+    when ``paths`` is empty). Full match, not search, so a symbol that
+    merely shares text with a module name is not flagged; every arm, so an
+    alternative naming a real symbol keeps the check a sound gate; every
+    path, because a grep that also reads files other than the declared one
+    can be a wiring check — a declared module named in ANOTHER file's
+    import.
     A pattern the splitter cannot parse is judged whole, and only when it
     carries no ``|`` at all.
     """
@@ -1051,9 +1055,7 @@ def _declared_filename_finding(
     except re.error:
         return None
     for declared in files:
-        if declared.endswith('/') or (
-            paths and not _covered_by_declared_files(declared, paths)
-        ):
+        if declared.endswith('/') or not all(_is_under(declared, scope) for scope in paths):
             continue
         base = posixpath.basename(declared)
         names = (base, posixpath.splitext(base)[0])
