@@ -335,6 +335,27 @@ def _annotate_description(
     return ('\n'.join(lines) if annotated else description), annotated
 
 
+def _with_gate_owned_keys(
+    metadata: dict[str, Any],
+    records: list[dict[str, str]],
+    *,
+    proven: bool,
+    verified_at: str,
+) -> dict[str, Any]:
+    """Only this write's own evidence sets the two liveness keys; an incoming
+    copy never survives, so a copied-forward stamp cannot pose as fresh."""
+    rewritten = {
+        key: value
+        for key, value in metadata.items()
+        if key not in (X_LIVENESS_REVERIFIED_AT_KEY, X_LIVENESS_EXCEPTIONS_KEY)
+    }
+    if proven:
+        rewritten[X_LIVENESS_REVERIFIED_AT_KEY] = verified_at
+    if records:
+        rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
+    return rewritten
+
+
 async def enumeration_liveness_gate(
     *,
     agent_id: str | None,
@@ -373,12 +394,14 @@ async def enumeration_liveness_gate(
         'truncated': len(fragments),
         'annotated_lines': annotated_lines,
     }
-    if not any(stats.values()):
-        return passthrough
+    reported = stats if any(stats.values()) else None
 
-    rewritten = parsed | liveness.enumerations
-    if records:
-        rewritten[X_LIVENESS_EXCEPTIONS_KEY] = records
+    rewritten = _with_gate_owned_keys(
+        parsed | liveness.enumerations,
+        records,
+        proven=bool(liveness.enumerations),
+        verified_at=verified_at,
+    )
     if rewritten == parsed and annotated_description is description:
-        return passthrough._replace(stats=stats)
-    return EnumerationGateResult(None, annotated_description, rewritten, stats)
+        return passthrough._replace(stats=reported)
+    return EnumerationGateResult(None, annotated_description, rewritten, reported)
