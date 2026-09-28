@@ -58,6 +58,7 @@ from df_pytest_isolation import (  # noqa: E402
     leaked_drain_process_reason,
     leaked_drain_processes,
     load_scaled_grace,
+    read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
     wait_pid_gone,
@@ -628,6 +629,51 @@ class TestLoadScaledGrace:
             warnings.simplefilter('error')
             assert load_scaled_grace(3, cap_secs=30) == 30
             assert load_scaled_grace(20, cap_secs=20) == 20
+
+
+class TestReadDrainPollTrace:
+    """The drain gate's poll ledger has ONE parser, shared by both test roots."""
+
+    UNIT = 'orchestrator-fake-reify.service'
+
+    def test_an_absent_ledger_reads_as_no_polls(self, tmp_path: Path) -> None:
+        """Callers then fail on their own diagnostic, not a bare FileNotFoundError."""
+        assert read_drain_poll_trace(tmp_path / 'never-written.tsv') == []
+
+    def test_records_are_verdict_unit_pairs_in_file_order(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidle\t{self.UNIT}\n')
+
+        assert read_drain_poll_trace(ledger) == [('busy', self.UNIT), ('idle', self.UNIT)]
+
+    def test_complete_only_drops_a_record_still_being_appended(self, tmp_path: Path) -> None:
+        """A reader racing the script must never count a half-written record."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        assert read_drain_poll_trace(ledger, complete_only=True) == [('busy', self.UNIT)]
+
+    def test_a_finished_ledger_with_a_torn_record_is_rejected(self, tmp_path: Path) -> None:
+        """Read whole, a torn final record must fail loudly rather than vanish."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        with pytest.raises(ValueError):
+            read_drain_poll_trace(ledger, complete_only=False)
+
+    @pytest.mark.parametrize('bad_line', ['busy', f'busy\t{UNIT}\textra'])
+    def test_a_record_without_exactly_two_fields_names_the_line_and_the_ledger(
+        self, tmp_path: Path, bad_line: str,
+    ) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'idle\t{self.UNIT}\n{bad_line}\n')
+
+        with pytest.raises(ValueError) as exc_info:
+            read_drain_poll_trace(ledger)
+
+        message = str(exc_info.value)
+        assert repr(bad_line) in message
+        assert str(ledger) in message
 
 
 # ---------------------------------------------------------------------------
