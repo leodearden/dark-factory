@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -354,3 +357,40 @@ class TestAddMemoryFilesTheVerdictAgainstTheNamedCandidate:
         assert CANONICAL_ID_KEY not in ack, f'{ack!r}'
         assert PARENT_ID_KEY not in persisted, f'{persisted!r}'
         assert counter.live_count() == 1
+
+
+#: The repo root, reached from `<repo>/fused-memory/tests/server/`.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: Gate item 5's own consumption probe (task 4949), run as the oracle.
+_CONSUMPTION_PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
+
+
+class TestGateItemFiveMeasuresTheConsumption:
+    """The flip gate's item-5 probe, run against this worktree's source.
+
+    It must reach its MEASURED branch — the attach tracking a judge-side swap
+    of the named candidate — not the branch that holds only by construction
+    while the prompt still marks the band's winner.
+    """
+
+    def test_the_probe_measures_the_judged_candidate_consumed(self) -> None:
+        if not _CONSUMPTION_PROBE.exists():
+            pytest.skip(f'attach-consumption probe not present at {_CONSUMPTION_PROBE}')
+        completed = subprocess.run(
+            [
+                sys.executable, str(_CONSUMPTION_PROBE),
+                '--src-root', str(_REPO_ROOT / 'fused-memory' / 'src'),
+                '--extra-path', str(_REPO_ROOT / 'shared' / 'src'),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert (
+            'PASS  the judge-bound candidate is CONSUMED by the attach' in completed.stdout
+        ), completed.stdout
+        assert 'ITEM5-BRANCH  judge-side designation swap' in completed.stdout, (
+            completed.stdout
+        )

@@ -63,6 +63,7 @@ from fused_memory.server.write_triage_judge import (
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     CANDIDATE_ID_KEY,
+    JUDGE_REPLY_SHAPE,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
@@ -351,17 +352,12 @@ class TestJudgeExemplars:
         the fields is counted too.
 
         BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
-        a construction the production path never makes bounds nothing. Two
-        details were missing when this test used 5-char stand-in ids and no
-        attach target, and together they cost 209 chars, enough to put the
-        real call over a budget this test reported as met. Both are now
-        asserted rather than assumed, because either could be quietly undone
-        by an edit that still left the test green: candidate ids are the
-        36-char uuids every record actually carries (all 104 in
-        ``tests/fixtures/write_triage_calibration.jsonl`` are, and
-        ``build_judge_prompt`` renders ``- id:`` UN-elided), and
-        ``attach_target_id`` is passed, because ``judge_write`` forwards it on
-        EVERY call — so its line is part of the worst case, not an extra.
+        a construction the production path never makes bounds nothing. The
+        candidate ids are the 36-char uuids every record actually carries (all
+        104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+        ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in
+        id under-measures every candidate line, so the length is asserted
+        rather than assumed.
 
         THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
         field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
@@ -385,16 +381,10 @@ class TestJudgeExemplars:
             'the slate must carry the 36-char uuids production carries — a '
             'shorter stand-in id under-measures every candidate line'
         )
-        rendered = build_judge_prompt(
-            maximal, candidates, attach_target_id=candidates[0].id,
-        )
+        rendered = build_judge_prompt(maximal, candidates)
         assert _ELIDED_MARKER in rendered, (
             'the worst case must be an ELIDED render — otherwise it misses '
             'the marker _elide appends, and under-measures the real ceiling'
-        )
-        assert f'  attach_target: {candidates[0].id}' in rendered, (
-            'the attach_target line is rendered on every production call, so '
-            'a worst case measured without it is not the worst case'
         )
         worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
         assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
@@ -638,50 +628,6 @@ _PROBE_PATH = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
 _JUDGE_SRC_ROOT = _REPO_ROOT / 'fused-memory' / 'src'
 
 
-def _marked_ids(candidates: list[MemoryResult], attach_target_id: str) -> set[str]:
-    """Which candidate ids the attach-target mark names, read from the DIFF.
-
-    Diffed against the same slate rendered with no target rather than grepped
-    for a mark's spelling: what the invariant asserts is that naming a target
-    changes the rendering in a way attributable to a specific candidate, which
-    is exactly what `check_write_triage_attach_target.py::_swap_verdict`
-    measures. A test keyed on the literal mark text would instead pin the
-    mechanism and pass for a marker that names the wrong record.
-    """
-    unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
-    marked = build_judge_prompt(
-        'new', candidates, attach_target_id=attach_target_id,
-    )
-    added = set(marked.splitlines()) - set(unmarked.splitlines())
-    return {
-        candidate.id
-        for candidate in candidates
-        for line in added
-        if candidate.id in line
-    }
-
-
-def _added_lines(candidates: list[MemoryResult], attach_target_id: str) -> list[str]:
-    """The lines naming a target ADDS to the rendering, in order.
-
-    A LIST, not a set. `_marked_ids` answers "which candidates does the mark
-    name", which is the right question for a marker that names the wrong
-    record — but it cannot see a marker that names TWO records whose ids
-    happen to collapse, and a set-valued assertion reads the same either way.
-    The count is its own invariant: AT MOST ONE candidate is ever marked, so
-    a second mark has to show up as a visible extra element rather than be
-    absorbed. Spelling-independent — it diffs against the same slate rendered
-    with no target instead of grepping for the mark's text.
-    """
-    unmarked = build_judge_prompt(
-        'new', candidates, attach_target_id=None,
-    ).splitlines()
-    marked = build_judge_prompt(
-        'new', candidates, attach_target_id=attach_target_id,
-    ).splitlines()
-    return [line for line in marked if line not in unmarked]
-
-
 class TestSelectJudgeCandidates:
     """Which of the retrieved results the judge actually gets to see.
 
@@ -842,6 +788,13 @@ class TestBuildJudgePrompt:
         assert VERDICT_KEY in prompt
         assert 'JSON' in prompt or 'json' in prompt
 
+    def test_both_halves_of_the_call_request_the_one_reply_shape(self) -> None:
+        """One spelling of the output contract, so the two halves cannot disagree."""
+        assert VERDICT_KEY in JUDGE_REPLY_SHAPE
+        assert CANDIDATE_ID_KEY in JUDGE_REPLY_SHAPE
+        assert JUDGE_REPLY_SHAPE in JUDGE_SYSTEM_PROMPT
+        assert JUDGE_REPLY_SHAPE in build_judge_prompt('new', [_result('m1', 0.9)])
+
     def test_a_long_candidate_is_truncated_and_marked(self) -> None:
         """The fixture contains a ~9k-char canonical; the budget is ~2.5k tokens.
 
@@ -898,237 +851,6 @@ class TestBuildJudgePrompt:
     def test_an_empty_candidate_list_still_renders(self) -> None:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
-
-    # --- the attach target (gate item 1, option (b)) -------------------------
-    #
-    # `select_judge_candidates` guarantees the band's winner is in the slate
-    # but NOT where it sits: the hoisted-parent rescue APPENDS the evidence
-    # child, so the attach target is LAST there and first on a flat slate.
-    # Position is therefore not a sound encoding of "the candidate this
-    # verdict will be filed against" — the prompt has to name it.
-    # `plans/write-triage-attach-target-contradiction.md` §2 carries the
-    # measurement; `scripts/check_write_triage_flip_preconditions.sh` item 1
-    # is the gate that reads it.
-
-    def test_the_named_candidate_is_the_only_one_marked(self) -> None:
-        """A flat slate: the mark lands on the id it was asked for, alone."""
-        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
-        marked = _marked_ids(candidates, 'm1')
-        assert marked == {'m1'}
-
-    def test_a_hoisted_parent_marks_the_child_that_carries_the_evidence(
-        self,
-    ) -> None:
-        """The canonical id can be absent from the slate ENTIRELY.
-
-        `_canonical_id_of` hoists a child winner to its parent id, so
-        `decision.canonical_id` names a record retrieval never returned. The
-        child carrying `PARENT_ID_KEY` is the one the judge is really looking
-        at, and a naive `r.id == canonical_id` marker marks NOTHING here —
-        which is the silent version of the defect, not a fix for it.
-        """
-        child = _result(
-            'child-1', 0.60,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        candidates = [_result('m0', 0.90), _result('m1', 0.89), child]
-        assert 'parent-1' not in [c.id for c in candidates]
-        assert _marked_ids(candidates, 'parent-1') == {'child-1'}
-
-    def test_the_target_is_marked_wherever_it_sits_in_the_slate(self) -> None:
-        """Built through `select_judge_candidates`, so the rescue produces it.
-
-        The rescue appends (`[*selected[: max(n - 1, 0)], winner]`), so the
-        attach target lands LAST. A marker keyed on position — `candidates[0]`
-        — marks the wrong record on exactly this slate, and the gate's own
-        report says so.
-        """
-        child = _result(
-            'child-1', 0.60,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        results = [*[_result(f'm{i}', 0.90 - i / 100) for i in range(6)], child]
-        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
-        assert [r.id for r in selected] == ['m0', 'm1', 'child-1']
-        assert _marked_ids(selected, 'parent-1') == {'child-1'}
-
-    def test_an_unrecognised_target_marks_nothing_and_does_not_perturb(
-        self,
-    ) -> None:
-        """The mark MATCHES against the slate; it does not echo its argument.
-
-        This is the control `scripts/check_write_triage_attach_target.py`
-        applies (`_echoes_argument`): an implementation that merely
-        interpolates the value satisfies a swap test while binding no verdict
-        to any candidate. A matcher recognises neither nonce and renders the
-        same prompt for both — and the same prompt as for no target at all.
-        """
-        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
-        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
-        first = build_judge_prompt(
-            'new', candidates, attach_target_id='not-on-this-slate-1',
-        )
-        second = build_judge_prompt(
-            'new', candidates, attach_target_id='not-on-this-slate-2',
-        )
-        assert first == unmarked
-        assert second == unmarked
-        assert first == second
-        assert 'not-on-this-slate-1' not in first
-        assert 'not-on-this-slate-2' not in second
-
-    def test_two_targets_on_one_slate_render_differently(self) -> None:
-        """The swap test the gate applies: the rendering DEPENDS on the target.
-
-        Necessary and not sufficient on its own — hence the echo control
-        above — but a prompt that renders identically for two different attach
-        targets has told the model nothing about which candidate the verdict
-        will be filed against.
-        """
-        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
-        first = build_judge_prompt('new', candidates, attach_target_id='m0')
-        second = build_judge_prompt('new', candidates, attach_target_id='m2')
-        assert first != second
-        first_only = set(first.splitlines()) - set(second.splitlines())
-        second_only = set(second.splitlines()) - set(first.splitlines())
-        assert any('m0' in line for line in first_only)
-        assert any('m2' in line for line in second_only)
-
-    # --- AT MOST ONE candidate is ever marked -------------------------------
-    #
-    # The two clauses above ("is this the id?" / "does this carry that
-    # `parent_id`?") are both true SOMEWHERE on a slate holding a canonical
-    # parent AND one of its children, and that is the ordinary consolidated-
-    # topic case, not an exotic one: `_canonical_id_of` hoists a child winner
-    # to its parent id and `retrieve_candidates` returns children un-filtered,
-    # so parent+child co-occurrence in the top-n is expected. Deciding the
-    # question per candidate marks EVERY one of them, and the constant
-    # instruction sentence — "The candidate marked `attach_target` is the one
-    # this verdict will be filed against" — is then simply false. The target
-    # has to be resolved ONCE for the whole slate, with the same ORDERED
-    # precedence `select_judge_candidates`' rescue arm uses.
-
-    def test_a_parent_and_its_child_on_one_slate_are_marked_once(self) -> None:
-        """The regression: two clauses, both true, must still yield ONE mark."""
-        child = _result(
-            'child-1', 0.95,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        selected = select_judge_candidates(
-            [_result('parent-1', 0.90), child], 5, canonical_id='parent-1',
-        )
-        assert {r.id for r in selected} == {'parent-1', 'child-1'}
-        assert _marked_ids(selected, 'parent-1') == {'parent-1'}
-        assert _added_lines(selected, 'parent-1') == [
-            '  attach_target: parent-1',
-        ]
-
-    def test_several_children_do_not_multiply_the_mark(self) -> None:
-        """More children of the same parent must not mean more marks.
-
-        A consolidated topic accretes amendments, so three children of one
-        parent is the steady state rather than the edge. Per-candidate
-        evaluation scales the defect with the topic's age.
-        """
-        children = [
-            _result(
-                f'child-{i}', 0.95 - i / 100,
-                extra_metadata={
-                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
-                },
-            )
-            for i in range(3)
-        ]
-        candidates = [*children, _result('parent-1', 0.80)]
-        assert _marked_ids(candidates, 'parent-1') == {'parent-1'}
-        assert _added_lines(candidates, 'parent-1') == [
-            '  attach_target: parent-1',
-        ]
-
-    def test_an_exact_id_wins_over_a_child_that_points_at_it(self) -> None:
-        """Precedence is EXACT-ID-FIRST, and does not depend on slate order.
-
-        The same ordered `next(...) or next(...)` the rescue arm uses: the
-        `PARENT_ID_KEY` clause is the FALLBACK for a hoisted parent that is
-        absent from the slate, not a co-equal alternative. A resolver that
-        merely took the first candidate satisfying EITHER clause would mark
-        the child whenever the child outranks its parent — which is the
-        common case, since the child is why the parent was hoisted.
-        """
-        def _slate(child_first: bool) -> list[MemoryResult]:
-            child = _result(
-                'child-1', 0.95,
-                extra_metadata={
-                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
-                },
-            )
-            parent = _result('parent-1', 0.90)
-            return [child, parent] if child_first else [parent, child]
-
-        for child_first in (True, False):
-            candidates = _slate(child_first)
-            assert _marked_ids(candidates, 'parent-1') == {'parent-1'}, (
-                f'child_first={child_first}'
-            )
-            assert _added_lines(candidates, 'parent-1') == [
-                '  attach_target: parent-1',
-            ], f'child_first={child_first}'
-
-    def test_the_single_mark_holds_on_the_shapes_that_already_worked(
-        self,
-    ) -> None:
-        """Regression guard: neither existing shape may lose or gain a mark.
-
-        The flat exact-id slate and the HOISTED slate (the parent id absent
-        entirely, only the child carrying `PARENT_ID_KEY`) are what the two
-        clauses exist for. Resolving one target for the whole slate must leave
-        both marking exactly what they marked before — the fallback clause is
-        narrowed in precedence, not removed.
-        """
-        flat = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
-        assert _marked_ids(flat, 'm1') == {'m1'}
-        assert _added_lines(flat, 'm1') == ['  attach_target: m1']
-
-        child = _result(
-            'child-1', 0.60,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        hoisted = [_result('m0', 0.90), _result('m1', 0.89), child]
-        assert 'parent-1' not in [c.id for c in hoisted]
-        assert _marked_ids(hoisted, 'parent-1') == {'child-1'}
-        assert _added_lines(hoisted, 'parent-1') == [
-            '  attach_target: child-1',
-        ]
-
-    def test_the_echo_control_still_holds_on_a_parent_and_child_slate(
-        self,
-    ) -> None:
-        """Resolving one target must not turn the marker into an echo.
-
-        Same control as `test_an_unrecognised_target_marks_nothing_and_does_
-        not_perturb`, re-applied to the slate the fix is about: an id naming
-        no candidate — and no `PARENT_ID_KEY` pointing at it — still renders
-        exactly as no target at all, and two such nonces render identically.
-        That is what `check_write_triage_attach_target.py::_echoes_argument`
-        separates a real marker from a free-text parameter by.
-        """
-        child = _result(
-            'child-1', 0.95,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        candidates = [child, _result('parent-1', 0.90)]
-        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
-        first = build_judge_prompt(
-            'new', candidates, attach_target_id='not-on-this-slate-1',
-        )
-        second = build_judge_prompt(
-            'new', candidates, attach_target_id='not-on-this-slate-2',
-        )
-        assert first == unmarked
-        assert second == unmarked
-        assert first == second
-        assert 'not-on-this-slate-1' not in first
-        assert 'not-on-this-slate-2' not in second
 
 
 class TestAttachTargetGateProbe:
@@ -1793,102 +1515,30 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
         client.chat.completions.create.assert_not_awaited()
 
 
-class TestJudgeWriteNamesTheAttachTarget:
-    """The band names the target; the prompt has to say which candidate it is.
-
-    `select_judge_candidates` guarantees the winner is IN the slate but not
-    WHERE — the hoisted-parent rescue appends it — so a judge shown an
-    unmarked slate is answering about a set, while the attach touches exactly
-    one record in it. Gate item 1
-    (`scripts/check_write_triage_flip_preconditions.sh`) is that gap.
-    """
-
-    @staticmethod
-    def _sent_prompt(client: MagicMock) -> str:
-        """The user turn that actually reached the provider."""
-        messages = client.chat.completions.create.await_args.kwargs['messages']
-        return next(m['content'] for m in messages if m['role'] == 'user')
+class TestTheSlateIsShownWithoutAFavourite:
+    """The model names its own candidate, so the prompt must not steer it to top-1."""
 
     @pytest.mark.asyncio
-    async def test_the_bands_hoisted_winner_is_marked_in_the_sent_prompt(
-        self,
-    ) -> None:
-        """`decision.canonical_id` names a parent absent from the slate.
+    async def test_the_prompt_does_not_favour_the_bands_winner(self) -> None:
+        """Whichever record the band ranked first, the model is shown the same thing.
 
-        Read off the prompt the fake provider was actually handed, not off a
-        patched renderer — what matters is what the model sees.
+        All three candidates sit inside the default window, so the selector's
+        winner rescue cannot change the slate between the two calls.
         """
-        child = _result(
-            'child-1', 0.60,
-            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
-        )
-        client = _openai_client(_payload('restates', 'm0'))
-        with patch('openai.AsyncOpenAI', return_value=client):
-            await judge_write(
-                memory_service=_judge_svc(),
-                content='c',
-                project_id='p',
-                decision=_decision('parent-1'),
-                candidates=[_result('m0', 0.90), _result('m1', 0.89), child],
-            )
-        prompt = self._sent_prompt(client)
-        marked = [line for line in prompt.splitlines() if 'attach_target:' in line]
-        assert marked == ['  attach_target: child-1'], prompt
-
-    @pytest.mark.asyncio
-    async def test_a_decision_naming_nothing_marks_nothing(self) -> None:
-        """A band decision with no canonical id must not mark an arbitrary row.
-
-        Marking `candidates[0]` "because something has to be the target" is
-        the exact defect: it would tell the model a record is the attach
-        target when nothing said so.
-        """
-        client = _openai_client(_payload('restates', 'm0'))
-        with patch('openai.AsyncOpenAI', return_value=client):
-            await judge_write(
-                memory_service=_judge_svc(),
-                content='c',
-                project_id='p',
-                decision=_decision(None),
-                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
-            )
-        prompt = self._sent_prompt(client)
-        assert [line for line in prompt.splitlines() if 'attach_target:' in line] == []
-
-    @pytest.mark.asyncio
-    async def test_the_selector_and_the_renderer_are_given_the_same_id(self) -> None:
-        """ONE expression for "the band's winner" on this path.
-
-        The selector guarantees the winner is present and the renderer marks
-        it; feeding them different ids would let the prompt mark a record the
-        selector never promised to keep, and neither call site would look
-        wrong on its own.
-        """
-        client = _openai_client(_payload('restates', 'm0'))
-        with (
-            patch('openai.AsyncOpenAI', return_value=client),
-            patch.object(
-                judge_module, 'select_judge_candidates',
-                wraps=judge_module.select_judge_candidates,
-            ) as selector,
-            patch.object(
-                judge_module, 'build_judge_prompt',
-                wraps=judge_module.build_judge_prompt,
-            ) as renderer,
-        ):
-            await judge_write(
-                memory_service=_judge_svc(),
-                content='c',
-                project_id='p',
-                decision=_decision('m1'),
-                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
-            )
-        assert selector.call_args.kwargs['canonical_id'] == 'm1'
-        assert renderer.call_args.kwargs['attach_target_id'] == 'm1'
-        assert (
-            renderer.call_args.kwargs['attach_target_id']
-            == selector.call_args.kwargs['canonical_id']
-        )
+        candidates = [_result('m0', 0.90), _result('m1', 0.89), _result('m2', 0.88)]
+        sent = []
+        for winner in ('m0', 'm2'):
+            client = _openai_client(_payload('restates', winner))
+            with patch('openai.AsyncOpenAI', return_value=client):
+                await judge_write(
+                    memory_service=_judge_svc(),
+                    content='c',
+                    project_id='p',
+                    decision=_decision(winner),
+                    candidates=candidates,
+                )
+            sent.append(client.chat.completions.create.call_args.kwargs['messages'][1]['content'])
+        assert sent[0] == sent[1]
 
 
 class TestJudgeWriteOpenAIArm:
