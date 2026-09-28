@@ -914,8 +914,8 @@ class TestFilenameShaped:
 
     def test_message_steers_a_file_existence_capability_to_kind_path(self, strand_repo):
         """Since task 4743 a file-existence capability has its own kind, so
-        the detective rule must name the prescriptive fix — including the
-        exact ``paths`` entry to write — not only the grep workaround."""
+        the detective rule must name the prescriptive fix, not only the grep
+        workaround."""
         findings = lint_delivered_checks(
             [
                 {
@@ -933,7 +933,7 @@ class TestFilenameShaped:
 
         message = findings[0].message
         assert "kind='path'" in message
-        assert "'orchestrator/tests/test_workflow_merge_gating_strand.py'" in message
+        assert 'creates' in message
 
     def test_no_content_match_and_no_path_match_is_healthy(self, strand_repo):
         """The CONTROL, and the reason this rule is narrow: an ordinary

@@ -72,9 +72,9 @@ THE PARITY CONTRACT. :func:`build_grep_argv` and :func:`interpret_grep_rc`
 are the SINGLE SOURCE OF TRUTH for grep-check semantics, as
 :func:`build_path_argv` and :func:`interpret_path_listing` are for
 path checks. ``orchestrator.delivered_checks._run_grep_check`` and
-``_run_path_check`` delegate to them, and that delegation is the point: the authoring gate and the runtime gate
-must agree exactly, or this module becomes a new source of the very
-defect it prevents. A check the lint judges healthy but the runtime later
+``_run_path_check`` delegate to them, and that delegation is the point:
+the authoring gate and the runtime gate must agree exactly, or this
+module becomes a new source of the very defect it prevents. A check the lint judges healthy but the runtime later
 fails still wedges a dependent; a check the lint rejects that the runtime
 would have accepted blocks legitimate planning. The semantics are
 non-obvious and easy to diverge on:
@@ -880,9 +880,10 @@ def _filename_shaped_finding(
 
     This is SCOPE item 3's detective option. Its prescriptive twin,
     ``kind='path'``, has since landed (task 4743), so the rejection names it
-    as the fix — with the tracked file(s) the pattern matched as the
-    ``paths`` to write — alongside the grep alternative of asserting a
-    symbol inside the file.
+    alongside the grep alternative of asserting a symbol inside the file.
+    It does not prefill ``paths`` with the matched files: at the authoring
+    tree those already exist, so a path check on them would itself be
+    rejected as ``vacuous_present``.
 
     ``re.search`` — Python's engine, not the POSIX ERE ``git grep -E`` uses
     — is deliberate and safe HERE and nowhere else in this module: the
@@ -910,10 +911,10 @@ def _filename_shaped_finding(
             f'content matches, but matches the FILENAME of a tracked path: '
             f'{", ".join(hits[:5])}. A grep check reads file CONTENTS, so this one '
             f'can never go green — the file existing is not something git grep can '
-            f"see. If the capability IS the file's existence, declare it as "
-            f"kind='path', expect='present', paths={hits[:5]!r}; otherwise assert a "
-            f'symbol defined INSIDE the file (a class, function or constant the '
-            f'producer adds).'
+            f"see. If the capability IS a file's existence, declare it as "
+            f"kind='path' with `paths` naming the file the producer creates; "
+            f'otherwise assert a symbol defined INSIDE the file (a class, function '
+            f'or constant the producer adds).'
         ),
         detail=tuple(hits[:5]),
     )
