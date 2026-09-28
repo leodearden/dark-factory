@@ -368,7 +368,9 @@ class MissingTranscript:
     Carries the identifying facts the escalation detail names so a human (or
     a follow-up probe) can locate the lost session: its registry slug, real
     ``cwd``, prompt prefix, ``start_ts``, exit code, and the encoded
-    ``~/.claude/projects/<enc>`` dir the transcript should have lived in.
+    ``~/.claude/projects/<enc>`` dir the transcript should have lived in. The
+    bound Claude Code session id, when present, names the exact file that was
+    expected: ``<expected_dir>/<id>.jsonl``.
     """
 
     session_slug: str
@@ -377,6 +379,7 @@ class MissingTranscript:
     start_ts: str
     exit_code: int | None
     expected_dir: Path
+    claude_session_id: str | None = None
 
 
 def find_missing_transcripts(
@@ -415,6 +418,7 @@ def find_missing_transcripts(
                 start_ts=record.start_ts,
                 exit_code=record.exit_code,
                 expected_dir=projects_root / inventory.encode_cwd(record.cwd),
+                claude_session_id=record.claude_session_id,
             )
         )
     return findings
@@ -498,10 +502,11 @@ def _build_escalation_arguments(
     labels the detector as the source since it is a timer-driven probe, not a
     Taskmaster task. The ``summary`` names the count of lost sessions; the
     ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
-    ``start_ts``, exit code, and prompt prefix) so a human can locate every
-    lost session. When *force_persistence_ok* is not ``None`` (the preventer
-    guard was evaluated), its verdict is appended — a MISSING preventer
-    strengthens the diagnosis (the known regression cause is present).
+    ``start_ts``, exit code, ``claude_session_id``, and prompt prefix) so a
+    human can locate every lost session. When *force_persistence_ok* is not
+    ``None`` (the preventer guard was evaluated), its verdict is appended — a
+    MISSING preventer strengthens the diagnosis (the known regression cause is
+    present).
     """
     count = len(findings)
     summary = (
@@ -512,20 +517,24 @@ def _build_escalation_arguments(
         f'{count} completed spawn-launched interactive session(s) in project '
         f'{cfg.project_id!r} produced no plausibly-matching transcript under '
         f'~/.claude/projects — the "session ran, no transcript" regression. '
-        f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / prompt):',
+        f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / '
+        f'claude_session_id / prompt):',
     ]
     for finding in findings:
         detail_lines.append(
             f'  - {finding.session_slug}  cwd={finding.cwd}  '
             f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
-            f'expected_dir={finding.expected_dir}  prompt={finding.prompt_prefix!r}'
+            f'expected_dir={finding.expected_dir}  '
+            f'claude_session_id={finding.claude_session_id}  '
+            f'prompt={finding.prompt_prefix!r}'
         )
     detail_lines.append(
-        'NOTE: matching is prompt-prefix containment (whitespace-normalized) in '
-        'a transcript first user turn under expected_dir. A session whose prompt '
-        'was expanded/rewritten before storage (e.g. a slash-command template, '
-        'where record.prompt holds the literal argv rather than the stored text) '
-        'is a known false-positive class — inspect expected_dir before acting.'
+        'NOTE: a record with a bound claude_session_id is matched exactly — '
+        '<expected_dir>/<claude_session_id>.jsonl must exist. An unbound record '
+        'falls back to prompt-prefix containment (whitespace-normalized) in a '
+        'transcript first user turn under expected_dir, with a slash-command '
+        'expansion de-expanded to its typed form, or to a file-mtime window when '
+        'the prompt is too short to match. Inspect expected_dir before acting.'
     )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'
