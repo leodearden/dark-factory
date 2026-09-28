@@ -247,8 +247,7 @@ def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
 class GrepCheckRef:
     """One ``kind: grep`` delivered_check, attributed back to its author.
 
-    The :class:`ScriptCheckRef` counterpart for the other mechanical check
-    kind (task 3500). Same attribution triple — sidecar, Greek-label task
+    The :class:`ScriptCheckRef` counterpart for the grep kind (task 3500). Same attribution triple — sidecar, Greek-label task
     block, capability — plus the three fields that make the descriptor
     re-evaluable: the ERE ``pattern`` verbatim, the ``expect`` polarity, and
     the ``paths`` pathspecs.

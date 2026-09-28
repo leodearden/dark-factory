@@ -24,6 +24,10 @@ the whole classification into a single measured predicate:
     no match at HEAD  healthy          REJECT
     ================  ===============  ==============
 
+The rule is about POLARITY, so it covers every kind that carries an
+``expect``: ``grep`` (does the pattern match) and ``path`` (does every
+listed path exist). ``script`` has no ``expect`` and is not linted.
+
 That subsumes the three fold-in modes (esc-4545-2) without parsing
 English or guessing at author intent from the check's NAME:
 
@@ -38,7 +42,8 @@ English or guessing at author intent from the check's NAME:
     matches are FILENAMES rather than file contents (a test module that
     never mentions its own name). Invisible to the vacuity rule (at
     authoring time the file does not exist yet, so nothing matches and
-    the check looks healthy), so it gets its own structural rule.
+    the check looks healthy), so it gets its own structural rule, whose
+    remedy is the ``kind='path'`` check that says what was meant.
 
 Comment-only and self-referential matches are not separate gates: at
 authoring time they are sub-species of "a check that already matches",
@@ -64,9 +69,10 @@ forward-looking check on a pending one", rather than reusing this
 predicate. Filed as esc-3500-1.
 
 THE PARITY CONTRACT. :func:`build_grep_argv` and :func:`interpret_grep_rc`
-are the SINGLE SOURCE OF TRUTH for grep-check semantics.
-``orchestrator.delivered_checks._run_grep_check`` delegates to them, and
-that delegation is the point: the authoring gate and the runtime gate
+are the SINGLE SOURCE OF TRUTH for grep-check semantics, as
+:func:`build_path_argv` and :func:`interpret_path_listing` are for
+path checks. ``orchestrator.delivered_checks._run_grep_check`` and
+``_run_path_check`` delegate to them, and that delegation is the point: the authoring gate and the runtime gate
 must agree exactly, or this module becomes a new source of the very
 defect it prevents. A check the lint judges healthy but the runtime later
 fails still wedges a dependent; a check the lint rejects that the runtime
@@ -88,7 +94,7 @@ non-obvious and easy to diverge on:
     ordinary healthy FAIL at the authoring tree, not as a reported
     ERRORED, so the gate stays quiet on the majority case.
 
-One builder plus one interpreter makes divergence structurally
+One builder plus one interpreter per kind makes divergence structurally
 impossible.
 
 NEVER RAISES. :func:`lint_delivered_checks` returns findings for any
@@ -114,7 +120,7 @@ import json
 import logging
 import re
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -124,21 +130,25 @@ __all__ = [
     'CheckFinding',
     'CheckOutcome',
     'build_grep_argv',
+    'build_path_argv',
     'evaluate_grep_at_tree',
+    'evaluate_path_at_tree',
     'extract_delivered_checks',
     'interpret_grep_rc',
+    'interpret_path_listing',
     'lint_delivered_checks',
     'polarity_error',
 ]
 
 logger = logging.getLogger(__name__)
 
-#: Wall-clock ceiling for ONE authoring-time ``git grep``. Generous
-#: relative to a real grep (milliseconds on this repo) because exceeding it
-#: is not a verdict — it degrades to ``ERRORED``, which is REPORTED rather
-#: than blocking, so a slow disk delays a commit_planning call instead of
-#: rejecting a healthy batch.
-GREP_TIMEOUT_SECS: float = 30.0
+#: Wall-clock ceiling for ONE authoring-time git probe (``grep``,
+#: ``ls-tree``, ``ls-files``). Generous relative to a real probe
+#: (milliseconds on this repo) because exceeding it is not a verdict — it
+#: degrades to ``ERRORED``, which is REPORTED rather than blocking, so a
+#: slow disk delays a commit_planning call instead of rejecting a healthy
+#: batch.
+GIT_TIMEOUT_SECS: float = 30.0
 
 
 class CheckOutcome(Enum):
@@ -208,6 +218,54 @@ def interpret_grep_rc(rc: int, expect: str | None) -> CheckOutcome:
     return CheckOutcome.PASS if holds else CheckOutcome.FAIL
 
 
+def build_path_argv(path: str, *, project_root: str | Path, ref: str) -> list[str]:
+    """``['git','-C',<root>,'ls-tree','-r','--full-tree','--name-only',<ref>,'--',<path>]``.
+
+    ONE path per probe: ``ls-tree`` answers with a flat filename list that
+    cannot be attributed back to the pathspec that produced it without an
+    ad-hoc parser over git output, so a multi-path check is one probe per
+    entry. ``--full-tree`` makes the pathspec repo-root-relative whatever
+    the subprocess cwd, matching the repo-relative ``paths`` the schema
+    validator enforces for this kind.
+    """
+    return [
+        'git',
+        '-C',
+        str(project_root),
+        'ls-tree',
+        '-r',
+        '--full-tree',
+        '--name-only',
+        ref,
+        '--',
+        path,
+    ]
+
+
+def interpret_path_listing(rc: int, stdout: str, expect: str | None) -> CheckOutcome:
+    """Map one ``ls-tree`` probe + expected polarity to a verdict.
+
+    EXISTENCE IS READ FROM STDOUT, NOT FROM THE RETURN CODE — the opposite
+    of :func:`interpret_grep_rc`, and the one thing that must not be carried
+    across by analogy. ``ls-tree`` exits 0 whether or not the path exists; a
+    missing path simply prints nothing. Reading ``rc == 0`` as "exists"
+    would make every path check green.
+
+    A non-zero rc is a genuine git error (a bad ref, or a pathspec outside
+    the repository, both exit 128) and is checked FIRST: git prints nothing
+    on an error and nothing on an absent path, so reading stdout first would
+    turn "could not be evaluated" into a definitive verdict.
+
+    Any non-``'present'`` *expect* takes the absent arm, exactly as
+    :func:`interpret_grep_rc` does.
+    """
+    if rc != 0:
+        return CheckOutcome.ERRORED
+    exists = bool(stdout.strip())
+    holds = exists if expect == 'present' else not exists
+    return CheckOutcome.PASS if holds else CheckOutcome.FAIL
+
+
 # ---------------------------------------------------------------------------
 # The non-vacuity rule
 # ---------------------------------------------------------------------------
@@ -256,7 +314,7 @@ def evaluate_grep_at_tree(
     expect: str | None,
     repo_root: str | Path,
     ref: str = 'HEAD',
-    timeout_secs: float = GREP_TIMEOUT_SECS,
+    timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> CheckOutcome:
     """Run one grep check against *ref* in *repo_root*. Never raises.
 
@@ -292,6 +350,37 @@ def evaluate_grep_at_tree(
     except (OSError, subprocess.SubprocessError):
         return CheckOutcome.ERRORED
     return interpret_grep_rc(completed.returncode, expect)
+
+
+def evaluate_path_at_tree(
+    paths: Sequence[str],
+    *,
+    expect: str | None,
+    repo_root: str | Path,
+    ref: str = 'HEAD',
+    timeout_secs: float = GIT_TIMEOUT_SECS,
+) -> CheckOutcome:
+    """Run one path check against *ref* in *repo_root*. Never raises.
+
+    The synchronous twin of ``orchestrator.delivered_checks._run_path_check``
+    and, like :func:`evaluate_grep_at_tree`, nothing but the shared builder,
+    ``subprocess.run`` and the shared interpreter. CONJUNCTIVE and
+    short-circuiting, as the runtime is: every path must hold, and the first
+    probe that does not decides the outcome — ``ERRORED`` included, so an
+    unevaluable probe is never outvoted by the paths after it.
+    """
+    for path in paths:
+        argv = build_path_argv(path, project_root=repo_root, ref=ref)
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout_secs
+            )
+        except (OSError, subprocess.SubprocessError):
+            return CheckOutcome.ERRORED
+        outcome = interpret_path_listing(completed.returncode, completed.stdout, expect)
+        if outcome is not CheckOutcome.PASS:
+            return outcome
+    return CheckOutcome.PASS
 
 
 #: The invariant, in the author's terms. Appended to every rejection so the
@@ -359,10 +448,10 @@ def lint_delivered_checks(
     declared ``metadata.files``, used by the refinements to tell a match
     inside the task's own scope from one outside it.
 
-    Only ``kind == 'grep'`` is evaluated: the 2x2 is a statement about grep
-    POLARITY, and a script check has no ``expect`` to invert. That
-    short-circuit is deliberately BEFORE any subprocess, so a script-only
-    batch costs nothing.
+    The 2x2 is a statement about POLARITY, so it evaluates the kinds that
+    carry an ``expect`` — ``grep`` and ``path``. A script check has none to
+    invert and is skipped BEFORE any subprocess, so a script-only batch
+    costs nothing.
     """
     findings: list[CheckFinding] = []
     for check in checks:
@@ -379,31 +468,50 @@ def _lint_one_check(
     repo_root: str | Path,
     ref: str,
 ) -> CheckFinding | None:
-    """The 2x2 for one check. ``None`` means healthy (or not our business).
+    """Route one check to its kind's 2x2. ``None`` means healthy (or not
+    our business).
 
     *check* is typed ``Any`` because it is a RAW metadata dict off the
     wire, not a validated ``DeliveredCheckMeta`` — the lint runs at
     authoring time precisely to catch entries a schema check cannot. Every
-    field is therefore re-checked here rather than trusted.
+    field is therefore re-checked rather than trusted.
 
-    The three skip guards below all run BEFORE any subprocess:
+    Both skip guards here run BEFORE any subprocess:
 
-    * ``kind != 'grep'`` — the 2x2 is a statement about grep POLARITY, and
-      a script check has no ``expect`` to invert. A script-only batch must
-      cost nothing.
     * no usable ``name`` — a finding is addressed to a check BY NAME;
       without one there is nothing a caller could report or an author could
       fix, so reporting it under a name that does not exist would be worse
       than skipping.
-    * no usable ``pattern`` — a grep check without one is a SCHEMA defect,
-      not a polarity defect, and there is nothing to grep for. The metadata
-      validator owns that diagnosis.
+    * a kind with no entry in :data:`_POLARITY_LINTERS` — ``script`` (no
+      ``expect`` to invert; a script-only batch must cost nothing), or a
+      kind the schema does not know at all.
     """
-    if not isinstance(check, dict) or check.get('kind') != 'grep':
+    if not isinstance(check, dict):
         return None
     name = check.get('name')
     if not isinstance(name, str) or not name:
         return None
+    kind = check.get('kind')
+    linter = _POLARITY_LINTERS.get(kind) if isinstance(kind, str) else None
+    if linter is None:
+        return None
+    return linter(check, name=name, files=files, repo_root=repo_root, ref=ref)
+
+
+def _lint_grep_check(
+    check: dict[str, Any],
+    *,
+    name: str,
+    files: Sequence[str] | None,
+    repo_root: str | Path,
+    ref: str,
+) -> CheckFinding | None:
+    """The 2x2 for a ``kind='grep'`` check, plus the two rules it cannot see.
+
+    A grep check without a usable ``pattern`` is a SCHEMA defect, not a
+    polarity defect, and there is nothing to grep for; the metadata
+    validator owns that diagnosis, so it is skipped before any subprocess.
+    """
     pattern = check.get('pattern')
     if not isinstance(pattern, str) or not pattern:
         return None
@@ -487,6 +595,76 @@ def _lint_one_check(
     return None
 
 
+def _vacuous_path_message(name: str, paths: Sequence[str], expect: str | None, ref: str) -> str:
+    if expect == 'present':
+        return (
+            f"delivered_check {name!r} (kind='path', expect=present, paths {list(paths)!r}) "
+            f'— every listed path ALREADY exists at the authoring tree at {ref}, so '
+            f'landing this task cannot change its verdict: it is green the day it is '
+            f'written and therefore gates nothing. {_INVARIANT} List a path this task '
+            f'will CREATE — or, if this task DELETES it, flip the check to expect=absent.'
+        )
+    return (
+        f"delivered_check {name!r} (kind='path', expect=absent, paths {list(paths)!r}) "
+        f'— none of the listed paths exists at the authoring tree at {ref}: there is '
+        f'nothing left for this task to delete, so the check is green the day it is '
+        f'written and therefore gates nothing. {_INVARIANT} List a path this task will '
+        f'actually DELETE — or, if this task CREATES it, flip the check to expect=present.'
+    )
+
+
+def _lint_path_check(
+    check: dict[str, Any],
+    *,
+    name: str,
+    files: Sequence[str] | None,
+    repo_root: str | Path,
+    ref: str,
+) -> CheckFinding | None:
+    """The 2x2 for a ``kind='path'`` check, read as existence.
+
+    "Matches the authoring tree" means every listed path already exists
+    there — the runtime's own conjunctive reading, reached through the same
+    primitive. The grep-only refinements and rules do not apply: a path has
+    no comment lines, no self-matching ``pattern:`` line, and nothing to
+    confuse with a filename. A check without a usable ``paths`` entry is a
+    SCHEMA defect the metadata validator owns, skipped before any
+    subprocess.
+    """
+    paths = _strings_only(check.get('paths'))
+    if not paths:
+        return None
+    expect = check.get('expect')
+    outcome = evaluate_path_at_tree(paths, expect=expect, repo_root=repo_root, ref=ref)
+    if outcome is CheckOutcome.ERRORED:
+        return CheckFinding(
+            check_name=name,
+            severity='errored',
+            code='unevaluable',
+            message=_unevaluable_message(name, ref, repo_root),
+        )
+    if outcome is CheckOutcome.FAIL:
+        return None
+    return CheckFinding(
+        check_name=name,
+        severity='reject',
+        code='vacuous_present' if expect == 'present' else 'vacuous_absent',
+        message=_vacuous_path_message(name, paths, expect, ref),
+        detail=tuple(paths),
+    )
+
+
+#: The kinds the 2x2 evaluates: exactly the mechanical kinds that carry an
+#: ``expect`` (``shared.capability_manifest`` forbids one on ``script``).
+#: ``shared/tests/test_delivered_check_polarity.py::TestEveryPolarityKindIsLinted``
+#: holds this against ``MECHANICAL_CHECK_KINDS`` so a new kind cannot be
+#: added to the schema and silently skipped here.
+_POLARITY_LINTERS: dict[str, Callable[..., CheckFinding | None]] = {
+    'grep': _lint_grep_check,
+    'path': _lint_path_check,
+}
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
@@ -519,7 +697,7 @@ def _grep_matches(
     *,
     repo_root: str | Path,
     ref: str,
-    timeout_secs: float = GREP_TIMEOUT_SECS,
+    timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> list[_GrepMatch] | None:
     """The match SITES for a check. ``None`` means git could not answer.
 
@@ -565,7 +743,7 @@ def _tracked_paths(
     paths: Sequence[str] | None,
     *,
     repo_root: str | Path,
-    timeout_secs: float = GREP_TIMEOUT_SECS,
+    timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> list[str] | None:
     """Tracked paths under *paths* (whole tree when empty). ``None`` on any
     git failure — same never-guess contract as :func:`_grep_matches`."""
@@ -700,13 +878,11 @@ def _filename_shaped_finding(
     mention its own name (the measured task-3536 specimen,
     ``test_workflow_merge_gating_strand``).
 
-    This is SCOPE item 3's SECOND sanctioned option — "reject a kind=grep
-    expect=present pattern whose only repo matches are FILENAMES rather than
-    file contents" — taken in preference to its first, adding a
-    ``kind='path'`` check kind, whose blast radius spans
-    ``DeliveredCheck``/``DeliveredCheckMeta``'s closed ``kind`` Literals and
-    every hard-coded mechanical-kind tuple in the fleet (design decision
-    #4). ``kind='path'`` is filed as the follow-up.
+    This is SCOPE item 3's detective option. Its prescriptive twin,
+    ``kind='path'``, has since landed (task 4743), so the rejection names it
+    as the fix — with the tracked file(s) the pattern matched as the
+    ``paths`` to write — alongside the grep alternative of asserting a
+    symbol inside the file.
 
     ``re.search`` — Python's engine, not the POSIX ERE ``git grep -E`` uses
     — is deliberate and safe HERE and nowhere else in this module: the
@@ -734,8 +910,10 @@ def _filename_shaped_finding(
             f'content matches, but matches the FILENAME of a tracked path: '
             f'{", ".join(hits[:5])}. A grep check reads file CONTENTS, so this one '
             f'can never go green — the file existing is not something git grep can '
-            f'see. Assert a symbol defined INSIDE the file instead (a class, '
-            f'function or constant the producer adds).'
+            f"see. If the capability IS the file's existence, declare it as "
+            f"kind='path', expect='present', paths={hits[:5]!r}; otherwise assert a "
+            f'symbol defined INSIDE the file (a class, function or constant the '
+            f'producer adds).'
         ),
         detail=tuple(hits[:5]),
     )
@@ -852,7 +1030,9 @@ _POLARITY_HINT = (
     'producer introduces (kind=grep, expect=present, pattern = a class, '
     'function or constant that does not exist yet), scoped with `paths` to the '
     'files this task actually writes. That is the shape every measured repair '
-    'took, and it is the only shape the gate can observe going green. '
+    'took, and it is the only shape the gate can observe going green. When the '
+    "capability IS a file's existence, use kind='path' with `paths` naming the "
+    'file(s) this task creates (expect=present) or deletes (expect=absent). '
     'The invariant: a sound delivered_check FAILS at the authoring tree and '
     'PASSES once its producer lands. A check that is already green the day it '
     'is written can never signal anything — it gates nothing, and its dependent '

@@ -735,6 +735,39 @@ class TestAuthoringDefectIsDistinguishable:
         )
 
     @pytest.mark.asyncio
+    async def test_an_unmet_path_check_escalates_undiagnosed(self, tmp_path: Path) -> None:
+        """A kind='path' check (task 4743) reaching the diagnosis consumer.
+
+        Its escalation detail carries no ``pattern:`` line, and no
+        reject-tier rule fires on a path check that FAILED (the vacuous codes
+        fire only on one that passes), so the right outcome is the plain
+        escalation — filed, critical, dependent blocked — with no diagnosis
+        and no crash."""
+        harness, session = _drive_to_l2(
+            tmp_path / 'path-kind', tmp_path / 'esc',
+            marker_rel_path=_UNDELIVERED_REL_PATH,
+            check={
+                'name': 'row3500_path_cap',
+                'kind': 'path',
+                'expect': 'present',
+                'paths': ['src/row3500_never_created.py'],
+            },
+            producer_id='P3500E', dependent_id='D3500E',
+        )
+        escs = await _tick_through_grace(harness, 'D3500E')
+
+        assert len(escs) == 1, escs
+        esc = escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+        assert esc.level == 2 and esc.severity == 'critical'
+        assert 'src/row3500_never_created.py' in esc.detail, esc.detail
+        assert 'AUTHORING DIAGNOSIS' not in esc.detail, esc.detail
+        status = next(
+            (t['status'] for t in session.tasks if str(t.get('id')) == 'D3500E'), None,
+        )
+        assert status == 'blocked'
+
+    @pytest.mark.asyncio
     async def test_a_raising_lint_never_costs_the_escalation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

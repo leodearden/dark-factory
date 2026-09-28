@@ -31,14 +31,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
+from shared.capability_manifest import MECHANICAL_CHECK_KINDS, DeliveredCheckMeta
 from shared.delivered_check_polarity import (
     CheckFinding,
     CheckOutcome,
     build_grep_argv,
+    build_path_argv,
     evaluate_grep_at_tree,
+    evaluate_path_at_tree,
     extract_delivered_checks,
     interpret_grep_rc,
+    interpret_path_listing,
     lint_delivered_checks,
     polarity_error,
 )
@@ -907,6 +912,29 @@ class TestFilenameShaped:
         assert 'inside' in message
         assert 'filename' in message or 'path' in message
 
+    def test_message_steers_a_file_existence_capability_to_kind_path(self, strand_repo):
+        """Since task 4743 a file-existence capability has its own kind, so
+        the detective rule must name the prescriptive fix — including the
+        exact ``paths`` entry to write — not only the grep workaround."""
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'gating-strand',
+                    'kind': 'grep',
+                    'pattern': 'test_workflow_merge_gating_strand',
+                    'expect': 'present',
+                    'paths': ['orchestrator/tests'],
+                }
+            ],
+            files=['orchestrator/tests'],
+            repo_root=strand_repo,
+            ref='HEAD',
+        )
+
+        message = findings[0].message
+        assert "kind='path'" in message
+        assert "'orchestrator/tests/test_workflow_merge_gating_strand.py'" in message
+
     def test_no_content_match_and_no_path_match_is_healthy(self, strand_repo):
         """The CONTROL, and the reason this rule is narrow: an ordinary
         forward-looking check has zero content matches too. Only the PATH
@@ -1208,6 +1236,11 @@ class TestPolarityError:
         assert 'new symbol' in hint.lower()
         assert 'expect=present' in hint
 
+    def test_hint_names_kind_path_for_a_file_existence_capability(self):
+        hint = polarity_error([_reject('cap-a')], task_id='3500')['hint']
+
+        assert "kind='path'" in hint
+
     def test_hint_states_the_invariant(self):
         hint = polarity_error([_reject('cap-a')], task_id='3500')['hint'].lower()
 
@@ -1341,3 +1374,261 @@ class TestLintImmunity:
         )
 
         assert [f.check_name for f in findings] == ['gen']
+
+
+# ---------------------------------------------------------------------------
+# kind='path' — the second kind that carries an ``expect`` (task 4743)
+# ---------------------------------------------------------------------------
+
+
+def _path_check(**overrides: object) -> dict[str, object]:
+    """A well-formed ``metadata.delivered_checks`` path entry.
+
+    Against :data:`_SEED_TREE`, ``src/producer.py`` exists and
+    ``src/new_module.py`` does not.
+    """
+    check: dict[str, object] = {
+        'name': 'cap',
+        'kind': 'path',
+        'expect': 'present',
+        'paths': ['src/producer.py'],
+    }
+    check.update(overrides)
+    return check
+
+
+class TestBuildPathArgv:
+    """The argv ``orchestrator/tests/test_delivered_check_gate.py::TestRunnerPathKind``
+    pins through ``run_delivered_check`` — mirrored here byte for byte."""
+
+    def test_argv_is_one_ls_tree_probe_for_one_path(self):
+        assert build_path_argv('a/one.py', project_root='/proj', ref='main') == [
+            'git',
+            '-C',
+            '/proj',
+            'ls-tree',
+            '-r',
+            '--full-tree',
+            '--name-only',
+            'main',
+            '--',
+            'a/one.py',
+        ]
+
+    def test_project_root_is_stringified(self):
+        assert build_path_argv('a', project_root=Path('/proj'), ref='HEAD')[2] == '/proj'
+
+
+class TestInterpretPathListing:
+    """``ls-tree`` exits 0 whether or not the path exists, so existence is
+    read from STDOUT and rc separates an answer from a git error."""
+
+    @pytest.mark.parametrize('expect', ['present', 'absent', None])
+    @pytest.mark.parametrize('stdout', ['', 'a/one.py\n'])
+    def test_nonzero_rc_is_errored_whatever_stdout_says(self, expect, stdout):
+        assert interpret_path_listing(128, stdout, expect) is CheckOutcome.ERRORED
+
+    @pytest.mark.parametrize(
+        ('expect', 'stdout', 'expected'),
+        [
+            ('present', 'a/one.py\n', CheckOutcome.PASS),
+            ('present', '', CheckOutcome.FAIL),
+            ('present', '   \n', CheckOutcome.FAIL),
+            ('absent', '', CheckOutcome.PASS),
+            ('absent', 'a/one.py\n', CheckOutcome.FAIL),
+            ('absent', '   \n', CheckOutcome.PASS),
+            (None, '', CheckOutcome.PASS),
+        ],
+    )
+    def test_rc_zero_reads_existence_from_stdout(self, expect, stdout, expected):
+        assert interpret_path_listing(0, stdout, expect) is expected
+
+
+class TestEvaluatePathAtTree:
+    """The shared primitive against a real tree: conjunctive over ``paths``,
+    exactly as ``orchestrator.delivered_checks._run_path_check`` is."""
+
+    @pytest.mark.parametrize(
+        ('expect', 'paths', 'expected'),
+        [
+            ('present', ['src/producer.py'], CheckOutcome.PASS),
+            ('present', ['src/new_module.py'], CheckOutcome.FAIL),
+            ('absent', ['src/new_module.py'], CheckOutcome.PASS),
+            ('absent', ['src/producer.py'], CheckOutcome.FAIL),
+            ('present', ['src'], CheckOutcome.PASS),
+        ],
+    )
+    def test_single_path_cells(self, authoring_repo, expect, paths, expected):
+        outcome = evaluate_path_at_tree(
+            paths, expect=expect, repo_root=authoring_repo, ref='HEAD'
+        )
+
+        assert outcome is expected
+
+    def test_present_is_conjunctive(self, authoring_repo):
+        outcome = evaluate_path_at_tree(
+            ['src/producer.py', 'src/new_module.py'],
+            expect='present',
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert outcome is CheckOutcome.FAIL
+
+    def test_non_repo_root_is_errored_not_a_verdict(self, tmp_path):
+        outcome = evaluate_path_at_tree(
+            ['src/producer.py'], expect='absent', repo_root=tmp_path, ref='HEAD'
+        )
+
+        assert outcome is CheckOutcome.ERRORED
+
+    def test_unresolvable_ref_is_errored(self, authoring_repo):
+        outcome = evaluate_path_at_tree(
+            ['src/new_module.py'],
+            expect='absent',
+            repo_root=authoring_repo,
+            ref='no-such-ref',
+        )
+
+        assert outcome is CheckOutcome.ERRORED
+
+
+class TestNonVacuityRulePathKind:
+    """The same 2x2, read as existence: "matches the authoring tree" means
+    every listed path already exists there."""
+
+    def test_present_path_that_already_exists_is_rejected_as_vacuous(self, authoring_repo):
+        findings = lint_delivered_checks(
+            [_path_check(name='producer-file')],
+            files=['src/producer.py'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert [(f.check_name, f.severity, f.code) for f in findings] == [
+            ('producer-file', 'reject', 'vacuous_present')
+        ]
+        message = findings[0].message
+        assert "kind='path'" in message
+        assert 'src/producer.py' in message
+        assert 'already' in message.lower()
+
+    def test_present_path_the_task_will_create_is_healthy(self, authoring_repo):
+        findings = lint_delivered_checks(
+            [_path_check(paths=['src/new_module.py'])],
+            files=['src/new_module.py'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
+    def test_present_with_one_path_still_missing_is_healthy(self, authoring_repo):
+        """Conjunctive: the check stays red until the missing path lands, so
+        it still observes the task's change."""
+        findings = lint_delivered_checks(
+            [_path_check(paths=['src/producer.py', 'src/new_module.py'])],
+            files=['src'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
+    def test_absent_path_the_task_will_delete_is_healthy(self, authoring_repo):
+        findings = lint_delivered_checks(
+            [_path_check(expect='absent')],
+            files=['src/producer.py'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
+    def test_absent_path_that_is_already_gone_is_rejected_as_vacuous(self, authoring_repo):
+        findings = lint_delivered_checks(
+            [_path_check(expect='absent', paths=['src/new_module.py'])],
+            files=['src/new_module.py'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('reject', 'vacuous_absent')]
+        assert "kind='path'" in findings[0].message
+
+    def test_unevaluable_path_check_is_errored_not_rejected(self, tmp_path):
+        findings = lint_delivered_checks(
+            [_path_check()], files=[], repo_root=tmp_path, ref='HEAD'
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('errored', 'unevaluable')]
+
+    @pytest.mark.parametrize('paths', [None, [], 'src/producer.py', [42, None]])
+    def test_no_usable_paths_is_skipped_before_any_git_call(self, authoring_repo, paths):
+        """A path check without a usable entry is a SCHEMA defect the metadata
+        validator owns; there is nothing to probe."""
+        with patch(
+            'shared.delivered_check_polarity.subprocess.run',
+            side_effect=AssertionError('lint must not shell out without a path'),
+        ):
+            findings = lint_delivered_checks(
+                [_path_check(paths=paths)], files=[], repo_root=authoring_repo
+            )
+
+        assert findings == []
+
+    @pytest.mark.parametrize('kind', [['path'], {'k': 'path'}, 7, None])
+    def test_an_unhashable_or_non_string_kind_never_raises(self, authoring_repo, kind):
+        findings = lint_delivered_checks(
+            [_path_check(kind=kind)], files=[], repo_root=authoring_repo
+        )
+
+        assert findings == []
+
+
+class TestEveryPolarityKindIsLinted:
+    """Every mechanical kind that carries an ``expect`` is evaluated by the
+    2x2 — a new one added to the schema must be wired here, not skipped.
+
+    The kind vocabulary is read from
+    :data:`shared.capability_manifest.MECHANICAL_CHECK_KINDS`, its single
+    home; the only kind exempted is one the schema itself forbids an
+    ``expect`` on, which the last test measures rather than asserts.
+    """
+
+    _VACUOUS_AT_SEED_TREE = {
+        'grep': _grep_check(),
+        'path': _path_check(),
+    }
+    _NO_EXPECT_KINDS = frozenset({'script'})
+
+    def test_the_two_tables_partition_the_mechanical_vocabulary(self):
+        linted = set(self._VACUOUS_AT_SEED_TREE)
+        assert linted.isdisjoint(self._NO_EXPECT_KINDS)
+        assert linted | self._NO_EXPECT_KINDS == set(MECHANICAL_CHECK_KINDS)
+
+    @pytest.mark.parametrize('kind', sorted(_VACUOUS_AT_SEED_TREE))
+    def test_a_vacuous_descriptor_of_every_polarity_kind_is_rejected(
+        self, authoring_repo, kind
+    ):
+        findings = lint_delivered_checks(
+            [self._VACUOUS_AT_SEED_TREE[kind]],
+            files=['src/producer.py'],
+            repo_root=authoring_repo,
+            ref='HEAD',
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('reject', 'vacuous_present')]
+
+    @pytest.mark.parametrize('kind', sorted(_NO_EXPECT_KINDS))
+    def test_an_exempt_kind_really_cannot_carry_an_expect(self, kind):
+        with pytest.raises(ValidationError, match='expect must not be set'):
+            DeliveredCheckMeta.model_validate(
+                {
+                    'name': 'cap',
+                    'kind': kind,
+                    'script': 'scripts/x.sh',
+                    'timeout_secs': 5,
+                    'expect': 'present',
+                }
+            )

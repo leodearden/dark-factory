@@ -208,10 +208,11 @@ class DeliveredCheck(_CheckFieldsBase):
 
     WHAT THIS SCHEMA CANNOT EXPRESS. Validity here is purely structural:
     every field a ``kind`` requires is present and well-typed. It cannot say
-    whether the descriptor will ever CHANGE VERDICT — a ``kind='grep'``
-    ``expect='present'`` pattern that already matches, or one that names a
-    FILE rather than a symbol inside it, is perfectly schema-valid and can
-    never go green, so it wedges whatever depends on it. Those rules are
+    whether the descriptor will ever CHANGE VERDICT — an ``expect='present'``
+    grep pattern that already matches, or a ``'path'`` that already exists,
+    is green the day it is written and gates nothing, and a grep pattern
+    that names a FILE rather than a symbol inside it can never go green and
+    wedges whatever depends on it. All are schema-valid. Those rules are
     tree-relative rather than field-relative, so they live in
     :mod:`shared.delivered_check_polarity`, which ``commit_planning`` and
     ``stamp_capability_manifests`` run at authoring time (task 3500). Authors

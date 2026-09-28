@@ -179,7 +179,31 @@ def _write_sidecar(
     paths: list[str],
 ) -> Path:
     """Write a capability-manifest sidecar (α schema) with ONE grep-kind
-    capability for *label*, derived strictly the same way
+    capability for *label* — see :func:`_write_sidecar_with_check`."""
+    return _write_sidecar_with_check(
+        project_root,
+        prd_path=prd_path,
+        label=label,
+        capability_name=capability_name,
+        delivered_check={
+            'kind': 'grep',
+            'pattern': pattern,
+            'expect': 'present',
+            'paths': paths,
+        },
+    )
+
+
+def _write_sidecar_with_check(
+    project_root: Path,
+    *,
+    prd_path: str,
+    label: str,
+    capability_name: str,
+    delivered_check: dict,
+) -> Path:
+    """Write a capability-manifest sidecar (α schema) with ONE capability for
+    *label* carrying *delivered_check*, derived strictly the same way
     ``stamp_capability_manifests`` derives it: ``re.sub(r'\\.md$', '', prd_path)
     + '.capability-manifest.yaml'``."""
     sidecar_rel = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
@@ -198,12 +222,7 @@ def _write_sidecar(
                         'name': capability_name,
                         'binding': 'grep for the capability token',
                         'verdict': 'PASS',
-                        'delivered_check': {
-                            'kind': 'grep',
-                            'pattern': pattern,
-                            'expect': 'present',
-                            'paths': paths,
-                        },
+                        'delivered_check': delivered_check,
                     },
                 ],
             },
@@ -931,6 +950,74 @@ class TestPolarityRefusal:
             f"a refused check must never be persisted; got "
             f"{producer_task['metadata']!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_vacuous_path_capability_is_refused(self, backend_stack):
+        """kind='path' (task 4743) through the same arc: the stamper copies
+        every mechanical kind, so the lint must judge this one too — a path
+        that already exists at the authoring tree gates nothing."""
+        server, _interceptor, project_root = backend_stack
+
+        _commit_capability(project_root, _MARKER_REL_PATH, _ALREADY_LANDED_TOKEN)
+        _write_sidecar_with_check(
+            project_root,
+            prd_path=_INVERTED_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name='existing_file_cap',
+            delivered_check={
+                'kind': 'path',
+                'expect': 'present',
+                'paths': [_MARKER_REL_PATH],
+            },
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_INVERTED_PRD_PATH,
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        joined = ' '.join(result['manifest_stamping']['errors'])
+        assert 'existing_file_cap' in joined, joined
+        assert 'vacuous_present' in joined, joined
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f"a refused check must never be persisted; got "
+            f"{producer_task['metadata']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_forward_looking_path_capability_is_copied(self, backend_stack):
+        """Control: a path the producer has yet to create is the healthy
+        cell, and reaches metadata exactly as authored."""
+        server, _interceptor, project_root = backend_stack
+
+        _write_sidecar_with_check(
+            project_root,
+            prd_path=_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name='new_file_cap',
+            delivered_check={
+                'kind': 'path',
+                'expect': 'present',
+                'paths': ['src/not_created_yet.py'],
+            },
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_PRD_PATH,
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        assert result['manifest_stamping']['errors'] == []
+        producer_task = await _get_task(server, project_root, producer_id)
+        checks = producer_task['metadata']['delivered_checks']
+        assert [
+            (c['name'], c['kind'], c['expect'], c['paths']) for c in checks
+        ] == [('new_file_cap', 'path', 'present', ['src/not_created_yet.py'])]
 
     @pytest.mark.asyncio
     async def test_forward_looking_capability_keeps_the_exact_legacy_report(

@@ -41,7 +41,13 @@ from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
-from shared.delivered_check_polarity import CheckOutcome, build_grep_argv, interpret_grep_rc
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    build_grep_argv,
+    build_path_argv,
+    interpret_grep_rc,
+    interpret_path_listing,
+)
 
 from orchestrator import git_ops
 
@@ -203,64 +209,29 @@ async def _run_path_check(
     ref: str,
     runner: _Runner,
 ) -> DeliveredCheckResult:
-    """``git -C <project_root> ls-tree -r --full-tree --name-only <ref> -- <path>``,
-    once per entry in ``meta.paths``.
+    """One ``git ls-tree`` probe per entry in ``meta.paths``.
 
-    EXISTENCE IS READ FROM STDOUT, NOT FROM THE RETURN CODE — the opposite
-    of :func:`_run_grep_check`, and the one thing that must not be carried
-    across by analogy. ``git grep`` answers through rc (0=match, 1=no
-    match), but ``ls-tree`` exits 0 either way: a MISSING path prints
-    nothing, an existing path prints its name. Reading ``rc == 0`` here
-    would make every path check report DELIVERED — a universal false green
-    on a dispatch gate.
-
-    A non-zero rc is reserved for genuine git errors (a bad ref and a
-    pathspec outside the repository both exit 128) and returns ERRORED
-    immediately, before stdout is interpreted and without probing any
-    further path. That ordering matters: git prints nothing on an error and
-    nothing on an absent path, so reading stdout first would report a
-    definitive FAILED for a check that could not be evaluated at all.
-
-    ``--full-tree`` makes the pathspec repo-root-relative regardless of the
-    subprocess cwd, matching the repo-relative ``paths`` invariant the
-    schema validator enforces.
+    The probe's argv and its reading — existence from STDOUT, with a
+    non-zero rc checked FIRST as ERRORED — live in
+    ``shared.delivered_check_polarity`` (``build_path_argv`` /
+    ``interpret_path_listing``), whose docstrings say why. The authoring-time
+    lint evaluates path checks through the same two functions (task 3500),
+    so the two gates cannot disagree about what a path check means.
 
     Multi-path semantics are CONJUNCTIVE and short-circuiting:
     ``expect='present'`` requires EVERY listed path to exist and
     ``expect='absent'`` requires every one to be gone, returning on the
-    first path that settles the verdict. A delivered_check is a dispatch
-    GATE, so it must be biased toward withholding: disjunctive semantics
-    would let it go green while part of the asserted capability was still
-    missing. One invocation per path rather than one multi-pathspec call,
-    because ``ls-tree`` returns a flat filename list that cannot be
-    attributed back to the requesting pathspec without an ad-hoc parser
-    over git output.
+    first path that settles the verdict — an ERRORED probe included, so no
+    further path is probed after a git error. A delivered_check is a
+    dispatch GATE, so it must be biased toward withholding: disjunctive
+    semantics would let it go green while part of the asserted capability
+    was still missing.
     """
     for path in meta.paths:
-        argv = [
-            'git',
-            '-C',
-            str(project_root),
-            'ls-tree',
-            '-r',
-            '--full-tree',
-            '--name-only',
-            ref,
-            '--',
-            path,
-        ]
-        rc, out, _err = await runner(argv)
-        if rc != 0:
-            # A genuine git error (bad ref / pathspec outside the repository
-            # both exit 128), NOT an answer about existence. Checked BEFORE
-            # stdout is interpreted, because an error prints nothing and an
-            # absent path prints nothing too — collapsing the two would turn
-            # an unevaluable check into a definitive "not delivered".
-            return DeliveredCheckResult.ERRORED
-        exists = bool(out.strip())
-        delivered = exists if meta.expect == 'present' else not exists
-        if not delivered:
-            return DeliveredCheckResult.FAILED
+        rc, out, _err = await runner(build_path_argv(path, project_root=project_root, ref=ref))
+        outcome = interpret_path_listing(rc, out, meta.expect)
+        if outcome is not CheckOutcome.PASS:
+            return _OUTCOME_TO_RESULT[outcome]
     return DeliveredCheckResult.DELIVERED
 
 

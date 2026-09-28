@@ -519,22 +519,28 @@ decidable at authoring time with nothing but the manifest and git:
 | **matches at authoring** | rejected `vacuous_present` | healthy |
 | **no match at authoring** | healthy | rejected `vacuous_absent` |
 
+The table covers every kind that carries an `expect`. For `kind: "grep"`,
+"matches" means the pattern matches; for `kind: "path"` it means every listed
+path already exists — the gate's own conjunctive reading. `script` has no
+`expect`, so it has no cell and is not linted.
+
 A check in a rejected cell is already green the day it is written: landing the
 producer cannot change its verdict, so the dependent is dispatched as if
 unguarded. The opposite failure is worse — a check that can *never* go green
 blocks its dependent forever, and at runtime that is indistinguishable from a
 genuinely undelivered capability.
 
-**Reject codes** (all four block; the first two `vacuous_present` entries are
-diagnostic refinements of it, not separate gates):
+**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+entries are diagnostic refinements of `vacuous_present` for grep, not separate
+gates):
 
 | Code | What fired | Measured specimen |
 |---|---|---|
-| `vacuous_present` | `expect: present` pattern already matches at authoring | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
+| `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
 | `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
 | `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
-| `vacuous_absent` | `expect: absent` pattern does not match at authoring | the mirror cell: nothing to remove, so the check is green before any work starts |
-| `filename_shaped` | `expect: present` pattern has zero content matches but names a tracked **filename** | task **3536**'s `test_workflow_merge_gating_strand` — the module is tracked, but a test module does not mention its own name, so `git grep` (which reads *contents*) can never see it |
+| `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
+| `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches but names a tracked **filename** | task **3536**'s `test_workflow_merge_gating_strand` — the module is tracked, but a test module does not mention its own name, so `git grep` (which reads *contents*) can never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
 
 **Warn code** (reported, never blocking):
 
@@ -546,7 +552,9 @@ diagnostic refinements of it, not separate gates):
 rather than banning the old one: `kind: grep`, `expect: present`, `pattern` = a
 class, function or constant that does not exist yet, scoped with `paths` to the
 files this task actually writes. That is the shape all three measured repairs
-took, and it is the only shape the gate can observe going green.
+took, and it is the only shape the gate can observe going green. When the
+capability IS a file's existence, use `kind: "path"` naming the file the task
+creates (or, with `expect: absent`, deletes).
 
 **Two enforcement points, deliberately different contracts:**
 
@@ -567,7 +575,8 @@ took, and it is the only shape the gate can observe going green.
 
 **Fail closed on a verdict, fail open on infrastructure.** The validation is
 applied unconditionally, but "git could not answer" is never a verdict: an
-unevaluable check (no repo, unresolvable ref, `git grep` rc ≥ 2) is reported as
+unevaluable check (no repo, unresolvable ref, `git grep` rc ≥ 2, `git ls-tree`
+rc ≠ 0) is reported as
 `unevaluable` and **never** rejects. An availability failure must not be able
 to halt planning — but it must not read as a clean bill of health either, which
 is why it is reported rather than silently passed.
@@ -631,7 +640,8 @@ canonical specimen, measured: task 3536 asserted `kind: "grep"`,
 mention its own filename, so the check could never go green — and it blocked
 four dependents (3537, 3544, 3545, 3837). `kind: "path"` with
 `paths: ["orchestrator/tests/test_workflow_merge_gating_strand.py"]` says
-what was meant.
+what was meant. The grep form is now refused at `commit_planning` as
+`filename_shaped`, whose message names this `kind: "path"` fix.
 
 When the capability IS behavioural, prefer `kind: "script"` pointing at a
 COMMITTED predicate. If the same invariant is already gated elsewhere (a

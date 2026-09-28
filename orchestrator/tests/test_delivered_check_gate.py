@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from shared.delivered_check_polarity import (
     CheckOutcome,
     build_grep_argv,
+    build_path_argv,
     interpret_grep_rc,
 )
 
@@ -502,6 +503,26 @@ class TestRunnerPathKind:
         result = await run_delivered_check(check, project_root='/proj', runner=runner)
 
         assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_every_probe_is_the_shared_builders_argv(self):
+        """Parity with the authoring-time lint (task 3500): both gates build
+        each ``ls-tree`` probe with ``shared.delivered_check_polarity.build_path_argv``,
+        so they cannot disagree about what a path check asks git."""
+        runner, calls = self._fake_runner(rc=0, out='hit\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', ref='abc123', runner=runner)
+
+        assert calls == [
+            build_path_argv('a/one.py', project_root='/proj', ref='abc123'),
+            build_path_argv('b/two', project_root='/proj', ref='abc123'),
+        ]
 
     @pytest.mark.asyncio
     async def test_multiple_paths_issue_one_call_each(self):

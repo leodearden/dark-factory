@@ -290,8 +290,12 @@ def _grep_rows_from_checks(
 
     Only ``kind == 'grep'`` survives: the sweep is a statement about grep
     POLARITY against a tree, and a script check has no pattern to evaluate
-    (its own guard is TestCheckedInScriptCheckTargets). A grep entry with no
-    pattern is a SCHEMA defect the corpus validator owns, not a delivery one.
+    (its own guard is TestCheckedInScriptCheckTargets). ``kind == 'path'`` is
+    not swept either: :func:`find_superseding_task` is a pickaxe over a
+    PATTERN and this tool has no path-history counterpart to it, so a done
+    path check that fails could not be told apart from a superseded one. A grep entry with
+    no pattern is a SCHEMA defect the corpus validator owns, not a delivery
+    one.
     """
     rows = []
     for check in checks:
