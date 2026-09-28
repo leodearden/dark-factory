@@ -357,6 +357,29 @@ def _run_cli(*args, timeout=_CLI_TIMEOUT):
     )
 
 
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+    captured_args = []
+
+    def spy(*args, **kwargs):
+        captured_args.append(args[0])
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--db", "/nonexistent.db")
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+    # The script imports `shared` (and its third-party deps), so it needs the
+    # project interpreter, unlike its stdlib-only siblings run as python3.
+    assert captured_args[0][0] == sys.executable
+
+    _run_cli("--db", "/nonexistent.db", timeout=3)
+    assert captured["timeout"] == 3
+
+
 def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
     db_path = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
     before = db_path.read_bytes()
