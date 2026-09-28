@@ -155,6 +155,58 @@ class TestTimeouts:
         assert cfg.timeouts.census_synthesis_secs == 2400
 
 
+class TestTrickleCensusCaps:
+    """The ``census.trickle_caps`` block — the cost caps the nightly trickle
+    forwards to the census it launches (census.py's --max-batches /
+    --max-verify-clusters).
+
+    An omitted block is BOUNDED (50/150), never uncapped: a trickle launch
+    with no config opinion must not run an unattended census without a
+    runaway backstop. ``null`` is the explicit uncapped opt-out. A bad cap
+    fails loud at load_config rather than reaching census.py's argv, where
+    it would exit 2 on every fired night.
+    """
+
+    def test_bounded_defaults_when_census_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert isinstance(cfg.census.trickle_caps, mod.TrickleCensusCaps)
+        assert cfg.census.trickle_caps.max_batches == 50
+        assert cfg.census.trickle_caps.max_verify_clusters == 150
+
+    def test_partial_block_keeps_other_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {trickle_caps: {max_batches: 10}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.trickle_caps.max_batches == 10
+        assert cfg.census.trickle_caps.max_verify_clusters == 150
+
+    def test_null_caps_are_the_explicit_uncapped_opt_out(self, tmp_path):
+        text = MINIMAL_YAML + (
+            'census: {trickle_caps: {max_batches: null, max_verify_clusters: null}}\n'
+        )
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.trickle_caps.max_batches is None
+        assert cfg.census.trickle_caps.max_verify_clusters is None
+
+    @pytest.mark.parametrize('field', ['max_batches', 'max_verify_clusters'])
+    @pytest.mark.parametrize('bad_value', ['0', '-1', 'true', "'50'", '2.5'])
+    def test_non_positive_int_cap_raises(self, tmp_path, field, bad_value):
+        # ``true`` would otherwise coerce to a silent 1-batch cap; 0 and
+        # negatives mirror census.py::_positive_int's CLI-boundary rejection.
+        text = MINIMAL_YAML + f'census: {{trickle_caps: {{{field}: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_trigger_thresholds_survive_alongside_trickle_caps(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              max_interval_days: 3
+              trickle_caps: {max_batches: 10}
+            """)
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.max_interval_days == 3
+        assert cfg.census.trickle_caps.max_batches == 10
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
