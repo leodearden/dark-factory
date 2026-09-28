@@ -222,12 +222,30 @@ def _normalize_ws(text: str) -> str:
     lines, normalize newlines) WITHOUT altering its words, which would break a
     raw substring check and FALSE-POSITIVE a present transcript as MISSING.
     Normalizing both the needle and the candidate text means whitespace-only
-    differences never mask a real match. This does NOT normalize a prompt that
-    was semantically expanded/rewritten before storage (e.g. a slash-command
-    template) — that residual false-positive class is named in the escalation
-    detail so a human reading the alarm can rule it out.
+    differences never mask a real match. A slash-command expansion is not a
+    whitespace difference; :func:`_typed_slash_command` handles it.
     """
     return ' '.join(text.split())
+
+
+_COMMAND_NAME_RE = re.compile(r'<command-name>(.*?)</command-name>', re.DOTALL)
+_COMMAND_ARGS_RE = re.compile(r'<command-args>(.*?)</command-args>', re.DOTALL)
+
+
+def _typed_slash_command(text: str) -> str | None:
+    """Rebuild the typed ``/name args`` from Claude Code's expanded slash-command turn.
+
+    ``record.prompt`` holds the literal argv (``/unblock 4743 ...``) while the
+    transcript stores the ``<command-name>``/``<command-args>`` tagged
+    expansion; this is the inverse that lets the unchanged prompt-prefix
+    needle match. Returns None when either tag is absent (not a slash-command
+    turn).
+    """
+    name = _COMMAND_NAME_RE.search(text)
+    args = _COMMAND_ARGS_RE.search(text)
+    if name is None or args is None:
+        return None
+    return '/' + name.group(1).strip().lstrip('/') + ' ' + args.group(1)
 
 
 def find_matching_transcript(
@@ -291,7 +309,9 @@ def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None
 
     Reads each candidate's first user turn via the light
     :func:`_first_user_turn`, not the full confusion-scorer, so a usable-prompt
-    session with only sibling transcripts is correctly flagged MISSING.
+    session with only sibling transcripts is correctly flagged MISSING. A
+    slash-command turn also matches on its de-expanded typed form
+    (:func:`_typed_slash_command`), which keeps the command name in the match.
     """
     # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
     # prompt, BEFORE appending its result-handback trailer, so the prompt
@@ -300,8 +320,12 @@ def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None
     # are whitespace-normalized so a reflowed transcript still matches.
     needle = _normalize_ws(prefix)
     for path in candidates:
-        text = _normalize_ws(sampling._first_user_turn_text(_first_user_turn(path)))
-        if needle in text:
+        text = sampling._first_user_turn_text(_first_user_turn(path))
+        typed = _typed_slash_command(text)
+        matched = needle in _normalize_ws(text) or (
+            typed is not None and needle in _normalize_ws(typed)
+        )
+        if matched:
             return path
     return None
 
