@@ -68,6 +68,7 @@ from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
     _looks_like_task_id,
+    interceptor_write_succeeded,
 )
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
@@ -9651,9 +9652,23 @@ def create_mcp_server(
         if _mo_err is not None:
             return _mo_err
 
+        # Enumeration liveness gate (task 3056), update half: see the matching
+        # submit_task call site and enumeration_guard's module docstring.
+        _enumeration = await enumeration_liveness_gate(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+            is_filing=False,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
-        return await task_interceptor.update_task(
+        result = await task_interceptor.update_task(
             task_id=id,
             project_root=project_root,
             prompt=prompt,
@@ -9670,6 +9685,9 @@ def create_mcp_server(
             agent_id=agent_id,
             client_op_id=client_op_id,
         )
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()
