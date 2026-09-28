@@ -371,6 +371,7 @@ class AllAccountsCappedException(Exception):
 # CLI change ever denies the schema tool itself, ``_parse_claude_output``
 # reports ``schema_tool_denied``.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
+_SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
 
 def no_mcp_servers_config() -> dict[str, Any]:
@@ -1197,15 +1198,39 @@ class TranscriptEvidence:
     """What a run did, as recorded in its transcript.
 
     - ``assistant_turns``: records with ``type == 'assistant'``.
-    - ``schema_payload``: the ``input`` of the last ``StructuredOutput``
-      tool_use whose input is a dict, else None. It is never a partial payload.
-    - ``other_tool_uses``: every other tool_use name in transcript order,
-      duplicates kept.
+    - ``accepted_schema_payload``: the ``data`` of the last ``structured_output``
+      attachment, i.e. the CLI's record that it accepted a ``StructuredOutput``
+      call against the schema, else None. A rejected or merely attempted call
+      (schema mismatch, unparseable input, permission denial, or killed before
+      validation) has none.
+    - ``other_tool_uses``: every tool_use name other than ``StructuredOutput``,
+      in transcript order, duplicates kept.
     """
 
     assistant_turns: int
-    schema_payload: dict | None
+    accepted_schema_payload: dict | None
     other_tool_uses: tuple[str, ...]
+
+
+def _accepted_schema_output(record: object) -> dict | None:
+    """Return the verdict *record* shows the CLI accepted, else None. Never raises."""
+    if not isinstance(record, dict) or record.get('type') != 'attachment':
+        return None
+    attachment = record.get('attachment')
+    if not isinstance(attachment, dict) or attachment.get('type') != _SCHEMA_OUTPUT_ATTACHMENT:
+        return None
+    data = attachment.get('data')
+    return data if isinstance(data, dict) else None
+
+
+def _tool_use_names(record: dict) -> list[str]:
+    """Return the name of every well-formed tool_use block in *record*."""
+    return [
+        block['name'] for block in _content_blocks(record)
+        if isinstance(block, dict)
+        and block.get('type') == 'tool_use'
+        and isinstance(block.get('name'), str)
+    ]
 
 
 def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
@@ -1213,28 +1238,27 @@ def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
 
     Recovers evidence from a run whose stdout never arrived (a killed
     process), so it complements ``_parse_claude_output``'s stdout-based
-    ``schema_salvaged`` path rather than duplicating it. Pure: whether to trust
-    a recovered payload is the caller's decision. Only assistant records
-    count, and malformed records and blocks are skipped without raising.
+    ``schema_salvaged`` path rather than duplicating it. The payload is taken
+    from the CLI's acceptance record, never from the model's tool_use input.
+    Pure: whether to trust a recovered payload is the caller's decision. Only
+    assistant records count as turns, and malformed records and blocks are
+    skipped without raising.
     """
     assistant_turns = 0
-    schema_payload: dict | None = None
+    accepted_schema_payload: dict | None = None
     other_tool_uses: list[str] = []
     for record in records:
+        accepted = _accepted_schema_output(record)
+        if accepted is not None:
+            accepted_schema_payload = accepted
+            continue
         if not isinstance(record, dict) or record.get('type') != 'assistant':
             continue
         assistant_turns += 1
-        for block in _content_blocks(record):
-            if not isinstance(block, dict) or block.get('type') != 'tool_use':
-                continue
-            name = block.get('name')
-            if not isinstance(name, str):
-                continue
-            if name != _SCHEMA_OUTPUT_TOOL:
-                other_tool_uses.append(name)
-            elif isinstance(block.get('input'), dict):
-                schema_payload = block['input']
-    return TranscriptEvidence(assistant_turns, schema_payload, tuple(other_tool_uses))
+        other_tool_uses += [
+            name for name in _tool_use_names(record) if name != _SCHEMA_OUTPUT_TOOL
+        ]
+    return TranscriptEvidence(assistant_turns, accepted_schema_payload, tuple(other_tool_uses))
 
 
 def transcript_evidence_for_session(

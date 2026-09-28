@@ -2940,7 +2940,7 @@ class TaskCurator:
         evidence = self._read_failure_evidence(transcript_scope)
         if (
             evidence is None
-            or evidence.schema_payload is None
+            or evidence.accepted_schema_payload is None
             or agent_result.structured_output is not None
         ):
             return agent_result, evidence
@@ -2948,12 +2948,12 @@ class TaskCurator:
             'TaskCurator: salvaged a completed verdict from the transcript of failed '
             'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
             transcript_scope.get('session_id'), agent_result.subtype,
-            agent_result.transcript_turns, json.dumps(evidence.schema_payload, default=str),
+            agent_result.transcript_turns, json.dumps(evidence.accepted_schema_payload, default=str),
         )
         salvaged = replace(
             agent_result,
             success=True,
-            structured_output=evidence.schema_payload,
+            structured_output=evidence.accepted_schema_payload,
             schema_salvaged=True,
         )
         return salvaged, evidence
