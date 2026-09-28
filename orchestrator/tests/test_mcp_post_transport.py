@@ -309,7 +309,7 @@ async def test_suggestions_write_client_follows_redirects_and_accepts_json(
 # mcp_lifecycle.py pattern in the first place.
 
 
-def _make_merge_worker(tmp_path, mcp_url='http://memory.test:8002'):
+def _make_merge_worker(tmp_path, mcp_url: str | None = 'http://memory.test:8002'):
     """A bare merge worker whose MCP handle points at *mcp_url* (None: no handle)."""
     import asyncio
 
