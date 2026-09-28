@@ -7528,3 +7528,53 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
 
     assert kwargs["submit_fn"].calls == []
     assert outcome.released_entry_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# task 5931 review fix: `withheld` lists only what promotion actually marked,
+# and a rejected record's sightings count toward recurrence.
+# ---------------------------------------------------------------------------
+
+def _rejected_first_run(tmp_path):
+    first = {**_gate_kwargs(tmp_path), "verify_fn": _make_fake_verify_fn(rejected_titles={_GATED_TITLE})}
+    mod.run_census(**first)
+    [candidate] = [
+        c for c in codebook.load(first["codebook_path"])["candidates"] if c["title"] == _GATED_TITLE
+    ]
+    assert candidate["disposition"] == "rejected", "run 1 must reject the title"
+    return first
+
+
+def _reverified_kwargs(tmp_path, first, *, session):
+    """A later census that re-mines *first*'s rejected title in *session* and
+    now verifies it, unremediated. The merger routes the sighting onto the
+    rejected candidate, so the verdict resolves to no pending candidate."""
+    return {
+        **_gate_kwargs(tmp_path, sessions=(session,)),
+        "codebook_dict": codebook.load(first["codebook_path"]),
+        "date": "2026-07-21",
+        "report_path": tmp_path / "confusion-census-2026-07-21.md",
+    }
+
+
+def test_run_census_does_not_report_an_unpromoted_cluster_as_withheld(tmp_path):
+    first = _rejected_first_run(tmp_path)
+    second = _reverified_kwargs(tmp_path, first, session="s1")
+
+    outcome = mod.run_census(**second)
+
+    assert [dropped.title for dropped in outcome.dropped_verdicts] == [_GATED_TITLE]
+    assert second["submit_fn"].calls == []
+    assert outcome.withheld == (), "no entry was promoted, so none carries the withheld marker"
+    assert not any(e["title"] == _GATED_TITLE for e in codebook.load(second["codebook_path"])["entries"])
+
+
+def test_run_census_counts_a_rejected_candidates_sightings_as_recurrence(tmp_path):
+    first = _rejected_first_run(tmp_path)
+    second = _reverified_kwargs(tmp_path, first, session="s2")
+
+    outcome = mod.run_census(**second)
+
+    [filed] = second["submit_fn"].calls
+    assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
+    assert outcome.withheld == ()

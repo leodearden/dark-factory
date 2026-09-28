@@ -1606,38 +1606,48 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     return None
 
 
-def _title_sighting_count(cb: dict, title: str | None) -> int:
-    """How many DISTINCT sessions have sighted *title*, across every entry and
-    candidate carrying it -- the same title key ``_find_pending_candidate_id``
-    resolves by. A promoted entry holds a copy of its candidate's sightings,
-    hence the dedup by session; a standing record from an earlier window
-    counts as recurrence."""
-    records = [*(cb.get("entries") or []), *(cb.get("candidates") or [])]
-    return len({
-        sighting.get("session")
-        for record in records
-        if record.get("title") == title
-        for sighting in record.get("sightings") or []
-        if sighting.get("session")
-    })
+def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
+    """How many DISTINCT sessions have sighted each title, across every entry
+    and candidate carrying it -- the same title key
+    ``_find_pending_candidate_id`` resolves by. A promoted entry holds a copy
+    of its candidate's sightings, hence the dedup by session.
+
+    Every record counts, whatever its disposition or status, including a
+    standing record from an earlier window. A sighting records that a
+    confusion was SEEN; a rejection judges the claim, and a retirement judges
+    the fix. The singleton gate asks only whether a confusion is a one-off.
+    This run's verifier has already answered whether it is real."""
+    sessions_by_title: dict[str | None, set] = {}
+    for record in [*(cb.get("entries") or []), *(cb.get("candidates") or [])]:
+        sessions = sessions_by_title.setdefault(record.get("title"), set())
+        sessions.update(
+            sighting.get("session")
+            for sighting in record.get("sightings") or []
+            if sighting.get("session")
+        )
+    return {title: len(sessions) for title, sessions in sessions_by_title.items()}
 
 
 def _split_fileable(
     verified: list[dict], cb: dict,
-) -> tuple[list[dict], tuple[filing_policy.WithheldCluster, ...]]:
+) -> tuple[list[dict], dict[str | None, filing_policy.WithheldCluster]]:
     """Partition *verified* by ``filing_policy.is_fileable``, counting each
-    cluster's sightings in the post-merge codebook *cb*."""
+    cluster's sightings in the post-merge codebook *cb*. The clusters held
+    back are keyed by title, the key promotion resolves a cluster by: only a
+    held-back cluster that is then PROMOTED is marked, and reported, withheld."""
+    sighting_counts = _sighting_counts_by_title(cb)
     fileable: list[dict] = []
-    withheld: list[filing_policy.WithheldCluster] = []
+    held_back: dict[str | None, filing_policy.WithheldCluster] = {}
     for cluster in verified:
-        sighting_count = _title_sighting_count(cb, cluster.get("title"))
+        title = cluster.get("title")
+        sighting_count = sighting_counts.get(title, 0)
         if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
             fileable.append(cluster)
         else:
-            withheld.append(filing_policy.WithheldCluster(
-                title=cluster.get("title"), sighting_count=sighting_count,
-            ))
-    return fileable, tuple(withheld)
+            held_back[title] = filing_policy.WithheldCluster(
+                title=title, sighting_count=sighting_count,
+            )
+    return fileable, held_back
 
 
 _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
@@ -1694,11 +1704,12 @@ def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
         for cluster in fileable
     ]
     paired = {pending.withheld_entry_id for pending in queue}
+    sighting_counts = _sighting_counts_by_title(cb)
     for entry in releasable:
         if entry["id"] in paired:
             continue
         cluster = _entry_cluster(cb, entry)
-        sighting_count = _title_sighting_count(cb, entry["title"])
+        sighting_count = sighting_counts.get(entry["title"], 0)
         if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
             queue.append(PendingFiling(cluster, entry["id"]))
     return queue
@@ -2282,7 +2293,8 @@ def run_census(
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
     one stays promoted, is marked withheld on its entry and is listed in the
-    report) -> ``_filing_queue``, which adds every earlier-withheld entry that
+    report, while one whose verdict was dropped is neither filed nor listed)
+    -> ``_filing_queue``, which adds every earlier-withheld entry that
     has since recurred -> ``build_task_payloads`` over that queue + *submit_fn*
     per payload, best-effort (a genuine ticket for a withheld entry marks it
     filed, so it is never filed twice; a raised exception, or a result
@@ -2632,16 +2644,9 @@ def run_census(
 
     # Split BEFORE promotion so a withheld cluster's entry is marked as it is
     # created. Promotion cannot change the count: it only copies a candidate's
-    # sightings into its entry, and _title_sighting_count dedups by session.
-    fileable, withheld = _split_fileable(verified, updated_codebook)
-    if withheld:
-        logger.info(
-            "census: %d verified cluster(s) recorded but not filed (no in-tree "
-            "remediation, fewer than %d sightings): %s",
-            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
-            [cluster.title for cluster in withheld],
-        )
-    withheld_titles = {cluster.title for cluster in withheld}
+    # sightings into its entry, and _sighting_counts_by_title dedups by session.
+    fileable, held_back = _split_fileable(verified, updated_codebook)
+    marked_withheld: list[filing_policy.WithheldCluster] = []
 
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -2681,9 +2686,20 @@ def run_census(
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
         }
-        if cluster.get("title") in withheld_titles:
+        held = held_back.get(cluster.get("title"))
+        if held is not None:
             entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
+            marked_withheld.append(held)
         updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
+
+    withheld = tuple(marked_withheld)
+    if withheld:
+        logger.info(
+            "census: %d verified cluster(s) recorded but not filed (no in-tree "
+            "remediation, fewer than %d sightings): %s",
+            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
+            [cluster.title for cluster in withheld],
+        )
 
     for cluster in rejected:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
