@@ -868,15 +868,13 @@ bad stamp land inside the exit-code table.
 """
 
 EXIT_RUN_FAILED = 1
-"""The run could not complete: artifacts unwritable, or stdout unwritable.
+"""The run did not finish: the artifacts could not be written, or stdout failed.
 
 Deliberately OUTSIDE :data:`EXIT_CODES` and :data:`EXIT_BAD_STAMP`: a wrapper
 reading only the exit code must be able to tell "the artifacts do not exist"
 apart from every coverage status and from a run that never started.
 
-It is also the status ``shared.cli_boundary.EXIT_STDOUT_FAILED`` reports for a
-stdout failure. That agreement is pinned by a real child process's exit status
-(``tests/test_scripts_cli_boundary_wiring.py``), not by comparing the names.
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
 """
 
 

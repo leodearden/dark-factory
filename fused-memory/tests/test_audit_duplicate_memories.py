@@ -4135,7 +4135,7 @@ class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
             rc = await _run(self._apply_args(tmp_path))
 
-        assert rc == 1
+        assert rc == _mod.EXIT_RUN_FAILED == 1
         aborts = _abort_messages(caplog)
         assert len(aborts) == 1
         assert 'store' in aborts[0]
@@ -4154,7 +4154,7 @@ class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
             rc = await _run(self._apply_args(metrics_root))
 
-        assert rc == 1
+        assert rc == _mod.EXIT_RUN_FAILED
         aborts = _abort_messages(caplog)
         assert len(aborts) == 1
         assert str(metrics_root) in aborts[0]

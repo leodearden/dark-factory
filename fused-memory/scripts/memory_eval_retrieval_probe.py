@@ -2678,13 +2678,15 @@ DEFAULT_CALIBRATION_PATH = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_
 DEFAULT_CENSUS_PATH = _REPO_ROOT / 'plans' / 'memory-metadata-census-report.json'
 
 EXIT_RUN_FAILED = 1
-"""The run could not complete: the store could not be opened, the artifacts
-could not be written, a derivation source could not be read, or stdout failed.
+"""The run did not finish: the store could not be opened, the artifacts could
+not be written, a derivation source could not be read, or stdout failed.
 
-The status ``shared.cli_boundary.EXIT_STDOUT_FAILED`` also uses. Distinct from
-the 2 an unloadable registry or an empty ``--project-id`` selection exits with:
-those say "fix the input", this says "the run did not finish".
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
 """
+
+EXIT_BAD_INPUT = 2
+"""Nothing can be measured until the input is fixed: the registry did not load,
+or ``--project-id`` selected nothing."""
 
 
 def corpus_categories() -> tuple[str, ...]:
@@ -3050,7 +3052,7 @@ def main(argv: list[str] | None = None) -> int:
             text = outcome.report
     except (RegistryError, EmptySelectionError) as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+        return EXIT_BAD_INPUT
     except ProbeRunError as exc:
         print(f'error: {exc}', file=sys.stderr)
         return EXIT_RUN_FAILED

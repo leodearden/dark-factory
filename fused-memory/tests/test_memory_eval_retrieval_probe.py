@@ -3537,6 +3537,17 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
         assert 'stdout' not in errors[0]
         assert captured.out == ''
 
+    def test_a_registry_that_cannot_be_read_is_an_input_error(self, tmp_path, capsys):
+        m = _mod()
+        absent = tmp_path / 'absent-registry.json'
+
+        code = m.main(['--registry', str(absent), '--project-id', 'dark_factory'])
+
+        assert code == m.EXIT_BAD_INPUT == 2
+        err = capsys.readouterr().err
+        assert str(absent) in err
+        assert 'stdout' not in err
+
 
 class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
     """The metrics and report are on disk before the report is printed, so a
