@@ -2459,6 +2459,55 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     return swept
 
 
+async def retire_flag_markers_for_terminal_task(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    task_id: str,
+    now: datetime | None = None,
+) -> int:
+    """Retire the ``flag_for_stage2`` markers of ONE task that just went terminal.
+
+    Task 4376. A LATENCY layer only: the per-cycle sweep in
+    :meth:`TaskKnowledgeSync.run` remains the correctness and audit mechanism,
+    and this path is invalid without it. Called from
+    ``reconciliation/targeted.py::TargetedReconciler._on_task_done`` so a marker
+    that is already past the age cutoff is retired the moment its task closes,
+    rather than at the next cycle.
+
+    The eligibility predicate is deliberately NOT re-implemented here. This
+    runs :func:`_sweep_stale_mem0_flag_for_stage2_markers` — the same routine
+    over the same pool — with a strictly narrower ``terminal_task_ids``, so it
+    can never be more aggressive than the sweep, and it inherits every gate the
+    sweep has now or gains later.
+
+    Terminality comes from the done-transition itself, not from
+    :func:`_resolve_terminal_task_ids` / ``get_statuses``: the caller only gets
+    here on a terminal transition that has just been persisted, and a
+    taskmaster round-trip would spend the latency budget that is this path's
+    whole justification.
+
+    ``str(task_id).strip()`` copies :func:`_sweep_stale_mem0_pool`'s own
+    membership normalisation, so a task id with stray whitespace or a non-str
+    type still matches.
+
+    Passing a 1-tuple rather than ``None`` is load-bearing: ``None`` means
+    "gate disabled", and the sweep would then delete every member of the pool
+    past the age cutoff, whatever task it cites.
+
+    Returns:
+        Number of markers retired (the sweep's own count).
+    """
+    return await _sweep_stale_mem0_flag_for_stage2_markers(
+        memory_service,
+        project_id,
+        run_id,
+        terminal_task_ids=(str(task_id).strip(),),
+        now=now,
+    )
+
+
 async def _sweep_entity_standing_decision_growth(
     memory_service,
     project_id: str,
