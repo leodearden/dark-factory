@@ -557,3 +557,135 @@ class TestLiveness:
 
         assert result.rejection is None
         assert result.metadata is metadata
+
+
+# --------------------------------------------------------------------------- #
+# CHANGE 1(c): description annotation
+# --------------------------------------------------------------------------- #
+
+VERIFIED_AT = FIXED_NOW.isoformat()
+
+# Gate 5537's description as filed: the deleted row is nominated by full id and
+# again by its 8-char prefix, beside commit prefixes of the identical shape.
+GATE_5537_DESCRIPTION = '\n'.join([
+    'THE FOUR ENTRIES:',
+    f'- {LIVE_B3F} (observations_and_summaries)',
+    f'- {DELETED_0D5} (procedural_knowledge)',
+    'Delete 0d542614 first: it ranks into how-to queries.',
+    'main moved 7074ed0e -> 509e950e on 2026-07-24.',
+])
+
+
+class TestDescriptionAnnotation:
+    """Only ids the METADATA pass proved absent or inconclusive are annotated
+    in the description; the description itself is never a detection source."""
+
+    @pytest.mark.asyncio
+    async def test_lines_naming_an_absent_id_are_annotated(self, project_root):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            description=GATE_5537_DESCRIPTION,
+        )
+
+        before = GATE_5537_DESCRIPTION.split('\n')
+        after = result.description.split('\n')
+        assert len(after) == len(before)
+        for index in (2, 3):
+            assert after[index].startswith(before[index])
+            assert after[index].count(f'already deleted, verified {VERIFIED_AT}') == 1
+        for index in (0, 1, 4):
+            assert after[index] == before[index]
+        assert result.stats is not None
+        assert result.stats['annotated_lines'] == 2
+
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_id_is_never_called_deleted(self, project_root):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]}
+        description = f'- {LIVE_21F} the fuller twin'
+
+        result = await run_gate(
+            project_root, metadata,
+            service=memory_service(
+                live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
+            ),
+            description=description,
+        )
+
+        assert result.description.startswith(description)
+        assert 'liveness inconclusive (TimeoutError)' in result.description
+        assert 'deleted' not in result.description
+
+    @pytest.mark.asyncio
+    async def test_annotating_twice_adds_no_second_annotation(self, project_root):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
+        service = memory_service(live=(LIVE_B3F,))
+
+        first = await run_gate(
+            project_root, metadata, service=service,
+            description=GATE_5537_DESCRIPTION,
+        )
+        second = await run_gate(
+            project_root, metadata, service=service, description=first.description,
+        )
+
+        assert second.description == first.description
+        assert second.stats is not None
+        assert second.stats['annotated_lines'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_none_description_stays_none(self, project_root):
+        result = await run_gate(
+            project_root, {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]},
+            service=memory_service(live=(LIVE_B3F,)), description=None,
+        )
+
+        assert result.description is None
+        assert result.metadata['mem0_falsified_entries'] == [LIVE_B3F]
+
+    @pytest.mark.asyncio
+    async def test_a_miss_in_an_unproven_list_never_annotates(self, project_root):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F],
+            'origin_finding_ids': list(FINDING_IDS),
+            'x_deleted_before_gate_open': [DELETED_0D5],
+        }
+        description = '\n'.join([
+            f'Filed from Stage 1 finding {FINDING_IDS[0]}.',
+            f'{DELETED_0D5} was deleted before this gate opened.',
+        ])
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            description=description,
+        )
+
+        assert result.description is description
+
+    @pytest.mark.asyncio
+    async def test_the_description_is_never_a_detection_source(self, project_root):
+        service = memory_service(live=(LIVE_B3F,))
+        description = f'- {DELETED_0D5} likeliest deletion target'
+
+        result = await run_gate(
+            project_root, {'mem0_falsified_entries': [LIVE_B3F]}, service=service,
+            description=description,
+        )
+
+        assert awaited_ids(service) == [LIVE_B3F]
+        assert result.description is description
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_twin_is_not_mistaken_for_the_absent_id(
+        self, project_root,
+    ):
+        twin = '0d542614-9999-4aaa-8bbb-000000000001'
+        description = f'- {twin} a different entry sharing the prefix'
+
+        result = await run_gate(
+            project_root, {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]},
+            service=memory_service(live=(LIVE_B3F,)), description=description,
+        )
+
+        assert result.description == description
