@@ -779,8 +779,9 @@ mode, which models reality today, carries no `topic` key at all.
 
 ## `curator_transcripts/`
 
-Three **redacted structural copies** of real TaskCurator CLI transcripts:
-the Exhibit A for each branch of the curator's timeout classification (task
+Five **redacted structural copies** of real TaskCurator CLI transcripts:
+the Exhibit A for each branch of the curator's timeout classification, and
+for the rule that only a verdict the CLI ACCEPTED is ever salvaged (task
 3995). Consumed by `fused-memory/tests/test_task_curator_timeout_evidence.py`,
 which materializes each file at
 `<curator config dir>/projects/<slug>/<session_id>.jsonl` and drives
@@ -793,14 +794,28 @@ other machine. These copies make the classification reproducible in CI.
 
 ### Provenance
 
-All three sources were read on 2026-09-27. Turn counts and tool sequences
-were re-measured at extraction and match the counts cited in the task.
+The first three sources were read on 2026-09-27. Turn counts and tool
+sequences were re-measured at extraction and match the counts cited in the
+task.
 
 | fixture | source (`~/.claude/projects/…`) | session id | assistant records | tool_use sequence | evidences |
 |---|---|---|---|---|---|
 | `esc_curator_33_salvageable.jsonl` | `-tmp-fm-neutral-classifier-cwd-wgm-f3h8/` | `d9b60a7a-a675-40cb-964d-eb5a2e20ff1e` | 2 | `StructuredOutput` | esc-curator-33: the verdict was COMPLETED in the transcript but never reached stdout |
 | `esc_curator_2_tool_wandering.jsonl` | `-tmp-fm-neutral-classifier-cwd-ds70bqzs/` | `91c4bcfd-d262-4f77-8df8-09a60321cc4c` | 6 | `ToolSearch` → `TaskGet` → `ToolSearch` | esc-curator-2: a "pure classifier" loading and running deferred tools, no verdict |
 | `esc_curator_4_pre_turn_stall.jsonl` | `-tmp-fm-neutral-classifier-cwd-3zgf473k/` | `42efe70b-26b4-426b-8adc-682b8544175e` | 0 | none | esc-curator-4: the only genuine pre-turn stall of the three |
+
+The other two are **rejected-only** transcripts: the model called
+`StructuredOutput` with a dict input, the CLI answered with an `is_error`
+tool_result, and no `structured_output` attachment (the CLI's acceptance
+record) was ever written. Each is one of the 24 rejected-only curator
+transcripts measured on 2026-09-28, when both sources were read and their
+turn counts re-measured. Salvaging either would turn a rejected attempt into
+a verdict.
+
+| fixture | source (`~/.claude/projects/…`) | session id | CLI | assistant records | tool_use sequence | rejection |
+|---|---|---|---|---|---|---|
+| `schema_tool_denied_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-5daj6zhy/` | `33f5159c-b127-43a1-87cf-a71013b1471d` | 2.1.222 | 2 | `StructuredOutput` (denied) | permission denial, "The user doesn't want to proceed with this tool use...": the shape of a `--tools ''` regression that denies the schema tool |
+| `schema_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-6nd89svh/` | `50df7bda-6c99-48ee-8cfa-72c524161007` | 2.1.283 | 2 | `StructuredOutput` (rejected) | schema mismatch, "Output does not match required schema: /rewritten_task: must be object,null" |
 
 ### What is preserved, and what is redacted
 
@@ -822,6 +837,15 @@ ids, and string tool results). `tool_use` ids are renumbered
 `toolu_fixture_NN`, consistently across a file, so each `tool_use` still
 pairs with its `tool_result`. Every other record key (`cwd`, `uuid`,
 `sessionId`, `version`, attachment bodies, …) is dropped.
+
+The two rejected-only fixtures additionally keep each tool_result's
+`is_error` flag and its text verbatim, plus the trailing
+`[Request interrupted by user for tool use]` marker: these are CLI output,
+not prose, and the error text is the evidence of why the call was rejected.
+`action` and `priority` are enum values and are kept; `schema_rejected_only`'s
+real `target_id` is replaced by the synthetic `"9001"`, and its other string
+inputs (including the malformed string `rewritten_task` the schema rejected)
+become `"redacted"`, so the value types the rejection depends on survive.
 
 **One value is deliberately changed.** The real esc-curator-33 verdict was
 `action: "create"` with a null `target_id`. The fixture's `StructuredOutput`

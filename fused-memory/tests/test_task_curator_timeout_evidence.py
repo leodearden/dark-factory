@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -224,11 +225,9 @@ def _fixture_lines(name: str) -> list[str]:
     return (_TRANSCRIPTS / name).read_text().splitlines()
 
 
-def _structured_output_lines(payload: Any) -> list[str]:
-    """A two-turn transcript whose second turn's StructuredOutput(*payload*) the
-    CLI accepted: tool_use, then the ``structured_output`` attachment, then the
-    success tool_result."""
-    records = [
+def _schema_call_records(payload: Any) -> list[dict[str, Any]]:
+    """A prompt, a thinking turn, then a StructuredOutput(*payload*) tool_use."""
+    return [
         {'type': 'user', 'message': {'role': 'user', 'content': 'prompt'}},
         {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
             {'type': 'thinking', 'thinking': 'redacted'},
@@ -236,13 +235,37 @@ def _structured_output_lines(payload: Any) -> list[str]:
         {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'StructuredOutput', 'input': payload},
         ]}},
+    ]
+
+
+def _schema_tool_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
+    block: dict[str, Any] = {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': text}
+    if is_error:
+        block['is_error'] = True
+    return {'type': 'user', 'message': {'role': 'user', 'content': [block]}}
+
+
+def _structured_output_lines(payload: Any) -> list[str]:
+    """A two-turn transcript whose second turn's StructuredOutput(*payload*) the
+    CLI accepted: tool_use, then the ``structured_output`` attachment, then the
+    success tool_result."""
+    records = _schema_call_records(payload) + [
         {'type': 'attachment', 'attachment': {
             'type': 'structured_output', 'data': payload, 'toolUseID': 'toolu_1',
         }},
-        {'type': 'user', 'message': {'role': 'user', 'content': [
-            {'type': 'tool_result', 'tool_use_id': 'toolu_1',
-             'content': 'Structured output provided successfully'},
-        ]}},
+        _schema_tool_result('Structured output provided successfully'),
+    ]
+    return [json.dumps(record) for record in records]
+
+
+def _denied_structured_output_lines(payload: Any) -> list[str]:
+    """The same two turns, but the CLI permission-denied the StructuredOutput
+    call: an ``is_error`` tool_result and no acceptance record."""
+    records = _schema_call_records(payload) + [
+        _schema_tool_result(
+            "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+            is_error=True,
+        ),
     ]
     return [json.dumps(record) for record in records]
 
@@ -673,3 +696,165 @@ class TestCitedTranscriptCorpus:
         assert err.transcript_turns == 6
         assert err.tools_used == ('ToolSearch', 'TaskGet', 'ToolSearch')
         assert len(_leak_warnings(caplog)) == 1
+
+
+def _schema_tool_denied() -> AgentResult:
+    """The shape ``_parse_claude_output`` mints when the CLI denied StructuredOutput."""
+    return AgentResult(
+        success=False,
+        output='StructuredOutput denied',
+        structured_output=None,
+        schema_tool_denied=True,
+        timed_out=False,
+        subtype='success',
+    )
+
+
+def _stdout_arrived_failure() -> AgentResult:
+    """A failure that was NOT a kill: its stdout arrived and was already parsed."""
+    return AgentResult(
+        success=False,
+        output='structured output retries exhausted',
+        structured_output=None,
+        timed_out=False,
+        subtype='error_max_structured_output_retries',
+        transcript_turns=2,
+    )
+
+
+_DENIED_TRANSCRIPTS = [
+    pytest.param(
+        _call_single, _fixture_lines('schema_tool_denied_rejected_only.jsonl'), id='single',
+    ),
+    pytest.param(_call_batch, _denied_structured_output_lines(_BATCH_OK), id='batch'),
+]
+
+_ACCEPTED_TRANSCRIPTS = [
+    pytest.param(_call_single, _structured_output_lines(_SALVAGEABLE_DROP), id='single'),
+    pytest.param(_call_batch, _structured_output_lines(_BATCH_OK), id='batch'),
+]
+
+
+class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
+    """Salvage is only for a run KILLED after the CLI accepted its verdict.
+
+    A denied schema tool must reach the loud, un-suppressed
+    ``curator_schema_tool_denied`` escalation whether or not the curator is
+    gated, and a failure whose stdout arrived was already parsed by
+    ``_parse_claude_output``, which owns stdout salvage.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('drive', 'transcript_lines'), _DENIED_TRANSCRIPTS)
+    async def test_denied_schema_tool_is_raised_not_salvaged(
+        self, drive, transcript_lines, tmp_path, caplog,
+    ):
+        invoke = _scripted_invoker((transcript_lines, _schema_tool_denied()))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(drive, _gated_curator(tmp_path), invoke)
+
+        assert err.schema_tool_denied is True
+        assert err.tools_used == ()
+        assert _salvage_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('drive', 'transcript_lines'), _ACCEPTED_TRANSCRIPTS)
+    async def test_denial_flag_alone_refuses_salvage(
+        self, drive, transcript_lines, tmp_path, caplog,
+    ):
+        """Pins the result-flag guard independently of the acceptance rule."""
+        denied_kill = replace(
+            _killed_run('error_timeout_killed_with_progress', transcript_turns=2),
+            schema_tool_denied=True,
+        )
+        invoke = _scripted_invoker((transcript_lines, denied_kill))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(drive, _gated_curator(tmp_path), invoke)
+
+        assert err.schema_tool_denied is True
+        assert _salvage_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('drive', 'transcript_lines'), _ACCEPTED_TRANSCRIPTS)
+    async def test_failure_that_was_not_a_kill_is_not_salvaged(
+        self, drive, transcript_lines, tmp_path, caplog,
+    ):
+        invoke = _scripted_invoker((transcript_lines, _stdout_arrived_failure()))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(drive, _gated_curator(tmp_path), invoke)
+
+        assert err.subtype == 'error_max_structured_output_retries'
+        assert _salvage_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_killed_run_with_only_a_rejected_verdict_is_raised(self, tmp_path, caplog):
+        """A real CLI 2.1.283 transcript whose only StructuredOutput call failed the schema."""
+        name = 'schema_rejected_only.jsonl'
+        invoke = _scripted_invoker((_fixture_lines(name), _killed_run_for_fixture(name)))
+
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
+            err = await _failure_of(_call_single, _gated_curator(tmp_path), invoke)
+
+        assert err.zero_output_timeout is False
+        assert err.transcript_turns == 2
+        assert err.tools_used == ()
+        assert _salvage_warnings(caplog) == []
+
+
+def _escalating_gated_curator(
+    tmp_path: Path, config: FusedMemoryConfig | None = None,
+) -> tuple[TaskCurator, AsyncMock]:
+    escalator = AsyncMock()
+    escalator.report_failure = AsyncMock(return_value=None)
+    curator = TaskCurator(
+        config=config or _make_config(),
+        taskmaster=None,
+        usage_gate=MagicMock(spec=UsageGate),
+        config_dir_base=tmp_path,
+        escalator=escalator,
+    )
+    return curator, escalator
+
+
+# Each transcript carries a verdict (a valid ``drop`` of pool entry 9001) that
+# a wrongful salvage would return; the acceptance record differs.
+_DENIAL_TRANSCRIPTS_WITH_A_DROP = [
+    pytest.param(_denied_structured_output_lines(_SALVAGEABLE_DROP), id='denied-attempt'),
+    pytest.param(_structured_output_lines(_SALVAGEABLE_DROP), id='accepted-verdict'),
+]
+
+
+class TestGatedSchemaToolDenialEscalates:
+    """The gated analogue of
+    ``test_task_curator.py::test_schema_tool_denied_threads_to_report_failure``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('transcript_lines', _DENIAL_TRANSCRIPTS_WITH_A_DROP)
+    async def test_denial_reaches_report_failure(self, transcript_lines, tmp_path):
+        curator, escalator = _escalating_gated_curator(tmp_path)
+        invoke = _scripted_invoker((transcript_lines, _schema_tool_denied()))
+
+        decision = await _curate(curator, invoke, 'T')
+
+        assert decision.action == 'create'
+        escalator.report_failure.assert_awaited_once()
+        assert escalator.report_failure.await_args.kwargs['schema_tool_denied'] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('transcript_lines', _DENIAL_TRANSCRIPTS_WITH_A_DROP)
+    async def test_denial_does_not_reset_the_breaker(self, transcript_lines, tmp_path):
+        """ZOT, denial, ZOT: a denial is neither a ZOT nor a success, so the two
+        ZOTs reach the threshold of two and the fourth call short-circuits."""
+        curator, _ = _escalating_gated_curator(tmp_path, _breaker_config(threshold=2))
+        invoke = _scripted_invoker(
+            _ZOT, (transcript_lines, _schema_tool_denied()), _ZOT, _HEALTHY,
+        )
+
+        decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
+
+        assert decisions[1].action == 'create'
+        assert invoke.await_count == 3
+        assert decisions[3].justification == 'zero-output-breaker-open'
