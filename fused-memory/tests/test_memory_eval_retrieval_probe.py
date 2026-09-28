@@ -3490,7 +3490,8 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
 
     def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys):
         m = _mod()
-        _install_double(monkeypatch, _UnopenableStoreDouble())
+        double = _UnopenableStoreDouble()
+        _install_double(monkeypatch, double)
         out_root = tmp_path / 'out'
 
         code = m.main(self._argv(monkeypatch, tmp_path, out_root))
@@ -3501,6 +3502,7 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
         assert 'store' in errors[0]
         assert '/unwritable/queue-data' in errors[0]
         assert 'stdout' not in errors[0]
+        assert double.closed
         assert not list(out_root.rglob('metrics-*.json'))
 
     def test_an_out_root_that_cannot_be_written(self, monkeypatch, tmp_path, capsys):

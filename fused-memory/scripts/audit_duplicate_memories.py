@@ -3016,14 +3016,14 @@ async def _run(args: argparse.Namespace) -> int:
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
     try:
-        await memory.initialize()
-    except OSError as exc:
-        logger.error(
-            'ABORT: the memory store could not be opened (%s): %s',
-            type(exc).__name__, exc,
-        )
-        return 1
-    try:
+        try:
+            await memory.initialize()
+        except OSError as exc:
+            logger.error(
+                'ABORT: the memory store could not be opened (%s): %s',
+                type(exc).__name__, exc,
+            )
+            return 1
         # The ANN cutoff is READ from the calibration (or an explicit
         # override), PER CATEGORY. An empty mapping means no category is
         # calibrated: the ANN path is disabled and counted, never run against

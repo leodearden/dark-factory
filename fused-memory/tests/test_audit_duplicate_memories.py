@@ -4140,7 +4140,8 @@ class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
         assert len(aborts) == 1
         assert 'store' in aborts[0]
         assert 'stdout' not in aborts[0]
-        assert all(s.deleted == [] for s in _FakeMemoryService.instances)
+        assert _FakeMemoryService.instances[-1].closed
+        assert not list(tmp_path.rglob('metrics-*.json'))
 
     async def test_an_unwritable_metrics_root_deletes_nothing(
         self, monkeypatch, tmp_path, caplog,

@@ -3002,12 +3002,12 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
 
     memory = MemoryService(FusedMemoryConfig())
     try:
-        await memory.initialize()
-    except OSError as exc:
-        raise ProbeRunError(
-            f'the memory store could not be opened ({type(exc).__name__}): {exc}'
-        ) from exc
-    try:
+        try:
+            await memory.initialize()
+        except OSError as exc:
+            raise ProbeRunError(
+                f'the memory store could not be opened ({type(exc).__name__}): {exc}'
+            ) from exc
         return await run_probe(
             memory, registry,
             project_ids=tuple(args.project_id),
