@@ -8,6 +8,16 @@ c4639ec8) all three "new occurrences" carried ``stage1_cycle_summary_trim`` /
 ``stage2_cycle_summary_trim`` tombstones from one run: the capped cycle-summary
 pool evicting its oldest mirror, as designed, re-flagged every cycle.
 
+**Visibility limit.**  The gate recognises an id as swept only if the id
+carries a tombstone or was deleted in THIS cycle's buffered events.  An
+untombstoned deletion from an EARLIER cycle is neither, so it reads exactly
+like the run ids and present records a flag also names, and is ignored with
+them.  A flag re-aggregating such an id alongside benign-tombstoned ones is
+therefore dropped.  "Absent from Mem0" cannot close the gap: a run id is
+absent too, and would keep every flag.  The cycle whose buffer held that
+deletion does see it, and keeps any flag naming it; the Stage-1 prompt tells
+the LLM to report such an id in a flag of its own.
+
 This module imports only downward (flag_dedup, recon_self_model, the event
 model); none of those may import it back.
 """
@@ -139,9 +149,10 @@ async def filter_benign_sweep_deletion_flags(
     deletion visible at all.
 
     **Fail direction is KEEP.**  A flag is dropped only when it has at least
-    one swept id and every one is benign.  A single unexplained id, or no
-    swept id at all, keeps it; a raising or non-dict tombstone read counts as
-    untombstoned.  Every kept candidate gains ``sweep_deletion_provenance``
+    one swept id and every one is benign.  A single unexplained swept id, or
+    no swept id at all, keeps it; a raising or non-dict tombstone read counts
+    as untombstoned.  Only deletions visible to the gate can keep a flag: see
+    the module docstring's visibility limit.  Every kept candidate gains ``sweep_deletion_provenance``
     (``{'swept': [...], 'decision': 'kept_unexplained_deletion' |
     'kept_no_swept_ids'}``), so Stage 2 does not re-investigate its benign ids.
     Non-candidates are never looked up or annotated, each distinct id is read

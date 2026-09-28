@@ -206,6 +206,25 @@ async def test_benign_tombstone_counts_as_swept_without_a_deletion_event():
 
 
 @pytest.mark.asyncio
+async def test_prior_cycle_untombstoned_deletion_is_invisible_to_the_gate():
+    """(5b) The documented visibility limit: outside this cycle's buffer, an
+    untombstoned deletion reads like a run id, so a flag bundling it with
+    benign ids is DROPPED.  Closing this gap must update the module docstring
+    and the Stage-1 prompt, which state the limit."""
+    reader = _FakeTombstoneReader({
+        _SWEPT_A: _tombstone('stage1_cycle_summary_trim'),
+        _SWEPT_B: _tombstone('stage2_cycle_summary_trim'),
+    })
+    flag = _deletion_flag((_SWEPT_A, _SWEPT_B, _UNTOMBSTONED))
+
+    result = await filter_benign_sweep_deletion_flags(
+        reader, _PROJECT, [flag], events=[_deleted(_SWEPT_A), _deleted(_SWEPT_B)],
+    )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
 async def test_flag_naming_no_swept_id_is_kept():
     """(6) Run ids and present records are neither tombstoned nor deleted -> KEEP."""
     reader = _FakeTombstoneReader({})

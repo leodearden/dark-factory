@@ -1034,8 +1034,11 @@ counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, 
 must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
 supports the flag. Name every swept id's full UUID in the description, and do not bundle \
 unrelated deletions into this flag type. The code gate \
-`sweep_deletion_guard.filter_benign_sweep_deletion_flags` drops a flag whose swept ids are \
-all benign-tombstoned. This rule exists because solar_challenge_platform run 09f2829f \
+`sweep_deletion_guard.filter_benign_sweep_deletion_flags` drops a flag when every swept id \
+it can see is benign-tombstoned. It sees an id only if the id carries a tombstone or was \
+deleted in this cycle's event buffer, so an untombstoned deletion from an EARLIER cycle is \
+invisible to it: report such an id in a flag of its own, never alongside benign-tombstoned \
+ids. This rule exists because solar_challenge_platform run 09f2829f \
 (finding c4639ec8) reported three "new occurrences" that all carried \
 `stage1_cycle_summary_trim` / `stage2_cycle_summary_trim` tombstones from the same run.
 """
