@@ -6023,6 +6023,14 @@ async def filter_already_recorded_caveat_flags(
     ``delete_memory``; here a wrong KEEP costs one extra cycle, while a wrong
     DROP would silence a genuinely missing caveat on every cycle.
 
+    **Known false-drop shape.**  The id's presence is taken as proof that the
+    caveat landed; the caveat itself is never read.  A task whose metadata
+    already named the caveat-source memory for another reason, such as being
+    filed from it before the caveat was written, is dropped on every cycle
+    even though the caveat is missing.  Only prose distinguishes the two
+    entries, and metadata entries carry no timestamp to compare with the
+    memory's ``created_at``, so the shape is accepted rather than parsed out.
+
     Shares its drop rule with :func:`filter_accounted_cluster_growth_flags`
     via :func:`_drop_flags_accounted_in_task_text`.  Returns a new list in
     input order; the input list and surviving flags are never mutated.
