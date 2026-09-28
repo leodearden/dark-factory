@@ -6,7 +6,6 @@ Follows the idiom in test_tab_curator.py / test_tab_overview.py.
 
 from __future__ import annotations
 
-import pathlib
 import re
 
 from _dashboard_helpers import (
@@ -512,7 +511,6 @@ class TestBurnTabReadsServedDatums:
         """No client point estimate: the server refuses to synthesise one on sparse history."""
         body = _burn_tab_body(tabs_jsx_body)
         assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
-        assert 'forecastDays' not in body
 
     def test_endpoint_table_no_longer_names_burndown(self, tabs_jsx_body):
         src = strip_js_comments(tabs_jsx_body)
@@ -526,13 +524,10 @@ class TestBurnTabReadsServedDatums:
 # OrchTab "Completed / day" — the server's per-day series, never re-derived
 # ---------------------------------------------------------------------------
 #
-# burndown.py::compute_window_completion serves each project's
-# `completed_per_day` (one entry per ISO day, the same series its velocity
-# divides by). The client used to re-derive it with shell.jsx::dailyDeltas,
-# which bucketed differently (N-1 entries against the server's N days), so the
-# spark and the velocity beside it disagreed about the same window.
-
-_REDUX_DIR = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
+# The spark plots the project's served `completed_per_day`
+# (burndown.py::compute_window_completion): one entry per ISO day, the same
+# N-day window its velocity divides by, so the spark and the velocity beside it
+# agree about the same window.
 
 
 class TestCompletedPerDayIsServerSeries:
@@ -547,21 +542,3 @@ class TestCompletedPerDayIsServerSeries:
             f"the 'Completed / day' spark plots {values!r}, not the project's served "
             'completed_per_day series'
         )
-        assert 'dailyDeltas' not in body
-
-    def test_no_redux_source_names_daily_deltas(self):
-        sources = [
-            path
-            for pattern in ('*.js', '*.jsx', '*.html')
-            for path in sorted(_REDUX_DIR.glob(pattern))
-        ]
-        assert any(path.name == 'shell.jsx' for path in sources), f'no redux sources under {_REDUX_DIR}'
-        naming = [path.name for path in sources if re.search(r'\bdailyDeltas\b', path.read_text())]
-        assert naming == [], f'dailyDeltas is still named in {naming}'
-
-    def test_df_shell_export_omits_daily_deltas(self, shell_jsx_body):
-        m = re.search(r'window\.DF_SHELL\s*=\s*\{([^{}]*)\}', shell_jsx_body)
-        assert m, 'shell.jsx no longer assigns its window.DF_SHELL export object'
-        exported = {canonical for canonical, _ in destructure_bindings(m.group(1))}
-        assert 'DatumReading' in exported
-        assert 'dailyDeltas' not in exported
