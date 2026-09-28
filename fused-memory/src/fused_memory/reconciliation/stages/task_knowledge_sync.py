@@ -2496,6 +2496,27 @@ async def retire_flag_markers_for_terminal_task(
     "gate disabled", and the sweep would then delete every member of the pool
     past the age cutoff, whatever task it cites.
 
+    **Idempotent per TASK, never per event.** done is not once-per-task (265
+    of 8,366 (task, project) pairs fired it more than once, one task 11 times),
+    so the action is keyed on the task (``terminal_task_ids=(task_id,)``) and
+    is a pure function of live Mem0 state: enumerate, gate, delete. It keeps no
+    counter, appends nothing and writes nothing back, so running it N times
+    leaves the same state as running it once — a repeat firing finds the
+    victims already gone and retires 0 — and, since nothing on this path writes
+    or restores a memory, nothing can be resurrected. Adding any event-counted
+    or accumulating side effect here (a tally, a metric persisted per firing, a
+    re-add) would break that. No durable per-(task, project) dedup key is
+    needed or wanted: the idempotence is structural, not bookkeeping.
+
+    **No reversal path, by design.** Reopen is rare on the data — 21 of 2,737
+    dark_factory tasks that fired the hook are no longer done (0.77%), 14 of
+    3,995 carry any reopen key (0.35%) — and a reversal hook could not fire
+    anyway: ``TaskInterceptor.STATUS_TRIGGERS`` excludes pending and
+    in-progress, so a task leaving done fires nothing (of 66 transitions
+    following a task_done, 24 were another task_done with no hook event
+    between). The sweep handles reopen for free: a reopened task stops matching
+    the terminal gate, so nothing further is retired.
+
     Returns:
         Number of markers retired (the sweep's own count).
     """

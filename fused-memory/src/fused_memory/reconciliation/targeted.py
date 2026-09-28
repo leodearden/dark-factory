@@ -630,6 +630,14 @@ class TargetedReconciler:
         #      which is why the sweep is primary and this path may lose work. The
         #      same holds when the reconciler is not wired at all (reconciliation
         #      disabled, or no task backend at boot): the sweep covers it.
+        #
+        #      Keyed on the TASK, never the event: done can fire several times
+        #      per task, and a repeat finds the victims already gone and retires
+        #      0. Nothing here writes or restores a memory, so nothing can be
+        #      resurrected, and there is deliberately no reversal on reopen. Do
+        #      not add an event-counted or accumulating side effect here — it
+        #      would break that idempotence. Full contract and data:
+        #      stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task.
         try:
             retired = await retire_flag_markers_for_terminal_task(
                 self.memory, str(scope.project_id), run_id, task_id=task_id,
