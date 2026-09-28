@@ -27,6 +27,7 @@ a nested-pytest end-to-end failure contract with a non-vacuity control.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import shutil
 import signal
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -61,6 +63,7 @@ from df_pytest_isolation import (  # noqa: E402
     read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -350,6 +353,128 @@ class TestRunInNewSession:
             f'pgid {ordinary} is an ordinary unrelated group and must be allowed, '
             'or the helper degrades to never group-killing anything.'
         )
+
+
+def _pid_recorded(pidfile: Path) -> Callable[[], bool]:
+    """A condition that holds once the leaker has written its grandchild's pid."""
+    def condition() -> bool:
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+    return condition
+
+
+def _never() -> bool:
+    return False
+
+
+class TestRunInNewSessionUntil:
+    """The spawner stops the whole process group once an observed condition holds."""
+
+    def test_it_stops_the_group_as_soon_as_the_condition_holds(self, tmp_path: Path) -> None:
+        """The elapsed bound is the non-vacuity proof: a stop on the 60s deadline
+        would have raised, and a stop on the condition returns in seconds."""
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            started = time.monotonic()
+            outcome = run_in_new_session_until(
+                ['bash', str(leaker)], condition=_pid_recorded(pidfile),
+                env=_leaker_env(pidfile), timeout=60,
+            )
+            elapsed = time.monotonic() - started
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert outcome.stopped_on_condition is True
+            assert elapsed < 15, (
+                f'the spawn took {elapsed:.1f}s to stop on a condition that held '
+                'as soon as the leaker recorded its pid.'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid}, a grandchild backgrounded by the spawned '
+                'script, is STILL ALIVE after the condition stopped the spawn: '
+                'the stop reached the direct child only.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_output_printed_before_the_stop_is_kept(self, tmp_path: Path) -> None:
+        flag = tmp_path / 'ready.flag'
+        env = dict(os.environ)
+        env['FLAG'] = str(flag)
+
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo READY; : > "$FLAG"; sleep 300'],
+            condition=flag.exists, env=env, timeout=60,
+        )
+
+        assert outcome.stopped_on_condition is True
+        assert 'READY' in outcome.completed.stdout
+
+    def test_a_child_that_exits_first_is_reported_as_completed(self) -> None:
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'], condition=_never, timeout=30,
+        )
+
+        assert outcome.stopped_on_condition is False
+        assert isinstance(outcome.completed, subprocess.CompletedProcess)
+        assert outcome.completed.returncode == 3
+        assert outcome.completed.stdout == 'hi\n'
+        assert outcome.completed.stderr == 'boom\n'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            outcome.stopped_on_condition = True  # type: ignore[misc]
+
+    def test_the_deadline_still_binds_and_kills_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=_never,
+                    env=_leaker_env(pidfile), timeout=2,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the deadline path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the deadline fired: the '
+                'deadline path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_condition_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def condition() -> bool:
+            if pid_recorded():
+                raise RuntimeError('condition blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='condition blew up'):
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=condition,
+                    env=_leaker_env(pidfile), timeout=60,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the condition raised: an '
+                'exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
 
 
 class TestWaitProofGraceSecs:
