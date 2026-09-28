@@ -41,18 +41,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from write_triage_attach_fixtures import write_fake_triage
 
 _HERE = Path(__file__).resolve().parent
-# The repo-wide `--import-mode=importlib` addopts keeps a test file's own
-# directory off sys.path, and scripts/tests/conftest.py inserts scripts/ but not
-# scripts/tests/. Without this the sibling fixture module — shared with
-# test_check_write_triage_attach_consumption.py so the two suites cannot lay
-# down different triage modules — is unimportable.
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-from write_triage_attach_fixtures import write_fake_triage  # noqa: E402
-
 _REPO_ROOT = _HERE.parents[1]
 _GATE_SCRIPT = _REPO_ROOT / 'scripts' / 'check_write_triage_flip_preconditions.sh'
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
