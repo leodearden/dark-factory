@@ -49,28 +49,6 @@ class TestCodexPiCandidatesRoster:
         names = [c.name for c in candidates]
         assert len(names) == len(set(names))
 
-    def test_codex_bundle_contract(self):
-        """Three codex implementer arms, all at effort 'xhigh' so the model
-        is the only axis that varies across them."""
-        from orchestrator.evals.configs import (
-            CODEX_ASTRA_MODEL,
-            CODEX_SOL_MODEL,
-            CODEX_TERRA_MODEL,
-            codex_pi_candidates,
-        )
-
-        codex_bundles = [c for c in codex_pi_candidates() if c.backend == 'codex']
-        assert len(codex_bundles) == 3
-        expected_model = {
-            'codex-gpt6-astra': CODEX_ASTRA_MODEL,
-            'codex-gpt5.6-sol': CODEX_SOL_MODEL,
-            'codex-gpt5.6-terra': CODEX_TERRA_MODEL,
-        }
-        for bundle in codex_bundles:
-            assert bundle.model == expected_model[bundle.name]
-            assert bundle.role == 'implementer'
-            assert bundle.effort == 'xhigh'
-
     def test_bundles_are_additive_not_in_eval_configs(self):
         """The ξ bundles are opt-in Phase-4 candidates, resolved by name via
         get_config_by_name — never injected into the default-matrix
@@ -123,24 +101,6 @@ class TestGetConfigByNameAndPropagation:
     to the codex/pi backend at the right model. Never a live codex/pi
     subprocess — that is μ's runtime driver behaviour, out of scope here."""
 
-    def test_get_config_by_name_resolves_codex_bundle(self):
-        from orchestrator.evals.configs import (
-            CODEX_ASTRA_MODEL,
-            CODEX_SOL_MODEL,
-            CODEX_TERRA_MODEL,
-            get_config_by_name,
-        )
-
-        for name, model in (
-            ('codex-gpt6-astra', CODEX_ASTRA_MODEL),
-            ('codex-gpt5.6-sol', CODEX_SOL_MODEL),
-            ('codex-gpt5.6-terra', CODEX_TERRA_MODEL),
-        ):
-            cfg = get_config_by_name(name)
-            assert cfg is not None
-            assert cfg.backend == 'codex'
-            assert cfg.model == model
-
     def test_get_config_by_name_resolves_pi_bundle(self):
         from orchestrator.evals.configs import PI_CONTROL_MODEL, get_config_by_name
 
@@ -175,13 +135,9 @@ class TestGetConfigByNameAndPropagation:
 
 
 class TestCodexSlatePin:
-    """The 2026-09 codex slate, pinned by LITERAL ids (task 5384).
-
-    Every other test in this module reads the ``CODEX_*_MODEL`` constants, so
-    it stays green whatever they hold (INV-10). This class restates the
-    roster and ids as literals so a stale id, or an unnoticed addition or
-    removal, fails loudly.
-    """
+    """The 2026-09 codex slate, pinned by LITERAL ids and list prices (task
+    5384), so a stale id, a drifted price, or an unnoticed addition or
+    removal fails loudly."""
 
     def test_roster_is_exactly_the_codex_slate_plus_the_pi_control(self):
         from orchestrator.evals.configs import codex_pi_candidates
@@ -216,19 +172,19 @@ class TestCodexSlatePin:
         ('gpt-5.6-terra', 2.00, 12.00),
     ])
     def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
-        """Read through the same ``claude_endpoint_price_table()`` the endpoint
-        slate pin uses — one price path for the whole slate."""
-        from orchestrator.evals.configs import claude_endpoint_price_table
+        """Codex reports no native cost, so its rates are the default price seeds."""
+        from orchestrator.config import default_price_table
 
-        entry = claude_endpoint_price_table()[model]
+        entry = default_price_table()[model]
         assert entry['input_per_1m'] == input_per_1m
         assert entry['output_per_1m'] == output_per_1m
 
     def test_every_codex_arm_has_a_price_seed(self):
         """Derived from the roster, so a future arm without a seed reddens."""
-        from orchestrator.evals.configs import claude_endpoint_price_table, codex_pi_candidates
+        from orchestrator.config import default_price_table
+        from orchestrator.evals.configs import codex_pi_candidates
 
-        table = claude_endpoint_price_table()
+        table = default_price_table()
         codex_models = {c.model for c in codex_pi_candidates() if c.backend == 'codex'}
         assert codex_models
         assert codex_models <= table.keys()

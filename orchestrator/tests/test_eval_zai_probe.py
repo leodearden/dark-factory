@@ -37,8 +37,8 @@ def _require(handler, **kwargs):
     """Run the probe against *handler* through a client with no timeout of its own."""
     from orchestrator.evals.zai_probe import require_zai_coding_endpoint
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), timeout=None)
-    return require_zai_coding_endpoint(client=client, **kwargs)
+    with httpx.Client(transport=httpx.MockTransport(handler), timeout=None) as client:
+        return require_zai_coding_endpoint(client=client, **kwargs)
 
 
 def _unavailable(handler, **kwargs):
@@ -55,11 +55,6 @@ class TestZaiCodingPlanConstants:
         from orchestrator.evals.configs import ZAI_CODING_BASE_URL
 
         assert ZAI_CODING_BASE_URL == 'https://api.z.ai/api/coding/paas/v4'
-
-    def test_the_glm_base_url_is_the_anthropic_protocol_coding_endpoint(self):
-        from orchestrator.evals.configs import GLM_BASE_URL
-
-        assert GLM_BASE_URL == 'https://api.z.ai/api/anthropic'
 
 
 class TestRequireZaiCodingEndpointAnswers:

@@ -365,19 +365,6 @@ class TestCandidatePriceCostBasis:
         with pytest.raises(dataclasses.FrozenInstanceError):
             price.input_per_1m = 0.0  # type: ignore[misc]
 
-    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
-    def test_price_table_projection_stays_rates_only(
-        self, model, input_per_1m, output_per_1m,
-    ):
-        """runner.py builds ``PriceEntry(**rates)`` from this table, so the
-        cost-basis tag must not leak into the projection."""
-        from orchestrator.evals.configs import claude_endpoint_price_table
-
-        assert claude_endpoint_price_table()[model] == {
-            'input_per_1m': input_per_1m,
-            'output_per_1m': output_per_1m,
-        }
-
 
 class TestEndpointSlatePin:
     """The 2026-09 endpoint slate, pinned by LITERAL ids and list prices.
@@ -408,12 +395,15 @@ class TestEndpointSlatePin:
             assert by_name[name].model == model
 
     @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
-    def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
+    def test_list_prices_are_pinned_as_rates_only(self, model, input_per_1m, output_per_1m):
+        """Exact equality also pins that the cost-basis tag stays out of this
+        projection, which runner.py unpacks into ``PriceEntry(**rates)``."""
         from orchestrator.evals.configs import claude_endpoint_price_table
 
-        entry = claude_endpoint_price_table()[model]
-        assert entry['input_per_1m'] == input_per_1m
-        assert entry['output_per_1m'] == output_per_1m
+        assert claude_endpoint_price_table()[model] == {
+            'input_per_1m': input_per_1m,
+            'output_per_1m': output_per_1m,
+        }
 
     def test_base_urls_are_pinned(self):
         from orchestrator.evals.configs import claude_endpoint_candidates

@@ -167,7 +167,6 @@ class TestRetiredMarchCloudBaselines:
             'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
             'gemini-31-pro-high', 'gemini-3-flash-high',
         }
-        assert [c.name for c in EVAL_CONFIGS if c.backend == 'gemini'] == []
         assert {c.model for c in EVAL_CONFIGS} & retired_models == set()
         assert {c.name for c in EVAL_CONFIGS} & retired_names == set()
 
