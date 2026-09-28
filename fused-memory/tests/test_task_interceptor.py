@@ -13897,6 +13897,50 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             f"metadata='' must not emit a discard WARNING; got {[r.message for r in warns]!r}"
         )
 
+    @pytest.mark.parametrize('raw', ['{not json', [1], 42])
+    def test_inject_helpers_discard_unreadable_metadata_naming_their_site(self, raw, caplog):
+        """Unreadable metadata is replaced by a fresh dict; each helper names its site."""
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+
+        verdict = PathGuardVerdict(
+            outcome='rejection', matched_paths=('x/',), suggested_project='other'
+        )
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            routed = TaskInterceptor._inject_routing_override(raw, 'why')
+            gated = TaskInterceptor._inject_deterministic_pure_gate(raw)
+            scoped: dict[str, Any] = {'metadata': raw}
+            TaskInterceptor._attach_possible_scope_mismatch(scoped, verdict)
+            marked: dict[str, Any] = {'metadata': raw}
+            TaskInterceptor._attach_cross_repo_marker(marked, 'other')
+        assert routed == {'routing_override_reason': 'why'}
+        assert gated == {'task_kind': 'deterministic', 'always_escalates': True}
+        assert list(scoped['metadata']) == ['possible_scope_mismatch']
+        assert marked['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        for site in (
+            'routing-override',
+            'deterministic-pure-gate',
+            'scope-mismatch-advisory',
+            'cross-repo-marker',
+        ):
+            assert any(m.startswith(f'{site}: non-dict metadata discarded') for m in messages), (
+                f'{site} must name itself in the discard WARNING; got {messages!r}'
+            )
+        census = [m for m in messages if 'task_metadata.schema_warning' in m]
+        assert len(census) == 4, f'one census line per helper call; got {messages!r}'
+
+    def test_inject_helpers_copy_rather_than_mutate_a_dict_input(self):
+        """A readable dict input is shallow-copied, never stamped in place."""
+        original = {'keep': 1}
+        routed = TaskInterceptor._inject_routing_override(original, 'why')
+        gated = TaskInterceptor._inject_deterministic_pure_gate(original)
+        assert routed == {'keep': 1, 'routing_override_reason': 'why'}
+        assert gated == {'keep': 1, 'task_kind': 'deterministic', 'always_escalates': True}
+        assert original == {'keep': 1}
+
     @pytest.mark.parametrize(
         'raw',
         [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],

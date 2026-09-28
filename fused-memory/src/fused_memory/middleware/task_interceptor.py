@@ -3145,6 +3145,28 @@ class TaskInterceptor:
         return parsed
 
     @staticmethod
+    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
+        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
+
+        Absent metadata gives a fresh ``{}``, and a readable dict is
+        shallow-copied, so the caller's dict is never mutated. Unreadable
+        metadata is DISCARDED for a fresh ``{}``. On top of the census line
+        :meth:`_extract_metadata_dict` already emitted, a second WARNING
+        prefixed with *site* is logged: two log lines for one failure, so the
+        discard can be grepped by caller.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            logger.warning(
+                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
+                site,
+                type(metadata).__name__,
+                metadata,
+            )
+            return {}
+        return dict(meta)
+
+    @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
         """True when *metadata* declares an escalation gate (task 3446).
 
@@ -3176,7 +3198,7 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
         shape (absent or unreadable → fresh dict) before writing the key, so
         the result is always a plain dict ready for JSON serialisation.
 
@@ -3188,17 +3210,7 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                'routing-override: non-dict metadata discarded (type=%s); '
-                'using fresh dict. Original value: %r',
-                type(metadata).__name__,
-                metadata,
-            )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
         meta['routing_override_reason'] = reason
         return meta
 
@@ -3206,7 +3218,7 @@ class TaskInterceptor:
     def _inject_deterministic_pure_gate(metadata: Any) -> dict:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
         shape (absent or unreadable → fresh dict) before writing the keys, so
         the result is always a plain dict ready for JSON serialisation —
         mirrors :meth:`_inject_routing_override`.
@@ -3219,24 +3231,7 @@ class TaskInterceptor:
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            # NOTE: _extract_metadata_dict() already emitted a WARNING
-            # (via _warn_metadata_discard) when it failed to parse this
-            # unreadable metadata. This second WARNING is intentional, not
-            # a duplicate bug — it names *this* call site
-            # (deterministic-pure-gate stamping) so the discard is
-            # greppable by caller, mirroring the identical double-log in
-            # _inject_routing_override above. Two log lines, one failure.
-            logger.warning(
-                'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
-                'using fresh dict. Original value: %r',
-                type(metadata).__name__,
-                metadata,
-            )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
@@ -3253,7 +3248,7 @@ class TaskInterceptor:
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
         — normalises the existing ``kwargs['metadata']`` (via
-        :meth:`_extract_metadata_dict`: absent or unreadable → fresh dict,
+        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
         unreadable input discarded with a WARNING, same as the override path)
         into a plain dict, sets ``possible_scope_mismatch``, and writes the
         result back into ``kwargs['metadata']`` in place.
@@ -3278,18 +3273,9 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                'scope-mismatch-advisory: non-dict metadata discarded (type=%s); '
-                'using fresh dict. Original value: %r',
-                type(metadata).__name__,
-                metadata,
-            )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(
+            kwargs.get('metadata'), 'scope-mismatch-advisory'
+        )
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -3306,7 +3292,7 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (via :meth:`_extract_metadata_dict`: absent or unreadable
+        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
         → fresh dict, unreadable input discarded with a WARNING) and, like
         it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
@@ -3317,18 +3303,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                'cross-repo-marker: non-dict metadata discarded (type=%s); '
-                'using fresh dict. Original value: %r',
-                type(metadata).__name__,
-                metadata,
-            )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
