@@ -588,6 +588,43 @@ def test_find_matching_transcript_unbound_slash_command_other_command_same_args_
 
 
 # ---------------------------------------------------------------------------
+# task 5873: a finding names the bound claude_session_id
+# ---------------------------------------------------------------------------
+
+_LOST_SESSION_ID = "fbc45451-7894-4330-961f-ba377c9ce8a3"
+
+
+def test_find_missing_transcripts_finding_carries_bound_claude_session_id(tmp_path):
+    projects = tmp_path / "projects"
+    bound = _spawn_record(
+        "sess-lost-bound", _DF_CWD, _USABLE_PROMPT, claude_session_id=_LOST_SESSION_ID,
+    )
+    unbound = _spawn_record(
+        "sess-lost-unbound", _DF_CWD,
+        "Diagnose the stuck reconciliation on task 2701 and summarise the root cause.",
+    )
+
+    findings = mod.find_missing_transcripts(
+        [bound, unbound], projects, [_DF_CWD],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert len(findings) == 2
+    by_slug = {f.session_slug: f for f in findings}
+    assert by_slug["sess-lost-bound"].claude_session_id == _LOST_SESSION_ID
+    assert by_slug["sess-lost-unbound"].claude_session_id is None
+
+
+def test_build_escalation_arguments_names_bound_claude_session_id(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    finding = _missing_finding(claude_session_id=_LOST_SESSION_ID)
+
+    args = mod._build_escalation_arguments([finding], cfg, force_persistence_ok=None)
+
+    assert _LOST_SESSION_ID in args["detail"]
+
+
+# ---------------------------------------------------------------------------
 # step-9/10: pure preventer guard — payload_exports_force_persistence
 # (fixture strings ONLY — never the real committed spawn-claude.sh)
 # ---------------------------------------------------------------------------
@@ -721,6 +758,8 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
+    *,
+    claude_session_id: str | None = None,
 ) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
@@ -729,6 +768,7 @@ def _missing_finding(
         start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
         exit_code=0,
         expected_dir=Path("/tmp/projects") / mod.inventory.encode_cwd(cwd),
+        claude_session_id=claude_session_id,
     )
 
 
