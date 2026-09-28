@@ -1428,8 +1428,10 @@ def census_report_sections(
             "## Recorded, Not Filed",
             "",
             f"- {len(withheld)} verified cluster(s) were promoted into the codebook "
-            f"but not filed: each has fewer than {filing_policy.MIN_UNREMEDIATED_SIGHTINGS} "
-            "sightings and no in-tree remediation from the verifier.",
+            f"and marked withheld, not filed: each has fewer than "
+            f"{filing_policy.MIN_UNREMEDIATED_SIGHTINGS} sightings and no in-tree "
+            "remediation from the verifier. Each files automatically once a later "
+            f"census counts {filing_policy.MIN_UNREMEDIATED_SIGHTINGS} sightings of it.",
         ]
         recorded_not_filed.extend(
             f"  - {cluster.title} (sightings: {cluster.sighting_count})" for cluster in withheld
@@ -1502,6 +1504,23 @@ def render_report(
 # -> matrix -> codebook update -> file tasks -> report -> advance state
 # ---------------------------------------------------------------------------
 
+def _cluster_record(
+    *, title, cause, area, origin_phase, manifested_phase, evidence, sightings,
+) -> dict:
+    """The one shape of a verification/filing cluster, whichever record it
+    was built from."""
+    return {
+        "title": title,
+        "summary": cause or title,
+        "cause": cause,
+        "area": area,
+        "origin_phase": origin_phase,
+        "manifested_phase": manifested_phase,
+        "evidence": evidence,
+        "sightings": sightings,
+    }
+
+
 def _novel_clusters(records: list[dict]) -> list[dict]:
     """Build one verification cluster per DISTINCT candidate title carried
     by a non-duplicate mining record (``is_duplicate`` False -- a candidate
@@ -1544,22 +1563,21 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
             manifested_phase = candidate.get("manifested_phase") or "unknown"
             evidence_quote = candidate.get("evidence_quote")
             clusters.append(
-                {
-                    "title": title,
-                    "summary": candidate.get("cause") or title,
-                    "cause": candidate.get("cause"),
-                    "area": candidate.get("area"),
-                    "origin_phase": origin_phase,
-                    "manifested_phase": manifested_phase,
-                    "evidence": [evidence_quote] if evidence_quote else [],
-                    "sightings": [
+                _cluster_record(
+                    title=title,
+                    cause=candidate.get("cause"),
+                    area=candidate.get("area"),
+                    origin_phase=origin_phase,
+                    manifested_phase=manifested_phase,
+                    evidence=[evidence_quote] if evidence_quote else [],
+                    sightings=[
                         {
                             "session": session,
                             "origin_phase": origin_phase,
                             "manifested_phase": manifested_phase,
                         }
                     ],
-                }
+                )
             )
     return clusters
 
@@ -1620,6 +1638,79 @@ def _split_fileable(
                 title=cluster.get("title"), sighting_count=sighting_count,
             ))
     return fileable, tuple(withheld)
+
+
+_RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
+"""Entry statuses a withheld entry may still be filed from: a fixed or
+retired confusion needs no ticket."""
+
+
+def _entry_cluster(cb: dict, entry: dict) -> dict:
+    """A fileable cluster rebuilt from codebook *entry*. Its cause and area are
+    the entry's own when a correction has written them, else those of the
+    candidate it was promoted from."""
+    source = _promoted_from(cb, entry["id"]) or {}
+    sightings = list(entry.get("sightings") or [])
+    return _cluster_record(
+        title=entry["title"],
+        cause=entry.get("cause") or source.get("cause"),
+        area=entry.get("area") or source.get("area"),
+        origin_phase=entry["origin_phase"],
+        manifested_phase=entry["manifested_phase"],
+        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
+        sightings=sightings,
+    )
+
+
+@dataclass(frozen=True)
+class PendingFiling:
+    """One cluster to file this run. A genuine ticket for it releases the
+    withheld codebook entry *withheld_entry_id* names, if any."""
+
+    cluster: dict
+    withheld_entry_id: str | None = None
+
+
+def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
+    """Every cluster to file this run, from the post-merge codebook *cb*.
+
+    Each *fileable* cluster is paired with the releasable withheld entry of
+    its title, if any -- a recurrence coded as a fresh candidate files one
+    ticket for its title, not two. Every other releasable withheld entry that
+    ``filing_policy.is_fileable`` now accepts at its title's sighting count
+    follows. An entry withheld THIS run is never among them: the split that
+    withheld it used that same count."""
+    releasable = [
+        entry for entry in cb.get("entries") or []
+        if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
+        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
+    ]
+    entry_id_by_title: dict[str | None, str] = {}
+    for entry in releasable:
+        entry_id_by_title.setdefault(entry["title"], entry["id"])
+
+    queue = [
+        PendingFiling(cluster, entry_id_by_title.get(cluster.get("title")))
+        for cluster in fileable
+    ]
+    paired = {pending.withheld_entry_id for pending in queue}
+    for entry in releasable:
+        if entry["id"] in paired:
+            continue
+        cluster = _entry_cluster(cb, entry)
+        sighting_count = _title_sighting_count(cb, entry["title"])
+        if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
+            queue.append(PendingFiling(cluster, entry["id"]))
+    return queue
+
+
+def _promoted_from(cb: dict, entry_id: str) -> dict | None:
+    """The candidate ``promote_candidate`` promoted to entry *entry_id*, found
+    by its ``promoted_to`` link."""
+    for candidate in cb.get("candidates") or []:
+        if candidate.get("promoted_to") == entry_id:
+            return candidate
+    return None
 
 
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
@@ -1973,13 +2064,19 @@ class CensusOutcome:
     without a hand re-open."""
 
     withheld: tuple[filing_policy.WithheldCluster, ...] = ()
-    """Verified clusters promoted into the codebook but NOT filed, because
-    ``filing_policy.is_fileable`` found neither an in-tree remediation nor a
-    recurrence (``"done"`` and ``"unlanded"`` runs only)."""
+    """Verified clusters promoted into the codebook, marked withheld, and NOT
+    filed, because ``filing_policy.is_fileable`` found neither an in-tree
+    remediation nor a recurrence (``"done"`` and ``"unlanded"`` runs only).
+    Each files automatically once a later census counts
+    ``filing_policy.MIN_UNREMEDIATED_SIGHTINGS`` sightings of it."""
 
     cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
     """The subset of ``filed_ticket_ids`` filed into a project other than the
     observed one, each naming the project_root ``resolve_ticket`` needs."""
+
+    released_entry_ids: tuple[str, ...] = ()
+    """Withheld codebook entries filed this run because they recurred, each
+    now marked ``filing: filed``."""
 
 
 def _defer(
@@ -2184,11 +2281,13 @@ def run_census(
     anything is written, on an invalid merge) -> the singleton filing gate
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
-    one stays promoted and is listed in the report) -> ``build_task_payloads``
-    over the fileable clusters + *submit_fn* per payload, best-effort (a
-    raised exception, or a result carrying no ticket id, is logged and
-    excluded from ``filed_ticket_ids`` rather than aborting the run or
-    inflating the filed count) ->
+    one stays promoted, is marked withheld on its entry and is listed in the
+    report) -> ``_filing_queue``, which adds every earlier-withheld entry that
+    has since recurred -> ``build_task_payloads`` over that queue + *submit_fn*
+    per payload, best-effort (a genuine ticket for a withheld entry marks it
+    filed, so it is never filed twice; a raised exception, or a result
+    carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
+    rather than aborting the run or inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
     ``codebook.dump`` -> ``advance_census_state`` (done-count from
     *status_fetcher*) -> *commit* of report + codebook + state. A *commit*
@@ -2628,11 +2727,14 @@ def run_census(
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook.
+    filing_queue = _filing_queue(fileable, updated_codebook)
     task_payloads = build_task_payloads(
-        fileable, project_root=project_root, project_id=project_id, harness=harness_project,
+        [pending.cluster for pending in filing_queue],
+        project_root=project_root, project_id=project_id, harness=harness_project,
     )
     filed_ticket_ids = []
     cross_project_tickets: list[CrossProjectTicket] = []
+    released_tickets: dict[str, str] = {}
     dry_run_filing = None
     if dry_run_payloads_path is not None:
         # --dry-run-filing: write the payloads for human review and file
@@ -2670,6 +2772,16 @@ def run_census(
             "matches, not candidates, and the census window has re-anchored).",
             len(task_payloads), resolved_path,
         )
+        withheld_offered = sum(
+            1 for pending in filing_queue if pending.withheld_entry_id is not None
+        )
+        if withheld_offered:
+            logger.warning(
+                "census: --dry-run-filing -- %d of those payload(s) are withheld "
+                "codebook entries that have since recurred; they stay marked "
+                "withheld, so the next real census re-offers them.",
+                withheld_offered,
+            )
         # Every downstream consumer -- the report's Filed Tasks section, the
         # commit paths and CensusOutcome -- reads the path off this one
         # object, so they all name the file actually written.
@@ -2677,7 +2789,7 @@ def run_census(
             path=str(resolved_path), payload_count=len(task_payloads),
         )
     else:
-        for payload in task_payloads:
+        for pending, payload in zip(filing_queue, task_payloads, strict=True):
             try:
                 submit_result = submit_fn(**payload)
             except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
@@ -2697,6 +2809,15 @@ def run_census(
                 cross_project_tickets.append(
                     CrossProjectTicket(ticket_id=ticket_id, project_root=payload["project_root"]),
                 )
+            if pending.withheld_entry_id is not None:
+                updated_codebook = mark_entry_filed(updated_codebook, pending.withheld_entry_id)
+                released_tickets[pending.withheld_entry_id] = ticket_id
+        if released_tickets:
+            logger.info(
+                "census: %d withheld codebook entr(ies) recurred and were filed "
+                "(entry -> ticket): %s",
+                len(released_tickets), released_tickets,
+            )
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -2796,6 +2917,7 @@ def run_census(
         unresolved_verdicts=len(dropped_verdicts),
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
+        released_entry_ids=tuple(released_tickets),
     )
     commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
     if dry_run_filing is not None:
