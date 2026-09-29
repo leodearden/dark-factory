@@ -526,6 +526,34 @@ async def test_await_group_membership_polls_through_fork_exec_window():
             await proc2.wait()
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_group_terminated_accepts_unreaped_zombies_and_fails_loudly_on_a_live_member(
+    unreaped_zombie_pgid, tmp_path
+):
+    """_await_group_terminated concludes on termination, never on anyone's reap.
+
+    (a) It returns while the zombie group still exists (killpg succeeds
+    afterwards): the state on which the killpg-based probe it replaces timed
+    out, red in task 6024's merge verify while systemd --user stalled.
+    (b) A running member exhausts the budget and raises the typed failure,
+    carrying the running members as data.
+    """
+    await _await_group_terminated(unreaped_zombie_pgid)
+    os.killpg(unreaped_zombie_pgid, 0)
+
+    proc = await _spawn_sleeper_in(tmp_path)
+    pgid = proc.pid
+    try:
+        with pytest.raises(_GroupTerminationTimeout) as excinfo:
+            await _await_group_terminated(pgid, timeout=0.2, min_attempts=2)
+        assert isinstance(excinfo.value, AssertionError)
+        assert [m.pid for m in excinfo.value.running] == [pgid]
+    finally:
+        _kill_group(pgid)
+        await proc.wait()
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
