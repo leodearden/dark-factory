@@ -3,12 +3,13 @@
 import json
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
 
@@ -19,10 +20,6 @@ from fused_memory.models.reconciliation import VerificationResult, VerificationV
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
-    _sweep_stale_mem0_flag_for_stage2_markers,
-)
 from fused_memory.reconciliation.targeted import TargetedReconciler
 from fused_memory.reconciliation.verify import CodebaseVerifier
 
@@ -3391,10 +3388,10 @@ def test_format_outcome_echo_no_mid_number_splice_regression():
 
 def _authoritative_precheck_calls(memory_service) -> list:
     """Section 0's per-task pre-check calls, told apart from section 0.6's
-    {'flag_for_stage2': True} pool scroll (task 4376) by their task_id filter."""
+    flag_for_stage2 marker read (task 4376) by that filter key."""
     return [
         call for call in memory_service.get_memories_by_metadata.await_args_list
-        if 'task_id' in (call.kwargs.get('filters') or {})
+        if 'flag_for_stage2' not in (call.kwargs.get('filters') or {})
     ]
 
 
@@ -7003,14 +7000,14 @@ _VICTIM_CONTENT = 'expired relay marker for task 4376'
 
 
 def _seeded_flag_pool() -> list[dict]:
-    """One eligible victim for task 4376, one too-young marker for the same
-    task, and one eligible-by-age marker for a DIFFERENT task."""
-    now = datetime.now(UTC)
-    stale = (now - timedelta(days=_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6)).isoformat()
-    fresh = (now - timedelta(days=1)).isoformat()
+    """One victim for task 4376, old enough under any age cutoff; one marker
+    for the same task too young under any; and one old marker for a DIFFERENT
+    task."""
+    ancient = datetime(2000, 1, 1, tzinfo=UTC).isoformat()
+    fresh = datetime.now(UTC).isoformat()
     return [
         {
-            'id': _VICTIM_ID, 'memory': _VICTIM_CONTENT, 'created_at': stale,
+            'id': _VICTIM_ID, 'memory': _VICTIM_CONTENT, 'created_at': ancient,
             'metadata': {'flag_for_stage2': True, 'task_id': '4376'},
         },
         {
@@ -7018,43 +7015,20 @@ def _seeded_flag_pool() -> list[dict]:
             'metadata': {'flag_for_stage2': True, 'task_id': '4376'},
         },
         {
-            'id': 'stale-other', 'memory': 'another task relay marker', 'created_at': stale,
+            'id': 'stale-other', 'memory': 'another task relay marker', 'created_at': ancient,
             'metadata': {'flag_for_stage2': True, 'task_id': 'OTHER'},
         },
     ]
 
 
-class _LiveFlagPool:
-    """A Mem0 stand-in whose pool really shrinks on delete, so a second
-    done-transition sees what the first one did."""
+class _ReconcilerFlagPool(LiveFlagPool):
+    """A live flag pool plus the rest of the memory surface _on_task_done uses."""
 
     def __init__(self, members: list[dict]):
-        self.members = {m['id']: m for m in members}
-        self.get_memories_by_metadata = AsyncMock(side_effect=self._scroll)
-        self.count_memories_by_metadata = AsyncMock(side_effect=self._count)
-        self.delete_memory = AsyncMock(side_effect=self._delete)
+        super().__init__(members)
         self.update_memory = AsyncMock()
         self.add_memory = AsyncMock(return_value=AsyncMock(model_dump=lambda: {}))
         self.search = AsyncMock(return_value=[])
-        self.recon_ledger = AsyncMock()
-
-    def _matching(self, filters: dict) -> list[dict]:
-        return [
-            m for m in self.members.values()
-            if all(m['metadata'].get(key) == value for key, value in filters.items())
-        ]
-
-    async def _scroll(self, *, project_id: str, filters: dict, limit: int) -> list[dict]:
-        return [dict(m) for m in self._matching(filters)][:limit]
-
-    async def _count(self, *, project_id: str, filters: dict) -> int:
-        return len(self._matching(filters))
-
-    async def _delete(self, *, memory_id: str, **_: object) -> None:
-        del self.members[memory_id]
-
-    def deleted_ids(self) -> list[str]:
-        return [c.kwargs['memory_id'] for c in self.delete_memory.await_args_list]
 
 
 class TestOnTaskDoneFlagRetirementIsIdempotent:
@@ -7065,7 +7039,7 @@ class TestOnTaskDoneFlagRetirementIsIdempotent:
 
     @pytest.fixture
     def mock_memory_service(self):
-        return _LiveFlagPool(_seeded_flag_pool())
+        return _ReconcilerFlagPool(_seeded_flag_pool())
 
     @pytest.mark.asyncio
     async def test_a_repeat_done_neither_double_retires_nor_resurrects(
@@ -7079,7 +7053,8 @@ class TestOnTaskDoneFlagRetirementIsIdempotent:
         assert pool.deleted_ids() == [_VICTIM_ID]
 
         first_run, second_run = await _task_done_runs(journal)
-        assert len(await _retire_rows(journal, first_run.id)) == 1
+        [first_row] = await _retire_rows(journal, first_run.id)
+        assert first_row['detail'] == {'task_id': '4376', 'retired': 1}
         assert await _retire_rows(journal, second_run.id) == []
 
         assert 'error' not in second, second
@@ -7090,29 +7065,7 @@ class TestOnTaskDoneFlagRetirementIsIdempotent:
         pool.update_memory.assert_not_awaited()
 
         assert _VICTIM_ID not in pool.members
-        assert 'fresh-4376' in pool.members
+        assert {'fresh-4376', 'stale-other'} <= set(pool.members)
         for call in pool.add_memory.await_args_list:
             assert _VICTIM_ID not in repr(call)
             assert _VICTIM_CONTENT not in repr(call)
-
-        pool.recon_ledger.upsert_many.assert_awaited_once()
-        assert pool.recon_ledger.upsert_many.await_args is not None
-        tombstones = pool.recon_ledger.upsert_many.await_args.args[0]
-        assert [t.task_id for t in tombstones] == [_VICTIM_ID]
-
-    @pytest.mark.asyncio
-    async def test_the_hook_never_retires_more_than_the_sweep(
-        self, reconciler, mock_memory_service, tmp_path,
-    ):
-        await _drive_transition(reconciler, tmp_path, 'done')
-        hook_deleted = set(mock_memory_service.deleted_ids())
-
-        sweep_pool = _LiveFlagPool(_seeded_flag_pool())
-        await _sweep_stale_mem0_flag_for_stage2_markers(
-            sweep_pool, 'dark_factory', 'cycle-run', terminal_task_ids={'4376', 'OTHER'},
-        )
-        sweep_deleted = set(sweep_pool.deleted_ids())
-
-        assert hook_deleted == {_VICTIM_ID}
-        assert hook_deleted <= sweep_deleted
-        assert sweep_deleted - hook_deleted == {'stale-other'}

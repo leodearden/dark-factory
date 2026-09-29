@@ -2439,24 +2439,56 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
-    swept = await _sweep_stale_mem0_pool(
+    swept = await _retire_flag_for_stage2_members(
+        memory_service,
+        project_id,
+        run_id,
+        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        terminal_task_ids=terminal_task_ids,
+        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        max_age_days=max_age_days,
+        now=now,
+        scroll_limit=scroll_limit,
+    )
+    # Diagnostic-only; never affects the returned sweep count (task 2966
+    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
+    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
+    return swept
+
+
+async def _retire_flag_for_stage2_members(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    enum_filters: dict,
+    terminal_task_ids: Collection[str],
+    log_name: str,
+    max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """The ``flag_for_stage2`` retirement core shared by the per-cycle sweep and the done hook.
+
+    Fixes what makes a delete a ``flag_for_stage2`` retirement — the pool label,
+    the deleter tag, the count short-circuit — and leaves eligibility entirely
+    to :func:`_sweep_stale_mem0_pool`'s composite rule. Callers choose only
+    which members to enumerate and which tasks count as terminal.
+    """
+    return await _sweep_stale_mem0_pool(
         memory_service,
         project_id,
         run_id,
         source='flag_for_stage2',
         gc_sweep_source=_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
         max_age_days=max_age_days,
-        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        log_name=log_name,
         now=now,
         scroll_limit=scroll_limit,
         count_short_circuit=True,
-        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        enum_filters=enum_filters,
         terminal_task_ids=terminal_task_ids,
     )
-    # Diagnostic-only; never affects the returned sweep count (task 2966
-    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
-    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
-    return swept
 
 
 async def retire_flag_markers_for_terminal_task(
@@ -2469,62 +2501,55 @@ async def retire_flag_markers_for_terminal_task(
 ) -> int:
     """Retire the ``flag_for_stage2`` markers of ONE task that just went terminal.
 
-    Task 4376. A LATENCY layer only: the per-cycle sweep in
-    :meth:`TaskKnowledgeSync.run` remains the correctness and audit mechanism,
-    and this path is invalid without it. Called from
-    ``reconciliation/targeted.py::TargetedReconciler._on_task_done`` so a marker
-    that is already past the age cutoff is retired the moment its task closes,
-    rather than at the next cycle.
+    Task 4376. A best-effort LATENCY layer over the per-cycle sweep in
+    :meth:`TaskKnowledgeSync.run`, which stays the correctness and audit
+    mechanism: a marker already past the age cutoff is retired the moment its
+    task closes rather than at the next cycle. Whatever this path misses — a
+    failure, an unwired targeted reconciler, a legacy marker whose stored
+    ``task_id`` the exact-match filter below cannot reach — is left for the
+    sweep, which is why this path may lose work.
 
-    The eligibility predicate is deliberately NOT re-implemented here. This
-    runs :func:`_sweep_stale_mem0_flag_for_stage2_markers` — the same routine
-    over the same pool — with a strictly narrower ``terminal_task_ids``, so it
-    can never be more aggressive than the sweep, and it inherits every gate the
-    sweep has now or gains later.
+    Shares the sweep's retirement core instead of re-implementing it: the same
+    pool, deleter tag and composite eligibility rule
+    (:func:`_sweep_stale_mem0_pool`), narrowed to this task twice over — the
+    enumeration is filtered on its ``task_id``, and ``terminal_task_ids`` is
+    just this task. So it never retires a marker the sweep would keep, and it
+    inherits every gate the sweep gains later; the closure gate, not the
+    filter, stays the authoritative check. Scoping the enumeration keeps each
+    firing to one exact count when the task has no markers, and keeps the
+    skeleton's aggregate diagnostics about this task alone. The pool-wide
+    type-drift probe stays with the sweep.
 
-    Terminality comes from the done-transition itself, not from
-    :func:`_resolve_terminal_task_ids` / ``get_statuses``: the caller only gets
-    here on a terminal transition that has just been persisted, and a
-    taskmaster round-trip would spend the latency budget that is this path's
-    whole justification.
+    Terminality comes from the done-transition itself, not ``get_statuses``:
+    the caller only gets here on a terminal transition that has just been
+    persisted, and a taskmaster round-trip would spend the latency this path
+    exists to save.
 
-    ``str(task_id).strip()`` copies :func:`_sweep_stale_mem0_pool`'s own
-    membership normalisation, so a task id with stray whitespace or a non-str
-    type still matches.
+    Idempotent per TASK in end state, never per event: done can fire more than
+    once for a task, and the action is a pure function of live Mem0 state keyed
+    on the task. It keeps no counter and writes or restores no memory, so a
+    repeat firing finds the victims gone and nothing can be resurrected. An
+    event-counted or accumulating side effect added here would break that. The
+    per-firing COUNTS are not idempotent under concurrency: firings are not
+    serialized against each other or against the sweep, and ``delete_memory``
+    reports an already-missing id as deleted, so two runs that enumerate the
+    same victim before either deletes it both count it and both tombstone it.
 
-    Passing a 1-tuple rather than ``None`` is load-bearing: ``None`` means
-    "gate disabled", and the sweep would then delete every member of the pool
-    past the age cutoff, whatever task it cites.
-
-    **Idempotent per TASK, never per event.** done is not once-per-task (265
-    of 8,366 (task, project) pairs fired it more than once, one task 11 times),
-    so the action is keyed on the task (``terminal_task_ids=(task_id,)``) and
-    is a pure function of live Mem0 state: enumerate, gate, delete. It keeps no
-    counter, appends nothing and writes nothing back, so running it N times
-    leaves the same state as running it once — a repeat firing finds the
-    victims already gone and retires 0 — and, since nothing on this path writes
-    or restores a memory, nothing can be resurrected. Adding any event-counted
-    or accumulating side effect here (a tally, a metric persisted per firing, a
-    re-add) would break that. No durable per-(task, project) dedup key is
-    needed or wanted: the idempotence is structural, not bookkeeping.
-
-    **No reversal path, by design.** Reopen is rare on the data — 21 of 2,737
-    dark_factory tasks that fired the hook are no longer done (0.77%), 14 of
-    3,995 carry any reopen key (0.35%) — and a reversal hook could not fire
-    anyway: ``TaskInterceptor.STATUS_TRIGGERS`` excludes pending and
-    in-progress, so a task leaving done fires nothing (of 66 transitions
-    following a task_done, 24 were another task_done with no hook event
-    between). The sweep handles reopen for free: a reopened task stops matching
-    the terminal gate, so nothing further is retired.
+    No reversal path, by design: a task leaving done fires no hook
+    (``TaskInterceptor.STATUS_TRIGGERS`` excludes pending and in-progress), and
+    a reopened task simply stops matching the sweep's terminal gate.
 
     Returns:
-        Number of markers retired (the sweep's own count).
+        Number of markers retired.
     """
-    return await _sweep_stale_mem0_flag_for_stage2_markers(
+    key = str(task_id).strip()
+    return await _retire_flag_for_stage2_members(
         memory_service,
         project_id,
         run_id,
-        terminal_task_ids=(str(task_id).strip(),),
+        enum_filters={**_FLAG_FOR_STAGE2_ENUM_FILTERS, 'task_id': key},
+        terminal_task_ids=(key,),
+        log_name='retire_flag_markers_for_terminal_task',
         now=now,
     )
 
