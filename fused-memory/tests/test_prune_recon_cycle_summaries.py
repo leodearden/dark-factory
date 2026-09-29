@@ -723,6 +723,40 @@ class TestRun:
         assert 'u2-wrong-stage' not in all_deletion_ids
 
     @pytest.mark.asyncio
+    async def test_mistagged_non_cycle_summary_record_is_never_classified_or_deleted(self):
+        """The script keys on kind + stage, never on recon_pool, so a record
+        carrying a pool tag without kind='cycle_summary' is invisible to it
+        (task 3239)."""
+        memory = self._make_memory(self._fixture_records())
+        mistagged = {
+            'id': 'm1-mistagged',
+            'created_at': '2025-01-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'note',
+                'stage': 'memory_consolidator',
+                'recon_pool': 'stage1_cycle_summary',
+                'data': '0 mutations. Quiescent cycle.',
+            },
+        }
+        memory.mem0.scroll_by_metadata.return_value = [
+            *memory.mem0.scroll_by_metadata.return_value, mistagged,
+        ]
+        memory.mem0.count_by_metadata.return_value = len(
+            memory.mem0.scroll_by_metadata.return_value,
+        )
+
+        report = await _mod.run(
+            self._args(apply=True, project_id='dark_factory'),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        called_ids = {c.kwargs.get('memory_id') for c in memory.delete_memory.call_args_list}
+        assert 'm1-mistagged' not in called_ids
+        assert 'm1-mistagged' not in {d['id'] for d in report['deletions']}
+        assert report['projects']['dark_factory']['memory_consolidator']['scanned'] == 4
+
+    @pytest.mark.asyncio
     async def test_scan_uses_metadata_filtered_scroll(self):
         """scroll_by_metadata (NOT get_all) is awaited once per selected
         project, scoped to that project_id, filtered to
