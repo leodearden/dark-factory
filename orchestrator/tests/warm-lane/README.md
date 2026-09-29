@@ -34,9 +34,13 @@ at that HEAD:
 | `test_warm_lane_gc.sh` | 1939 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_audit.sh` | 1999 | `973fde7955` | 2026-07-28 |
 
+Two rows are later **per-file re-syncs**, each explained below:
+`test_warm_lane_degenerate_ref.sh` and `test_warm_lane_sizing_lifecycle.sh`.
+The `8489b49bfaefddd4abbe875a970661220dacbd57` HEAD above governs every other
+row.
+
 **The `test_warm_lane_degenerate_ref.sh` row is a PARTIAL re-sync, not a new
-anchor.** The `8489b49bfaefddd4abbe875a970661220dacbd57` HEAD above still
-governs every other row. That one file was re-synced by **task 5566** at reify
+anchor.** That one file was re-synced by **task 5566** at reify
 HEAD `63ac8d9b4b5faf761bf3fbe79339d56120f31431` (2026-09-17), where reify's task
 7244 landed the K1–K6 block; nothing else was re-copied at that HEAD. The port
 is `warm-lane-degenerate-ref-check.sh`'s test half — see
@@ -47,10 +51,11 @@ the ported block diverges.
 **The `test_warm_lane_sizing_lifecycle.sh` row is likewise a per-file re-sync.**
 **Task 6053** ported reify `a90327f927` (2026-09-25), reify's deflake that adds
 `dd conv=fsync` to `_seed_divergent_lane`, and that commit is the only change to
-the file since the `62c0f188c5` port anchor. The copy therefore equals
-reify@`a90327f927` plus Delta 1, and no new delta is introduced. The
-`8489b49bfaefddd4abbe875a970661220dacbd57` HEAD above still governs every other
-row.
+the file since the `62c0f188c5` port anchor. The copy therefore differs from
+reify@`a90327f927` only by the port's existing edits: Delta 1, plus the two
+header comments the port rewrote (the file's own path, and a
+`Driven by … (PORTED_TESTS)` line in place of reify's `run_all.sh` one). No new
+delta is introduced.
 
 `test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
 reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
