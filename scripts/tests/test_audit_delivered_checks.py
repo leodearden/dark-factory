@@ -38,6 +38,7 @@ from audit_delivered_checks import (
     DISPOSITION_NO_TASK,
     DISPOSITION_SUPERSEDED,
     DISPOSITION_UNEVALUABLE,
+    DISPOSITION_UNWIRED_LIVE_GATE,
     DISPOSITION_VACUOUS_LIVE_GATE,
     AuditCoverage,
     DescriptorRow,
@@ -162,6 +163,39 @@ class TestClassifyDescriptor:
         would present a partial sweep as a complete one."""
         assert classify_descriptor(CheckOutcome.PASS, status=None) == DISPOSITION_NO_TASK
         assert classify_descriptor(CheckOutcome.FAIL, status=None) == DISPOSITION_NO_TASK
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'deferred', 'blocked'])
+    def test_live_failing_check_never_stamped_is_an_unwired_live_gate(self, status):
+        """A sound forward-looking descriptor its live producer never
+        received: the runtime gate cannot see it, so its dependents dispatch
+        ungated. It must not read as the ordinary 'healthy' majority."""
+        assert (
+            classify_descriptor(CheckOutcome.FAIL, status=status, stamped=False)
+            == DISPOSITION_UNWIRED_LIVE_GATE
+        )
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'deferred', 'blocked'])
+    def test_live_failing_check_that_is_stamped_stays_healthy(self, status):
+        assert (
+            classify_descriptor(CheckOutcome.FAIL, status=status, stamped=True)
+            == DISPOSITION_HEALTHY
+        )
+        assert classify_descriptor(CheckOutcome.FAIL, status=status) == DISPOSITION_HEALTHY
+
+    def test_stamping_matters_in_no_other_cell(self):
+        # Every other cell is already decided by polarity or status: an
+        # unstamped vacuous or broken descriptor is still that defect.
+        cases = [
+            (CheckOutcome.PASS, 'pending', DISPOSITION_VACUOUS_LIVE_GATE),
+            (CheckOutcome.PASS, 'done', DISPOSITION_DELIVERED),
+            (CheckOutcome.FAIL, 'done', DISPOSITION_BROKEN),
+            (CheckOutcome.FAIL, 'cancelled', DISPOSITION_INERT),
+            (CheckOutcome.PASS, 'cancelled', DISPOSITION_INERT),
+            (CheckOutcome.FAIL, None, DISPOSITION_NO_TASK),
+            (CheckOutcome.ERRORED, 'pending', DISPOSITION_UNEVALUABLE),
+        ]
+        for outcome, status, expected in cases:
+            assert classify_descriptor(outcome, status=status, stamped=False) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +734,68 @@ class TestMainExitCodes:
         # 77 is still open behind the defect; 78 already closed and is not.
         assert '77' in result.stdout
         assert 'open_dependents' in result.stdout
+
+    def test_unwired_live_gate_is_actionable_and_names_its_dependents(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A sidecar capability its open producer never received in
+        metadata.delivered_checks is invisible to the runtime gate, so the
+        producer's dependents dispatch ungated. Reported as 'healthy' it
+        would never be printed; it must be a named, actionable section."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={
+                'src/a.py': 'pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 20\n'
+                    '    capabilities:\n'
+                    '      - name: wired\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: WiredYet\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                    '      - name: unwired\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: UnwiredYet\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                ),
+            },
+            tasks=[
+                {'id': 20, 'status': 'pending',
+                 'metadata': _checks(_grep('wired', 'WiredYet'))},
+                {'id': 30, 'status': 'pending'},
+            ],
+        )
+        _seed_dependencies(root, [(30, 20)])
+
+        result = _run_cli('--project-root', str(root))
+        payload = json.loads(_run_cli('--project-root', str(root), '--json').stdout)
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'UNWIRED LIVE GATES (1)' in result.stdout
+        # The next header is the first TERMINAL section: live ones come first.
+        section = result.stdout.split('UNWIRED LIVE GATES (1)', 1)[1].split('  BROKEN (', 1)[0]
+        [row_line] = [line for line in section.splitlines() if 'name=' in line]
+        assert 'name=unwired' in row_line
+        assert 'source=manifest' in row_line
+        assert 'manifest=plans/x-prd.capability-manifest.yaml' in row_line
+        assert 'open_dependents=30' in row_line
+        finding = next(
+            f for f in payload['projects'][0]['findings'] if f['name'] == 'unwired'
+        )
+        assert finding['disposition'] == DISPOSITION_UNWIRED_LIVE_GATE
+        assert finding['reason']
 
     def test_superseded_rows_never_drive_the_exit_code(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
