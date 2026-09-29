@@ -555,6 +555,7 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
     memory_service = MemoryService(config)
@@ -970,6 +971,9 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
             server_ready_event=recon_server_ready,
+            escalation_listener=_claim_listener(
+                systemd_listeners, config.reconciliation.escalation_port,
+            ),
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -1173,7 +1177,12 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
-            primary_sockets = _claim_systemd_listener(config.server.port)
+            primary_socket = _claim_listener(systemd_listeners, config.server.port)
+            if systemd_listeners:
+                logger.warning(
+                    'systemd passed listening sockets for ports %s that nothing here serves',
+                    sorted(systemd_listeners),
+                )
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1237,7 +1246,8 @@ async def run_server():
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
             _primary_task = asyncio.create_task(
-                server.serve(sockets=primary_sockets), name='fused_memory_primary',
+                server.serve(sockets=[primary_socket] if primary_socket else None),
+                name='fused_memory_primary',
             )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
@@ -2006,25 +2016,17 @@ def _build_uvicorn_config(
     return uvicorn.Config(app, **kwargs)
 
 
-def _claim_systemd_listener(port: int) -> list[socket.socket] | None:
-    """The systemd-held listening socket for *port*, as uvicorn ``serve(sockets=)``.
+def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
+    """Remove and return the systemd-held listening socket for *port*, if any.
 
     Under ``fused-memory.socket`` the port stays bound across restarts, so
-    clients queue instead of being refused. Returns None (uvicorn binds the
-    port itself) when not socket-activated or when systemd holds no socket
-    for *port*.
+    clients queue instead of being refused. None means the caller binds the
+    port itself (not socket-activated, or systemd holds no socket for it).
     """
-    listeners = take_systemd_listeners()
     sock = listeners.pop(port, None)
-    if listeners:
-        logger.warning(
-            'systemd passed listening sockets for ports %s that nothing here serves',
-            sorted(listeners),
-        )
-    if sock is None:
-        return None
-    logger.info('  Serving on systemd-held socket %s (survives restarts)', sock.getsockname())
-    return [sock]
+    if sock is not None:
+        logger.info('  Port %d: serving on the systemd-held socket (survives restarts)', port)
+    return sock
 
 
 def _build_recon_report_components(

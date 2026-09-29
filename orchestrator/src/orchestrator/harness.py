@@ -31,6 +31,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
+from shared.systemd_listeners import take_systemd_listeners
 from shared.task_claimant import compose_claimant_run_id, has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
@@ -12870,6 +12871,13 @@ class Harness:
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
+        listeners = take_systemd_listeners()
+        listener = listeners.pop(port, None)
+        if listeners:
+            logger.warning(
+                'systemd passed listening sockets for ports %s that nothing here serves',
+                sorted(listeners),
+            )
 
         async def _serve():
             import uvicorn
@@ -12878,10 +12886,11 @@ class Harness:
                 app, host=host, port=port, log_level='warning',
             )
             server = uvicorn.Server(uv_config)
-            await server.serve()
+            await server.serve(sockets=[listener] if listener else None)
 
         self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
-        logger.info(f'Escalation MCP server starting on {host}:{port}')
+        held = ' on the systemd-held socket (survives restarts)' if listener else ''
+        logger.info(f'Escalation MCP server starting on {host}:{port}{held}')
         # Give the server a moment to bind, then verify it didn't crash
         await asyncio.sleep(0.5)
         if self._escalation_task.done():

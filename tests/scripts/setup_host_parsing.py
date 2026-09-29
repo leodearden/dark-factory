@@ -64,7 +64,16 @@ INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
 # aborts setup-host.sh on the first unit it cannot write — one uncopyable unit
 # would take daemon-reload, every enable and every later installer section
 # with it.
-INSTALL_LOOP_CP = f'if cp "$REPO_ROOT/scripts/$_unit" "{UNIT_DIR_VAR}/"; then'
+#
+# The SOURCE goes through `_orch_unit_source`, which maps a `.socket` unit
+# name to its `<name>.template` committed path (`.socket` is not in the shared
+# lock-charter extension allowlist) and every other unit to its own name. The
+# DESTINATION is the literal `$_unit` — never the source's own basename — so a
+# `.socket`'s installed copy is named `.socket`, not `.socket.template`.
+INSTALL_LOOP_CP = (
+    'if cp "$REPO_ROOT/$(_orch_unit_source "$_unit")" '
+    f'"{UNIT_DIR_VAR}/$_unit"; then'
+)
 
 
 def shell_statements(script_text: str) -> list[str]:

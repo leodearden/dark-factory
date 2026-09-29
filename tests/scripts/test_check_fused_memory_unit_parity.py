@@ -116,6 +116,7 @@ Type=simple
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 RestartSteps=4
@@ -192,6 +193,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 
 [Install]
 WantedBy=default.target
@@ -210,6 +212,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 RestartMaxDelaySec=60
@@ -233,6 +236,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
@@ -342,6 +346,7 @@ Description=Installed Fused Memory
 Type=notify
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
 [Install]
@@ -925,16 +930,16 @@ def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
 ):
     """The '[fixed] Appended N' count reflects only the EXACT directives appended.
 
-    find_drift(_MISSING_MEM0_UNIT) returns the 5 missing exact directives PLUS
-    the ExecStartPre= prefix miss (6 total), but fix_unit_text only appends the
-    5 exact directives. The reported count must therefore be 5, never the
-    inflated len(drift)==6.
+    find_drift(_MISSING_MEM0_UNIT) returns the missing exact directives PLUS
+    every required-prefix miss (ExecStartPre=, ExecStopPost=), but
+    fix_unit_text only appends the exact directives. The reported count must
+    therefore be the exact-directive count, never the inflated len(drift).
     """
     mod = _load_checker()
     monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
     exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
-    assert len(full_drift) == len(exact_only) + 1  # exactly the ExecStartPre miss
+    assert len(full_drift) == len(exact_only) + len(mod.REQUIRED_SERVICE_DIRECTIVE_PREFIXES)
     installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
     mod.main(["--installed", str(installed), "--fix"])
     out = capsys.readouterr().out

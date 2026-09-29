@@ -282,13 +282,45 @@ def test_probe_port_returns_true_on_timeout(monkeypatch: pytest.MonkeyPatch) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_restart_unit_stop_reset_failed_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    """restart_unit must call stop, reset-failed, then start — in that order.
+@pytest.mark.parametrize(
+    ("unit", "socket_unit"),
+    [
+        ("orchestrator-dark-factory.service", "orchestrator-dark-factory.socket"),
+        ("fused-memory.service", "fused-memory.socket"),
+    ],
+)
+def test_restart_unit_reset_failed_then_restart_no_block(
+    monkeypatch: pytest.MonkeyPatch, unit: str, socket_unit: str
+) -> None:
+    """restart_unit must reset-failed the service AND its socket, then restart --no-block.
 
-    The three-phase sequence ensures:
-    - stop: give the unit a grace period (TimeoutStopSec=30 escalates SIGTERM→SIGKILL)
-    - reset-failed: clear StartLimit state so the start is not a silent no-op
-    - start: re-launch the unit
+    Under systemd socket activation (task fm-socket-activation) reset-failed
+    must target both units to clear a shared start-limit, and the restart
+    must pass --no-block so the oneshot watchdog never blocks on a
+    Type=notify start.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog.restart_unit(unit)
+
+    assert len(calls) == 2, f"Expected exactly 2 systemctl calls, got {len(calls)}: {calls}"
+    assert calls[0] == ["systemctl", "--user", "reset-failed", unit, socket_unit]
+    assert calls[1] == ["systemctl", "--user", "restart", "--no-block", unit]
+
+
+def test_restart_unit_never_stops_the_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """restart_unit must never call `systemctl stop`.
+
+    Each socket-activated unit's ExecStopPost hook closes its socket only for
+    a genuine `stop` job — a watchdog-issued stop would sever every open MCP
+    connection for the whole restart instead of leaving the socket bound
+    (task fm-socket-activation).
     """
     wdog = _load_watchdog()
     calls: list[list[str]] = []
@@ -300,10 +332,8 @@ def test_restart_unit_stop_reset_failed_start(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(subprocess, "run", fake_run)
     wdog.restart_unit("orchestrator-dark-factory.service")
 
-    assert len(calls) == 3, f"Expected exactly 3 systemctl calls, got {len(calls)}: {calls}"
-    assert calls[0] == ["systemctl", "--user", "stop", "orchestrator-dark-factory.service"]
-    assert calls[1] == ["systemctl", "--user", "reset-failed", "orchestrator-dark-factory.service"]
-    assert calls[2] == ["systemctl", "--user", "start", "orchestrator-dark-factory.service"]
+    verbs = [c[2] for c in calls if c[0] == "systemctl"]
+    assert "stop" not in verbs, f"restart_unit must never stop the unit: {calls}"
 
 
 def test_restart_unit_never_uses_kill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,63 +358,11 @@ def test_restart_unit_never_uses_kill(monkeypatch: pytest.MonkeyPatch) -> None:
             )
 
 
-def test_restart_unit_handles_stop_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """restart_unit must not raise if systemctl stop times out.
-
-    After a stop timeout the reset-failed and start calls must still execute
-    so the unit is not left in a permanently-down state.
-    """
-    wdog = _load_watchdog()
-    calls: list[list[str]] = []
-    log_messages: list[str] = []
-
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
-        calls.append(list(cmd))
-        if cmd[:3] == ["systemctl", "--user", "stop"]:
-            raise subprocess.TimeoutExpired(cmd, 45)
-        if cmd[0] == "systemd-cat":
-            log_messages.append(" ".join(cmd))
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    # Must not raise
-    wdog.restart_unit("orchestrator-dark-factory.service")
-
-    systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
-    verbs = [c[2] for c in systemctl_cmds]
-    assert "reset-failed" in verbs, "reset-failed must be called after stop timeout"
-    assert "start" in verbs, "start must be called even after stop timeout"
-    assert len(log_messages) >= 1, "timeout must be logged via log()"
-
-
-def test_restart_unit_handles_start_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """restart_unit must not raise if systemctl start times out."""
-    wdog = _load_watchdog()
-    log_messages: list[str] = []
-
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
-        if cmd[:3] == ["systemctl", "--user", "start"]:
-            raise subprocess.TimeoutExpired(cmd, 45)
-        if cmd[0] == "systemd-cat":
-            log_messages.append(" ".join(cmd))
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    # Must not raise
-    wdog.restart_unit("orchestrator-dark-factory.service")
-
-    assert len(log_messages) >= 1, "start timeout must be logged via log()"
-
-
 def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """restart_unit must not raise if systemctl reset-failed times out.
 
-    After a reset-failed timeout the start call must still execute so the
-    unit is not left in a permanently-down state (docstring: "remaining
-    phases still execute").
+    After a reset-failed timeout the restart call must still execute so the
+    unit is not left un-revived.
     """
     wdog = _load_watchdog()
     calls: list[list[str]] = []
@@ -406,8 +384,28 @@ def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPat
 
     systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
     verbs = [c[2] for c in systemctl_cmds]
-    assert "start" in verbs, "start must be called even after reset-failed timeout"
+    assert "restart" in verbs, "restart must be called even after reset-failed timeout"
     assert len(log_messages) >= 1, "reset-failed timeout must be logged via log()"
+
+
+def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """restart_unit must not raise if systemctl restart --no-block times out."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "restart"]:
+            raise subprocess.TimeoutExpired(cmd, 45)
+        if cmd[0] == "systemd-cat":
+            log_messages.append(" ".join(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Must not raise
+    wdog.restart_unit("orchestrator-dark-factory.service")
+
+    assert len(log_messages) >= 1, "restart timeout must be logged via log()"
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +739,9 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    # reify's port is up, so main() also consults ActiveState for it (module
+    # docstring) — stub it 'active' so this test never touches real systemd.
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -771,6 +772,7 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -874,6 +876,10 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    # Every port reads up, so main() also consults ActiveState per unit
+    # (module docstring) — stub it 'active' so "no restart expected" holds
+    # regardless of real systemd state.
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -908,6 +914,11 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    # Every port reads up, so main() also consults ActiveState per unit
+    # (module docstring); stub both it and restart_unit so a real systemctl
+    # call is never reachable from this test.
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -1033,6 +1044,241 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     # reify is enabled → probed, and the failed probe triggers a restart
     assert probed == [8100]
     assert restarted == ["orchestrator-reify.service"]
+
+
+# ---------------------------------------------------------------------------
+# _unit_active_state() direct tests (task fm-socket-activation)
+# ---------------------------------------------------------------------------
+
+
+def test_unit_active_state_returns_stripped_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state returns the trimmed --value output on a zero exit."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="inactive\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_state("orchestrator-dark-factory.service") == "inactive"
+
+
+def test_unit_active_state_queries_value_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state must query ActiveState with --value, naming the unit."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="active\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._unit_active_state("orchestrator-dark-factory.service")
+
+    assert calls == [
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "-p",
+            "ActiveState",
+            "--value",
+            "orchestrator-dark-factory.service",
+        ]
+    ]
+
+
+def test_unit_active_state_none_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state fails safe to None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such unit")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_state("orchestrator-dark-factory.service") is None
+
+
+def test_unit_active_state_none_on_blank_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state fails safe to None on a zero exit with empty stdout."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_state("orchestrator-dark-factory.service") is None
+
+
+def test_unit_active_state_none_on_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state fails safe to None when systemctl isn't on PATH."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_state("orchestrator-dark-factory.service") is None
+
+
+def test_unit_active_state_none_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_state fails safe to None when the systemctl call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_state("orchestrator-dark-factory.service") is None
+
+
+# ---------------------------------------------------------------------------
+# main() dead-but-socket-held detection (task fm-socket-activation)
+#
+# Under systemd socket activation an escalation port is held by its own
+# `.socket` unit, so it can keep reading LISTEN across a dead service —
+# probe_port() alone is no longer a complete liveness signal. main() must
+# also consult _unit_active_state() whenever the port IS up, and revive on
+# 'inactive'/'failed' (UNIT_DEAD_ACTIVE_STATES) exactly as it would a down
+# port, while leaving every transitional ActiveState alone.
+# ---------------------------------------------------------------------------
+
+
+def _wire_main_all_ports_up(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, *, active_state
+) -> list[str]:
+    """Wire main() so every unit's port reads up; *active_state* answers ActiveState."""
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "_unit_active_state", active_state)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    return restarted
+
+
+@pytest.mark.parametrize("dead_state", ["inactive", "failed"])
+def test_main_revives_dead_enabled_unit_whose_port_still_listens(
+    monkeypatch: pytest.MonkeyPatch, dead_state: str
+) -> None:
+    """A dead-but-socket-held unit (port up, ActiveState inactive/failed) is revived.
+
+    This is the case socket activation newly introduces: probe_port() alone
+    would see LISTEN and conclude the unit is fine.
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: dead_state)
+
+    wdog.main()
+
+    assert restarted == [u for _p, u in wdog.WATCHED], (
+        f"every enabled unit reporting ActiveState={dead_state!r} while its port "
+        f"still listens must be revived; got {restarted}"
+    )
+
+
+@pytest.mark.parametrize(
+    "transitional_state", ["active", "activating", "deactivating", "reloading"]
+)
+def test_main_does_not_revive_a_unit_in_a_transitional_active_state(
+    monkeypatch: pytest.MonkeyPatch, transitional_state: str
+) -> None:
+    """A unit mid-restart (activating/deactivating/reloading) or simply active,
+    with its port still listening, must NOT be revived.
+
+    'deactivating' is the case this guards specifically: an orchestrator stop
+    can take up to 90s, and a unit mid-stop is not dead, it is working. This
+    test fails if UNIT_DEAD_ACTIVE_STATES is ever widened to include any of
+    these — verified by hand: with 'deactivating' added to that set, this
+    parametrization for 'deactivating' fails (restarted == [unit] instead of
+    []).
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_main_all_ports_up(
+        wdog, monkeypatch, active_state=lambda _u: transitional_state
+    )
+
+    wdog.main()
+
+    assert restarted == [], (
+        f"ActiveState={transitional_state!r} while the port listens must not "
+        f"trigger a revive; got {restarted}"
+    )
+
+
+def test_main_does_not_query_active_state_when_the_port_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The port-down path must not change: _unit_active_state is never consulted."""
+    wdog = _load_watchdog()
+    queried: list[str] = []
+    restarted: list[str] = []
+
+    def spy_active_state(unit: str) -> str | None:
+        queried.append(unit)
+        return "active"  # would be "not dead" if consulted — the test is that it never is
+
+    # Scoped to the single df pair so only ITS port-down path is exercised —
+    # the other 6 WATCHED units' ports would read up and correctly trigger
+    # their OWN ActiveState query, which is not what this test pins.
+    monkeypatch.setattr(wdog, "WATCHED", [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != _DF_PORT)
+    monkeypatch.setattr(wdog, "_unit_active_state", spy_active_state)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT], f"the down-port unit must still be revived; got {restarted}"
+    assert queried == [], (
+        f"_unit_active_state must not be consulted for a unit whose port is "
+        f"already down; queried: {queried}"
+    )
+
+
+def test_main_log_line_names_the_active_state_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The log line for an ActiveState-triggered revive must name ActiveState,
+    distinguishing it from a port-down revive (the brief: 'the log line
+    should say which signal fired').
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "failed")
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    wdog.main()
+
+    restart_lines = [m for m in logged if "restarting" in m]
+    assert restart_lines, f"expected at least one 'restarting' log line: {logged}"
+    assert all("ActiveState" in m for m in restart_lines), (
+        f"an ActiveState-triggered revive must name the signal: {restart_lines}"
+    )
+
+
+def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REGRESSION: the port-down revive's log wording is byte-identical to
+    before this feature — _unit_active_state must not be consulted or
+    threaded into that message.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "WATCHED", [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != _DF_PORT)
+    monkeypatch.setattr(
+        wdog, "_unit_active_state", lambda _u: pytest.fail("must not be queried")
+    )
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: None)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    wdog.main()
+
+    assert (
+        f"{_DF_UNIT} escalation port {_DF_PORT} not listening; restarting" in logged
+    ), logged
 
 
 # ---------------------------------------------------------------------------
@@ -3002,6 +3248,10 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails
+    # The other 6 units' ports read up, so main() also consults ActiveState
+    # for them (module docstring) — stub 'active' so this test never touches
+    # real systemd.
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
@@ -3048,6 +3298,7 @@ def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
@@ -4903,6 +5154,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails (down)
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
@@ -11332,11 +11584,19 @@ def _wire_liveness_probe(
     *,
     down_port: int | None,
 ) -> list[str]:
-    """Drive main() with *down_port* failing its probe; record restart_unit calls."""
+    """Drive main() with *down_port* failing its probe; record restart_unit calls.
+
+    Every unit whose port is NOT *down_port* reads as up, so main() also
+    consults _unit_active_state() for it (module docstring) — stubbed
+    'active' here so this suite's assertions depend only on the port
+    signal, never on real systemd state (see the "no live systemd runtime
+    is needed" module docstring above).
+    """
     restarted: list[str] = []
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != down_port)
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     return restarted
 
