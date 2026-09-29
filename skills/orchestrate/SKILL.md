@@ -321,7 +321,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 
