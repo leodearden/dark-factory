@@ -365,6 +365,51 @@ class TestAuditProject:
         assert [f.row.task_id for f in orphans] == [999]
         assert audit.coverage.descriptors_without_task == 1
 
+    def test_sidecar_copy_is_a_phantom_when_metadata_carries_the_name_in_any_kind(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """The metadata copy is the one the runtime gate evaluates, so a
+        sidecar capability whose (task_id, name) is already stamped is a
+        phantom WHATEVER kind the stamped copy has. The measured shape: a
+        producer's metadata carries the check as kind=path while its sidecar
+        still spells it as a grep."""
+        root = _init_repo(
+            tmp_path / 'proj',
+            {
+                'src/a.py': 'pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 20\n'
+                    '    capabilities:\n'
+                    '      - name: cap-x\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: NotYetBuilt\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                ),
+            },
+        )
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [{'id': 20, 'status': 'pending', 'metadata': {'delivered_checks': [
+                {'name': 'cap-x', 'kind': 'path', 'expect': 'present',
+                 'paths': ['src/b.py']}]}}],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+
+        assert [
+            f for f in audit.findings
+            if f.row.name == 'cap-x' and f.row.source == 'manifest'
+        ] == []
+
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
         # correctly-authored descriptor that later work legitimately undid, and
