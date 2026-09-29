@@ -552,6 +552,44 @@ class TestCrossProject:
         assert state.standing_policy.source == ', '.join(
             normalize_escalations_dir(q) for q in (df / 'data' / 'escalations', recon))
 
+    def test_a_second_root_folding_to_a_measured_token_is_flagged_on_every_measurement(self, df, tmp_path):
+        twin = tmp_path / 'elsewhere' / 'dark_factory'
+        twin.mkdir(parents=True)
+
+        states = mod.measure_projects([df, twin], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW)
+
+        assert list(states) == ['dark_factory']
+        kept = states['dark_factory']
+        assert kept.root == str(df) and kept.landed.value == 3
+        for measurement in (kept.landed, kept.stuck, kept.spend, kept.standing_policy, kept.trial):
+            collision = [s for s in measurement.shortfalls if s.path == str(twin)]
+            assert collision and 'dark_factory' in collision[0].reason and str(df) in collision[0].reason
+
+    def test_one_root_spelled_twice_is_measured_once_with_no_collision(self, df, tmp_path):
+        states = mod.measure_projects([df, f'{df}/'], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW)
+
+        assert list(states) == ['dark_factory']
+        assert not any(s.source == 'project_root' for s in states['dark_factory'].landed.shortfalls)
+
+    def test_a_measurement_that_raises_is_unreadable_and_the_others_still_answer(self, df, tmp_path, monkeypatch):
+        def pathological(*_args, **_kwargs):
+            raise RuntimeError('pathological record: simulated')
+
+        monkeypatch.setattr(mod, 'agreement_report', pathological)
+        pending = _pending(df / 'data' / 'escalations', tmp_path=tmp_path)
+
+        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW)['dark_factory']
+
+        assert state.standing_policy.status == 'unreadable'
+        (failure,) = state.standing_policy.shortfalls
+        assert 'RuntimeError' in failure.reason and 'simulated' in failure.reason
+        assert state.standing_policy.measured_at == NOW.isoformat()
+        assert (state.landed.status, state.stuck.status, state.spend.status, state.trial.status) == ('ok',) * 4
+
+    def test_a_naive_now_is_still_a_configuration_error(self, df, tmp_path):
+        with pytest.raises(ValueError, match='aware'):
+            mod.measure_projects([df], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW.replace(tzinfo=None))
+
 
 class TestReadOnly:
     def test_no_gatherer_writes_anything(self, df, tmp_path):

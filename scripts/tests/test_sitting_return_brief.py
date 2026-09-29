@@ -398,6 +398,34 @@ class TestMain:
         assert statuses['closes'] == 'ok'
         assert env.output.is_file()
 
+    def test_a_root_folding_onto_a_measured_project_is_a_shortfall_not_a_missing_page(self, env, capsys):
+        twin = env.tmp / 'elsewhere' / 'dark_factory'
+        twin.mkdir(parents=True)
+
+        rc, out = _run(capsys, env.argv(env.df, twin))
+
+        assert rc == 0
+        sections = _sections(env.output.read_text())
+        assert list(sections) == list(TITLES)
+        for title in TITLES[1:5]:
+            assert f'shortfall: project_root {twin}: folds to project' in sections[title], title
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(3) == 'degraded'
+
+    def test_a_measurement_that_raises_degrades_its_section_and_the_page_is_written(self, env, capsys, monkeypatch):
+        def pathological(*_args, **_kwargs):
+            raise RuntimeError('pathological registry: simulated')
+
+        monkeypatch.setattr(fleet_state, 'autonomous_closes', pathological)
+
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert '(unreadable)' in section and 'RuntimeError: pathological registry: simulated' in section
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(6) == 'degraded'
+
     def test_no_subprocess_and_no_network(self, env, capsys, monkeypatch):
         calls: list[str] = []
 

@@ -37,7 +37,7 @@ for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
 
 from _task_db_scan import discover_project_roots  # noqa: E402
 from orchestrator.digest import ModelRoleRow  # noqa: E402
-from orchestrator.session_registry import fleet_root, sessions_dir  # noqa: E402
+from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir  # noqa: E402
 from shared.safe_io import atomic_write_text  # noqa: E402
 from sitting import brief, fleet_state, prepare_sitting  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
@@ -117,7 +117,10 @@ def build(
         sitting=sitting,
         preparation=_freshness(sources, sitting),
         projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now),
-        closes=fleet_state.autonomous_closes(decisions_root, window, now=now),
+        closes=fleet_state.unreadable_if_raises(
+            'decision_registry', str(decisions_dir(decisions_root)), AutonomousCloses((), (), 0),
+            lambda: fleet_state.autonomous_closes(decisions_root, window, now=now), now=now,
+        ),
     )
 
 

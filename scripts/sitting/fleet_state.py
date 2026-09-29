@@ -26,7 +26,7 @@ import statistics
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -345,24 +345,32 @@ def measure_projects(
     window: Window,
     now: datetime,
 ) -> Mapping[str, ProjectState]:
-    """Every per-project measurement, keyed by canonical project token; a root with no stores is flagged, never dropped."""
-    states: dict[str, ProjectState] = {}
+    """Every per-project measurement, keyed by canonical project token; a root with no stores is flagged, never dropped.
+
+    The first root folding to a token is the one measured. Any other directory
+    folding to it is a shortfall on every measurement of that project, and a
+    measurement that raises is ``unreadable``: neither costs the page.
+    """
+    _stamp(now)
+    by_project: dict[str, list[Path | str]] = defaultdict(list)
     for root in project_roots:
-        project = normalize_project_token(Path(root).name)
-        if project in states:
-            raise ValueError(f'{root} and {states[project].root} both fold to project {project!r}')
-        queues = _measured_queues(root)
-        runs_db = runs_db_path(root)
-        states[project] = ProjectState(
-            project=project,
-            root=str(root),
-            landed=landed(runs_db, window, now=now),
-            stuck=stuck(root, pending, now=now),
-            spend=spend_and_cap_hits(runs_db, window, now=now),
-            standing_policy=standing_policy_rulings(queues, window, now=now),
-            trial=preparer_trial(queues, window, now=now),
-        )
-    return MappingProxyType(states)
+        by_project[normalize_project_token(Path(root).name)].append(root)
+    return MappingProxyType({
+        project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now)
+        for project, roots in by_project.items()
+    })
+
+
+def unreadable_if_raises(
+    store: str, source: str, empty: T, measure: Callable[[], Measurement[T]], *, now: datetime,
+) -> Measurement[T]:
+    """*measure*'s result, or an ``unreadable`` measurement naming the exception it raised."""
+    stamp = _stamp(now)
+    try:
+        return measure()
+    except Exception as exc:
+        failure = Shortfall(store, source, f'measurement raised {type(exc).__name__}: {exc}')
+        return Measurement(empty, stamp, source, 'unreadable', (failure,))
 
 
 def _stamp(now: datetime) -> str:
@@ -492,6 +500,51 @@ def _autonomous_close(record: DecisionRecord) -> AutonomousClose:
         closed_at=record.closed_at,
         evidence=record.closing_evidence,
     )
+
+
+def _measure_project(
+    project: str,
+    root: Path | str,
+    noted: tuple[Shortfall, ...],
+    pending: Mapping[str, PendingRecords],
+    window: Window,
+    now: datetime,
+) -> ProjectState:
+    """Each measurement guarded by ``unreadable_if_raises`` and carrying *noted*, the root-level shortfalls."""
+    queues = _measured_queues(root)
+    runs_db = runs_db_path(root)
+    tasks_db = str(tasks_db_path(str(root)))
+    queue_source = ', '.join(queues)
+
+    def guarded(store: str, source: str, empty: T, measure: Callable[[], Measurement[T]]) -> Measurement[T]:
+        measurement = unreadable_if_raises(store, source, empty, measure, now=now)
+        return replace(measurement, shortfalls=measurement.shortfalls + noted)
+
+    return ProjectState(
+        project=project,
+        root=str(root),
+        landed=guarded('runs_db', str(runs_db), 0, lambda: landed(runs_db, window, now=now)),
+        stuck=guarded('tasks_db', tasks_db, (), lambda: stuck(root, pending, now=now)),
+        spend=guarded('runs_db', str(runs_db), (), lambda: spend_and_cap_hits(runs_db, window, now=now)),
+        standing_policy=guarded('escalation_queue', queue_source, StandingPolicyRulings(_fold_reports((), window)),
+                                lambda: standing_policy_rulings(queues, window, now=now)),
+        trial=guarded('escalation_queue', queue_source, _trial(()), lambda: preparer_trial(queues, window, now=now)),
+    )
+
+
+def _fold_collisions(project: str, roots: Sequence[Path | str]) -> tuple[Shortfall, ...]:
+    """A shortfall per directory after the first in *roots*; a second spelling of a directory already seen is none."""
+    kept = roots[0]
+    seen = {Path(kept).resolve()}
+    collisions: list[Shortfall] = []
+    for root in roots[1:]:
+        resolved = Path(root).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            collisions.append(Shortfall(
+                'project_root', str(root), f'folds to project {project!r}, already measured from {kept}; not measured',
+            ))
+    return tuple(collisions)
 
 
 def _measured_queues(project_root: Path | str) -> tuple[str, ...]:
