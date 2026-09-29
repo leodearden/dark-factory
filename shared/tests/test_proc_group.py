@@ -1551,6 +1551,18 @@ class TestReapProcessGroups:
             with contextlib.suppress(Exception):
                 await proc.wait()
 
+    @pytest.mark.timeout(15)
+    def test_reap_reports_a_group_of_only_unreaped_zombies_as_reaped(self, unreaped_zombie_pgid):
+        """Members awaiting their parent's reap have terminated; that is 'reaped'.
+
+        The zombie is held unreaped for the whole call, so the verdict does
+        not depend on grace_secs; it is small only to keep a regression fast.
+        """
+        pgid = unreaped_zombie_pgid
+        outcomes = reap_process_groups({pgid}, grace_secs=0.2)
+        assert outcomes == {pgid: 'reaped'}
+        os.killpg(pgid, 0)
+
     @pytest.mark.timeout(5)
     def test_reap_refuses_unsafe_pgids(self, monkeypatch):
         """os.getpgrp() and pgid 1 are REFUSED and never signalled.
