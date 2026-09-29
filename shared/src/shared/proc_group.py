@@ -489,32 +489,16 @@ def scan_process_groups_under_path(
         return set()
 
 
-def _pgid_alive(pgid: int) -> bool:
-    """True while *pgid* still exists (``killpg(pgid, 0)`` succeeds).
-
-    ProcessLookupError (ESRCH) → gone.  PermissionError (EPERM) → the pgid was
-    recycled to another user's group, so the group we were reaping is gone;
-    treat as gone.  Any other OSError → treat as gone (fail-safe: never report
-    a group as alive on an ambiguous error, which would falsely mark it
-    'survived').
-    """
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-
-
 def _drop_dead_pgids(pgids: list[int], grace_secs: float, poll_step: float) -> list[int]:
-    """Bounded-poll *pgids*, returning those still alive after *grace_secs*.
+    """Bounded-poll *pgids*, returning those not yet terminated after *grace_secs*.
 
-    Checks liveness immediately (so an already-dead group needs no sleep),
-    then polls every *poll_step* until the deadline.
+    Checks immediately (so an already-terminated group needs no sleep), then
+    polls every *poll_step* until the deadline.
     """
     remaining = list(pgids)
     deadline = time.monotonic() + max(0.0, grace_secs)
     while True:
-        remaining = [p for p in remaining if _pgid_alive(p)]
+        remaining = [p for p in remaining if not process_group_terminated(p)]
         if not remaining or time.monotonic() >= deadline:
             return remaining
         time.sleep(poll_step)
@@ -529,9 +513,11 @@ def reap_process_groups(
     """SIGTERM→wait→SIGKILL every pgid in *pgids*; return a per-pgid outcome.
 
     Outcomes:
-    - ``'reaped'``       — the group is gone.
-    - ``'survived'``     — still alive after SIGKILL + *grace_secs* (rare;
-      only same-user-uncooperative or unsignalable groups).
+    - ``'reaped'``       — every member has terminated: the group is gone, or
+      only zombies awaiting their subreaper's reap remain
+      (:func:`process_group_terminated`).
+    - ``'survived'``     — a member was still running after SIGKILL +
+      *grace_secs* (rare; only same-user-uncooperative or unsignalable groups).
     - ``'refused:<reason>'`` — an unsafe pgid (``pgid <= 1`` / self / parent /
       own group per :func:`unsafe_pgid_reason`); never signalled at all.
 
