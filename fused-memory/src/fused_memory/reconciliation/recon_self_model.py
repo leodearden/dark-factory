@@ -196,15 +196,11 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
         # records in autopilot_video, all citing a merely-'deferred' task.
         #
-        # That routine has TWO firing sites (task 4376). The primary one, and
-        # the correctness and audit mechanism, is the unconditional
-        # per-project, per-cycle sweep in TaskKnowledgeSync.run(). The second,
-        # reconciliation/targeted.py::TargetedReconciler._on_task_done via
+        # Second firing site (task 4376), a latency layer applying the same
+        # rule to the one task that just closed:
         # stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task,
-        # exists only to cut latency: best-effort, no retry, and inert whenever
-        # the targeted reconciler is not wired. The ELIGIBILITY RULE is
-        # identical at both — the hook narrows only terminal_task_ids, to the
-        # one task that just closed — so the rule above holds for both sites.
+        # called from reconciliation/targeted.py::TargetedReconciler._on_task_done.
+        # The per-cycle sweep in TaskKnowledgeSync.run() stays primary.
         #
         # The terminal-closure arm NARROWS the declared-vs-actual gap this
         # comment documents, without closing it: the Mem0 side now applies the

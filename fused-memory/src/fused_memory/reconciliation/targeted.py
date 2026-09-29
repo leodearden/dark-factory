@@ -614,41 +614,17 @@ class TargetedReconciler:
         except Exception as e:
             logger.warning(f'Fast-path write failed for task {task_id}: {e}')
 
-        # 0.6. Retire this task's expired flag_for_stage2 markers now (task 4376),
-        #      rather than at the next per-cycle sweep, which stays primary.
-        #      Placed ahead of sections 1-3 for two reasons: latency is this
-        #      step's whole point, so it must not wait behind them (one measured
-        #      task_done run took 27s end to end); and an eligible marker is an
-        #      expired work-item marker whose continued presence in search is the
-        #      esc-3796-1 bug, so it should be gone before section 1 searches.
-        #
-        #      Fail-open: this dispatch is fire-and-forget with no retry and no
-        #      replay (middleware/task_interceptor.py::TaskInterceptor._apply_status_transition
-        #      schedules reconcile_task via asyncio.create_task, and only when
-        #      self.reconciler is wired). A failure here never gets a second
-        #      attempt, so it simply leaves the work to the next per-cycle sweep —
-        #      which is why the sweep is primary and this path may lose work. The
-        #      same holds when the reconciler is not wired at all (reconciliation
-        #      disabled, or no task backend at boot): the sweep covers it.
-        #
-        #      Keyed on the TASK, never the event: done can fire several times
-        #      per task, and a repeat finds the victims already gone and retires
-        #      0. Nothing here writes or restores a memory, so nothing can be
-        #      resurrected, and there is deliberately no reversal on reopen. Do
-        #      not add an event-counted or accumulating side effect here — it
-        #      would break that idempotence. Full contract and data:
+        # 0.6. Latency layer (task 4376), ahead of section 1's search so an expired
+        #      marker is gone before it can surface: fail-open, leaving any miss
+        #      to the per-cycle sweep. Contract:
         #      stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task.
         try:
             retired = await retire_flag_markers_for_terminal_task(
                 self.memory, str(scope.project_id), run_id, task_id=task_id,
             )
             if retired > 0:
-                # The durable record of this path's work. The shared sweep also
-                # writes a tombstone per victim, so the action is auditable from
-                # either end. Hook and sweep share the flag_for_stage2_gc_sweep
-                # deleter tag, but the tombstone carries the deleting run_id, and
-                # this run is a RunType.targeted row with trigger_reason
-                # task_done:<id> — a join on run_id tells them apart.
+                # Tombstones share the sweep's deleter tag; their deleting
+                # run_id (this task_done run) is what tells hook from sweep.
                 await self.journal.add_run_action(
                     run_id, 'retire', 'flag_for_stage2', 'delete',
                     {'task_id': task_id, 'retired': retired},
