@@ -9622,6 +9622,129 @@ class TestReconPoolAutoTagMissingStageWarning:
         )
 
 
+class TestNonCycleSummaryReconPoolStrip:
+    """A Mem0 record carries recon_pool only if kind == 'cycle_summary' (task
+    3239): both public write seams strip a caller-supplied recon_pool from any
+    other write, loudly, so a stray tag can never join a reconciliation trim
+    pool.
+    """
+
+    _LOGGER = 'fused_memory.services.memory_service'
+
+    def _scoped_warnings(self, caplog):
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == self._LOGGER
+        ]
+
+    async def _add_note_with_pool_tag(self, service, recon_pool='stage1_cycle_summary'):
+        await service.add_memory(
+            content='An ordinary observation',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            agent_id='recon-stage-memory_consolidator',
+            metadata={'kind': 'note', 'recon_pool': recon_pool},
+        )
+        return service.mem0.add.call_args[1]['metadata']
+
+    @pytest.mark.asyncio
+    async def test_add_memory_strips_pool_recon_pool_from_non_cycle_summary_kind(self, service):
+        backend_meta = await self._add_note_with_pool_tag(service)
+        assert 'recon_pool' not in backend_meta
+        assert backend_meta['kind'] == 'note'
+
+    @pytest.mark.asyncio
+    async def test_add_memory_strips_recon_pool_when_kind_absent(self, service):
+        await service.add_memory(
+            content='Cycle summary whose kind the LLM dropped',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            metadata={
+                'stage': 'task_knowledge_sync',
+                'recon_pool': 'stage2_cycle_summary',
+                'run_id': 'r1',
+            },
+        )
+        backend_meta = service.mem0.add.call_args[1]['metadata']
+        assert 'recon_pool' not in backend_meta
+        assert backend_meta['stage'] == 'task_knowledge_sync'
+        assert backend_meta['run_id'] == 'r1'
+
+    @pytest.mark.asyncio
+    async def test_strip_logs_one_structured_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await self._add_note_with_pool_tag(service)
+
+        warning_records = self._scoped_warnings(caplog)
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 strip WARNING, got {len(warning_records)}: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert record.project_id == 'dark_factory'
+        assert record.agent_id == 'recon-stage-memory_consolidator'
+        assert record.kind == 'note'
+        assert record.caller_recon_pool == 'stage1_cycle_summary'
+        assert 'recon_pool' in record.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_strip_handles_unhashable_recon_pool_value(self, service):
+        """Qdrant matches a scalar filter against ANY element of an array
+        payload, so a list-valued tag would still join the pool — and it must
+        not crash the strip either."""
+        backend_meta = await self._add_note_with_pool_tag(
+            service, recon_pool=['stage1_cycle_summary'],
+        )
+        assert 'recon_pool' not in backend_meta
+
+    @pytest.mark.asyncio
+    async def test_add_system_record_strips_recon_pool_from_non_cycle_summary(
+        self, service, caplog,
+    ):
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await service.add_system_record(
+                content='system note',
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                category='observations_and_summaries',
+                metadata={'kind': 'note', 'recon_pool': 'stage2_cycle_summary'},
+                causation_id='c1',
+            )
+
+        assert service.mem0.add_system_record.await_args is not None
+        backend_meta = service.mem0.add_system_record.await_args.kwargs['metadata']
+        assert 'recon_pool' not in backend_meta
+        warning_records = self._scoped_warnings(caplog)
+        assert len(warning_records) == 1
+        assert warning_records[0].agent_id == 'recon-stage-task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_cycle_summary_write_keeps_recon_pool_without_strip_warning(
+        self, service, caplog,
+    ):
+        """The stage-2 prompt's legitimate caller-supplied tag survives."""
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                agent_id='recon-stage-memory_consolidator',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'r1',
+                    'recon_pool': 'stage1_cycle_summary',
+                },
+            )
+
+        backend_meta = service.mem0.add.call_args[1]['metadata']
+        assert backend_meta['recon_pool'] == 'stage1_cycle_summary'
+        assert self._scoped_warnings(caplog) == []
+
+
 class TestCycleSummaryRunIdGuard:
     """add_memory's cycle_summary run_id guard (task 2094), updated for the
     task-2109 auto-backfill.
