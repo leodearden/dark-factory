@@ -10,17 +10,22 @@ timestamped": an unstamped claim is unrepresentable.
 The runs.db figures are ``orchestrator.digest``'s own readers, called directly
 (they import cleanly under the scripts env). They fail open to a zero that
 cannot be told from a true zero, so each call is preceded by this module's
-probe of the store and of the tables its query reads.
+probe of the store and of the tables its query reads, and followed by a look
+at what the reader swallowed: every failure it answers with a zero it first
+logs at WARNING with the exception attached, and that exception flags the
+figure ``unreadable``.
 
 Read-only: every store is opened ``mode=ro`` and every queue is read through
 the unlocked scan helpers, so nothing here creates a file or a directory.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +43,7 @@ from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 from escalation.shadow_ruling import AgreementReport, ClassAgreement, agreement_report
 from orchestrator.digest import ModelRoleRow, count_done_in_window, model_role_rollup
+from orchestrator.digest import logger as digest_log
 from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
@@ -374,10 +380,54 @@ def _refusal(store: str, path: Path, exc: TaskDbUnreadable | sqlite3.Error) -> R
 def _from_runs_db(runs_db: Path, tables: Sequence[str], empty: T, read: Callable[[Path], T], now: datetime) -> Measurement[T]:
     stamp = _stamp(now)
     refusal = _probe_runs_db(runs_db, tables)
-    if refusal is not None:
-        status, shortfall = refusal
-        return Measurement(empty, stamp, str(runs_db), status, (shortfall,))
-    return Measurement(read(runs_db), stamp, str(runs_db), 'ok')
+    if refusal is None:
+        with _swallowed_by_digest() as swallowed:
+            value = read(runs_db)
+        refusal = _read_refusal(runs_db, swallowed)
+        if refusal is None:
+            return Measurement(value, stamp, str(runs_db), 'ok')
+    status, shortfall = refusal
+    return Measurement(empty, stamp, str(runs_db), status, (shortfall,))
+
+
+class _ExceptionCollector(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.caught: list[BaseException] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.exc_info and record.exc_info[1] is not None:
+            self.caught.append(record.exc_info[1])
+
+
+@contextmanager
+def _swallowed_by_digest() -> Iterator[list[BaseException]]:
+    """The exceptions ``orchestrator.digest``'s readers catch and log while the block runs.
+
+    When logging is disabled outright those logs never happen, so the list
+    starts with a note saying the read cannot be vouched for.
+    """
+    collector = _ExceptionCollector()
+    saved_level = digest_log.level
+    digest_log.setLevel(min(digest_log.getEffectiveLevel(), logging.WARNING))
+    digest_log.addHandler(collector)
+    if not digest_log.isEnabledFor(logging.WARNING):
+        collector.caught.append(RuntimeError('logging is disabled, so a failed read cannot be told from a zero'))
+    try:
+        yield collector.caught
+    finally:
+        digest_log.removeHandler(collector)
+        digest_log.setLevel(saved_level)
+
+
+def _read_refusal(runs_db: Path, swallowed: Sequence[BaseException]) -> Refusal | None:
+    """Why the digest's answer cannot be stood behind, or None when it can."""
+    if not runs_db.exists():
+        return 'source_missing', Shortfall('runs_db', str(runs_db), 'vanished during the read')
+    if swallowed:
+        return 'unreadable', Shortfall('runs_db', str(runs_db),
+                                       '; '.join(f'{type(exc).__name__}: {exc}' for exc in swallowed))
+    return None
 
 
 def _probe_runs_db(runs_db: Path, tables: Sequence[str]) -> Refusal | None:

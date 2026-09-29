@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -226,6 +227,54 @@ class TestLanded:
 
         assert measurement.status == 'unreadable'
         assert 'events' in measurement.shortfalls[0].reason
+
+
+def _drifted_runs_db(path: Path) -> Path:
+    """Every table the probe looks for, none of the columns the digest's queries read."""
+    conn = sqlite3.connect(path)
+    conn.executescript('CREATE TABLE events (id INTEGER); CREATE TABLE invocations (id INTEGER); '
+                       'CREATE TABLE task_results (id INTEGER);')
+    conn.close()
+    return path
+
+
+class TestQueryFailureAfterTheProbe:
+    """The digest's readers answer a failed query with the zero of a quiet night; the page must not."""
+
+    @pytest.mark.parametrize('measure', [mod.landed, mod.spend_and_cap_hits], ids=['landed', 'spend'])
+    def test_a_query_that_fails_once_the_probe_passed_is_unreadable_not_zero(self, tmp_path, measure):
+        runs_db = _drifted_runs_db(tmp_path / 'runs.db')
+
+        measurement = measure(runs_db, WINDOW, now=NOW)
+
+        assert measurement.status == 'unreadable'
+        assert 'no such column' in measurement.shortfalls[0].reason
+        assert measurement.shortfalls[0].path == str(runs_db)
+
+    def test_a_failure_is_seen_whatever_level_the_digest_logger_is_set_to(self, tmp_path):
+        runs_db = _drifted_runs_db(tmp_path / 'runs.db')
+        level, handlers = digest.logger.level, list(digest.logger.handlers)
+        digest.logger.setLevel('CRITICAL')
+        try:
+            measurement = mod.landed(runs_db, WINDOW, now=NOW)
+        finally:
+            digest.logger.setLevel(level)
+
+        assert measurement.status == 'unreadable'
+        assert digest.logger.handlers == handlers
+
+    def test_with_logging_disabled_a_read_it_cannot_vouch_for_is_unreadable(self, df):
+        logging.disable(logging.CRITICAL)
+        try:
+            measurement = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
+        finally:
+            logging.disable(logging.NOTSET)
+
+        assert measurement.status == 'unreadable'
+        assert 'logging' in measurement.shortfalls[0].reason
+
+    def test_a_clean_read_is_still_ok(self, df):
+        assert mod.landed(mod.runs_db_path(df), WINDOW, now=NOW).status == 'ok'
 
 
 class TestStuck:
