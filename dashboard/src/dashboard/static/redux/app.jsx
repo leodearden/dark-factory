@@ -9,6 +9,7 @@ const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
+const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -53,7 +54,7 @@ function App() {
   const [tw, setTw] = useTweaks ? useTweaks(TWEAK_DEFAULTS) : [TWEAK_DEFAULTS, () => {}];
 
   // Filter state — per tab
-  const [win, setWin] = uS('24h');
+  const [win, setWin] = uS(CHIP_DEFAULT_WINDOW);
   const [projects, setProjects] = uS([]);     // [] = all
   const [agents, setAgents] = uS([]);
   const [search, setSearch] = uS('');
@@ -81,6 +82,12 @@ function App() {
   uE(() => {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
+
+  // Re-validate the window on every tab switch, whichever path switched it: a
+  // chip tab that does not offer the current window resets it.
+  uE(() => {
+    setWin(w => windowForTab(tab, w));
+  }, [tab]);
 
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints
   // ignore ?window= silently, so passing it from chip-less tabs is harmless.
@@ -170,31 +177,24 @@ function App() {
     }
   }
 
-  // Per-tab toolbar config.
-  //
-  // showWindow / windows are scoped per Option-A "honest scoping": the chip
-  // appears only on tabs whose endpoints actually consume ?window=, and the
-  // chip set is restricted to values the server maps. Specifically:
-  //   - Costs / Performance / Merge / Overview-cost-spark obey app.py's
-  //     _WINDOW_DAYS = {24h, 7d, 30d, all} — no 1h, no 90d.
-  //   - Burndown obeys _BURNDOWN_WINDOWS = {24h, 7d, 30d, 90d} — no all.
-  const WIN_DEFAULT  = ['24h', '7d', '30d', 'all'];
-  const WIN_BURNDOWN = ['24h', '7d', '30d', '90d'];
+  // Per-tab toolbar config. Which tabs carry the window chip, and which
+  // windows each offers, is window_chip.js's TAB_WINDOWS.
   const toolbarConfig = {
-    overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
-    tasks:     { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
-    scheduler: { showWindow: false, showProjects: false,    showAgents: false, search: false },
-    curator:  { showWindow: false,                        showAgents: false, search: false },
-    perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    memory:   { showWindow: false,                        showAgents: true,  search: false },
-    recon:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
-    merge:    { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
-    esc:      { showWindow: false,                        showAgents: false, search: false },
-    'esc-analytics': { showWindow: false,                 showAgents: false, search: false },
+    overview:  { showAgents: false, search: false },
+    orch:      { showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
+    tasks:     { showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
+    scheduler: { showProjects: false, showAgents: false, search: false },
+    curator:   { showAgents: false, search: false },
+    perf:      { showAgents: false, search: false },
+    memory:    { showAgents: true,  search: false },
+    recon:     { showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
+    merge:     { showAgents: false, search: false },
+    cost:      { showAgents: false, search: false },
+    burn:      { showAgents: false, search: false },
+    esc:       { showAgents: false, search: false },
+    'esc-analytics': { showAgents: false, search: false },
   }[tab] || {};
+  const chip = CHIP_TAB_WINDOWS[tab];
 
   return (
     <div className="app" data-density={tw.density}>
@@ -209,9 +209,10 @@ function App() {
       </div>
       <div className="main">
         <Toolbar
-          window={win} onWindow={setWin}
-          showWindow={toolbarConfig.showWindow !== false}
-          windows={toolbarConfig.windows}
+          showWindow={!!chip}
+          windows={chip?.windows}
+          window={chip ? highlightedWindow(windowEcho(DD.__receipt, chip.endpoint), chip.windows) : null}
+          onWindow={setWin}
           showProjects={toolbarConfig.showProjects !== false}
           projects={projects} onProjects={setProjects}
           agents={agents} onAgents={setAgents}
