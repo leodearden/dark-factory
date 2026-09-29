@@ -28,7 +28,7 @@ at that HEAD:
 | `test_warm_lane_disk_guard.sh` | 432 | `3662006952` | 2026-07-11 |
 | `test_thin_warm_lane.sh` | 440 | `2ac7b723b7` | 2026-07-28 |
 | `test_warm_lane_degenerate_ref.sh` | 645 | `d1fea3e2c0` | 2026-09-17 |
-| `test_warm_lane_sizing_lifecycle.sh` | 672 | `62c0f188c5` | 2026-07-26 |
+| `test_warm_lane_sizing_lifecycle.sh` | 679 | `a90327f927` | 2026-09-25 |
 | `test_provision_warm_lane_fs.sh` | 1140 | `b37e00eaa6` | 2026-07-11 |
 | `test_warm_lane_gc_sweep.sh` | 1230 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_gc.sh` | 1939 | `973fde7955` | 2026-07-28 |
@@ -43,6 +43,14 @@ is `warm-lane-degenerate-ref-check.sh`'s test half — see
 [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
 "Delta 11" for what moved on the script side, and Delta 7 below for the two ways
 the ported block diverges.
+
+**The `test_warm_lane_sizing_lifecycle.sh` row is likewise a per-file re-sync.**
+**Task 6053** ported reify `a90327f927` (2026-09-25), reify's deflake that adds
+`dd conv=fsync` to `_seed_divergent_lane`, and that commit is the only change to
+the file since the `62c0f188c5` port anchor. The copy therefore equals
+reify@`a90327f927` plus Delta 1, and no new delta is introduced. The
+`8489b49bfaefddd4abbe875a970661220dacbd57` HEAD above still governs every other
+row.
 
 `test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
 reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
