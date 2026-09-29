@@ -3,8 +3,9 @@
 On every run it installs the prebuilt launcher at the contract's pin, then
 registers jcodemunch in the user-level Claude config from the contract,
 replacing any existing entry so a host carrying a legacy registration
-converges on it. It never registers a command that does not resolve on PATH,
-and a failed install or registration is loud but never aborts the bootstrap.
+converges on it. It never registers a command that does not resolve on PATH.
+A contract that does not render, a failed install and a failed registration
+are each loud but never abort the bootstrap.
 
 The block is sliced out of the shipped setup-host.sh and run with the REAL
 REPO_ROOT, so `$REPO_ROOT/shared/src` resolves, against `claude` and `uv`
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 from setup_host_sections import (
@@ -172,15 +174,64 @@ def test_an_existing_registration_is_replaced_not_skipped(tmp_path):
     ]
 
 
-def test_a_failed_registration_is_loud_but_does_not_abort_setup(tmp_path):
-    _write_claude_stub(tmp_path, remove_rc=0, add_rc=1)
+@pytest.mark.parametrize(
+    ("remove_rc", "reports_the_removal"),
+    [
+        pytest.param(0, True, id="an-existing-entry-was-removed"),
+        pytest.param(1, False, id="there-was-no-entry-to-remove"),
+    ],
+)
+def test_a_failed_registration_is_loud_and_says_whether_it_removed_the_old_one(
+    tmp_path, remove_rc, reports_the_removal
+):
+    """Remove-then-add is not atomic: an add that fails after a remove leaves no entry."""
+    _write_claude_stub(tmp_path, remove_rc=remove_rc, add_rc=1)
 
     proc = _run_registration(tmp_path)
 
     assert proc.returncode == 0, proc.stderr
-    assert _lines_starting(proc.stdout, "FAIL "), proc.stdout
+    assert _calls(tmp_path, _CLAUDE_LOG) == [
+        _REMOVAL,
+        [*_REGISTRATION, json.dumps(jcodemunch_server_config())],
+    ]
+    failures = _registration_lines(proc.stdout, "FAIL ")
+    assert len(failures) == 1, proc.stdout
+    assert ("removed" in failures[0]) is reports_the_removal, failures
     assert any("add-json" in line for line in _lines_starting(proc.stdout, "WARN ")), proc.stdout
     assert not _registration_lines(proc.stdout, "OK "), proc.stdout
+
+
+@pytest.mark.parametrize(
+    "failing_render_args",
+    [
+        pytest.param("-m shared.jcodemunch_launch", id="server-config"),
+        pytest.param("-m shared.jcodemunch_launch install-argv", id="install-argv"),
+    ],
+)
+def test_a_contract_that_does_not_render_is_loud_and_touches_nothing(
+    tmp_path, failing_render_args
+):
+    real_python3 = shutil.which("python3")
+    assert real_python3, "python3 must be on PATH to render the contract"
+    write_stub(
+        stub_bin_dir(tmp_path),
+        "python3",
+        f'if [ "$*" = "{failing_render_args}" ]; then exit 1; fi\n'
+        f'exec "{real_python3}" "$@"\n',
+    )
+    _write_claude_stub(tmp_path, remove_rc=0, add_rc=0)
+
+    proc = _run_registration(tmp_path, section_suffix="printf 'SLICE-COMPLETED\\n'\n")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "SLICE-COMPLETED" in proc.stdout, proc.stdout
+    assert _uv_calls(tmp_path) == []
+    assert _calls(tmp_path, _CLAUDE_LOG) == []
+    assert _registration_lines(proc.stdout, "FAIL "), proc.stdout
+    assert any(
+        "shared.jcodemunch_launch" in line for line in _lines_starting(proc.stdout, "WARN ")
+    ), proc.stdout
+    assert not _lines_starting(proc.stdout, "OK "), proc.stdout
 
 
 def test_registration_is_skipped_on_a_host_with_no_claude(tmp_path):
