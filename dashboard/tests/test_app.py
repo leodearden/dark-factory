@@ -1426,22 +1426,51 @@ def test_merge_queue_returns_merge_queue(client):
     assert isinstance(body['MERGE_QUEUE'], dict)
 
 
-def test_merge_queue_uses_24h_recent_window(client):
-    """The /api/v2/dashboard/merge-queue endpoint must pass recent_window_minutes=1440
-    to build_per_project_merge_queue.  Asserted via call-site kwargs because the
-    test fixture carries no per-project DBs, so the window is not observable in
-    the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
+@pytest.mark.parametrize('query, expected_hours', [
+    ('?window=7d', 168),
+    ('?window=24h', 24),
+])
+def test_merge_queue_threads_the_chip_window(client, query, expected_hours):
+    """Every merge-queue leg, recent merges included, follows the chip window.
+
+    Asserted via call-site kwargs because the test fixture carries no
+    per-project DBs, so the window is not observable in the JSON payload.
+    There is no separate recent-merges window to pass: the smallest chip is
+    24h, so following the chip can only widen what the old fixed 1440-minute
+    recent window showed."""
     mock_build = AsyncMock(return_value={})
     with (
         patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
         patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+        resp = client.get(f'/api/v2/dashboard/merge-queue{query}')
     assert resp.status_code == 200
     assert mock_build.await_args is not None, "build_per_project_merge_queue was never awaited"
-    assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
-        f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
-    )
+    assert mock_build.await_args.kwargs['hours'] == expected_hours
+    assert 'recent_window_minutes' not in mock_build.await_args.kwargs
+
+
+@pytest.mark.parametrize('path, payload_key, expected_window', [
+    ('/api/v2/dashboard/costs?window=90d', 'COSTS', {'requested': '90d', 'served': '30d', 'days': 30}),
+    ('/api/v2/dashboard/costs?window=7d', 'COSTS', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance', 'PERFORMANCE', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance?window=all', 'PERFORMANCE',
+     {'requested': 'all', 'served': 'all', 'days': 3650}),
+    ('/api/v2/dashboard/merge-queue?window=24h', 'MERGE_QUEUE',
+     {'requested': '24h', 'served': '24h', 'days': 1}),
+    ('/api/v2/dashboard/burndown?window=90d', 'BURNDOWN', {'requested': '90d', 'served': '90d', 'days': 90}),
+    ('/api/v2/dashboard/burndown?window=all', 'BURNDOWN', {'requested': 'all', 'served': '30d', 'days': 30}),
+])
+def test_windowed_payload_echoes_the_served_window(client, path, payload_key, expected_window):
+    """Sketch #8: every windowed payload says which window it was computed over."""
+    with patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)):
+        resp = client.get(path)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['WINDOW'] == expected_window
+    assert payload_key in body
+    if payload_key == 'BURNDOWN':
+        assert 'served_at' in body
 
 
 def test_costs_returns_full_costs_block(client):

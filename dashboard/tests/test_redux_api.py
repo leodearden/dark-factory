@@ -584,6 +584,34 @@ def test_shape_merge_queue_relabels_and_renames_depth():
     assert section['halt'] == {'offline': True}
 
 
+def test_shape_merge_queue_carries_the_recent_window_total():
+    """recent_total is the window's merge count, which the capped recent rows may not reach."""
+    recent = [{'task_id': str(i)} for i in range(200)]
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': recent,
+            'recent_total': 228,
+            'speculative': {},
+            'active': [],
+        },
+        '/home/leo/src/reify': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {},
+            'active': [],
+        },
+    }
+    mq = redux_api.shape_merge_queue(raw)['MERGE_QUEUE']
+    assert mq['dark-factory']['recent_total'] == 228
+    assert mq['dark-factory']['recent'] == recent
+    assert mq['reify']['recent_total'] == 0
+
+
 def test_shape_merge_queue_injects_halt_status_per_project():
     raw = {
         '/home/leo/src/reify': {
