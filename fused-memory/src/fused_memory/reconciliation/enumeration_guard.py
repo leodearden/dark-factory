@@ -576,27 +576,72 @@ def render_enumeration_guard_section() -> str:
     )
 
 
-async def enumeration_liveness_gate(
+async def enumeration_gate_for_filing(
     *,
     agent_id: str | None,
     description: str | None,
     metadata: Any,
     memory_service: Any,
     project_root: str,
-    is_filing: bool,
-    metadata_mode: str | None = None,
-    append: bool | None = None,
     now: Callable[[], datetime] = _utc_now,
 ) -> EnumerationGateResult:
-    """Shape-check, re-resolve and stamp the memory ids a recon write enumerates.
+    """Shape-check, re-resolve and stamp the memory ids a recon ``submit_task``
+    enumerates. A new task has no stored metadata, so every key lands as sent;
+    the filing-only rules are the fragment rejection and the required scope.
+    Never raises: a failed lookup is an inconclusive verdict, not an error."""
+    return await _enumeration_gate(
+        agent_id=agent_id,
+        description=description,
+        metadata=metadata,
+        memory_service=memory_service,
+        project_root=project_root,
+        now=now,
+        is_filing=True,
+        metadata_mode=None,
+        append=None,
+    )
 
-    ``is_filing`` is True for ``submit_task`` and False for ``update_task``;
-    the module docstring states which rules differ between the two.
-    ``metadata_mode`` and ``append`` are the update's merge flags, passed so
-    the gate judges the merge the backend will apply; a filing has no stored
-    metadata and passes neither. Never raises: a failed lookup is an
-    inconclusive verdict, not an error.
-    """
+
+async def enumeration_gate_for_update(
+    *,
+    agent_id: str | None,
+    description: str | None,
+    metadata: Any,
+    memory_service: Any,
+    project_root: str,
+    metadata_mode: str | None,
+    append: bool | None,
+    now: Callable[[], datetime] = _utc_now,
+) -> EnumerationGateResult:
+    """Shape-check, re-resolve and stamp the memory ids a recon ``update_task``
+    enumerates, judged against the merge its ``metadata_mode`` / ``append``
+    flags make the backend apply. A fragment is recorded, never rejected.
+    Never raises: a failed lookup is an inconclusive verdict, not an error."""
+    return await _enumeration_gate(
+        agent_id=agent_id,
+        description=description,
+        metadata=metadata,
+        memory_service=memory_service,
+        project_root=project_root,
+        now=now,
+        is_filing=False,
+        metadata_mode=metadata_mode,
+        append=append,
+    )
+
+
+async def _enumeration_gate(
+    *,
+    agent_id: str | None,
+    description: str | None,
+    metadata: Any,
+    memory_service: Any,
+    project_root: str,
+    now: Callable[[], datetime],
+    is_filing: bool,
+    metadata_mode: str | None,
+    append: bool | None,
+) -> EnumerationGateResult:
     passthrough = EnumerationGateResult(None, description, metadata, None)
     if not _is_recon_stage(agent_id):
         return passthrough

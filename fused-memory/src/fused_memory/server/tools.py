@@ -77,7 +77,10 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
-from fused_memory.reconciliation.enumeration_guard import enumeration_liveness_gate
+from fused_memory.reconciliation.enumeration_guard import (
+    enumeration_gate_for_filing,
+    enumeration_gate_for_update,
+)
 from fused_memory.reconciliation.mem0_tombstone import (
     record_mem0_deletion_tombstones,
 )
@@ -8989,13 +8992,12 @@ def create_mcp_server(
 
         # Enumeration liveness gate (task 3056) — see enumeration_guard's
         # module docstring. Rebinds description/metadata to the cleaned payload.
-        _enumeration = await enumeration_liveness_gate(
+        _enumeration = await enumeration_gate_for_filing(
             agent_id=agent_id,
             description=description,
             metadata=metadata,
             memory_service=memory_service,
             project_root=project_root,
-            is_filing=True,
         )
         if _enumeration.rejection is not None:
             return _enumeration.rejection
@@ -9654,13 +9656,12 @@ def create_mcp_server(
 
         # Enumeration liveness gate (task 3056), update half: see the matching
         # submit_task call site and enumeration_guard's module docstring.
-        _enumeration = await enumeration_liveness_gate(
+        _enumeration = await enumeration_gate_for_update(
             agent_id=agent_id,
             description=description,
             metadata=metadata,
             memory_service=memory_service,
             project_root=project_root,
-            is_filing=False,
             metadata_mode=metadata_mode,
             append=append,
         )

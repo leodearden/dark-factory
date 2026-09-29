@@ -1,9 +1,10 @@
-"""Tests for ``reconciliation.enumeration_guard.enumeration_liveness_gate``.
+"""Tests for ``reconciliation.enumeration_guard``'s write-time gate.
 
 The gate is the write-time filter a recon-stage ``submit_task`` /
 ``update_task`` payload passes through: enumerated memory ids are
 shape-checked, re-resolved against the live store, and the enumeration is
-stamped as verified. Every test drives the ONE public entry point with an
+stamped as verified. Every test drives one of the two public entry points,
+``enumeration_gate_for_filing`` or ``enumeration_gate_for_update``, with an
 explicit ``AsyncMock`` memory service and a fixed clock.
 
 The fixture ids are the real ones from reify gates 5533 and 5537, the two
@@ -28,7 +29,8 @@ from fused_memory.reconciliation.enumeration_guard import (
     X_LIVENESS_EXCEPTIONS_KEY,
     X_LIVENESS_REVERIFIED_AT_KEY,
     EnumerationGateResult,
-    enumeration_liveness_gate,
+    enumeration_gate_for_filing,
+    enumeration_gate_for_update,
     render_enumeration_guard_section,
 )
 from fused_memory.reconciliation.predicate_contradiction import (
@@ -115,13 +117,23 @@ async def run_gate(
     metadata_mode: str | None = None,
     append: bool | None = None,
 ) -> EnumerationGateResult:
-    return await enumeration_liveness_gate(
+    """*is_filing* picks the entry point; only an update takes merge flags."""
+    if is_filing:
+        assert metadata_mode is None and append is None, 'a filing has no merge'
+        return await enumeration_gate_for_filing(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=service,
+            project_root=project_root,
+            now=lambda: FIXED_NOW,
+        )
+    return await enumeration_gate_for_update(
         agent_id=agent_id,
         description=description,
         metadata=metadata,
         memory_service=service,
         project_root=project_root,
-        is_filing=is_filing,
         metadata_mode=metadata_mode,
         append=append,
         now=lambda: FIXED_NOW,
