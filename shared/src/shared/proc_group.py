@@ -130,29 +130,11 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             continue
         pid = int(entry.name)
 
-        # Read /proc/<pid>/stat to get pgrp (field 5, 1-indexed), ppid (4), state (3).
-        # stat format: "pid (comm) state ppid pgrp ..."
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
+        fields = _read_stat_fields(entry)
+        if fields is None or fields.pgrp != pgid:
             continue
-
-        # Parse: find the closing ')' of the comm field to handle spaces/parens in names.
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            tail = stat_text[rparen + 2 :]  # skip ') '
-            fields = tail.split()
-            # fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session, ...
-            state = fields[0]
-            ppid = int(fields[1])
-            pgrp = int(fields[2])
-        except (IndexError, ValueError):
-            continue
-
-        if pgrp != pgid:
-            continue
+        state = fields.state
+        ppid = fields.ppid
 
         # Read comm (short executable name, capped at 15 chars by the kernel).
         try:
@@ -297,7 +279,7 @@ async def terminate_process_group(
 # ---------------------------------------------------------------------------
 
 
-#: The procfs mount the at-or-under scan walks.
+#: The procfs mount the at-or-under scan and process_group_members walk.
 #:
 #: Module-level solely so the synthetic-/proc tests can point the scan at a
 #: fabricated tree (``test_proc_group.TestScanProcessGroupsAgainstASyntheticProc``
@@ -463,21 +445,10 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
         if not entry.name.isdigit():
             continue
 
-        # Parse pgrp from /proc/<pid>/stat (field 5, after the parenthesized
-        # comm). Reuses _snapshot_process_group_unsafe's rfind(')') idiom so a
-        # comm containing spaces/parens is handled correctly.
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
+        fields = _read_stat_fields(entry)
+        if fields is None:
             continue
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            fields = stat_text[rparen + 2 :].split()
-            pgrp = int(fields[2])  # fields: state, ppid, pgrp, ...
-        except (IndexError, ValueError):
-            continue
+        pgrp = fields.pgrp
 
         if pgrp in exclude or pgrp in result:
             # Excluded, or already recorded via another pid in the same group —
