@@ -120,6 +120,8 @@ Deps: Γ1←κ1; τ←κ1; ρ1←Γ1; Γ2←ρ1, 5794; ρ2←Γ2; σ←—; μ�
 - **ν — Jev provider arm** (normal, filed `deferred`; deps Γ3). Third arm in `_call_llm` over `POST /v1/systemone` with a `choice` over the slate plus a relation `choice`; adapter into `parse_judge_verdict`; schema + credentials; tests. *Signal:* with `judge_provider: jev` a fixture write's verdict names a slate id; μ's matrix gains a Jev row.
 - **Γ4 — gate: flip preconditions on the refreshed tree** (deterministic, predicate; deps Γ3, 4949, 5794). Sub-check `scripts/check_write_triage_flip_preconditions.sh` exits 0 (`--subcheck-timeout 90`, `before_done.timeout_secs 180`); the committed judge artifact is retrieved-mode; `best_config.json` exists with `selection.residual`. *On pass:* `done`; 3169's new dependency is satisfied and the operator rules on esc-3169-1 with the artifacts named here. *On fail:* the escalation names the failing item; nothing is cancelled.
 
+- **2026-09-29 re-base, Γ2 (Leo, esc-5804-1):** `best.rank1_rate >= 0.40` → `>= 0.38`. Γ2 failed on bge-reranker-v2-m3 at 32/84 = 0.381, two records short of 0.40 (p95 0.47 s passed). The new floor is the basis's "double cosine" leg exactly: 2 × 16/84. The "half the recall@20 ceiling" leg (0.395) is about one record away, and n = 84 cannot separate 0.38 from 0.40. ρ2 stays behind its flag; μ and Γ3 remain the flip gates. The threshold's home is still 5804's `before_done.args`.
+
 Sizing (overlay bands): κ1 carries ~2,400 changed lines already written; τ, σ under ~300; ρ1, ρ2, μ, ν within 300–1,500; gates are deterministic and exempt from the floor.
 
 ## 10. Open questions (tactical)
