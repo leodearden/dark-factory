@@ -171,11 +171,14 @@ class TestSubmitTask:
         memory_service.get_memory_by_id.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('execution_class', ['operational', 'decision'])
     async def test_an_enumerating_gate_without_a_scope_is_rejected(
-        self, server, project_root, task_interceptor,
+        self, server, project_root, task_interceptor, execution_class,
     ):
-        metadata = gate_5537_metadata()
+        metadata = gate_5537_metadata(execution_class=execution_class)
         del metadata['x_enumeration_scope']
+        if execution_class == 'decision':
+            del metadata['operational_mode']
 
         result = await submit(server, project_root, metadata)
 

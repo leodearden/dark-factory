@@ -42,7 +42,10 @@ as bare 8-char fragments with no full id anywhere beside them.
    the stored value, so neither a drop nor the fresh stamp would land.
 5. *Scope required.* Filing a gate that carries an enumeration without
    ``x_enumeration_scope`` is rejected: a gate cannot be filed with an
-   unqualified "these are the N entries" claim.
+   unqualified "these are the N entries" claim. A gate is any filing
+   ``operational_routing_guard.inject_operational_routing`` stores as
+   always-escalating, so ``decision`` filings count as well as
+   ``operational`` ones.
 6. *Stamp.* ``x_liveness_reverified_at`` and ``x_liveness_exceptions`` are
    gate-owned: set from this write's own evidence, incoming copies overwritten
    or stripped, so a copied-forward stamp never poses as a fresh verification.
@@ -71,7 +74,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, NamedTuple
 
-from fused_memory.middleware.recurring_gate_guard import is_gate_submission
+from fused_memory.middleware.operational_routing_guard import inject_operational_routing
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_project_id_for_root
 from fused_memory.reconciliation.citation_verifier import (
@@ -492,11 +495,19 @@ def _rejection_before_lookup(
     return _malformed_scope_rejection(problems) if problems else None
 
 
+def _files_an_escalating_gate(parsed: dict[str, Any]) -> bool:
+    """Judged on the metadata the filing is stored as: the operational
+    routing coerces an ``operational`` or ``decision`` declaration into an
+    always-escalating gate, and is idempotent on one already coerced."""
+    routed = inject_operational_routing(parsed)
+    return isinstance(routed, dict) and routed.get('always_escalates') is True
+
+
 def _scope_required(parsed: dict[str, Any], liveness: _LivenessPass) -> bool:
     return (
         bool(liveness.enumerations)
         and X_ENUMERATION_SCOPE_KEY not in parsed
-        and is_gate_submission(parsed)
+        and _files_an_escalating_gate(parsed)
     )
 
 

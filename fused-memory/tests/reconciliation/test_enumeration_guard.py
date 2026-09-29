@@ -923,17 +923,29 @@ def gate_5537_service() -> AsyncMock:
     return memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
 
 
+# Every declaration the operational routing turns into an escalating gate,
+# plus the already-routed stamp itself.
+GATE_DECLARATIONS = {
+    'operational-gate': {'execution_class': 'operational', 'operational_mode': 'gate'},
+    'operational-mode-absent': {'execution_class': 'operational'},
+    'operational-llm': {'execution_class': 'operational', 'operational_mode': 'llm'},
+    'decision': {'execution_class': 'decision'},
+    'routed-pure-gate': {'task_kind': 'deterministic', 'always_escalates': True},
+}
+
+
 class TestEnumerationScope:
     """Filing a gate that enumerates Mem0 entries must say what was searched."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('mode', [{'operational_mode': 'gate'}, {}])
+    @pytest.mark.parametrize('declaration', sorted(GATE_DECLARATIONS))
     async def test_filing_an_enumerating_gate_without_a_scope_is_rejected(
-        self, project_root, mode,
+        self, project_root, declaration,
     ):
-        metadata = gate_5537_filing()
-        del metadata['operational_mode']
-        metadata.update(mode)
+        metadata = {
+            key: value for key, value in gate_5537_filing().items()
+            if key not in ('execution_class', 'operational_mode')
+        } | GATE_DECLARATIONS[declaration]
 
         result = await run_gate(
             project_root, metadata, service=gate_5537_service(), is_filing=True,
