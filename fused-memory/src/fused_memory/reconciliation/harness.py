@@ -355,6 +355,12 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     A legacy ``affected_ids`` field takes precedence when present, so cross-run
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
+
+    The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
+    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
+    are.  Guarded by
+    ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
+    (task-4772 section).
     """
     legacy = finding.get('affected_ids')
     if legacy:
@@ -1977,6 +1983,8 @@ class ReconciliationHarness:
                 run, lock_holder, lock_age,
                 error_message=f'Run stale (>{cutoff}s, lock expired), recovered by harness',
             )
+            if diag is None:
+                continue
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
                 f'(started {run.started_at.isoformat()}, lock expired, '
@@ -2053,8 +2061,8 @@ class ReconciliationHarness:
         disposition: str = 'failed',
         error_type: str = 'StaleRunRecovery',
         error_message: str | None = None,
-    ) -> dict:
-        """Recover a single stuck 'running' row to a terminal status.
+    ) -> dict | None:
+        """Recover a single orphaned run row to a terminal status.
 
         Shared mechanical body for both recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
@@ -2063,6 +2071,11 @@ class ReconciliationHarness:
         and replay any deferred writes for the project. Returns the
         ``build_stale_run_diagnostics`` dict so the caller can drive its own
         logging/escalation policy on top of this shared body.
+
+        The terminalisation is a compare-and-set on ``run.status``, the status
+        the caller's read observed. ``None`` means the row moved on since that
+        read — its own coroutine terminalised it, and owns its cleanup — so
+        nothing was written, restored, released or replayed.
 
         The restore is run-scoped (task 2711 / E7): only events this run
         itself drained (plus any pre-task-2711, unattributed leftovers — see
@@ -2084,8 +2097,23 @@ class ReconciliationHarness:
             'failed_stage': None,
             **diag,
         }
-        await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-        await self.journal.complete_run(run.id, disposition)
+        recovered = await self.journal.complete_run_if_status(
+            run.id,
+            expected_status=run.status,
+            status=disposition,
+            stage_reports=run.stage_reports,
+        )
+        if not recovered:
+            logger.warning(
+                'reconciliation.stale_run_recovery_refused',
+                extra={
+                    'run_id': run.id,
+                    'project_id': run.project_id,
+                    'expected_status': str(run.status),
+                    'error_type': error_type,
+                },
+            )
+            return None
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
@@ -2185,6 +2213,8 @@ class ReconciliationHarness:
                     'Run owned by dead predecessor instance, recovered at startup'
                 ),
             )
+            if diag is None:
+                continue
             logger.info(
                 'reconciliation.predecessor_run_recovered',
                 extra={
@@ -2242,7 +2272,7 @@ class ReconciliationHarness:
             # a resume failure, so it deliberately does NOT feed the
             # _record_resume_failure storm counter.
             if not self.config.resume_after_restart:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunResumeDisabled',
@@ -2252,6 +2282,8 @@ class ReconciliationHarness:
                         'out of resuming into a changed prompt/toolset)'
                     ),
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_resume_disabled',
                     extra={
@@ -2270,12 +2302,14 @@ class ReconciliationHarness:
             # predecessor's lock exactly as the predecessor-recovery pass does.
             unresumable_reason = self._resume_guard_reason(run)
             if unresumable_reason is not None:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunUnresumable',
                     error_message=unresumable_reason,
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_unresumable',
                     extra={

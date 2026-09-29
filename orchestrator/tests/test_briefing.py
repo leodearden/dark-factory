@@ -13,32 +13,23 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _briefing_helpers import (
+    _mcp_search_envelope,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 from shared.capability_manifest import DeliveredCheckMeta
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
+    MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
     _format_delivered_checks,
 )
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
 
 
 @pytest.fixture
@@ -1019,3 +1010,159 @@ class TestReviewerPromptAmendmentScope:
         )
         assert '# Amendment Re-Review Scope' not in omitted
         assert omitted == explicit_none
+
+
+def _memory_reply(content: str = 'A recalled fact.') -> dict:
+    """A one-result, fully-tagged ``search`` reply, in the real wire shape."""
+    entry = _result('1', content, source_store='mem0')
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return _mcp_search_envelope([entry])
+
+
+@pytest.mark.asyncio
+class TestPerRoleMemoryTable:
+    """Which roles get a memory block, and which deliberately do not (D7).
+
+    Task 3659. The merger is a mechanical role — read both sides of a
+    conflict, resolve, test — measured at 7 dispatches in 14 days, and had
+    only the generic block nobody could show helped it. The reviewer is the
+    single highest-volume role and had the same generic block, despite the
+    workflow holding the task id at every dispatch site.
+    """
+
+    async def test_the_merger_asks_memory_nothing(self, briefing: BriefingAssembler):
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_merger_prompt('CONFLICT TEXT', 'THE INTENT')
+
+        assert mcp.await_args_list == [], 'the merger fires no memory query at all'
+        assert '# Context' not in prompt
+        assert '## Conventions & Gotchas' not in prompt
+        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) not in prompt
+        assert 'CONFLICT TEXT' in prompt and 'THE INTENT' in prompt
+
+    async def test_the_reviewer_gets_the_task_scoped_sections(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_memory_reply())
+        task = {
+            'id': '4242',
+            'title': 'Tighten the merge-lane park grace',
+            'metadata': {'files': ['orchestrator/src/orchestrator/merge_worker.py']},
+        }
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt(
+                'reviewer_comprehensive', 'DIFF', task=task,
+            )
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' in prompt
+        assert 'A recalled fact.' in prompt
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-4242-reviewer'
+            assert args['caller_task_id'] == '4242'
+
+    async def test_the_reviewer_still_builds_without_a_task(
+        self, briefing: BriefingAssembler,
+    ):
+        """Existing callers pass no task; they must keep working, with the
+        generic conventions query and no task-scoped section.
+
+        Also the task-less half of D8: a dispatch with no task declares the
+        role alone and must not invent a ``caller_task_id`` for the journal
+        to record it under.
+        """
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' not in prompt
+        arguments = _search_arguments(mcp)
+        assert len(arguments) == 1
+        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+        assert 'caller_task_id' not in arguments[0]
+
+    async def test_the_steward_continuation_asks_memory_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        """Unchanged by this task: the steward session already holds the full
+        context from its initial briefing."""
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_steward_continuation_prompt(
+                {'id': '4242', 'title': 'A task'},
+                {'id': 'esc-4242-1', 'summary': 'Something blocked'},
+            )
+
+        assert mcp.await_args_list == []
+        assert 'esc-4242-1' in prompt
+
+
+class TestFormatTaskFieldSurface:
+    """Pins which task fields ``_format_task`` renders into the prompt.
+
+    Each populated field must reach the prompt on its own line and each
+    absent one must render nothing, so a rewrite that quietly stopped
+    rendering a field an agent is briefed from would not land undetected.
+
+    This does NOT guard ``memory_hints`` delivery: ``briefing.py`` delivers no
+    hints today, and task 3254, which owns that decision, has no protection
+    here.
+
+    Pinned FIELD BY FIELD, not as one byte-for-byte equality: a whole-string
+    equality would additionally freeze field ORDER and every label's exact
+    spelling, so a harmless relabelling would break a guard that has nothing
+    to do with it.
+    """
+
+    def _task(self) -> dict:
+        return {
+            'id': '3254',
+            'title': 'Deliver memory hints to dispatched agents',
+            'description': 'Wire metadata.memory_hints through to the briefing.',
+            'details': 'The channel is reconciliation-internal today.',
+            'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
+            'dependencies': [{'id': '3659'}, '3212'],
+        }
+
+    def test_every_populated_field_renders_on_its_own_line(
+        self, briefing: BriefingAssembler,
+    ):
+        rendered = briefing._format_task(self._task()).splitlines()
+
+        assert '**ID:** 3254' in rendered
+        assert '**Title:** Deliver memory hints to dispatched agents' in rendered
+        assert '**Description:** Wire metadata.memory_hints through to the briefing.' in rendered
+        assert '**Details:** The channel is reconciliation-internal today.' in rendered
+        assert '**Files:** orchestrator/src/orchestrator/agents/briefing.py' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered, (
+            'a dependency reads the same whether it arrives as a dict or a bare id'
+        )
+
+    def test_an_absent_field_renders_nothing_at_all(
+        self, briefing: BriefingAssembler,
+    ):
+        """No empty labels and no ``None`` — the guard against a field that
+        stops being populated turning into a line of noise."""
+        rendered = briefing._format_task({'id': '3254', 'title': 'A task'})
+
+        assert rendered == '**ID:** 3254\n**Title:** A task'
+
+    def test_the_files_line_is_the_only_opt_out(
+        self, briefing: BriefingAssembler,
+    ):
+        """``include_files=False`` is the architect's anti-anchor path (C-A1);
+        it must drop that one line and leave every other field standing."""
+        rendered = briefing._format_task(self._task(), include_files=False).splitlines()
+
+        assert not [line for line in rendered if line.startswith('**Files:**')]
+        assert '**ID:** 3254' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered

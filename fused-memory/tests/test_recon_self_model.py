@@ -256,6 +256,74 @@ class TestMem0TombstoneDeleters:
         assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
 
 
+class _OneTombstoneReader:
+    """A memory service holding exactly one tombstone."""
+
+    def __init__(self, memory_id: str, deleter: str) -> None:
+        self._memory_id = memory_id
+        self._deleter = deleter
+
+    async def get_mem0_deletion_tombstone(self, project_id: str, memory_id: str):
+        if memory_id != self._memory_id:
+            return None
+        return {'deleter': self._deleter, 'deleting_run_id': 'run-sweep'}
+
+
+_SWEPT_ID = '445c97ac-14d7-4956-9e46-e4475eecff16'
+
+
+def _sole_swept_id_flag() -> dict:
+    return {
+        'task_id': '165',
+        'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+        'description': f'mem0 {_SWEPT_ID} deleted after the ledger-stamp write',
+    }
+
+
+class TestSweepDeletionGuardBenignSetIsTheDeleterTuple:
+    """sweep_deletion_guard's benign-deleter set IS MEM0_TOMBSTONE_DELETERS
+    (task 5271): every documented deleter clears a flag, and a deleter outside
+    the tuple does not.  Imports the guard lazily, per this file's import-light
+    idiom."""
+
+    @pytest.mark.parametrize('deleter', m.MEM0_TOMBSTONE_DELETERS)
+    @pytest.mark.asyncio
+    async def test_every_documented_deleter_clears_the_flag(self, deleter):
+        from fused_memory.reconciliation.sweep_deletion_guard import (
+            filter_benign_sweep_deletion_flags,
+        )
+
+        result = await filter_benign_sweep_deletion_flags(
+            _OneTombstoneReader(_SWEPT_ID, deleter),
+            'p',
+            [_sole_swept_id_flag()],
+            events=[],
+        )
+
+        assert result == [], (
+            f'{deleter!r} is in MEM0_TOMBSTONE_DELETERS, so its sweep is '
+            f'documented and the flag must be DROPPED; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_deleter_outside_the_tuple_keeps_the_flag(self):
+        from fused_memory.reconciliation.sweep_deletion_guard import (
+            filter_benign_sweep_deletion_flags,
+        )
+
+        assert 'stage9_imaginary_sweep' not in m.MEM0_TOMBSTONE_DELETERS
+        flag = _sole_swept_id_flag()
+
+        result = await filter_benign_sweep_deletion_flags(
+            _OneTombstoneReader(_SWEPT_ID, 'stage9_imaginary_sweep'),
+            'p',
+            [flag],
+            events=[],
+        )
+
+        assert result == [flag]
+
+
 # --------------------------------------------------------------------------- #
 # FINGERPRINT_IDENTITY_FIELDS + harness._derive_affected_ids cross-check (step-5/6)
 # --------------------------------------------------------------------------- #

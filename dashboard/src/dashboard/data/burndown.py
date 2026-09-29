@@ -33,7 +33,7 @@ import httpx
 from shared.task_statuses import TaskStatus
 
 from dashboard.config import DashboardConfig
-from dashboard.data.census import TaskCensus, TaskView
+from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
@@ -318,13 +318,12 @@ def _row_for_root(
     # per-project scalar stored on the row because max_concurrent_tasks varies
     # across restarts and across projects — see BURNDOWN_SCHEMA.
     cap = read_max_concurrent_tasks(root)
-    # The `running` sub-view is the one number an operator compares against
-    # max_concurrent_tasks (PRD decision 3).
-    running = measurement.census.sub_views[TaskView.RUNNING]
-    if cap is not None and running > cap:
+    # The same live-vs-cap comparison compute_parity_alarm makes (PRD decision 9).
+    live = measurement.in_progress_live
+    if cap is not None and live > cap:
         logger.warning(
-            'Concurrency cap breached for %s: %d in-progress vs cap %d (%d stranded)',
-            root, running, cap, measurement.in_progress_stranded,
+            'Concurrency cap breached for %s: %d live in-progress vs cap %d (%d stranded)',
+            root, live, cap, measurement.in_progress_stranded,
         )
     return _value_row(root, ts, measurement, cap)
 
@@ -775,9 +774,15 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     still TIME-VARYING across the window: re-deriving a single cap would forgive
     a real past breach after a cap raise, and invent a fictional one after a cut.
 
+    The numerator is the rows' live count, not the census ``in_progress``
+    (plans/dashboard-one-datum-one-path-prd.md decision 9).  A stranded row
+    holds no scheduler slot and is surfaced by the stranded band, so counting
+    it would fire the over-dispatch alarm on a strand pile-up.  A snapshot with
+    no live count is unmeasured and skipped, never read as 0 or as the census.
+
     Semantics:
 
-    * ``parity_breach_count`` — snapshots where ``in_progress > cap``.  The cap
+    * ``parity_breach_count`` — snapshots where ``in_progress_live > cap``.  The cap
       is INCLUSIVE, so running exactly at capacity is healthy, not an alarm.
     * ``parity_alarm`` — ``breach_count > 0``.
     * ``parity_peak`` / ``parity_cap`` — a MATCHED PAIR read off ONE snapshot,
@@ -792,7 +797,7 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
       - when the series breaches — the breaching snapshot with the WIDEST
         margin ``count - cap`` (ties broken toward the larger count), i.e. the
         worst moment and the cap that was actually in force at it;
-      - otherwise — the snapshot with the highest ``in_progress`` (ties broken
+      - otherwise — the snapshot with the highest ``in_progress_live`` (ties broken
         toward the tighter cap), i.e. the literal peak of a healthy window and
         the cap it was actually measured against.
 
@@ -807,7 +812,7 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     Pure: no clock, no I/O, no mutation of *series*.  Ragged or non-numeric
     input degrades to the quiet result rather than raising inside a route.
     """
-    in_progress = list(series.get('in_progress') or [])
+    live = list(series.get('in_progress_live') or [])
     caps = list(series.get('concurrency_cap') or [])
 
     breaches = 0
@@ -816,7 +821,7 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     # whichever one is published cannot misdescribe the other half.
     worst_breach: tuple[int, int] | None = None   # widest margin among breaches
     highest: tuple[int, int] | None = None        # highest count overall
-    for count, cap in zip(in_progress, caps, strict=False):
+    for count, cap in zip(live, caps, strict=False):
         if not isinstance(count, int) or isinstance(count, bool):
             continue
         if not isinstance(cap, int) or isinstance(cap, bool):
@@ -839,7 +844,7 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
         logger.debug(
             'compute_parity_alarm: no snapshot carries a concurrency cap over '
             '%d label(s); reporting unknown rather than "not breaching"',
-            len(in_progress),
+            len(live),
         )
 
     return {

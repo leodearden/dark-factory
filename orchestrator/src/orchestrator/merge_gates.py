@@ -271,20 +271,16 @@ _REVERT_SUBJECT_RE = re.compile(r'^\s*(Revert\b|revert[(:!])', re.IGNORECASE)
 """Subjects that mean "this commit UNDOES a delivery", not "this IS one".
 
 Applied to the ATTRIBUTING commit in :func:`_resolve_already_landed_branch`,
-uniformly across BOTH attribution mechanisms.  Not redundant with
-:data:`ALREADY_LANDED_CITATION_PATTERN`, which only narrows the citation
-FALLBACK — the merge-marker probe needs its own guard, and the reason is
-measured rather than theoretical:
-
-``git revert -m 1 <M>`` writes the subject ``Revert "Merge task/<id> into
-main"``, which CONTAINS the marker string ``Merge task/<id> into main``
-verbatim.  ``GitOps.find_merge_marker`` greps with ``--fixed-strings
---max-count=1`` in most-recent-first order, so after a revert it returns the
-REVERT COMMIT rather than the merge.  Every downstream signal then agrees:
-``revert^1..revert`` names exactly the declared files (coverage passes), and
-the revert's OWN effect — the deletion — is genuinely present at main HEAD, so
-even the survival signal says yes.  The attribution is where this has to be
-caught, and it is caught for both mechanisms in one place.
+uniformly across BOTH attribution mechanisms, as DEFENCE IN DEPTH: neither
+probe answers with a revert today.  ``git revert -m 1 <M>`` writes the subject
+``Revert "Merge task/<id> into main"``, which QUOTES the marker, but since task
+5765 ``GitOps.find_merge_marker`` requires the WHOLE subject to equal the merge
+subject, so after a revert it answers with ``M`` itself, and signal 4
+(SURVIVAL) declines ``M``.  :data:`ALREADY_LANDED_CITATION_PATTERN` rejects
+revert subjects through its anchored delivery prefixes.  The guard stays so a
+future widening of either probe cannot silently re-admit a revert, whose OWN
+effect (the deletion) is present at main HEAD and would pass every later
+signal.
 """
 
 
@@ -1701,9 +1697,8 @@ async def _resolve_already_landed_branch(
     about.
 
     Whichever probe answers, the attributing commit is then required NOT to
-    have a revert-shaped subject (:data:`_REVERT_SUBJECT_RE`) — see that
-    constant for why the merge-marker probe needs the guard just as much as
-    the citation one, and why no later signal can substitute for it.
+    have a revert-shaped subject (:data:`_REVERT_SUBJECT_RE`), a
+    defence-in-depth guard — see that constant for why it is kept.
 
     **TRAP 1 — the citation fallback is mandatory, not belt-and-braces.**  A
     non-tip coalesce-train member lands with NO per-task merge marker: the
@@ -1831,9 +1826,9 @@ async def _resolve_already_landed_branch(
     landed_sha = landed_sha.strip()
 
     # ATTRIBUTION, part 2: the commit that answered must be a DELIVERY, not a
-    # revert of one.  See `_REVERT_SUBJECT_RE` — a `git revert -m 1 <M>`
-    # subject quotes the merge marker verbatim, so the marker probe returns
-    # the revert, and every later signal then agrees with it.
+    # revert of one.  Defence in depth: see `_REVERT_SUBJECT_RE` for why
+    # neither probe answers with a revert today, and why a revert that did
+    # answer would pass every later signal.
     rc, subject, err = await _run(
         ['git', 'log', '-1', '--format=%s', landed_sha],
         cwd=git_ops.project_root,

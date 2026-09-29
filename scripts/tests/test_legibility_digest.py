@@ -21,6 +21,7 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,7 +31,13 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from orchestrator.agents.briefing import (
+    MEMORY_CONTEXT_CAVEAT,
+    MEMORY_DEGRADED_STORES_NOTICE,
+    MEMORY_EMPTY_NOTICE,
+    MEMORY_OUTAGE_NOTICE,
+    MEMORY_SECTION_FAILURE_NOTICE,
+)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
@@ -1148,6 +1155,19 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 3
 
+    def test_frontmatter_names_a_generation_that_excludes_non_human_origin_turns(self):
+        """Generation 4 is the first whose gold section and user-text signal
+        carriers exclude non-human-origin records, so a census can tell a
+        pre-fix task-notification "User Correction" from a live regression.
+        A floor, not a freeze, exactly like the generation-3 test above."""
+        digest = mod.render_digest(
+            [_with_session_meta(_task_notification())], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 4
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
@@ -2082,29 +2102,49 @@ _DROP_NOTE_EXAMPLE = (
 (``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
 f'{query_word} were tagged to another project and filtered out'``)."""
 
-_NO_RECALLED_SECTIONS_VARIANTS = (
-    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
-    (
-        '# Context\n\n_Memory unavailable — proceed with codebase '
-        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
-    ),
-    '# Context\n\n_No memory context available._',
-    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
-)
-"""The four literal shapes ``_get_memory_context`` returns when
-``recalled_sections`` is empty
-(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
-literal families (memory-unavailable / no-memory-context available), each
-with a plain and a drop_note-bearing variant. Not lockstep-importable
-like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
-``_get_memory_context``'s body, not a module-level constant."""
+_SECTION_NOTICES_EXAMPLE = '\n\n'.join((
+    MEMORY_SECTION_FAILURE_NOTICE.format(section='Task Context', reason='transport'),
+    MEMORY_DEGRADED_STORES_NOTICE.format(section='Conventions & Gotchas', stores='graphiti'),
+))
+"""Representative per-section notice text -- one broken query and one
+server-reported store outage, the two lines ``_section_notices`` emits."""
+
+
+def _no_recalled_sections_variants() -> tuple[str, ...]:
+    """Every shape ``_get_memory_context`` returns with no section recalled.
+
+    Two families -- MEMORY_OUTAGE_NOTICE (nothing worked) and
+    MEMORY_EMPTY_NOTICE (the corpus had nothing to say) -- each in three
+    shapes: plain, drop_note-bearing, and notices-bearing. The third arrived
+    with task 3659 step 20, which stopped discarding the per-section notices
+    on this path; before it, a broken dispatch rendered the empty-corpus
+    sentence verbatim.
+
+    Built by composing the PRODUCTION constants exactly as
+    ``_get_memory_context`` composes them -- family line first, notices
+    joined after it, drop_note appended last -- so a rewording of either
+    family turns this red instead of silently un-covering the marker it
+    pins. Lockstep-importable since task 3659 hoisted both families out of
+    ``_get_memory_context``'s body into module-level constants.
+    """
+    variants = []
+    for family in (MEMORY_OUTAGE_NOTICE.format(reasons='transport'), MEMORY_EMPTY_NOTICE):
+        variants.extend((
+            f'# Context\n\n{family}',
+            f'# Context\n\n{family}\n\n_Note: {_DROP_NOTE_EXAMPLE}._',
+            f'# Context\n\n{family}\n\n{_SECTION_NOTICES_EXAMPLE}',
+        ))
+    return tuple(variants)
+
+
+_NO_RECALLED_SECTIONS_VARIANTS = _no_recalled_sections_variants()
 
 
 def _recalled_sections_with_trailing_unavailable_note():
     """The recalled-sections return path's fullest composite shape
-    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
-    fifth of ``_get_memory_context``'s five return paths, distinct from
-    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    (``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+    -- ``_get_memory_context``'s OTHER return, distinct from
+    the ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
     have recalled_sections EMPTY; this one has it non-empty). Builds a
     caveat carrying its own drop_note suffix (a foreign-tagged result was
     filtered from an earlier query), a genuinely recalled section, AND
@@ -2120,6 +2160,34 @@ def _recalled_sections_with_trailing_unavailable_note():
         '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
         'with codebase exploration for anything not covered above._'
     )
+
+
+def _merger_prompt(tmp_path):
+    """The real text ``BriefingAssembler.build_merger_prompt`` injects
+    (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
+    production builder rather than restating its headings here — the same
+    lockstep discipline ``test_resume_prompt_is_excluded_lockstep`` applies
+    to the cli_invoke resume constants.
+
+    The builder is async and touches no I/O and no config, so a throwaway
+    assembler over *tmp_path* and a plain ``asyncio.run`` suffice; this file
+    is otherwise synchronous and stays that way."""
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    assembler = BriefingAssembler(OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    ))
+    return asyncio.run(assembler.build_merger_prompt(
+        conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
+        task_intent='Rescope the briefing memory block.',
+    ))
 
 
 def _resume_and_context_block_records():
@@ -2336,6 +2404,41 @@ class TestHarnessInjectedTurnFilter:
         # resume prompt is covered by adding one more row.
         assert mod.is_harness_injected_turn(resume_prompt) is True
 
+    def test_merger_prompt_is_excluded_lockstep(self, tmp_path):
+        # LOCKSTEP: built by the REAL prompt builder, not a hand-copied
+        # literal, the same way test_resume_prompt_is_excluded_lockstep
+        # pins the cli_invoke constants -- so a future merger-prompt
+        # rewording turns this red instead of silently dropping the role
+        # out of coverage.
+        #
+        # The merger is the one dispatched role with NO memory block
+        # (task 3659, D7), so it emits no '# Context' anchor and the
+        # briefing anchor+corroborator rule cannot see it at all. Before
+        # 3659 it was classified via that anchor; MERGER_HEADINGS is what
+        # keeps merge-conflict dispatches (7 per 14 days, measured) out of
+        # the digest's gold user_corrections section.
+        assert mod.is_harness_injected_turn(_merger_prompt(tmp_path)) is True
+
+    def test_merger_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
+        # The end-to-end consequence of the lockstep pin above: a merger
+        # dispatch transcript presents no user turn to mine.
+        records = [_user_text(_merger_prompt(tmp_path))]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_human_turn_with_one_merger_heading_is_retained(self, tmp_path):
+        # The all-of guard MERGER_HEADINGS is matched under: a human turn
+        # writing '# Action' (an ordinary spec-writing heading, emitted by
+        # every role template and deliberately NOT a briefing corroborator
+        # since task 3610) must stay gold.
+        human = (
+            '# Action\n\n'
+            'Please resolve the conflict in briefing.py by hand -- the '
+            'merge queue keeps picking the wrong side.\n'
+        )
+
+        assert mod.is_harness_injected_turn(human) is False
+
     def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
         # The sibling of the usage-limit resume prompt: same defect class
         # (harness-injected continuation boilerplate typed into the
@@ -2405,13 +2508,13 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize(
         'text', _NO_RECALLED_SECTIONS_VARIANTS,
         ids=[
-            'memory_unavailable', 'memory_unavailable_with_drop_note',
-            'no_memory_context', 'no_memory_context_with_drop_note',
+            'outage', 'outage_with_drop_note', 'outage_with_notices',
+            'empty', 'empty_with_drop_note', 'empty_with_notices',
         ],
     )
     def test_no_recalled_sections_variant_is_excluded(self, text):
-        # Exhaustive over _get_memory_context's four no-recalled-sections
-        # return paths, not just the caveat-bearing happy path covered
+        # Exhaustive over _get_memory_context's no-recalled-sections
+        # return shapes, not just the caveat-bearing happy path covered
         # above -- the marker set must cover every output of that
         # function, not merely its most common case.
         records = [_user_text(text)]
@@ -2505,6 +2608,228 @@ class TestHarnessInjectedTurnFilter:
             + '\nTask ID: 4275\nWorktree: /home/leo/src/dark-factory/.worktrees/4275\n'
         )
         records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Non-human-origin records (task 5956). Claude Code stamps a queued prompt
+# with a structured top-level ``origin`` dict, and a background task's
+# completion or failure arrives as an ordinary user record with isMeta ABSENT
+# and origin={'kind': 'task-notification'} -- so no text rule saw it, and it
+# rendered as a gold "User Correction". Census sighting: reify session
+# 50e12d17's only gold turn was record 196, a sub-agent's weekly-limit
+# failure notification (_TASK_NOTIFICATION_TEXT, verbatim).
+# ---------------------------------------------------------------------------
+
+_TASK_NOTIFICATION_TEXT = (
+    '<task-notification>\n'
+    '<task-id>a1ab810a169bbb353</task-id>\n'
+    '<tool-use-id>toolu_019A8emLVkosytrg3s2up7AD</tool-use-id>\n'
+    '<output-file>/tmp/claude-1000/-home-leo-src-warm-lanes-worktrees--lane-20/'
+    '50e12d17-9e73-4686-a364-7ae08109140c/tasks/a1ab810a169bbb353.output</output-file>\n'
+    '<status>failed</status>\n'
+    '<summary>Agent "Find .ri fixture test harness patterns" failed: Agent terminated'
+    " early due to an API error: You've hit your weekly limit · resets Aug 26, 11am"
+    ' (Europe/London)</summary>\n'
+    '<note>A task-notification fires each time this agent stops with no live background'
+    ' children of its own. The user can send it another message and resume it, so the'
+    ' same task-id may notify more than once.</note>\n'
+    '<result>Now the harness and builtin tests.</result>\n'
+    '</task-notification>'
+)
+
+_GENUINE_CORRECTION = 'This is wrong, please redo it.'
+
+_UNKNOWN_PROVENANCE_TEXT = 'please redo the merge'
+
+
+def _with_origin(rec, kind):
+    """Return a copy of *rec* stamped with Claude Code's structured
+    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
+    a real origin-stamped record carries isMeta absent, not False."""
+    out = dict(rec)
+    out.pop('isMeta', None)
+    out['origin'] = {'kind': kind}
+    return out
+
+
+_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
+    '<task-notification>\n'
+    '<task-id>b2bc921b279ccc464</task-id>\n'
+    '<status>completed</status>\n'
+    '<summary>Background command "merge the branch" completed (exit code 1)</summary>\n'
+    '<result>BLOCKED: merge gate refused the branch\n'
+    '[Request interrupted by user for tool use]</result>\n'
+    '</task-notification>'
+)
+
+
+def _task_notification(text=_TASK_NOTIFICATION_TEXT):
+    """A background-task notification record, shaped like census record 196."""
+    return _with_origin(_user_text(text), 'task-notification')
+
+
+class TestNonHumanOriginFilter:
+    def test_census_task_notification_is_excluded_from_iter_user_turns(self):
+        assert mod.iter_user_turns([_task_notification()]) == []
+
+    @pytest.mark.parametrize(
+        ('kind', 'text'),
+        [
+            ('task-notification', _TASK_NOTIFICATION_TEXT),
+            (
+                'auto-continuation',
+                'Implement the following plan:\n\n# Fix: the laptop verify host is benched'
+                '\n\n## Objective\n\nMake the sync find uv on the remote host.',
+            ),
+            (
+                'auto-continuation',
+                'Your claude.ai usage limit has reset. Continue the task you were working on'
+                ' when the limit was reached; do not repeat work that is already complete.',
+            ),
+            (
+                'coordinator',
+                'The coordinator sent a message while you were working:\n'
+                'Task 5878 has landed; stop now and make no further changes.',
+            ),
+            (
+                'peer',
+                'Another Claude session sent a message:\n'
+                '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock"'
+                ' from-name="dark-factory-19">\nplease pick up the dedup scope\n'
+                '</cross-session-message>',
+            ),
+            ('a-future-kind', _UNKNOWN_PROVENANCE_TEXT),
+        ],
+        ids=[
+            'task_notification', 'auto_continuation_plan',
+            'auto_continuation_usage_limit_reset', 'coordinator', 'peer',
+            'unseen_future_kind',
+        ],
+    )
+    def test_every_non_human_origin_kind_is_excluded(self, kind, text):
+        # The text alone is ordinary dialogue to the content classifier, so
+        # only the record's provenance can exclude it -- and the rule is
+        # "anything but human", never an allowlist of known machine kinds.
+        rec = _with_origin(_user_text(text), kind)
+
+        assert mod.is_reingested_content(text) is False
+        assert mod.has_non_human_origin(rec) is True
+        assert mod.iter_user_turns([rec]) == []
+
+    def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
+        text = 'why did the <task-notification> for the lint run say failed? please look again'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert mod.has_non_human_origin(rec) is False
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    def test_human_origin_record_opening_with_a_pasted_notification_is_kept(self):
+        # PROVENANCE decides, not text: there is no '<task-notification>'
+        # prefix fallback, so a human who pastes one to ask about it stays gold.
+        text = _TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            _user_text(_UNKNOWN_PROVENANCE_TEXT),
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+        ],
+        ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
+    )
+    def test_unknown_provenance_falls_through_to_text_rules(self, record):
+        assert mod.has_non_human_origin(record) is False
+        assert [t['text'] for t in mod.iter_user_turns([record])] == [
+            _UNKNOWN_PROVENANCE_TEXT,
+        ]
+
+    def test_genuine_turn_between_notifications_keeps_its_record_index(self):
+        records = [
+            _task_notification(),
+            _with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
+            _task_notification(),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, _GENUINE_CORRECTION)]
+
+    def test_render_digest_notification_only_session_has_no_gold_section(self):
+        # The census 50e12d17 shape at render level.
+        records = [_with_session_meta(_task_notification())]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
+        assert '<task-notification>' not in body
+
+    def test_render_digest_keeps_only_the_genuine_correction_beside_notifications(self):
+        records = [
+            _with_session_meta(_task_notification()),
+            _with_session_meta(_with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
+            _with_session_meta(_task_notification()),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
+        assert meta['n_user_turns'] == 1
+
+    def test_df_guard_and_interrupt_ignore_a_task_notification_carrier(self):
+        records = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)]
+
+        assert mod.iter_df_guards(records) == []
+        assert mod.iter_interrupts(records) == []
+
+    def test_same_literals_under_human_origin_still_fire(self):
+        # The carrier filter keys on provenance, not on the text.
+        records = [_with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
+
+        assert len(mod.iter_df_guards(records)) == 1
+        assert len(mod.iter_interrupts(records)) == 1
+
+    def test_non_human_origin_drops_the_records_tool_result_carrier_too(self):
+        # Provenance is a property of the RECORD, so it filters every carrier
+        # the record holds -- not only its user text.
+        content = 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'
+        stamped = [_with_origin(_tool_result('tool-1', content), 'task-notification')]
+        unstamped = [_tool_result('tool-1', content)]
+
+        assert mod.iter_df_guards(stamped) == []
+        assert mod.iter_not_found(stamped) == []
+        assert len(mod.iter_df_guards(unstamped)) == 1
+        assert len(mod.iter_not_found(unstamped)) == 1
+
+    def test_signal_counts_unaffected_by_a_task_notification_turn(self):
+        base = _all_signals_records()
+        with_notification = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)] + base
+
+        assert mod.signal_counts(with_notification) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_reads_markers_inside_a_notification(self):
+        # classify_agent_class reads the RAW carriers, which stay unfiltered.
+        text = (
+            _TASK_NOTIFICATION_TEXT
+            + 'Task ID: 5956\nWorktree: /home/leo/src/dark-factory/.worktrees/5956\n'
+        )
+        records = [_task_notification(text)]
 
         assert mod.iter_user_turns(records) == []
         assert mod.classify_agent_class(records) == 'orchestrated-task'

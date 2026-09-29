@@ -219,6 +219,12 @@ when they can answer there is nothing to anchor.
 | `add_memory` | 0-3 LLM calls | Discrete, distilled facts — **prefer this** |
 | `add_episode` | 5-15 LLM calls | Raw content needing extraction — use sparingly |
 
+```
+add_memory(content="Task 3127 moved retries into the caller because they hid latency",
+           category="decisions_and_rationale", project_id="dark_factory",
+           agent_id="claude-interactive", entities=[{'kind': 'task', 'id': 3127}])
+```
+
 ### Category routing
 
 | Category | Primary Store | Use for |
@@ -235,6 +241,7 @@ when they can answer there is nothing to anchor.
 Always pass these parameters on write operations:
 - **`project_id`**: `"dark_factory"`
 - **`agent_id`**: descriptive identifier, e.g. `"claude-interactive"`, `"claude-task-7"`, `"reconciliation-stage-1"`
+- **`entities`**: declare what the write is about (`[]` if nothing), e.g. `[{'kind': 'task', 'id': 3127}]`. Omitting it always succeeds; a declaration your own content contradicts is rejected.
 
 ## Task Routing
 

@@ -153,22 +153,21 @@ are holding a sha from somewhere else and want to know whether it is a marker. I
 substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
-command explicitly mirrors (`GitOps.find_merge_marker` resolves through `_lookup_merge_marker`'s
-full-message `%B` index, falling back to `_scan_merge_marker`'s bare `--grep`; both derive the
-pattern from `_merge_subject`, and neither restricts to merge commits nor checks the subject —
-`_merge_marker_pattern` is deliberately unanchored to mirror `--grep`), whose whole value is that
-writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
+command explicitly mirrors (`GitOps.find_merge_marker`, on both its index and scan paths, selects
+the newest commit on main whose SUBJECT equals `_merge_subject`, and does not restrict to merge
+commits — `orchestrator/src/orchestrator/git_ops.py::_merge_markers_by_branch`), whose whole value
+is that writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
 measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker
 with a **single parent**, which `--merges` drops — and which the command above does return.
 Subject equality as selected above loses nothing and needs no divergence. (That claim is only true
 of the selecting form: paired with `--max-count=1` subject equality *was* lossy, in the 8 measured
 cases above.)
 
-The root cause is in that production lookup, which this doc faithfully mirrors; the shell-side
-subject check is the guard available to an agent. It is the same relationship [step 2](#step-2)'s
-containment check already has to `find_merge_marker`'s branch-existence gate: the agent re-supplies
-in the shell a guard the bare search does not carry. The production half is tracked as **task
-5765**; while that is open this shell-side guard is the only one there is.
+The shell selection above and the server's lookup now apply the same rule: the newest commit whose
+subject equals the merge subject. The `awk` selection is the agent re-supplying in the shell what
+the server already does — the same relationship [step 2](#step-2)'s containment check has to
+`find_merge_marker`'s branch-existence gate. It is not optional: the bare `--grep` still matches
+bodies.
 
 - **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
 - **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.

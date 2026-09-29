@@ -2845,13 +2845,15 @@ class TaskCurator:
             system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
-            # ``max_turns=1`` is incompatible with ``--json-schema`` because
-            # the schema mechanism burns a tool-use turn; the CLI returns
-            # ``error_max_turns`` after the schema turn, even when the
-            # structured payload is already attached. The configured floor
-            # is 3 (schema tool-use + optional reasoning + final response);
-            # the default of 8 leaves headroom for harder combine-vs-create
-            # decisions. Schema salvage in cli_invoke.py covers the boundary.
+            # Never 1: a cap of 1 leaves no room for the prose turn the model
+            # emits before calling ``StructuredOutput`` (see
+            # fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS).
+            # Schema salvage in cli_invoke is not a backstop for that: on the
+            # measured recon-verify shape the ``error_max_turns`` result carried
+            # no payload, so salvage had nothing to recover.  The curator's own
+            # shape has not been measured, so the ``ge=3`` floor and the default
+            # of 8 are established values, not revalidated ones; 8 leaves
+            # headroom for harder combine-vs-create decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
