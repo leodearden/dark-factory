@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -538,8 +539,14 @@ class TestGetSchedulerEventsTool:
 # ===========================================================================
 
 
+def _burn_60ms_of_thread_cpu() -> None:
+    started = time.thread_time()
+    while time.thread_time() - started < 0.06:
+        pass
+
+
 class TestMedianThreadCpuMs:
-    """The perf instrument charges a call's CPU work, not its time off-CPU."""
+    """The perf instrument charges the calling thread's CPU work, and nothing else."""
 
     def test_time_spent_off_cpu_is_not_charged(self):
         median_ms = _median_thread_cpu_ms(
@@ -550,13 +557,25 @@ class TestMedianThreadCpuMs:
             f'not count against the {_SNAPSHOT_READ_BUDGET_MS}ms budget'
         )
 
-    def test_cpu_work_is_charged(self):
-        def burn_60ms_of_cpu():
-            started = time.thread_time()
-            while time.thread_time() - started < 0.06:
-                pass
+    def test_cpu_work_on_other_threads_is_not_charged(self):
+        def wait_for_another_thread_to_burn_60ms():
+            worker = threading.Thread(target=_burn_60ms_of_thread_cpu)
+            worker.start()
+            worker.join()
 
-        median_ms = _median_thread_cpu_ms(burn_60ms_of_cpu, warmup=0, samples=3)
+        median_ms = _median_thread_cpu_ms(
+            wait_for_another_thread_to_burn_60ms, warmup=0, samples=3,
+        )
+        assert median_ms < _SNAPSHOT_READ_BUDGET_MS, (
+            f'60ms of CPU work on another thread was charged {median_ms:.3f}ms; '
+            f'other threads in the worker must not count against the '
+            f'{_SNAPSHOT_READ_BUDGET_MS}ms budget'
+        )
+
+    def test_cpu_work_is_charged(self):
+        median_ms = _median_thread_cpu_ms(
+            _burn_60ms_of_thread_cpu, warmup=0, samples=3,
+        )
         assert median_ms >= _SNAPSHOT_READ_BUDGET_MS, (
             f'60ms of CPU work was charged only {median_ms:.3f}ms; it must '
             f'trip the {_SNAPSHOT_READ_BUDGET_MS}ms budget'
@@ -597,7 +616,8 @@ class TestSnapshotPerformance:
             f'fallback or truncated payload'
         )
 
-        # Times the sync helper, not the MCP dispatch. Do NOT loosen the budget.
+        # Times the sync helper: the MCP tool runs it via asyncio.to_thread, so its
+        # CPU would land on a worker thread this clock does not see. Do NOT loosen the budget.
         median_ms = _median_thread_cpu_ms(
             lambda: read_scheduler_state(tmp_path), warmup=2, samples=20,
         )
