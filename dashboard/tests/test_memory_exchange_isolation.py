@@ -19,12 +19,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import httpcore
 import httpx
 import pytest
+from _dashboard_helpers import apply_isolated_env
+from fastapi import FastAPI
 
+from dashboard.app import lifespan
 from dashboard.data.memory import mcp_tool_call, reset_sessions
 from dashboard.http_pool import PoolCensus, census
 
@@ -57,6 +62,7 @@ class _HeldToolCallServer:
 
     def __init__(self) -> None:
         self.connections_accepted = 0
+        self.handlers: set[asyncio.Task[Any]] = set()
         self.hold_next_tool_call = True
         self.tool_call_held = asyncio.Event()
         self.release = asyncio.Event()
@@ -75,6 +81,9 @@ class _HeldToolCallServer:
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connections_accepted += 1
+        handler = asyncio.current_task()
+        assert handler is not None
+        self.handlers.add(handler)
         try:
             while True:
                 try:
@@ -132,6 +141,54 @@ async def test_a_caller_that_gives_up_leaves_its_connection_reusable() -> None:
         )
         assert await mcp_tool_call(client, server.url, 'get_status', {}) == _TOOL_RESULT
         assert server.connections_accepted == 1
+
+
+async def test_an_abandoned_exchange_does_not_outlive_the_apps_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lifespan ends every detached exchange before it closes the client.
+
+    Observed at the instant ``aclose`` is entered, as
+    ``test_app_lifespan_reap.py`` observes its bypass reap.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    before = asyncio.all_tasks()
+    still_running_at_aclose: list[set[asyncio.Task[Any]]] = []
+    real_async_client = httpx.AsyncClient
+
+    def _observing_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client = real_async_client(*args, **kwargs)
+        real_aclose = client.aclose
+
+        async def _observing_aclose() -> None:
+            still_running_at_aclose.append({
+                task for task in asyncio.all_tasks() - before - server.handlers
+                if not task.done()
+            })
+            await real_aclose()
+
+        client.aclose = _observing_aclose
+        return client
+
+    async with _HeldToolCallServer() as server:
+        with (
+            patch('dashboard.app.httpx.AsyncClient', _observing_async_client),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        ):
+            app = FastAPI(lifespan=lifespan)
+            async with lifespan(app):
+                call = asyncio.create_task(
+                    mcp_tool_call(app.state.http_client, server.url, 'get_status', {}),
+                )
+                await server.tool_call_held.wait()
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(call, timeout=0)
+        server.release.set()
+
+    assert still_running_at_aclose == [set()], (
+        f'exchanges still running when the client closed: {still_running_at_aclose}'
+    )
 
 
 # ── the stranded-owned class, reproduced deterministically ─────────────

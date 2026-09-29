@@ -11,11 +11,13 @@ import asyncio
 import json
 import logging
 
+import anyio
 import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import (
+    _REAP_UNWIND_TIMEOUT_SECONDS,
     FANOUT_FAILURE_EXCEPTIONS,
     call_with_deadline,
     describe_exc,
@@ -49,6 +51,65 @@ MCP_HEADERS = {
 # across attempts (or a retry loop must be added here); a fresh per-attempt
 # uuid4 would NOT trigger server-side dedup. Safe today only because reads
 # never dedup and a caller-supplied key is preserved.
+
+
+# httpx applies one ``timeout`` to each of four phases separately: pool, connect,
+# write and read. Bounding the whole exchange by their sum lets httpx's own
+# timeouts fire first; this bound ends only what they cannot, such as a response
+# trickled in under the per-read timeout.
+_HTTPX_TIMEOUT_PHASES = 4
+
+_exchanges: set[asyncio.Task[httpx.Response]] = set()
+
+
+async def _post(
+    client: httpx.AsyncClient, url: str, payload: dict, headers: dict, timeout: float,
+) -> httpx.Response:
+    """POST *payload* and read the response, in a task the caller cannot cancel.
+
+    The dashboard's only HTTP egress. A native cancel landing inside httpcore's
+    release path strands the connection (``dashboard/http_pool.py`` states how),
+    so a caller that gives up stops waiting while the exchange runs on to
+    completion under an anyio bound, which httpcore's shields do honour.
+    """
+    exchange = asyncio.create_task(_bounded_post(client, url, payload, headers, timeout))
+    _exchanges.add(exchange)
+    exchange.add_done_callback(_exchanges.discard)
+    return await asyncio.shield(exchange)
+
+
+async def _bounded_post(
+    client: httpx.AsyncClient, url: str, payload: dict, headers: dict, timeout: float,
+) -> httpx.Response:
+    with anyio.fail_after(timeout * _HTTPX_TIMEOUT_PHASES):
+        return await client.post(url, json=payload, headers=headers, timeout=timeout)
+
+
+async def cancel_inflight_exchanges() -> None:
+    """Cancel every exchange still running on this loop, and await them.
+
+    For ``dashboard.app.lifespan`` teardown, so no exchange outlives the client
+    it runs on. Scoped to the running loop and bounded, for the reasons
+    ``mcp_fanout.py::TTLCache.cancel_live_bypasses`` gives; residue of a closed
+    loop can never finish, so it is dropped.
+    """
+    loop = asyncio.get_running_loop()
+    running_here: list[asyncio.Task[httpx.Response]] = []
+    for exchange in list(_exchanges):
+        if exchange.get_loop().is_closed():
+            _exchanges.discard(exchange)
+        elif exchange.get_loop() is loop:
+            running_here.append(exchange)
+    for exchange in running_here:
+        exchange.cancel()
+    if not running_here:
+        return
+    _ended, abandoned = await asyncio.wait(running_here, timeout=_REAP_UNWIND_TIMEOUT_SECONDS)
+    if abandoned:
+        logger.warning(
+            '%d MCP exchange(s) did not unwind within %.1fs; shutdown continues without them',
+            len(abandoned), _REAP_UNWIND_TIMEOUT_SECONDS,
+        )
 
 
 def _parse_mcp_response(resp: httpx.Response) -> dict:
@@ -161,9 +222,7 @@ class McpSession:
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
 
-        resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
-        )
+        resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)
         resp.raise_for_status()
 
         if sid := resp.headers.get('mcp-session-id'):
@@ -181,9 +240,7 @@ class McpSession:
         headers = dict(MCP_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
-        resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
-        )
+        resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)
         if resp.status_code not in (200, 202, 204):
             logger.warning('MCP notify %s returned %s', method, resp.status_code)
 

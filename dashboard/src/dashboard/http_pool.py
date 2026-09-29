@@ -44,12 +44,12 @@ CLOSE-WAIT entries — the measure 3857 correctly rejected. The reading is pool
 occupancy, taken from the pool's own bookkeeping.
 
 THE PREDICATE, and why it is sound without a timestamp. ``pool._requests``
-holds one ``AsyncPoolRequest`` per live request, each carrying ``.connection``,
-and every exit path removes the request before its connection is abandoned. So
-a pooled connection owned by no live request, and neither idle nor closed, is
-provably unreachable. A genuinely in-flight request is never an orphan,
-because its ``AsyncPoolRequest`` is still in ``_requests``. No age heuristic,
-and so no window in which a slow-but-healthy request looks dead.
+holds one ``AsyncPoolRequest`` per live request, each carrying ``.connection``;
+a connection owned by none, neither idle nor closed, is unreachable, while an
+in-flight one is owned and so never reaped. One exit never delists its request,
+``httpcore/_async/connection_pool.py::PoolByteStream.aclose``: a native asyncio
+cancel pierces its anyio shield, stranding an OWNED connection ACTIVE, unseen
+here. ``dashboard/data/memory.py::_post`` keeps caller cancels off that path.
 
 VERIFIED AGAINST httpx 0.28.1 / httpcore 1.0.9 — the same discipline, and the
 same reason, as ``app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS``: this module reads

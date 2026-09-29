@@ -409,6 +409,9 @@ async def lifespan(app: FastAPI):
         # flight can start a bypass behind it, which is the ordinary
         # abandon-don't-cancel leak this reap narrows rather than abolishes.
         await reap_detached_refreshes()
+        # After that reap, which cancels callers but not the exchanges they
+        # started (memory.py::_post).
+        await memory_data.cancel_inflight_exchanges()
     finally:
         await _close_each(
             burndown_store.close,
