@@ -2670,7 +2670,7 @@ def _real_settings_snapshot() -> dict:
                     'hooks': [
                         {
                             'type': 'command',
-                            'command': '/home/leo/.claude/hooks/skim-rewrite.sh',
+                            'command': '/home/leo/.claude/hooks/some-bash-pretooluse.sh',
                             'timeout': 5,
                         }
                     ],
