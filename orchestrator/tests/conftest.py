@@ -8,6 +8,7 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
+import logging
 import os
 import shutil
 import sys
@@ -58,6 +59,7 @@ os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
+    ExitContractViolationCollector,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -455,6 +457,45 @@ def _no_mock_derived_stray_dirs(request):
         "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
         "attribute to auto-spec into a child mock. The stray tree has been "
         "removed so following tests are unaffected."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_unexpected_exit_contract_violation(request):
+    """Fail any test whose ``TaskWorkflow.run()`` exit breaks the spec §5 exit
+    contract (docs/task-escalation-state-spec.md).
+
+    Until task 3542, SM-2 raised ``AssertionError`` out of ``run()`` on an
+    inconsistent exit, which failed whichever test drove it. ``run()`` now
+    RECORDS the verdict instead (a WARNING in the shipped log mode), so this
+    guard restores that oracle: it collects the real recorder's VIOLATION
+    records and fails at teardown.
+
+    **Opt-out via ``exit_contract_violation_expected`` marker**, in the style
+    of ``real_verify_admission`` above: only for a test that DELIBERATELY
+    drives a violation.
+    """
+    collector = ExitContractViolationCollector()
+    contract_logger = logging.getLogger('orchestrator.exit_contract')
+    contract_logger.addHandler(collector)
+    try:
+        yield
+    finally:
+        contract_logger.removeHandler(collector)
+    if not collector.violations:
+        return
+    if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
+        return
+    records = '\n'.join(f'  - {r.getMessage()}' for r in collector.violations)
+    pytest.fail(
+        f"{request.node.nodeid}: a TaskWorkflow.run() exit left a status the "
+        "spec §5 exit contract forbids "
+        "(shared/src/shared/task_transitions.py::outcome_allows_status):\n"
+        f"{records}\n"
+        "Fix the producer that wrote (or skipped) the row, or the test double "
+        "that does not write it the way the real collaborator does. The "
+        "`exit_contract_violation_expected` marker is only for a test that "
+        "DELIBERATELY drives a violation, never a fix for this failure."
     )
 
 
