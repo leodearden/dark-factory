@@ -1610,23 +1610,13 @@ class SqliteTaskBackend:
     ) -> dict[int, list[int]]:
         """Return ``{task_id: [depends_on, ...]}`` for *tag* — the edge set alone.
 
-        The compact dependency read, and it exists separately from
-        :meth:`get_tasks` for exactly the reason :meth:`get_statuses` does:
-        a caller that wants the three-column ``dependencies`` table should not
-        pay for ~3800 fully-hydrated task rows to get it. The first such caller
-        (``MemoryService._check_dependency_direction``, task 3770) reads inside
-        the Graphiti per-``group_id`` identity lock, where payload size is write
-        latency for every concurrent writer on that group.
-
-        A thin public wrapper over :meth:`_fetch_dependencies` — no new SQL, and
-        no second notion of "the dependency edge set". Its contract is
-        inherited verbatim rather than restated in code:
+        The compact counterpart of :meth:`get_tasks`, as :meth:`get_statuses`
+        is, and a thin wrapper over :meth:`_fetch_dependencies`:
 
         - each dependency list is SORTED ascending;
         - a task with NO dependencies is **absent** from the map, not present
-          with an empty list (the SELECT returns no row for it);
-        - the read-skew note on :meth:`_fetch_dependencies` applies — this is a
-          single statement, so it is self-consistent, but it is not a joint
+          with an empty list;
+        - it is a single statement, so self-consistent, but not a joint
           snapshot with any other read a caller issues around it.
 
         Args:

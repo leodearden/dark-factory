@@ -1,17 +1,10 @@
-"""Post-write sanity check for Graphiti dependency-direction extraction (task 3770).
+"""Post-write check of Graphiti dependency-direction extraction (task 3770).
 
-Graphiti's extraction LLM does not hallucinate task numbers here — every task
-it names is real, and adjacent to the ones it is genuinely about. What it gets
-wrong is the DIRECTION: it FLATTENS sibling/parallel relations into sequential
-ones ("A waits behind B" for two tasks that are merely both prerequisites of C)
-and INVERTS transitive chains ("A waits behind B" where B in fact reaches A).
-Because the numbers are plausible and adjacent, a planning read accepts the
-resulting fact without friction — which makes this strictly more dangerous than
-random hallucination, and is why the check exists.
-
-The decision core is pure: the ground-truth graph is passed IN as data, so
-every classification below is exercised against a plain dict with no Taskmaster,
-no Graphiti and no I/O.
+The extraction names real, adjacent task ids but can state the direction wrong:
+it flattens parallel tasks into a sequence and inverts transitive chains. The
+decision core is pure, so most of this suite runs against a plain dict; the
+write-path tests at the end drive the MemoryService seam the durable queue
+dispatches into.
 """
 
 from __future__ import annotations
@@ -20,6 +13,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+from datetime import datetime
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -37,51 +31,21 @@ from fused_memory.middleware.dependency_direction_check import (
     check_dependency_direction,
     classify_dependency_assertion,
     extract_dependency_assertions,
+    extract_dependency_facts,
 )
-from fused_memory.services.memory_service import (
-    MemoryService,
-    ReferentRepairStats,
-    ReferentStats,
-)
+from fused_memory.services.memory_service import MemoryService, ReconcileStats
 
-#: The logger the sub-pass emits its structured WARNING through.
 _MS_LOGGER = 'fused_memory.services.memory_service'
 
-# ── The frozen ground-truth fixture ────────────────────────────────────────
-#
-# PROVENANCE. Read READ-ONLY from `/home/leo/src/dark-factory/.taskmaster/
-# tasks/tasks.db` (table `dependencies(tag, task_id, depends_on)`, tag
-# 'master') during task-3770 planning. These are measured values, NOT invented
-# ones. Note the DB path: `.taskmaster/tasks.db` is a 0-byte DECOY and is not
-# the live database — the live one is `.taskmaster/tasks/tasks.db`.
-#
-# WHY IT IS FROZEN, and deliberately NOT refreshed from live. The constant
-# reproduces the graph AS OF the bad extraction (2026-08-05). The LIVE graph has
-# since DRIFTED, in two ways that both matter:
-#
-#   1. Task 3578 has gained the dependencies {3983, 4005}.
-#   2. Task 5020 now depends on BOTH 3730 AND 3733 — so today those two share a
-#      DEPENDENT, which they did NOT at extraction time.
-#
-# Drift (2) is the load-bearing one. In this frozen shape 3730/3733 share only
-# DEPENDENCIES, which is the only reason the shared-dependency arm of the
-# sibling predicate gets exercised at all. Refreshing against live would let
-# that arm go untested, and the predicate could silently narrow back to the
-# escalation's literal "two tasks that share a dependent" one-liner with no test
-# failing. Independently, a live read would make the leaf signal
-# non-reproducible: this suite must fail before the change and pass after, and a
-# fixture that mutates under operator activity guarantees neither.
-#
-# A future reader who diffs this constant against live data will find the
-# discrepancy already explained here rather than "correcting" it.
-#
-# DERIVED CLOSURES (recorded so expectations can be re-verified without
-# re-deriving them by hand):
+# The dark_factory dependency graph as of the bad extraction (2026-08-05). Keep
+# it FROZEN: the live graph has drifted (task 5020 now depends on both 3730 and
+# 3733), and only in this shape do 3730/3733 share dependencies but no
+# dependent, which is what exercises the shared-dependency sibling arm.
 #   closure(3578) = {3256, 3619, 3727, 3618}
 #   closure(3730) = {3578, 3727, 3728, 3256, 3619, 3618}
 #   closure(3733) = {3578, 3728, 3256, 3727, 3619, 3618}
 #   closure(3619) = {3256, 3618}
-#   closure(3618) = {}  (a leaf: 3618 depends on nothing)
+#   closure(3618) = {}
 LIVE_SHAPE_EDGES: dict[int, list[int]] = {
     3256: [],
     3618: [],
@@ -94,20 +58,26 @@ LIVE_SHAPE_EDGES: dict[int, list[int]] = {
 }
 
 
-# ── extract_dependency_assertions — the scope gate plus parser ─────────────
+class _DictEdge(dict):
+    """A dict-shaped edge, to prove the pure core needs no graphiti_core."""
+
+
+class _AttrEdge:
+    def __init__(self, uuid: str, fact: str) -> None:
+        self.uuid = uuid
+        self.fact = fact
+
+
+# ── extract_dependency_assertions — the per-fact parser ────────────────────
 
 
 class TestExtractDependencyAssertions:
-    """The SCOPE GATE. Only compact multi-task dependency shorthand is in scope;
-    everything else must return `[]` without the caller ever touching Taskmaster.
-    """
-
     def test_forward_phrase_binds_dependent_then_dependency(self):
         assertions = extract_dependency_assertions(
             'Task 3727 waits behind task 3619'
         )
         assert [(a.dependent, a.dependency) for a in assertions] == [(3727, 3619)]
-        assert 'waits behind' in assertions[0].phrase.lower()
+        assert assertions[0].phrase.lower() == 'waits behind'
 
     @pytest.mark.parametrize(
         'fact',
@@ -155,10 +125,13 @@ class TestExtractDependencyAssertions:
             'Task 3727 depends on the merge queue draining',
             # A dependency phrase but no task references.
             'The parser depends on the extraction stage running first',
-            # The phrase and the two refs sit in DIFFERENT clauses: no
-            # cross-clause binding.
+            # The phrase and the two refs sit in DIFFERENT clauses.
             'Task 3727 waits behind. Task 3619 was filed',
             'Task 3727 waits behind; task 3619 landed',
+            # Past tense is history, not a claim about the current graph.
+            'Task 3727 was blocked by task 3619',
+            'Task 3727 was waiting on task 3619',
+            'Task 3727 and task 3730 were blocked by task 3619',
         ],
     )
     def test_out_of_scope_returns_empty(self, fact):
@@ -174,7 +147,6 @@ class TestExtractDependencyAssertions:
         ],
     )
     def test_accepts_the_inherited_task_ref_spellings(self, fact):
-        """The gate must not be narrower than TASK_REF_RE's canonical vocabulary."""
         assertions = extract_dependency_assertions(fact)
         assert [(a.dependent, a.dependency) for a in assertions] == [(3727, 3619)]
 
@@ -191,15 +163,48 @@ class TestExtractDependencyAssertions:
         assert extract_dependency_assertions(fact) == []
 
 
-# ── build_dependency_index — direct, reverse and TRANSITIVE closure ────────
+# ── extract_dependency_facts — the episode-level scope gate ────────────────
+
+
+class TestExtractDependencyFacts:
+    def test_keeps_only_edges_whose_fact_makes_an_assertion(self):
+        facts = extract_dependency_facts(
+            [
+                _AttrEdge('e1', 'Task 3727 waits behind task 3619'),
+                _AttrEdge('e2', 'Task 3727 and task 3619 were both filed today'),
+            ]
+        )
+        assert [(f.edge_uuid, f.fact) for f in facts] == [
+            ('e1', 'Task 3727 waits behind task 3619')
+        ]
+        assert [(a.dependent, a.dependency) for a in facts[0].assertions] == [
+            (3727, 3619)
+        ]
+
+    def test_dict_shaped_edges_are_accepted_too(self):
+        facts = extract_dependency_facts(
+            [_DictEdge(uuid='e1', fact='Task 3727 needs task 3619')]
+        )
+        assert [f.edge_uuid for f in facts] == ['e1']
+
+    @pytest.mark.parametrize(
+        'edge',
+        [
+            _AttrEdge('', 'Task 3727 waits behind task 3619'),   # no uuid
+            _AttrEdge('edge-x', ''),                             # no fact
+            _AttrEdge('edge-x', 'Tasks were filed today'),       # unparseable
+            _DictEdge(),                                         # neither
+            None,
+        ],
+    )
+    def test_unusable_edges_are_skipped_never_raised_on(self, edge):
+        assert extract_dependency_facts([edge]) == []
+
+
+# ── build_dependency_index — direct, reverse and TRANSITIVE reachability ───
 
 
 class TestBuildDependencyIndex:
-    """The index is where refinement #1 lives: the closure is TRANSITIVE, so an
-    inverted chain is detectable even when neither id appears in the other's
-    direct edge list.
-    """
-
     @pytest.fixture
     def index(self):
         return build_dependency_index(LIVE_SHAPE_EDGES)
@@ -215,44 +220,44 @@ class TestBuildDependencyIndex:
         assert index.direct[3618] == frozenset()
 
     def test_closure_is_transitive(self, index):
-        # 3618 is reachable from 3578 via 3619, though direct[3578] EXCLUDES
-        # it — the whole point of computing a closure rather than checking
-        # direct edges.
+        # 3618 is reachable from 3578 via 3619, though direct[3578] excludes it.
         assert 3618 not in index.direct[3578]
-        assert index.closure[3578] == frozenset({3256, 3619, 3727, 3618})
-        assert index.closure[3730] == frozenset(
+        assert index.closure_of(3578) == frozenset({3256, 3619, 3727, 3618})
+        assert index.closure_of(3730) == frozenset(
             {3578, 3727, 3728, 3256, 3619, 3618}
         )
-        assert index.closure[3733] == frozenset(
+        assert index.closure_of(3733) == frozenset(
             {3578, 3728, 3256, 3727, 3619, 3618}
         )
-        assert index.closure[3619] == frozenset({3256, 3618})
-        assert index.closure[3618] == frozenset()
+        assert index.closure_of(3619) == frozenset({3256, 3618})
+        assert index.closure_of(3618) == frozenset()
 
     def test_reverse_adjacency(self, index):
         assert index.dependents[3578] == frozenset({3730, 3733})
         assert index.dependents[3256] == frozenset({3619, 3727, 3728, 3578})
-        # Frozen-fixture value: 5020 is deliberately absent, see the drift
-        # note on LIVE_SHAPE_EDGES.
         assert index.dependents[3733] == frozenset()
 
-    def test_diamond_is_deduplicated_not_double_counted(self):
-        # 3578 reaches 3256 directly AND via 3619 — a set, not a multiset.
-        index = build_dependency_index(LIVE_SHAPE_EDGES)
-        assert sorted(index.closure[3578]) == [3256, 3618, 3619, 3727]
-
     def test_cycle_terminates(self):
-        """A malformed cyclic graph must terminate, not blow the stack."""
         index = build_dependency_index({1: [2], 2: [1]})
-        assert index.closure[1] == frozenset({1, 2})
-        assert index.closure[2] == frozenset({1, 2})
+        assert index.closure_of(1) == frozenset({1, 2})
+        assert index.closure_of(2) == frozenset({1, 2})
+
+    def test_a_chain_deeper_than_the_recursion_limit_is_walked(self):
+        depth = 5000
+        index = build_dependency_index({i: [i + 1] for i in range(depth)})
+        assert len(index.closure_of(0)) == depth
+        assert (
+            classify_dependency_assertion(
+                DependencyAssertion(depth, 0, 'needs'), index
+            )
+            == REVERSED
+        )
 
     def test_id_present_only_as_a_dependency_value_is_still_a_known_node(self):
         index = build_dependency_index({10: [11]})
-        assert 11 in index.closure
-        assert index.closure[11] == frozenset()
-        assert index.dependents[11] == frozenset({10})
         assert index.direct[11] == frozenset()
+        assert index.dependents[11] == frozenset({10})
+        assert index.closure_of(11) == frozenset()
 
     def test_caller_input_is_not_mutated(self):
         edges = {1: [2], 2: []}
@@ -269,11 +274,6 @@ def _assertion(dependent: int, dependency: int) -> DependencyAssertion:
 
 
 class TestClassifyDependencyAssertion:
-    """Five rules evaluated in a STRICT order. The order is behaviour, not an
-    implementation detail: case (f) below fails outright if the sibling check is
-    ever hoisted above the closure check.
-    """
-
     @pytest.fixture
     def index(self):
         return build_dependency_index(LIVE_SHAPE_EDGES)
@@ -282,13 +282,10 @@ class TestClassifyDependencyAssertion:
         assert classify_dependency_assertion(_assertion(3578, 3619), index) is None
 
     def test_b_supported_transitively_is_not_flagged(self, index):
-        """3618 is reachable from 3730 only transitively — a direct-edge-only
-        check would false-positive here."""
         assert 3618 not in index.direct[3730]
         assert classify_dependency_assertion(_assertion(3730, 3618), index) is None
 
     def test_c_inverted_transitive_chain_is_reversed(self, index):
-        """Invisible against direct[3578]; detectable only via closure[3578]."""
         assert 3618 not in index.direct[3578]
         assert (
             classify_dependency_assertion(_assertion(3618, 3578), index) == REVERSED
@@ -302,9 +299,7 @@ class TestClassifyDependencyAssertion:
         )
 
     def test_e_shared_dependency_arm_is_sibling_sequential(self, index):
-        """3730 and 3733 both depend on 3728 and 3578, and in the FROZEN
-        fixture share NO dependent — a predicate limited to the escalation's
-        literal "share a dependent" would MISS this one."""
+        """3730 and 3733 share the dependencies 3728 and 3578 but no dependent."""
         assert not (index.dependents[3730] & index.dependents[3733])
         assert (
             classify_dependency_assertion(_assertion(3730, 3733), index)
@@ -312,10 +307,7 @@ class TestClassifyDependencyAssertion:
         )
 
     def test_f_closure_precedence_beats_the_sibling_arm(self, index):
-        """3730 and 3728 share the dependency 3727, so arm (e) matches — yet
-        3730 -> 3728 is a REAL direct edge. Flagging it would be exactly the
-        false-positive class the task forbids, so the closure check MUST be
-        evaluated strictly before the sibling check."""
+        """3730 and 3728 share the dependency 3727, yet 3730 -> 3728 is real."""
         assert index.direct[3730] & index.direct[3728] == frozenset({3727})
         assert classify_dependency_assertion(_assertion(3730, 3728), index) is None
 
@@ -323,7 +315,6 @@ class TestClassifyDependencyAssertion:
         'pair', [(99999, 3619), (3727, 99999), (99999, 88888)]
     )
     def test_g_an_unknown_id_is_never_flagged(self, index, pair):
-        """Fail-safe under-selection: unknown means unknown, not wrong."""
         assert classify_dependency_assertion(_assertion(*pair), index) is None
 
     def test_h_no_path_and_not_siblings_is_unsupported(self):
@@ -338,11 +329,8 @@ class TestClassifyDependencyAssertion:
 
 # ── THE LEAF SIGNAL ───────────────────────────────────────────────────────
 #
-# The three VERBATIM facts below were extracted into Graphiti episode
-# f3d18584-4041-4397-9faa-d4a14c01f71d. Every task number in them is real and
-# adjacent; only the DIRECTION is wrong. Against the frozen ground truth all
-# three must be flagged and none of the three genuinely-correct facts from the
-# same neighbourhood may be.
+# The three bad facts are verbatim from Graphiti episode
+# f3d18584-4041-4397-9faa-d4a14c01f71d.
 
 BAD_FACTS = {
     'edge-bad-1': 'Task 3727 waits behind task 3619',
@@ -351,404 +339,373 @@ BAD_FACTS = {
 }
 
 CORRECT_FACTS = {
-    # A direct edge: 3619 IS in direct[3578].
+    # A direct edge.
     'edge-ok-1': 'Task 3578 waits behind task 3619',
-    # A direct edge whose pair ALSO shares the dependency 3727 — the
-    # sibling-arm false-positive trap.
+    # A direct edge whose pair also shares the dependency 3727.
     'edge-ok-2': 'Task 3730 needs task 3728',
-    # True only TRANSITIVELY (3730 -> 3578 -> 3619 -> 3618) — the
-    # direct-edge-only false-positive trap.
+    # True only transitively (3730 -> 3578 -> 3619 -> 3618).
     'edge-ok-3': 'Task 3730 waits behind task 3618',
 }
 
 
-class _DictEdge(dict):
-    """A dict-shaped edge, to prove the pure core needs no graphiti_core."""
-
-
-class _AttrEdge:
-    def __init__(self, uuid: str, fact: str) -> None:
-        self.uuid = uuid
-        self.fact = fact
+def _check(facts: dict[str, str], edges: dict[int, list[int]] = LIVE_SHAPE_EDGES):
+    parsed = extract_dependency_facts(
+        [_AttrEdge(uuid, fact) for uuid, fact in facts.items()]
+    )
+    return check_dependency_direction(parsed, build_dependency_index(edges))
 
 
 class TestKnownBadEpisodeFacts:
-    """Fails before the change, passes after: the three real bad facts are
-    flagged with the right classifications and the three correct ones are not.
-    """
+    def test_three_known_bad_facts_flagged_and_correct_facts_are_not(self):
+        findings = _check({**BAD_FACTS, **CORRECT_FACTS})
 
-    @pytest.fixture
-    def index(self):
-        return build_dependency_index(LIVE_SHAPE_EDGES)
-
-    @pytest.fixture
-    def edges(self):
-        return [
-            _AttrEdge(uuid, fact)
-            for uuid, fact in {**BAD_FACTS, **CORRECT_FACTS}.items()
-        ]
-
-    def test_three_known_bad_facts_flagged_and_correct_facts_are_not(
-        self, edges, index
-    ):
-        findings = check_dependency_direction(edges, index)
-
-        assert len(findings) == 3
         assert {f.edge_uuid: f.classification for f in findings} == {
             'edge-bad-1': SIBLING_SEQUENTIAL,
             'edge-bad-2': SIBLING_SEQUENTIAL,
             'edge-bad-3': REVERSED,
         }
-        # The no-false-positive companion assertion.
-        flagged = {f.edge_uuid for f in findings}
-        assert flagged.isdisjoint(CORRECT_FACTS)
+        assert all(f.contradicts_ground_truth for f in findings)
 
-    def test_findings_carry_verbatim_evidence(self, edges, index):
-        findings = {f.edge_uuid: f for f in check_dependency_direction(edges, index)}
+    def test_findings_carry_verbatim_evidence(self):
+        findings = {f.edge_uuid: f for f in _check(BAD_FACTS)}
 
         inverted = findings['edge-bad-3']
-        # The extraction's OWN wording, never a corrected one.
         assert inverted.fact == BAD_FACTS['edge-bad-3']
         assert (inverted.dependent, inverted.dependency) == (3618, 3578)
-        assert inverted.classification == REVERSED
-        assert inverted.ground_truth
+        assert inverted.ground_truth['dependent_direct_dependencies'] == frozenset()
+        assert inverted.ground_truth['dependency_direct_dependencies'] == frozenset(
+            {3256, 3619, 3727}
+        )
 
-    def test_to_dict_round_trips_and_is_json_serialisable(self, edges, index):
-        findings = check_dependency_direction(edges, index)
-        for finding in findings:
+    def test_to_dict_round_trips_and_is_json_serialisable(self):
+        for finding in _check(BAD_FACTS):
             record = finding.to_dict()
             assert record['edge_uuid'] == finding.edge_uuid
             assert record['fact'] == finding.fact
             assert record['dependent'] == finding.dependent
             assert record['dependency'] == finding.dependency
             assert record['classification'] == finding.classification
-            # Sets rendered as sorted lists so this cannot raise.
+            assert record['contradicts_ground_truth'] is True
             json.dumps(record)
 
-    def test_dict_shaped_edges_are_accepted_too(self, index):
-        edges = [
-            _DictEdge(uuid=uuid, fact=fact) for uuid, fact in BAD_FACTS.items()
-        ]
-        findings = check_dependency_direction(edges, index)
-        assert {f.edge_uuid for f in findings} == set(BAD_FACTS)
-
-    @pytest.mark.parametrize(
-        'edge',
-        [
-            _AttrEdge('', 'Task 3727 waits behind task 3619'),   # no uuid
-            _AttrEdge('edge-x', ''),                             # no fact
-            _AttrEdge('edge-x', 'Tasks were filed today'),       # unparseable
-            _DictEdge(),                                         # neither
-            None,
-        ],
-    )
-    def test_unusable_edges_are_skipped_never_raised_on(self, edge, index):
-        assert check_dependency_direction([edge], index) == []
-
-    def test_finding_is_frozen(self, edges, index):
-        finding = check_dependency_direction(edges, index)[0]
+    def test_finding_is_frozen(self):
+        finding = _check(BAD_FACTS)[0]
         with pytest.raises(dataclasses.FrozenInstanceError):
             finding.classification = REVERSED  # type: ignore[misc]
 
 
-# ── The MemoryService adapter — the only place any I/O happens ─────────────
+# ── True facts Taskmaster does not model are reported, never contradicted ──
+
+#: Two orderings the dependency graph does not carry: merge-queue order between
+#: unrelated tasks, and a dependency stated before it is wired.
+UNMODELLED_EDGES: dict[int, list[int]] = {
+    **LIVE_SHAPE_EDGES,
+    5100: [4000],
+    5101: [4001],
+    5102: [4002],
+}
+UNMODELLED_FACTS = {
+    'edge-merge-queue': 'Task 5101 waits behind task 5100',
+    'edge-planned': 'Task 5102 depends on task 3619',
+}
+
+
+class TestTrueFactsTaskmasterDoesNotModel:
+    def test_they_are_unsupported_not_contradicted(self):
+        findings = _check(UNMODELLED_FACTS, UNMODELLED_EDGES)
+
+        assert {f.edge_uuid: f.classification for f in findings} == {
+            'edge-merge-queue': UNSUPPORTED,
+            'edge-planned': UNSUPPORTED,
+        }
+        assert not any(f.contradicts_ground_truth for f in findings)
+        assert all(
+            f.to_dict()['contradicts_ground_truth'] is False for f in findings
+        )
+
+
+# ── The write path — the only place any I/O happens ───────────────────────
 
 GROUP = 'dark_factory'
 
 
-def _service(mock_config):
-    """MemoryService with fully-mocked backends.
-
-    `install_identity_mocks` is required, not decorative: the post-write
-    sub-passes run inside `_execute_graphiti_write`'s
-    `async with self.graphiti._identity_lock_for(...)`, which a bare MagicMock
-    cannot satisfy.
-    """
+def _service(
+    mock_config, *, ground_truth: dict[int, list[int]] = LIVE_SHAPE_EDGES
+) -> MemoryService:
     svc = MemoryService(mock_config)
     svc.graphiti = MagicMock()
-    svc.graphiti.add_episode = AsyncMock(return_value=None)
-    svc.graphiti._require_client = MagicMock()
     install_identity_mocks(svc.graphiti)
-    svc.update_edge = AsyncMock(return_value={})
+    svc.graphiti.update_edge = AsyncMock(return_value={})
     svc.taskmaster = AsyncMock()
-    svc.taskmaster.get_dependency_edges = AsyncMock(return_value=LIVE_SHAPE_EDGES)
+    _tm(svc).get_dependency_edges = AsyncMock(return_value=ground_truth)
     svc.set_known_projects({GROUP: '/srv/dark-factory'})
     return svc
 
 
 def _tm(svc: MemoryService) -> AsyncMock:
-    """The mocked Taskmaster backend, typed as the mock the test installed.
-
-    `MemoryService.taskmaster` is declared `TaskBackendProtocol | None`, so a
-    bare `svc.taskmaster.get_dependency_edges` reads as possibly-None AND as
-    the protocol's own method -- neither of which carries the await-assertion
-    surface these tests are written against.
-    """
     return cast(AsyncMock, svc.taskmaster)
 
 
-def _ue(svc: MemoryService) -> AsyncMock:
-    """The mocked `update_edge`, typed as the mock the test installed.
-
-    Same reason as `_tm`: the declared attribute is a real bound method.
-    """
-    return cast(AsyncMock, svc.update_edge)
+def _update_edge(svc: MemoryService) -> AsyncMock:
+    return cast(AsyncMock, svc.graphiti.update_edge)
 
 
-def _result(facts: dict[str, str], *, field: str = 'edges'):
+def _result(facts: dict[str, str], *, field: str = 'edges') -> MockAddEpisodeResult:
     edges = [MockEdge(fact=fact, uuid=uuid) for uuid, fact in facts.items()]
-    # Dispatched explicitly rather than through `**{field: edges}`: unpacking a
-    # `dict[str, list[MockEdge]]` makes the checker test that one value type
-    # against EVERY field, `nodes: list[MockNode]` included.
     if field == 'entity_edges':
         return MockAddEpisodeResult(entity_edges=edges)
     return MockAddEpisodeResult(edges=edges)
 
 
-class TestMemoryServiceSubPass:
-    """The thin adapter: gate, resolve, read, classify, flag. It never repairs."""
+async def _write(
+    svc: MemoryService,
+    facts: dict[str, str],
+    *,
+    group_id: str = GROUP,
+    field: str = 'edges',
+) -> object:
+    """Run one queued add_episode write whose extraction yields *facts*."""
+    result = _result(facts, field=field)
+    svc.graphiti.add_episode = AsyncMock(return_value=result)
+    return await svc._execute_graphiti_write(
+        'add_episode',
+        {
+            'name': 'ep',
+            'content': 'episode body',
+            'source': 'text',
+            'group_id': group_id,
+            'source_description': '',
+        },
+    )
 
+
+async def _reconcile(
+    svc: MemoryService, facts: dict[str, str], *, group_id: str = GROUP
+) -> ReconcileStats:
+    return await svc._reconcile_episode_identity(_result(facts), group_id=group_id)
+
+
+def _retired(svc: MemoryService) -> set[str]:
+    return {c.args[0] for c in _update_edge(svc).await_args_list}
+
+
+def _warnings(caplog) -> str:
+    return '\n'.join(
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    )
+
+
+class TestWritePath:
     @pytest.mark.asyncio
-    async def test_a_out_of_scope_short_circuits_before_any_taskmaster_read(
-        self, mock_config
-    ):
+    async def test_an_out_of_scope_episode_never_reads_taskmaster(self, mock_config):
         svc = _service(mock_config)
-        result = _result({'e1': 'Task 3727 and task 3619 were both filed today'})
 
-        assert await svc._check_dependency_direction(result, group_id=GROUP) == []
+        await _write(svc, {'e1': 'Task 3727 and task 3619 were both filed today'})
 
-        # The restriction to compact dependency shorthand is what keeps a
-        # blanket check off every write. Pinned so it cannot silently erode.
         _tm(svc).get_dependency_edges.assert_not_awaited()
-        _ue(svc).assert_not_awaited()
+        _update_edge(svc).assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_b_flagged_edges_are_invalidated_never_rewritten(self, mock_config):
+    async def test_a_historical_claim_is_out_of_scope(self, mock_config):
         svc = _service(mock_config)
-        result = _result({**BAD_FACTS, **CORRECT_FACTS})
 
-        records = await svc._check_dependency_direction(result, group_id=GROUP)
+        await _write(svc, {'e1': 'Task 3727 was blocked by task 3619'})
 
-        assert {r['edge_uuid'] for r in records} == set(BAD_FACTS)
-        for record in records:
-            assert record['fact'] == BAD_FACTS[record['edge_uuid']]
-            assert isinstance(record['dependent'], int)
-            assert isinstance(record['dependency'], int)
-            assert record['classification'] in (REVERSED, SIBLING_SEQUENTIAL)
-            assert 'ground_truth' in record
-
-        calls = _ue(svc).await_args_list
-        assert {c.args[0] for c in calls} == set(BAD_FACTS)
-        for call in calls:
-            assert call.kwargs['invalid_at'] is not None
-            # Flag, never silently correct.
-            assert 'fact' not in call.kwargs
+        _tm(svc).get_dependency_edges.assert_not_awaited()
+        _update_edge(svc).assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_c_correct_facts_are_never_invalidated(self, mock_config):
+    async def test_contradicted_edges_are_retired_never_rewritten(self, mock_config):
         svc = _service(mock_config)
-        result = _result({**BAD_FACTS, **CORRECT_FACTS})
-        await svc._check_dependency_direction(result, group_id=GROUP)
-        touched = {c.args[0] for c in _ue(svc).await_args_list}
-        assert touched.isdisjoint(CORRECT_FACTS)
+
+        await _write(svc, {**BAD_FACTS, **CORRECT_FACTS})
+
+        assert _retired(svc) == set(BAD_FACTS)
+        for call in _update_edge(svc).await_args_list:
+            # invalid_at only: no positional or keyword fact.
+            assert len(call.args) == 1
+            assert call.kwargs.keys() == {'group_id', 'invalid_at'}
+            assert call.kwargs['group_id'] == GROUP
+            assert isinstance(call.kwargs['invalid_at'], datetime)
 
     @pytest.mark.asyncio
-    async def test_d_each_mismatch_is_logged_at_warning_with_the_finding(
-        self, mock_config, caplog
-    ):
+    async def test_the_project_root_comes_from_known_projects(self, mock_config):
         svc = _service(mock_config)
+
+        await _write(svc, BAD_FACTS)
+
+        _tm(svc).get_dependency_edges.assert_awaited_once_with('/srv/dark-factory')
+
+    @pytest.mark.asyncio
+    async def test_each_contradiction_is_logged_at_warning(self, mock_config, caplog):
+        svc = _service(mock_config)
+
         with caplog.at_level(logging.WARNING, logger=_MS_LOGGER):
-            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+            await _write(svc, BAD_FACTS)
 
-        blob = '\n'.join(
-            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
-        )
+        blob = _warnings(caplog)
         for uuid, fact in BAD_FACTS.items():
             assert uuid in blob
             assert fact in blob
         assert REVERSED in blob and SIBLING_SEQUENTIAL in blob
 
     @pytest.mark.asyncio
-    async def test_e_project_root_comes_from_known_projects(self, mock_config):
-        svc = _service(mock_config)
-
-        await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
-
-        assert _tm(svc).get_dependency_edges.await_args.args[0] == (
-            '/srv/dark-factory'
-        )
-
-    @pytest.mark.asyncio
-    async def test_e_an_unregistered_group_is_refused_never_given_a_fallback_root(
+    async def test_true_facts_taskmaster_does_not_model_stay_valid(
         self, mock_config, caplog
     ):
-        # THE TRAP: a non-empty configured root. Without it the stock config's
-        # `taskmaster=None` leaves any fallback empty, and a fallback-using
-        # implementation would refuse anyway, so this test would pass vacuously.
+        svc = _service(mock_config, ground_truth=UNMODELLED_EDGES)
+
+        with caplog.at_level(logging.WARNING, logger=_MS_LOGGER):
+            await _write(svc, UNMODELLED_FACTS)
+
+        _update_edge(svc).assert_not_awaited()
+        blob = _warnings(caplog)
+        for uuid in UNMODELLED_FACTS:
+            assert uuid in blob
+        assert UNSUPPORTED in blob
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_group_is_refused_never_given_a_fallback_root(
+        self, mock_config, caplog
+    ):
+        # A non-empty configured root, so a fallback would have somewhere to go.
         mock_config.taskmaster = TaskmasterConfig(project_root='/srv/other-project')
         svc = _service(mock_config)
-        # Non-empty but lacking GROUP: no "any registered root" guess either.
         svc.set_known_projects({'some_other_project': '/srv/elsewhere'})
 
         with caplog.at_level(logging.WARNING, logger=_MS_LOGGER):
-            records = await svc._check_dependency_direction(
-                _result(BAD_FACTS), group_id=GROUP
-            )
+            await _write(svc, BAD_FACTS)
 
-        assert records == []
-        # Task ids overlap across projects: judging this episode against a
-        # foreign graph would misclassify true facts, so it is never read...
         _tm(svc).get_dependency_edges.assert_not_awaited()
-        # ...and nothing is retired, since retirement is destructive.
-        _ue(svc).assert_not_awaited()
-        # The refusal is loud, never silent.
-        assert any(
-            GROUP in r.getMessage()
-            for r in caplog.records
-            if r.levelno >= logging.WARNING
-        )
+        _update_edge(svc).assert_not_awaited()
+        assert GROUP in _warnings(caplog)
 
     @pytest.mark.asyncio
-    async def test_f_no_taskmaster_returns_no_records_without_raising(self, mock_config):
+    async def test_no_taskmaster_leaves_every_edge_alone(self, mock_config):
         svc = _service(mock_config)
         svc.taskmaster = None
-        assert await svc._check_dependency_direction(
-            _result(BAD_FACTS), group_id=GROUP
-        ) == []
+
+        await _write(svc, BAD_FACTS)
+
+        _update_edge(svc).assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_g_ground_truth_read_failure_returns_no_records(self, mock_config):
-        svc = _service(mock_config)
-        _tm(svc).get_dependency_edges = AsyncMock(side_effect=RuntimeError('db'))
-        assert await svc._check_dependency_direction(
-            _result(BAD_FACTS), group_id=GROUP
-        ) == []
-        _ue(svc).assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_g_per_edge_failure_is_best_effort(self, mock_config):
-        svc = _service(mock_config)
-        svc.update_edge = AsyncMock(
-            side_effect=[RuntimeError('boom'), {}, {}]
-        )
-        # The remaining flagged edges are still attempted.
-        records = await svc._check_dependency_direction(
-            _result(BAD_FACTS), group_id=GROUP
-        )
-        assert svc.update_edge.await_count == 3
-
-        # A record means the edge was really invalidated, never that
-        # invalidation was merely attempted.
-        failed_uuid = svc.update_edge.await_args_list[0].args[0]
-        assert len(records) == 2
-        assert failed_uuid not in {r['edge_uuid'] for r in records}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
-    async def test_g_lifecycle_exceptions_propagate(self, mock_config, exc):
-        svc = _service(mock_config)
-        _tm(svc).get_dependency_edges = AsyncMock(side_effect=exc)
-        with pytest.raises(exc):
-            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
-
-        svc = _service(mock_config)
-        svc.update_edge = AsyncMock(side_effect=exc)
-        with pytest.raises(exc):
-            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('field', ['edges', 'entity_edges'])
-    async def test_h_both_result_edge_fields_are_honoured(self, mock_config, field):
-        svc = _service(mock_config)
-        result = _result(BAD_FACTS, field=field)
-        records = await svc._check_dependency_direction(result, group_id=GROUP)
-        assert len(records) == 3
-
-
-class TestReconcileEpisodeIdentityWiring:
-    """The check is the NINTH `_run_pass` — appended AFTER zeta/eta, whose
-    documented load-bearing "runs last" ordering must stay undisturbed.
-    """
-
-    @pytest.mark.asyncio
-    async def test_findings_are_folded_into_reconcile_stats(self, mock_config):
-        svc = _service(mock_config)
-        stats = await svc._reconcile_episode_identity(
-            _result(BAD_FACTS), group_id=GROUP
-        )
-
-        assert stats.dependency_direction_flagged == 3
-        assert len(stats.dependency_direction_findings) == 3
-        for record in stats.dependency_direction_findings:
-            assert record['edge_uuid'] in BAD_FACTS
-            assert record['fact'] == BAD_FACTS[record['edge_uuid']]
-            assert isinstance(record['dependent'], int)
-            assert isinstance(record['dependency'], int)
-            assert record['classification'] in (REVERSED, SIBLING_SEQUENTIAL)
-
-    @pytest.mark.asyncio
-    async def test_the_eight_pre_existing_stats_fields_are_undisturbed(
+    async def test_a_failed_ground_truth_read_leaves_every_edge_alone(
         self, mock_config
     ):
         svc = _service(mock_config)
-        stats = await svc._reconcile_episode_identity(
-            _result(BAD_FACTS), group_id=GROUP
-        )
+        _tm(svc).get_dependency_edges = AsyncMock(side_effect=RuntimeError('db'))
 
-        assert stats.errors == []
-        for name in (
-            'edges_deduped',
-            'dependency_edges_restored',
-            'sibling_edges_restored',
-            'stale_ttl_edges_invalidated',
-            'nodes_resolved',
-            'task_names_normalized',
-        ):
-            assert isinstance(getattr(stats, name), int)
-        # zeta/eta still return their own dataclasses: the new pass did not
-        # disturb their ordering contract or eta's data dependency on zeta.
-        assert isinstance(stats.referent_stats, ReferentStats)
-        assert isinstance(stats.repair_stats, ReferentRepairStats)
+        await _write(svc, BAD_FACTS)
+
+        _update_edge(svc).assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['edges', 'entity_edges'])
+    async def test_both_result_edge_fields_are_honoured(self, mock_config, field):
+        svc = _service(mock_config)
+
+        await _write(svc, BAD_FACTS, field=field)
+
+        assert _retired(svc) == set(BAD_FACTS)
 
     @pytest.mark.asyncio
     async def test_a_raising_check_never_fails_the_committed_write(
-        self, mock_config, monkeypatch
+        self, mock_config
     ):
+        svc = _service(mock_config, ground_truth={3727: 5})  # type: ignore[dict-item]
+
+        result = await _write(svc, BAD_FACTS)
+
+        assert isinstance(result, MockAddEpisodeResult)
+        _update_edge(svc).assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
+    async def test_lifecycle_exceptions_propagate(self, mock_config, exc):
+        svc = _service(mock_config)
+        _tm(svc).get_dependency_edges = AsyncMock(side_effect=exc)
+        with pytest.raises(exc):
+            await _write(svc, BAD_FACTS)
+
+        svc = _service(mock_config)
+        svc.graphiti.update_edge = AsyncMock(side_effect=exc)
+        with pytest.raises(exc):
+            await _write(svc, BAD_FACTS)
+
+
+class TestReconcileStats:
+    @pytest.mark.asyncio
+    async def test_findings_are_folded_into_reconcile_stats(self, mock_config):
         svc = _service(mock_config)
 
-        async def _boom(*a, **kw):
-            raise RuntimeError('checker bug')
+        stats = await _reconcile(svc, {**BAD_FACTS, **CORRECT_FACTS})
 
-        monkeypatch.setattr(svc, '_check_dependency_direction', _boom)
-        stats = await svc._reconcile_episode_identity(
-            _result(BAD_FACTS), group_id=GROUP
-        )
+        assert stats.errors == []
+        assert stats.dependency_direction_flagged == 3
+        assert {
+            r['edge_uuid']: (r['fact'], r['contradicts_ground_truth'])
+            for r in stats.dependency_direction_findings
+        } == {uuid: (fact, True) for uuid, fact in BAD_FACTS.items()}
 
-        assert '_check_dependency_direction' in stats.errors
-        assert stats.dependency_direction_flagged == 0
-        # A swallowed failure must never leave partial findings that read as a
-        # clean result.
+    @pytest.mark.asyncio
+    async def test_unsupported_findings_are_recorded_as_not_contradicting(
+        self, mock_config
+    ):
+        svc = _service(mock_config, ground_truth=UNMODELLED_EDGES)
+
+        stats = await _reconcile(svc, UNMODELLED_FACTS)
+
+        assert {
+            r['edge_uuid']: (r['classification'], r['contradicts_ground_truth'])
+            for r in stats.dependency_direction_findings
+        } == {uuid: (UNSUPPORTED, False) for uuid in UNMODELLED_FACTS}
+
+    @pytest.mark.asyncio
+    async def test_a_contradiction_is_recorded_only_once_its_edge_is_retired(
+        self, mock_config
+    ):
+        svc = _service(mock_config)
+        svc.graphiti.update_edge = AsyncMock(side_effect=[RuntimeError('boom'), {}, {}])
+
+        stats = await _reconcile(svc, BAD_FACTS)
+
+        assert _update_edge(svc).await_count == 3
+        failed_uuid = _update_edge(svc).await_args_list[0].args[0]
+        assert stats.dependency_direction_flagged == 2
+        assert failed_uuid not in {
+            r['edge_uuid'] for r in stats.dependency_direction_findings
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_raising_check_is_recorded_as_an_error_with_no_findings(
+        self, mock_config
+    ):
+        svc = _service(mock_config, ground_truth={3727: 5})  # type: ignore[dict-item]
+
+        stats = await _reconcile(svc, BAD_FACTS)
+
+        assert stats.errors == ['_check_dependency_direction']
         assert stats.dependency_direction_findings == []
 
     @pytest.mark.asyncio
-    async def test_cancellation_still_propagates(self, mock_config, monkeypatch):
+    async def test_an_out_of_scope_episode_records_nothing(self, mock_config):
         svc = _service(mock_config)
 
-        async def _cancel(*a, **kw):
-            raise asyncio.CancelledError
+        stats = await _reconcile(
+            svc, {'e1': 'Task 3727 and task 3619 were both filed today'}
+        )
 
-        monkeypatch.setattr(svc, '_check_dependency_direction', _cancel)
-        with pytest.raises(asyncio.CancelledError):
-            await svc._reconcile_episode_identity(_result(BAD_FACTS), group_id=GROUP)
+        assert stats.dependency_direction_findings == []
+        assert stats.dependency_direction_flagged == 0
 
     @pytest.mark.asyncio
     async def test_findings_never_leak_between_concurrently_reconciling_groups(
         self, mock_config
     ):
-        # The identity lock in `_execute_graphiti_write` is per-group_id, so
-        # writes for DIFFERENT groups reconcile concurrently on one service.
-        # Group A is held inside its ground-truth read while group B runs a
-        # whole reconcile; neither may see the other's records.
+        # The identity lock is per group_id, so two groups reconcile
+        # concurrently on one service. Group A is held inside its ground-truth
+        # read while group B runs a whole reconcile.
         svc = _service(mock_config)
         svc.set_known_projects({'proj_a': '/srv/a', 'proj_b': '/srv/b'})
         a_reading = asyncio.Event()
@@ -761,34 +718,18 @@ class TestReconcileEpisodeIdentityWiring:
             return LIVE_SHAPE_EDGES
 
         _tm(svc).get_dependency_edges = AsyncMock(side_effect=_edges)
-        result_a = _result({f'a-{k}': v for k, v in BAD_FACTS.items()})
-        result_b = _result({f'b-{k}': v for k, v in BAD_FACTS.items()})
+        facts_a = {f'a-{k}': v for k, v in BAD_FACTS.items()}
+        facts_b = {f'b-{k}': v for k, v in BAD_FACTS.items()}
 
-        task_a = asyncio.create_task(
-            svc._reconcile_episode_identity(result_a, group_id='proj_a')
-        )
+        task_a = asyncio.create_task(_reconcile(svc, facts_a, group_id='proj_a'))
         await asyncio.wait_for(a_reading.wait(), 5)
-        stats_b = await svc._reconcile_episode_identity(result_b, group_id='proj_b')
+        stats_b = await _reconcile(svc, facts_b, group_id='proj_b')
         release_a.set()
         stats_a = await asyncio.wait_for(task_a, 5)
 
-        assert {r['edge_uuid'] for r in stats_a.dependency_direction_findings} == {
-            f'a-{k}' for k in BAD_FACTS
-        }
-        assert {r['edge_uuid'] for r in stats_b.dependency_direction_findings} == {
-            f'b-{k}' for k in BAD_FACTS
-        }
-        assert stats_a.dependency_direction_flagged == 3
-        assert stats_b.dependency_direction_flagged == 3
-
-    @pytest.mark.asyncio
-    async def test_an_out_of_scope_episode_leaves_both_fields_at_defaults(
-        self, mock_config
-    ):
-        svc = _service(mock_config)
-        stats = await svc._reconcile_episode_identity(
-            _result({'e1': 'Task 3727 and task 3619 were both filed today'}),
-            group_id=GROUP,
+        assert {r['edge_uuid'] for r in stats_a.dependency_direction_findings} == set(
+            facts_a
         )
-        assert stats.dependency_direction_flagged == 0
-        assert stats.dependency_direction_findings == []
+        assert {r['edge_uuid'] for r in stats_b.dependency_direction_findings} == set(
+            facts_b
+        )

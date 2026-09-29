@@ -268,14 +268,8 @@ class TaskBackendProtocol(Protocol):
     ) -> dict[int, list[int]]:
         """Return ``{task_id: [depends_on, ...]}`` — the dependency edge set alone.
 
-        Declared here (unlike some backend-only reads) because
-        ``MemoryService.taskmaster`` is annotated ``TaskBackendProtocol | None``
-        and its caller must type-check without a ``getattr`` escape hatch, which
-        would itself be the silent-degradation anti-pattern this repo forbids.
-
-        Implementations inherit the SQLite shape: lists sorted ascending, and a
-        task with no dependencies ABSENT from the map rather than present with
-        an empty list.
+        Lists are sorted ascending, and a task with no dependencies is ABSENT
+        from the map rather than present with an empty list.
         """
         ...
 
