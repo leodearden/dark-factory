@@ -10,10 +10,16 @@ spurious task failure. Same stance as ``test_toolcall_xml_leak_sweep_artifacts.p
 pre-image, and the searches that found it. ``phase1-apply.json`` is the
 mutation record: each amendment's raw ``update_memory`` reply, its raw
 ``get_memory_by_id`` readback, and the census searches re-run afterwards.
+
+The referent-attribution checks deliberately run the frozen correction text
+through the PRODUCTION ``resolve_referents``, not a recorded snapshot of its
+output: what matters is how today's scanner reads the corrections. Task 6059
+changes that scanner, and the phase-2 follow-up (task 6067) revisits them.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import uuid
 from pathlib import Path
@@ -48,6 +54,11 @@ NOT_TARGET = 'reviewed_not_target'
 RECORD_DISPOSITIONS = {'teaches_omission', 'frames_defect_as_rule', NOT_TARGET}
 AUTO_MEMORY_DISPOSITIONS = {'teaches_omission', 'already_corrected'}
 
+FIX_TASK_NUMBER = '6059'
+LOCAL_PROJECT = 'dark_factory'
+REPLY_FAILURE_KEYS = ('error', 'error_type', '_mcp_is_error', '_raw')
+OBSERVATION_KEPT_MIN_RATIO = 0.85
+
 
 def _load(name: str) -> dict:
     path = ARTIFACT_DIR / name
@@ -61,8 +72,43 @@ def census() -> dict:
     return _load('census.json')
 
 
+@pytest.fixture(scope='module')
+def phase1() -> dict:
+    return _load('phase1-apply.json')
+
+
+@pytest.fixture(scope='module')
+def census_by_key(census) -> dict[tuple[str, str], dict]:
+    return {_record_key(r): r for r in census['records']}
+
+
 def _record_key(record: dict) -> tuple[str, str]:
     return record['project_id'], record['memory_id']
+
+
+def _census_targets(census) -> set[tuple[str, str]]:
+    return {_record_key(r) for r in census['records'] if r['disposition'] != NOT_TARGET}
+
+
+def _found_ids(hits_by_query: dict) -> set[str]:
+    found: set[str] = set()
+    for hits in hits_by_query.values():
+        assert isinstance(hits, list), hits
+        found.update(hits)
+    return found
+
+
+def _readback_content(readback: dict, memory_id: str) -> str:
+    assert readback['found'] is True, (memory_id, readback)
+    assert readback['memory_id'] == memory_id
+    return readback['content']
+
+
+def _observation_body(amended_content: str, marker: str) -> str:
+    assert amended_content.startswith(marker)
+    _correction, blank_line, body = amended_content.partition('\n\n')
+    assert blank_line, 'no blank line separates the correction block from the observation'
+    return body
 
 
 def test_census_names_the_repair_task_and_the_fix_task(census):
@@ -106,13 +152,7 @@ def test_task_named_targets_are_census_targets(census):
 
 def test_every_census_record_was_found_by_a_recorded_search(census):
     for record in census['records']:
-        hits_by_query = census['search_hits'][record['project_id']]
-        found = {
-            memory_id
-            for hits in hits_by_query.values()
-            if isinstance(hits, list)
-            for memory_id in hits
-        }
+        found = _found_ids(census['search_hits'][record['project_id']])
         assert record['memory_id'] in found, _record_key(record)
 
 
@@ -123,33 +163,6 @@ def test_every_auto_memory_hit_is_classified_with_its_excerpt(census):
         assert entry['excerpt'].strip()
         assert entry['path']
         assert isinstance(entry['line'], int)
-
-
-FIX_TASK_NUMBER = '6059'
-LOCAL_PROJECT = 'dark_factory'
-REPLY_FAILURE_KEYS = ('error', 'error_type', '_mcp_is_error', '_raw')
-
-
-@pytest.fixture(scope='module')
-def phase1() -> dict:
-    return _load('phase1-apply.json')
-
-
-@pytest.fixture(scope='module')
-def census_by_key(census) -> dict[tuple[str, str], dict]:
-    return {_record_key(r): r for r in census['records']}
-
-
-def _census_targets(census) -> set[tuple[str, str]]:
-    return {_record_key(r) for r in census['records'] if r['disposition'] != NOT_TARGET}
-
-
-def _found_ids(hits_by_query: dict) -> set[str]:
-    found: set[str] = set()
-    for hits in hits_by_query.values():
-        assert isinstance(hits, list), hits
-        found.update(hits)
-    return found
 
 
 def test_phase1_amended_exactly_the_census_targets_once_each(census, phase1):
@@ -170,10 +183,8 @@ def test_every_phase1_update_reply_is_a_success_naming_its_target(phase1):
 
 def test_every_amendment_landed_in_place_and_changed_the_text(phase1, census_by_key):
     for amendment in phase1['amendments']:
-        readback = amendment['readback']
-        assert readback['found'] is True
-        assert readback['memory_id'] == amendment['memory_id']
-        assert readback['content'] == amendment['amended_content']
+        landed = _readback_content(amendment['readback'], amendment['memory_id'])
+        assert landed == amendment['amended_content']
         before = census_by_key[_record_key(amendment)]['before_content']
         assert amendment['amended_content'] != before
 
@@ -188,6 +199,15 @@ def test_every_amendment_leads_with_the_task_neutral_correction_marker(phase1):
         assert marker_scan.referents == ()
     for amendment in phase1['amendments']:
         assert amendment['amended_content'].startswith(marker)
+
+
+def test_every_amendment_keeps_the_original_observation(phase1, census_by_key):
+    marker = phase1['correction_marker']
+    for amendment in phase1['amendments']:
+        before = census_by_key[_record_key(amendment)]['before_content']
+        body = _observation_body(amendment['amended_content'], marker)
+        kept = difflib.SequenceMatcher(None, before, body, autojunk=False).ratio()
+        assert kept >= OBSERVATION_KEPT_MIN_RATIO, (amendment['memory_id'], kept)
 
 
 def test_every_correction_attributes_the_fix_task_to_dark_factory(phase1):
@@ -208,16 +228,24 @@ def test_every_correction_attributes_the_fix_task_to_dark_factory(phase1):
             assert local_fix not in resolution.referents, amendment['memory_id']
 
 
+def test_phase1_rerun_repeated_every_census_search(census, phase1):
+    rerun = phase1['search_hits_after']
+    assert set(rerun) == set(census['projects'])
+    for project_id in census['projects']:
+        assert set(rerun[project_id]) == set(census['queries']), project_id
+
+
 def test_amended_records_stay_findable_and_no_duplicate_correction_appeared(census, phase1):
     marker = phase1['correction_marker']
+    rerun = phase1['search_hits_after']
     targets = _census_targets(census)
     for project_id, memory_id in targets:
-        assert memory_id in _found_ids(phase1['search_hits_after'][project_id]), memory_id
+        assert memory_id in _found_ids(rerun[project_id]), memory_id
     target_ids = {memory_id for _, memory_id in targets}
-    for project_id, hits_by_query in phase1['search_hits_after'].items():
-        for query, hits in hits_by_query.items():
+    for project_id in census['projects']:
+        for query in census['queries']:
             before = census['search_hits'][project_id][query]
-            new_ids = set(hits) - set(before) - target_ids
+            new_ids = set(rerun[project_id][query]) - set(before) - target_ids
             for memory_id in new_ids:
                 readback = phase1['new_hit_readbacks'][memory_id]
-                assert marker not in readback.get('content', ''), memory_id
+                assert marker not in _readback_content(readback, memory_id), memory_id
