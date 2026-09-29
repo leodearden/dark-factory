@@ -36,10 +36,14 @@ as bare 8-char fragments with no full id anywhere beside them.
    ABSENT members are dropped and INCONCLUSIVE ones kept; both are recorded.
    Nested lists belong to records another module builds (a consolidation
    gate's provenance, a predicate task's cited ids) and are never looked up.
-4. *Scope required.* Filing a gate that carries an enumeration without
+4. *Overwriting update.* An update carrying an enumeration must be one whose
+   metadata merge lets every incoming top-level key replace the stored one.
+   The additive union keeps every stored member and, on a scalar collision,
+   the stored value, so neither a drop nor the fresh stamp would land.
+5. *Scope required.* Filing a gate that carries an enumeration without
    ``x_enumeration_scope`` is rejected: a gate cannot be filed with an
    unqualified "these are the N entries" claim.
-5. *Stamp.* ``x_liveness_reverified_at`` and ``x_liveness_exceptions`` are
+6. *Stamp.* ``x_liveness_reverified_at`` and ``x_liveness_exceptions`` are
    gate-owned: set from this write's own evidence, incoming copies overwritten
    or stripped, so a copied-forward stamp never poses as a fresh verification.
    Description lines naming an absent or inconclusive id are annotated.
@@ -47,11 +51,14 @@ as bare 8-char fragments with no full id anywhere beside them.
 **Scope of the gate.** Recon-stage callers only: the defect is a property of
 the writer's provenance, and interactive writes legitimately cite deleted ids
 as incident evidence. It filters the OUTGOING payload only and never reads or
-repairs stored task state. Named residuals: a list mixing memory ids with
+repairs stored task state, which is why it refuses an update whose merge would
+not let that payload land. Named residuals: a list mixing memory ids with
 non-memory UUIDs can lose its non-memory members; a Mem0 list whose members
 are all deleted is not proven and stays unstamped; an enumeration carried only
 in description prose is not checked, which is why the rendered Stage-2 section
-demands top-level metadata lists.
+demands top-level metadata lists; under ``merge`` a stored
+``x_liveness_exceptions`` from an earlier write survives a later write that
+records nothing.
 """
 
 from __future__ import annotations
@@ -83,6 +90,7 @@ X_LIVENESS_EXCEPTIONS_KEY = 'x_liveness_exceptions'
 ENUMERATED_ID_TRUNCATED = 'EnumeratedIdTruncated'
 ENUMERATION_SCOPE_MISSING = 'EnumerationScopeMissing'
 ENUMERATION_SCOPE_MALFORMED = 'EnumerationScopeMalformed'
+ENUMERATION_UPDATE_NOT_OVERWRITING = 'EnumerationUpdateNotOverwriting'
 
 _TRUNCATED_OUTCOME = 'truncated'
 
@@ -249,6 +257,41 @@ def _missing_scope_rejection(enumerations: list[str]) -> dict[str, Any]:
             'Say which stores and categories the enumeration was drawn from and '
             'whether that sweep was exhaustive, so the gate never claims "these '
             'are the N entries" unqualified.'
+        ),
+    }
+
+
+def _overwrites_top_level_keys(metadata_mode: str | None, append: bool | None) -> bool:
+    """Whether the backend's merge lets every incoming top-level key replace
+    the stored one. The authority is
+    ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_resolve_metadata_mode``;
+    this is a fail-closed allowlist of its overwriting outcomes, so a mode the
+    backend adds later is classified non-overwriting and rejected loudly, never
+    silently misreported as landed."""
+    if metadata_mode in ('merge', 'replace'):
+        return True
+    return metadata_mode is None and append is None
+
+
+def _not_overwriting_rejection(
+    enumerations: list[str], metadata_mode: str | None, append: bool | None,
+) -> dict[str, Any]:
+    return {
+        'error': (
+            f'an update re-asserting the Mem0 enumeration(s) {enumerations} '
+            f'under metadata_mode={metadata_mode!r}, append={append!r} would '
+            'keep every stored member and the stored liveness stamp, so the '
+            "gate's drops and stamp would not persist"
+        ),
+        'error_type': ENUMERATION_UPDATE_NOT_OVERWRITING,
+        'enumerations': enumerations,
+        'metadata_mode': metadata_mode,
+        'append': append,
+        'hint': (
+            "Re-send the enumeration with metadata_mode='merge' (the default "
+            "when both flags are omitted), or 'replace' after a get_task "
+            'read-modify-write. Attach memory_hints in a separate append=True '
+            'update.'
         ),
     }
 
@@ -533,13 +576,18 @@ async def enumeration_liveness_gate(
     memory_service: Any,
     project_root: str,
     is_filing: bool,
+    metadata_mode: str | None = None,
+    append: bool | None = None,
     now: Callable[[], datetime] = _utc_now,
 ) -> EnumerationGateResult:
     """Shape-check, re-resolve and stamp the memory ids a recon write enumerates.
 
     ``is_filing`` is True for ``submit_task`` and False for ``update_task``;
-    the module docstring states which rules differ between the two. Never
-    raises: a failed lookup is an inconclusive verdict, not an error.
+    the module docstring states which rules differ between the two.
+    ``metadata_mode`` and ``append`` are the update's merge flags, passed so
+    the gate judges the merge the backend will apply; a filing has no stored
+    metadata and passes neither. Never raises: a failed lookup is an
+    inconclusive verdict, not an error.
     """
     passthrough = EnumerationGateResult(None, description, metadata, None)
     if not _is_recon_stage(agent_id):
@@ -554,6 +602,10 @@ async def enumeration_liveness_gate(
         return passthrough._replace(rejection=rejection)
 
     liveness = await _liveness_pass(parsed, memory_service, project_root)
+    if liveness.enumerations and not _overwrites_top_level_keys(metadata_mode, append):
+        return passthrough._replace(rejection=_not_overwriting_rejection(
+            list(liveness.enumerations), metadata_mode, append,
+        ))
     if is_filing and _scope_required(parsed, liveness):
         return passthrough._replace(
             rejection=_missing_scope_rejection(list(liveness.enumerations)),
