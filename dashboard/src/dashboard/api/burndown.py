@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from dashboard.api.window import _parse_window
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.burndown import (
@@ -62,4 +62,4 @@ async def api_burndown(request: Request) -> JSONResponse:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
     shaped = redux_api.shape_burndown(series, served_at=now)
-    return JSONResponse({**shaped, 'served_at': now.isoformat()})
+    return JSONResponse(with_window({**shaped, 'served_at': now.isoformat()}, window))

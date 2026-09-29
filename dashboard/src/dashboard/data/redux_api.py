@@ -455,8 +455,9 @@ def shape_merge_queue(
     from absolute project_root paths to short basenames so the React side can
     match against ``PROJECTS[].name``.  The shape per-project follows the
     DF_DATA mock: ``depth`` (renamed from ``depth_timeseries``), ``outcomes``,
-    ``latency``, ``recent``, ``speculative``, ``active``, ``active_spark``,
-    ``halt``, ``train_events``.
+    ``latency``, ``recent``, ``recent_total`` (how many merges the window
+    holds; ``recent`` is capped), ``speculative``, ``active``,
+    ``active_spark``, ``halt``, ``train_events``.
 
     ``active_sparks`` (optional) carries true active-queue depth over time
     keyed by absolute project_root path; surfaced as ``active_spark`` per
@@ -478,6 +479,7 @@ def shape_merge_queue(
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': [dict(r) for r in (data.get('recent') or [])],
+            'recent_total': int(data.get('recent_total') or 0),
             'speculative': dict(data.get('speculative') or {}),
             'active': [dict(a) for a in (data.get('active') or [])],
             'active_approximate': bool(data.get('active_approximate', False)),

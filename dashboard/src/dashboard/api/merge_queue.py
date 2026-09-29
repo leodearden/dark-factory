@@ -22,7 +22,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from dashboard.api.window import _parse_window
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
@@ -89,9 +89,12 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     for pid in pids:
         active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
     return JSONResponse(
-        redux_api.shape_merge_queue(
-            enriched,
-            active_sparks=active_sparks,
-            halt_status=halt_status,
+        with_window(
+            redux_api.shape_merge_queue(
+                enriched,
+                active_sparks=active_sparks,
+                halt_status=halt_status,
+            ),
+            window,
         )
     )
