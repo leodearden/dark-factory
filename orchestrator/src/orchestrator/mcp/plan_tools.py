@@ -295,6 +295,11 @@ _ADD_DESIGN_DECISION_TARGETS: Mapping[str, str] = MappingProxyType(
 _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
     {'what': 'what', 'where': 'where', 'how': 'how'}
 )
+# ``path`` is deliberately EXCLUDED, for the same reason ``files`` and
+# ``task_id`` are: it is not prose. Letting an absorbed tail land there would
+# re-point a recorded drop at a different file, turning an honest-drop record
+# into a false one.
+_DROP_PLAN_FILE_TARGETS: Mapping[str, str] = MappingProxyType({'reason': 'reason'})
 
 #: The OTHER tools that write a given field, per row of the table below. Each
 #: entry is machine-checked to name a real plan-tools entry point that is
@@ -347,7 +352,7 @@ _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 #: :func:`_coerce_files`) and every future non-prose key, rewriting values this
 #: surface has no business touching.
 #:
-#: Bound ONCE, immediately below the five writer functions it derives its
+#: Bound ONCE, immediately below the six writer functions it derives its
 #: ``schema_params`` from (``_params_of`` needs them to exist). Annotated but
 #: deliberately UNBOUND here, so a use before that point raises a loud
 #: NameError instead of silently reading an empty table and repairing nothing.
@@ -402,6 +407,13 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
         _PlanField(
             'reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
         ),
+        _PlanField(
+            'dropped_files',
+            'reason',
+            _params_of(_drop_plan_file),
+            _DROP_PLAN_FILE_TARGETS,
+            (),
+        ),
     )
 
 #: The collection's SCHEMA OWNER — the tool whose parameter vocabulary defines
@@ -423,6 +435,7 @@ _COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
     'steps': 'add_plan_step',
     'design_decisions': 'add_design_decision',
     'reuse': 'add_reuse_item',
+    'dropped_files': 'drop_plan_file',
 }
 
 
@@ -1026,6 +1039,7 @@ def _create_plan(
         'steps': [],
         'design_decisions': [],
         'reuse': [],
+        'dropped_files': [],
     }
     try:
         # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
@@ -1186,7 +1200,102 @@ def _add_reuse_item(
     )
 
 
-# The repairable-field table, bound here because ``_params_of`` reads the five
+def _drop_plan_file(
+    artifacts: TaskArtifacts,
+    path: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Drop a declared file from ``plan['files']`` AND record why, atomically.
+
+    The honest third exit from the architect narrowing pass. The pre-merge
+    plan-files gate names the dilemma twice —
+    ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
+    and ``::ALREADY_LANDED_REASON_PREFIX``: "drop = falsify provenance,
+    confirm = mislabel complete work". A bare
+    ``update_plan_metadata(files=[narrowed])`` is the falsifying half — the
+    entry vanishes with no record that it was ever correctly in scope. Dropping
+    and recording the reason in ONE call closes that: the entry leaves the
+    gate's re-check surface while the plan keeps why it was declared and why
+    the branch legitimately needed no edit to it.
+
+    Atomicity is the invariant, not a convenience. Because the removal and the
+    note are the same write, it is structurally impossible to note a file that
+    was kept, to drop without a reason, or to ADD a file — so
+    ``workflow._try_narrow_plan``'s ``after.issubset(before)`` guard holds by
+    construction and needs no change.
+    """
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    # Every refusal below returns BEFORE any artifacts.write_plan call — the
+    # module-wide convention that a refusal envelope always implies no write.
+    if not reason or not reason.strip():
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'Cannot drop {path!r} without a reason. Every drop must '
+                    'record WHY the entry was in scope and WHY the branch '
+                    'legitimately needed no edit to it — a drop with no '
+                    'recorded reason is the falsified provenance this tool '
+                    'exists to avoid.'
+                ),
+            },
+            markup_facts,
+        )
+
+    current = plan.get('files', [])
+    if path not in current:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'{path!r} is not in the plan files list, so there is '
+                    'nothing to drop and no declaration to explain. Current '
+                    f'files: {current!r}'
+                ),
+            },
+            markup_facts,
+        )
+
+    # Scoped HERE rather than left to _confirm_plan's own empty-files check:
+    # the narrowing pass's dropping option never calls confirm_plan() at all,
+    # so that check never fires on this route.
+    if len(current) <= 1:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'Refusing to drop {path!r}: it is the last file in the '
+                    'plan, and the plan must never be narrowed to an empty '
+                    'files list — an empty list is not a narrowed plan, it is '
+                    'an unchecked one. If nothing in the plan legitimately '
+                    'remains, call confirm_plan() instead and let the '
+                    'escalation triage the scope.'
+                ),
+            },
+            markup_facts,
+        )
+
+    plan['files'] = [f for f in current if f != path]
+    plan.setdefault('dropped_files', []).append({
+        'path': path,
+        'reason': reason,
+    })
+    artifacts.write_plan(plan)
+    return _with_markup_repairs(
+        {
+            'status': 'ok',
+            'dropped': path,
+            'total_dropped': len(plan['dropped_files']),
+            'files': len(plan['files']),
+        },
+        markup_facts,
+    )
+
+
+# The repairable-field table, bound here because ``_params_of`` reads the six
 # writer signatures above off the live functions. Declared and documented at
 # its annotation further up; nothing between that point and here reads it.
 _REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
@@ -1235,6 +1344,7 @@ def _update_plan_metadata(
 
     if files is not None:
         plan['files'] = _coerce_files(files)
+        _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
     artifacts.write_plan(plan)
@@ -1245,6 +1355,19 @@ def _update_plan_metadata(
         },
         markup_facts,
     )
+
+
+def _forget_redeclared_drops(plan: dict) -> None:
+    """Keep ``files`` and ``dropped_files`` disjoint: a re-declared path is back
+    in scope, so its drop record no longer describes the plan."""
+    drops = plan.get('dropped_files')
+    if not isinstance(drops, list):
+        return
+    declared = set(plan['files'])
+    plan['dropped_files'] = [
+        entry for entry in drops
+        if not (isinstance(entry, dict) and entry.get('path') in declared)
+    ]
 
 
 def _remove_plan_step(
@@ -2046,6 +2169,39 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             how: How it will be reused in this task.
         """
         return _add_reuse_item(artifacts, what, where, how)
+
+    @mcp.tool()
+    @accepts_markup_override
+    def drop_plan_file(
+        path: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Drop a declared file from the plan, recording WHY it needed no edit.
+
+        Use this when a file you declared was CORRECTLY declared and
+        CORRECTLY needed no change — the branch delivered the work, and this
+        entry simply turned out not to require an edit. The entry leaves the
+        ``files`` list so the pre-merge gate's re-check can pass, while
+        ``reason`` preserves why it was in scope and why no edit was needed,
+        so nothing about the plan's provenance is falsified.
+
+        Call it once per such entry. Dropping NARROWS what the pre-merge
+        verify covers (the MergeRequest ``task_files`` scope), which is why
+        the reason is mandatory rather than optional.
+
+        Args:
+            path: A path currently in the plan's files list.
+            reason: One line: why the file was in scope, and why the branch
+                legitimately needed no edit to it.
+        """
+        # Both parameters are flat ``str`` DELIBERATELY, not a map or a list
+        # of drops. MarkupGuardMiddleware._first_markup_argument skips
+        # non-string values (shared/src/shared/mcp_markup_middleware.py::
+        # _first_markup_argument), so ONLY flat string params get inbound
+        # envelope-markup protection — and ``reason`` is agent-authored free
+        # prose, exactly the leak class that guard exists for. A later
+        # refactor to a batch/map signature would silently drop the guard.
+        return _drop_plan_file(artifacts, path, reason)
 
     @mcp.tool()
     @accepts_markup_override
