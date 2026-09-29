@@ -111,6 +111,8 @@ async def run_gate(
     description: str | None = None,
     agent_id: str | None = RECON_AGENT,
     is_filing: bool = False,
+    metadata_mode: str | None = None,
+    append: bool | None = None,
 ) -> EnumerationGateResult:
     return await enumeration_liveness_gate(
         agent_id=agent_id,
@@ -119,6 +121,8 @@ async def run_gate(
         memory_service=service,
         project_root=project_root,
         is_filing=is_filing,
+        metadata_mode=metadata_mode,
+        append=append,
         now=lambda: FIXED_NOW,
     )
 
@@ -1019,6 +1023,194 @@ class TestEnumerationScope:
 
         assert result.rejection is not None
         assert result.rejection['error_type'] == 'EnumeratedIdTruncated'
+        service.get_memory_by_id.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# The update path: the gate's rewrite must be able to land
+# --------------------------------------------------------------------------- #
+
+GATE_5537_ENUMERATION = {
+    'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, LIVE_23E, DELETED_0D5],
+}
+
+# (metadata_mode, append) pairs under which a stored top-level key survives the
+# incoming one: the additive union, and the combinations the backend refuses.
+NOT_OVERWRITING = [
+    ('additive', None),
+    ('additive', True),
+    ('additive', False),
+    (None, True),
+    (None, False),
+    ('bogus', None),
+]
+
+# Pairs under which every incoming top-level key replaces the stored one.
+OVERWRITING = [
+    (None, None),
+    ('merge', None),
+    ('replace', None),
+    ('replace', True),
+    ('replace', False),
+]
+
+STAGE2_MEMORY_HINTS_ATTACH = {
+    'memory_hints': {'entities': ['E1'], 'queries': ['Q1']},
+}
+
+
+class TestUpdateMergeMode:
+    """An update the backend would merge additively keeps every stored member
+    and the stored stamp, so the gate refuses to report a drop or a fresh
+    verification that would never persist."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('metadata_mode', 'append'), NOT_OVERWRITING)
+    async def test_an_enumeration_under_a_non_overwriting_merge_is_rejected(
+        self, project_root, metadata_mode, append,
+    ):
+        metadata = {**GATE_5537_ENUMERATION, 'origin_finding_ids': list(FINDING_IDS)}
+
+        result = await run_gate(
+            project_root, metadata, service=gate_5537_service(),
+            metadata_mode=metadata_mode, append=append,
+        )
+
+        rejection = result.rejection
+        assert rejection is not None
+        assert rejection['error_type'] == 'EnumerationUpdateNotOverwriting'
+        assert rejection['enumerations'] == ['mem0_falsified_entries']
+        assert 'mem0_falsified_entries' in rejection['error']
+        assert 'origin_finding_ids' not in rejection['error']
+        assert rejection['metadata_mode'] == metadata_mode
+        assert rejection['append'] == append
+        for token in ('merge', 'replace', 'memory_hints'):
+            assert token in rejection['hint'], token
+        assert result.stats is None
+
+    @pytest.mark.asyncio
+    async def test_an_all_live_enumeration_under_append_is_rejected_too(
+        self, project_root,
+    ):
+        result = await run_gate(
+            project_root, {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]},
+            service=memory_service(live=(LIVE_B3F, LIVE_21F)), append=True,
+        )
+
+        assert result.rejection is not None
+        assert result.rejection['error_type'] == 'EnumerationUpdateNotOverwriting'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('metadata_mode', 'append'), OVERWRITING)
+    async def test_an_overwriting_merge_is_rewritten_as_before(
+        self, project_root, metadata_mode, append,
+    ):
+        result = await run_gate(
+            project_root, dict(GATE_5537_ENUMERATION), service=gate_5537_service(),
+            metadata_mode=metadata_mode, append=append,
+        )
+
+        assert result.rejection is None
+        assert result.metadata['mem0_falsified_entries'] == [
+            LIVE_B3F, LIVE_21F, LIVE_23E,
+        ]
+        assert result.metadata[X_LIVENESS_REVERIFIED_AT_KEY] == FIXED_NOW.isoformat()
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            {
+                'memory_id': DELETED_0D5,
+                'path': 'mem0_falsified_entries[3]',
+                'outcome': 'absent',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_append_to_unproven_lists_is_accepted_unchanged(
+        self, project_root,
+    ):
+        metadata = {
+            'origin_finding_ids': list(FINDING_IDS),
+            'cited_edges': list(GRAPHITI_EDGE_IDS),
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(), append=True,
+        )
+
+        assert result.rejection is None
+        assert result.metadata == metadata
+
+    @pytest.mark.asyncio
+    async def test_a_memory_hints_attach_is_accepted_with_zero_lookups(
+        self, project_root,
+    ):
+        metadata = copy.deepcopy(STAGE2_MEMORY_HINTS_ATTACH)
+        service = memory_service()
+
+        result = await run_gate(project_root, metadata, service=service, append=True)
+
+        assert result.rejection is None
+        assert result.metadata == STAGE2_MEMORY_HINTS_ATTACH
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_fragment_only_append_is_recorded_but_not_stamped(
+        self, project_root,
+    ):
+        metadata = {'mem0_legacy_repeat_entries': list(GATE_5533_FRAGMENTS)}
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(), append=True,
+        )
+
+        assert result.rejection is None
+        assert X_LIVENESS_REVERIFIED_AT_KEY not in result.metadata
+        assert [r['outcome'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == (
+            ['truncated'] * len(GATE_5533_FRAGMENTS)
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unproven_append_still_strips_an_incoming_stamp(
+        self, project_root,
+    ):
+        metadata = {
+            'origin_finding_ids': list(FINDING_IDS),
+            X_LIVENESS_REVERIFIED_AT_KEY: GATE_5537_STAMP,
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=memory_service(), append=True,
+        )
+
+        assert result.rejection is None
+        assert result.metadata == {'origin_finding_ids': FINDING_IDS}
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_scope_is_rejected_first_with_zero_lookups(
+        self, project_root,
+    ):
+        metadata = {**GATE_5537_ENUMERATION, X_ENUMERATION_SCOPE_KEY: GATE_5533_SCOPE}
+        service = gate_5537_service()
+
+        result = await run_gate(project_root, metadata, service=service, append=True)
+
+        assert result.rejection is not None
+        assert result.rejection['error_type'] == 'EnumerationScopeMalformed'
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_non_recon_append_is_never_touched(self, project_root):
+        metadata = dict(GATE_5537_ENUMERATION)
+        description = f'- {DELETED_0D5} likeliest deletion target'
+        service = gate_5537_service()
+
+        result = await run_gate(
+            project_root, metadata, service=service, description=description,
+            agent_id='claude-interactive', append=True,
+        )
+
+        assert result.rejection is None
+        assert result.metadata is metadata
+        assert result.description is description
         service.get_memory_by_id.assert_not_awaited()
 
 
