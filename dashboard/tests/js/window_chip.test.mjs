@@ -56,6 +56,7 @@ const {
   windowEcho,
   windowLabel,
   highlightedWindow,
+  pendingWindow,
   recentMergesCaption,
 } = chip;
 const { EM_DASH } = loadedWindow.DF_DATUM;
@@ -81,6 +82,7 @@ test('exports: the module publishes exactly its API, on module.exports and windo
     'TAB_WINDOWS',
     'WINDOW_SETS',
     'highlightedWindow',
+    'pendingWindow',
     'recentMergesCaption',
     'windowEcho',
     'windowForTab',
@@ -223,7 +225,33 @@ test('highlightedWindow: an honoured window the set does not offer lights no chi
 });
 
 // ---------------------------------------------------------------------------
-// (f) recentMergesCaption — "showing N of M in <window>" (sketch #9)
+// (f) pendingWindow — a click taken but not yet served
+// ---------------------------------------------------------------------------
+
+test('pendingWindow: a chosen window the echo has not answered yet is pending', () => {
+  assert.equal(pendingWindow('7d', HONOURED_24H, WINDOW_SETS.standard), '7d');
+});
+
+test('pendingWindow: nothing served yet leaves the chosen window pending', () => {
+  assert.equal(pendingWindow('24h', null, WINDOW_SETS.standard), '24h');
+});
+
+test('pendingWindow: once the echo answers the chosen window nothing is pending, honoured or declined', () => {
+  assert.equal(pendingWindow('7d', HONOURED_7D, WINDOW_SETS.standard), null);
+  assert.equal(pendingWindow('90d', DECLINED_90D, WINDOW_SETS.burndown), null);
+});
+
+test('pendingWindow: a window the tab does not offer is never pending', () => {
+  assert.equal(pendingWindow('90d', HONOURED_24H, WINDOW_SETS.standard), null);
+});
+
+test('pendingWindow: the served chip stays lit while the chosen one is pending', () => {
+  assert.equal(highlightedWindow(HONOURED_24H, WINDOW_SETS.standard), '24h');
+  assert.equal(pendingWindow('7d', HONOURED_24H, WINDOW_SETS.standard), '7d');
+});
+
+// ---------------------------------------------------------------------------
+// (g) recentMergesCaption — "showing N of M in <window>" (sketch #9)
 // ---------------------------------------------------------------------------
 
 test('recentMergesCaption: the capped rows against the window total', () => {

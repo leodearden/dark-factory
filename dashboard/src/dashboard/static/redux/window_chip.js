@@ -1,7 +1,8 @@
 // window_chip.js — the pure decisions behind the global window chip: which
 // tabs carry it, which windows each offers, whose served-window echo each
-// reports, and how a served window is labelled and highlighted (app.jsx's
-// Toolbar wiring, tabs.jsx's panel headers and Recent-merges caption).
+// reports, how a served window is labelled and highlighted, and which chosen
+// window is still pending (app.jsx's Toolbar wiring, tabs.jsx's panel headers
+// and Recent-merges caption).
 //
 // LOAD CONTRACT. It destructures window.DF_DATUM at module scope with no
 // fallback, so index.html loads it after datum.js and before the Babel JSX
@@ -87,6 +88,15 @@ function highlightedWindow(echo, windows) {
   return echo && isHonoured(echo) && windows.includes(echo.served) ? echo.served : null;
 }
 
+// A click is taken the moment the chosen window changes, but no chip lights
+// for it until the endpoint serves it — which a slow fetch, a backoff or a
+// paused poll can delay indefinitely. Until the echo answers the chosen window
+// it is pending, so the click never reads as ignored.
+function pendingWindow(win, echo, windows) {
+  const answered = echo && echo.requested === win;
+  return windows.includes(win) && !answered ? win : null;
+}
+
 function recentMergesCaption(shown, total, echo) {
   const of = Number.isFinite(total) ? total : WINDOW_LABEL_UNKNOWN;
   return `showing ${shown} of ${of} in ${windowLabel(echo)}`;
@@ -103,6 +113,7 @@ const WINDOW_CHIP_API = {
   windowEcho,
   windowLabel,
   highlightedWindow,
+  pendingWindow,
   recentMergesCaption,
 };
 

@@ -9,7 +9,7 @@ const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
-const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow } = window.DF_WINDOW_CHIP;
+const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -195,6 +195,8 @@ function App() {
     'esc-analytics': { showAgents: false, search: false },
   }[tab] || {};
   const chip = CHIP_TAB_WINDOWS[tab];
+  const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;
+  const pending = chip ? pendingWindow(win, chipEcho, chip.windows) : null;
 
   return (
     <div className="app" data-density={tw.density}>
@@ -211,7 +213,7 @@ function App() {
         <Toolbar
           showWindow={!!chip}
           windows={chip?.windows}
-          window={chip ? highlightedWindow(windowEcho(DD.__receipt, chip.endpoint), chip.windows) : null}
+          window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
           onWindow={setWin}
           showProjects={toolbarConfig.showProjects !== false}
           projects={projects} onProjects={setProjects}
@@ -221,10 +223,17 @@ function App() {
           onSearch={toolbarConfig.search ? setSearch : undefined}
           searchPlaceholder={toolbarConfig.searchPlaceholder}
           extra={
-            <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
-              className="multi" style={{ cursor: 'pointer' }}>
-              {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
-            </button>
+            <>
+              {pending && (
+                <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                  {pending} pending
+                </span>
+              )}
+              <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
+                className="multi" style={{ cursor: 'pointer' }}>
+                {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
+              </button>
+            </>
           }
         />
         <div className="body" key={tab}>
