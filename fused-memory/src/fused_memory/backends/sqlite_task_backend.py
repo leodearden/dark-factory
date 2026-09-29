@@ -2008,6 +2008,30 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None,
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` for *tag* — the edge set alone.
+
+        The compact counterpart of :meth:`get_tasks`, as :meth:`get_statuses`
+        is, and a thin wrapper over :meth:`_fetch_dependencies`:
+
+        - each dependency list is SORTED ascending;
+        - a task with NO dependencies is **absent** from the map, not present
+          with an empty list;
+        - it is a single statement, so self-consistent, but not a joint
+          snapshot with any other read a caller issues around it.
+
+        Args:
+            project_root: Project whose task DB to read.
+            tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``. An
+                unknown tag yields ``{}``.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        async with self._fresh_read_conn(project_root) as conn:
+            return await self._fetch_dependencies(conn, tag)
+
     async def _statuses_from_conn(
         self,
         conn: aiosqlite.Connection,

@@ -283,6 +283,16 @@ class TaskBackendProtocol(Protocol):
         tag: str | None = None,
     ) -> DependencyResult: ...
 
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` — the dependency edge set alone.
+
+        Lists are sorted ascending, and a task with no dependencies is ABSENT
+        from the map rather than present with an empty list.
+        """
+        ...
+
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None
     ) -> ValidateDependenciesResult: ...

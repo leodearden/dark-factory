@@ -44,6 +44,12 @@ from fused_memory.memory_metadata import (
 from fused_memory.middleware.dead_letter_escalator import (
     emit_dead_letter_escalation,
 )
+from fused_memory.middleware.dependency_direction_check import (
+    DependencyDirectionFinding,
+    build_dependency_index,
+    check_dependency_direction,
+    extract_dependency_facts,
+)
 from fused_memory.middleware.entity_mint_storm_escalator import (
     emit_entity_mint_storm_escalation,
 )
@@ -1748,8 +1754,8 @@ class ReconcileStats:
     """Aggregated counts from one ``_reconcile_episode_identity`` run.
 
     Returned to the caller and logged for observability — NOT wired into the
-    durable write-journal schema (extending that schema is out of scope for
-    task 2202 / W6-β). Each field mirrors the int return of the
+    durable write-journal schema (extending that schema is out of scope for task
+    2202 / W6-β). Each int field mirrors the int return of the
     correspondingly-named post-write sweep — including
     ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
     direction counterpart of ``sibling_edges_restored``. ``errors`` collects
@@ -1780,7 +1786,16 @@ class ReconcileStats:
     repair_stats: ReferentRepairStats = field(
         default_factory=lambda: ReferentRepairStats()
     )
+    #: The dependency-direction check's records (task 3770, the ninth
+    #: sub-pass), one per finding it reported. A record whose
+    #: ``contradicts_ground_truth`` is true names an edge that was retired.
+    dependency_direction_findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def dependency_direction_flagged(self) -> int:
+        """The number of dependency-direction findings reported this run."""
+        return len(self.dependency_direction_findings)
 
 
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
@@ -3209,6 +3224,111 @@ class MemoryService:
                 failed,
             )
         return invalidated
+
+    async def _check_dependency_direction(
+        self, result: Any, *, group_id: str
+    ) -> list[dict]:
+        """Report extracted dependency facts whose direction Taskmaster rejects.
+
+        The ninth post-write sub-pass (task 3770). The classification rules live
+        in ``middleware/dependency_direction_check.py``.
+
+        - Scope gate first: an episode with no dependency shorthand returns
+          ``[]`` without reading Taskmaster.
+        - The project root is ``self._known_projects[group_id]`` with no
+          fallback. Task ids overlap across projects, so an unregistered group
+          is refused with a WARNING rather than judged against another
+          project's graph.
+        - A finding that contradicts ground truth retires its edge with
+          ``invalid_at`` only; the fact text is never rewritten. An UNSUPPORTED
+          finding is reported and its edge stays valid.
+        - Best-effort: a missing Taskmaster, a failed read or a failed retire
+          never raises. ``CancelledError``, ``KeyboardInterrupt`` and
+          ``SystemExit`` propagate.
+
+        Returns:
+            One record (``DependencyDirectionFinding.to_dict()``) per reported
+            finding. A contradicting finding is reported only once its edge
+            has actually been retired.
+        """
+        if result is None:
+            return []
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        facts = extract_dependency_facts(edges)
+        if not facts or self.taskmaster is None:
+            return []
+        project_root = self._known_projects.get(group_id)
+        if not project_root:
+            logger.warning(
+                'Dependency-direction check SKIPPED for group_id=%r: the group is '
+                'absent from `_known_projects` (%d known project(s)), and no '
+                'fallback root is used. %d dependency fact(s) go unchecked.',
+                group_id, len(self._known_projects), len(facts),
+            )
+            return []
+
+        try:
+            edge_map = await self.taskmaster.get_dependency_edges(project_root)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Dependency-direction check could not read ground truth for %s; '
+                'skipping this episode',
+                project_root,
+            )
+            return []
+
+        index = build_dependency_index(edge_map or {})
+        records: list[dict] = []
+        for finding in check_dependency_direction(facts, index):
+            record = await self._report_dependency_direction_finding(
+                finding, group_id=group_id,
+            )
+            if record is not None:
+                records.append(record)
+        return records
+
+    async def _report_dependency_direction_finding(
+        self, finding: DependencyDirectionFinding, *, group_id: str
+    ) -> dict | None:
+        """Log *finding*, retiring its edge if it contradicts ground truth.
+
+        Returns its record, or ``None`` when the retire failed.
+        """
+        record = finding.to_dict()
+        if not finding.contradicts_ground_truth:
+            logger.warning(
+                'Extracted dependency fact is unsupported by Taskmaster ground '
+                'truth (%s), edge %s left valid: %r — %s',
+                finding.classification, finding.edge_uuid, finding.fact,
+                record['ground_truth'],
+            )
+            return record
+        logger.warning(
+            'Extracted dependency fact contradicts Taskmaster ground truth (%s), '
+            'retiring edge %s: %r — %s',
+            finding.classification, finding.edge_uuid, finding.fact,
+            record['ground_truth'],
+        )
+        try:
+            await self.graphiti.update_edge(
+                finding.edge_uuid, group_id=group_id, invalid_at=datetime.now(UTC),
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Failed to retire direction-mismatched edge %s; '
+                'will retry on the next episode that re-asserts it',
+                finding.edge_uuid,
+            )
+            return None
+        return record
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Collapse every spelling of a touched task's node onto 'Task N'.
@@ -5176,7 +5296,7 @@ class MemoryService:
         content: str = '', referent_source: str = 'derived',
         ambiguous: ReferentSet | None = None,
     ) -> ReconcileStats:
-        """Fold the eight post-write identity/verification/repair sweeps into one call.
+        """Fold the nine post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -5188,7 +5308,7 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the six sub-passes in their pre-existing chain order —
+        Runs the first six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
@@ -5237,11 +5357,18 @@ class MemoryService:
         stays the documented MANUAL escape hatch for that case. Overwriting a
         summary verbatim is not a decision a write-time pass may take unattended.
 
+        ``_check_dependency_direction`` (task 3770) is the ninth and last. It
+        checks the direction of freshly-extracted dependency facts against live
+        Taskmaster edges, retiring an edge only when ground truth contradicts
+        it and never rewriting a fact. It reads only edge ``.fact`` text, so it
+        runs after eta and leaves zeta's and eta's ordering contracts alone.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
         the six int passes, an empty ``ReferentStats`` for zeta, an empty
-        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        ``ReferentRepairStats`` for eta, and an empty list for the
+        dependency-direction check), and the remaining sub-passes still
         run — a single sub-pass failure must never fail the already-committed
         episode write. That guarantee is worth most at eta, the one pass that
         WRITES: its failure is the likeliest to be real, and it arrives after
@@ -5352,6 +5479,11 @@ class MemoryService:
                 episode_uuid=_episode_uuid_of(result),
             ),
             ReferentRepairStats(),
+        )
+        stats.dependency_direction_findings = await _run_pass(
+            '_check_dependency_direction',
+            self._check_dependency_direction(result, group_id=group_id),
+            [],
         )
         return stats
 
