@@ -77,6 +77,9 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND as _CYCLE_SUMMARY_KIND,
+)
+from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
 )
 from fused_memory.reconciliation.recon_pool_map import (
@@ -417,7 +420,7 @@ def _infer_recon_pool(meta: dict) -> str | None:
     pool cannot be inferred; callers must not clobber any caller-supplied
     recon_pool in that case).
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return None
     stage = meta.get('stage')
     if not isinstance(stage, str):
@@ -441,7 +444,7 @@ def _missing_cycle_summary_keys(meta: dict) -> list[str]:
     count_memories_by_metadata({kind, run_id, stage}) pre-check as an absent
     one). Order is stable: 'stage' before 'run_id'.
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return []
 
     missing: list[str] = []
@@ -500,7 +503,7 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     tests/test_memory_service.py, which pins today's behavior so this stays
     a tracked, visible follow-up rather than silent debt.
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return None
     run_id = meta.get('run_id')
     if isinstance(run_id, str) and run_id.strip():
@@ -1161,26 +1164,67 @@ async def _check_canonical_uniqueness(
     _census('canonical_uniqueness_violation', str(error))
 
 
+def _strip_recon_pool_from_non_cycle_summary(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+) -> None:
+    """Enforce "a Mem0 record carries recon_pool only if kind == cycle_summary"
+    (task 3239) by popping a caller-supplied recon_pool from any other write,
+    with one WARNING so the prompt-compliance failure behind it stays visible.
+
+    Keys on the key's presence, not its value: an unhashable LLM-supplied
+    value cannot raise, and a list value (which Qdrant would still match
+    element-wise against the pool filter) is stripped too.
+    """
+    if meta.get('kind') == _CYCLE_SUMMARY_KIND or 'recon_pool' not in meta:
+        return
+    stripped = meta.pop('recon_pool')
+    logger.warning(
+        'MemoryService: stripped caller-supplied recon_pool=%s from a '
+        'non-cycle_summary write (kind=%s, agent_id=%s) — recon_pool is '
+        'server-stamped on kind=cycle_summary writes only, and a stray tag '
+        'would join a reconciliation trim pool',
+        _safe_repr(stripped), _safe_repr(meta.get('kind')), agent_id,
+        extra={
+            'project_id': project_id,
+            'agent_id': agent_id,
+            'kind': meta.get('kind'),
+            'caller_recon_pool': stripped,
+        },
+    )
+
+
 def _apply_cycle_summary_metadata_tagging(
     meta: dict,
     causation_id: str | None,
     *,
     project_id: str,
+    agent_id: str | None,
 ) -> None:
     """Apply server-side cycle_summary metadata tagging to ``meta`` in place.
 
     Shared by add_memory and add_system_record (task 2222 amendment) so
     every write path that can carry a cycle_summary payload gets the same
     authoritative treatment: recon_pool auto-tag from metadata.stage (task
-    2077) — recon_pool is the only key the pool-cap trim and
-    prune_recon_cycle_summaries.py filter on; run_id auto-backfill from the
-    causation id (task 2109) — run_id drives the Path-2 triple-filter
-    verification pre-check; and a WARNING for whatever remains
-    missing/invalid after the backfill (task 2094/2109), so an untagged or
-    unverifiable cycle_summary write is observable instead of silently
-    piling up unbounded or dropping out of the Path-2 pre-check. No-op
-    (and no warning) for any meta['kind'] != 'cycle_summary'.
+    2077) — the pool-cap trim
+    (reconciliation/summary_pool.py::enforce_summary_pool_cap) enumerates on
+    recon_pool together with kind, while
+    fused-memory/scripts/prune_recon_cycle_summaries.py keys on kind and
+    stage; run_id auto-backfill from the causation id (task 2109) — run_id
+    drives the Path-2 triple-filter verification pre-check; and a WARNING
+    for whatever remains missing/invalid after the backfill (task
+    2094/2109), so an untagged or unverifiable cycle_summary write is
+    observable instead of silently piling up unbounded or dropping out of
+    the Path-2 pre-check. A write whose kind is not cycle_summary is left
+    untouched EXCEPT that a caller-supplied recon_pool is stripped, with one
+    WARNING (task 3239, :func:`_strip_recon_pool_from_non_cycle_summary`).
     """
+    _strip_recon_pool_from_non_cycle_summary(
+        meta, project_id=project_id, agent_id=agent_id,
+    )
+
     inferred_recon_pool = _infer_recon_pool(meta)
     if inferred_recon_pool is not None:
         meta['recon_pool'] = inferred_recon_pool
@@ -6504,7 +6548,9 @@ class MemoryService:
         # task 2094/2109) — factored into a shared helper (task 2222
         # amendment) so add_system_record gets the identical authoritative
         # treatment. See _apply_cycle_summary_metadata_tagging's docstring.
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
 
         # Mem0 metadata vocabulary validation (task 3195, leaf β). Placement is
         # load-bearing at BOTH ends:
@@ -6919,7 +6965,9 @@ class MemoryService:
         # the pool-cap trim and Path-2 triple-filter pre-check rely on — a
         # system-record cycle_summary must not go untagged just because it
         # bypassed add_memory.
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
 
         # Same vocabulary validation add_memory applies (task 3195, leaf β).
         # PRD D8/§2 name add_system_record as the second unguarded write path

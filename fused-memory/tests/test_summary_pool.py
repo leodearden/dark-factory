@@ -1412,9 +1412,11 @@ class _StatefulMem0Pool:
             'metadata': dict(metadata),
         }
 
-    def _insert(self, metadata: dict, causation_id, project_id: str) -> str:
+    def _insert(self, metadata: dict, causation_id, project_id: str, agent_id) -> str:
         meta = dict(metadata or {})
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
         self._seq += 1
         memory_id = f'mem-{self._seq:03d}'
         self.records[memory_id] = {
@@ -1424,14 +1426,18 @@ class _StatefulMem0Pool:
         }
         return memory_id
 
-    async def add_system_record(self, *, metadata=None, project_id, causation_id=None, **_):
+    async def add_system_record(
+        self, *, metadata=None, project_id, agent_id=None, causation_id=None, **_,
+    ):
         return SimpleNamespace(
-            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id, agent_id)]
         )
 
-    async def add_memory(self, *, metadata=None, project_id, causation_id=None, **_):
+    async def add_memory(
+        self, *, metadata=None, project_id, agent_id=None, causation_id=None, **_,
+    ):
         return SimpleNamespace(
-            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id, agent_id)]
         )
 
     # -- reads/deletes ---------------------------------------------------
