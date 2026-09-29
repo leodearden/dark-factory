@@ -2159,7 +2159,11 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    denylist of every apply verb, both in `nightly_prepare.py`, and its
    environment sets `SITTING_NIGHTLY_CONFINED`, under which
    `prepare_sitting.py` refuses anything but `brief` and `record` into
-   `data/sitting/`, including `--apply-closes` and `--ledger`. Its account comes from the shared pool, as a
+   `data/sitting/`, including `--apply-closes` and `--ledger`. Its only MCP
+   servers are the `escalation` and `fused-memory` blocks of the checkout's
+   `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
+   on the project config being approved for a headless run, and playwright
+   never starts. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
    is invisible to the gate. With nothing leasable, it inherits the unit's
    environment. It stops itself after 2700s.

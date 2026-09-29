@@ -16,6 +16,11 @@ any other subcommand, a non-default ``--preparation``, ``--ledger`` and
 ``--apply-closes``. A write outside ``data/sitting/`` is therefore refused in
 code rather than merely instructed against.
 
+Its MCP servers are exactly ``NIGHTLY_MCP_SERVERS``, copied from the
+checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
+allowlisted reads therefore never depend on the ambient project config being
+approved for a headless run, and no other server starts.
+
 The account comes from the shared pool through ``account_pool.subprocess_env``
 and inherits its known limit: the lease is handed straight back, so this run's
 spend is invisible to the gate. With no lease the child inherits this process's
@@ -64,6 +69,9 @@ DEFAULT_TIMEOUT_SECS = 2700.0
 DEFAULT_MAX_TURNS = 200
 PERMISSION_MODE = 'dontAsk'
 STREAM_TAIL_CHARS = 2000
+
+DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
+NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 
 PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in this checkout."""
@@ -130,6 +138,11 @@ class Settings:
     budget_usd: float
     timeout_secs: float
     max_turns: int
+    mcp_json: Path
+
+
+class McpConfigUnusable(Exception):
+    """The MCP config file cannot supply a block for every server in ``NIGHTLY_MCP_SERVERS``."""
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,11 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     if claude is None:
         _log(f'claude binary not found or not executable: {settings.claude_bin!r}')
         return EXIT_CONFIG
+    try:
+        mcp_config = _mcp_config(settings.mcp_json)
+    except McpConfigUnusable as exc:
+        _log(f'no usable MCP config: {exc}')
+        return EXIT_CONFIG
     env = _child_env(gate if gate is not None else account_pool.build_pool())
     argv, temp_files = build_claude_argv(
         model=settings.model,
@@ -156,11 +174,12 @@ def run(settings: Settings, *, gate: Any = None) -> int:
         permission_mode=PERMISSION_MODE,
         allowed_tools=list(NIGHTLY_ALLOWED_TOOLS),
         disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
-        mcp_config=None,
+        mcp_config=mcp_config,
         output_schema=None,
         effort=None,
         resume_session_id=None,
         session_id=None,
+        strict_mcp_config=True,
     )
     argv[0] = claude
     try:
@@ -176,12 +195,26 @@ def run(settings: Settings, *, gate: Any = None) -> int:
 
 def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
         _log(f'failed before the run completed: {exc!r}')
         return EXIT_FAILED
+
+
+def _mcp_config(path: Path) -> dict[str, Any]:
+    """*path*'s blocks for ``NIGHTLY_MCP_SERVERS`` and no other."""
+    try:
+        servers = json.loads(path.read_text(encoding='utf-8'))['mcpServers']
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise McpConfigUnusable(f'{path}: {type(exc).__name__}: {exc}') from exc
+    if not isinstance(servers, dict):
+        raise McpConfigUnusable(f'{path}: mcpServers is not an object')
+    missing = [name for name in NIGHTLY_MCP_SERVERS if not isinstance(servers.get(name), dict)]
+    if missing:
+        raise McpConfigUnusable(f'{path}: no mcpServers block for {", ".join(missing)}')
+    return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
 
 
 def _child_env(gate: Any) -> dict[str, str]:
@@ -267,6 +300,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--budget-usd', type=_positive(float), default=DEFAULT_BUDGET_USD)
     parser.add_argument('--timeout-secs', type=_positive(float), default=DEFAULT_TIMEOUT_SECS)
     parser.add_argument('--max-turns', type=_positive(int), default=DEFAULT_MAX_TURNS)
+    parser.add_argument('--mcp-json', type=Path, default=DEFAULT_MCP_JSON,
+                        help="the MCP config whose escalation and fused-memory blocks the run uses (default: this checkout's)")
     return parser
 
 

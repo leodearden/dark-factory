@@ -59,6 +59,10 @@ if '--system-prompt-file' in argv:
     path = argv[argv.index('--system-prompt-file') + 1]
     record['sysprompt_path'] = path
     record['sysprompt'] = Path(path).read_text() if os.path.exists(path) else None
+if '--mcp-config' in argv:
+    path = argv[argv.index('--mcp-config') + 1]
+    record['mcp_config_path'] = path
+    record['mcp_config'] = json.loads(Path(path).read_text()) if os.path.exists(path) else None
 with open(spec['record'], 'a') as sink:
     sink.write(json.dumps(record) + '\\n')
 sys.stdout.write(spec['stdout'])
@@ -163,16 +167,18 @@ def test_argv_is_exactly_the_shared_builders_with_the_defaults(tmp_path):
         permission_mode='dontAsk',
         allowed_tools=list(mod.NIGHTLY_ALLOWED_TOOLS),
         disallowed_tools=list(mod.NIGHTLY_DENIED_TOOLS),
-        mcp_config=None,
+        mcp_config=call['mcp_config'],
         output_schema=None,
         effort=None,
         resume_session_id=None,
         session_id=None,
+        strict_mcp_config=True,
     )
     for path in temp_files:
         Path(path).unlink(missing_ok=True)
     expected[0] = str(fake.bin)
     expected[expected.index('--system-prompt-file') + 1] = call['sysprompt_path']
+    expected[expected.index('--mcp-config') + 1] = call['mcp_config_path']
     assert call['argv'] == expected
     assert mod.DEFAULT_MODEL == 'fable', 'the task mandates the prepare-sitting mode run nightly on Fable'
     assert call['sysprompt'], 'the builder always writes a system prompt; it must not be empty'
@@ -224,7 +230,9 @@ def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, spec, extra):
 
     call = fake.only_call()
     assert call['sysprompt'] is not None, 'the system prompt file must exist while the CLI runs'
+    assert call['mcp_config'] is not None, 'the MCP config file must exist while the CLI runs'
     assert not _sysprompt_path(call).exists(), 'the builder temp file must be unlinked after the run'
+    assert not Path(call['mcp_config_path']).exists(), 'the MCP config temp file must be unlinked after the run'
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +271,61 @@ def test_every_allowed_mcp_tool_is_a_read():
 
     assert reads, 'the run should be able to read escalations and tasks through MCP'
     assert all(verb.startswith(('get_', 'search')) for verb in reads), reads
+
+
+def test_the_mcp_servers_are_exactly_the_checkouts_escalation_and_fused_memory_blocks(tmp_path):
+    """Explicit and strict: the reads never hang on the ambient .mcp.json being approved headless, and nothing else starts."""
+    fake = _fake_claude(tmp_path)
+
+    assert _main(fake) == mod.EXIT_OK
+
+    call = fake.only_call()
+    ambient = json.loads((REPO_ROOT / '.mcp.json').read_text())['mcpServers']
+    assert call['mcp_config'] == {'mcpServers': {name: ambient[name] for name in ('escalation', 'fused-memory')}}
+    argv = call['argv']
+    assert argv[argv.index('--mcp-config') + 2] == '--strict-mcp-config'
+
+
+def test_every_allowed_or_denied_mcp_tool_names_a_configured_server():
+    tools = [tool for tool in (*mod.NIGHTLY_ALLOWED_TOOLS, *mod.NIGHTLY_DENIED_TOOLS) if tool.startswith('mcp__')]
+
+    assert {tool.split('__')[1] for tool in tools} == set(mod.NIGHTLY_MCP_SERVERS)
+
+
+@pytest.mark.parametrize(
+    ('contents', 'named'),
+    [
+        (None, 'No such file'),
+        ('{not json', 'JSONDecodeError'),
+        (json.dumps({'mcpServers': {'escalation': {'type': 'http', 'url': 'http://127.0.0.1:1/mcp'}}}), 'fused-memory'),
+        (json.dumps({'servers': {}}), 'mcpServers'),
+    ],
+    ids=['absent', 'not-json', 'a-server-missing', 'no-mcpServers'],
+)
+def test_an_unusable_mcp_config_is_a_configuration_error_and_leases_nothing(tmp_path, capsys, contents, named):
+    mcp_json = tmp_path / 'mcp.json'
+    if contents is not None:
+        mcp_json.write_text(contents)
+    fake = _fake_claude(tmp_path)
+    gate = _live_gate()
+
+    rc = _main(fake, '--mcp-json', str(mcp_json), gate=gate)
+
+    assert rc == mod.EXIT_CONFIG
+    assert (gate.leases, fake.calls()) == (0, [])
+    err = capsys.readouterr().err
+    assert str(mcp_json) in err and named in err
+
+
+def test_the_mcp_json_seam_reaches_the_run(tmp_path):
+    servers = {name: {'type': 'http', 'url': f'http://127.0.0.1:9/{name}'} for name in ('escalation', 'fused-memory')}
+    mcp_json = tmp_path / 'mcp.json'
+    mcp_json.write_text(json.dumps({'mcpServers': {**servers, 'playwright': {'command': 'npx'}}}))
+    fake = _fake_claude(tmp_path)
+
+    assert _main(fake, '--mcp-json', str(mcp_json)) == mod.EXIT_OK
+
+    assert fake.only_call()['mcp_config'] == {'mcpServers': servers}
 
 
 def test_the_child_runs_the_prepare_script_confined_to_data_sitting(tmp_path):
