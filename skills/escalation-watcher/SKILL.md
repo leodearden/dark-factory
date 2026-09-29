@@ -19,7 +19,7 @@ L2 items reach this queue via two paths: (a) **born-at-L2** — severity `critic
 Before starting, verify these are in place. If anything is missing, ask the user — don't guess.
 
 1. **`DARK_FACTORY_ROOT`** env var — path to the dark-factory repository (contains the `escalation` package used by the watcher)
-2. **Running orchestrator** with escalation MCP accessible (port `8102` for dark-factory — set in `orchestrator/config.yaml` and matching `.mcp.json`; the code default is `8100`, which other projects may use)
+2. **Running orchestrator** with escalation MCP accessible (port `8102` for dark-factory — set in `<project_root>/dark-factory-orchestrator.yaml` and matching `.mcp.json`; the code default is `8100`, which other projects may use)
 3. **Escalation queue directory** at `<project_root>/data/escalations/`
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
@@ -768,7 +768,7 @@ mechanical gate to check whether the at-block-time dry-run investigation found a
   --worktree <worktree> \
   --project-root <project_root> \
   --category <task_failure|review_issues> \
-  --config <watched-project orchestrator config, e.g. orchestrator/config.yaml>
+  --config <project_root>/dark-factory-orchestrator.yaml
 ```
 
 > **`--tag` note:** Both `check` and `record-launch` default `--tag` to `master` — the
@@ -907,8 +907,9 @@ its abort as authoritative.
 **Applicability:**
 
 B3 applies in AFK mode always. In attended mode it applies when the watched project's orchestrator
-config `UnblockAutoConfig.attended_b3_enabled` (e.g. `orchestrator/config.yaml` →
-`unblock_auto.attended_b3_enabled`, default `false`) is `true` OR the human enabled it for this
+config `UnblockAutoConfig.attended_b3_enabled` (`<project_root>/dark-factory-orchestrator.yaml` →
+`unblock_auto.attended_b3_enabled`, default `false`; dark-factory and reify set it `true` since
+2026-09-25) is `true` OR the human enabled it for this
 session via a session override. A session override wins in either direction — a human may turn it on
 even if config is false, or off even if config is true.
 
@@ -1844,7 +1845,7 @@ Run from `$DARK_FACTORY_ROOT`:
 ```bash
 .venv/bin/python -m orchestrator.recover_main \
   --project-root <watched-project-root> \
-  --config <watched-orchestrator.yaml, e.g. orchestrator/config.yaml> \
+  --config <watched-project-root>/dark-factory-orchestrator.yaml \
   --target-sha <good-sha> \
   --expected-main <current-main>
 ```
