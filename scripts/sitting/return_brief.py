@@ -12,9 +12,13 @@ adjudicator's shadow agreement; section 6 is this preparer's own carve-out
 closes, read back from ``closing_evidence``. Leo audits the two mechanisms
 independently.
 
-The night's numbering is written to ``--ledger-out`` as a fresh sitting. A
-watcher seeds its session ledger from it (``prepare_sitting.py new-sitting
---seed``), so the numbers Leo reads here are the numbers his session applies.
+The night's numbering is a fresh sitting seeded from the previous night's
+``--ledger-out`` and written back there, so an item keeps its number from night
+to night, and an item that left since the last render is listed under Done with
+the number it had. A watcher seeds its session ledger from it
+(``prepare_sitting.py new-sitting --seed``), so the numbers Leo reads here are
+the numbers his session applies. That holds for a session launched on an
+earlier night too, for every item a render had already numbered by then.
 
 No subprocess, no network, no git. Exit codes: 0 whenever the page is written,
 degraded or not; 2 on a configuration error.
@@ -24,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -100,17 +104,21 @@ def build(
     sessions_root: Path,
     handover_path: Path | None,
     preparation_path: Path,
+    previous_ledger: Path | None,
     window: Window,
     now: datetime,
 ) -> ReturnBriefDocument:
-    """Read every store once, number the open items as a fresh recommend-only sitting, and measure the fleet."""
+    """Read every store once, number the open items as a recommend-only sitting seeded from *previous_ledger*, and measure the fleet."""
     sources = prepare_sitting.read_sources(
         project_roots=project_roots, decisions_root=decisions_root, sessions_root=sessions_root,
         handover_path=handover_path, preparation_path=preparation_path, project=None, now=now,
     )
+    seed, unseeded = _previous_numbering(previous_ledger)
     sitting = prepare_sitting.compose(
-        sources, ledgers.new_sitting(now.isoformat()), recommend_only=True, multi_sitting=False, now=now,
+        sources, ledgers.new_sitting(now.isoformat(), seed=seed), recommend_only=True, multi_sitting=False, now=now,
     )
+    if unseeded is not None:
+        sitting = replace(sitting, shortfalls=(*sitting.shortfalls, unseeded))
     return ReturnBriefDocument(
         generated_at=now.isoformat(),
         window=window,
@@ -157,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
             handover_path=prepare_sitting.handover_file(args.handover),
             preparation_path=args.preparation,
+            previous_ledger=args.ledger_out,
             window=Window.trailing(now, days=args.window_days),
             now=now,
         )
@@ -169,6 +178,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     statuses = section_statuses(document)
     print(f'done ({", ".join(f"{slug}={status}" for slug, status in statuses.items())})')
     return EXIT_OK
+
+
+def _previous_numbering(path: Path | None) -> tuple[ledgers.Ledger | None, Shortfall | None]:
+    """The ledger the last render wrote, or why tonight numbers afresh despite one being there."""
+    if path is None:
+        return None, None
+    try:
+        return ledgers.load(path), None
+    except ledgers.LedgerCorrupt as exc:
+        return None, Shortfall('nightly_ledger', str(exc.path), f'{exc.reason}; numbered afresh')
 
 
 def _freshness(sources: prepare_sitting.Sources, sitting: Sitting) -> PreparationFreshness:
@@ -369,7 +388,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='return_brief.py', description='Write the cross-project return brief.')
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument('--ledger-out', type=Path, default=DEFAULT_LEDGER_OUT,
-                        help='the nightly numbering, a fresh sitting a watcher seeds from')
+                        help='the nightly numbering: seeded from the one here, written back, and what a watcher seeds from')
     parser.add_argument('--project-root', action='append', dest='project_roots',
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     parser.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')

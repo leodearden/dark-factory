@@ -27,6 +27,8 @@ NOW_ISO = NOW.isoformat()
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
 BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
 CLOSED_IN_WINDOW = '2026-09-25T20:00:00+00:00'
+NIGHT_TWO = (NOW + timedelta(days=1)).isoformat()
+NIGHT_THREE = (NOW + timedelta(days=2)).isoformat()
 TITLES = (
     '1. Decisions needed',
     '2. Rulings made under standing policy',
@@ -82,6 +84,7 @@ class Env:
             sessions_root=self.sessions,
             handover_path=self.handover,
             preparation_path=self.preparation,
+            previous_ledger=self.ledger_out,
             window=fleet_state.Window.trailing(NOW, days=1),
             now=NOW,
         )
@@ -204,6 +207,17 @@ def _header(text: str) -> str:
 def _run(capsys, argv: list[str]) -> tuple[int, str]:
     rc = mod.main(argv)
     return rc, capsys.readouterr().out
+
+
+def _key(env: Env, esc_id: str) -> str:
+    return json.dumps(list(escalation_key(normalize_escalations_dir(env.queue), esc_id)))
+
+
+def _numbers(env: Env) -> dict[str, int]:
+    """Every live (open or standing) item's number in the ledger the last render wrote."""
+    ledger = ledger_mod.load(env.ledger_out)
+    assert ledger is not None
+    return {key: entry.number for key, entry in ledger.entries.items() if entry.state != 'done'}
 
 
 class TestSections:
@@ -357,18 +371,49 @@ class TestMain:
         assert ledger.sitting_id == f'sitting-{NOW_ISO}'
         assert sorted(entry.number for _, entry in ledger.in_state('open')) == [1, 2, 3, 4, 5, 6, 7]
 
-    def test_a_second_run_overwrites_and_the_ledger_starts_fresh_each_night(self, env, capsys):
+    def test_an_item_present_on_consecutive_nights_keeps_its_number(self, env, capsys):
         _run(capsys, env.argv())
-        _esc(env.queue, id='esc-101-1', status='resolved', resolved_at=NOW_ISO, resolved_by='interactive')
+        first = _numbers(env)
+        _esc(env.queue, id='esc-101-1', status='resolved', resolved_at=NIGHT_TWO, resolved_by='interactive')
+        _esc(env.queue, id='esc-110-1', severity='critical')
 
-        _run(capsys, env.argv())
+        _run(capsys, [*env.argv(), '--now', NIGHT_TWO])
 
         assert env.output.read_text().count('# Return brief') == 1
+        second = _numbers(env)
+        resolved = _key(env, 'esc-101-1')
+        assert {key: number for key, number in second.items() if key in first} == {
+            key: number for key, number in first.items() if key != resolved}
+        assert second[_key(env, 'esc-110-1')] == max(first.values()) + 1
         ledger = ledger_mod.load(env.ledger_out)
         assert ledger is not None
-        assert list(ledger.in_state('done')) == []
-        assert escalation_key(normalize_escalations_dir(env.queue), 'esc-101-1') not in {
-            tuple(json.loads(key)) for key in ledger.entries}
+        assert [(key, entry.number) for key, entry in ledger.in_state('done')] == [(resolved, first[resolved])]
+
+    def test_a_done_item_is_not_carried_a_further_night_and_its_number_is_never_reissued(self, env, capsys):
+        _run(capsys, env.argv())
+        retired = _numbers(env)[_key(env, 'esc-101-1')]
+        _esc(env.queue, id='esc-101-1', status='resolved', resolved_at=NIGHT_TWO, resolved_by='interactive')
+        _run(capsys, [*env.argv(), '--now', NIGHT_TWO])
+        _esc(env.queue, id='esc-111-1')
+
+        _run(capsys, [*env.argv(), '--now', NIGHT_THREE])
+
+        third = _numbers(env)
+        assert _key(env, 'esc-101-1') not in third
+        assert retired not in third.values()
+
+    def test_an_unreadable_previous_ledger_numbers_afresh_and_says_so(self, env, capsys):
+        env.ledger_out.parent.mkdir(parents=True)
+        env.ledger_out.write_text('{not json')
+
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[0]]
+        assert f'shortfall: nightly_ledger {env.ledger_out}' in section and 'numbered afresh' in section
+        assert sorted(_numbers(env).values()) == [1, 2, 3, 4, 5, 6, 7]
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(1) == 'degraded'
 
     def test_default_paths_are_under_this_checkouts_data_dir(self):
         assert mod.DEFAULT_OUTPUT == REPO_ROOT / 'data' / 'return-brief.md'

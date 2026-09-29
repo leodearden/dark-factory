@@ -1262,6 +1262,11 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 - At launch: `new-sitting --ledger data/sitting/ledger-<lease-slug>.json --seed
   data/sitting/ledger-nightly.json`. The seed carries forward the numbers Leo read in the return
   brief.
+- Each 05:30 render seeds its numbering from the night before. An item keeps its number from night
+  to night, so a session launched on an earlier night still agrees with a newer page on every item
+  a render had numbered before that launch. An item your session numbered itself after launch can
+  carry a different number on a later page. The `resolve-answers` echo table names each record id,
+  so check it there.
 - For every brief or re-brief: `brief --ledger <that ledger>`.
 - A number belongs to its item for the whole session and is never reused. An applied item keeps its
   number under **Done**. An item under a HOLD, a pin or another owner renders in the **Standing / no

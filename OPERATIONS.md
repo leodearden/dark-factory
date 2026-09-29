@@ -2174,7 +2174,7 @@ is no commit seam, unlike the 05:00 census:
 | Path | What it carries |
 |---|---|
 | `data/return-brief.md` | The page |
-| `data/sitting/ledger-nightly.json` | The night's item numbering; a watcher seeds its sitting from it |
+| `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
