@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -1483,6 +1484,34 @@ class TestProcessGroupTermination:
                 members = process_group_members(pgid)
                 assert [m.pid for m in members if m.terminated] == [pgid], members
                 assert [m for m in members if not m.terminated], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    @pytest.mark.timeout(15)
+    def test_a_member_with_an_undecodable_comm_is_still_listed(self):
+        """comm is arbitrary bytes; a member must never drop out of the walk over them."""
+        pr_set_name = 15
+        script = (
+            'import ctypes, time\n'
+            f"ctypes.CDLL(None).prctl({pr_set_name}, b'\\xff\\xfe', 0, 0, 0)\n"
+            "print('ready', flush=True)\n"
+            'time.sleep(30)\n'
+        )
+        with subprocess.Popen(
+            [sys.executable, '-c', script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                members = process_group_members(pgid)
+                assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                    (pgid, '��', False)
+                ], members
                 assert process_group_terminated(pgid) is False
             finally:
                 _kill_group(pgid)

@@ -73,6 +73,7 @@ import signal
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +307,92 @@ async def terminate_process_group(
 #: already assumes Linux procfs semantics (os.killpg, /proc/<pid>/stat field
 #: order), so pointing it elsewhere at runtime would not make it portable.
 _PROC_ROOT = Path('/proc')
+
+
+class _StatFields(NamedTuple):
+    comm: str
+    state: str
+    ppid: int
+    pgrp: int
+
+
+def _read_stat_fields(entry: Path) -> _StatFields | None:
+    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
+
+    comm is delimited by the LAST ``)``, so a comm containing spaces or parens
+    parses correctly; its bytes are arbitrary, so undecodable ones are replaced
+    rather than costing the pid its entry.
+    """
+    try:
+        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    rparen = text.rfind(')')
+    if rparen < 0:
+        return None
+    comm = text[text.find('(') + 1 : rparen]
+    fields = text[rparen + 2 :].split()
+    try:
+        return _StatFields(
+            comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
+        )
+    except (IndexError, ValueError):
+        return None
+
+
+class ProcessGroupMember(NamedTuple):
+    pid: int
+    ppid: int
+    state: str
+    comm: str
+
+    @property
+    def terminated(self) -> bool:
+        """Exited; awaits only its (maybe reparented) parent's reap, not the signaller's job."""
+        return self.state in ('Z', 'X')
+
+
+def process_group_members(pgid: int) -> list[ProcessGroupMember]:
+    """Every process whose pgrp is *pgid*, zombies included, sorted by pid.
+
+    Walks ``/proc``; a pid that vanishes or cannot be read mid-walk is skipped.
+    Never raises OSError.
+    """
+    if pgid <= 0:
+        return []
+    try:
+        entries = list(_PROC_ROOT.iterdir())
+    except OSError:
+        return []
+    members: list[ProcessGroupMember] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fields = _read_stat_fields(entry)
+        if fields is None or fields.pgrp != pgid:
+            continue
+        members.append(
+            ProcessGroupMember(
+                pid=int(entry.name), ppid=fields.ppid, state=fields.state, comm=fields.comm
+            )
+        )
+    return sorted(members)
+
+
+def process_group_terminated(pgid: int) -> bool:
+    """True iff every member of group *pgid* has terminated, or the group is gone.
+
+    Concluded only on positive evidence: ``killpg(pgid, 0)`` failing (ESRCH:
+    gone; EPERM: the pgid now belongs to another user), or a /proc walk that
+    sees at least one member, all terminated.  An empty walk while killpg
+    still sees the group is inconclusive and yields False.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except OSError:
+        return True
+    members = process_group_members(pgid)
+    return bool(members) and all(m.terminated for m in members)
 
 
 def _path_at_or_under(candidate: str, root: str) -> bool:
