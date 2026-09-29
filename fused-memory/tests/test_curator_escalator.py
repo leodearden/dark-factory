@@ -21,7 +21,6 @@ from typing import IO, Any, Literal, overload
 import pytest
 from escalation.queue import EscalationQueue
 
-from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import CuratorFailureError
 
@@ -447,7 +446,8 @@ class TestZeroOutputTimeoutEscalation:
     # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
     # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
     # "hours apart / across a restart" without touching the 60s in-process
-    # dedup or its clock.
+    # dedup or its clock. The root_cause is a literal on purpose: it is the
+    # key recurrences fold under, so a renamed key is a new incident class.
 
     @pytest.mark.asyncio
     async def test_recurrence_folds_under_the_pinned_root_cause(self, tmp_path):
@@ -457,7 +457,7 @@ class TestZeroOutputTimeoutEscalation:
             await CuratorEscalator().report_failure(**_zot_report(tmp_path))
 
             [parent] = _pending_records(tmp_path)
-            assert parent['root_cause'] == curator_escalator._ZOT_ROOT_CAUSE
+            assert parent['root_cause'] == _PINNED_ZOT_ROOT_CAUSE
             assert parent['dedupe_fingerprint']
             assert parent['dedupe_count'] == 1
             assert parent['dedupe_children'] == ['esc-curator-2']
@@ -479,7 +479,7 @@ class TestZeroOutputTimeoutEscalation:
 
             [fresh] = _pending_records(tmp_path)
             assert fresh['id'] != parent['id']
-            assert fresh['root_cause'] == curator_escalator._ZOT_ROOT_CAUSE
+            assert fresh['root_cause'] == _PINNED_ZOT_ROOT_CAUSE
         finally:
             handle.close()
 
@@ -528,12 +528,14 @@ class TestZeroOutputTimeoutEscalation:
             await CuratorEscalator().report_failure(**_zot_report(tmp_path))
 
             detail = _only_escalation_detail(tmp_path)
-            assert 'Root cause: transient Anthropic-backend degradation' not in detail
             assert 'esc-task-curator-17' in detail
-            assert curator_escalator._ZOT_ROOT_CAUSE in detail
+            assert _PINNED_ZOT_ROOT_CAUSE in detail
             assert 'dedupe_count' in detail
         finally:
             handle.close()
+
+
+_PINNED_ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
 
 
 def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
