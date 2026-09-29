@@ -1255,14 +1255,25 @@ Three restart mechanisms act on the orchestrator fleet. They're
 deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
-- **Liveness = brokenness.** `main()`'s port-probe pass over the
-  **`WATCHED` orchestrator units** revives a wedged or port-down unit
-  immediately: per-unit, uncapped, not gated by any fleet-wide clock, and
-  it never stamps that clock. A single wedged-unit revive is not a fleet
-  deploy. Read "uncapped" as scoped to those units: it does **not**
-  describe `fused-memory.service`, which is deliberately kept out of
-  `WATCHED` and has had its own streak-gated, rate-capped liveness pass
-  since task 3764 — see
+- **Liveness = brokenness.** `main()`'s pass over the **`WATCHED`
+  orchestrator units** revives a dead unit immediately on either of two
+  signals — per-unit, uncapped, not gated by any fleet-wide clock, and it
+  never stamps that clock. The port-probe signal (wedged or port-down) is
+  unchanged. Under systemd socket activation each unit's escalation port is
+  held by its own `.socket` unit, so it can keep reading LISTEN across a
+  dead service; `main()` therefore also asks systemd's ActiveState
+  (`_unit_active_state()`) whenever the port IS up, and revives on
+  `inactive`/`failed` (`UNIT_DEAD_ACTIVE_STATES`) exactly as it would a down
+  port — a transitional state (`activating`/`deactivating`/`reloading`) is
+  never treated as dead, since a unit mid-restart can take up to 90s to
+  settle. Reviving no longer calls `systemctl stop`: `restart_unit()` is
+  `reset-failed` (targeting the unit AND its `.socket` sibling) then
+  `restart --no-block`, so a revive never closes a socket-activated unit's
+  listening socket out from under an open MCP connection. A single
+  wedged-unit revive is not a fleet deploy. Read "uncapped" as scoped to
+  those units: it does **not** describe `fused-memory.service`, which is
+  deliberately kept out of `WATCHED` and has had its own streak-gated,
+  rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
   is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
@@ -1393,38 +1404,56 @@ Classification lives in
 `scripts/orchestrator-watchdog.py::_register_transient_unit`; the state probe
 is `scripts/orchestrator-watchdog.py::_unit_is_active`.
 
-### fused-memory socket activation (port 8002 survives restarts)
+### Socket activation (MCP ports survive restarts)
 
-`fused-memory.socket` (committed at `scripts/fused-memory.socket.template`) owns the
-listening socket on `0.0.0.0:8002`; `fused-memory.service` requires it, and
-the server adopts it via
-`shared/src/shared/systemd_listeners.py::take_systemd_listeners`. The port
-therefore stays bound while the service restarts (~50s): clients connecting
+Every MCP port an interactive Claude session talks to is owned by a systemd
+socket unit, so it stays bound while its service restarts: clients connecting
 mid-restart wait in the kernel backlog and are served by the new process.
+
+| Socket unit | Ports | Service |
+|---|---|---|
+| `fused-memory.socket` | `0.0.0.0:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
+| `orchestrator-<project>.socket` | that project's `escalation.port` (8100–8108) | `orchestrator-<project>.service` |
+
+The servers adopt the socket via
+`shared/src/shared/systemd_listeners.py::take_systemd_listeners`; without
+socket activation they bind the port themselves, as before. The units are
+committed as `scripts/<unit>.socket.template` — only because `.socket` is not
+in the lock-charter extension allowlist; they have no placeholders — and
+installed as `<unit>.socket` by `scripts/setup-host.sh` (fused-memory in
+section 4, orchestrators in section 5, both parity-gated).
 
 Why: Claude Code's HTTP MCP client (≥2.1.280) treats refused connections as
 terminal, retries 5 times over ~15s, then withdraws the server's tools until
-a manual `/mcp`. Before this, every fused-memory restart (~9/day) did that to
-every connected interactive session. Measured 2026-09-25 on 2.1.282 with a
-45s restart: without the socket the client gave up at +16s; with it, one
-connection reset and nothing else, and tool calls kept working.
+a manual `/mcp`. A fused-memory restart kept 8002 closed 41–63s (~9/day), an
+orchestrator restart its escalation port 6–97s. Measured 2026-09-25 on
+2.1.282 with a 45s restart: without the socket the client gave up at +16s;
+with it, one connection reset and nothing else, and tool calls kept working.
 
-What changes for an operator:
+**Stopping still stops.** Each service's `ExecStopPost`
+(`scripts/stop-socket-unless-restarting.sh`) stops its socket when the service
+has a `stop` job, so the port closes and no later connection — the
+dashboard polls every escalation port every ~3s — can start a stopped or
+disabled service again. A `restart` job, or a crash awaiting auto-restart,
+keeps the socket bound. `Also=` in each service's `[Install]` makes
+`enable`/`disable` cover its socket.
 
 | Command | Effect |
 |---|---|
-| `systemctl --user restart fused-memory` | Unchanged — restarts the process; the port never closes. |
-| `systemctl --user stop fused-memory` | Stops the process but **the port stays listening**, and the next connection (any orchestrator, the watchdog's `/alive` probe) starts it again. |
-| `systemctl --user stop fused-memory.socket fused-memory` | Actually takes fused-memory down; stopping the socket stops the service too. |
+| `systemctl --user restart <service>` | Restarts the process; the port never closes. |
+| `systemctl --user stop <service>` / `disable --now <service>` | Stops the process **and** its socket; the port closes. |
+| a crash under `Restart=on-failure` | The port stays bound; clients queue until the automatic restart. |
 
-Installing on a host that predates it: `scripts/setup-host.sh` section 4
-installs and enables the socket. By hand: copy `scripts/fused-memory.socket.template`
-to `~/.config/systemd/user/fused-memory.socket`, re-render the service unit (it now carries
-`Requires=`/`After=fused-memory.socket`), `systemctl --user daemon-reload`,
-`systemctl --user enable fused-memory.socket`, then
-`systemctl --user stop fused-memory` **before**
-`systemctl --user start fused-memory.socket fused-memory` — the old process
-binds 8002 itself, so the socket cannot bind until it exits.
+The watchdog revives with `reset-failed` + `restart --no-block` (never
+`stop`, which would close the port), and treats an enabled unit whose port
+listens but whose `ActiveState` is `inactive`/`failed` as dead — under socket
+activation a listening port no longer proves the process is alive.
+
+Migrating a host: run `scripts/setup-host.sh`, or install the units by hand
+and `systemctl --user daemon-reload` + `enable` the sockets. The next
+`systemctl --user restart` of each service completes the switch — systemd
+orders the old process's stop before the socket's start, so the socket binds
+the port the old process just released.
 
 ### fused-memory liveness revive
 
@@ -1438,12 +1467,14 @@ and a revive rate cap — described below.
 
 **The verdict** comes from
 `scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
-classifies fm three ways: `port-down` (the port probe fails — under socket
-activation the probe sees systemd's socket, so this now means
-`fused-memory.socket` itself is down; a dead process behind a live socket
-is restarted by the next connection instead), `healthy` (the zero-I/O `/alive` route
-answers within 15s), or `wedged` (the port is up but `/alive` does not
-answer — the asyncio loop is hung). `/health` is deliberately not
+classifies fm three ways: `port-down` (the port probe fails), `healthy`
+(the zero-I/O `/alive` route answers within 15s), or `wedged` (the port is
+up but `/alive` does not answer — the asyncio loop is hung). Under socket
+activation `port-down` does **not** mean the process is gone: the probe sees
+`fused-memory.socket`, which stays bound through a restart or a crash awaiting
+auto-restart and closes only on a deliberate stop or disable. A dead process
+behind a live socket is restarted by the next connection, and one that does
+not answer in time reads as `wedged`. `/health` is deliberately not
 consulted for the verdict: it awaits two sequential backing-store
 round-trips, which would make a slow FalkorDB/Qdrant read as a wedge and
 get the shared MCP server restarted for nothing. `/health` is still the

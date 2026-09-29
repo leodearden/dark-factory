@@ -336,7 +336,7 @@ fi
 # ---------------------------------------------------------------------------
 # The install is gated PER UNIT (task 4198). Each unit is judged on its own
 # parity verdict, so a finding on one no longer declines the install of all
-# nine. The POLICY is unchanged and still ratified — a unit that did not clear
+# sixteen. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
@@ -362,6 +362,18 @@ fi
 #     reinstall or re-enable the supervision safety net. On 2026-08-10 that
 #     left the fleet 31.8h stale. It now blocks reify alone, and a plain
 #     `bash scripts/setup-host.sh` is the natural repair path for the pair.
+#   - orchestrator-<project>.socket, one per project above (holds that
+#     project's escalation MCP port across a restart — Claude Code's HTTP MCP
+#     client gives up for good after ~15s of refused connections, and an
+#     orchestrator restart takes up to ~97s). Committed as
+#     scripts/orchestrator-<project>.socket.template ONLY because `.socket` is
+#     not in the shared lock-charter extension allowlist — there are no
+#     placeholders, and `_orch_unit_source` below is the one place that maps
+#     the installed name back to that template. This section never starts,
+#     stops or restarts anything: a later `systemctl restart` of the service
+#     migrates it onto its socket, because the service carries
+#     `Wants=`/`After=` on the socket and systemd orders the service's stop
+#     before the socket's start.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
 # the running host into the repo, i.e. committed-follows-installed. BOTH have
@@ -425,7 +437,7 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and two of the nine registered units carry a
+# sections below still run, and two of the sixteen registered units carry a
 # standing, deliberate finding on this host — re-measured 2026-09-05, see the
 # checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
 # instead. A bare warning would not be an intervention point
@@ -505,7 +517,30 @@ _orch_units=(
   orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
   orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
+  orchestrator-dark-factory.socket               # holds escalation port 8102 across a restart (socket activation)
+  orchestrator-reify.socket                      # holds escalation port 8100 across a restart
+  orchestrator-autopilot-video.socket            # holds escalation port 8101 across a restart
+  orchestrator-my-solar-challenge.socket         # holds escalation port 8106 across a restart
+  orchestrator-solar-challenge-platform.socket   # holds escalation port 8107 across a restart
+  orchestrator-know-live.socket                  # holds escalation port 8105 across a restart
+  orchestrator-pump-web-ui.socket                # holds escalation port 8108 across a restart
 )
+
+# `.socket` is not in the shared lock-charter extension allowlist, so each
+# socket unit's committed source lives one basename over, as `<name>.template`
+# (scripts/orchestrator-dark-factory.socket.template, etc.) — the templates
+# carry no placeholders; the suffix is only what the charter forced. This is
+# the ONE place a unit name becomes a repo-relative path to read FROM, used by
+# the existence test, the `cp`, the `[Install]` grep and the failed-copy
+# warning below. It answers only "where do I read this unit's committed bytes
+# from" — the INSTALLED name is unaffected and always `$_unit` itself, so a
+# `.socket`'s installed copy is never named `.socket.template`.
+_orch_unit_source() {
+  case "$1" in
+  *.socket) printf 'scripts/%s.template' "$1" ;;
+  *)        printf 'scripts/%s' "$1" ;;
+  esac
+}
 
 # 1 => the run as a WHOLE reported something unverifiable. Still used for the
 # operator-facing summary below; the install decision itself is per-unit.
@@ -689,7 +724,7 @@ for _unit in "${_orch_units[@]}"; do
   # still be uncopyable (mode 000, or an installed copy this user cannot
   # overwrite). That half is caught by the install loop's own failure handling
   # below rather than by a pre-flight test, because only the copy itself knows.
-  if [ ! -f "$REPO_ROOT/scripts/$_unit" ]; then
+  if [ ! -f "$REPO_ROOT/$(_orch_unit_source "$_unit")" ]; then
     warn "SKIPPING $_unit — $(_orch_skip_reason vanished "$_unit"); its installed copy is UNCHANGED"
     continue
   fi
@@ -730,10 +765,10 @@ else
   # nor counted in the success line below.
   _orch_installed_units=()
   for _unit in "${_orch_install_units[@]}"; do
-    if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then
+    if cp "$REPO_ROOT/$(_orch_unit_source "$_unit")" "$UNIT_DIR/$_unit"; then
       _orch_installed_units+=("$_unit")
     else
-      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/scripts/$_unit and $UNIT_DIR/$_unit"
+      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/$(_orch_unit_source "$_unit") and $UNIT_DIR/$_unit"
     fi
   done
 
@@ -760,14 +795,14 @@ else
   # This is the same rule tests/scripts/test_orchestrator_service_files.py's
   # _unit_has_install_section predicate expresses in Python.
   for _unit in "${_orch_installed_units[@]}"; do
-    if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
+    if grep -q '^\[Install\]' "$REPO_ROOT/$(_orch_unit_source "$_unit")"; then
       systemctl --user enable "$_unit"
     fi
   done
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all nine" on a run that installed one. Counted from the
+  # line would read as "all sixteen" on a run that installed one. Counted from the
   # units that COPIED, so a failed `cp` is never reported as an install.
   if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
     warn "NO orchestrator unit was installed — every copy that cleared the gate"
