@@ -1509,6 +1509,16 @@ forward from an earlier write never poses as a fresh verification. Never
 write them yourself. The response reports the gate's counts under
 `enumeration_liveness` whenever it checked anything.
 
+**Updates must overwrite.** A recon-stage `update_task` that carries a Mem0
+enumeration must use `metadata_mode='merge'` (the default when both flags
+are omitted) or `'replace'`. Under the additive merge (`append=True` or
+`metadata_mode='additive'`) the backend unions lists and keeps the stored
+value on a scalar collision, so the gate's drops and its stamp would not
+persist; such an update is rejected with `EnumerationUpdateNotOverwriting`.
+Additive writes that carry no enumeration are unaffected — a `memory_hints`
+attach, or an append to a non-memory id list. Send an enumeration and a
+`memory_hints` attach as two separate updates.
+
 **Fragments.** A UUID-prefix fragment such as `21f78de1`, as a metadata
 list element at any depth, is rejected when filing
 (`EnumeratedIdTruncated`) and recorded as a `truncated` exception when
