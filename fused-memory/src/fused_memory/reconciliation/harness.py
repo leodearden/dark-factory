@@ -355,6 +355,12 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     A legacy ``affected_ids`` field takes precedence when present, so cross-run
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
+
+    The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
+    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
+    are.  Guarded by
+    ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
+    (task-4772 section).
     """
     legacy = finding.get('affected_ids')
     if legacy:
