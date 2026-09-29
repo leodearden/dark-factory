@@ -102,6 +102,8 @@ Modules touched: <list>
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
 ```
 
+Only a task in the PRD's decomposition plan carries a `prd_task_label`, and it is that plan's own label, verbatim; a task filed against the PRD from outside the plan (an out-of-batch dependent, a later follow-up) keeps `prd_path` and sets no `prd_task_label` — never an invented one — because Step 5.5 binds only labels the sidecar declares.
+
 If `submit_task` itself times out (no `task_id` returned), **don't retry**; poll `get_task` (by title, or by IDs above your last known one) to see whether the write landed asynchronously. Re-submitting on timeout risks double-filing — the curator-dedupe path is not active in planning_mode.
 
 ### Step 4 — Wire ALL dependencies (still deferred)

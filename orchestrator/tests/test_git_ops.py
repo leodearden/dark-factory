@@ -1,14 +1,16 @@
 """Tests for git operations — worktree lifecycle."""
 
+import ast
 import asyncio
 import contextlib
 import fcntl
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
@@ -19,7 +21,9 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 
+from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -418,6 +422,68 @@ class TestWorktreeLifecycle:
         assert worktree_info.path.exists()
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
+
+    async def test_create_worktree_self_heals_duplicate_hooks_path(
+        self, git_ops: GitOps,
+    ):
+        """create_worktree must converge core.hooksPath even when it is already
+        duplicated in the shared config (task 4570).
+
+        A plain single-value `git config core.hooksPath hooks` is REFUSED by
+        git (exit 5, "cannot overwrite multiple values with a single value")
+        once the key already holds two values — which is exactly the jammed
+        state this self-heal exists to repair. Seed that jam directly (as an
+        external/manual mutation would) and confirm create_worktree both
+        succeeds and collapses the key back to a single "hooks" value.
+        """
+        await _run(['git', 'config', 'core.hooksPath', 'hooks'], cwd=git_ops.project_root)
+        await _run(['git', 'config', '--add', 'core.hooksPath', 'echo'], cwd=git_ops.project_root)
+        rc, dup_values, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert dup_values.strip().splitlines() == ['hooks', 'echo']
+
+        worktree_info = await git_ops.create_worktree('hooks-path-jam')
+        assert worktree_info.path.exists()
+
+        rc, resolved, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert resolved.strip().splitlines() == ['hooks']
+
+    async def test_create_worktree_logs_hooks_path_set_failure(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A failed core.hooksPath write is logged, not silently discarded (4570).
+
+        --replace-all converges from the duplicated-key jam covered above, but
+        not from every failure mode — e.g. `.git/config.lock` contention with a
+        concurrent orchestrator/merge worker, or a read-only shared .git under
+        the OS-sandbox write-set. Silently discarding that rc is precisely what
+        let the exit-5 duplicate-value jam run unnoticed on every
+        worktree-create, so the write must stay best-effort (never raises) while
+        no longer being silent.
+        """
+        async def fake_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'config'] and 'core.hooksPath' in cmd:
+                return (
+                    255, '',
+                    "error: could not lock config file .git/config: File exists\n",
+                )
+            return await _run(cmd, cwd=cwd, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            worktree_info = await git_ops.create_worktree('hooks-path-set-failed')
+
+        # Best-effort: a wrong hooksPath must not block worktree create/dispatch.
+        assert worktree_info.path.exists()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('failed to set core.hooksPath' in r.getMessage() for r in warnings), (
+            f'All warnings: {[r.getMessage() for r in warnings]}'
+        )
 
     async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
         """create_worktree returns WorktreeInfo with path and base_commit."""
@@ -4109,8 +4175,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The trailing ' into ' literal in the --fixed-strings --grep pattern
-        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
+        A marker's subject must EQUAL 'Merge task/1 into main', which
+        'Merge task/10 into main' does not.
         """
         # Merge task/10 and delete branch
         tid = '10'
@@ -4168,7 +4234,7 @@ class TestFindMergeMarker:
         so a git-log invocation with conflicting --max-count=1 and -n 5000 flags would
         return both SHAs newline-joined (last-wins: -n 5000 overrides --max-count=1),
         corrupting done_provenance={'commit': marker_sha} in harness reconcile.
-        After dropping -n 5000, --max-count=1 alone ensures a single SHA is returned.
+        The newest marker must win, as a single SHA.
         """
         tid = 'reopened-1'
 
@@ -4217,7 +4283,7 @@ class TestFindMergeMarker:
         assert marker_sha is not None
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
-        assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+        assert marker_sha == second_sha  # most-recent first (git log is newest-first)
 
 
 @pytest.mark.asyncio
@@ -4246,23 +4312,6 @@ class TestMergeMarkerIndex:
 
         assert await git_ops.find_merge_marker('task/absent') is None
         assert await git_ops._scan_merge_marker('task/absent') is None
-
-    async def test_marker_in_commit_BODY_is_found(self, git_ops: GitOps):
-        """A marker in the body, not the subject, must still be found.
-
-        ``git log --grep`` matches anywhere in the commit message, so the index
-        reads ``%B`` rather than ``%s``.  Measured on dark-factory's own main:
-        19 of 62,950 commits carry a marker only in the body, so a subject-only
-        index would silently change those verdicts.
-        """
-        repo = git_ops.project_root
-        marker = _merge_subject('task/body-only', git_ops.config.main_branch)
-        message = f'chore: record a landing\n\n{marker}\n'
-        sha = await _seed_on_main(repo, {'body.txt': 'x\n'}, message)
-
-        assert await git_ops.find_merge_marker('task/body-only') == sha
-        # Equivalence with the path it replaced.
-        assert await git_ops._scan_merge_marker('task/body-only') == sha
 
     async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
         """A hand-written ``Merge task/x: ...`` subject is not a marker.
@@ -4378,6 +4427,97 @@ class TestMergeMarkerIndex:
 
         assert match is not None
         assert match.group(1) == 'task/derived'
+
+
+async def _quote_marker_in_body(repo: Path, marker: str) -> None:
+    await _seed_on_main(
+        repo, {'notes.md': 'x\n'},
+        f'docs: explain markers\n\nQuoting {marker} verbatim.\n',
+    )
+
+
+async def _body_quote_only(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 4104 shape: e79f9b1094 quotes a marker in prose; nothing landed."""
+    await _quote_marker_in_body(repo, marker)
+    return None
+
+
+async def _body_quote_newer_than_true_merge(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """Task 4181 shape: d0d67f0c53 quotes the marker after the real merge landed."""
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    await _quote_marker_in_body(repo, marker)
+    return merge
+
+
+async def _revert_of_true_merge(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
+    assert_isolated_git_repo(repo)
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    rc, _, err = await _run(
+        ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
+    )
+    assert rc == 0, f'revert failed: {err}'
+    return merge
+
+
+async def _suffixed_subject(repo: Path, task_id: str, marker: str) -> str | None:
+    """ce78ad8546 shape: '<marker>: extra words' is a longer subject."""
+    await _seed_on_main(repo, {'suffixed.txt': 'x\n'}, f'{marker}: extra words')
+    return None
+
+
+async def _single_parent_exact_subject(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """task/176 shape: ba1bba2611 is a real marker with a single parent."""
+    return await _seed_on_main(repo, {'single.txt': 'x\n'}, marker)
+
+
+async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str | None:
+    """git's %s joins a wrapped first paragraph back into the marker."""
+    wrapped = marker.replace(' into ', '\ninto ', 1)
+    return await _seed_on_main(repo, {'wrapped.txt': 'x\n'}, wrapped)
+
+
+@pytest.mark.asyncio
+class TestMergeMarkerIsExactSubject:
+    """A marker is a commit whose git subject (``%s``) equals
+    ``_merge_subject(branch, main_branch)``; the body and the parent count are
+    never consulted (task 5765).
+    """
+
+    @pytest.mark.parametrize(
+        'build',
+        [
+            pytest.param(_body_quote_only, id='body_quote_only'),
+            pytest.param(
+                _body_quote_newer_than_true_merge,
+                id='body_quote_newer_than_true_merge',
+            ),
+            pytest.param(_revert_of_true_merge, id='revert_of_true_merge'),
+            pytest.param(_suffixed_subject, id='suffixed_subject'),
+            pytest.param(
+                _single_parent_exact_subject, id='single_parent_exact_subject',
+            ),
+            pytest.param(_wrapped_first_paragraph, id='wrapped_first_paragraph'),
+        ],
+    )
+    async def test_marker_is_the_commit_whose_subject_is_exactly_the_merge_subject(
+        self,
+        git_ops: GitOps,
+        build: Callable[[Path, str, str], Awaitable[str | None]],
+    ):
+        repo = git_ops.project_root
+        task_id = '5765'
+        branch = f'task/{task_id}'
+        marker = _merge_subject(branch, git_ops.config.main_branch)
+
+        expected = await build(repo, task_id, marker)
+
+        assert await git_ops.find_merge_marker(branch, gate_on_existing_ref=False) == expected
+        assert await git_ops._scan_merge_marker(branch) == expected
 
 
 @pytest.mark.asyncio
@@ -13959,6 +14099,197 @@ class TestDisableSharedRepoAutoMaintenance:
 
 
 # ---------------------------------------------------------------------------
+# task 3778 step-3: _run delegates its spawn to shared.git_async (INV-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunDelegatesToSharedGitAsync:
+    """``_run`` owns the WorktreeMissing taxonomy; ``shared.git_async`` owns the spawn.
+
+    The primitive (``create_subprocess_exec`` + LC_ALL=C child env + optional
+    stdin + the task-2608 kill+reap) grew here and is now needed verbatim by
+    fused-memory's live-workflow probes.  Rather than clone it (INV-5,
+    no-lockstep-duplication) it moved to ``shared/`` and ``_run`` became a thin
+    adapter.  What must NOT change is ``_run``'s own surface: the
+    ``WorktreeMissing`` pre-flight and re-classification, and the
+    ``(returncode, stdout, stderr)`` 3-tuple that git_ops' ~12k lines of call
+    sites destructure.
+    """
+
+    async def test_shared_helper_is_the_single_spawn_seam(self, tmp_path: Path) -> None:
+        """Patching the shared entry point AS BOUND IN git_ops intercepts _run.
+
+        Bare-name binding (``from shared.git_async import run_git``) is what
+        makes ``git_ops.run_git`` the patchable seam; a qualified
+        ``shared.git_async.run_git(...)`` call would leave this patch applying
+        cleanly but no longer intercepting.
+        """
+        sentinel = GitResult(returncode=7, stdout='intercepted', stderr='se')
+        with patch('orchestrator.git_ops.run_git', return_value=sentinel) as spawn:
+            rc, out, err = await _run(['git', 'status'], cwd=tmp_path)
+
+        assert spawn.await_count == 1, 'the spawn did not route through shared.git_async'
+        assert (rc, out, err) == (7, 'intercepted', 'se')
+
+    async def test_returns_the_same_three_tuple_shape(self, tmp_path: Path) -> None:
+        """Not the new GitResult dataclass — no call site changes."""
+        result = await _run(['git', 'init', '-q'], cwd=tmp_path)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        rc, out, err = result
+        assert isinstance(rc, int)
+        assert isinstance(out, str)
+        assert isinstance(err, str)
+        assert rc == 0
+
+    async def test_cwd_vanishing_between_preflight_and_spawn_is_reclassified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The race the pre-flight alone cannot catch.
+
+        cwd exists when ``_run`` checks it and is gone by the time the child is
+        spawned.  The helper surfaces a plain ``FileNotFoundError``; ``_run``
+        must re-classify it as :class:`WorktreeMissing` so callers still see a
+        deleted worktree as the recoverable race it is.
+        """
+        doomed = tmp_path / 'doomed'
+        doomed.mkdir()
+
+        async def _vanish_then_fail(*args, **kwargs):
+            shutil.rmtree(doomed)
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_vanish_then_fail),
+            pytest.raises(WorktreeMissing) as exc,
+        ):
+            await _run(['git', 'status'], cwd=doomed)
+
+        assert exc.value.path == doomed
+
+    async def test_filenotfound_with_live_cwd_propagates_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing BINARY is a real bug, not a vanished worktree."""
+
+        async def _boom(*args, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_boom),
+            pytest.raises(FileNotFoundError) as exc,
+        ):
+            await _run(['git', 'status'], cwd=tmp_path)
+
+        assert not isinstance(exc.value, WorktreeMissing)
+
+    async def test_a_long_running_script_cannot_delay_a_concurrent_git_call(
+        self,
+    ) -> None:
+        """``_run`` opts OUT of the shared per-loop spawn bound.
+
+        ``run_git``'s ``MAX_CONCURRENT_SPAWNS`` bound is sized for
+        fused-memory's live-workflow fan-out (hundreds of short-lived git
+        probes).  ``_run`` is the orchestrator's GENERAL subprocess runner:
+        ``delivered_checks`` puts operator-supplied script checks through it
+        and gathers them concurrently, ``merge_skew_tripwire`` runs its oracle
+        through it, and it also runs every merge-lane and scheduler git call.
+        If those shared one 8-slot queue, a handful of slow or abandoned
+        scripts would head-of-line block the merge lane.
+
+        Causal, not wall-clock: the fake children stay alive until an Event
+        this test controls, so the git call can only have spawned by NOT
+        having queued behind them.
+        """
+        released = asyncio.Event()
+        spawned: list[str] = []
+
+        class _Blocking:
+            returncode = 0
+
+            def __init__(self, tag: str) -> None:
+                self._tag = tag
+
+            async def communicate(self, input: bytes | None = None):  # noqa: A002
+                spawned.append(self._tag)
+                await released.wait()
+                return b'', b''
+
+            def kill(self) -> None:
+                return None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def _fake_spawn(*args: object, **kwargs: object) -> object:
+            return _Blocking('git' if args and args[0] == 'git' else 'script')
+
+        # Comfortably more scripts than the shared bound, so a bound that
+        # applied here would certainly be saturated.
+        script_count = MAX_CONCURRENT_SPAWNS * 2
+
+        with patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+            scripts = [
+                asyncio.create_task(_run(['sh', '-c', 'sleep forever']))
+                for _ in range(script_count)
+            ]
+            git_call = asyncio.create_task(_run(['git', 'rev-parse', 'HEAD']))
+            try:
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while (
+                    'git' not in spawned
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+
+                assert spawned.count('script') == script_count, (
+                    'script checks queued on a spawn bound _run must not have'
+                )
+                assert 'git' in spawned, (
+                    'the git call never spawned: _run is queueing behind '
+                    'long-running script children (it must pass bounded=False)'
+                )
+            finally:
+                released.set()
+                await asyncio.wait_for(
+                    asyncio.gather(git_call, *scripts, return_exceptions=True),
+                    timeout=5,
+                )
+
+class TestGitOpsHoldsNoSecondSpawnPrimitive:
+    """Source-level guard against a REGROWN duplicate of the spawn primitive.
+
+    A source scan rather than a behavioural assertion because the failure mode
+    is additive: a future edit that reintroduces a second
+    ``create_subprocess_exec`` into git_ops would leave every behavioural test
+    in the sibling class green while the two copies silently drift apart.
+
+    AST-based, not a substring scan: ``WorktreeMissing``'s docstring
+    legitimately NAMES ``asyncio.create_subprocess_exec`` when explaining where
+    the generic ``FileNotFoundError`` comes from, and prose should not be
+    collateral damage of a guard aimed at calls.
+    """
+
+    def test_git_ops_makes_no_direct_create_subprocess_exec_call(self) -> None:
+        source = Path(git_ops_module.__file__).read_text()
+        tree = ast.parse(source)
+
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'create_subprocess_exec'
+        ]
+
+        assert offenders == [], (
+            f'git_ops calls create_subprocess_exec directly at line(s) {offenders}; '
+            'it must delegate its spawn to shared.git_async instead of keeping a '
+            'second copy of the primitive (INV-5 no-lockstep-duplication)'
+        )
+
 # task 3060: advance_main stands off from a FOREIGN project_root index.lock
 # ---------------------------------------------------------------------------
 

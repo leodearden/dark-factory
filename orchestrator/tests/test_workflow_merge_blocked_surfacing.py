@@ -24,6 +24,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from _merge_lane_fakes import drive_merge
+
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -121,20 +123,22 @@ class TestGenericMergeBlockedSurfacing:
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
         workflow._write_merge_failure_review = MagicMock()
 
-        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
-            request.result.set_result(generic_outcome)
+        # A REAL queue, so the REAL enqueue path runs and the blocked outcome
+        # this test surfaces is delivered to the request the production code
+        # actually enqueued. Nothing drains the queue, so the test plays the
+        # merger: take the request off, resolve it, let the submit finish.
+        queue: asyncio.Queue = asyncio.Queue()
+        workflow.merge_queue = queue
 
-        workflow.merge_queue = asyncio.Queue()
-        with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
-        ):
-            result = asyncio.run(
-                workflow._submit_to_merge_queue(
-                    'task/42', pre_rebased=False, merge_phase=True,
-                )
-            )
+        driven = asyncio.run(drive_merge(
+            workflow._submit_to_merge_queue(
+                'task/42', pre_rebased=False, merge_phase=True,
+            ),
+            queue,
+            generic_outcome,
+        ))
 
-        assert result == WorkflowOutcome.BLOCKED
+        assert driven.result == WorkflowOutcome.BLOCKED
 
         # (a) exactly one merge_blocked row, carrying reason/category/failure_category.
         rows = store.fetch_events_by_type(EventType.merge_blocked)

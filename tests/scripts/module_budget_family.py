@@ -50,6 +50,7 @@ as authoritative.
 from __future__ import annotations
 
 import ast
+import math
 import pathlib
 from collections.abc import Iterable, Iterator
 from typing import Any, NamedTuple
@@ -157,6 +158,49 @@ def min_budget(worst: float) -> int:
     worst_run``'s non-degeneracy assertion.
     """
     return (int(2 * worst) // 100) * 100
+
+
+def census_budget_floor(worst: float) -> int:
+    """1.5x the census-measured worst run, rounded UP to the nearest 100s.
+
+    ORIGIN: ruling D17 (Leo, 2026-09-14), task 3353 scope D'. THE canonical
+    spelling of that derivation — the budget census
+    (``scripts/verify_budget_census.py``) imports this rather than re-spelling
+    ``1.5 * max``, so the report an operator runs and the gate that holds a
+    budget up cannot drift apart.
+
+    WHY 1.5 AND NOT ``min_budget``'s 2. D17 rejected the 2x multiple for the
+    orchestrator module specifically: against a still-growing unsharded suite,
+    2x a worst run is a moving target that ratchets the budget upward every
+    time the suite gets slower, so the floor chases the regression instead of
+    bounding it. The replacement is a tighter multiple over a SHORTER,
+    REGIME-SCOPED window — a different trade, not a weakening. The 2x-over-
+    all-time form buys more headroom from a figure that may be a year old and
+    from a configuration that no longer exists; this buys less headroom from a
+    dated distribution under the PREVAILING config. Which is stronger depends
+    on which failure you are guarding against, and D17 names the one that
+    matters here: a budget in the band where green runs already land.
+
+    WHY IT ROUNDS UP WHERE ``min_budget`` ROUNDS DOWN. This floor is derived
+    from a measured TAIL, and truncating it would put the floor BELOW the very
+    run it was derived from — e.g. a 4667s worst would truncate to 7000 when
+    1.5x is 7000.5. ``min_budget`` rounds down because it is an "at least
+    roughly 2x" sanity check whose slack absorbs the truncation; there is no
+    slack here by construction. ``census_budget_floor(w) > w`` for every
+    positive w, which ``min_budget`` does not guarantee (it degenerates to 0
+    below 50s).
+
+    DELIBERATELY NOT ADDED to ``HELPER_NAME`` or the canonical-expression
+    guard's evaluation namespace. That namespace holds only ``min_budget`` and
+    the published worst, without ``__builtins__``, precisely so a re-spelled
+    derivation raises ``NameError`` there. Putting a SECOND callable in it
+    would let a publisher's ``MIN_MODULE_BUDGET_SECS`` silently switch
+    derivations and still evaluate green — the exact drift that namespace
+    exists to catch. This function has one consumer pair (the census report and
+    ``test_module_verify_budgets``' excepted branch) and is imported by name at
+    both.
+    """
+    return math.ceil(1.5 * worst / 100) * 100
 
 
 class PublishedPair(NamedTuple):

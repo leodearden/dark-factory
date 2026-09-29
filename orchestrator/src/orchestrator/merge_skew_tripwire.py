@@ -24,6 +24,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from shared.asyncio_tasks import abandon_task
+
 logger = logging.getLogger(__name__)
 
 # Mirrors GitConfig.load_bearing_oracle_timeout_secs' default (config.py) —
@@ -46,21 +48,10 @@ class TripwireHit:
     overlap_files: tuple[str, ...]
 
 
-# The event loop holds only a WEAK reference to a Task, so an
-# otherwise-unreferenced one can be garbage-collected mid-flight; membership
-# in this set is what supplies the strong reference until the task ends.
-#
-# Mirrors the sibling ``_ABANDONED_PROBES`` / ``_abandon_probe`` registry in
-# dashboard/src/dashboard/app.py (task 4089). This module does NOT call that
-# package's ``track_task`` helper (dashboard/src/dashboard/data/db.py) —
-# orchestrator has no dependency edge onto the leaf dashboard UI package, and
-# ``_log_abandoned_oracle_cleanup`` below already does everything
-# ``track_task``'s ``_release`` does (consumes the task's exception) plus
-# DEBUG diagnostics it doesn't, so only the strong reference was missing
-# here. This is now the THIRD near-identical copy of this pattern (the other
-# two live in dashboard/); a follow-up (fused-memory ticket
-# tkt_0RSP5RCWJGY202HZ0ZA0QRYCHE, dark_factory project) tracks consolidating
-# it into shared/.
+# Strong references to abandoned load-bearing-oracle tasks, held until they
+# unwind (why: shared/src/shared/asyncio_tasks.py::abandon_task). Module-local
+# rather than shared because _abandon_oracle's backlog WARNING must count
+# oracle tasks alone, and the tests drain it independently of other packages.
 _ABANDONED_ORACLES: set[asyncio.Task] = set()
 
 # A handful of concurrently-abandoned oracles is already unusual — at most
@@ -72,15 +63,13 @@ _ABANDONED_ORACLES_WARN_THRESHOLD = 8
 
 
 def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
-    """Done-callback for a load-bearing-oracle task abandoned after an
-    exceptional exit from ``_run_load_bearing_oracle``'s wait — a timeout or
-    the caller being cancelled (see ``_run_load_bearing_oracle`` and
-    ``_abandon_oracle``) — releases the strong reference held in
-    ``_ABANDONED_ORACLES``, retrieves the task's result/exception so a
-    background cleanup failure never surfaces as an "exception was never
-    retrieved" warning, and logs at DEBUG for diagnostics. Never raises.
+    """``on_done`` hook for a load-bearing-oracle task abandoned by
+    :func:`_abandon_oracle` after an exceptional exit from
+    ``_run_load_bearing_oracle``'s wait — a timeout or the caller being
+    cancelled. Only logs, at DEBUG, how the task ended; releasing the strong
+    reference and consuming the exception belong to
+    ``shared/src/shared/asyncio_tasks.py::track_task``. Never raises.
     """
-    _ABANDONED_ORACLES.discard(task)
     try:
         if task.cancelled():
             logger.debug('_run_load_bearing_oracle: abandoned oracle task finished cancelling')
@@ -100,8 +89,8 @@ def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
 def _abandon_oracle(task: asyncio.Task) -> None:
     """Cancel *task* fire-and-forget and hold a strong reference until it ends.
 
-    Mirrors ``_abandon_probe`` in dashboard/src/dashboard/app.py (task
-    4089) — the landed sibling fix for the same defect class.
+    Delegates to ``shared/src/shared/asyncio_tasks.py::abandon_task``, with
+    :func:`_log_abandoned_oracle_cleanup` as the ``on_done`` hook.
 
     Also logs a WARNING naming the registry size once it exceeds
     :data:`_ABANDONED_ORACLES_WARN_THRESHOLD`: the per-call WARNING already
@@ -109,9 +98,7 @@ def _abandon_oracle(task: asyncio.Task) -> None:
     hiccup, so a persistent pile-up would otherwise stay invisible until
     something else notices the memory.
     """
-    task.cancel()  # fire-and-forget — do NOT await the unwinding
-    _ABANDONED_ORACLES.add(task)
-    task.add_done_callback(_log_abandoned_oracle_cleanup)
+    abandon_task(task, _ABANDONED_ORACLES, on_done=_log_abandoned_oracle_cleanup)
     backlog = len(_ABANDONED_ORACLES)
     if backlog > _ABANDONED_ORACLES_WARN_THRESHOLD:
         logger.warning(

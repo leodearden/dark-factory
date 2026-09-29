@@ -86,9 +86,9 @@ UPDATED 2026-08-27 (task 4793). This paragraph used to continue: "That
 destructive path — a `sed` re-render or a setup-host.sh re-run — is exactly
 what this module's _REMEDIATION warns against." The re-render is no longer
 destructive. setup-host.sh section 8 now installs this unit through
-scripts/render_dashboard_unit.py, which reads the ALREADY-INSTALLED unit's
+scripts/render_systemd_unit.py, which reads the ALREADY-INSTALLED unit's
 host-local Environment= values and puts them back
-(render_dashboard_unit.HOST_LOCAL_ENVIRONMENT), so a re-run preserves the nine
+(render_systemd_unit.HOST_LOCAL_ENVIRONMENT), so a re-run preserves the nine
 roots instead of collapsing them to one. _REMEDIATION below is rewritten
 accordingly. What is unchanged is the argument in the paragraph above: BYTE
 parity is still the wrong invariant for this module, because the divergence is
@@ -210,7 +210,7 @@ UNIT_BASENAME = "dark-factory-dashboard.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
 
 # The committed template the installed copy is rendered FROM by
-# scripts/render_dashboard_unit.py (`__REPO_ROOT__` / `__UV_PATH__` placeholder
+# scripts/render_systemd_unit.py (`__REPO_ROOT__` / `__UV_PATH__` placeholder
 # substitution, invoked by setup-host.sh section 8) — NOT a plain
 # `cp`, which is why this is a differently-named `.template` file rather
 # than `parents[2]/"scripts"/UNIT_BASENAME` as in the orchestrator-*.service
@@ -237,7 +237,7 @@ _NO_CAP_SENTINEL = "infinity"
 # Remediation for either layer below. TWO routes now, where there used to be
 # one — task 4793 removed the hazard that made the surgical edit the only safe
 # option. setup-host.sh section 8 installs this unit through
-# scripts/render_dashboard_unit.py, which reads the installed unit's host-local
+# scripts/render_systemd_unit.py, which reads the installed unit's host-local
 # Environment= values and puts them back, so a re-run no longer strips this
 # host's extra DASHBOARD_KNOWN_PROJECT_ROOTS entries. It is the SANCTIONED path
 # and it is what check_dashboard_unit_parity.py's own drift report tells the

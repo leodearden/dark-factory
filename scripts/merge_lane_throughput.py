@@ -375,6 +375,24 @@ def _last_before(
     return best
 
 
+def _any_between(
+    events: Sequence[dict[str, Any]], lo: datetime, hi: datetime
+) -> bool:
+    """True when any event's timestamp falls STRICTLY between *lo* and *hi*.
+
+    Both ends are open on purpose.  An event stamped exactly at *lo* is the
+    boundary event itself (the speculation the interval was opened from), and
+    one stamped exactly at *hi* is simultaneous with the landing rather than
+    before it — neither is evidence of something happening in between.  A row
+    with an unparseable timestamp is skipped, matching :func:`_last_before`.
+    """
+    for event in events:
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is not None and lo < ts < hi:
+            return True
+    return False
+
+
 def _first_at_or_after(
     events: Sequence[dict[str, Any]], cutoff: datetime
 ) -> tuple[datetime, dict[str, Any]] | None:
@@ -830,13 +848,93 @@ def compute_speculation(
     ``speculative`` truthy — reported as ``matched``/``total`` as well as a
     share, because the share alone hides how thin the denominator can be.
 
+    TWO AHEAD MEASURES LIVE SIDE BY SIDE, and which one a caller wants is not
+    a matter of taste.  ``speculative_ahead`` is LOOSE: it credits a landing
+    for a speculation that was subsequently VOIDED, i.e. thrown away before it
+    could shorten anything.  That over-counts precisely in the project whose
+    voids dominate, so comparing two projects on the loose measure compares
+    partly on how often each one wasted work.  ``speculative_ahead_adopted``
+    is STRICT: a landing counts only when no CHAIN-DEAD `verdict_voided` row
+    for that task falls strictly between its LAST preceding speculation and
+    the landing.  The window opens at the LAST preceding speculation, not the
+    first, because a task that is voided and then re-speculated did have live
+    speculation running ahead of the landing that actually happened.  The
+    disqualifying rows are the ``chain_dead``-filtered list, the SAME one the
+    void rate is computed over, so the filter discipline stated above holds
+    across the whole function: a new void reason shows up as a shrinking void
+    numerator and CANNOT silently shrink the adopted share, where the drop
+    would have read as "speculation helped less" with nothing on the surface
+    to say otherwise.
+
+    The loose key is KEPT, not redefined, even though it is the one that
+    disagrees with the throughput PRD's § Background rows: its printed line
+    and ``--json`` shape are the landed contract that the before/after
+    measurement reports compare against, and silently swapping in a different
+    definition would move their baseline underneath them.  Naming the artifact
+    is the point; hiding it is not.  DATED PROVENANCE, not a live assertion:
+    over 2026-08-04T16:10Z..2026-09-03T16:10Z the two measures read 351/507
+    loose vs 255/507 strict for dark_factory, and 191/323 vs 84/323 for reify
+    — the strict measure moves reify roughly three times as far, which is the
+    spread the loose measure was concealing.
+
+    VOID ANATOMY = what a chain-dead void actually COST, which is the number
+    the void rate alone gets wrong.  A void is ``verify_burned`` only when a
+    SPECULATIVE `merge_verify` row for the same task ran strictly between that
+    item's last preceding `speculative_merge` and the void — the same
+    ``data['speculative']`` filter the loose ahead measure applies, and for the
+    same reason: the join key is the task COLUMN and not a request id (see
+    :func:`_by_task`), so an unfiltered interval search would book a post-merge
+    verify, or a `_reverify_rebased_tree` gate verify for an EARLIER attempt on
+    that same task, as a burned speculative verify.  That error runs
+    INFLATIONARY and lands straight in the arm whose becoming non-zero is the
+    signal to revisit this whole reading, so it is filtered at the source
+    rather than caveated downstream.  Every other chain-dead void is
+    ``pre_verify`` — except one that cannot be classified at all (unparseable
+    timestamp, NULL task_id), which is tallied under ``unclassifiable``.  The
+    THREE arms partition ``n_voided_chain_dead`` by construction.  The third
+    arm exists so ``pre_verify`` stays a genuine count of cheap-arm voids
+    instead of doubling as the bucket for malformed rows: folding them in
+    would bias the split toward this module's own conclusion (that the voids
+    are all the cheap arm) by exactly the number of rows it failed to read.
+    The distinction is load-bearing because the two void arms
+    in `merge_queue.py::SpeculativeMergeWorker` cost completely different
+    things.  The ADOPTION arm (`merge_queue.py::SpeculativeMergeWorker._void_and_remerge`,
+    reached from `_finalize_inflight`) discards a verify that has already run
+    — expensive.  The DISPATCH arm (the INV-3 `_chain_dead_link` re-check in
+    `_dispatch_item`) fires at the TOP of dispatch, before host acquisition,
+    and its own log line reads "dead-base straggler at dispatch (dead link %s)
+    — re-merging against actual main instead of burning a verify".  So a
+    ``pre_verify`` void costs a merge-worktree build, a
+    `_cleanup_owned_merge_worktree` and a `_remerge` — plus the foregone
+    speculation — and NOT verify minutes.  Reading a high void rate as burned
+    verify capacity would aim a policy remedy at the wrong resource, which is
+    exactly what this split exists to prevent; ``verify_burned`` is the
+    expensive case, reported so that it is detected if it ever appears rather
+    than assumed away.
+
+    DEAD-LINK FAN-OUT answers the other question a void rate hides: whether
+    voids are independent stragglers or one dead base cascading into many.
+    ``dead_link_distinct`` is the number of distinct ``data['dead_link']``
+    SHAs and ``dead_link_max_voids`` the most voids attributable to any single
+    one, so a fan-out near 1.0 rules out cascade amplification and a fat one
+    would name the cascading base.  A void carrying no ``dead_link`` is
+    tallied under :data:`UNKNOWN` (reported separately as
+    ``dead_link_unknown``) — the same idiom as ``void_points`` — rather than
+    crashing or being dropped, and the sentinel bucket is EXCLUDED from both
+    fan-out numbers.  It is not a dead base: letting it ride would report N
+    rows that name no base at all as "max N voids from one base", which is
+    precisely the shape a reader takes for cascade amplification, and the
+    separate ``dead_link_unknown`` tally would only unpick it for a reader who
+    noticed the coincidence.
+
     Every rate is ``None``, never ``0.0``, when its denominator is empty:
     "nothing was speculated in this window" is not "speculation was tried and
-    never voided".
+    never voided".  ``dead_link_max_voids`` follows the same rule for the same
+    reason: "no void had a dead base" is not "the worst base killed none".
 
     Returns ``{'speculative_depth', 'verify_depth', 'void_rate',
     'n_speculative', 'n_voided_chain_dead', 'void_points',
-    'speculative_ahead'}``.
+    'speculative_ahead', 'speculative_ahead_adopted', 'void_anatomy'}``.
     """
     n_speculative = len(speculative_events)
     chain_dead = [
@@ -849,9 +947,54 @@ def compute_speculation(
 
     speculative_by_task = _by_task(speculative_events)
     verify_by_task = _by_task(verify_events)
+    # CHAIN-DEAD only, matching the void rate's filter: see the STRICT
+    # paragraph above for why a new void reason must not quietly shrink the
+    # adopted share.
+    voided_by_task = _by_task(chain_dead)
+
+    # Void anatomy: which arm fired, and how far one dead base reached.
+    verify_burned = 0
+    unclassifiable = 0
+    dead_links: Counter[str] = Counter()
+    for void in chain_dead:
+        dead_links[str(void.get('data', {}).get('dead_link') or UNKNOWN)] += 1
+        void_ts = _parse_ts(void.get('timestamp'))
+        raw_task = void.get('task_id')
+        if void_ts is None or raw_task is None:
+            # Its own arm, NOT pre_verify. This row was not read as a cheap
+            # void; it was not read at all, and silently spending it on the
+            # arm this module concludes in favour of is how a measurement
+            # starts agreeing with itself.
+            unclassifiable += 1
+            continue
+        void_task = str(raw_task)
+        speculated = _last_before(
+            speculative_by_task.get(void_task, []), void_ts
+        )
+        if speculated is None:
+            # No speculation precedes this void, so nothing could have been
+            # verified between the two. Classified, not dropped: dropping it
+            # would shrink the denominator and inflate whichever arm survived.
+            continue
+        # SPECULATIVE verifies only, mirroring the loose ahead measure below:
+        # the task-column join would otherwise let an unrelated verify for an
+        # earlier attempt on this task inflate the expensive arm.
+        speculative_verifies = [
+            e for e in verify_by_task.get(void_task, [])
+            if e.get('data', {}).get('speculative')
+        ]
+        if _any_between(speculative_verifies, speculated[0], void_ts):
+            verify_burned += 1
+    # Subtraction, not a second tally: the three arms partition the chain-dead
+    # voids by construction, so no row can fall out of all of them.
+    pre_verify = len(chain_dead) - verify_burned - unclassifiable
+    # The fan-out describes REAL dead bases; the sentinel bucket is counted
+    # beside them, never among them.
+    real_links = {k: v for k, v in dead_links.items() if k != UNKNOWN}
 
     total_landings = 0
     matched_landings = 0
+    adopted_landings = 0
     for event in finalized_events:
         if event.get('data', {}).get('state') != 'done':
             continue
@@ -870,6 +1013,17 @@ def compute_speculation(
             ahead = _last_before(speculative_verifies, finalized_ts)
         if ahead is not None:
             matched_landings += 1
+            # STRICT: the speculation must still have been live at the
+            # landing.  `_last_before` already gave us the latest speculation
+            # preceding the landing, so the disqualifying interval is exactly
+            # (that speculation, the landing) — a void outside it either
+            # predates a re-speculation or postdates the landing, and in
+            # neither case did it throw away the work that ran ahead.
+            ahead_ts = ahead[0]
+            if not _any_between(
+                voided_by_task.get(task_id, []), ahead_ts, finalized_ts
+            ):
+                adopted_landings += 1
 
     return {
         'speculative_depth': _depth_distribution(speculative_events),
@@ -882,6 +1036,19 @@ def compute_speculation(
             'matched': matched_landings,
             'total': total_landings,
             'share': matched_landings / total_landings if total_landings else None,
+        },
+        'speculative_ahead_adopted': {
+            'matched': adopted_landings,
+            'total': total_landings,
+            'share': adopted_landings / total_landings if total_landings else None,
+        },
+        'void_anatomy': {
+            'verify_burned': verify_burned,
+            'pre_verify': pre_verify,
+            'unclassifiable': unclassifiable,
+            'dead_link_distinct': len(real_links),
+            'dead_link_max_voids': max(real_links.values()) if real_links else None,
+            'dead_link_unknown': dead_links.get(UNKNOWN, 0),
         },
     }
 
@@ -1238,7 +1405,7 @@ def collect_projects(
 def void_rate_by_project(
     bundles: Sequence[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """The chain-dead void rate PER project, keyed by project root.
+    """Every cross-project speculation headline rate, keyed by project root.
 
     The cross-project view the ``--speculation`` section exists for: the rates
     are placed beside each other, never pooled into one numerator over one
@@ -1246,9 +1413,23 @@ def void_rate_by_project(
     a different one, and it erases the between-project spread that motivates
     the PRD's decomposition.
 
+    The headline a diagnosis quotes is now fully reproducible from THIS one
+    section: alongside the void rate it carries both speculative-ahead
+    measures (loose and strict — see :func:`compute_speculation` for why both
+    exist) and the void anatomy's ``pre_verify``/``verify_burned`` split.  A
+    reader who had to reopen each project's own speculation section to
+    assemble the comparison was doing by hand what this section is for, and
+    the void rate on its own is the rate most likely to be misread: it says
+    how OFTEN speculation was thrown away and nothing at all about what the
+    throwing-away cost.
+
+    Every field is read straight off the bundle's already-computed
+    ``speculation`` section — no second query path and no re-derivation.
+
     A bundle that errored is ABSENT from the result rather than present with a
     rate of 0.0: a project whose store could not be read has no measured void
-    rate at all.
+    rate at all, and — now that the anatomy rides along — a zero-filled entry
+    would positively read as "nothing was wasted here".
     """
     out: dict[str, dict[str, Any]] = {}
     for bundle in bundles:
@@ -1259,6 +1440,9 @@ def void_rate_by_project(
             'n_speculative': speculation['n_speculative'],
             'n_voided_chain_dead': speculation['n_voided_chain_dead'],
             'void_rate': speculation['void_rate'],
+            'speculative_ahead': speculation['speculative_ahead'],
+            'speculative_ahead_adopted': speculation['speculative_ahead_adopted'],
+            'void_anatomy': speculation['void_anatomy'],
         }
     return out
 
@@ -1505,6 +1689,8 @@ def _format_speculation(
     section: dict[str, Any], window: tuple[str, str] | list[str]
 ) -> list[str]:
     ahead = section['speculative_ahead']
+    adopted = section['speculative_ahead_adopted']
+    anatomy = section['void_anatomy']
     lines = [_section(SECTION_TITLES['speculation'], window)]
     lines.append(
         f"    speculative_merge {section['n_speculative']}, chain_dead voids "
@@ -1515,6 +1701,33 @@ def _format_speculation(
     lines.append(
         f"      landed with speculation ahead: {ahead['matched']}/"
         f"{ahead['total']} ({_rate(ahead['share'])})"
+    )
+    # The STRICT measure, on its own line and over the SAME denominator. The
+    # label spells out what it excludes because on many windows the two counts
+    # are equal, and a reader who mistook one for the other would draw the
+    # opposite conclusion about how much speculation actually helped.
+    lines.append(
+        f"      landed with speculation ahead and NOT voided first (strict): "
+        f"{adopted['matched']}/{adopted['total']} "
+        f"({_rate(adopted['share'])})"
+    )
+    # The void anatomy belongs on the same screen as the void rate above: the
+    # rate alone invites "that much verify capacity burned", which the
+    # pre-verify arm is precisely the refutation of.
+    # `unclassifiable` rides on the same line rather than being printed only
+    # when non-zero: a reader checking that the arms sum to the void count
+    # above needs the third term visible even at 0, and a field that appears
+    # only on the bad day is a field nobody knows to look for.
+    lines.append(
+        f"      void anatomy: {anatomy['pre_verify']} pre-verify (build "
+        f"discarded before host acquisition), "
+        f"{anatomy['verify_burned']} verify-burned, "
+        f"{anatomy['unclassifiable']} unclassifiable"
+    )
+    lines.append(
+        f"      dead_link fan-out: {anatomy['dead_link_distinct']} distinct "
+        f"dead base(s), max {_count(anatomy['dead_link_max_voids'])} void(s) "
+        f"from one, {anatomy['dead_link_unknown']} with no dead_link"
     )
     # Two distributions, never pooled: speculative_merge.depth is a STR and
     # merge_verify.depth is a native int (see compute_speculation).
@@ -1612,6 +1825,21 @@ def format_report(bundles: Sequence[dict[str, Any]]) -> str:
             lines.append(
                 f"  {root}: {entry['n_voided_chain_dead']}/"
                 f"{entry['n_speculative']} = {_rate(entry['void_rate'])}"
+            )
+            # Continuation line, so the rate line above stays byte-identical:
+            # this block is the one place a reader can read the whole
+            # two-project headline without reopening each project's section.
+            ahead = entry['speculative_ahead']
+            adopted = entry['speculative_ahead_adopted']
+            anatomy = entry['void_anatomy']
+            lines.append(
+                f"      ahead {ahead['matched']}/{ahead['total']} "
+                f"({_rate(ahead['share'])}) loose, "
+                f"{adopted['matched']}/{adopted['total']} "
+                f"({_rate(adopted['share'])}) strict; "
+                f"{anatomy['pre_verify']} pre-verify void(s), "
+                f"{anatomy['verify_burned']} verify-burned, "
+                f"{anatomy['unclassifiable']} unclassifiable"
             )
         lines.append(
             '  (side by side, never pooled: the spread between projects is '

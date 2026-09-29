@@ -13,7 +13,14 @@ state/expiry_reason vocabularies, and the 90-day TTL. Consumers:
   to ``decided_at`` and consumes ``MEM0_KIND_INVESTIGATION_OUTCOME`` /
   ``GROUNDS_ENUM``.
 * **γ/δ** (Hook A filter / Hook B annotation) — consume ``GROUNDS_ENUM`` and
-  ``GROUNDS_TOKEN_FAMILIES`` for the fallback token-family match.
+  ``GROUNDS_TOKEN_FAMILIES`` for the fallback token-family match; γ also
+  consumes ``SUPPRESSION_STORM_THRESHOLD_PER_CYCLE`` and
+  ``CATEGORY_STANDING_DECISION_STORM`` for its storm escape, and
+  ``RECORD_KIND_ENTITY_SUPPRESSION_STREAK``,
+  ``SUPPRESSION_STREAK_THRESHOLD_CYCLES``,
+  ``SUPPRESSION_STREAK_VOLUME_THRESHOLD``, ``STREAK_PAYLOAD_KEY`` and
+  ``STREAK_WINDOW_PAYLOAD_KEY`` for that escape's cross-cycle streak arm
+  (task 2943).
 * **ε** (prompt/self-model renderer) — consumes the grounds enum and
   ``MEM0_KIND_INVESTIGATION_OUTCOME``.
 * **ζ** (growth/merge sweeps) — consume ``STATE_*`` and the growth/merge
@@ -46,10 +53,98 @@ GROUNDS_ENUM: frozenset[str] = frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION})
 # bound token-family tuple. The seed token *contents* are γ-tactical (PRD Open
 # Question 5, decided in γ) — γ consumes this map for the Hook A/B fallback
 # match ("the flag_type matches the token-family list bound to the row's
-# grounds"). The seed below is a minimal, non-empty placeholder γ replaces.
+# grounds").
+#
+# γ (task 2896, PRD Open Question 5) finalizes the seed for
+# ``structural_size_conflation`` to a curated list of DISTINCTIVE stems covering
+# the "entity is too big / its edges conflate multiple topics" false-positive
+# class. Each entry is a lowercase substring stem matched (casefolded) against a
+# flag_type by :func:`~fused_memory.reconciliation.flag_dedup._flag_type_in_grounds_family`
+# — e.g. ``'conflat'`` matches ``topic_conflation``/``conflated_entity``,
+# ``'monolith'`` matches ``monolithic_entity``. Kept deliberately conservative
+# (distinctive stems, not generic filler words) so an unrelated flag_type citing
+# the entity uuid in free text is NOT fallback-suppressed — the under-suppression
+# bias (PRD decision 10): a fallback miss costs one cycle of noise, never a
+# hidden finding. Preserves α's structure invariant (keys == GROUNDS_ENUM; each
+# family a tuple of str), so test_standing_decision_constants.py stays green.
+#
+# DISTINCTIVE means "does not occur in a flag_type outside this class", and that
+# is a checkable property, not a slogan (reviewer finding correctness, amendment
+# pass).  The first cut also carried ``'count'``, ``'topic'``, ``'scope'`` and
+# ``'broad'``; each matches live flag_types that have nothing to do with entity
+# size — ``'count'`` hits ``recon_stale_task_count_snapshot`` and every other
+# ``*_count_*`` flag, ``'scope'`` hits ``scope_violation`` and
+# ``consolidated_scope_correction``.  A stem that fires there does not merely
+# add noise: it silently DROPS that finding for any entity under an active
+# standing decision, which is the exact failure the under-suppression bias
+# forbids.  They are dropped rather than made exact-token matches because
+# splitting on ``_`` would not save them (``scope_violation`` and
+# ``recon_stale_task_count_snapshot`` both contain the bare token) while it
+# WOULD break the stems that carry this family (``'conflat'`` inside
+# ``conflation``, ``'size'`` inside ``oversized``).  The surviving eight cover
+# the class; ``topic_conflation`` still matches via ``'conflat'``.  Add a stem
+# only after checking it against the live flag_type vocabulary.
 GROUNDS_TOKEN_FAMILIES: dict[str, tuple[str, ...]] = {
-    GROUNDS_STRUCTURAL_SIZE_CONFLATION: ('size', 'large', 'count', 'magnitude'),
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION: (
+        'size',
+        'large',
+        'magnitude',
+        'conflat',
+        'sprawl',
+        'bloat',
+        'monolith',
+        'overload',
+    ),
 }
+
+# --- Suppression-storm threshold (γ, task 2896; PRD Open Question 4) ---------
+# Hook A (Stage-1 filter, γ) files ONE recon "storm escape" escalation per
+# ACTIVE standing decision that suppresses MORE THAN this many flags in a single
+# reconciliation cycle (strict ``>``): an active decision hiding a flood of
+# flags in one cycle is a signal the decision may be over-broad or the entity's
+# situation has changed, warranting a human look. The PRD's parenthetical
+# variant ("across a streak of cycles") is the second escape, below:
+# SUPPRESSION_STREAK_THRESHOLD_CYCLES.
+SUPPRESSION_STORM_THRESHOLD_PER_CYCLE = 5
+
+# --- Cross-cycle suppression streak (task 2943) -----------------------------
+# The storm escape's second arm: a decision whose suppression streak has
+# reached K consecutive full reconciliation cycles AND that suppressed more
+# than N flags in total across the last K of them files the same storm
+# category. A persistent drain can hide a new finding as surely as a
+# single-cycle flood. A cycle already over the per-cycle N is left out of that
+# total, because the per-cycle escape reported it.
+#
+# The window is bounded to the last K cycles because a decision that works
+# suppresses its re-derived complaint about once per cycle, so its window
+# holds K <= N and it never fires, however long its streak runs.
+#
+# The streak comparison is inclusive (``streak >= K``) where the volume
+# comparison is strict (``> N``): "more than N flags" is naturally strict,
+# while K consecutive cycles IS a streak of length K. K=3 and the inclusive
+# comparison match ζ's GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open
+# Question 4). The volume N is the per-cycle N, the PRD's one number.
+#
+# The count and its per-cycle window persist per (project, entity, grounds) as
+# their own ledger record kind rather than as keys on the decision row, because
+# the decision row's writer rebuilds its payload from scratch on every upsert.
+RECORD_KIND_ENTITY_SUPPRESSION_STREAK = 'entity_standing_decision_suppression_streak'
+SUPPRESSION_STREAK_THRESHOLD_CYCLES = 3
+SUPPRESSION_STREAK_VOLUME_THRESHOLD = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
+STREAK_PAYLOAD_KEY = 'consecutive_suppressing_cycles'
+STREAK_WINDOW_PAYLOAD_KEY = 'recent_cycle_suppression_counts'
+
+# Escalation category of that storm escape, single-sourced HERE rather than
+# spelled as a literal at each use site (reviewer finding architecture-coherence,
+# amendment pass).  ``Escalation.category`` is free-form prose validated by
+# nothing at submit time (see the REFACTOR TRIGGER comment on
+# ``escalation.models.Escalation``), and the correctness of a categorized
+# detector rests entirely on its filer and its reader spelling the category
+# identically: γ's filer stamps it on the record while the fold gate
+# (``DedupeConfig.infra_dedupe_categories``) and any operator query read it back.
+# A shared constant makes that agreement structural instead of a discipline
+# every future reader has to re-verify.
+CATEGORY_STANDING_DECISION_STORM = 'reconciliation_standing_decision_storm'
 
 # --- Evidence mem0 kind (Arm 2 of the β authorization gate) -----------------
 # The ledger kind is the sole machine-consulted standing-decision form; the

@@ -41,5 +41,44 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Clean up _SchedulerLike Protocol: replace _status_cache with method + static conformance tests",
+      "description": "Two improvements to _SchedulerLike Protocol in orchestrator/src/orchestrator/workflow.py:\n1. Replace _status_cache dict attribute with get_cached_status(task_id) method. Update all three implementors (Scheduler, FakeScheduler, _EvalScheduler) and the call site at workflow.py:1884.\n2. Replace runtime hasattr/isinstance conformance tests in test_workflow_e2e.py with static TYPE_CHECKING assertions that catch method signature drift.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "639",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-11T01:15:38.090Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "orchestrator/src/orchestrator/evals/runner.py",
+      "orchestrator/src/orchestrator/scheduler.py",
+      "orchestrator/src/orchestrator/workflow.py",
+      "orchestrator/tests/test_scheduler.py",
+      "orchestrator/tests/test_workflow_e2e.py"
+    ],
+    "base_sha": "fd570d606f55ccfe989904a2575b043c136c0838",
+    "branch_sha": "85409456db40228a4e5b87c8beecc811e994023f",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "fce631c072fe781d4ecbb4319ac2129aa21625ea",
+      "merge_base_sha": "217f3b84290980a5d3e57f25a2c00ef8a188b0ad",
+      "diff_reproduces_from": "git diff fd570d606f fce631c072",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -6,6 +6,25 @@ Description=Nightly timer for the legibility trickle (%i)
 # (laptop asleep/offline at 03:00) on next boot/login instead of silently
 # skipping it. A small randomized delay avoids every project's timer firing
 # at the exact same instant.
+#
+# WHAT Persistent=true DOES NOT BUY, recorded in task 4514 because the
+# gap is invisible from here: it is ONE catch-up attempt per missed
+# night, and that attempt CONSUMES the missed target_date (run_nightly
+# defaults target_date to yesterday UTC). If the catch-up itself fails,
+# the date is gone -- no later run ever retries it. That is how
+# 2026-08-17's sightings were permanently lost: reify main jumps
+# b79cecf53a (08-16) straight to 75ea893d3a (08-18) with no "sightings
+# for 2026-08-17" commit in between.
+#
+# DECIDED, not overlooked: the loss is now VISIBLE rather than silent --
+# such a night records outcome=failed with a non-restamped
+# last_productive_at, and legibility-trickle-health@.timer reports it.
+# Making a failed date eligible for RETRY is deliberately OUT OF SCOPE
+# for task 4514: it changes target-date selection (a durable record of
+# unconsumed dates, how far back to reach, how not to re-digest a night
+# that partially succeeded), which is a different concern from health
+# observability. Filed as a follow-up. Cross-referenced from
+# scripts/legibility/nightly.py::_record_trickle_progress.
 OnCalendar=*-*-* 03:00:00
 Persistent=true
 RandomizedDelaySec=300

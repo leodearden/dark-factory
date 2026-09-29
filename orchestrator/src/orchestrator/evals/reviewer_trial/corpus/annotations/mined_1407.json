@@ -40,5 +40,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Extract a shared MagicMock-gate factory for orchestrator tests (mirror shared/tests _mock_gate)",
+      "description": "gate.soonest_resets_at = None was added inline to ~9 separate MagicMock gate construction sites across orchestrator/tests/test_invoke.py and orchestrator/tests/test_steward.py (task 1404). The orchestrator test helpers (_make_gate_yielding and per-test gate setup blocks) repeat the same attribute initialization for on_agent_complete, confirm_account_ok, release_probe_slot, and now soonest_resets_at rather than funneling through one builder, so each new gate attribute requires a shotgun edit touching every site. shared/tests already centralizes this in a _mock_gate helper (test_cap_retry.py:93). Extract an equivalent gate-factory helper for the orchestrator tests so attribute defaults like soonest_resets_at=None are set in one place. Prior bare-MagicMock() gate drift caused a 122-error cascade (tasks 1313/1339), so consolidation has concrete payoff. Scope: refactor only \u2014 preserve existing test behavior; route _make_gate_yielding and the standalone gate=MagicMock() builders through the new factory.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1407",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-15T18:15:15.505Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "orchestrator/tests/test_invoke.py",
+      "orchestrator/tests/test_steward.py"
+    ],
+    "base_sha": "b790403a78e64f0e7425ee631bc874869703746f",
+    "branch_sha": "fda9579f19f804f1bd81a62192950d9250a3ec05",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task. Surviving text: a fragment only (git commit fda9579f19f804f1bd81a62192950d9250a3ec05 (task/1407 branch, amend commit message) in /home/leo/src/dark-factory: {\"design_decisions\": [\"#2 (\\\"separate per-file _make_gate ... not single shared/conftest helper\\\")\"]}), not shipped as a plan",
+    "verification": {
+      "merge_sha": "a6b7576fab0bf539697dd014a1ab705bbcdd4c55",
+      "merge_base_sha": "b790403a78e64f0e7425ee631bc874869703746f",
+      "diff_reproduces_from": "git diff b790403a78 a6b7576fab",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

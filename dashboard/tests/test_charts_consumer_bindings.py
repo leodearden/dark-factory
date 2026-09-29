@@ -24,9 +24,12 @@ the way a destructure list is.  The defect this file exists to catch — an
 imported-but-never-rendered component — can only exist in the destructure shape
 anyway.
 
-The parser is the one already proven in test_tab_burndown.py
-(``_DF_CHARTS_DESTRUCTURE_RE`` and its ``Canonical: alias`` splitting), copied
-rather than re-invented so this is not a third dialect of the same line.
+The parser is the shared one in ``_dashboard_helpers`` (``DF_CHARTS_DESTRUCTURE_RE``
+and ``destructure_bindings``), so this is not a second dialect of the same line.
+That helper returns ``(canonical, local)`` PAIRS and this module projects the
+LOCAL half, because the alias is what the file renders by and therefore what
+must be referenced; test_charts_axis_labels.py projects the CANONICAL half off
+the same pairs.
 """
 
 from __future__ import annotations
@@ -34,13 +37,10 @@ from __future__ import annotations
 import pathlib
 import re
 
+from _dashboard_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
+
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
-# Copied verbatim from
-# dashboard/tests/test_tab_burndown.py::_DF_CHARTS_DESTRUCTURE_RE.
-# Matches ONLY the destructure
-# shape (see the module docstring for the three shapes it deliberately skips).
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
 
 # Measured after the sweep above was made green (task 3681): tab_curator 3,
 # tab_memory_evals 3, tab_overview 4, tab_tasks 1, tabs 12.  It was 29 across
@@ -63,17 +63,11 @@ def _local_names(destructured: str) -> list[str]:
 
     ``{ StackedAreaChart, HistBar: HB }`` binds ``StackedAreaChart`` and ``HB``
     — the alias is what the file actually renders by, so the alias is what must
-    be referenced.  Same splitting as test_tab_burndown.py's
-    ``_chart_component_aliases``.
+    be referenced.  A projection over the shared `destructure_bindings`; the
+    canonical half is what test_charts_axis_labels.py projects off the same
+    pairs, so the two must never be confused (see the negative control below).
     """
-    names = []
-    for part in destructured.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        canonical, _, alias = part.partition(':')
-        names.append(alias.strip() or canonical.strip())
-    return names
+    return [local for _canonical, local in destructure_bindings(destructured)]
 
 
 def _unused_bindings(src: str) -> list[str]:
@@ -89,7 +83,7 @@ def _unused_bindings(src: str) -> list[str]:
     on a false positive means deleting an import the tab actually renders
     through.
     """
-    spans = [m.span() for m in _DF_CHARTS_DESTRUCTURE_RE.finditer(src)]
+    spans = [m.span() for m in DF_CHARTS_DESTRUCTURE_RE.finditer(src)]
     if not spans:
         return []
 
@@ -100,7 +94,7 @@ def _unused_bindings(src: str) -> list[str]:
     remainder.append(src[cursor:])
     outside = ' '.join(remainder)
 
-    names = [n for m in _DF_CHARTS_DESTRUCTURE_RE.finditer(src) for n in _local_names(m.group(1))]
+    names = [n for m in DF_CHARTS_DESTRUCTURE_RE.finditer(src) for n in _local_names(m.group(1))]
     return [n for n in names if not re.search(rf'\b{re.escape(n)}\b', outside)]
 
 
@@ -109,7 +103,7 @@ def _destructure_consumers() -> dict[str, str]:
     return {
         p.name: src
         for p in sorted(_REDUX_DIR.glob('*.jsx'))
-        if _DF_CHARTS_DESTRUCTURE_RE.search(src := p.read_text(encoding='utf-8'))
+        if DF_CHARTS_DESTRUCTURE_RE.search(src := p.read_text(encoding='utf-8'))
     }
 
 
@@ -157,7 +151,7 @@ def test_the_sweep_actually_found_the_destructure_shaped_consumers() -> None:
 
     consumers = _destructure_consumers()
     bindings = {
-        name: [n for m in _DF_CHARTS_DESTRUCTURE_RE.finditer(src) for n in _local_names(m.group(1))]
+        name: [n for m in DF_CHARTS_DESTRUCTURE_RE.finditer(src) for n in _local_names(m.group(1))]
         for name, src in consumers.items()
     }
     total = sum(len(v) for v in bindings.values())
@@ -267,7 +261,7 @@ def test_the_detector_does_not_report_a_binding_the_file_actually_renders() -> N
     for filename, (src, expected_dead) in _PRE_FIX_SOURCES.items():
         live = [
             n
-            for m in _DF_CHARTS_DESTRUCTURE_RE.finditer(src)
+            for m in DF_CHARTS_DESTRUCTURE_RE.finditer(src)
             for n in _local_names(m.group(1))
             if n not in expected_dead
         ]

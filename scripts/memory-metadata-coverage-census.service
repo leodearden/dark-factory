@@ -14,7 +14,7 @@ Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
 Type=oneshot
 # All logic lives in the committed wrapper script -- the unit itself is a thin
 # systemd shell around it (mirrors
-# scripts/reify-closure-staleness-sweep.service). The wrapper runs the census
+# scripts/reclaim-orphaned-worktrees.service). The wrapper runs the census
 # and then a DRY-RUN of 3201's retro stamp, in sequence, and always exits 0: a
 # recurring `oneshot` that can fail enters systemd `failed` state and STAYS
 # there, silently stopping the whole nightly job. The census exits 1 by design

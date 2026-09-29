@@ -1,0 +1,2290 @@
+"""Tests for ``orchestrator.rebase_recovery`` — guarded rebase/merge abort (task 4797).
+
+Two defects motivate the module under test, and both were reproduced
+first-hand in throwaway repos on git 2.43.0 before any code was written:
+
+* A MERGE_RR record naming a conflict id whose ``rr-cache/<id>`` directory is
+  absent makes ``git rebase --abort`` die in ``rerere_clear()`` — measured
+  ``Segmentation fault (core dumped)``, rc 139, with the rebase state left
+  fully in place and a fresh ``MERGE_RR.lock`` created.
+* A stale ``MERGE_RR.lock`` with a perfectly INTACT rr-cache makes the same
+  abort fail rc 128 with git's "Another git process seems to be running"
+  advice.  This is an independent failure, not the crash's residue.
+
+Nothing here asserts the segfault.  It is an upstream git bug that this task
+puts out of scope, so pinning rc 139 would turn a future git patch into a red
+suite — the fix would read as the regression.  What is asserted is the
+version-independent post-condition: the preflight DETECTS the dangling id, and
+the guarded abort then returns rc 0 with the evidence preserved.
+
+The paired negative control matters as much as the positive case.  An "abort
+works" assertion against a HEALTHY worktree passes vacuously — the unguarded
+abort works there too — so every behavioural claim below is made against a
+deliberately dangling fixture with an intact-fixture control beside it.
+
+ISOLATION (esc-3072-3).  This module builds real conflicted repositories and
+deliberately deletes ``rr-cache`` directories, which is precisely the shape of
+write that once landed in a live task worktree: git's repository discovery
+walks UP, and pytest's basetemp can sit inside one.  Both layers of the house
+defence are applied to every git subprocess spawned here —
+:func:`assert_isolated_git_repo` first (pure filesystem, so a rejected call
+writes nothing anywhere), then ``env=`` :func:`git_env_with_ceiling` (so escape
+is impossible at the git level even if the pre-flight is refactored away).
+"""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import errno
+import json
+import logging
+import os
+import shutil
+import subprocess
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+
+from orchestrator import git_ops as git_ops_module
+from orchestrator import rebase_recovery
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
+
+# ---------------------------------------------------------------------------
+# Real-git fixture scaffolding
+# ---------------------------------------------------------------------------
+
+_BASE = 'line1\nline2\nline3\n'
+_FEATURE = 'line1\nFEATURE\nline3\n'
+_MAIN = 'line1\nMAIN\nline3\n'
+
+
+def _run_argv(repo: Path, argv) -> subprocess.CompletedProcess:
+    """Run an arbitrary command vector inside *repo*, under both isolation layers.
+
+    Takes the whole vector rather than trailing arguments so a caller can pass
+    ``rebase_recovery.RECOVERY_GIT`` itself, instead of re-spelling the prefix
+    the production code already defines.
+    """
+    assert_isolated_git_repo(repo)
+    return subprocess.run(
+        list(argv),
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=git_env_with_ceiling(repo),
+    )
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run one plain git command inside *repo*."""
+    return _run_argv(repo, ['git', *args])
+
+
+def _git_ok(repo: Path, *args: str) -> str:
+    proc = _git(repo, *args)
+    assert proc.returncode == 0, f'git {args!r} failed: {proc.stderr}'
+    return proc.stdout
+
+
+def _build_conflicting_branches(root: Path, name: str) -> Path:
+    """An isolated repo with ``feature`` and ``main`` in conflict, HEAD on main.
+
+    The substrate both mid-rebase fixtures share: rebasing ``feature`` onto
+    ``main`` stops on a one-line content conflict, and rerere — enabled here —
+    then writes MERGE_RR plus its backing ``rr-cache/<id>/``.  Where that
+    rebase is RUN is what the two fixtures differ on, and it is the only thing
+    they differ on.
+    """
+    repo = root / name
+    repo.mkdir(parents=True)
+
+    # The one call that cannot pre-assert: the directory is not a repository
+    # until this command makes it one.  ``git init`` creates a repo at the path
+    # given rather than reusing an enclosing one, and the ceiling is applied
+    # regardless; the assertion inside ``_git`` covers every call after it.
+    init = subprocess.run(
+        ['git', 'init', '-q', '-b', 'main', '.'],
+        cwd=str(repo), capture_output=True, text=True,
+        env=git_env_with_ceiling(repo),
+    )
+    assert init.returncode == 0, f'git init failed: {init.stderr}'
+    assert_isolated_git_repo(repo)
+
+    _git_ok(repo, 'config', 'user.email', 'rebase-recovery@test.invalid')
+    _git_ok(repo, 'config', 'user.name', 'Rebase Recovery Test')
+    _git_ok(repo, 'config', 'commit.gpgsign', 'false')
+    _git_ok(repo, 'config', 'rerere.enabled', 'true')
+    _git_ok(repo, 'config', 'rerere.autoupdate', 'true')
+
+    (repo / 'f.txt').write_text(_BASE)
+    _git_ok(repo, 'add', 'f.txt')
+    _git_ok(repo, 'commit', '-qm', 'base')
+
+    _git_ok(repo, 'checkout', '-qb', 'feature')
+    (repo / 'f.txt').write_text(_FEATURE)
+    _git_ok(repo, 'commit', '-qam', 'feature edit')
+
+    _git_ok(repo, 'checkout', '-q', 'main')
+    (repo / 'f.txt').write_text(_MAIN)
+    _git_ok(repo, 'commit', '-qam', 'main edit')
+    return repo
+
+
+def _conflict_id_of(git_dir: Path, common_dir: Path) -> str:
+    """The LITERAL first MERGE_RR token, with its backing rr-cache asserted.
+
+    Read from the PER-WORKTREE dir and checked against the COMMON one, which
+    is the same split the module under test makes — in a single checkout the
+    two are one directory, in a linked worktree they are not.
+    """
+    merge_rr = (git_dir / 'MERGE_RR').read_bytes()
+    conflict_id = merge_rr.split(b'\x00')[0].split(b'\t')[0].decode()
+    assert (common_dir / 'rr-cache' / conflict_id).is_dir(), (
+        'fixture expected a backing rr-cache entry'
+    )
+    return conflict_id
+
+
+def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
+    """Build an isolated repo left mid-rebase with a populated MERGE_RR.
+
+    Returns ``(repo, conflict_id)``.  The conflict id is the LITERAL token from
+    MERGE_RR, carrying any rerere variant suffix verbatim.
+    """
+    repo = _build_conflicting_branches(root, name)
+
+    _git_ok(repo, 'checkout', '-q', 'feature')
+    rebase = _git(repo, 'rebase', 'main')
+    assert rebase.returncode != 0, 'fixture expected a rebase conflict'
+
+    git_dir = repo / '.git'
+    assert (git_dir / 'rebase-merge').is_dir(), 'fixture expected mid-rebase state'
+    return repo, _conflict_id_of(git_dir, git_dir)
+
+
+def build_linked_mid_rebase_worktree(root: Path) -> tuple[Path, Path, str]:
+    """A LINKED worktree left mid-rebase — the shape production actually passes.
+
+    All four routed call sites operate on ``.worktrees/*`` or merge worktrees,
+    never on a standalone ``git init`` checkout.  The distinction is not
+    cosmetic: MERGE_RR is PER-WORKTREE while rr-cache is SHARED, so the two
+    directories the module resolves are the same path in a single checkout and
+    different paths here.  Measured on git 2.43.0 for this fixture:
+    ``--git-dir`` is ``<repo>/.git/worktrees/linked``, ``--git-common-dir`` is
+    ``<repo>/.git``, and rr-cache exists only under the latter.
+
+    Returns ``(repo, linked, conflict_id)``.
+    """
+    repo = _build_conflicting_branches(root, 'repo')
+    linked = root / 'linked'
+    _git_ok(repo, 'worktree', 'add', '-q', str(linked), 'feature')
+
+    rebase = _git(linked, 'rebase', 'main')
+    assert rebase.returncode != 0, 'fixture expected a rebase conflict'
+
+    git_dir = repo / '.git' / 'worktrees' / 'linked'
+    assert (git_dir / 'rebase-merge').is_dir(), 'fixture expected mid-rebase state'
+    assert not (git_dir / 'rr-cache').exists(), (
+        'fixture expected rr-cache in the COMMON dir only'
+    )
+    return repo, linked, _conflict_id_of(git_dir, repo / '.git')
+
+
+# ---------------------------------------------------------------------------
+# The MERGE_RR grammar
+# ---------------------------------------------------------------------------
+
+class TestParseMergeRr:
+    """MERGE_RR's real on-disk grammar, measured rather than assumed.
+
+    Records are NUL-TERMINATED ``<id>\\t<path>\\0``, not newline-separated, and
+    the id is ``<40-hex>[.<variant>]`` — git appends a ``.N`` suffix when one
+    conflict has several rerere variants.  Both details are load-bearing: a
+    parser that splits on newlines finds nothing in a real file, and one that
+    normalizes the id away reports a dangling ref as intact.
+
+    The byte literals below are taken verbatim from live files in this repo's
+    ``.git/worktrees/*/MERGE_RR`` (read-only observation).
+    """
+
+    def test_empty_file_yields_no_records(self) -> None:
+        parsed = rebase_recovery.parse_merge_rr(b'')
+        assert parsed.records == ()
+        assert parsed.unparsable == ()
+
+    def test_single_nul_terminated_record(self) -> None:
+        data = b'd233fdd99096e62540dc6cb96cae57c25398fa57\tshared/src/shared/mcp_markup_middleware.py\x00'
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert len(parsed.records) == 1
+        assert parsed.records[0].conflict_id == 'd233fdd99096e62540dc6cb96cae57c25398fa57'
+        assert parsed.records[0].path == 'shared/src/shared/mcp_markup_middleware.py'
+
+    def test_variant_suffix_is_retained_verbatim(self) -> None:
+        """The ``.1`` is part of the rr-cache directory NAME, never a decoration.
+
+        Live state of worktree 29171: MERGE_RR cites ``...648.1`` while
+        ``rr-cache/...648.1`` is ABSENT and the bare ``rr-cache/...648`` is
+        PRESENT.  A parser that strips the suffix here hands the classifier a
+        token that resolves, turning a genuinely dangling ref into a false
+        "intact" — the exact false negative that lets the crash through.
+        """
+        data = (
+            b'd932b0e1e48d84453c25373f569e77581b8cc648.1\t'
+            b'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py\x00'
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert parsed.records[0].conflict_id == (
+            'd932b0e1e48d84453c25373f569e77581b8cc648.1'
+        )
+
+    def test_multiple_records_including_a_path_with_a_space(self) -> None:
+        data = (
+            b'a' * 40 + b'\tsrc/one.py\x00'
+            + b'b' * 40 + b'\tdocs/a file with spaces.md\x00'
+            + b'c' * 40 + b'.12\tsrc/three.py\x00'
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert [r.conflict_id for r in parsed.records] == [
+            'a' * 40, 'b' * 40, 'c' * 40 + '.12',
+        ]
+        assert parsed.records[1].path == 'docs/a file with spaces.md'
+
+    def test_corrupt_records_surface_as_unparsable_without_raising(self) -> None:
+        """``read_rr()`` calls ``die("corrupt MERGE_RR")`` on these shapes.
+
+        A malformed record is a second way recovery fails hard, so it is
+        reported rather than raised: this helper decorates a RECOVERY path and
+        must never itself become the reason recovery fails.
+        """
+        data = (
+            b'deadbeef\tsrc/short-id.py\x00'          # id too short
+            + b'e' * 40 + b'src/no-tab.py\x00'        # missing the tab
+            + b'f' * 40 + b'\tsrc/good.py\x00'        # still parsed
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert [r.conflict_id for r in parsed.records] == ['f' * 40]
+        assert parsed.unparsable == (
+            b'deadbeef\tsrc/short-id.py',
+            b'e' * 40 + b'src/no-tab.py',
+        )
+
+    def test_a_sha256_repository_id_is_a_record_not_corruption(self) -> None:
+        """rerere hashes with the REPOSITORY's algorithm, so 64 hex is legal.
+
+        MEASURED on git 2.43.0: ``git init --object-format=sha256`` plus a
+        conflicted rebase writes a 64-hex id with a matching
+        ``rr-cache/<64-hex>/`` directory.  Against a 40-only grammar every
+        record of such a repository lands in ``unparsable``, which makes the
+        scan SUSPECT, which quarantines a perfectly healthy MERGE_RR on every
+        guarded abort and verdicts the worktree ``repaired`` — or ``blocked``
+        under ``--report-only``, where a skill branching on the enum then
+        refuses to proceed on a healthy worktree.  Measured against the real
+        file before the widening: 0 records, 1 unparsable, suspect True.
+        """
+        data = _record(_HEX_SHA256, 'f.txt') + b'\x00'
+
+        parsed = rebase_recovery.parse_merge_rr(data)
+
+        assert [r.conflict_id for r in parsed.records] == [_HEX_SHA256]
+        assert parsed.unparsable == ()
+
+    def test_a_sha256_id_keeps_its_variant_suffix_too(self) -> None:
+        """The widening must not cost the variant suffix the 40-hex case pins."""
+        parsed = rebase_recovery.parse_merge_rr(
+            _record(f'{_HEX_SHA256}.1', 'f.txt') + b'\x00',
+        )
+
+        assert [r.conflict_id for r in parsed.records] == [f'{_HEX_SHA256}.1']
+
+    def test_widths_between_and_beyond_the_two_hash_algorithms_are_corruption(
+        self,
+    ) -> None:
+        """Only the two widths git can actually produce are records.
+
+        ``{40,64}`` would accept every length in between, which no git writes,
+        and would reclassify a truncated id as healthy — losing the corruption
+        arm the module deliberately treats as suspect.
+        """
+        data = (
+            _record('a' * 41) + b'\x00'
+            + _record('b' * 63) + b'\x00'
+            + _record('c' * 65) + b'\x00'
+        )
+
+        parsed = rebase_recovery.parse_merge_rr(data)
+
+        assert parsed.records == ()
+        assert len(parsed.unparsable) == 3
+
+    def test_trailing_bytes_without_a_nul_are_not_dropped(self) -> None:
+        """A truncated final record is evidence of damage, not something to skip."""
+        parsed = rebase_recovery.parse_merge_rr(b'a' * 40 + b'\tsrc/one.py')
+        assert [r.conflict_id for r in parsed.records] == ['a' * 40]
+
+
+# ---------------------------------------------------------------------------
+# Dangling-vs-intact classification
+# ---------------------------------------------------------------------------
+
+_HEX = 'd932b0e1e48d84453c25373f569e77581b8cc648'
+#: The conflict id git 2.43.0 writes for the same one-line conflict in a
+#: repository created with ``--object-format=sha256`` — measured, not
+#: constructed.  rerere hashes with the repository's algorithm, so an id is 40
+#: hex OR 64, and the orchestrator is documented as operating projects beyond
+#: this one.
+_HEX_SHA256 = 'a47652b46dc0309b3584fa863d414f52633f44a5b1f89c45d6b6ca378879d45a'
+
+
+def _plant_merge_rr(git_dir: Path, *records: bytes) -> None:
+    git_dir.mkdir(parents=True, exist_ok=True)
+    (git_dir / 'MERGE_RR').write_bytes(b''.join(r + b'\x00' for r in records))
+
+
+def _specimens(common_dir: Path) -> list[Path]:
+    """Every quarantined MERGE_RR under a COMMON dir, by name.
+
+    Reached through one helper on purpose.  Every negative control in this file
+    asserts that nothing was quarantined, and a negative control that globs a
+    directory the quarantine no longer writes to passes for the wrong reason --
+    it would keep passing if the quarantine ran on every healthy worktree in
+    the fleet.  Moving the destination must break these tests or change them,
+    never silently satisfy them.
+    """
+    return sorted((common_dir / 'rerere-specimens').glob('MERGE_RR.*'))
+
+
+def _record(conflict_id: str, path: str = 'src/one.py') -> bytes:
+    return f'{conflict_id}\t{path}'.encode()
+
+
+class TestScanMergeRr:
+    """Classify each MERGE_RR record against its backing rr-cache directory.
+
+    The scan is filesystem-only and takes ``git_dir`` and ``common_dir`` as
+    explicit arguments, so these cases need plain directories rather than real
+    repositories.  That separation is deliberate: it keeps the classifier
+    testable without a repo, and it makes the common-dir resolution an
+    assertable property rather than an implementation detail.
+    """
+
+    def test_variant_suffix_dangling_while_bare_id_exists(self, tmp_path: Path) -> None:
+        """THE load-bearing case — the measured live state of worktree 29171.
+
+        MERGE_RR cites ``<hex>.1``; ``rr-cache/<hex>`` EXISTS and
+        ``rr-cache/<hex>.1`` does NOT.  Verdict must be DANGLING.  A checker
+        that strips or splits the suffix resolves the bare directory, reports
+        intact, and lets exactly the crash this module guards against through.
+        """
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(f'{_HEX}.1'))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [f'{_HEX}.1']
+
+    def test_present_directory_classifies_intact(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.dangling == ()
+        assert [r.conflict_id for r in scan.records] == [_HEX]
+
+    def test_absent_directory_classifies_dangling(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache').mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [_HEX]
+
+    def test_rr_cache_entry_that_is_a_file_classifies_dangling(
+        self, tmp_path: Path,
+    ) -> None:
+        """git wants a DIRECTORY holding preimage/postimage; a file is not one."""
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache').mkdir(parents=True)
+        (git_dir / 'rr-cache' / _HEX).write_text('not a directory')
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [_HEX]
+
+    def test_rr_cache_resolves_under_the_common_dir_not_the_worktree_git_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """A linked worktree's MERGE_RR is per-worktree; its rr-cache is shared.
+
+        Resolving rr-cache under the per-worktree git dir would find nothing
+        for EVERY record in a linked worktree — reporting the whole file
+        dangling and quarantining healthy state on every run.
+        """
+        git_dir = tmp_path / 'worktrees' / '4797'
+        common_dir = tmp_path / 'common'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (common_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+        (git_dir / 'rr-cache').mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=common_dir)
+
+        assert scan.dangling == ()
+
+    def test_unparsable_record_is_reported_as_suspect(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, b'deadbeef\tsrc/short.py', _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.dangling == ()
+        assert scan.unparsable == (b'deadbeef\tsrc/short.py',)
+        assert scan.suspect is True
+
+    def test_missing_merge_rr_is_the_healthy_case(self, tmp_path: Path) -> None:
+        """Absence is normal, not an error: most worktrees have no MERGE_RR."""
+        git_dir = tmp_path / 'gitdir'
+        git_dir.mkdir()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.records == ()
+        assert scan.dangling == ()
+        assert scan.unparsable == ()
+        assert scan.suspect is False
+
+    def test_dangling_records_make_the_scan_suspect(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.suspect is True
+
+
+# ---------------------------------------------------------------------------
+# Quarantine
+# ---------------------------------------------------------------------------
+
+class TestQuarantineMergeRr:
+    """MERGE_RR is MOVED aside, never unlinked.
+
+    The file is the only record of which conflict ids a wedged worktree was
+    carrying, and a SUCCESSFUL abort DELETES it (measured).  So the quarantine
+    is not crash-avoidance — the ``RECOVERY_GIT`` prefix already covers that —
+    it is what stops the repair from destroying its own evidence.
+    """
+
+    def test_dangling_scan_moves_the_file_preserving_its_bytes(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+        backup = rebase_recovery.quarantine_merge_rr(scan)
+
+        assert backup is not None
+        assert not (git_dir / 'MERGE_RR').exists()
+        assert backup.read_bytes() == original
+        assert backup.parent == git_dir / 'rerere-specimens'
+
+    def test_a_second_quarantine_does_not_clobber_the_first(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two wedged runs leave two backups; the earlier evidence survives."""
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/first.py'))
+        first = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/second.py'))
+        second = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        assert first is not None and second is not None
+        assert first != second
+        assert b'src/first.py' in first.read_bytes()
+        assert b'src/second.py' in second.read_bytes()
+
+    def test_a_name_claimed_between_choosing_and_moving_is_not_overwritten(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The SEQUENTIAL counter does not make the docstring's promise true.
+
+        ``quarantine_merge_rr`` promises that a worktree which wedges twice
+        keeps both wedges' evidence, and the counter delivers that only when
+        the two runs are ordered.  Two preflights on the same worktree in the
+        same second both see the base name free, and ``Path.rename`` on POSIX
+        silently REPLACES its destination — so the second destroys the first
+        backup while both report success.
+
+        The interleave is injected once, at the instant the race really turns:
+        the claim itself.  The wrapper puts another run's bytes at the
+        destination and then delegates to the REAL ``os.link``, so what is
+        exercised is the kernel's exclusivity rather than a simulation of it.
+        Sequential repeats are covered by the case above; what this adds is the
+        concurrent one, which no amount of counting can answer on its own.
+        """
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/mine.py'))
+        theirs = b'the other run got here first\n'
+        real_link = os.link
+        raced: list[Path] = []
+
+        def lose_the_race_once(src, dst, **kwargs):
+            if not raced and Path(src).name == 'MERGE_RR':
+                Path(dst).write_bytes(theirs)   # one racing run, one loss
+                raced.append(Path(dst))
+            return real_link(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, 'link', lose_the_race_once)
+
+        backup = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        assert raced, 'the fixture must actually have raced'
+        assert raced[0].read_bytes() == theirs, (
+            "the other run's evidence was overwritten"
+        )
+        assert backup is not None and backup != raced[0]
+        assert b'src/mine.py' in backup.read_bytes()
+        assert not (git_dir / 'MERGE_RR').exists()
+
+    def test_intact_scan_leaves_the_file_exactly_where_it_was(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+        backup = rebase_recovery.quarantine_merge_rr(scan)
+
+        assert backup is None
+        assert (git_dir / 'MERGE_RR').read_bytes() == original
+        assert list(git_dir.glob('MERGE_RR.*')) == []
+
+    def test_unparsable_record_also_quarantines(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, b'deadbeef\tsrc/short.py')
+
+        backup = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        assert backup is not None
+        assert not (git_dir / 'MERGE_RR').exists()
+
+    def test_warning_names_every_dangling_conflict_id(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Assert on the IDS, not on sentence wording — the ids are the payload."""
+        git_dir = tmp_path / 'gitdir'
+        other = 'a' * 40
+        _plant_merge_rr(
+            git_dir, _record(f'{_HEX}.1', 'src/one.py'), _record(other, 'src/two.py'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            backup = rebase_recovery.quarantine_merge_rr(
+                rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+            )
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert f'{_HEX}.1' in logged
+        assert other in logged
+        assert backup is not None and str(backup) in logged
+
+
+# ---------------------------------------------------------------------------
+# Stale-lock sweep
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=UTC)
+_STALE = 3600
+
+
+def _plant_lock(git_dir: Path, name: str, *, age_seconds: float) -> Path:
+    git_dir.mkdir(parents=True, exist_ok=True)
+    lock = git_dir / name
+    lock.touch()
+    stamp = (_NOW - timedelta(seconds=age_seconds)).timestamp()
+    os.utime(lock, (stamp, stamp))
+    return lock
+
+
+def _swept(git_dir: Path):
+    return rebase_recovery.sweep_stale_locks(
+        git_dir=git_dir, now=_NOW, stale_after_seconds=_STALE,
+    )
+
+
+def _fake_proc(root: Path, *, holders: dict[int, Path], unreadable: int = 0,
+               vanished: int = 0) -> Path:
+    """A stand-in ``/proc`` with the three shapes a real one presents.
+
+    Built rather than chmod-ed: ``chmod`` is a no-op for root, so a
+    permission-based fixture asserts nothing wherever CI runs as root (the same
+    vacuity trap that put :func:`_merge_rr_read_fails` in this file).  An ``fd``
+    that is a FILE raises ``NotADirectoryError`` for every uid, modelling "this
+    process's descriptors are not ours to read" deterministically.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'self').mkdir()          # a non-numeric entry, which is skipped
+    for pid, target in holders.items():
+        fd = root / str(pid) / 'fd'
+        fd.mkdir(parents=True)
+        (fd / '0').symlink_to(target)
+    for offset in range(unreadable):
+        pid = root / str(900 + offset)
+        pid.mkdir()
+        (pid / 'fd').write_text('not a directory')
+    for offset in range(vanished):
+        (root / str(800 + offset)).mkdir()   # no fd dir: exited mid-scan
+    return root
+
+
+class TestScanLockHolders:
+    """One ``/proc`` pass, and an honest account of what it could not see.
+
+    The distinction this class exists for: an EMPTY pid list can mean "nothing
+    holds this" or "this run could not tell", and the sweep turns the first
+    into a deletion.  They must not be the same value.
+
+    Where the line falls is a MEASUREMENT, not a preference.  On this host,
+    right now, as the orchestrator's own uid: 1329 pids, 467 fd directories
+    readable, 860 denied (root's and other users' processes), 2 vanished
+    mid-scan.  So treating any unreadable fd directory as blindness would
+    retain every lock on every run and silently delete the stale-lock half of
+    this task, while all its unit cases stayed green.  Blindness is therefore
+    scoped to what it can honestly mean: ``/proc`` itself unavailable.
+    """
+
+    def test_a_holder_is_found_through_the_fd_symlink(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={4242: lock})
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.pids_by_path[lock] == (4242,)
+        assert scan.confirmed is True
+
+    def test_processes_whose_descriptors_are_not_ours_do_not_veto(
+        self, tmp_path: Path,
+    ) -> None:
+        """65% of this host's pids are unreadable; vetoing on them removes nothing."""
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={}, unreadable=3)
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.pids_by_path[lock] == ()
+        assert scan.confirmed is True
+
+    def test_a_process_that_exited_mid_scan_does_not_veto(
+        self, tmp_path: Path,
+    ) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={}, vanished=3)
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.confirmed is True
+
+    def test_an_unavailable_proc_is_reported_rather_than_raised(
+        self, tmp_path: Path,
+    ) -> None:
+        """The case that MEASURED as raising out of the preflight entirely.
+
+        ``Path('/proc').iterdir()`` on a host with no ``/proc`` mounted raised
+        ``FileNotFoundError`` straight through ``survey_locks`` and out of
+        ``preflight_rebase_recovery``, breaching the totality invariant the
+        module documents and ``TestPreflightIsTotal`` pins.
+        """
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+
+        scan = rebase_recovery.scan_lock_holders(
+            [lock], proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert scan.confirmed is False
+        assert scan.pids_by_path[lock] == ()
+
+    def test_no_candidates_means_no_pass_at_all(self, tmp_path: Path) -> None:
+        """The common case: a git dir with no locks must not walk the fd table.
+
+        Measured by review: a full pass costs ~0.18s, and it runs inside
+        ``guarded_abort`` on all four abort sites — including ``abort_merge``,
+        whose caller invokes it on ANY non-zero merge rc, the no-op
+        'no merge to abort' case included.
+
+        Asserted through the RESULT rather than by counting syscalls: an absent
+        ``proc_root`` is the one input that makes an enumeration observable
+        (it answers ``confirmed=False``), so a trivially-confirmed empty answer
+        is proof that nothing was enumerated.
+        """
+        scan = rebase_recovery.scan_lock_holders(
+            [], proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert scan.confirmed is True
+        assert dict(scan.pids_by_path) == {}
+
+    def test_a_git_dir_with_no_locks_never_reaches_the_process_table(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Same claim one layer up, where the cost is actually paid."""
+        git_dir = tmp_path / 'gitdir'
+        git_dir.mkdir()
+        (git_dir / 'HEAD').write_text('ref: refs/heads/main\n')
+
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.rebase_recovery',
+        ):
+            findings = rebase_recovery.survey_locks(
+                git_dir, proc_root=tmp_path / 'no-such-proc',
+            )
+
+        assert findings == ()
+        assert caplog.records == [], 'an absent /proc was enumerated anyway'
+
+    def test_one_pass_answers_every_candidate_lock(self, tmp_path: Path) -> None:
+        """The scan is per SWEEP, not per lock.
+
+        Each pass readlinks every descriptor of every process, so repeating it
+        per lock multiplies the syscalls by the number of locks — under exactly
+        the contention this module exists to handle, and serialising a
+        merge-lane abort behind it.
+        """
+        git_dir = tmp_path / 'gitdir'
+        locks = [
+            _plant_lock(git_dir, name, age_seconds=5)
+            for name in ('MERGE_RR.lock', 'config.lock', 'index.lock')
+        ]
+        passes: list[list[Path]] = []
+        real = rebase_recovery.scan_lock_holders
+
+        def spy(paths, **kwargs):
+            passes.append(list(paths))
+            return real(paths, **kwargs)
+
+        with patch.object(rebase_recovery, 'scan_lock_holders', side_effect=spy):
+            rebase_recovery.survey_locks(git_dir)
+
+        assert len(passes) == 1, f'{len(passes)} /proc passes for 3 locks'
+        assert sorted(passes[0]) == sorted(locks)
+
+
+class TestBlindnessIsNotEvidenceOfAbsence:
+    """A scan that could not run must retain, and must say why.
+
+    'No holder found' authorises a deletion.  When the finding is really 'no
+    scan happened', that same value deletes a lock something may well be
+    holding — biasing the failure the one direction a module whose contract is
+    never to make things worse cannot afford.
+    """
+
+    def test_an_unscannable_proc_retains_an_old_unheld_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        swept = rebase_recovery.sweep_stale_locks(
+            git_dir=tmp_path / 'gitdir', now=_NOW, stale_after_seconds=_STALE,
+            proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holders_confirmed is False
+        assert lock.exists(), 'a lock nothing could check must survive the sweep'
+
+    def test_the_reason_reaches_the_result(self, tmp_path: Path) -> None:
+        """A retained lock with no pids still owes the caller an explanation."""
+        result = rebase_recovery.PreflightResult(
+            worktree=tmp_path, dangling=(), unparsable=(), merge_rr_backup=None,
+            locks_removed=(),
+            locks_retained=(
+                rebase_recovery.LockFinding(
+                    path=tmp_path / 'MERGE_RR.lock', age_seconds=99999.0,
+                    holder_pids=(), holders_confirmed=False,
+                ),
+            ),
+        )
+
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert len(result.unrepaired) == 1
+        assert 'MERGE_RR.lock' in result.unrepaired[0]
+
+
+class TestSweepStaleLocks:
+    """Removal requires the CONJUNCTION of no holder AND age past threshold.
+
+    Age alone must never authorise removal: a legitimately held lock can be
+    arbitrarily old, and deleting it corrupts whatever still holds it.
+    """
+
+    def test_old_and_unheld_is_removed(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        swept = _swept(tmp_path / 'gitdir')
+
+        assert [s.path for s in swept.removed] == [lock]
+        assert swept.retained == ()
+        assert not lock.exists()
+
+    def test_old_but_HELD_is_retained(self, tmp_path: Path) -> None:
+        """The case age alone gets wrong, and the reason the conjunction exists."""
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        with lock.open('a'):
+            swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holder_pids == (os.getpid(),)
+        assert lock.exists()
+
+    def test_young_and_unheld_is_retained(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=5)
+
+        swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holder_pids == ()
+        assert lock.exists()
+
+    def test_young_and_held_is_retained(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=5)
+
+        with lock.open('a'):
+            swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert lock.exists()
+
+    def test_verdict_ignores_the_mtime_of_the_operation_the_lock_blocks(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE ordering trap from incident 3517, pinned so it cannot come back.
+
+        That lock's mtime (16:52:47) was OLDER than the rebase-merge directory
+        it blocked (17:33:50).  So "newer than the operation" would have
+        cleared a lock it must keep, and "older than the operation" would have
+        kept one it must clear — the relative comparison is wrong in BOTH
+        directions and is banned outright.  With a rebase-merge dir planted
+        NEWER than each lock, both verdicts must be unchanged from the cases
+        above: the blocked operation's mtime is never consulted.
+        """
+        git_dir = tmp_path / 'gitdir'
+        old = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        young = _plant_lock(git_dir, 'index.lock', age_seconds=5)
+        rebase_merge = git_dir / 'rebase-merge'
+        rebase_merge.mkdir()
+        fresh = _NOW.timestamp()
+        os.utime(rebase_merge, (fresh, fresh))
+
+        swept = _swept(git_dir)
+
+        assert [s.path for s in swept.removed] == [old]
+        assert [s.path for s in swept.retained] == [young]
+
+    def test_zero_byte_lock_is_not_treated_specially(self, tmp_path: Path) -> None:
+        """Size is not a liveness signal: git's locks are empty while held.
+
+        The incident's lock was 0 bytes AND stale; a 0-byte lock held right now
+        is indistinguishable by size and must still be retained.
+        """
+        git_dir = tmp_path / 'gitdir'
+        lock = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        assert lock.stat().st_size == 0
+
+        with lock.open('a'):
+            held = _swept(git_dir)
+        unheld = _swept(git_dir)
+
+        assert held.removed == ()
+        assert [s.path for s in unheld.removed] == [lock]
+
+    def test_removal_logs_both_the_age_and_the_holder_finding(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Both halves of the conjunction are evidence, so both are reported."""
+        git_dir = tmp_path / 'gitdir'
+        lock = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=7200)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            _swept(git_dir)
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(lock) in logged
+        assert '7200' in logged
+        assert 'holder' in logged.lower()
+
+    def test_an_abandoned_index_lock_is_swept_and_a_held_one_is_not(
+        self, tmp_path: Path,
+    ) -> None:
+        """The sweep's scope is deliberately wider than the lock that motivated it.
+
+        ``MERGE_RR.lock`` is what incident 3517 left behind, but rc 128 comes
+        equally from ``index.lock``: git refuses the abort with the same
+        unactionable "Another git process seems to be running" whichever
+        sentinel is stale.  A reader deciding whether it is safe to point
+        ``guarded_abort`` at a new path should not have to derive that scope
+        from a glob, so it is asserted here rather than left incidental — with
+        the held control beside it, because the breadth is only defensible
+        while the conjunction holds for every file it reaches.
+        """
+        git_dir = tmp_path / 'gitdir'
+        swept_lock = _plant_lock(git_dir, 'index.lock', age_seconds=_STALE * 2)
+        held_lock = _plant_lock(git_dir, 'config.lock', age_seconds=_STALE * 2)
+
+        with held_lock.open('a'):
+            swept = _swept(git_dir)
+
+        assert [s.path for s in swept.removed] == [swept_lock]
+        assert not swept_lock.exists()
+        assert [s.path for s in swept.retained] == [held_lock]
+        assert held_lock.exists(), 'breadth must not outrun the conjunction'
+
+    def test_only_lock_files_directly_under_the_git_dir_are_considered(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        nested = git_dir / 'refs'
+        plain = _plant_lock(git_dir, 'ORIG_HEAD', age_seconds=_STALE * 2)
+        deep = _plant_lock(nested, 'heads.lock', age_seconds=_STALE * 2)
+
+        swept = _swept(git_dir)
+
+        assert plain.exists()
+        assert deep.exists()
+        assert [s.path.name for s in swept.removed] == ['MERGE_RR.lock']
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the two recoveries this task exists for
+# ---------------------------------------------------------------------------
+
+def _make_dangling(repo: Path, conflict_id: str) -> None:
+    """Delete the rr-cache directory MERGE_RR points at, leaving the ref dangling."""
+    shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+
+
+class TestPreflightEndToEnd:
+    """The full guarded-recovery path against a real wedged repository.
+
+    BOTH measured failure modes get a behavioural case here, because the module
+    carries a separate half for each and either half could rot green: the
+    dangling rr-cache ref that the quarantine answers, and the ``MERGE_RR.lock``
+    that the sweep and the guard answer between them.  Each has its negative
+    control beside it — a healthy fixture for the first, a lock too young to
+    sweep for the second.
+
+    What is deliberately NOT asserted: how an UNGUARDED abort fails.  On git
+    2.43.0 it segfaults on the dangling ref (measured rc 139) and dies rc 128
+    on the lock (measured, with the rebase state left intact) — but the first
+    is an upstream ``rerere_clear()`` bug this task puts out of scope, and
+    pinning either would turn the day the host's git changes into a red suite,
+    with the fix reading as the regression.  The guarded post-conditions
+    asserted instead are version-independent and still fail loudly if the
+    preflight regresses.
+    """
+
+    def test_dangling_ref_is_detected_quarantined_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        pre_rebase_tip = _git_ok(repo, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert [r.conflict_id for r in result.dangling] == [conflict_id]
+        assert result.verdict == 'repaired'
+
+        assert result.merge_rr_backup is not None
+        assert not (repo / '.git' / 'MERGE_RR').exists()
+        assert conflict_id.encode() in result.merge_rr_backup.read_bytes()
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert _git_ok(repo, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+        assert _git_ok(repo, 'rev-parse', '--abbrev-ref', 'HEAD').strip() == 'feature'
+        assert result.merge_rr_backup.exists(), 'evidence must outlive the abort'
+
+    def test_healthy_mid_rebase_worktree_is_left_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        """The negative control that stops the case above passing vacuously.
+
+        Same fixture, rr-cache INTACT.  If the preflight reported dangling refs
+        here it would quarantine healthy state on every wedged rebase in the
+        fleet, and the assertion above would hold no matter what the classifier
+        did.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        original = (repo / '.git' / 'MERGE_RR').read_bytes()
+
+        result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.dangling == ()
+        assert result.merge_rr_backup is None
+        assert result.verdict == 'clean'
+        assert (repo / '.git' / 'MERGE_RR').read_bytes() == original
+        assert _specimens(repo / '.git') == []
+
+    def test_an_abandoned_lock_is_swept_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        """The OTHER defect, end to end: intact rr-cache, abandoned lock, rc 0.
+
+        This mode is independent of the dangling ref — it reproduces with a
+        perfectly healthy rr-cache — and until now only its unit halves were
+        covered, against synthetic git dirs.  A lock left by a process that is
+        long gone is exactly the state incident 3517 left behind, and the
+        repair asserted here is the sweep's: the lock is named in
+        ``locks_removed`` and gone from disk.
+
+        The MERGE_RR assertions are the control that keeps the two halves
+        honest.  It is healthy, so it must be left exactly where git put it —
+        a sweep that dragged a healthy MERGE_RR into quarantine would satisfy
+        every other assertion in this case while destroying state on every
+        wedged rebase in the fleet.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        pre_rebase_tip = _git_ok(repo, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            repo, now=_NOW, lock_stale_after_seconds=_STALE,
+        )
+
+        assert [finding.path for finding in result.locks_removed] == [lock]
+        assert not lock.exists()
+        assert result.verdict == rebase_recovery.VERDICT_REPAIRED
+
+        assert result.dangling == ()
+        assert result.merge_rr_backup is None
+        assert merge_rr.read_bytes() == original
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert _git_ok(repo, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+
+    def test_a_lock_too_young_to_sweep_is_recovered_by_the_guard_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """The control for ``RECOVERY_GIT`` itself, and the only one there is.
+
+        MEASURED on git 2.43.0: an abort refuses while ANY ``MERGE_RR.lock``
+        exists — rc 128, "Another git process seems to be running", rebase
+        state intact — and age is nothing to git.  Age is the SWEEP's concern,
+        and here it declines: a lock this young may still be live, and the
+        sweep will not guess.  So no repair happened, the verdict is ``clean``,
+        the lock is still on disk — and the abort below still returns 0.
+
+        Nothing but the ``rerere.enabled=false`` prefix can be carrying that.
+        MEASURED by reducing ``RECOVERY_GIT`` to a bare ``('git',)``: this is
+        the only BEHAVIOURAL case in the module that goes red — the two others
+        that fail assert the token itself, not a recovery.  Both end-to-end
+        cases above keep passing, because their own repair covers for the
+        missing prefix, the quarantine for the dangling ref and the sweep for
+        the abandoned lock.  That is the evidence for the module header's claim
+        that the guard and the repairs are independently load-bearing rather
+        than one of them dead weight.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE / 2)
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            repo, now=_NOW, lock_stale_after_seconds=_STALE,
+        )
+
+        assert result.locks_removed == ()
+        assert [finding.path for finding in result.locks_retained] == [lock]
+        assert result.verdict == 'clean'
+        assert lock.exists(), 'a lock young enough to be live is left alone'
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert lock.exists(), 'the guard recovers around the lock, not through it'
+
+
+class TestTheGitProbeIsBounded:
+    """The module's one subprocess cannot hang the lane it exists to unwedge.
+
+    The probe sits on the critical path of every abort in the merge lane and
+    runs against worktrees that are damaged by construction, so a hang there
+    wedges the recovery rather than performing it — this module's own stated
+    anti-goal.
+
+    Asserted as a BOUND rather than by observing a hang, because a probe with
+    no timeout can only be caught by waiting forever, which is the failure
+    itself.  What is pinned is the thing whose absence makes
+    ``subprocess.TimeoutExpired`` unreachable and the ``git_probe_times_out``
+    totality arm vacuous.
+    """
+
+    def test_rev_parse_is_spawned_with_a_positive_timeout(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        spawned: list[dict] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            spawned.append(kwargs)
+            return real_run(*args, **kwargs)
+
+        with patch.object(rebase_recovery.subprocess, 'run', side_effect=spy):
+            resolved = rebase_recovery.resolve_git_dirs(repo)
+
+        assert resolved is not None, 'the control must be a resolvable worktree'
+        assert spawned, 'the probe must actually spawn'
+        assert spawned[0].get('timeout', 0) > 0
+
+
+class TestLinkedWorktreeIsTheProductionShape:
+    """Everything above builds standalone repos; production never passes one.
+
+    All four routed call sites operate on ``.worktrees/*`` or merge worktrees.
+    The per-worktree-vs-common split the module treats as load-bearing is
+    INVISIBLE in a standalone checkout — the two paths are the same directory,
+    so a classifier that resolved rr-cache under the wrong one would still pass
+    every case above.  Here they differ, which is what makes the split
+    falsifiable.
+    """
+
+    def test_resolve_returns_the_two_directories_that_actually_differ(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+
+        resolved = rebase_recovery.resolve_git_dirs(linked)
+
+        assert resolved is not None
+        git_dir, common_dir = resolved
+        assert git_dir.resolve() == (repo / '.git' / 'worktrees' / 'linked').resolve()
+        assert common_dir.resolve() == (repo / '.git').resolve()
+        assert git_dir.resolve() != common_dir.resolve()
+        assert (git_dir / 'MERGE_RR').exists(), 'MERGE_RR is per-worktree'
+        assert (common_dir / 'rr-cache').is_dir(), 'rr-cache is shared'
+
+    def test_a_dangling_ref_is_detected_quarantined_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        """The headline recovery, end to end, on the shape production passes."""
+        repo, linked, conflict_id = build_linked_mid_rebase_worktree(tmp_path)
+        shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        pre_rebase_tip = _git_ok(linked, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert [r.conflict_id for r in result.dangling] == [conflict_id]
+        assert result.verdict == 'repaired'
+        assert result.merge_rr_backup is not None
+        assert result.merge_rr_backup.parent.resolve() == (
+            repo / '.git' / 'rerere-specimens'
+        ).resolve(), (
+            'evidence belongs in the COMMON dir: the per-worktree git dir is '
+            'torn down by the very landing that makes the evidence worth having'
+        )
+        assert git_dir.name in result.merge_rr_backup.name, (
+            'a specimen in a shared directory must name the worktree it came from'
+        )
+        assert not (git_dir / 'MERGE_RR').exists()
+
+        abort = _run_argv(linked, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (git_dir / 'rebase-merge').exists()
+        assert _git_ok(linked, 'status', '--porcelain') == ''
+        assert _git_ok(linked, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+        assert result.merge_rr_backup.exists(), 'evidence must outlive the abort'
+
+    def test_the_specimen_outlives_the_worktree_it_came_from(
+        self, tmp_path: Path,
+    ) -> None:
+        """The assertion that makes the destination load-bearing, not cosmetic.
+
+        A quarantine BESIDE the original satisfies every other assertion in
+        this file: the bytes are preserved, the abort returns 0, and the
+        evidence outlives the ABORT.  It is still a no-op in production,
+        because ``.git/worktrees/<id>/`` is removed by the landing that
+        follows -- so the evidence survives exactly until the task succeeds,
+        which is the case nobody is looking at.  That is not hypothetical: it
+        is how the 5033 specimen was lost (merge ``dcbff02f00``), and task
+        4797's own record predicted the code would inherit it.
+
+        Tearing the worktree down is the ONLY thing that tells the two
+        destinations apart, which is why it is asserted here and nowhere else.
+        """
+        repo, linked, conflict_id = build_linked_mid_rebase_worktree(tmp_path)
+        shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert result.merge_rr_backup is not None
+        specimen = result.merge_rr_backup
+        preserved = specimen.read_bytes()
+        assert conflict_id.encode() in preserved
+
+        abort = _run_argv(linked, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+        _git_ok(repo, 'worktree', 'remove', '--force', str(linked))
+
+        assert not git_dir.exists(), (
+            'fixture expected the per-worktree admin dir to be torn down; '
+            'without that this test cannot discriminate'
+        )
+        assert specimen.exists(), (
+            'the specimen did not outlive its worktree -- preserving evidence '
+            'inside .git/worktrees/<id>/ is the no-op this destination exists '
+            'to avoid'
+        )
+        assert specimen.read_bytes() == preserved
+
+    def test_an_intact_shared_rr_cache_is_left_alone(self, tmp_path: Path) -> None:
+        """The control, and the one that falsifies resolving rr-cache wrongly.
+
+        rr-cache exists ONLY under the common dir, so a classifier looking for
+        it under the per-worktree dir finds nothing for every record and calls
+        a healthy worktree dangling — quarantining good state on every guarded
+        abort in the fleet.  In a standalone repo that mistake is unobservable.
+        """
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert result.dangling == ()
+        assert result.verdict == 'clean'
+        assert result.merge_rr_backup is None
+        assert (git_dir / 'MERGE_RR').read_bytes() == original
+        assert _specimens(repo / '.git') == []
+
+
+# ---------------------------------------------------------------------------
+# Discovery escape: the preflight must never repair a repository it was not
+# pointed at
+# ---------------------------------------------------------------------------
+
+class TestPreflightRepairsOnlyTheWorktreeItWasGiven:
+    """A cwd that is not itself a worktree must not be repaired via its parent.
+
+    Git's repository discovery walks UP.  A ``.worktrees/<id>`` that exists but
+    carries no ``.git`` — deleted or corrupted out-of-band, which is precisely
+    the wedged class this module is invoked for — therefore resolves to the
+    ENCLOSING repository, which in production is the machine-operated
+    ``project_root``.  The preflight's repairs are destructive, while the bare
+    abort it replaces was inert there ("no rebase in progress"), so an escape
+    would give a recovery helper blast radius the original code never had.
+
+    The guard is an identity check on ``--show-toplevel``, and the two cases
+    cover the two DIFFERENT routes by which git can hand back a repository that
+    is not the one asked about: the upward walk, and the environment naming one
+    outright.  A ceiling on the ascent would close only the first, which is why
+    the check is on the answer rather than on the search.
+    """
+
+    @staticmethod
+    def _wedged_outer_repo(tmp_path: Path) -> tuple[Path, Path]:
+        """A real repo holding repairable state, plus a plain dir nested in it."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=100_000)
+        nested = repo / '.worktrees' / '4797'
+        nested.mkdir(parents=True)
+        return repo, nested
+
+    @staticmethod
+    def _assert_outer_untouched(repo: Path) -> None:
+        git_dir = repo / '.git'
+        assert (git_dir / 'MERGE_RR').exists(), 'foreign MERGE_RR was quarantined'
+        assert _specimens(git_dir) == []
+        assert (git_dir / 'MERGE_RR.lock').exists(), 'foreign lock was unlinked'
+
+    def test_plain_directory_inside_a_repo_resolves_to_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, nested = self._wedged_outer_repo(tmp_path)
+
+        result = rebase_recovery.preflight_rebase_recovery(nested)
+
+        assert result.resolved is False
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert result.merge_rr_backup is None
+        assert result.locks_removed == ()
+        self._assert_outer_untouched(repo)
+
+    def test_a_repo_named_by_the_environment_is_rejected(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """``GIT_DIR``/``GIT_WORK_TREE`` name a repository instead of finding one.
+
+        The orchestrator hands agent subprocesses a copy of its own environment
+        (``agents/invoke.py``), so these arriving set is not hypothetical, and
+        they reach a foreign repository without any upward walk to intercept.
+        """
+        repo, nested = self._wedged_outer_repo(tmp_path)
+        monkeypatch.setenv('GIT_DIR', str(repo / '.git'))
+        monkeypatch.setenv('GIT_WORK_TREE', str(repo))
+
+        result = rebase_recovery.preflight_rebase_recovery(nested)
+
+        assert result.resolved is False
+        self._assert_outer_untouched(repo)
+
+
+# ---------------------------------------------------------------------------
+# git_ops wiring
+# ---------------------------------------------------------------------------
+
+async def _isolated_run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
+    """An :data:`rebase_recovery.AbortRunner` that keeps both isolation layers.
+
+    ``guarded_abort`` takes its runner as a PARAMETER, so a caller supplies one
+    rather than reaching into git_ops for the private ``_run`` it happens to
+    pass.  Here that parameter earns its keep twice over: these cases run real
+    aborts against real conflicted repos, and routing them through
+    :func:`_run_argv` keeps them inside the module's isolation contract.
+    """
+    assert cwd is not None
+    proc = _run_argv(Path(cwd), cmd)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _recording_run(recorded: list[list[str]]):
+    """A runner that records the command vector and spawns nothing.
+
+    Lets a case assert on command STRUCTURE — token order and membership —
+    rather than on a rendered line a harmless reflow would break.
+    """
+    async def run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
+        recorded.append(list(cmd))
+        return 0, '', ''
+
+    return run
+
+
+@contextlib.contextmanager
+def _guard_spy():
+    """Record every ``(verb, cwd)`` git_ops routes through the public guard.
+
+    Patches :func:`rebase_recovery.guarded_abort` — the seam the two modules
+    genuinely share — so the wiring cases are phrased in the vocabulary of that
+    interface instead of reaching through git_ops' private ``_run``.  The real
+    guard still runs underneath, so the abort these cases observe is the one
+    production issues.
+    """
+    recorded: list[tuple[str, Path]] = []
+    real_guard = rebase_recovery.guarded_abort
+
+    async def recording_guard(verb, cwd, run):
+        recorded.append((verb, Path(cwd)))
+        return await real_guard(verb, cwd, run)
+
+    with patch.object(rebase_recovery, 'guarded_abort', side_effect=recording_guard):
+        yield recorded
+
+
+def _make_git_ops(repo: Path):
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(config, repo)
+
+
+@pytest.mark.asyncio
+class TestGitOpsGuardedAbort:
+    """Every abort git_ops issues on a recovery path carries the guard."""
+
+    async def test_guarded_abort_recovers_a_dangling_mid_rebase_worktree(
+        self, tmp_path: Path,
+    ) -> None:
+        """The behavioural arm: real repo, real dangling ref, real recovery."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        rc, _, err = await rebase_recovery.guarded_abort(
+            'rebase', repo, _isolated_run,
+        )
+
+        assert rc == 0, err
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        backups = _specimens(repo / '.git')
+        assert len(backups) == 1
+        assert conflict_id.encode() in backups[0].read_bytes()
+
+    async def test_guarded_abort_emits_the_rerere_disabling_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        """Asserted by token ORDER, never by matching a rendered command line."""
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        recorded: list[list[str]] = []
+
+        await rebase_recovery.guarded_abort('rebase', repo, _recording_run(recorded))
+
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']]
+        assert recorded[0].index('rerere.enabled=false') < recorded[0].index('rebase')
+
+    async def test_preflight_runs_BEFORE_the_abort(self, tmp_path: Path) -> None:
+        """Ordering is the contract: a preflight after the abort guards nothing.
+
+        The abort DELETES MERGE_RR, so a preflight that ran afterwards would
+        find an empty worktree, report clean, and quarantine nothing — passing
+        every state assertion while preserving no evidence at all.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        observed: list[str] = []
+
+        real_preflight = rebase_recovery.preflight_rebase_recovery
+
+        def spy_preflight(worktree, **kwargs):
+            observed.append('preflight')
+            return real_preflight(worktree, **kwargs)
+
+        async def spy_run(cmd, cwd=None, **kwargs):
+            observed.append('abort')
+            return await _isolated_run(cmd, cwd=cwd, **kwargs)
+
+        with patch.object(
+            rebase_recovery, 'preflight_rebase_recovery', side_effect=spy_preflight,
+        ):
+            await rebase_recovery.guarded_abort('rebase', repo, spy_run)
+
+        assert observed == ['preflight', 'abort']
+        backups = _specimens(repo / '.git')
+        assert len(backups) == 1, 'the preflight that ran first kept the evidence'
+        assert conflict_id.encode() in backups[0].read_bytes()
+
+    async def test_rebase_onto_main_failure_path_aborts_through_the_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(repo)
+
+        assert landed is False, 'fixture expected the rebase to conflict'
+        assert recorded == [('rebase', repo)]
+
+    async def test_abort_merge_aborts_through_the_same_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """Included for UNIFORMITY, and the docstring says why.
+
+        ``git merge --abort`` was measured NOT to crash on a dangling ref
+        (rc 0), so this site needs no crash-avoidance.  It still consumes
+        MERGE_RR and can still hit the stale-lock rc 128, and a per-site
+        carve-out is a rule a future reader has to re-derive before they can
+        safely touch any of the four.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            await ops.abort_merge(repo)
+
+        assert recorded == [('merge', repo)]
+
+
+@pytest.mark.asyncio
+class TestGuardedAbortReportsWhatThePreflightCouldNotRepair:
+    """Findings the preflight could not repair must reach the log of the abort.
+
+    ``guarded_abort`` proceeds unconditionally, and that is deliberate — an
+    unguarded abort beats no abort at all.  Proceeding SILENTLY is the part
+    that costs: ``sweep_stale_locks`` logs only REMOVALS, so a lock RETAINED
+    because something still holds it is logged nowhere, and the abort then
+    fails rc 128 with git's "Another git process seems to be running", which
+    names no remedy.  The pid that names it was computed moments earlier.
+    """
+
+    async def test_a_held_lock_pid_is_logged_and_the_abort_still_runs(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        recorded: list[list[str]] = []
+
+        with lock.open('a'), caplog.at_level(
+            logging.WARNING, logger='orchestrator.rebase_recovery',
+        ):
+            await rebase_recovery.guarded_abort(
+                'rebase', repo, _recording_run(recorded),
+            )
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(os.getpid()) in logged, logged
+        assert str(lock) in logged, logged
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']], (
+            'the guard reports, it never blocks'
+        )
+
+
+def _failing_run(rc: int = 128, stderr: str = 'fatal: No rebase in progress?'):
+    """A runner whose abort FAILS, spawning nothing.
+
+    The two cases below must differ ONLY in what is on disk, so the abort's
+    exit code is held fixed here rather than coming from a real git.
+    """
+    async def run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
+        return rc, '', stderr
+    return run
+
+
+@pytest.mark.asyncio
+class TestGuardedAbortLogsOnlyAWedgedFailure:
+    """A non-zero abort has two meanings, and only one is worth waking anyone.
+
+    ``git rebase --abort`` exits non-zero when it could not undo an interrupted
+    rebase AND when there was no rebase to undo.  The second is routine -- a
+    defensive abort, or a rebase that failed BEFORE starting one (an unstaged
+    change, a bad revision) -- and ``advance_main`` takes exactly that path.
+    Warning there would cry wolf on a common route and assert a half-applied
+    tree that does not exist.
+
+    The pair below is the discriminator: the SAME failing abort against two
+    worktrees that differ only in whether the operation is still on disk.
+    """
+
+    async def test_a_failed_abort_over_a_live_rebase_is_logged(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        assert (repo / '.git' / 'rebase-merge').exists(), (
+            'fixture expected an interrupted rebase'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            rc, _, _ = await rebase_recovery.guarded_abort(
+                'rebase', repo, _failing_run(),
+            )
+
+        assert rc == 128
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'STILL THERE' in logged, logged
+        assert '128' in logged, logged
+
+    async def test_a_failed_abort_with_nothing_to_abort_is_silent(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The case the git_ops divergence canary caught: no rebase, no alarm."""
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, *rebase_recovery.RECOVERY_GIT[1:], 'rebase', '--abort')
+        assert not (repo / '.git' / 'rebase-merge').exists(), (
+            'fixture expected a clean worktree; without that this case cannot '
+            'discriminate'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            rc, _, _ = await rebase_recovery.guarded_abort(
+                'rebase', repo, _failing_run(),
+            )
+
+        assert rc == 128, 'the failure still reaches the caller unchanged'
+        assert [r.getMessage() for r in caplog.records] == [], (
+            'an abort that found nothing to abort is not a wedged worktree'
+        )
+
+
+class TestGitOpsAbortUniformity:
+    """SPOT, enforced against the FILE rather than against known call sites."""
+
+    def test_no_unguarded_abort_vector_survives_anywhere_in_git_ops(self) -> None:
+        """SPOT, enforced against the file rather than against known call sites.
+
+        Four sites route through one guard precisely so a future edit cannot
+        fix three and miss the fourth.  A per-site spy cannot see that: it
+        asserts about the sites it already knows, so a newly ADDED fifth
+        unguarded abort passes it silently.  Scanning the module closes that,
+        and it is the only assertion here that gets stronger as the file grows.
+
+        Scanned as a SYNTAX TREE, not as text.  git_ops discusses ``git rebase
+        --abort`` in prose, and a line-regex spares it only by the accident of
+        which delimiters that prose happens to use — so the text version failed
+        on documentation edits that broke nothing, and would have pressured a
+        future author to reword a comment to appease a test.  A ``Constant``
+        equal to ``'--abort'`` cannot be prose: comments are absent from the
+        tree entirely and a docstring is one long string, never that token.
+
+        The routed count is a FLOOR, not an equality.  A legitimate fifth
+        guarded site is the behaviour this test exists to encourage, and
+        equality turned it into a red suite reading as a regression.  The floor
+        still does the job equality was there for — it is what fails if a
+        future edit deletes the calls rather than guarding them.
+        """
+        tree = ast.parse(Path(git_ops_module.__file__).read_text())
+
+        offenders = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == '--abort'
+        ]
+        assert [node.lineno for node in offenders] == []
+
+        routed = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'guarded_abort'
+        ]
+        assert len(routed) >= 4, [node.lineno for node in routed]
+
+
+# ---------------------------------------------------------------------------
+# Fail-safe: the guard never becomes the reason recovery fails
+# ---------------------------------------------------------------------------
+
+class TestVanishedWorktreeKeepsTheTypedException:
+    """A worktree deleted out-of-band must still surface as ``WorktreeMissing``.
+
+    The orchestrator races humans who delete a task worktree mid-flight, and
+    two consumers pattern-match the typed exception to recover: merge_queue's
+    ``except WorktreeMissing`` logs ``exc.path``, cleans up the merge worktree
+    and surfaces the task ``blocked``; steward's auto-escalates naming
+    ``exc.path``.  Both read ``.path``, and a bare ``FileNotFoundError``
+    carries neither the type nor the attribute — it escapes to a broader
+    handler with a different disposition and no worktree cleanup.
+
+    Inserting a preflight AHEAD of the abort put a second subprocess spawn in
+    front of ``_run``'s own typed pre-flight check, so the generic error now
+    wins the race.  ``WorktreeMissing`` subclasses ``FileNotFoundError``, so
+    this discriminates: the parent is not an instance of the subclass.
+
+    :meth:`TestPreflightCli.test_an_unresolvable_worktree_does_not_crash_the_cli`
+    does not cover this.  It points at a directory that EXISTS but is not a
+    repository — git runs and exits non-zero — whereas here git never spawns
+    at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_abort_on_a_vanished_worktree_raises_the_typed_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """Through ``GitOps.abort_merge``: the production wiring, unmocked."""
+        vanished = tmp_path / 'deleted-out-of-band'
+        ops = _make_git_ops(tmp_path)
+
+        with pytest.raises(git_ops_module.WorktreeMissing) as caught:
+            await ops.abort_merge(vanished)
+
+        assert caught.value.path == vanished
+
+    def test_preflight_on_a_vanished_worktree_reports_unresolved(
+        self, tmp_path: Path,
+    ) -> None:
+        """The unit arm: an unspawnable cwd degrades, it does not raise.
+
+        Degrading is not the same as reporting health — nothing here was
+        inspected, so the verdict says ``blocked`` while the abort above still
+        runs and still raises the typed exception this class exists for.
+        """
+        vanished = tmp_path / 'deleted-out-of-band'
+
+        result = rebase_recovery.preflight_rebase_recovery(vanished)
+
+        assert result.resolved is False
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+
+def _quarantine_move_fails(monkeypatch, error: OSError) -> None:
+    """Make the quarantine's MOVE of MERGE_RR fail with a chosen errno.
+
+    Targets ``os.link``, which is the claim half of the link-then-unlink the
+    quarantine performs — chosen over ``rename`` precisely because it fails
+    rather than silently replacing a backup another run just claimed.  The
+    errno must not be ``EEXIST``: that one is the retry path, not a failure.
+
+    Monkeypatched rather than ``chmod``ed.  ``chmod`` is a no-op for root, so a
+    permission-bit fixture asserts nothing wherever CI runs as root — the same
+    vacuous pass this module's own header warns about for "abort works" on a
+    healthy worktree.  A monkeypatch is deterministic and root-independent, and
+    it models the likelier race more directly anyway: a concurrent process
+    unlinking MERGE_RR between the scan's ``read_bytes`` and the quarantine's
+    move produces an errno, not a permission change.
+
+    Scoped to the MERGE_RR name so every other link in the process — pytest's
+    own bookkeeping included — still works.
+    """
+    real_link = os.link
+
+    def link(src, dst, **kwargs):
+        if Path(src).name == 'MERGE_RR':
+            raise error
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, 'link', link)
+
+
+def _quarantine_removal_fails(monkeypatch, error: OSError) -> None:
+    """Make the quarantine's REMOVAL of the original MERGE_RR fail.
+
+    The other half of the link-then-unlink :func:`_quarantine_move_fails`
+    covers.  Both halves have to be reachable independently, because they leave
+    DIFFERENT states behind: a failed claim leaves one file, a failed removal
+    leaves two — the evidence and the damage.
+
+    Scoped to the MERGE_RR name for the reasons given above, and here that
+    scoping is load-bearing rather than merely tidy: ``Path.unlink`` is how
+    ``sweep_stale_locks`` clears a lock and how pytest tears its own temporary
+    files down, so an unscoped patch would fail the sweep in the same breath
+    and the case would no longer be about the quarantine at all.
+    """
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self.name == 'MERGE_RR':
+            raise error
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', unlink)
+
+
+class TestQuarantineFailureDoesNotSwallowTheAbort:
+    """A repair this module cannot perform degrades into the RESULT, not an exception.
+
+    The module exists to stop a recovery path failing hard, so a preflight that
+    raises makes it the NEW reason recovery fails — strictly worse than having
+    no preflight at all.  Measured on this branch with a read-only git dir:
+    the quarantine's unguarded move raised ``PermissionError`` out through
+    ``guarded_abort``, THE ABORT NEVER RAN, and the worktree was left wedged.
+
+    ``sweep_stale_locks`` already had the right shape — ``except OSError``
+    around ``unlink``, counting the lock as retained — so the module's two
+    mutating repairs degraded differently for no reason a reader could derive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_abort_is_still_issued_and_the_evidence_survives(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Nothing escapes, the guarded vector is still emitted, MERGE_RR stays.
+
+        The runner records instead of spawning, so the abort that would
+        otherwise DELETE MERGE_RR does not run — which is what lets the same
+        case assert both that the abort was issued and that a failed move
+        destroyed no evidence.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        _quarantine_move_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+        recorded: list[list[str]] = []
+
+        rc, _, _ = await rebase_recovery.guarded_abort(
+            'rebase', repo, _recording_run(recorded),
+        )
+
+        assert rc == 0
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']]
+        assert recorded[0].index('rerere.enabled=false') < recorded[0].index('rebase')
+        assert merge_rr.read_bytes() == original
+
+    def test_the_failure_is_reported_as_unrepaired_and_logged(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """``guarded_abort`` discards the result, so the report is asserted here.
+
+        No new reporting machinery is needed for this: a suspect scan with no
+        backup is already rendered by ``unrepaired`` and already turns the
+        verdict ``blocked``, so the operator is told precisely what was left
+        un-repaired while the abort proceeds regardless.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        _quarantine_move_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.merge_rr_backup is None
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert conflict_id in ' '.join(result.unrepaired)
+        assert merge_rr.exists()
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(merge_rr) in logged
+
+    def test_a_copy_the_original_outlived_is_not_a_repair(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """Half a move is no move: the damage is still on disk, so say so.
+
+        The move's SECOND half failing is the tempting one to call a success —
+        the evidence is safely copied, and the abort ahead deletes the original
+        anyway.  Calling it one would hand a caller ``repaired`` for a worktree
+        whose suspect MERGE_RR never went anywhere, which is precisely the
+        report-only dishonesty ``verdict``'s own docstring rules out, and the
+        skills branch on that word alone.  ``blocked`` costs nothing here: the
+        guarded abort proceeds on any verdict.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        _quarantine_removal_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert result.merge_rr_backup is None
+        assert conflict_id in ' '.join(result.unrepaired)
+        assert merge_rr.read_bytes() == original, 'the damage is still in place'
+
+        backups = _specimens(repo / '.git')
+        assert [b.read_bytes() for b in backups] == [original], (
+            'the copy the first half made is evidence, and it must survive'
+        )
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(backups[0]) in logged, 'an unnamed copy is a copy no one finds'
+
+def _merge_rr_read_fails(monkeypatch, error: OSError) -> None:
+    """Make reading MERGE_RR fail with a chosen errno, by the same means as above.
+
+    Monkeypatched for the reasons :func:`_quarantine_rename_fails` gives, plus
+    one this case adds: it pins ``IsADirectoryError`` and ``PermissionError``
+    as DISTINCT states, where a real fixture would hand back whichever errno
+    the filesystem and euid happened to produce.
+
+    Scoped to the MERGE_RR name, so the quarantined backup — a different name —
+    is still readable, and a case can assert the evidence survived.
+    """
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(self: Path):
+        if self.name == 'MERGE_RR':
+            raise error
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', read_bytes)
+
+
+def vanished_worktree(tmp_path: Path, monkeypatch) -> Path:
+    """Deleted out-of-band: ``git`` cannot be spawned, so there is no exit code."""
+    return tmp_path / 'deleted-out-of-band'
+
+
+def worktree_is_a_file(tmp_path: Path, monkeypatch) -> Path:
+    """Same spawn failure, different errno (``ENOTDIR``) — a distinct code path in."""
+    path = tmp_path / 'a-file'
+    path.write_text('not a directory\n')
+    return path
+
+
+def merge_rr_is_a_directory(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose MERGE_RR cannot be read as a file (``EISDIR``)."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+    _merge_rr_read_fails(
+        monkeypatch, IsADirectoryError(errno.EISDIR, 'Is a directory'),
+    )
+    return repo
+
+
+def merge_rr_is_unreadable(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose MERGE_RR cannot be read at all (``EACCES``)."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+    _merge_rr_read_fails(
+        monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+    )
+    return repo
+
+
+def git_probe_times_out(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose ``git rev-parse`` probe never answers."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd='git rev-parse', timeout=1)
+
+    monkeypatch.setattr(rebase_recovery.subprocess, 'run', _timeout)
+    return repo
+
+
+#: Hostile states the preflight must survive.  Every one was MEASURED to raise
+#: on this branch before the guards landed, so none of them is a hypothetical.
+HOSTILE_STATES = (
+    vanished_worktree,
+    worktree_is_a_file,
+    merge_rr_is_a_directory,
+    merge_rr_is_unreadable,
+    git_probe_times_out,
+)
+
+
+class TestPreflightIsTotal:
+    """The fail-safe contract is an INVARIANT over the entry point, not two patches.
+
+    Both docstrings in the module already assert it — ``guarded_abort``'s "It
+    never raises", ``preflight_rebase_recovery``'s "no filesystem state makes
+    this raise" — and what review found is
+    that the contract did not hold.  The two defects it named were instances;
+    pinning only those leaves the defect class live, and leaves the prose
+    untrue for the next reader who relies on it.
+
+    So the battery is over STATES, not over the call sites that happened to be
+    found.  ``survey_locks`` is deliberately absent: ``Path.glob`` on an
+    unreadable directory was measured to yield ``[]`` rather than raise, so a
+    glob arm would assert a hole that does not exist.
+    """
+
+    @pytest.mark.parametrize('report_only', [False, True])
+    @pytest.mark.parametrize(
+        'make_worktree', HOSTILE_STATES, ids=lambda f: f.__name__,
+    )
+    def test_no_hostile_state_makes_the_preflight_raise(
+        self, make_worktree, report_only: bool, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Both arms of the one public flag: report-only takes different branches."""
+        worktree = make_worktree(tmp_path, monkeypatch)
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            worktree, report_only=report_only,
+        )
+
+        assert isinstance(result, rebase_recovery.PreflightResult)
+        assert result.verdict in {
+            rebase_recovery.VERDICT_CLEAN,
+            rebase_recovery.VERDICT_REPAIRED,
+            rebase_recovery.VERDICT_BLOCKED,
+        }
+
+    def test_a_merge_rr_that_could_not_be_read_is_never_called_clean(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Surviving is not enough — the survivor must not report a lie.
+
+        Folding an unreadable MERGE_RR into the absent/healthy branch would
+        make the preflight say ``clean`` about a file it never managed to
+        inspect, which is exactly the dishonesty ``PreflightResult.verdict``'s
+        own docstring argues against for ``report_only``.  Absent means
+        healthy; unreadable means unknown, and unknown is not healthy.
+        """
+        repo = merge_rr_is_unreadable(tmp_path, monkeypatch)
+
+        repaired = rebase_recovery.preflight_rebase_recovery(repo)
+        assert repaired.verdict != rebase_recovery.VERDICT_CLEAN
+        assert repaired.merge_rr_backup is not None, 'evidence is still preserved'
+        assert not (repo / '.git' / 'MERGE_RR').exists()
+
+    def test_an_unreadable_merge_rr_is_reported_unrepaired_when_nothing_moves(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Report-only leaves it in place, so the caller must be told it is there."""
+        repo = merge_rr_is_unreadable(tmp_path, monkeypatch)
+
+        reported = rebase_recovery.preflight_rebase_recovery(repo, report_only=True)
+
+        assert reported.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert reported.unrepaired
+        assert (repo / '.git' / 'MERGE_RR').exists()
+
+# ---------------------------------------------------------------------------
+# The CLI the skills invoke
+# ---------------------------------------------------------------------------
+
+class TestPreflightCli:
+    """The contract both SKILL.md files already use for ``b3_gate check``.
+
+    They invoke it, parse JSON from stdout, and branch on a ``verdict`` string.
+    Matching that shape verbatim means the skills edit reuses a sentence
+    pattern already in those files rather than inventing a second convention.
+    """
+
+    def _run_cli(self, capsys, *argv: str) -> tuple[int, dict]:
+        code = rebase_recovery.main(list(argv))
+        out = capsys.readouterr().out
+        return code, json.loads(out)
+
+    def test_dangling_fixture_reports_repaired_with_the_id_and_backup(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        code, payload = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        assert code == 0
+        assert payload['verdict'] == 'repaired'
+        assert [d['conflict_id'] for d in payload['dangling']] == [conflict_id]
+        assert payload['merge_rr_backup'] is not None
+        assert Path(payload['merge_rr_backup']).exists()
+
+    def test_healthy_fixture_reports_clean_with_no_backup(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+
+        code, payload = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        assert code == 0
+        assert payload['verdict'] == 'clean'
+        assert payload['dangling'] == []
+        assert payload['merge_rr_backup'] is None
+
+    def test_report_only_detects_without_moving_anything(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Detection and reporting with zero mutation, so an operator can look first."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+
+        code, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert code == 0
+        assert [d['conflict_id'] for d in payload['dangling']] == [conflict_id]
+        assert payload['merge_rr_backup'] is None
+        assert merge_rr.read_bytes() == original
+        assert _specimens(repo / '.git') == []
+
+    def test_stdout_is_exactly_one_json_object(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """A caller does ``json.loads(stdout)``; a second line or a log breaks it."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        rebase_recovery.main(['preflight', '--worktree', str(repo)])
+
+        out = capsys.readouterr().out
+        assert len([line for line in out.splitlines() if line.strip()]) == 1
+        assert isinstance(json.loads(out), dict)
+
+    def test_verdict_is_always_one_of_the_documented_enum(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        _, repaired = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+        _, again = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        allowed = {
+            rebase_recovery.VERDICT_CLEAN,
+            rebase_recovery.VERDICT_REPAIRED,
+            rebase_recovery.VERDICT_BLOCKED,
+        }
+        assert repaired['verdict'] in allowed
+        assert again['verdict'] in allowed
+
+    def test_lock_stale_after_seconds_is_a_flag_not_a_config_knob(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The threshold varies per invocation, so it is an argument, not config.
+
+        A young unheld lock is retained at the default and swept once the
+        caller lowers the threshold below its age — which is the only
+        observable difference the flag is supposed to make.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        _, default = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+        assert default['locks_removed'] == []
+        assert lock.exists()
+
+        _, lowered = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo),
+            '--lock-stale-after-seconds', '0',
+        )
+        assert [Path(f['path']).name for f in lowered['locks_removed']] == [
+            'MERGE_RR.lock',
+        ]
+        assert not lock.exists()
+
+    def test_an_unresolvable_worktree_does_not_crash_the_cli(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Fail-safe all the way out: exit 0 with an honest verdict, never a crash.
+
+        Exit code and verdict answer different questions, and the CLI's whole
+        contract is that the first never carries the second: a non-zero exit
+        would make a skill treat a completed inspection as a failed command.
+        """
+        not_a_repo = tmp_path / 'plain'
+        not_a_repo.mkdir()
+
+        code, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(not_a_repo),
+        )
+
+        assert code == 0
+        assert payload['resolved'] is False
+
+    def test_a_worktree_that_could_not_be_resolved_is_never_called_clean(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Nothing inspected is the least known state there is, not the healthiest.
+
+        The enum is the only thing either skill branches on — both read
+        `verdict`, neither reads `resolved` — so a `clean` here tells a caller
+        to proceed on a worktree no one looked at, and with a live lock present
+        that abort then fails rc 128 with no prior warning.  The sibling
+        contract is already pinned for a MERGE_RR that could not be READ; a
+        worktree that was never opened at all cannot be the healthier answer.
+        """
+        not_a_repo = tmp_path / 'plain'
+        not_a_repo.mkdir()
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(not_a_repo),
+        )
+
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(not_a_repo) in ' '.join(payload['unrepaired'])
+
+    def test_report_only_never_calls_detected_damage_clean(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """`clean` must mean "nothing needs attention", not "I changed nothing".
+
+        The two coincide everywhere EXCEPT here, and this is the case a caller
+        acts on: report-only deliberately leaves the damage in place, so a
+        verdict derived purely from what was MUTATED reports `clean` for a
+        worktree it just described as dangling.  A skill branching on the
+        verdict — which is the whole point of the enum — would then proceed
+        unguarded into exactly the state the preflight exists to catch.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert payload['dangling'], 'fixture expected a detected dangling ref'
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert conflict_id in ' '.join(payload['unrepaired'])
+
+    def test_report_only_names_the_lock_a_repairing_run_would_have_removed(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The lock half of the same contract the dangling half already holds.
+
+        A stale unheld lock is one of the exact two failure modes this module
+        exists for.  Report-only used to render it as merely *retained* — the
+        bucket reserved for locks nothing will touch — so the verdict came back
+        `clean` for a worktree the repairing run fixes, and `skills/unblock`
+        reads any non-`blocked` verdict as licence to run a plain
+        `git rebase --abort`.  That abort fails rc 128 on the lock still
+        sitting there.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+        os.utime(lock, (0, 0))
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(lock) in ' '.join(payload['unrepaired'])
+        assert lock.exists(), 'report-only must not remove it'
+        assert payload['locks_removed'] == []
+
+    def test_report_only_honours_the_staleness_threshold_flag(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """`--report-only` and `--lock-stale-after-seconds` must compose.
+
+        The flag used never to reach the report-only path at all, which made
+        the combination silently inert: the two answers a caller can ask for —
+        "what is wrong" and "what would you fix at THIS threshold" — have to be
+        the same question asked of the same predicate, or report-only is not a
+        preview of anything.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        _, defaulted = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+        _, lowered = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+            '--lock-stale-after-seconds', '0',
+        )
+
+        assert defaulted['verdict'] == rebase_recovery.VERDICT_CLEAN
+        assert lowered['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(lock) in ' '.join(lowered['unrepaired'])
+        assert lock.exists(), 'report-only must not remove it at any threshold'
+
+    def test_a_held_lock_blocks_even_when_everything_else_was_repaired(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The other unrepaired arm: a live holder is a human's decision."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        with lock.open('a'):
+            _, payload = self._run_cli(
+                capsys, 'preflight', '--worktree', str(repo),
+                '--lock-stale-after-seconds', '0',
+            )
+
+        assert payload['merge_rr_backup'] is not None, 'MERGE_RR was still repaired'
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(os.getpid()) in ' '.join(payload['unrepaired'])

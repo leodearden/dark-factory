@@ -89,20 +89,22 @@ class TestJcodemunchLaunchPinned:
 
     def test_command_is_prebuilt_launcher_not_uvx(self):
         """JCODEMUNCH_COMMAND is 'jcodemunch-mcp' (prebuilt, not 'uvx')."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND
+        from shared.jcodemunch_launch import JCODEMUNCH_COMMAND
 
         assert JCODEMUNCH_COMMAND == 'jcodemunch-mcp'
         assert JCODEMUNCH_COMMAND != 'uvx'
 
     def test_env_contains_no_version_hint(self):
         """JCODEMUNCH_ENV contains JCODEMUNCH_NO_VERSION_HINT."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_ENV
+        from shared.jcodemunch_launch import JCODEMUNCH_ENV
 
         assert 'JCODEMUNCH_NO_VERSION_HINT' in JCODEMUNCH_ENV
 
     def test_mcp_config_json_uses_constants(self, mock_orch_config):
         """mcp_config_json() jcodemunch entry matches constants (regression guard)."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV, McpLifecycle
+        from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
+
+        from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
         lifecycle = McpLifecycle(mock_orch_config)
@@ -124,7 +126,7 @@ class TestJcodemunchLaunchPinned:
         silently reverting to the worktree-collapsing git-root default) — so
         this must assert the literal value, not just key presence.
         """
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_ENV
+        from shared.jcodemunch_launch import JCODEMUNCH_ENV
 
         assert 'JCODEMUNCH_GIT_ROOT_IDENTITY' in JCODEMUNCH_ENV
         assert JCODEMUNCH_ENV['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'

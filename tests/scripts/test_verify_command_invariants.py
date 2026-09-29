@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import pathlib
 import posixpath
+import re
 import shlex
 
 import pytest
@@ -611,3 +612,270 @@ def test_flag_args_scope_is_the_callers_choice_not_a_default() -> None:
     prefixes = ("--skip", "-p", "--project")
     assert vci.flag_args(shlex.split(segment), prefixes) == ["--project"]
     assert vci.flag_args(vci.anchor_split(segment, "pyright")[1], prefixes) == []
+
+
+# ---------------------------------------------------------------------------
+# pyright_clause_cwds
+# ---------------------------------------------------------------------------
+
+# The live fleet chain's SHAPE, spelled out as a literal rather than read from
+# dark-factory-orchestrator.yaml — this file is the parser's oracle, so it must
+# be able to disagree with the config (the same reason _RUFF / _PYRIGHT /
+# _PYTEST above are literals). The two guards that read the REAL chain are
+# where the live value is asserted:
+# ``test_fallback_verify_config.py::TestRootTypeCheckCommandPyrightInterpreterPinned``
+# and ``test_contributing_type_check_command_drift.py``.
+_NPX_TYPE_CHECK_CHAIN = (
+    "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && "
+    "cd ../dashboard && npx pyright && cd ../shared && npx pyright && "
+    "cd ../escalation && npx pyright && cd ../sampler && npx pyright && "
+    "cd ../cockpit && npx pyright"
+)
+
+# The SAME chain in the runner a contributor is told to use. CONTRIBUTING.md
+# documents `uv run pyright` (wheel lane, uv.lock) against the gate's `npx
+# pyright` (Node lane, package.json) on purpose, and
+# ``test_pyright_version_pin.py`` holds the two to one version. Both spellings
+# must therefore walk through ONE code path — see the equivalence test below.
+_UV_TYPE_CHECK_CHAIN = _NPX_TYPE_CHECK_CHAIN.replace("npx pyright", "uv run pyright")
+
+_SEVEN_MEMBER_CWDS = [
+    "fused-memory",
+    "orchestrator",
+    "dashboard",
+    "shared",
+    "escalation",
+    "sampler",
+    "cockpit",
+]
+
+
+def test_pyright_clause_cwds_resolves_a_live_shaped_chain_in_order() -> None:
+    """(a) Each bare-pyright clause reports the cwd the chain has walked to.
+
+    The ORDERED list is asserted, never a set. Order is the walk's whole
+    semantics: a mis-tracked relative ``cd`` yields a wrong-but-same-set
+    result — swap two ``cd ../<member>`` hops and every member is still
+    present — so a set comparison would pass on exactly the bug this helper
+    exists to catch.
+    """
+    assert vci.pyright_clause_cwds(_NPX_TYPE_CHECK_CHAIN) == _SEVEN_MEMBER_CWDS
+
+
+def test_pyright_clause_cwds_walks_the_uv_and_npx_runners_identically() -> None:
+    """(b) The two lanes CONTRIBUTING.md documents parse through one code path.
+
+    The runner is not part of the walk: a clause is selected by MENTIONING
+    ``pyright``, and the cwd comes from the ``cd`` clauses around it. Pinning
+    that equivalence here is what lets the doc mirror compare a documented
+    ``uv run pyright`` chain against the live ``npx pyright`` one and know the
+    difference it reports is a real DIRECTORY difference, not a parser artifact.
+    """
+    assert vci.pyright_clause_cwds(_UV_TYPE_CHECK_CHAIN) == _SEVEN_MEMBER_CWDS
+    assert vci.pyright_clause_cwds(_UV_TYPE_CHECK_CHAIN) == vci.pyright_clause_cwds(
+        _NPX_TYPE_CHECK_CHAIN
+    )
+
+
+# A chain whose LAST member is entered by uv's own `--project` rather than by a
+# `cd`. The two callers ask genuinely different questions of this shape, which
+# is why `skip_uv_project` is a parameter and not a second function.
+_UV_PROJECT_CHAIN = "cd alpha && npx pyright && cd ../beta && uv run --project beta pyright"
+
+
+def test_pyright_clause_cwds_skips_a_uv_project_clause_by_default() -> None:
+    """(c) The DEFAULT preserves the interpreter-pin semantic verbatim.
+
+    ``uv run --project <member> pyright`` is interpreter-pinned by uv itself,
+    which selects the workspace venv, NOT by that directory's ``[tool.pyright]``
+    block. ``test_fallback_verify_config.py``'s interpreter-pin guard asks
+    "which clauses resolve their interpreter from ``[tool.pyright]``?", so such
+    a clause must stay excluded from what it inspects. Defaulting to ``True``
+    is what keeps that pre-existing caller byte-identical in behaviour after
+    task 4108 lifted the walk into this module.
+    """
+    assert vci.pyright_clause_cwds(_UV_PROJECT_CHAIN) == ["alpha"]
+
+
+def test_pyright_clause_cwds_includes_a_uv_project_clause_when_asked() -> None:
+    """(d) ``skip_uv_project=False`` answers the COVERAGE question instead.
+
+    The doc mirror asks "which directories does this command type-check?", and
+    for that question a ``--project`` spelling is a real answer: the clause
+    genuinely type-checks ``beta``. Were the flag not honoured, a yaml rewritten
+    into ``--project`` form would silently shrink the live side of the mirror
+    and the guard would report the DOC as carrying extra members — a red with a
+    backwards diagnosis.
+    """
+    assert vci.pyright_clause_cwds(_UV_PROJECT_CHAIN, skip_uv_project=False) == ["alpha", "beta"]
+
+
+def test_pyright_clause_cwds_ignores_a_clause_that_is_neither_cd_nor_pyright() -> None:
+    """(e) An unrelated clause is skipped and does not disturb cwd tracking.
+
+    Real chains interleave setup steps; ``npm ci`` is the one this repo's own
+    Node lane would plausibly grow. It must neither contribute a cwd nor reset
+    the one the walk has reached.
+    """
+    assert vci.pyright_clause_cwds("cd alpha && npm ci && npx pyright") == ["alpha"]
+
+
+@pytest.mark.parametrize(
+    ("malformed_cd", "case"),
+    [
+        ("cd beta gamma", "more than a lone `cd <dir>`"),
+        ("cd", "a no-op `cd` with no argument"),
+        ('cd "unclosed', "an unbalanced quote shlex cannot split"),
+    ],
+)
+def test_pyright_clause_cwds_leaves_cwd_unchanged_on_a_malformed_cd(
+    malformed_cd: str, case: str
+) -> None:
+    """(f) A clause that is not an exact two-token ``cd <dir>`` RETURNS, never RAISES.
+
+    This restates ``verify._cd_clause_target``'s documented contract at the
+    level of the walk, and it is restated because task 4108 gave this parser a
+    caller that reads HUMAN-EDITED PROSE. In a markdown bullet a stray
+    apostrophe is ordinary input, not a programming error, so the walker must
+    degrade to "cwd unchanged" rather than blow up inside an extractor whose
+    own failures are supposed to be loud, specific AssertionErrors.
+    """
+    cmd = f"cd alpha && {malformed_cd} && npx pyright"
+    assert vci.pyright_clause_cwds(cmd) == ["alpha"], case
+
+
+def test_pyright_clause_cwds_normalises_relative_hops() -> None:
+    """(g) A ``../`` hop is normalised, not accumulated.
+
+    Without ``normpath`` the second clause would report ``a/../b``, which
+    compares unequal to the plain ``b`` any other reader of the chain produces —
+    so the mirror would report drift between two commands that agree.
+    """
+    assert vci.pyright_clause_cwds("cd a && npx pyright && cd ../b && npx pyright") == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# marked_span
+# ---------------------------------------------------------------------------
+
+# The two live patterns, spelled as literals for the same reason the chains above
+# are: this file is the helper's oracle and must be able to disagree with its
+# callers. `_INLINE_SPAN` is the shape
+# ``test_contributing_lint_command_drift.py`` extracts (an inline-code command on
+# a labelled bullet); `_FENCE_SPAN` is the shape
+# ``test_contributing_type_check_command_drift.py`` extracts (a fenced block).
+# Both are exercised so the shared mechanic is pinned against BOTH callers'
+# patterns, not just the one that currently imports it.
+_INLINE_SPAN = re.compile(r"- \*\*Lint\*\*: `([^`]+)`")
+_FENCE_SPAN = re.compile(r"```bash\n(.*?)```", re.DOTALL)
+
+_SPAN_KWARGS = {
+    "begin": "demo-mirror:begin",
+    "end": "demo-mirror:end",
+    "what": "fenced ```bash block",
+    "source": "CONTRIBUTING.md",
+    "label": "the demo bullet's fenced command",
+    "task": "4108",
+}
+
+_MARKED_FENCE_DOC = """\
+```bash
+cd decoy && uv run pyright
+```
+
+<!-- demo-mirror:begin cites `type_check_command` in its own prose -->
+```bash
+  cd alpha && uv run pyright
+```
+<!-- demo-mirror:end -->
+
+```bash
+cd another-decoy && uv run pyright
+```
+"""
+
+
+def test_marked_span_returns_the_marked_match_verbatim() -> None:
+    """Only the marked match is returned, and it is NOT normalised on the way out.
+
+    Two properties in one assertion, both load-bearing. The decoy fences above
+    and below the marker are what a "first match"/"last match" extractor would
+    return — the measured hazard, since CONTRIBUTING.md really does carry other
+    fenced pyright commands that must stay generic and unpinned. And the leading
+    whitespace survives: only the caller's downstream comparison knows how much
+    normalisation is safe, so canonicalising here could hide a real difference
+    from it.
+    """
+    assert (
+        marked_span_result := vci.marked_span(
+            _MARKED_FENCE_DOC, pattern=_FENCE_SPAN, **_SPAN_KWARGS
+        )
+    ) == "  cd alpha && uv run pyright\n"
+    assert marked_span_result != marked_span_result.strip()
+
+
+def test_marked_span_works_on_an_inline_code_pattern_too() -> None:
+    """The mechanic is pattern-agnostic — the caller's regex is the only policy.
+
+    The Lint mirror extracts an inline-code span off a labelled bullet, the
+    Type-check mirror a fenced block. Sharing the four marker assertions is only
+    safe if neither shape is privileged, so both are pinned here rather than in
+    whichever guard happens to import the helper first.
+    """
+    doc = (
+        "<!-- demo-mirror:begin -->\n"
+        "- **Lint**: `uv run ruff check alpha beta`\n"
+        "<!-- demo-mirror:end -->\n"
+    )
+    assert (
+        vci.marked_span(doc, pattern=_INLINE_SPAN, **{**_SPAN_KWARGS, "what": "Lint bullet"})
+        == "uv run ruff check alpha beta"
+    )
+
+
+@pytest.mark.parametrize(
+    ("doc", "case"),
+    [
+        ("```bash\ncd alpha && uv run pyright\n```\n", "no marker at all"),
+        (
+            "<!-- demo-mirror:begin -->\n```bash\ncd alpha\n```\n<!-- demo-mirror:end -->\n"
+            "<!-- demo-mirror:begin -->\n```bash\ncd beta\n```\n<!-- demo-mirror:end -->\n",
+            "duplicated marker pair",
+        ),
+        (
+            "<!-- demo-mirror:end -->\n```bash\ncd alpha\n```\n<!-- demo-mirror:begin -->\n",
+            "inverted markers",
+        ),
+        (
+            "<!-- demo-mirror:begin -->\nno fence here at all\n<!-- demo-mirror:end -->\n",
+            "marker present, no match",
+        ),
+        (
+            "<!-- demo-mirror:begin -->\n```bash\n   \n```\n<!-- demo-mirror:end -->\n",
+            "blank match",
+        ),
+    ],
+)
+def test_marked_span_fails_loudly_and_names_the_artifact(doc: str, case: str) -> None:
+    """Every failure RAISES and names the marker and the source — never '' or None.
+
+    This is the vacuity contract both CONTRIBUTING.md mirrors are built on: an
+    extractor that silently yields nothing turns the drift assertion green while
+    pinning nothing, which is strictly worse than no guard because the check
+    still reports success. "No marker" is that hazard head-on; "duplicated" is it
+    one level down, where silently taking the first leaves the second mirror
+    unpinned and free to drift; "inverted" yields an empty slice and so falls to
+    the match assertion with the same remedy; "no match" and "blank" are the two
+    ways a marker can survive a rewrite while delimiting nothing usable.
+
+    The MESSAGE wording is not pinned, only that it carries the begin literal and
+    the source — the same discipline this file states for the command helpers'
+    ``label``, and what keeps the two mirrors' failures distinguishable.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        vci.marked_span(doc, pattern=_FENCE_SPAN, **_SPAN_KWARGS)
+
+    message = str(excinfo.value)
+    assert _SPAN_KWARGS["begin"] in message, case
+    assert _SPAN_KWARGS["source"] in message, case
+    assert _SPAN_KWARGS["task"] in message, case

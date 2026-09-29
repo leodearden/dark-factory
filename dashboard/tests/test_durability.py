@@ -27,14 +27,9 @@ from _dashboard_helpers import apply_isolated_env, live_aiosqlite_worker_threads
 from fastapi import FastAPI
 from shared.async_sqlite_base import CheckpointResult
 
-from dashboard.app import (
-    _burndown_loop,
-    _BurndownStore,
-    _metrics_loop,
-    _MetricsStore,
-    lifespan,
-)
+from dashboard.app import lifespan
 from dashboard.config import DashboardConfig
+from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Step-1: burndown store pragma triad
@@ -61,8 +56,8 @@ async def test_burndown_store_applies_full_pragma_triad_after_lifespan(
     local_app = FastAPI(lifespan=lifespan)
 
     with (
-        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
         async with lifespan(local_app):
             # local_app.state.burndown_store must exist after lifespan startup.
@@ -121,8 +116,8 @@ async def test_metrics_store_applies_full_pragma_triad_after_lifespan(
     local_app = FastAPI(lifespan=lifespan)
 
     with (
-        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
         async with lifespan(local_app):
             # local_app.state.metrics_store must exist after lifespan startup.
@@ -200,9 +195,9 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
 
     try:
         with (
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
             task = asyncio.create_task(
                 _burndown_loop(store, config, MagicMock())
@@ -263,9 +258,9 @@ async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
 
     try:
         with (
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(side_effect=_counting_collect)),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 3600),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(side_effect=_counting_collect)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
         ):
             task = asyncio.create_task(_burndown_loop(store, config, MagicMock()))
             try:
@@ -334,13 +329,20 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
     try:
         with (
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
-            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_app.state.http_client,
+                )
+            )
             try:
                 # Wait until store.checkpoint() is actually called — this is racefree
                 # because the event is set inside the checkpoint mock itself.
@@ -400,13 +402,20 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
     try:
         with (
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(side_effect=_counting_collect),
             ),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 3600),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
         ):
-            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_app.state.http_client,
+                )
+            )
             try:
                 await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
             finally:
@@ -552,8 +561,8 @@ async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
 
     local_app = FastAPI(lifespan=lifespan)
     with (
-        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
         patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
     ):
         async with lifespan(local_app):
@@ -648,9 +657,9 @@ def test_metrics_loop_cancelled_mid_connect_reports_no_unhandled_thread_exceptio
     async def _drive_lifespan() -> None:
         local_app = FastAPI(lifespan=lifespan)
         with (
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
             patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
@@ -725,8 +734,8 @@ async def test_nested_lifespan_closes_the_stores_it_opened(tmp_path: Path, monke
 
     shared_app = FastAPI(lifespan=lifespan)
     with (
-        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
         async with lifespan(shared_app):
             outer = (

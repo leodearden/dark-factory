@@ -65,6 +65,44 @@ markers = [
 # deselect.
 addopts = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this file declared neither key, so a
+# bare root-bound `pytest` — and any arg set whose rootdir resolves here, e.g.
+# `pytest escalation/tests` from the repo root — ran with NO per-test wall-clock
+# cap at all. The mirroring rule above is why: pytest reads exactly ONE inifile,
+# so a member's `timeout` does nothing for a run rooted here.
+#
+# `signal`. THE PREMISE THIS USED TO GIVE IS CORRECTED, not softened. It read
+# "runs rooted here are SERIAL — the addopts above carries no `-n`, and
+# ::test_root_addopts_never_leaks_the_parallel_flags forbids it acquiring one".
+# That is false twice over, and both halves are measured.
+#   (a) scripts/orchestrator.yaml's test_command is `uv run --project shared
+#       pytest tests/scripts/ scripts/tests/ ... -n auto --dist loadgroup`, run
+#       from the repo root. MEASURED: those args report `rootdir: <repo>`,
+#       `configfile: pyproject.toml`, `timeout: 540.0s`. So THIS config is what
+#       a 32-worker merge-gate leg resolves.
+#   (b) verify.py::_with_pytest_numprocesses_str appends
+#       `-n <verify_admission_pytest_n>` — "8" in dark-factory-orchestrator.yaml
+#       — to every pytest leg at the gated roles, so a leg that declares the
+#       flag nowhere still receives it.
+# The guard cited above says nothing to the contrary: it constrains the ini
+# `addopts` only, never the CLI, and its own docstring is explicit that the root
+# inifile is not the `scripts` module's private config even though that leg
+# resolves its rootdir here.
+# WHAT SURVIVES IS THE CHOICE, on the same evidence as every other config in
+# this workspace: signal is KEPT under xdist because dashboard/ and
+# escalation/pyproject.toml record themselves measured green under exactly those
+# flags (task 5408) — not because anything rooted here is serial. NOT flipped to
+# `thread`, and that trade is not reopened here: it lives once, in
+# fused-memory/pyproject.toml's own timeout_method block.
+#
+# The VALUE's provenance is
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md; the RATIONALE for the
+# setting existing at all is shared/pyproject.toml's block. Neither is restated
+# here. Every pytest config in the repo carries the same value — enforced by
+# tests/scripts/test_pytest_per_test_timeout_policy.py.
+timeout = 540
+timeout_method = "signal"
 
 # ── ruff: the rule set for everything OUTSIDE a workspace member ──────────────
 #

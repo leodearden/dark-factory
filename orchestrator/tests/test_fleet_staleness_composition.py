@@ -193,18 +193,29 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         assert coord._restart_precondition == harness._merge_pipeline_idle
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('on_active_override', [None, 37])
     async def test_fires_systemd_run_with_fleet_script_via_committed_config(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+        on_active_override: int | None,
     ) -> None:
         """End-to-end: note_merge arms the real (list-index-2) coordinator on a
         watched-path diff; once the merge pipeline is drained, the systemd-run
         argv targets the FLEET script (restart-all-orchestrators.sh) — not
-        restart-orchestrator.sh — with the resulting on_active_secs. Note:
-        dark-factory-orchestrator.yaml does not set orchestrator_restart_on_active_secs,
-        so the asserted value (10) comes from config.py's pydantic default, not
-        a value pinned in the committed YAML.
+        restart-orchestrator.sh — with the resulting on_active_secs.
+
+        The ``--on-active=`` expectation is derived from the parsed committed
+        config rather than hardcoded, precisely so an operator retune or task
+        4481's adversarial-config sweep cannot redden it:
+        orchestrator_restart_on_active_secs is declared nowhere in
+        dark-factory-orchestrator.yaml, so its value is config.py's pydantic
+        default and a perturbation of that undeclared leaf must not break this
+        test. ``on_active_override`` parametrizes exactly that perturbation.
+        Not a tautology — this still pins that the parsed value reaches the
+        systemd-run argv, which is the I3 composition contract.
         """
         committed = _load_committed_orchestrator_config(monkeypatch)
+        if on_active_override is not None:
+            committed.orchestrator_restart_on_active_secs = on_active_override
         _graft_committed_restart_config(harness, committed)
         # Deterministic fire — no need to wait the committed 300s debounce.
         harness.config.orchestrator_restart_debounce_secs = 0.0
@@ -244,7 +255,9 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         mock_exec.assert_awaited_once()
         pos_args = mock_exec.call_args.args
         assert pos_args[0] == 'systemd-run'
-        assert '--on-active=10' in pos_args
+        # Asserted against the parsed committed config's own field (not a
+        # hardcoded literal), matching the watch-prefixes assertion above.
+        assert f'--on-active={committed.orchestrator_restart_on_active_secs}' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
         assert expected_script in pos_args
         assert orch_coord.is_pending is False

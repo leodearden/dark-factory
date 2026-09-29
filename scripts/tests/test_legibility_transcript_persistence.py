@@ -27,6 +27,22 @@ from legibility.config import load_config
 
 from orchestrator import session_registry
 
+SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_persistence.py"
+
+
+def test_script_is_executable():
+    """Mirrors test_install_transcript_check_timer.py::test_script_is_executable.
+
+    deterministic_task_guard.py::_validate_before_done requires
+    os.access(resolved, os.X_OK) before a script can be bound as
+    metadata.before_done.script, so a non-executable mode bit silently makes
+    this detector un-bindable (task 4616)."""
+    assert os.access(SCRIPT, os.X_OK), (
+        f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SCRIPT}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------

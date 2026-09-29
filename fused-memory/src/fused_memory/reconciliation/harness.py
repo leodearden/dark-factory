@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -50,7 +50,15 @@ from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
     recon_config_base_dir,
 )
+from fused_memory.reconciliation.escalation_archive import (
+    scan_recently_resolved_fingerprints,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.finding_task_escalation import (
+    FINDING_TASK_ESCALATION_CATEGORY,
+    build_finding_task_escalation_kwargs,
+    resolve_finding_task_target,
+)
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -92,9 +100,13 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
+    worktree_index_kwargs,
 )
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.orchestrator_detector import orchestrator_started_at
+from fused_memory.services.orchestrator_detector import (
+    is_orchestrator_live_for,
+    orchestrator_started_at,
+)
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -106,10 +118,7 @@ try:
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import (  # type: ignore[import-untyped]
-        EscalationQueue,
-        iter_all_escalation_paths,
-    )
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
@@ -133,6 +142,18 @@ except ImportError:
 #     by BacklogPolicy.on_judge_unhalt — write and close stay with the class
 #     that owns that record, so this invariant is not contradicted.
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+#   - Task 4821: the harness now ALSO WRITES (and never resolves)
+#     `recon_task_finding` LEVEL-0 records to the per-project ORCHESTRATOR
+#     queue <project_root>/data/escalations/ — see
+#     ReconciliationHarness._file_finding_task_escalation.  This is NOT an A7b
+#     violation, on exactly the task-2998 scope note above that already
+#     sanctions BacklogPolicy's judge-halt write there: the invariant governs
+#     the RECON queue (config.escalation_queue_dir), and that is a DIFFERENT
+#     queue with a different reader.  Unlike BacklogPolicy, this filer does not
+#     close its own records either.  Level 0 keeps them off the orchestrator's
+#     level-1-only has_open_l1 guard surface; an unattended one still reaches
+#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
     dataclasses.replace(
@@ -152,6 +173,12 @@ _RECON_DEDUP_CONFIG = (
             # _record_placeholder_finding_drop).  Same fold rationale as
             # recon_watchdog_kill_storm above.
             'recon_remediation_placeholder_storm',
+            # Task 4781: aggregate storm alarm for actionable findings dropped
+            # from remediation after phantom-citation verification stripped
+            # every citation (see _PHANTOM_CITATION_DROP_STORM_FINDING /
+            # _record_phantom_citation_finding_drop).  Same fold rationale as
+            # the two storm categories above it.
+            'recon_remediation_phantom_citation_storm',
             # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
             # so a sustained task_count_snapshot cadence gap folds into a single pending
             # escalation per project instead of firing once per cycle.
@@ -201,6 +228,13 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
+# Task 4821: the per-project ORCHESTRATOR escalation queue, relative to a
+# project_root.  DISTINCT from the recon queue (`config.escalation_queue_dir`,
+# drained by the port-8103 watcher) that `_escalate` writes to.  Same spelling
+# and same convention as `targeted.py::_ESCALATION_QUEUE_DIRNAME`,
+# `scope_violation_escalator.py` and `ticket_janitor.py`.
+_ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
+
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
 # the two can never desynchronise.
@@ -241,8 +275,13 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
-# runaway Stage 3 that stops citing anything.  Each individual referenceless-
-# finding drop in _maybe_remediate is only logged
+# runaway Stage 3 that stops citing anything — i.e. a finding that was NEVER
+# cited at all.  Task 4781 gave the other referenceless cause (a finding that
+# WAS cited but had every citation phantom-stripped by
+# citation_verifier.py::verify_cited_memories) its own sibling counter,
+# _PHANTOM_CITATION_DROP_STORM_THRESHOLD below, so this one now covers only
+# never-cited drops.  Each individual never-cited-finding drop in
+# _maybe_remediate is only logged
 # (reconciliation.remediation_dropped_placeholder_finding) and, being noise
 # rather than a human-actionable integrity issue, is deliberately never
 # escalated on its own — see _maybe_remediate.  That means a systemic Stage 3
@@ -280,6 +319,26 @@ _PLACEHOLDER_DROP_STORM_FINDING: dict[str, Any] = {
     ),
 }
 
+# Task 4781: sibling rolling-window counter for actionable findings dropped
+# from remediation because phantom-citation verification
+# (citation_verifier.py::verify_cited_memories) stripped every citation —
+# NOT because the stage never cited anything (that is the counter above).
+# Same knob values and the same stable-identity/fold rationale as the
+# placeholder pair, deliberately kept parallel so an operator reads the two
+# alarms side by side; all variable data (count, window, projects) lives
+# only in summary/detail, never in these constants, so submit_or_dedupe
+# folds repeat windows into one pending escalation.
+_PHANTOM_CITATION_DROP_STORM_THRESHOLD = 5
+_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
+_PHANTOM_CITATION_DROP_STORM_FINDING: dict[str, Any] = {
+    'category': 'recon_remediation_phantom_citation_storm',
+    'affected_ids': ['remediation_phantom_citation_drop_storm'],
+    'description': (
+        'actionable findings dropped from remediation after phantom-citation '
+        'verification stripped every citation'
+    ),
+}
+
 
 def _derive_affected_ids(finding: dict) -> list[str]:
     """Derive an affected-ids-equivalent list from a finding's typed citations.
@@ -296,6 +355,12 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     A legacy ``affected_ids`` field takes precedence when present, so cross-run
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
+
+    The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
+    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
+    are.  Guarded by
+    ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
+    (task-4772 section).
     """
     legacy = finding.get('affected_ids')
     if legacy:
@@ -335,8 +400,75 @@ def _finding_has_reference(finding: dict) -> bool:
 
     Task 1970: used by ``_maybe_remediate`` to drop referenceless actionable
     findings before they reach the production remediation batch.
+
+    Task 4781: "never followed up with a cite_* call" is not the only way a
+    finding ends up referenceless.  Since task 2979 hoisted
+    ``citation_verifier.py::verify_cited_memories`` into
+    ``stages/base.py::BaseStage.run``, a finding that WAS cited can also land
+    here if every citation was later phantom-stripped — which is why
+    ``_maybe_remediate`` consults ``_finding_has_citation_failures`` before
+    attributing a drop to either cause.
     """
     return bool(_derive_affected_ids(finding))
+
+
+def _finding_has_citation_failures(finding: dict) -> bool:
+    """Return True iff *finding* carries a ``citation_failures`` marker.
+
+    ``fused_memory/reconciliation/citation_verifier.py::verify_cited_memories``
+    is the sole writer of ``citation_failures`` (called from every stage via
+    ``stages/base.py::BaseStage.run``), and it only ever inspects a finding
+    that ALREADY had a ``cited_memories`` entry to check. So a truthy
+    ``citation_failures`` is positive evidence that the stage DID call a
+    ``cite_*`` follow-up — the opposite of what ``_finding_has_reference``
+    screens for, which is a finding that never cited anything at all.
+
+    Both marker reasons route here: ``memory_not_found`` (the citation is
+    DROPPED from ``cited_memories``) and ``verification_error`` (the citation
+    is KEPT, verification just couldn't confirm it). Neither reason changes
+    what a marker proves — verification touched this finding's citations —
+    so this predicate does not filter on ``reason``.
+
+    Plain truthiness is deliberate: a malformed non-list value (or any other
+    truthy junk) fails SAFE by routing to the phantom-cited branch, i.e. AWAY
+    from the never-cited-placeholder storm alarm, rather than being
+    mis-counted as evidence of a stage that stopped citing.
+
+    Task 4781: used by ``_maybe_remediate`` alongside ``_finding_has_reference``
+    to tell a phantom-cited drop (evidence evaporated after citing) apart from
+    a never-cited placeholder drop (never cited in the first place).
+    """
+    return bool(finding.get('citation_failures'))
+
+
+def _finding_is_live_actionable(finding: dict) -> bool:
+    """Return True iff *finding* is actionable and not superseded.
+
+    Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
+    run mark an earlier one historical, stamping the target's
+    ``superseded_by``.  A superseded claim has already been refuted by the
+    run that filed it, so acting on it is acting on a known-false instruction.
+
+    ``get_assembled_report`` already projects such a finding with
+    ``actionable`` forced False, which would make the ``superseded_by`` check
+    here look redundant.  It is kept anyway, and NOT because some production
+    path is known to skip that projection: both partition sites read
+    ``s3_report`` duck-typed — a ``StageReport`` or the equivalent dict off
+    persisted JSON, from a producer they cannot identify — so neither can
+    verify that the ``actionable`` it is trusting was computed by that
+    projection at all.  Enforcing the invariant locally is cheap, and it keeps
+    the rule readable at the point it is applied instead of implied by an
+    upstream projection two modules away.
+
+    Applied at the actionable/non-actionable partition in
+    ``_maybe_remediate`` and ``_run_remediation_pass``, so the complement
+    feeds the existing ``_log_non_actionable_finding`` branch unchanged.
+    Deliberately UPSTREAM of ``_maybe_remediate``'s task-4781 three-way
+    split: a superseded finding is neither a phantom-cited drop nor a
+    never-cited placeholder, so counting it as either would corrupt the
+    drop-cause attribution that split exists to get right.
+    """
+    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -570,6 +702,52 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     return _cycle_summary_ledger_write_missing(report, 'stage2')
 
 
+def _sqlite_classification(exc: BaseException) -> dict[str, object]:
+    """Set by the sqlite3 module on errors it raises, None for any other
+    exception; see plans/recon-sqlite-database-locked-rca-2026-09-16.md for
+    what they mean."""
+    return {
+        'sqlite_errorname': getattr(exc, 'sqlite_errorname', None),
+        'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None),
+    }
+
+
+def _run_failure_record(
+    exc: BaseException,
+    *,
+    failed_stage: str | None,
+    error_message: str | None = None,
+) -> dict[str, object]:
+    """The ``_error`` record both S1→S2→S3 drivers' ``except Exception``
+    handlers, and the remediation pass's cancellation handler, write for a
+    run ended by an exception, so the failure can be classified from the row
+    alone. The other ``_error`` records (run_full_cycle's cancellation, both
+    drivers' AllAccountsCapped, the stale-run reaper) are built by hand and
+    carry neither the traceback nor the sqlite keys.
+    """
+    return {
+        'error_type': type(exc).__name__,
+        'error_message': str(exc) if error_message is None else error_message,
+        'failed_stage': failed_stage,
+        'traceback': ''.join(traceback.format_exception(exc)),
+        **_sqlite_classification(exc),
+    }
+
+
+def _run_failure_log_fields(run_id: str, record: Mapping[str, object]) -> str:
+    return (
+        f"run_id={run_id} sqlite_errorname={record['sqlite_errorname']} "
+        f"sqlite_errorcode={record['sqlite_errorcode']}"
+    )
+
+
+def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
+    logger.warning(
+        'reconciliation.escalation_dropped (%s): category=%s run_id=%s summary=%s',
+        reason, category, run_id, summary,
+    )
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
@@ -686,6 +864,17 @@ class ReconciliationHarness:
         # the dead-owner suppression counter above.
         self._placeholder_drop_storm = StormCounter()
 
+        # Task 4781: sibling rolling-window counter for actionable findings
+        # dropped from remediation because phantom-citation verification
+        # stripped every citation (see _record_phantom_citation_finding_drop /
+        # _maybe_remediate).  Deliberately a SEPARATE StormCounter instance
+        # from _placeholder_drop_storm above — the two drop causes must never
+        # share a window, or a phantom-citation outage could push the
+        # never-cited-placeholder alarm over threshold (or vice versa) and
+        # misattribute the cause.  Same in-process-lifetime caveat and
+        # rate-limited single-fire semantics.
+        self._phantom_citation_drop_storm = StormCounter()
+
         # Task σ / 2717: rolling-window per-event counter of unresumable/failed
         # interrupted-run resume attempts (config-driven
         # resume_failure_storm_threshold / _window_seconds).  Fed from
@@ -775,6 +964,45 @@ class ReconciliationHarness:
         # still be re-filed.  Cleared when a graph recovers, so a later re-drift
         # is loud again.
         self._last_missing_indices: dict[str, tuple] = {}
+        # Task 5550: one-slot memo for `_memoised_resolved_fingerprints`,
+        # `(scan_key, str(queue_dir), fingerprints)`.  Calls under the same
+        # scan_key (a run_id) share one archive walk; a call under any other key
+        # evicts the slot, so runs whose `_escalate`s interleave each walk again.
+        # A record resolved mid-run is unseen until the next run — at most one
+        # extra escalation, the fail-open direction.
+        self._resolved_fps_memo: tuple[str, str, frozenset[str]] | None = None
+
+    def _scan_resolved_fingerprints(self, *, now: datetime) -> frozenset[str]:
+        """The archive scan under this harness's window and category policy.
+
+        Synchronous and unbounded (see ``reconciliation/escalation_archive.py``):
+        a coroutine may reach it only through ``asyncio.to_thread``.
+        """
+        return scan_recently_resolved_fingerprints(
+            self._escalation_queue.queue_dir,  # type: ignore[union-attr]
+            now=now,
+            window=timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS),
+            categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
+        )
+
+    def _memoised_resolved_fingerprints(
+        self, scan_key: str | None, *, now: datetime,
+    ) -> frozenset[str]:
+        """:meth:`_scan_resolved_fingerprints`, walked once per consecutive *scan_key*.
+
+        Blocks its caller for the walk on a miss, so only the already-sync
+        `_escalate` path calls it.  ``scan_key=None`` scans on every call and
+        leaves the memo untouched.
+        """
+        if scan_key is None:
+            return self._scan_resolved_fingerprints(now=now)
+        queue_dir = str(self._escalation_queue.queue_dir)  # type: ignore[union-attr]
+        memo = self._resolved_fps_memo
+        if memo is not None and memo[:2] == (scan_key, queue_dir):
+            return memo[2]
+        fingerprints = self._scan_resolved_fingerprints(now=now)
+        self._resolved_fps_memo = (scan_key, queue_dir, fingerprints)
+        return fingerprints
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -1755,6 +1983,8 @@ class ReconciliationHarness:
                 run, lock_holder, lock_age,
                 error_message=f'Run stale (>{cutoff}s, lock expired), recovered by harness',
             )
+            if diag is None:
+                continue
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
                 f'(started {run.started_at.isoformat()}, lock expired, '
@@ -1831,8 +2061,8 @@ class ReconciliationHarness:
         disposition: str = 'failed',
         error_type: str = 'StaleRunRecovery',
         error_message: str | None = None,
-    ) -> dict:
-        """Recover a single stuck 'running' row to a terminal status.
+    ) -> dict | None:
+        """Recover a single orphaned run row to a terminal status.
 
         Shared mechanical body for both recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
@@ -1841,6 +2071,11 @@ class ReconciliationHarness:
         and replay any deferred writes for the project. Returns the
         ``build_stale_run_diagnostics`` dict so the caller can drive its own
         logging/escalation policy on top of this shared body.
+
+        The terminalisation is a compare-and-set on ``run.status``, the status
+        the caller's read observed. ``None`` means the row moved on since that
+        read — its own coroutine terminalised it, and owns its cleanup — so
+        nothing was written, restored, released or replayed.
 
         The restore is run-scoped (task 2711 / E7): only events this run
         itself drained (plus any pre-task-2711, unattributed leftovers — see
@@ -1862,8 +2097,23 @@ class ReconciliationHarness:
             'failed_stage': None,
             **diag,
         }
-        await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-        await self.journal.complete_run(run.id, disposition)
+        recovered = await self.journal.complete_run_if_status(
+            run.id,
+            expected_status=run.status,
+            status=disposition,
+            stage_reports=run.stage_reports,
+        )
+        if not recovered:
+            logger.warning(
+                'reconciliation.stale_run_recovery_refused',
+                extra={
+                    'run_id': run.id,
+                    'project_id': run.project_id,
+                    'expected_status': str(run.status),
+                    'error_type': error_type,
+                },
+            )
+            return None
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
@@ -1963,6 +2213,8 @@ class ReconciliationHarness:
                     'Run owned by dead predecessor instance, recovered at startup'
                 ),
             )
+            if diag is None:
+                continue
             logger.info(
                 'reconciliation.predecessor_run_recovered',
                 extra={
@@ -2020,7 +2272,7 @@ class ReconciliationHarness:
             # a resume failure, so it deliberately does NOT feed the
             # _record_resume_failure storm counter.
             if not self.config.resume_after_restart:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunResumeDisabled',
@@ -2030,6 +2282,8 @@ class ReconciliationHarness:
                         'out of resuming into a changed prompt/toolset)'
                     ),
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_resume_disabled',
                     extra={
@@ -2048,12 +2302,14 @@ class ReconciliationHarness:
             # predecessor's lock exactly as the predecessor-recovery pass does.
             unresumable_reason = self._resume_guard_reason(run)
             if unresumable_reason is not None:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunUnresumable',
                     error_message=unresumable_reason,
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_unresumable',
                     extra={
@@ -2327,7 +2583,7 @@ class ReconciliationHarness:
     def _record_placeholder_finding_drop(
         self, project_id: str, *, now: datetime | None = None
     ) -> dict | None:
-        """Record one dropped referenceless-finding event and check for a storm.
+        """Record one dropped never-cited-finding event and check for a storm.
 
         Applied to reconciliation.remediation_dropped_placeholder_finding events
         instead of the dead_owner_shielded suppressions
@@ -2335,6 +2591,15 @@ class ReconciliationHarness:
         module constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
         _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
         fields, since this counter is private to this module.
+
+        Task 4781: covers only findings _maybe_remediate classified as never
+        cited at all (``_finding_has_citation_failures`` is False).  A finding
+        that WAS cited but had every citation phantom-stripped by
+        ``citation_verifier.py::verify_cited_memories`` (a truthy
+        ``citation_failures`` marker) is routed to
+        :meth:`_record_phantom_citation_finding_drop` instead — a marker
+        proves the stage DID call cite_*, so counting it here would
+        misattribute an evidence-loss event as "Stage 3 stopped citing".
 
         The rolling-window mechanics — append, prune to the window, count,
         compare to the threshold, rate-limit to one fire per window, and report
@@ -2352,6 +2617,44 @@ class ReconciliationHarness:
             self._placeholder_drop_storm,
             threshold=_PLACEHOLDER_DROP_STORM_THRESHOLD,
             window_seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
+
+    # ── Phantom-citation drop storm counter (task 4781) ─────────────────
+
+    def _record_phantom_citation_finding_drop(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dropped phantom-cited-finding event and check for a storm.
+
+        The complement of :meth:`_record_placeholder_finding_drop`: applied to
+        ``reconciliation.remediation_dropped_phantom_cited_finding`` events —
+        actionable findings dropped because
+        ``citation_verifier.py::verify_cited_memories`` stripped every citation
+        (the cited mem0 id(s) no longer resolve), NOT because the stage never
+        cited anything.  Thresholds are the plain module constants
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD /
+        _PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS, for the same
+        private-to-this-module reason as the placeholder counter's.
+
+        The rolling-window mechanics live in ``shared.storm_counter.StormCounter``
+        (INV-5); this method only supplies the knobs and the event, via the same
+        :meth:`_storm_summary` adapter the placeholder counter uses — but against
+        its OWN counter instance (``self._phantom_citation_drop_storm``), so a
+        phantom-citation outage and a never-cited-placeholder regression are
+        counted, thresholded, and alarmed independently.  Returns None below
+        the threshold and None when the alarm already fired within this
+        window, otherwise a storm summary dict with 'count', 'window_seconds',
+        and 'projects' (sorted distinct project labels seen in the window).
+
+        The now= parameter follows the same time-injection convention as
+        _record_placeholder_finding_drop, for deterministic unit tests.
+        """
+        return self._storm_summary(
+            self._phantom_citation_drop_storm,
+            threshold=_PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+            window_seconds=_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS,
             project_id=project_id,
             now=now,
         )
@@ -2519,8 +2822,28 @@ class ReconciliationHarness:
         - When finding is None, the fingerprint falls back to a description-only
           hash of the summary, so identical recurring messages fold while distinct
           ones stay individually visible.
+
+        Task id, and why this method keeps a SYNTHETIC one: every record filed
+        here carries ``task_id=f'recon-{run_id[:8]}'``.  That is deliberate and
+        stays — a recon escalation is about a RUN, and the port-8103 watcher
+        groups by it.  The cost is that a finding NAMING a task never surfaces
+        on that task's own ladder, because ``get_by_task`` filters on the
+        stored ``task_id`` field.  :meth:`_file_finding_task_escalation` (task
+        4821) closes that gap on the OTHER queue, carrying the REAL task id.
+        The two are complementary, not alternatives: both fire for the same
+        finding, and this one fires first and unconditionally.
+
+        Every path that files nothing, other than the recently-resolved fold,
+        logs ``reconciliation.escalation_dropped``.
         """
         if not HAS_ESCALATION or self._escalation_queue is None:
+            _log_dropped_escalation(
+                category, run_id, summary,
+                reason=(
+                    'escalation package not installed' if not HAS_ESCALATION
+                    else 'escalation queue not initialised'
+                ),
+            )
             return
         try:
             queue = self._escalation_queue
@@ -2544,7 +2867,9 @@ class ReconciliationHarness:
                     [],
                     summary,
                 )
-            if self._finding_recently_resolved(category, fingerprint, resolved_fps=resolved_fps):
+            if self._finding_recently_resolved(
+                category, fingerprint, resolved_fps=resolved_fps, scan_key=run_id,
+            ):
                 logger.info(
                     'reconciliation.escalation_suppressed_recently_resolved',
                     extra={
@@ -2569,7 +2894,205 @@ class ReconciliationHarness:
             )
             submit_or_dedupe(queue, esc, _RECON_DEDUP_CONFIG)  # type: ignore[possibly-undefined]
         except Exception as e:
-            logger.warning(f'Failed to submit escalation: {e}')
+            _log_dropped_escalation(category, run_id, summary, reason=f'submit failed: {e!r}')
+
+    def _file_finding_task_escalation(
+        self,
+        project_id: str,
+        run_id: str,
+        finding: dict,
+        persistence: int,
+        task_id: str | None = None,
+    ) -> str | None:
+        """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
+
+        The counterpart to :meth:`_escalate`, and deliberately NOT a
+        replacement for it (task 4821 / task 4764 arm 3).  ``_escalate`` writes
+        the RECON queue (``config.escalation_queue_dir``, port-8103 watcher)
+        under a synthetic ``recon-<run8>`` task id; this writes
+        ``<project_root>/data/escalations`` — the per-project ORCHESTRATOR
+        queue — under the finding's REAL task id, so a finding that names a
+        task surfaces on that task's own ladder instead of dead-ending in a
+        queue nobody reading the task would look at.
+
+        Returns the escalation id, or None when nothing was filed.  Every
+        no-file path is a deliberate gate:
+
+        - the finding names no same-project task -- either *task_id* was
+          supplied as None and
+          :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`
+          also returned None;
+        - the project is not registered in ``_known_projects``;
+        - no orchestrator is live for that root, so nothing would drain the
+          record;
+        - a pending record of this same CATEGORY is already on the task, at
+          ANY level -- level-blind so the fold survives the orphan reaper
+          promoting an earlier record from L0 to L1.
+
+        LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
+        and is what a spread of orchestrator guards read as "a human is already
+        on this task", so an L1 here would turn a passive observation into a
+        gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
+        `finding_task_escalation.py` for the full guard-site population and for
+        why an unattended record still reaches L1 (via
+        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
+
+        FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
+        cycle is never aborted by a failed filing (mirroring
+        ``targeted.py::ReconciliationHandler._sweep_escalate_l1``, from which
+        this is otherwise transcribed).
+
+        A7b note: this WRITES but never RESOLVES, and the queue it writes is
+        NOT the recon queue the A7b invariant governs — see the contract block
+        at the top of this module.
+        """
+        # Mirrors _escalate's guard: on ImportError the module-level names are
+        # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
+        # is the only safe check here and the accesses below carry
+        # `possibly-undefined` ignores.
+        if not HAS_ESCALATION:
+            return None
+
+        # *task_id* is an OPTIONAL pre-resolved target.  The production call
+        # site in `_run_remediation_pass` already has to resolve it — it gates
+        # the routed target on the live-workflow check before calling — so it
+        # passes the value through rather than paying for a second, silently
+        # divergable resolution here.  Resolving on None keeps the filer
+        # self-sufficient for direct callers (and keeps the no-target gate
+        # below reachable and tested) without making the two paths disagree:
+        # both end up at the same `resolve_finding_task_target` result.
+        if task_id is None:
+            task_id = resolve_finding_task_target(finding, project_id)
+        if task_id is None:
+            logger.debug(
+                'reconciliation.finding_task_escalation_no_target',
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'finding_category': finding.get('category', ''),
+                },
+            )
+            return None
+
+        project_root = self._resolve_known_root(project_id)
+        if project_root is None:
+            logger.debug(
+                'reconciliation.finding_task_escalation_unknown_project',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
+            )
+            return None
+
+        # Do not pile records into a queue no orchestrator is draining.  This
+        # probe never raises and fails safe to False (missing lock file,
+        # unparseable PID, dead PID), so an ambiguous environment yields no
+        # filing rather than a spurious one.
+        if not is_orchestrator_live_for(project_root):
+            logger.debug(
+                'reconciliation.finding_task_escalation_orchestrator_not_live',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
+            )
+            return None
+
+        try:
+            # Constructed LAZILY, only after every gate above has passed:
+            # `EscalationQueue.__init__` does a `mkdir(parents=True,
+            # exist_ok=True)`, so building it earlier would create a spurious
+            # `data/escalations` directory under a project that never files
+            # (targeted.py defers construction for exactly this reason).
+            queue = EscalationQueue(  # type: ignore[possibly-undefined]
+                Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
+            )
+            # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
+            # and can refile on every sweep — fine for a one-shot cancellation
+            # event, wrong for a filer that re-evaluates each reconciliation
+            # cycle.
+            #
+            # NOT `has_open_l1`: that helper is LEVEL-1-ONLY, and these records
+            # are written at level 0 precisely so they stay off the
+            # orchestrator's L1 guard surface, so it would see nothing and the
+            # filer would refile every cycle.  This is the pending-scan idiom
+            # transcribed from
+            # `orchestrator/harness.py::_file_warm_base_hard_down_notice`.
+            #
+            # The scan filters on `category` ONLY, and is deliberately
+            # LEVEL-BLIND even though the write side is pinned to
+            # FINDING_TASK_ESCALATION_LEVEL.  The asymmetry is load-bearing in
+            # both directions:
+            #
+            #   - `category` is the task-2757 property: it lets a NEW root cause
+            #     escape being silently suppressed by an UNRELATED open record.
+            #     Without it a lingering starvation INFO on the task would
+            #     swallow every recon finding for it forever, and an
+            #     uncategorized `has_open_l1`-style read would do the same via
+            #     the level axis.
+            #   - Level-blindness makes the fold survive PROMOTION.
+            #     `orchestrator/harness.py::_reap_orphan_l0_escalations`
+            #     promotes an aged pending L0 to L1 with no category filter, and
+            #     this filer fires only when NO workflow is live for the task —
+            #     the very condition that makes a record an orphan candidate. So
+            #     a record filed here is born eligible for promotion. A
+            #     `level == 0` scan stopped matching the moment that happened,
+            #     the next cycle filed a fresh L0, and the reaper dismissed it as
+            #     a duplicate of the open L1 — one born-and-dismissed record per
+            #     reconciliation cycle, forever, while the finding persists.
+            #     Matching at ANY level folds onto the promoted record instead,
+            #     which is the right answer: the L1 IS this finding, escalated.
+            #
+            # `FINDING_TASK_ESCALATION_CATEGORY` is IMPORTED, never re-spelled,
+            # so the scan and the builder cannot drift on the one axis they
+            # BOTH read.  The level is set by the builder alone
+            # (`FINDING_TASK_ESCALATION_LEVEL`, public and exported for exactly
+            # that contract) and deliberately not imported here — this scan does
+            # not read it, and an import that only appeared in a comment would
+            # imply a coupling that no longer exists.
+            #
+            # `status='pending'` skips the archive by construction, so a finding
+            # that recurs after a human adjudicated the last record reaches the
+            # ladder again.
+            if [
+                e for e in queue.get_by_task(task_id, status='pending')
+                if e.category == FINDING_TASK_ESCALATION_CATEGORY
+            ]:
+                logger.info(
+                    'reconciliation.finding_task_escalation_deduped',
+                    extra={
+                        'project_id': project_id,
+                        'run_id': run_id,
+                        'task_id': task_id,
+                        'finding_category': finding.get('category', ''),
+                    },
+                )
+                return None
+            esc = Escalation(  # type: ignore[possibly-undefined]
+                id=queue.make_id(task_id),
+                **build_finding_task_escalation_kwargs(
+                    finding,
+                    task_id=task_id,
+                    project_id=project_id,
+                    run_id=run_id,
+                    persistence=persistence,
+                ),
+            )
+            esc_id: str = queue.submit(esc)
+        except Exception as e:
+            logger.warning(
+                'reconciliation: orchestrator-queue filing failed for task %s '
+                '(project %s, run %s): %s',
+                task_id, project_id, run_id, e,
+            )
+            return None
+        logger.info(
+            'reconciliation.finding_task_escalation_filed',
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'task_id': task_id,
+                'escalation_id': esc_id,
+                'finding_category': finding.get('category', ''),
+                'persistence': persistence,
+            },
+        )
+        return esc_id
 
     # ── Tier selection ─────────────────────────────────────────────────
 
@@ -3517,16 +4040,14 @@ class ReconciliationHarness:
                 )
                 return run
             except Exception as e:
+                failure = _run_failure_record(e, failed_stage=current_stage_name)
+                logger.error(
+                    'Reconciliation failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
+                )
                 run.status = RunStatus.failed
-                run.stage_reports['_error'] = {
-                    'error_type': type(e).__name__,
-                    'error_message': str(e),
-                    'failed_stage': current_stage_name,
-                    'traceback': traceback.format_exc(),
-                }
+                run.stage_reports['_error'] = failure
                 await self.journal.complete_run(run_id, 'failed')
                 await self.buffer.restore_drained(project_id)
-                logger.error(f'Reconciliation failed: {e}')
                 self._escalate(
                     'recon_failure', run_id,
                     f'Stage {current_stage_name} failed: {e}',
@@ -4064,8 +4585,10 @@ class ReconciliationHarness:
         re-raises ``CancelledError`` without returning a partial report — so
         an absent key is proof Stage 2 produced no report, never merely a
         bookkeeping gap. (``_run_remediation_pass``'s scope-freshness
-        short-circuit returns before its ``try:`` block, so its ``finally``
-        is never reached on that path either.) A SECOND population the
+        short-circuit returns from inside its ``try:`` block, so its
+        ``finally`` does run on that path; this presence gate keeps the
+        method inert there, since a short-circuited pass runs no stage and
+        records no ``task_knowledge_sync`` key.) A SECOND population the
         presence gate alone would not exclude — a Stage 2 that started, was
         recorded, but died before reaching its own write — is excluded by
         :func:`_stage2_ledger_write_missing` treating an ABSENT
@@ -4147,9 +4670,11 @@ class ReconciliationHarness:
         ``get_cycle_summary_presence`` reads to disambiguate expected-missing
         rows. Note this does not weaken the never-fabricate guarantee on that
         driver either: ``_run_remediation_pass``'s scope-freshness
-        short-circuit RETURNS before its ``try:`` block, so its ``finally``
-        — and therefore this method — is never reached on that never-ran-any-
-        stage path.
+        short-circuit returns from inside its ``try:`` block, so its
+        ``finally`` — and therefore this method — does run on that
+        never-ran-any-stage path, but the presence gate keeps this method
+        inert there, since a short-circuited pass records no
+        ``task_knowledge_sync`` key.
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
@@ -4232,7 +4757,27 @@ class ReconciliationHarness:
     # ── Remediation support ───────────────────────────────────────────
 
     async def _get_prior_s3_findings(self, project_id: str) -> list[dict] | None:
-        """Extract S3 findings from the last completed run's stage reports."""
+        """Extract S3 findings from the last completed run's stage reports.
+
+        Superseded findings are dropped (task-4653).  This return value becomes
+        the next cycle's Stage-1 ``prior_s3_findings``, which
+        ``MemoryConsolidator.assemble_payload`` renders under "These issues were
+        found in the last integrity check and should be addressed during this
+        consolidation pass if possible" — so a claim a LATER finding of the
+        producing run already refuted would come back as a live to-do.  Its
+        renderer (``_format_findings``) emits description / severity / category
+        / suggested_action and the typed citation lists only, never
+        ``superseded_by``, so an agent reading the payload could not tell that
+        the claim had been retired.  Same rationale as the Stage-2 channel's
+        filter in ``stages/task_knowledge_sync.py::_query_recon_report_findings``,
+        applied to a stricter instruction.
+
+        The filter runs BEFORE the ``if items:`` fall-through, so a run whose
+        every finding was retired behaves exactly like a run that flagged
+        nothing: an older completed run still gets its turn, and no empty
+        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
+        a finding dict that never carried the key is unaffected.
+        """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
             for r in recent:
@@ -4245,6 +4790,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
+                items = [f for f in items if not f.get('superseded_by')]
                 if items:
                     return items
         except Exception as e:
@@ -4356,12 +4902,12 @@ class ReconciliationHarness:
         (``task_count_snapshot_mem0_written``, already computed by
         ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
         current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  Journal rows
-        persisted before the task-3045 rename carry the old
-        ``task_count_snapshot_written`` spelling and are still honored, via
-        ``extract_snapshot_written``'s legacy-key fallback — without it the
-        streak below would stop dead at the first pre-rename row.  The prior
-        consecutive-miss streak is recomputed each call from
+        inconclusive/unknown check) is eligible to escalate.  A read-only
+        alias for the pre-task-3045 stat spelling was retired in task 3488,
+        once measurement confirmed no journal row inside the lookback window
+        below could still change the computed streak; a pre-rename row now
+        reads as unknown, which stops the streak rather than extending it.
+        The prior consecutive-miss streak is recomputed each call from
         ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
         journal-recompute pattern — rather than a stored counter, so it
         naturally resets on any successful write and survives a harness
@@ -4459,6 +5005,11 @@ class ReconciliationHarness:
 
         Called from both _maybe_remediate (parent pass) and _run_remediation_pass (after
         the second-pass actionable partition) so both sites stay in sync as fields evolve.
+
+        Task 4653: both partitions now route two different kinds of finding here —
+        one that was never actionable, and one a later finding of the same run
+        RETIRED (``_finding_is_live_actionable``).  ``superseded_by`` is logged so
+        the two are distinguishable in the journal; it is None for the first kind.
         """
         logger.info(
             'reconciliation.non_actionable_integrity_finding',
@@ -4469,6 +5020,7 @@ class ReconciliationHarness:
                 'affected_ids': _derive_affected_ids(finding),
                 'description': finding.get('description', ''),
                 'severity': finding.get('severity', ''),
+                'superseded_by': finding.get('superseded_by'),
             },
         )
 
@@ -4532,11 +5084,12 @@ class ReconciliationHarness:
         *,
         now=None,
         resolved_fps: frozenset[str] | None = None,
+        scan_key: str | None = None,
     ) -> bool:
         """Return True iff a recently-resolved escalation matches category + fingerprint.
 
         Mirrors _finding_has_open_escalation but scans resolved/dismissed escalations
-        in the full queue root + archive via iter_all_escalation_paths.  Used by
+        in the full queue root + archive via escalation_archive's scan.  Used by
         _escalate() to suppress re-firing of a finding whose matching escalation was
         resolved within _RESOLVED_RECURRENCE_WINDOW_SECONDS (task 1669).
 
@@ -4544,7 +5097,12 @@ class ReconciliationHarness:
         escalations within the recurrence window (filtered to recon categories by the
         caller).  When supplied (built once by _run_remediation_pass), the check is an
         O(1) set membership test — no archive scan.  Pass None to fall back to the full
-        iter_all_escalation_paths scan per-call (direct / unit-test use).
+        archive scan (direct / unit-test use).
+
+        scan_key: memo key for that fallback scan (task 5550).  _escalate passes its
+        run_id, so consecutive fallback checks in one run share one archive walk —
+        see _memoised_resolved_fingerprints.  None scans per call and touches no memo
+        state (the direct / unit-test path above).
 
         Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
         matching the category gate used by submit_or_dedupe.
@@ -4563,31 +5121,10 @@ class ReconciliationHarness:
             return fingerprint in resolved_fps
         try:
             effective_now = now if now is not None else datetime.now(UTC)
-            window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-            for path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                self._escalation_queue.queue_dir
-            ):
-                try:
-                    esc = Escalation.from_json(path.read_text())  # type: ignore[possibly-undefined]
-                except Exception:
-                    continue
-                if not (
-                    esc.status in ('resolved', 'dismissed')
-                    and esc.category == category
-                    and esc.dedupe_fingerprint == fingerprint
-                ):
-                    continue
-                if not esc.resolved_at:
-                    continue
-                try:
-                    resolved = datetime.fromisoformat(esc.resolved_at)
-                except (ValueError, TypeError):
-                    continue
-                if resolved.tzinfo is None:
-                    resolved = resolved.replace(tzinfo=UTC)
-                if effective_now - resolved <= window:
-                    return True
-            return False
+            # The fingerprint hashes its category first, so membership in the
+            # category-set scan is the category + fingerprint match.
+            fps = self._memoised_resolved_fingerprints(scan_key, now=effective_now)
+            return fingerprint in fps
         except Exception as e:
             logger.warning(
                 'reconciliation.recently_resolved_check_failed',
@@ -4659,8 +5196,8 @@ class ReconciliationHarness:
                 return
 
             # Partition into actionable vs escalation
-            actionable = [f for f in all_findings if f.get('actionable', False)]
-            non_actionable = [f for f in all_findings if not f.get('actionable', False)]
+            actionable = [f for f in all_findings if _finding_is_live_actionable(f)]
+            non_actionable = [f for f in all_findings if not _finding_is_live_actionable(f)]
 
             # Task 1512 / plans/afk-A7-recon-closure.md:
             # Non-actionable findings are NOT escalated.  Per the Stage-3 contract
@@ -4685,13 +5222,101 @@ class ReconciliationHarness:
             # the leak.  Fail-open: _finding_has_reference only drops a
             # finding when _derive_affected_ids is clearly empty; anything
             # ambiguous (legacy affected_ids or any typed citation) passes.
+            # Task 4781: split the drop bucket a second way.  Precedence is
+            # deliberate — _finding_has_citation_failures is checked BEFORE
+            # falling back to "never cited", because a citation_failures
+            # marker can only exist on a finding that DID have a citation to
+            # verify (see _finding_has_citation_failures's docstring). A
+            # phantom-cited finding must never be miscounted as evidence that
+            # Stage 3 stopped citing.
             referenceable: list[dict] = []
+            dropped_phantom_cited: list[dict] = []
             dropped_placeholders: list[dict] = []
             for finding in actionable:
                 if _finding_has_reference(finding):
                     referenceable.append(finding)
+                elif _finding_has_citation_failures(finding):
+                    dropped_phantom_cited.append(finding)
                 else:
                     dropped_placeholders.append(finding)
+
+            # Task 4781: a phantom-cited finding is a REAL finding whose
+            # evidence evaporated after Stage 3 cited it (its cited mem0 id(s)
+            # no longer resolve — see citation_verifier.py::verify_cited_memories).
+            # It is still dropped here, same as a never-cited placeholder:
+            # _derive_affected_ids(finding) is empty either way, so a
+            # remediation agent would have no task/entity/edge/memory identity
+            # to investigate, and _escalate's fingerprint would fall back to a
+            # description-only hash that folds unrelated findings together —
+            # exactly the leak _finding_has_reference exists to close. What
+            # changes is attribution: this drop is logged and (step-6) alarmed
+            # under its own name, so it is never misfiled as "Stage 3 stopped
+            # citing findings".
+            #
+            # COVERAGE TRADE-OFF (reviewer_comprehensive, task 4781 amendment):
+            # splitting one counter into two independently-thresholded counters
+            # is NOT coverage-neutral for a MIXED burst. Before this split, both
+            # causes fed one counter at threshold 5, so e.g. 3 never-cited drops
+            # + 3 phantom-cited drops in a window summed to 6 and fired (under
+            # the wrong label) the placeholder storm. Now each cause has its own
+            # threshold-5 counter, so that same 3+3 burst trips NEITHER alarm —
+            # six actionable findings can vanish from remediation in one window
+            # with no escalation at all. Accepted deliberately: correct
+            # attribution was judged more valuable than aggregate-sum
+            # sensitivity to a mixed burst (see this task's plan
+            # design_decisions), and a genuinely sustained single-cause outage
+            # still fires its own alarm at the same threshold as before the
+            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
+            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
+            # bursts behaviour so a future reader sees it as a decision, not a
+            # bug. If mixed-cause bursts under each per-cause threshold prove to
+            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
+            # loops below, whose escalation names both per-cause counts — not
+            # raising these two thresholds, which would blunt each alarm's own
+            # single-cause sensitivity instead of restoring aggregate coverage.
+            for finding in dropped_phantom_cited:
+                logger.warning(
+                    'reconciliation.remediation_dropped_phantom_cited_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                        'citation_failures': finding.get('citation_failures') or [],
+                    },
+                )
+                # Task 4781: coarse aggregate alarm for a sustained
+                # phantom-citation-verification outage (e.g. mem0/Qdrant
+                # health, a bad bulk-delete) — the sibling of the
+                # placeholder-storm alarm below, but for the OTHER drop
+                # cause. Without this, a real evidence-loss event would push
+                # findings out of every remediation batch with no alarm at
+                # all: an individual drop is logged-only, and a dropped
+                # finding never enters a remediation run, so it can no longer
+                # accumulate toward _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+                # either (same gap the module comment above
+                # _PLACEHOLDER_DROP_STORM_THRESHOLD documents for the other
+                # cause).
+                storm = self._record_phantom_citation_finding_drop(project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or project_id
+                    storm_summary = (
+                        f"phantom-cited finding drop storm: {storm['count']} in "
+                        f'{window_min:.0f} min (projects: {proj_label}) — actionable '
+                        f'findings are reaching remediation with every citation stripped '
+                        f'by phantom-citation verification (cited mem0 ids no longer '
+                        f'resolve); their evidence evaporated — check mem0/Qdrant health '
+                        f'and recent memory deletions'
+                    )
+                    storm_detail = f'project={project_id} parent_run={parent_run_id}'
+                    self._escalate(
+                        'recon_remediation_phantom_citation_storm',
+                        parent_run_id,
+                        storm_summary,
+                        storm_detail,
+                        finding=_PHANTOM_CITATION_DROP_STORM_FINDING,
+                    )
 
             for finding in dropped_placeholders:
                 logger.warning(
@@ -4934,220 +5559,219 @@ class ReconciliationHarness:
             },
         )
 
-        # Task 4115: resolve the tree and the instant it was read as ONE unit
-        # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
-        # itself), so a caller's read instant can never be paired with a tree
-        # it does not describe. Caller-supplied tree: honour the caller's read
-        # instant when given AND timezone-aware; otherwise fall back to a
-        # fresh now() with a WARNING trace — loud rather than silent, since a
-        # caller that drops or malforms the instant regresses straight back to
-        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
-        # norm). A naive (tzinfo-less) instant is treated the same as a
-        # missing one rather than handed to corroboration_for_task as-is:
-        # has_live_claimant compares it against timezone-aware heartbeats, and
-        # the resulting TypeError is caught and swallowed several frames down
-        # (see the `except Exception as _corr_exc` below), which would
-        # otherwise leave corroborated=None and silently suppress every
-        # stranded-work escalation in the pass — the opposite of this gate's
-        # fail-safe direction. The WARNING fallback is otherwise exactly the
-        # pre-4115 behaviour, which the ~30 existing direct
-        # _run_remediation_pass callers that pass a tree without an instant
-        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
-        # (if one was even supplied) describes a different tree, or no tree at
-        # all, and must never leak onto the tree just fetched here.
-        #
-        # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
-        # below (task_by_id, and therefore every heartbeat_at it carries) was
-        # read. It is threaded into corroboration_for_task ONLY to age-check
-        # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
-        # must be the snapshot's clock, not the clock at the moment the gate
-        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
-        # minutes of LLM work, and the TTL is 10 minutes — comparable to a
-        # whole pass. Using a fresh now() there would age a heartbeat that was
-        # fresh when read past the TTL purely because the pass was slow,
-        # reporting corroborated=False for a task that is in fact live and
-        # filing a spurious stranded-work escalation — task 4115 found this
-        # happening on exactly the caller-supplied-tree path, the one
-        # production always takes (run_full_cycle threads its pre-stage-loop
-        # fetch straight through): this stamp used to be an unconditional
-        # datetime.now(UTC) taken here regardless of which tree was in play,
-        # so a caller's own (earlier, more accurate) read instant was silently
-        # discarded. Pinning the clock to the read makes the verdict "was
-        # there a fresh per-task signal in the snapshot we hold" — evaluable,
-        # and biased toward suppression (the fail-safe direction) rather than
-        # toward escalating. task_by_id's own staleness is pre-existing and
-        # orthogonal.
-        _tasks_snapshot_at: datetime
-        if filtered_task_tree is not None:
-            remediation_tree = filtered_task_tree
-            if (
-                filtered_task_tree_fetched_at is not None
-                and filtered_task_tree_fetched_at.tzinfo is not None
-            ):
-                _tasks_snapshot_at = filtered_task_tree_fetched_at
+        current_stage_name: str | None = None
+        try:
+            # Task 4115: resolve the tree and the instant it was read as ONE unit
+            # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
+            # itself), so a caller's read instant can never be paired with a tree
+            # it does not describe. Caller-supplied tree: honour the caller's read
+            # instant when given AND timezone-aware; otherwise fall back to a
+            # fresh now() with a WARNING trace — loud rather than silent, since a
+            # caller that drops or malforms the instant regresses straight back to
+            # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+            # norm). A naive (tzinfo-less) instant is treated the same as a
+            # missing one rather than handed to corroboration_for_task as-is:
+            # has_live_claimant compares it against timezone-aware heartbeats, and
+            # the resulting TypeError is caught and swallowed several frames down
+            # (see the `except Exception as _corr_exc` below), which would
+            # otherwise leave corroborated=None and silently suppress every
+            # stranded-work escalation in the pass — the opposite of this gate's
+            # fail-safe direction. The WARNING fallback is otherwise exactly the
+            # pre-4115 behaviour, which the ~30 existing direct
+            # _run_remediation_pass callers that pass a tree without an instant
+            # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+            # (if one was even supplied) describes a different tree, or no tree at
+            # all, and must never leak onto the tree just fetched here.
+            #
+            # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
+            # below (task_by_id, and therefore every heartbeat_at it carries) was
+            # read. It is threaded into corroboration_for_task ONLY to age-check
+            # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+            # must be the snapshot's clock, not the clock at the moment the gate
+            # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
+            # minutes of LLM work, and the TTL is 10 minutes — comparable to a
+            # whole pass. Using a fresh now() there would age a heartbeat that was
+            # fresh when read past the TTL purely because the pass was slow,
+            # reporting corroborated=False for a task that is in fact live and
+            # filing a spurious stranded-work escalation — task 4115 found this
+            # happening on exactly the caller-supplied-tree path, the one
+            # production always takes (run_full_cycle threads its pre-stage-loop
+            # fetch straight through): this stamp used to be an unconditional
+            # datetime.now(UTC) taken here regardless of which tree was in play,
+            # so a caller's own (earlier, more accurate) read instant was silently
+            # discarded. Pinning the clock to the read makes the verdict "was
+            # there a fresh per-task signal in the snapshot we hold" — evaluable,
+            # and biased toward suppression (the fail-safe direction) rather than
+            # toward escalating. task_by_id's own staleness is pre-existing and
+            # orthogonal.
+            _tasks_snapshot_at: datetime
+            if filtered_task_tree is not None:
+                remediation_tree = filtered_task_tree
+                if (
+                    filtered_task_tree_fetched_at is not None
+                    and filtered_task_tree_fetched_at.tzinfo is not None
+                ):
+                    _tasks_snapshot_at = filtered_task_tree_fetched_at
+                else:
+                    logger.warning(
+                        'reconciliation.remediation_tree_read_instant_missing',
+                        extra={
+                            'project_id': project_id,
+                            'parent_run_id': parent_run_id,
+                            'reason': (
+                                'naive_datetime'
+                                if filtered_task_tree_fetched_at is not None
+                                else 'not_supplied'
+                            ),
+                        },
+                    )
+                    _tasks_snapshot_at = datetime.now(UTC)
             else:
-                logger.warning(
-                    'reconciliation.remediation_tree_read_instant_missing',
+                remediation_tree = await self._fetch_filtered_task_tree(project_root)
+                _tasks_snapshot_at = datetime.now(UTC)
+
+            # Task 2031/2067: a {str(task_id): task dict} map derived from
+            # remediation_tree in a single pass, used by the live-workflow gate below
+            # so never-dispatched cited tasks (deferred/done/cancelled) drop the
+            # project-wide orchestrator_live signal instead of being suppressed by it,
+            # and so BLOCKED cited tasks that are deterministic (never acquire a
+            # worktree/branch of their own — routed to DeterministicRunner) do too —
+            # which status alone cannot express since 'blocked' is deliberately not in
+            # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+            # auto-unblock mid-pipeline). remediation_tree is always a valid
+            # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+            #
+            # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
+            # scalar maps into this one: the gate now also needs `metadata` (for
+            # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
+            # corroboration), which no scalar map can express. Keying the whole dict
+            # subsumes all of them from the same single pass at no extra cost, and
+            # keeps every derived value guaranteed to come from ONE task snapshot.
+            #
+            # Coverage caveat (unchanged, restated for the consolidated map): active_
+            # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
+            # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
+            # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
+            # done/cancelled task outside those caps, or one with an untracked status,
+            # is simply absent here and task_by_id.get(tid) falls back to None below —
+            # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
+            # status-blind, fail-safe-toward-live values for that one id, not a new
+            # failure mode.
+            task_by_id: dict[str, dict] = {}
+            for t in (
+                list(remediation_tree.active_tasks)
+                + list(remediation_tree.done_tasks)
+                + list(remediation_tree.cancelled_tasks)
+            ):
+                if not isinstance(t, dict) or t.get('id') is None:
+                    continue
+                task_by_id[str(t.get('id'))] = t
+
+            # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
+            # stage is built or run. Filters cross-project scope-correction
+            # findings whose subject task is unchanged since the last
+            # consolidated snapshot out of `findings`, the single choke point
+            # shared by both Stage 1 (remediation_findings, wired below via
+            # _configure_consolidator) and Stage 2 (remediation_mode=True — no
+            # findings list of its own) remediation re-derivation. Best-effort:
+            # any failure here (unresolvable project, get_task/Mem0 errors, ...)
+            # falls back to the original, unfiltered `findings` — see the
+            # fused_memory.reconciliation.scope_freshness module docstring.
+            # `freshness` is pre-initialized to None so the except branch below
+            # (the pre-check raising before ever assigning it) leaves an
+            # unambiguous "pre-check did not run" sentinel for the short-circuit
+            # guard just below to key off of.
+            # `max_consecutive_skips` is wired to the SAME
+            # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
+            # escalation loop below (amendment: reviewer finding
+            # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
+            # skipped by the pre-check at most threshold-1 cycles in a row before
+            # it is forced back through a real Stage 1-3 pass. The cap ALONE is
+            # not sufficient for the loud-failure guarantee, though: the
+            # persistence-gated escalation loop only counts a run toward a
+            # finding's recurrence if that run's stage_reports carries an
+            # integrity_check entry, and a short-circuited run built none.  The
+            # short-circuit block below also stamps `freshness.skipped` into a
+            # synthetic integrity_check report before completing the run
+            # (amendment — reviewer finding behavior_change), so BOTH the cap's
+            # periodic forced re-investigation AND every intervening
+            # short-circuited skip contribute to the window — only together do
+            # they guarantee a genuinely stranded cross-project thread escalates
+            # within a bounded number of cycles instead of being silently
+            # suppressed forever.
+            freshness: ScopeFreshnessResult | None = None
+            try:
+                if self.taskmaster is None:
+                    raise RuntimeError('taskmaster is not configured')
+                freshness = await precheck_scope_correction_freshness(
+                    memory_service=self.memory,
+                    taskmaster=self.taskmaster,
+                    project_id=project_id,
+                    resolve_project_root=self._resolve_known_root,
+                    run_id=run_id,
+                    findings=findings,
+                    max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+                )
+                findings = freshness.to_reinvestigate
+                skipped_task_refs = []
+                for _skipped in freshness.skipped:
+                    _sig = compute_scope_signature(_skipped, project_id)
+                    if _sig is not None:
+                        skipped_task_refs.append(_sig[0])
+                logger.info(
+                    'reconciliation.scope_freshness_precheck',
                     extra={
+                        'run_id': run_id,
                         'project_id': project_id,
-                        'parent_run_id': parent_run_id,
-                        'reason': (
-                            'naive_datetime'
-                            if filtered_task_tree_fetched_at is not None
-                            else 'not_supplied'
-                        ),
+                        'skipped_task_refs': skipped_task_refs,
+                        **freshness.stats,
                     },
                 )
-                _tasks_snapshot_at = datetime.now(UTC)
-        else:
-            remediation_tree = await self._fetch_filtered_task_tree(project_root)
-            _tasks_snapshot_at = datetime.now(UTC)
+            except Exception as exc:
+                logger.warning(
+                    'reconciliation.scope_freshness_precheck_wiring_failed',
+                    extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
+                )
 
-        # Task 2031/2067: a {str(task_id): task dict} map derived from
-        # remediation_tree in a single pass, used by the live-workflow gate below
-        # so never-dispatched cited tasks (deferred/done/cancelled) drop the
-        # project-wide orchestrator_live signal instead of being suppressed by it,
-        # and so BLOCKED cited tasks that are deterministic (never acquire a
-        # worktree/branch of their own — routed to DeterministicRunner) do too —
-        # which status alone cannot express since 'blocked' is deliberately not in
-        # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
-        # auto-unblock mid-pipeline). remediation_tree is always a valid
-        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
-        #
-        # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
-        # scalar maps into this one: the gate now also needs `metadata` (for
-        # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
-        # corroboration), which no scalar map can express. Keying the whole dict
-        # subsumes all of them from the same single pass at no extra cost, and
-        # keeps every derived value guaranteed to come from ONE task snapshot.
-        #
-        # Coverage caveat (unchanged, restated for the consolidated map): active_
-        # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
-        # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
-        # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
-        # done/cancelled task outside those caps, or one with an untracked status,
-        # is simply absent here and task_by_id.get(tid) falls back to None below —
-        # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
-        # status-blind, fail-safe-toward-live values for that one id, not a new
-        # failure mode.
-        task_by_id: dict[str, dict] = {}
-        for t in (
-            list(remediation_tree.active_tasks)
-            + list(remediation_tree.done_tasks)
-            + list(remediation_tree.cancelled_tasks)
-        ):
-            if not isinstance(t, dict) or t.get('id') is None:
-                continue
-            task_by_id[str(t.get('id'))] = t
+            # Short-circuit: every finding was confirmed fresh (unchanged) by the
+            # pre-check above — skip building/running any stage entirely (no LLM
+            # subprocess launches) and journal-complete the run as-is. Guarded on
+            # `freshness is not None` so a pre-check that raised (and therefore
+            # fell back to the original, unfiltered `findings` above) never
+            # short-circuits — only a POSITIVE freshness confirmation may skip
+            # remediation, never an error/uncertainty path.
+            if freshness is not None and not findings and freshness.skipped:
+                logger.info(
+                    'reconciliation.remediation_skipped_all_fresh',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        **freshness.stats,
+                    },
+                )
+                # Stamp the skipped findings into a synthetic integrity_check
+                # stage report BEFORE completing the run, so this short-circuited
+                # run still counts toward _finding_persistence_count's lookback
+                # window exactly as a real Stage 3 re-flag would have (task 2417
+                # amendment — reviewer finding behavior_change).  Without this,
+                # a short-circuited run occupied a slot in the persistence
+                # window while contributing 0, and the loud-failure guarantee
+                # described above depended on BOTH the consecutive-skip cap's
+                # periodic forced re-investigation AND this stamp — the cap
+                # alone forces a real pass only every threshold-th cycle, which
+                # is not by itself enough to saturate the persistence window.
+                # No stage is built or run here — this uses the plain-dict
+                # report shape the journal/tests already accept elsewhere
+                # ({'integrity_check': {'items_flagged': [...]}}).
+                run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
+                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                run.completed_at = datetime.now(UTC)
+                run.status = RunStatus.completed
+                await self.journal.complete_run(run_id, 'completed')
+                return
 
-        current_stage_name: str | None = None
-
-        # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
-        # stage is built or run. Filters cross-project scope-correction
-        # findings whose subject task is unchanged since the last
-        # consolidated snapshot out of `findings`, the single choke point
-        # shared by both Stage 1 (remediation_findings, wired below via
-        # _configure_consolidator) and Stage 2 (remediation_mode=True — no
-        # findings list of its own) remediation re-derivation. Best-effort:
-        # any failure here (unresolvable project, get_task/Mem0 errors, ...)
-        # falls back to the original, unfiltered `findings` — see the
-        # fused_memory.reconciliation.scope_freshness module docstring.
-        # `freshness` is pre-initialized to None so the except branch below
-        # (the pre-check raising before ever assigning it) leaves an
-        # unambiguous "pre-check did not run" sentinel for the short-circuit
-        # guard just below to key off of.
-        # `max_consecutive_skips` is wired to the SAME
-        # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
-        # escalation loop below (amendment: reviewer finding
-        # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
-        # skipped by the pre-check at most threshold-1 cycles in a row before
-        # it is forced back through a real Stage 1-3 pass. The cap ALONE is
-        # not sufficient for the loud-failure guarantee, though: the
-        # persistence-gated escalation loop only counts a run toward a
-        # finding's recurrence if that run's stage_reports carries an
-        # integrity_check entry, and a short-circuited run built none.  The
-        # short-circuit block below also stamps `freshness.skipped` into a
-        # synthetic integrity_check report before completing the run
-        # (amendment — reviewer finding behavior_change), so BOTH the cap's
-        # periodic forced re-investigation AND every intervening
-        # short-circuited skip contribute to the window — only together do
-        # they guarantee a genuinely stranded cross-project thread escalates
-        # within a bounded number of cycles instead of being silently
-        # suppressed forever.
-        freshness: ScopeFreshnessResult | None = None
-        try:
-            if self.taskmaster is None:
-                raise RuntimeError('taskmaster is not configured')
-            freshness = await precheck_scope_correction_freshness(
-                memory_service=self.memory,
-                taskmaster=self.taskmaster,
-                project_id=project_id,
-                resolve_project_root=self._resolve_known_root,
-                run_id=run_id,
-                findings=findings,
-                max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
-            )
-            findings = freshness.to_reinvestigate
-            skipped_task_refs = []
-            for _skipped in freshness.skipped:
-                _sig = compute_scope_signature(_skipped, project_id)
-                if _sig is not None:
-                    skipped_task_refs.append(_sig[0])
-            logger.info(
-                'reconciliation.scope_freshness_precheck',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'skipped_task_refs': skipped_task_refs,
-                    **freshness.stats,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                'reconciliation.scope_freshness_precheck_wiring_failed',
-                extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
-            )
-
-        # Short-circuit: every finding was confirmed fresh (unchanged) by the
-        # pre-check above — skip building/running any stage entirely (no LLM
-        # subprocess launches) and journal-complete the run as-is. Guarded on
-        # `freshness is not None` so a pre-check that raised (and therefore
-        # fell back to the original, unfiltered `findings` above) never
-        # short-circuits — only a POSITIVE freshness confirmation may skip
-        # remediation, never an error/uncertainty path.
-        if freshness is not None and not findings and freshness.skipped:
-            logger.info(
-                'reconciliation.remediation_skipped_all_fresh',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'parent_run_id': parent_run_id,
-                    **freshness.stats,
-                },
-            )
-            # Stamp the skipped findings into a synthetic integrity_check
-            # stage report BEFORE completing the run, so this short-circuited
-            # run still counts toward _finding_persistence_count's lookback
-            # window exactly as a real Stage 3 re-flag would have (task 2417
-            # amendment — reviewer finding behavior_change).  Without this,
-            # a short-circuited run occupied a slot in the persistence
-            # window while contributing 0, and the loud-failure guarantee
-            # described above depended on BOTH the consecutive-skip cap's
-            # periodic forced re-investigation AND this stamp — the cap
-            # alone forces a real pass only every threshold-th cycle, which
-            # is not by itself enough to saturate the persistence window.
-            # No stage is built or run here — this uses the plain-dict
-            # report shape the journal/tests already accept elsewhere
-            # ({'integrity_check': {'items_flagged': [...]}}).
-            run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            run.completed_at = datetime.now(UTC)
-            run.status = RunStatus.completed
-            await self.journal.complete_run(run_id, 'completed')
-            return
-
-        stages = self._make_stages(scope)
-        try:
+            stages = self._make_stages(scope)
             # Configure stages for remediation mode
             stage1 = stages[0]
             stage2 = stages[1]
@@ -5221,7 +5845,7 @@ class ReconciliationHarness:
             # that remediation cannot fix it on its own.  Below the threshold we
             # suppress the escalation and emit a structured log so the finding
             # stays observable without polluting the queue.
-            # The except handlers further below (AllAccountsCappedException and
+            # The except handlers further below (CancelledError, AllAccountsCappedException and
             # bare Exception) are untouched — they fire on stage *exceptions*, not
             # on Stage-3 findings, and are the genuine "needs human" signals.
             #
@@ -5236,8 +5860,10 @@ class ReconciliationHarness:
                     all_remaining = s3_report.get('items_flagged', [])
                 else:
                     all_remaining = s3_report.items_flagged
-                actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
-                non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
+                actionable_remaining = [f for f in all_remaining if _finding_is_live_actionable(f)]
+                non_actionable_remaining = [
+                    f for f in all_remaining if not _finding_is_live_actionable(f)
+                ]
                 # Non-actionable findings are logged but never escalated — same
                 # contract as the parent pass in _maybe_remediate.
                 for finding in non_actionable_remaining:
@@ -5250,6 +5876,9 @@ class ReconciliationHarness:
                 # Fail-open: on any scan error, leave resolved_fps empty (no
                 # suppressions) and proceed with full escalation — same philosophy
                 # as the pending_fps build in _maybe_remediate.
+                #
+                # Task 5550: the walk is unbounded, so it runs in a worker thread;
+                # to_thread can itself raise, hence the try/except.
                 resolved_fps: frozenset[str] = frozenset()
                 if (
                     HAS_ESCALATION
@@ -5257,32 +5886,9 @@ class ReconciliationHarness:
                     and _RECON_DEDUP_CONFIG is not None
                 ):
                     try:
-                        _now = datetime.now(UTC)
-                        _window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-                        _rfps: set[str] = set()
-                        for _path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                            self._escalation_queue.queue_dir
-                        ):
-                            try:
-                                _esc = Escalation.from_json(_path.read_text())  # type: ignore[possibly-undefined]
-                            except Exception:
-                                continue
-                            if not (
-                                _esc.status in ('resolved', 'dismissed')
-                                and _esc.category in _RECON_DEDUP_CONFIG.infra_dedupe_categories
-                                and _esc.dedupe_fingerprint
-                                and _esc.resolved_at
-                            ):
-                                continue
-                            try:
-                                _resolved = datetime.fromisoformat(_esc.resolved_at)
-                            except (ValueError, TypeError):
-                                continue
-                            if _resolved.tzinfo is None:
-                                _resolved = _resolved.replace(tzinfo=UTC)
-                            if _now - _resolved <= _window:
-                                _rfps.add(_esc.dedupe_fingerprint)
-                        resolved_fps = frozenset(_rfps)
+                        resolved_fps = await asyncio.to_thread(
+                            self._scan_resolved_fingerprints, now=datetime.now(UTC),
+                        )
                     except Exception as _rfps_err:
                         logger.warning(
                             'reconciliation.recently_resolved_check_failed',
@@ -5319,6 +5925,112 @@ class ReconciliationHarness:
                     _orch_started: datetime | None = orchestrator_started_at(project_root)
                 except Exception:
                     _orch_started = None
+
+                # Task 3778: hoist the whole-repo `git worktree list --porcelain`
+                # out of the cited-task fan-out below, the same way
+                # _render_live_workflow_section hoists it out of its per-task
+                # loop (and the same way the is_orchestrator_live_for hoist
+                # noted above already works here). It is invariant across every
+                # cited task in this pass, so the doubly-nested loop pays ONE
+                # worktree list rather than one per cited task.
+                #
+                # worktree_index_kwargs owns the three-valued contract for both
+                # hoisting call sites: fail-safe, WARNING on every unknown, and
+                # the unknown → omit-the-kwarg rule that makes each probe fall
+                # back to its own list rather than trusting an empty index from
+                # a hoisted ERROR (which would read as a project-wide "nothing
+                # is live" and fire stranded escalations for genuinely live
+                # tasks). A known-empty repo arrives as {'worktree_index': {}}.
+                _index_kwargs: dict = await worktree_index_kwargs(project_root)
+
+                async def _task_is_live(tid: str) -> bool:
+                    """Is task *tid* covered by a live workflow right now?
+
+                    Extracted verbatim (task 4821) from the per-cited-task body
+                    of the live-workflow gate below so a SECOND consumer — the
+                    routed-filing gate on the escalate branch — asks the exact
+                    same question of the exact same inputs.  A re-implementation
+                    would be free to drift; a shared helper cannot.
+
+                    Closes over the five pass-local, loop-constant inputs
+                    (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
+                    `_orch_started`, `_index_kwargs`) plus `project_root`, so
+                    the caller supplies only the task id.
+
+                    Fail-safe direction is UNCHANGED from the inline version it
+                    replaces: a corroboration error leaves the gate inert
+                    (`corroborated=None`), and a detector error is treated as
+                    NOT live — biasing toward escalating rather than toward
+                    silencing a genuine stranded-work escalation.
+                    """
+                    _task = task_by_id.get(tid)
+                    _metadata = _task.get('metadata') if _task else None
+                    _status = _task.get('status') if _task else None
+                    # In-progress-only, mirroring the renderer's
+                    # `task.get('status') == 'in-progress'` guard so all
+                    # three consumers gate corroboration identically.
+                    corroborated: bool | None = None
+                    if _status == 'in-progress' and _task is not None:
+                        try:
+                            corroborated = corroboration_for_task(
+                                _task, tid,
+                                # The snapshot's own clock, NOT now() — see
+                                # the _tasks_snapshot_at comment above: the
+                                # heartbeat being aged came from that same
+                                # read, and the 10-minute TTL is comparable
+                                # to a remediation pass.
+                                now=_tasks_snapshot_at,
+                                scheduler_state=_sched_state,
+                                orchestrator_started_at=_orch_started,
+                            )
+                        except Exception as _corr_exc:
+                            logger.debug(
+                                'corroboration_for_task error for task %s; '
+                                'leaving the gate inert: %s',
+                                tid, _corr_exc,
+                            )
+                    try:
+                        # Awaited (task 3778): the detector's three git
+                        # probes are async now, so this gate no longer
+                        # blocks the loop this pass runs on.
+                        return bool(await is_workflow_live_for_task(
+                            tid, project_root,
+                            status=_status,
+                            **_index_kwargs,
+                            task_kind=(
+                                _metadata.get('task_kind')
+                                if isinstance(_metadata, dict) else None
+                            ),
+                            # Task 3751 rule 5 (pending + deterministic +
+                            # pure gate). is_pure_gate_metadata's own
+                            # non-Mapping -> False contract is the guard,
+                            # so an absent or malformed blob degrades
+                            # toward live with no extra check here. This
+                            # completes the input parity: this consumer,
+                            # recon_write_policy Gate 2 and
+                            # _render_live_workflow_section now all pass
+                            # the identical status/task_kind/pure_gate/
+                            # corroborated tuple — the invariant task 2964
+                            # exists to establish.
+                            pure_gate=is_pure_gate_metadata(_metadata),
+                            corroborated=corroborated,
+                        ))
+                    except Exception as _det_exc:
+                        logger.debug(
+                            'live_workflow_detector error for task %s; treating as not-live: %s',
+                            tid, _det_exc,
+                        )
+                        return False
+
+                # Task 5550: liveness is loop-constant per task id here, like
+                # `_sched_state` above, so each id's git probes run once per pass.
+                _live_by_task: dict[str, bool] = {}
+
+                async def _task_is_live_memoised(tid: str) -> bool:
+                    """`_task_is_live`, asked once per id per pass."""
+                    if tid not in _live_by_task:
+                        _live_by_task[tid] = await _task_is_live(tid)
+                    return _live_by_task[tid]
 
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
@@ -5379,61 +6091,9 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
-                            _task = task_by_id.get(tid)
-                            _metadata = _task.get('metadata') if _task else None
-                            _status = _task.get('status') if _task else None
-                            # In-progress-only, mirroring the renderer's
-                            # `task.get('status') == 'in-progress'` guard so all
-                            # three consumers gate corroboration identically.
-                            corroborated: bool | None = None
-                            if _status == 'in-progress' and _task is not None:
-                                try:
-                                    corroborated = corroboration_for_task(
-                                        _task, tid,
-                                        # The snapshot's own clock, NOT now() — see
-                                        # the _tasks_snapshot_at comment above: the
-                                        # heartbeat being aged came from that same
-                                        # read, and the 10-minute TTL is comparable
-                                        # to a remediation pass.
-                                        now=_tasks_snapshot_at,
-                                        scheduler_state=_sched_state,
-                                        orchestrator_started_at=_orch_started,
-                                    )
-                                except Exception as _corr_exc:
-                                    logger.debug(
-                                        'corroboration_for_task error for task %s; '
-                                        'leaving the gate inert: %s',
-                                        tid, _corr_exc,
-                                    )
-                            try:
-                                if is_workflow_live_for_task(
-                                    tid, project_root,
-                                    status=_status,
-                                    task_kind=(
-                                        _metadata.get('task_kind')
-                                        if isinstance(_metadata, dict) else None
-                                    ),
-                                    # Task 3751 rule 5 (pending + deterministic +
-                                    # pure gate). is_pure_gate_metadata's own
-                                    # non-Mapping -> False contract is the guard,
-                                    # so an absent or malformed blob degrades
-                                    # toward live with no extra check here. This
-                                    # completes the input parity: this consumer,
-                                    # recon_write_policy Gate 2 and
-                                    # _render_live_workflow_section now all pass
-                                    # the identical status/task_kind/pure_gate/
-                                    # corroborated tuple — the invariant task 2964
-                                    # exists to establish.
-                                    pure_gate=is_pure_gate_metadata(_metadata),
-                                    corroborated=corroborated,
-                                ):
-                                    any_live = True
-                                    break
-                            except Exception as _det_exc:
-                                logger.debug(
-                                    'live_workflow_detector error for task %s; treating as not-live: %s',
-                                    tid, _det_exc,
-                                )
+                            if await _task_is_live_memoised(tid):
+                                any_live = True
+                                break
                         if any_live:
                             logger.info(
                                 'reconciliation.integrity_escalation_suppressed_live_workflow',
@@ -5458,6 +6118,154 @@ class ReconciliationHarness:
                                 finding=finding,
                                 resolved_fps=resolved_fps,
                             )
+                            # Task 4821 (task 4764 arm 3): additionally route a
+                            # finding that NAMES a task onto that task's own
+                            # ORCHESTRATOR ladder, so it stops dead-ending in a
+                            # queue nobody reading the task would look at.  The
+                            # `_escalate` call above stays FIRST and
+                            # unconditional — this path adds a filing, it never
+                            # displaces the recon-queue one (the two queues have
+                            # different readers).
+                            #
+                            # Placement is load-bearing: sitting on this exact
+                            # branch inherits MOST existing suppression layers
+                            # structurally, with no duplicated logic that could
+                            # drift.  A finding only reaches here having already
+                            # survived the non-actionable partition, the
+                            # `_finding_has_reference` placeholder drop, the
+                            # open-recon-escalation check, the
+                            # `_INTEGRITY_FINDING_RECURRENCE_THRESHOLD`
+                            # persistence bar, and the live-workflow gate AS
+                            # APPLIED TO CITED TASKS.
+                            #
+                            # That last one is NOT inherited in full, and the
+                            # difference is the whole reason for the explicit
+                            # check below.  The gate above iterates
+                            # `cited_task_ids` — findings' `cited_tasks`
+                            # citations — while `resolve_finding_task_target`
+                            # ALSO honours the bare `finding['task_id']` field,
+                            # which the gate never sees.  The two are different
+                            # SETS, not the same set reached two ways: a finding
+                            # carrying only a bare `task_id` leaves
+                            # `cited_task_ids` empty, so `any_live` is VACUOUSLY
+                            # False and this branch is reached even when the
+                            # named task has live work in flight.  Gate the
+                            # resolved target explicitly, skipping the recheck
+                            # when it is already a cited id (the loop above just
+                            # proved that one not-live, and a recheck would spend
+                            # git subprocess calls to re-derive the same answer).
+                            #
+                            # The `_escalate` gate above is deliberately NOT
+                            # widened to the resolved target: that would silence
+                            # recon-queue escalations that file today, a
+                            # behaviour change outside this arm's scope.
+                            #
+                            # Resolved ONCE, here, and passed through to the
+                            # filer: this branch has to know the target anyway
+                            # (to gate it), and a second resolution inside the
+                            # filer would be free to drift from this one should
+                            # the resolver ever grow a caller-visible input.
+                            routed_task_id = resolve_finding_task_target(finding, project_id)
+                            if routed_task_id is None:
+                                # Nothing to route.  Do NOT call the filer just
+                                # to have it re-resolve to None: that is a pure
+                                # no-op call, and skipping it keeps the "was a
+                                # target found" decision at exactly one site.
+                                pass
+                            elif task_by_id and routed_task_id not in task_by_id:
+                                # EXISTENCE GATE (esc-4821 amendment pass).
+                                # Stage-3 findings are LLM-authored free text and
+                                # the bare-`task_id` branch of the resolver
+                                # INTERPRETS whatever string it finds as a task
+                                # in this project without confirming one exists.
+                                # A hallucinated or stale id ('9999', or a
+                                # subtask spelling like '4458.2') would otherwise
+                                # file `esc-9999-N` onto the orchestrator queue,
+                                # and `orchestrator/harness.py::
+                                # Harness._reap_orphan_l0_escalations` scans
+                                # `get_pending()` with NO task-existence check —
+                                # so after `orphan_l0_timeout_secs` the phantom
+                                # L0 becomes a phantom L1 in front of a human.
+                                # This is the same hazard `_sole_task_id_part`'s
+                                # docstring already reasons about for the
+                                # comma-joined case; `task_by_id` is in scope
+                                # here, so the check is free.
+                                #
+                                # `task_by_id and ...` is load-bearing, and is
+                                # the ONE place this gate deliberately fails
+                                # OPEN.  `_fetch_filtered_task_tree` degrades to
+                                # an EMPTY tree whenever taskmaster is disabled
+                                # or the fetch fails, and an empty map is not
+                                # evidence that a task is absent — it is evidence
+                                # that we do not know.  Treating "no tree" as
+                                # "no such task" would silently switch this whole
+                                # arm off for the duration of any taskmaster
+                                # hiccup, which is precisely the silent
+                                # degradation the surrounding gate already
+                                # refuses (see the coverage caveat on
+                                # `task_by_id`'s construction, which degrades a
+                                # missing entry to the fail-safe value for that
+                                # ONE id rather than for every id).
+                                #
+                                # RETENTION CAVEAT, and why failing closed on a
+                                # POPULATED tree is still right: `task_by_id` is
+                                # built from active_tasks (uncapped) plus
+                                # done/cancelled capped at
+                                # MAX_DONE_TASKS_RETAINED=30 /
+                                # MAX_CANCELLED_TASKS_RETAINED=15, so a finding
+                                # about a long-since-done task is also dropped
+                                # here.  That is the case where a fresh ladder
+                                # record is least useful — nobody is going to
+                                # act on an L1 for a task that finished 40
+                                # completions ago — while the recon-queue
+                                # `_escalate` filing above still fires, so the
+                                # finding is not lost.
+                                logger.info(
+                                    'reconciliation.integrity_escalation_routed_target_not_in_tree',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_id': routed_task_id,
+                                        'description': finding.get('description', ''),
+                                        'finding_category': finding.get('category', ''),
+                                    },
+                                )
+                            elif (
+                                routed_task_id not in cited_task_ids
+                                and await _task_is_live_memoised(routed_task_id)
+                            ):
+                                logger.info(
+                                    'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_id': routed_task_id,
+                                        'description': finding.get('description', ''),
+                                        'finding_category': finding.get('category', ''),
+                                    },
+                                )
+                            else:
+                                # VOLUME PARITY: at most one orchestrator-queue
+                                # record per finding that already files one recon
+                                # escalation today, folded across later cycles by
+                                # the filer's own pending scan on
+                                # FINDING_TASK_ESCALATION_CATEGORY.
+                                #
+                                # That scan is deliberately level-BLIND (see the
+                                # dedupe comment in
+                                # `_file_finding_task_escalation`) so the fold
+                                # survives `orchestrator/harness.py::
+                                # _reap_orphan_l0_escalations` promoting the
+                                # record from L0 to L1.  Without that, promotion
+                                # broke the fold and the next cycle filed a fresh
+                                # L0 that the reaper then dismissed as a
+                                # duplicate — one born-and-dismissed record per
+                                # reconciliation cycle, forever, on a task
+                                # already represented by an open L1.
+                                self._file_finding_task_escalation(
+                                    project_id, run_id, finding, persistence,
+                                    task_id=routed_task_id,
+                                )
                     else:
                         logger.info(
                             'reconciliation.unresolved_after_remediation_suppressed',
@@ -5478,6 +6286,27 @@ class ReconciliationHarness:
                 extra={'run_id': run_id, 'parent_run_id': parent_run_id},
             )
 
+        except asyncio.CancelledError as e:
+            # Always 'failed', never 'interrupted': _resume_interrupted_runs re-drives
+            # only run_full_cycle, and get_interrupted_runs does not filter by run_type.
+            run.status = RunStatus.failed
+            run.stage_reports['_error'] = _run_failure_record(
+                e, failed_stage=current_stage_name,
+                error_message='Remediation pass cancelled (shutdown, timeout or external cancellation)',
+            )
+            try:
+                await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+            except BaseException as cleanup_err:
+                logger.error(
+                    'complete_run(failed) failed after remediation cancellation: %r (%s)',
+                    cleanup_err,
+                    _run_failure_log_fields(run_id, _sqlite_classification(cleanup_err)),
+                )
+            logger.error(
+                'Remediation pass %s (parent %s) cancelled for %s (stage: %s)',
+                run_id, parent_run_id, project_id, current_stage_name,
+            )
+            raise
         except AllAccountsCappedException as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
@@ -5494,16 +6323,22 @@ class ReconciliationHarness:
                 f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
             )
         except Exception as e:
+            failure = _run_failure_record(e, failed_stage=current_stage_name)
+            logger.error(
+                'Remediation pass failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
+            )
             run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': type(e).__name__,
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-            }
-            await self.journal.complete_run(run_id, 'failed')
+            run.stage_reports['_error'] = failure
+            try:
+                await self.journal.complete_run(run_id, 'failed')
+            except Exception as write_err:
+                logger.error(
+                    'complete_run(failed) failed after remediation failure: %r (%s)',
+                    write_err,
+                    _run_failure_log_fields(run_id, _sqlite_classification(write_err)),
+                )
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none
-            logger.error(f'Remediation pass failed: {e}')
             self._escalate(
                 'recon_integrity_issue',
                 run_id,

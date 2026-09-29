@@ -4,11 +4,11 @@ systemd unit files it installs, and the wrapper their ExecStart names (task
 
 Drives the installer via subprocess with a FAKE `systemctl` shimmed onto PATH
 (records every invocation, minus `--user`, into a shared JSON state file) --
-mirroring test_install_reify_closure_staleness_sweep_timer.py. Real systemd is
+mirroring test_install_reclaim_orphaned_worktrees_timer.py. Real systemd is
 never touched.
 
 The wrapper half is driven with BOTH `*_CMD` seams pointed at fake recorder
-executables, mirroring test_reify_closure_staleness_sweep_wrapper.py, so the
+executables, mirroring test_flag_marker_sweep_wrapper.py, so the
 census never runs against live Qdrant and 3201's retro sweep never touches the
 live corpus.
 
@@ -291,12 +291,11 @@ def _values(directives, section, key) -> list[str]:
 
 
 def test_timer_fires_at_the_next_free_nightly_slot():
-    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep, the
+    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep and the
     already-double-booked 04:00 (reclaim-orphaned-worktrees +
-    legibility-transcript-check) and 04:30 reify-closure-staleness-sweep. The
-    stagger is deliberate: these jobs all touch the same machine and, in
-    several cases, the same backing stores -- this one scrolls every point in
-    both live Qdrant collections."""
+    legibility-transcript-check). The stagger is deliberate: these jobs all
+    touch the same machine and, in several cases, the same backing stores --
+    this one scrolls every point in both live Qdrant collections."""
     assert _values(_directives(TIMER_NAME), 'Timer', 'OnCalendar') == [
         '*-*-* 05:00:00']
 

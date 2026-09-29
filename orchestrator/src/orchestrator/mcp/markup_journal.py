@@ -120,10 +120,13 @@ def _encode(entry: dict[str, Any]) -> str:
     """One journal record as a line, with no envelope literal left verbatim.
 
     Deterministic key order is what makes the file greppable BY FIELD, and
-    matches the encoding the existing fact emitters
-    (``verdict_tools._emit_markup_fact`` and ``escalation.server``'s twin) use —
-    so a journal line and a log line are the same bytes plus this module's
-    envelope.
+    matches the encoding the last remaining logger-only fact emitter,
+    ``escalation/src/escalation/server.py::_emit_markup_fact``, uses — so a
+    journal line and a log line are the same bytes plus this module's envelope.
+    That emitter is the one boundary where a log line genuinely IS durable: the
+    escalation server runs under ``systemd --user``, so its stderr reaches
+    journald, which is the contrast this module's header draws. verdict-tools'
+    twin was retired for this journal by task 4917.
 
     THE OPENING ANGLE BRACKET IS ESCAPED, blanket. This journal records envelope
     literals by construction: ``pattern`` and ``misclose`` ARE the leaked

@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
 
+from dashboard.data import performance
 from dashboard.data.performance import (
+    _HISTORY_CACHE,
+    _cutoff,
+    _hour_bucketed_history,
     _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_performance_history,
     aggregate_time_centiles,
     get_completion_paths,
     get_escalation_rates,
@@ -1862,3 +1870,473 @@ class TestLoadEscalationsLogsWarningOnCorruptFile:
         ), (
             f'Expected WARNING mentioning esc-bad-1.json; got: {warning_texts}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test_Cutoff (step-1)
+# ---------------------------------------------------------------------------
+
+
+class Test_Cutoff:
+    """Tests for performance._cutoff — adapted from test_costs_data.py:250-268."""
+
+    def test_cutoff_uses_provided_now(self):
+        """_cutoff(days=7, now=fixed_dt) returns (fixed_dt - 7d).isoformat().
+
+        Also asserts the returned string carries a 'T' separator and a
+        '+00:00' offset — that is the whole point of the fix, since it must
+        compare correctly against the ISO-with-offset `completed_at` column.
+        """
+        fixed_dt = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+        expected = datetime(2026, 5, 8, 12, 0, tzinfo=UTC).isoformat()
+        result = _cutoff(7, now=fixed_dt)
+        assert result == expected
+        assert result == '2026-05-08T12:00:00+00:00'
+        assert 'T' in result
+        assert '+00:00' in result
+
+    def test_cutoff_no_now_uses_current_time(self):
+        """Without now, _cutoff derives its cutoff from the current UTC clock.
+
+        Brackets the real clock read with before/after captures (rather than
+        asserting equality) because the no-now branch resolves through
+        `resolve_now` in `dashboard.data.utils`, not a clock read local to
+        this test — the established non-flaky pattern for the `now=None`
+        default path (test_costs_data.py:257-272).
+        """
+        before = datetime.now(UTC)
+        result = _cutoff(7)
+        after = datetime.now(UTC)
+
+        lower = (before - timedelta(days=7)).isoformat()
+        upper = (after - timedelta(days=7)).isoformat()
+        assert lower <= result <= upper
+
+
+# ---------------------------------------------------------------------------
+# TestHourBucketedHistoryWindowBoundary (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestHourBucketedHistoryWindowBoundary:
+    """_hour_bucketed_history must exclude rows before the cutoff INSTANT,
+    not merely rows that share an earlier calendar DATE with the cutoff
+    (task 4624).
+
+    now=2026-05-15T12:00:00+00:00, days=7 -> cutoff instant is exactly
+    2026-05-08T12:00:00+00:00.
+    """
+
+    NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+    DAYS = 7
+
+    @pytest.fixture()
+    def boundary_db(self, tmp_path):
+        rows = [
+            # (run_id, task_id, project_id, title, outcome, cost_usd, duration_ms,
+            #  agent_invocations, execute_iterations, verify_attempts, review_cycles,
+            #  steward_cost_usd, steward_invocations, completed_at)
+            (
+                'r1', 't1', 'proj-a', None, 'done', 0.0, 1111,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T00:30:00+00:00',
+            ),  # same calendar date as cutoff, 11h30m BEFORE the cutoff instant
+            (
+                'r2', 't2', 'proj-a', None, 'done', 0.0, 2222,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T13:00:00+00:00',
+            ),  # 1h after the cutoff instant -- must be included
+            (
+                'r3', 't3', 'proj-a', None, 'done', 0.0, 3333,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-14T09:00:00+00:00',
+            ),  # comfortably inside the window -- must be included
+            (
+                'r4', 't4', 'proj-a', None, 'done', 0.0, 4444,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-07T23:00:00+00:00',
+            ),  # previous calendar date -- control row, excluded either way
+        ]
+        return _make_runs_db(tmp_path, 'boundary.db', rows)
+
+    @pytest.fixture()
+    async def boundary_conn(self, boundary_db):
+        async with aiosqlite.connect(str(boundary_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            yield conn
+
+    @pytest.mark.asyncio
+    async def test_row_before_cutoff_on_boundary_day_is_excluded(self, boundary_conn):
+        result = await _hour_bucketed_history(
+            boundary_conn, 'proj-a', days=self.DAYS, now=self.NOW
+        )
+        assert '2026-05-08T00:00' not in result['labels'], (
+            f"Boundary-day row 11h30m before the cutoff instant must be "
+            f"excluded; got labels {result['labels']}"
+        )
+        assert '2026-05-08T13:00' in result['labels']
+        assert '2026-05-14T09:00' in result['labels']
+        assert len(result['labels']) == 2, result['labels']
+
+    @pytest.mark.asyncio
+    async def test_binds_cutoff_as_parameter_and_keeps_covering_index(self, boundary_conn):
+        """The cutoff must be a bound TEXT parameter (not a SQL-side
+        datetime('now') call), and binding it must not defeat
+        idx_task_results_project as a covering index (performance.py:630-632).
+        """
+        captured: list[tuple[str, tuple]] = []
+        real_execute_fetchall = boundary_conn.execute_fetchall
+
+        async def spy(sql, params=()):
+            captured.append((sql, params))
+            return await real_execute_fetchall(sql, params)
+
+        boundary_conn.execute_fetchall = spy
+        await _hour_bucketed_history(boundary_conn, 'proj-a', days=self.DAYS, now=self.NOW)
+
+        assert len(captured) == 1, captured
+        sql, params = captured[0]
+        assert "datetime('now'" not in sql, sql
+
+        expected_cutoff = _cutoff(self.DAYS, now=self.NOW)
+        assert expected_cutoff in params, (
+            f'Expected bound cutoff {expected_cutoff!r} in params {params!r}'
+        )
+
+        plan_rows = await real_execute_fetchall(f'EXPLAIN QUERY PLAN {sql}', params)
+        plan_text = ' '.join(str(cell) for row in plan_rows for cell in row)
+        assert 'idx_task_results_project' in plan_text, plan_text
+
+
+# ---------------------------------------------------------------------------
+# TestAggregatePerformanceHistoryWindowBoundary (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestAggregatePerformanceHistoryWindowBoundary:
+    """aggregate_performance_history must not discover a project whose only
+    activity is before the cutoff INSTANT but on the cutoff's calendar DATE
+    (task 4624, defect site 2 — the SELECT DISTINCT project_id discovery
+    query).
+
+    now=2026-05-15T12:00:00+00:00, days=7 -> cutoff instant is exactly
+    2026-05-08T12:00:00+00:00 (same anchoring as step-3).
+    """
+
+    NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+    DAYS = 7
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        """The cache key (id(db), project_id, days, max_ts) excludes `now`
+        (see design decision), so tests that vary `now` across runs must
+        clear it explicitly to avoid reading a stale entry from another
+        test's db (whose id(db) could, in principle, be reused by the
+        allocator once the earlier db object is garbage collected).
+        """
+        _HISTORY_CACHE.clear()
+
+    @pytest.fixture()
+    async def boundary_only_conn(self, tmp_path):
+        rows = [
+            (
+                'r1', 't1', 'proj-inside', None, 'done', 0.0, 1000,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-14T09:00:00+00:00',
+            ),
+            (
+                'r2', 't2', 'proj-boundary', None, 'done', 0.0, 2000,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T00:30:00+00:00',
+            ),  # same calendar date as cutoff, before the cutoff instant --
+            # proj-boundary's ONLY row.
+        ]
+        db_path = _make_runs_db(tmp_path, 'boundary_only.db', rows)
+        db = await aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True)
+        db.row_factory = aiosqlite.Row
+        try:
+            yield db
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_boundary_only_project_is_not_discovered(self, boundary_only_conn):
+        """Discriminates site 784 specifically: if only site 642 were fixed,
+        'proj-boundary' would still be discovered (its only row passes the
+        buggy lexical comparison) and would appear in the output carrying
+        empty label/value lists -- so `not in` would fail. With both sites
+        fixed the key is absent entirely.
+        """
+        result = await aggregate_performance_history(
+            [boundary_only_conn], days=self.DAYS, now=self.NOW
+        )
+        assert 'proj-inside' in result, result
+        assert 'proj-boundary' not in result, (
+            f"proj-boundary's only row is before the cutoff instant and "
+            f'must not be discovered at all; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_now_is_resolved_once_and_threaded(self, boundary_only_conn):
+        """The discovery query and the per-project bucketing leg must share
+        one resolved cutoff instant rather than each reading the clock
+        independently and risking a straddled boundary.
+
+        Mirrors the spy pattern at test_costs_data.py:2296.
+        """
+        fixed_now = self.NOW
+        captured: list = []
+        real_cutoff = performance._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(performance, '_cutoff', side_effect=spy):
+            await aggregate_performance_history(
+                [boundary_only_conn], days=self.DAYS, now=fixed_now
+            )
+
+        assert captured, 'Expected _cutoff to be called at least once'
+        assert len(captured) >= 2, (
+            f'Expected at least 2 calls (discovery leg + at least one '
+            f'per-project bucketing leg) so this test cannot pass '
+            f'vacuously off the discovery call alone; got {captured!r}'
+        )
+        assert all(now == fixed_now for now in captured), (
+            f'Expected every _cutoff call to receive now={fixed_now!r} '
+            f'(never None), got {captured!r}'
+        )
+
+
+def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
+    """Yield ``(lineno, value)`` for every string-literal ``ast.Constant`` node
+    in *tree*, excluding module/class/function docstrings.
+
+    Used to restrict a source-scanning guard to string content that could
+    actually reach SQLite as a query, rather than every physical source
+    line. Comments are never part of the AST at all, so walking the tree
+    already excludes them; explicitly excluding docstring nodes here closes
+    the other gap -- a naive whole-file substring scan flags both, which is
+    why prose in performance.py previously had to avoid spelling out the
+    forbidden pattern literally.
+
+    Yielding the already-narrowed ``str`` value rather than the node carries
+    the "value is a `str`" invariant across the yield boundary in the type.
+    pyright infers `ast.Constant.value` as a union and this generator's
+    internal `isinstance` check does not survive yielding the node itself,
+    so every call site would otherwise have to re-narrow it defensively.
+    """
+    docstring_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstring_ids.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_ids
+        ):
+            yield node.lineno, node.value
+
+
+# Both spellings of the forbidden SQL-side clock read, in one place: the
+# detection below and the remediation message both derive from this tuple.
+_SQL_CLOCK_READ_PATTERNS = ("datetime('now'", 'datetime("now"')
+
+
+def _sql_clock_read_violations(source: str, label: str) -> list[str]:
+    """Return one ``'<label>:<lineno>: <excerpt>'`` entry per non-docstring
+    string literal in *source* whose value contains a
+    `_SQL_CLOCK_READ_PATTERNS` spelling.
+
+    A match is reported straight off the AST literal -- its start line and
+    its folded value -- and never off a physical source line. Python folds
+    implicitly-concatenated adjacent literals into ONE `ast.Constant` whose
+    value can contain the pattern while no single line does, so re-deriving
+    the violation by re-scanning lines silently misses exactly the
+    multi-line SQL style the module under guard is written in (task 4624
+    review finding).
+
+    Interior whitespace in the excerpt is collapsed so that a triple-quoted
+    multi-line SQL literal cannot emit embedded newlines, which would garble
+    the joined failure message into unattributable fragments.
+    """
+    violations: list[str] = []
+    for lineno, value in _iter_non_docstring_string_literals(ast.parse(source, filename=label)):
+        if any(pattern in value for pattern in _SQL_CLOCK_READ_PATTERNS):
+            excerpt = ' '.join(value.split())[:120]
+            violations.append(f'{label}:{lineno}: {excerpt}')
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Detection-helper unit tests for the data-layer SQL clock-read guard
+# ---------------------------------------------------------------------------
+
+# Implicit concatenation folds these three adjacent fragments into ONE
+# `ast.Constant` (lineno=4, end_lineno=6) whose value contains the forbidden
+# pattern while no single physical line does. This is the SQL style already
+# used in the module under guard.
+_FOLDED_SQL_SOURCE = '''
+def q():
+    return (
+        "SELECT project_id FROM task_results "
+        "WHERE completed_at >= datetime("
+        "'now', ? || ' days')"
+    )
+'''
+
+_SINGLE_QUOTED_NOW_SOURCE = '''
+def q():
+    return "SELECT 1 FROM t WHERE completed_at >= datetime('now', ? || ' days')"
+'''
+
+_DOUBLE_QUOTED_NOW_SOURCE = """
+def q():
+    return 'SELECT 1 FROM t WHERE completed_at >= datetime("now", ? || " days")'
+"""
+
+_PROSE_DOCSTRING_SOURCE = '''
+"""Module prose explaining why datetime('now', ...) must not reach SQLite."""
+
+
+def q():
+    """Function prose naming datetime("now", ...) the same way."""
+    return 'SELECT 1'
+'''
+
+_PROSE_COMMENT_SOURCE = '''
+# Comment naming datetime('now', ? || ' days') in prose.
+def q():
+    return 'SELECT 1'  # and datetime("now", ...) named again here
+'''
+
+
+class TestSqlClockReadGuard:
+    """Unit tests for `_sql_clock_read_violations`, the detection helper behind
+    `test_no_sql_side_clock_reads_in_data_layer`.
+
+    That guard asserts `assert not violations`, which is vacuous on its own:
+    detection broken to return `[]` for everything would keep it green
+    forever. These tests pin the end-to-end detection contract directly, so
+    both halves are exercised -- SQL that must be flagged, and prose that must
+    not be.
+    """
+
+    def test_implicitly_concatenated_literal_is_flagged(self):
+        """A folded multi-line SQL literal is flagged, reported off the AST node.
+
+        Regression test for the task-4624 review finding: Python folds
+        implicitly-concatenated adjacent literals into one `ast.Constant`
+        whose value contains the pattern while no single physical line does,
+        so re-deriving the violation by re-scanning physical source lines
+        silently misses it.
+        """
+        violations = _sql_clock_read_violations(_FOLDED_SQL_SOURCE, 'fake.py')
+
+        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+        assert violations[0].startswith('fake.py:4: '), (
+            f'expected the violation to report the line where the implicit '
+            f'concatenation starts, got {violations[0]!r}'
+        )
+        assert "datetime('now'" in violations[0], (
+            f'expected the excerpt to carry the folded literal value, '
+            f'got {violations[0]!r}'
+        )
+        assert not any(
+            "datetime('now'" in line for line in _FOLDED_SQL_SOURCE.splitlines()
+        ), (
+            'fixture is no longer a folded literal -- some physical line now '
+            'contains the pattern, so this test would pass under the very '
+            'line re-scan it exists to forbid'
+        )
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(_SINGLE_QUOTED_NOW_SOURCE, id='single-quoted-now'),
+            pytest.param(_DOUBLE_QUOTED_NOW_SOURCE, id='double-quoted-now'),
+        ],
+    )
+    def test_single_line_literal_is_flagged(self, source: str):
+        """Both spellings of an ordinary one-line SQL clock read are flagged."""
+        violations = _sql_clock_read_violations(source, 'fake.py')
+
+        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+        assert violations[0].startswith('fake.py:3: '), (
+            f'expected the violation to report the literal\'s line, '
+            f'got {violations[0]!r}'
+        )
+
+    def test_docstring_mention_is_not_flagged(self):
+        """Module and function docstrings naming the pattern in prose are not queries.
+
+        performance.py's own docstring depends on this exclusion, so the
+        detection must not over-correct into flagging prose.
+        """
+        assert _sql_clock_read_violations(_PROSE_DOCSTRING_SOURCE, 'fake.py') == []
+
+    def test_comment_mention_is_not_flagged(self):
+        """A `#` comment naming the pattern is not a query.
+
+        Comments are absent from the AST entirely, so this documents an
+        invariant the implementation gets for free and must not lose.
+        """
+        assert _sql_clock_read_violations(_PROSE_COMMENT_SOURCE, 'fake.py') == []
+
+
+def test_no_sql_side_clock_reads_in_data_layer():
+    """No `dashboard/src/dashboard/data/*.py` module computes a cutoff via a
+    SQL-side `datetime('now', ...)` call (task 4624 -- its 4th recorded
+    sighting of this defect class).
+
+    Modelled on test_clock_discipline.py:157-175's source-scanning guard,
+    but restricted to non-docstring string literals (via
+    `_iter_non_docstring_string_literals`) rather than every physical
+    source line -- so a comment or docstring *naming* the forbidden pattern
+    in prose (as performance.py's do) cannot trip a false positive; only
+    string literals that could actually reach SQLite as a query are
+    inspected. Does not fire on `_project_cutoffs` (performance.py), which
+    uses `datetime(MAX(completed_at), ...)` and is deliberately out of
+    scope for this task (see design decision).
+
+    Detection lives in `_sql_clock_read_violations`, which reports a match
+    directly off the AST literal -- file, the literal's start line, and the
+    folded value. Reporting off a physical source line instead silently
+    misses implicitly-concatenated SQL, which is the style already used in
+    the module under guard; `TestSqlClockReadGuard` above pins both that
+    regression and the prose exclusions, so `assert not violations` below
+    cannot pass vacuously on broken detection.
+
+    Placement note: this guard belongs conceptually next to
+    `test_clock_discipline.py::test_no_bare_clock_reads_in_data_modules`,
+    which already owns the `_DATA_DIR` scan root this test re-derives. It
+    stays here rather than being relocated because `test_clock_discipline.py`
+    is not one of the modules this task holds a lock on
+    (`dashboard/src/dashboard/data/performance.py` and this file only); the
+    move is filed as a follow-up instead of being done here --
+    tkt_0RTY030WB80YZK4EZ5JBJ6EB0T (a fused-memory ticket; the curator
+    converts it to a task_id asynchronously).
+    """
+    data_dir = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
+    violations: list[str] = []
+    for path in sorted(data_dir.glob('*.py')):
+        rel = path.relative_to(data_dir.parent.parent)
+        violations.extend(_sql_clock_read_violations(path.read_text(), str(rel)))
+
+    assert not violations, (
+        'SQL-side clock read(s) found ('
+        + ' / '.join(f'{pattern}, ...)' for pattern in _SQL_CLOCK_READ_PATTERNS)
+        + ') -- compute the cutoff in Python instead via a module-local '
+        '`_cutoff(days, *, now=None)` helper routed through '
+        'dashboard.data.utils.resolve_now '
+        '(see dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
+    )

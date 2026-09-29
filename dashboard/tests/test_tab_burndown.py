@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import re
 
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    destructure_bindings,
+)
+
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
 # ---------------------------------------------------------------------------
@@ -49,8 +55,6 @@ _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
 _TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
-_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
 
 
 def _series_root(expr):
@@ -74,30 +78,18 @@ def _chart_component_aliases(src):
     window.DF_CHARTS` line, so the known-component list is never a hardcoded
     second copy that can drift from what the file actually renders.
     """
-    m = _DF_CHARTS_DESTRUCTURE_RE.search(src)
+    m = DF_CHARTS_DESTRUCTURE_RE.search(src)
     if not m:
         return {}
-    aliases = {}
-    for part in m.group(1).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        canonical, _, alias = part.partition(':')
-        canonical = canonical.strip()
-        aliases[alias.strip() or canonical] = canonical
-    return aliases
+    return {local: canonical for canonical, local in destructure_bindings(m.group(1))}
 
 
 def _df_charts_exports(src):
     """Names exported by charts.jsx's `window.DF_CHARTS = { ... }` line."""
-    m = _DF_CHARTS_EXPORT_RE.search(src)
+    m = DF_CHARTS_EXPORT_RE.search(src)
     if not m:
         return set()
-    return {
-        part.split(':', 1)[0].strip()
-        for part in m.group(1).split(',')
-        if part.strip()
-    }
+    return {canonical for canonical, _local in destructure_bindings(m.group(1))}
 
 
 def _element_at(src, pos):
@@ -325,13 +317,16 @@ class TestBurnTabSmoothingChip:
 
 class TestVelocitySparkWiring:
     def test_net_velocity_tile_uses_derive(self, tabs_jsx_body):
-        """Net velocity StatTile spark must use deriveVelocitySeries, not raw b.done.
+        """Net velocity StatTile history must use deriveVelocitySeries, not raw b.done.
 
-        The regex ties the tile's label attribute to its spark attribute within the
-        same element, so the test fails if the Net velocity tile reverts to spark={b.done}.
+        The regex ties the tile's label attribute to its history attribute within the
+        same element, so the test fails if the Net velocity tile reverts to
+        history={b.done}.  The prop was named `spark` until task 5588 renamed it
+        `history` — the series is the tile's PAST, and `spark` named the drawing
+        rather than the data beside a `datum` that carries the present value.
         """
         assert re.search(
-            r'label=["\']Net velocity["\'].*?spark=\{deriveVelocitySeries\(',
+            r'label=["\']Net velocity["\'].*?history=\{deriveVelocitySeries\(',
             tabs_jsx_body,
             re.DOTALL,
         )
@@ -389,13 +384,14 @@ class TestVelocitySparkWiring:
             )
 
     def test_completed_window_tile_stays_cumulative(self, tabs_jsx_body):
-        """'Completed (window)' tile spark must remain on raw b.done.
+        """'Completed (window)' tile history must remain on raw b.done.
 
-        Ties the label and spark attributes within the same element so that
+        Ties the label and history attributes within the same element so that
         a regression swapping this tile to deriveVelocitySeries is caught.
+        (`spark` -> `history`: see the Net velocity test above.)
         """
         assert re.search(
-            r'label=["\']Completed \(window\)["\'].*?spark=\{b\.done\}',
+            r'label=["\']Completed \(window\)["\'].*?history=\{b\.done\}',
             tabs_jsx_body,
             re.DOTALL,
         )

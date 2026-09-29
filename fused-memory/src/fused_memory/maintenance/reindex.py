@@ -115,6 +115,15 @@ class ReindexManager:
                 failed drop propagates — with the partial list logged at ERROR —
                 rather than being reported as a clean run.
 
+                As of task 4777 the drop also WAITS for the FalkorDB index
+                catalog to settle before reading it, so re-running this
+                entrypoint after a failed or interrupted run is safe rather than
+                liable to a spurious ``no such index``.  A catalog that never
+                settles raises ``IndexCatalogUnsettledError``, having dropped
+                nothing, instead of dropping against an undetermined index
+                state.  ``GraphitiBackend.drop_vector_indices``' docstring
+                records the rebuild window behind both.
+
         Returns:
             Dict with reindex_result (ReindexResult), replay_count (int), and
             indices_dropped (list of {label, field} dicts).

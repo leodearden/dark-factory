@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.landing_evidence import LandingEvidenceVerdict
@@ -145,18 +146,27 @@ def _make_worker(
     config: OrchestratorConfig,
     git_ops: GitOps | None = None,
     factory=None,
+    clock=None,
 ) -> SpeculativeMergeWorker:
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    """Build a bare MergeLane for these tests.
+
+    *clock* is for the one test whose SUBJECT is a wait: a FakeClock makes the
+    worker's deadline arithmetic run to completion without a wall-clock wait.
+    Everywhere else the wait is incidental and the production clock is what
+    keeps the test honest about real concurrency, so it is left alone.
+    """
+    from orchestrator.merge_lane import MergeLane
     if git_ops is None:
         # stub git_ops — not used in no-op guard tests
         git_ops = MagicMock()
         git_ops.config = config
-    worker = SpeculativeMergeWorker(
+    kwargs = {} if clock is None else {'clock': clock}
+    return MergeLane(
         git_ops,
         queue,
         train_callback_factory=factory,
+        **kwargs,
     )
-    return worker
 
 
 # ─── Step 3 ─────────────────────────────────────────────────────────────────
@@ -1013,25 +1023,55 @@ def _gated_verify(
     gate_release: asyncio.Event,
     gate_entered: asyncio.Event | None = None,
 ):
-    """Block the FIRST run_scoped_verification call until gate_release is set.
+    """A ``run_scoped_verification``-shaped gate wrapping :class:`_GatedVerifier`.
 
-    gate_entered (optional): set when the first call starts, giving the test a
-    synchronisation point.  Subsequent calls pass immediately (MagicMock passed=True).
-    Local copy — test_merge_queue_coalesce must not import from test_merge_queue.
+    For the two callers that must still patch the module global rather than
+    inject the port: the TRAIN scene below (see its comment — _do_train_merge
+    does not forward the worker's verifier) and out-of-group
+    test_coalesce_integration_gate.py, which imports this name. One gate
+    implementation, two ways of installing it.
     """
-    _first_blocked = [False]
+    return AsyncMock(side_effect=_GatedVerifier(gate_release, gate_entered).run_scoped)
 
-    from unittest.mock import MagicMock as _MagicMock  # local alias for clarity
 
-    async def _side_effect(*args, **kwargs):
-        if not _first_blocked[0]:
-            _first_blocked[0] = True
-            if gate_entered is not None:
-                gate_entered.set()
-            await gate_release.wait()
-        return _MagicMock(passed=True, summary='')
+class _GatedVerifier(FakeVerifier):
+    """The verify port, holding its FIRST verify open until *gate_release*.
 
-    return AsyncMock(side_effect=_side_effect)
+    Injected through ``SpeculativeMergeWorker(..., verifier=...)`` rather than
+    patching ``orchestrator.merge_queue.run_scoped_verification``: the gate is
+    a property of the VERIFY the lane runs, so it belongs on the port the lane
+    was handed.
+
+    *gate_entered*, when given, is set the moment that first verify starts,
+    giving the test a synchronisation point — while it is held, the merge
+    commit is on the verifier queue and main has NOT advanced to it, which is
+    the state these scenes exist to observe.  Every later verify passes
+    immediately.
+
+    Only the arguments this double actually READS are named; the rest of
+    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
+    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
+    too -- so a port-signature change lands in the port and its one fake, not
+    in every double that wraps them.
+    """
+
+    def __init__(
+        self,
+        gate_release: asyncio.Event,
+        gate_entered: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.gate_release = gate_release
+        self.gate_entered = gate_entered
+        self._first_blocked = False
+
+    async def run_scoped(self, *args, **options):
+        if not self._first_blocked:
+            self._first_blocked = True
+            if self.gate_entered is not None:
+                self.gate_entered.set()
+            await self.gate_release.wait()
+        return await super().run_scoped(*args, **options)
 
 
 @pytest.mark.asyncio
@@ -1100,6 +1140,8 @@ class TestEndToEndWiring:
             )
 
         queue: asyncio.Queue = asyncio.Queue()
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
         worker = SpeculativeMergeWorker(
             git_ops, queue, event_store=es, train_callback_factory=factory,
         )
@@ -1116,10 +1158,12 @@ class TestEndToEndWiring:
         await queue.put(req2)
         await queue.put(req3)
 
-        # Gate the train's first run_scoped_verification call.
-        gate_release = asyncio.Event()
-        gate_entered = asyncio.Event()
-
+        # The TRAIN path is the one place the injected verify port does not
+        # reach: _do_train_merge calls _run_post_merge_verify WITHOUT
+        # forwarding worker's verifier (merge_queue.py:7297-7307), so it always
+        # resolves PRODUCTION_VERIFIER. Until that gap closes, the train's gate
+        # has to be installed on the module global — but it is the SAME gate
+        # object the port-injected scenes use, not a second implementation.
         with patch(
             'orchestrator.merge_queue.run_scoped_verification',
             _gated_verify(gate_release, gate_entered),
@@ -2712,8 +2756,11 @@ class TestCoalesceAfterHealthyMerge:
             )
 
         queue: asyncio.Queue = asyncio.Queue()
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
         worker = SpeculativeMergeWorker(
             git_ops, queue, event_store=es, train_callback_factory=factory,
+            verifier=_GatedVerifier(gate_release, gate_entered),
         )
 
         warm_req = _make_req('hm0', 'hm0', wt_warm, coalesce_config)
@@ -2732,84 +2779,77 @@ class TestCoalesceAfterHealthyMerge:
                 await asyncio.sleep(0.05)
             return []
 
-        # Gate the warm-up's verify (the first run_scoped_verification call).
-        # While it is held, hm0's merge commit is on the verifier queue and main
-        # has NOT advanced to it — the exact "merge succeeded, look-ahead left
-        # speculation state behind" condition the old gate read as busy.
-        gate_release = asyncio.Event()
-        gate_entered = asyncio.Event()
+        # While the warm-up's verify is held, hm0's merge commit is on the
+        # verifier queue and main has NOT advanced to it — the exact "merge
+        # succeeded, look-ahead left speculation state behind" condition the
+        # old gate read as busy.
+        await queue.put(warm_req)
+        worker_task = asyncio.create_task(worker.run())
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _gated_verify(gate_release, gate_entered),
-        ):
-            await queue.put(warm_req)
-            worker_task = asyncio.create_task(worker.run())
+        await asyncio.wait_for(gate_entered.wait(), timeout=60)
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+        for req in follower_reqs.values():
+            queue.put_nowait(req)
 
-            for req in follower_reqs.values():
-                queue.put_nowait(req)
+        # Hold the gate until a follower has actually been dequeued, so the
+        # first coalesce evaluation provably happened with hm0's merge
+        # commit still unadvanced.  Releasing before that could hand the
+        # coalescer a settled pipeline — the sterile state every other test
+        # already covers.
+        deadline = asyncio.get_running_loop().time() + 60
+        while asyncio.get_running_loop().time() < deadline:
+            dequeued = {
+                e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
+            }
+            if dequeued & set(follower_reqs):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail('no follower was dequeued within 60s')
 
-            # Hold the gate until a follower has actually been dequeued, so the
-            # first coalesce evaluation provably happened with hm0's merge
-            # commit still unadvanced.  Releasing before that could hand the
-            # coalescer a settled pipeline — the sterile state every other test
-            # already covers.
-            deadline = asyncio.get_running_loop().time() + 60
-            while asyncio.get_running_loop().time() < deadline:
-                dequeued = {
-                    e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
-                }
-                if dequeued & set(follower_reqs):
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                pytest.fail('no follower was dequeued within 60s')
+        # Release now: with speculation depth K=1 the merger blocks on the
+        # speculation permit at its next look-ahead until the verifier
+        # drains, so holding the gate any longer would stall the run rather
+        # than test it.  Every later coalesce evaluation still carries a
+        # non-None spec_base from the preceding look-ahead — which is
+        # exactly the state the old is_idle() gate read as busy.
+        gate_release.set()
 
-            # Release now: with speculation depth K=1 the merger blocks on the
-            # speculation permit at its next look-ahead until the verifier
-            # drains, so holding the gate any longer would stall the run rather
-            # than test it.  Every later coalesce evaluation still carries a
-            # non-None spec_base from the preceding look-ahead — which is
-            # exactly the state the old is_idle() gate read as busy.
-            gate_release.set()
+        events = await _poll_events('train_coalesced', timeout=120)
+        assert events, (
+            'no train_coalesced event: the coalescer never ran while a '
+            'merge was in flight — every merge in this sequence succeeded, '
+            'so there was no conflict/abandon/drop to open the gate'
+        )
+        coalesced_members = list(events[0]['data'].get('member_task_ids', []))
+        assert len(coalesced_members) >= 2, coalesced_members
+        assert set(coalesced_members) <= set(follower_reqs), coalesced_members
+        assert 'hm0' not in coalesced_members, (
+            'the in-flight warm-up request must not be a coalesce candidate'
+        )
 
-            events = await _poll_events('train_coalesced', timeout=120)
-            assert events, (
-                'no train_coalesced event: the coalescer never ran while a '
-                'merge was in flight — every merge in this sequence succeeded, '
-                'so there was no conflict/abandon/drop to open the gate'
-            )
-            coalesced_members = list(events[0]['data'].get('member_task_ids', []))
-            assert len(coalesced_members) >= 2, coalesced_members
-            assert set(coalesced_members) <= set(follower_reqs), coalesced_members
-            assert 'hm0' not in coalesced_members, (
-                'the in-flight warm-up request must not be a coalesce candidate'
-            )
-
-            for tid in coalesced_members:
-                outcome = await asyncio.wait_for(
-                    follower_reqs[tid].result, timeout=60)
-                assert outcome.status == 'superseded', (
-                    f'{tid}: absorbed member must resolve superseded, '
-                    f'got {outcome.status!r}'
-                )
-
-            warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
-            assert warm_outcome.status == 'done', (
-                f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
+        for tid in coalesced_members:
+            outcome = await asyncio.wait_for(
+                follower_reqs[tid].result, timeout=60)
+            assert outcome.status == 'superseded', (
+                f'{tid}: absorbed member must resolve superseded, '
+                f'got {outcome.status!r}'
             )
 
-            # The train lands only after its members are marked done, which is
-            # the last step of _do_train_merge's success path.
-            merged = await _poll_events('train_merged', timeout=180)
-            assert merged, (
-                'train_coalesced but never train_merged: the train derailed. '
-                'A train cannot recover from a lost CAS — check that it parked '
-                'behind the unadvanced predecessor '
-                '(_await_unadvanced_predecessor)'
-            )
+        warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
+        assert warm_outcome.status == 'done', (
+            f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
+        )
+
+        # The train lands only after its members are marked done, which is
+        # the last step of _do_train_merge's success path.
+        merged = await _poll_events('train_merged', timeout=180)
+        assert merged, (
+            'train_coalesced but never train_merged: the train derailed. '
+            'A train cannot recover from a lost CAS — check that it parked '
+            'behind the unadvanced predecessor '
+            '(_await_unadvanced_predecessor)'
+        )
 
         # The train landed: every member's file is on main under one shared SHA.
         _, main_files, _ = await _run(
@@ -2923,21 +2963,27 @@ class TestAwaitUnadvancedPredecessor:
     ) -> None:
         """Fail-safe: an interlock that could hang the merger forever would be
         worse than the derail it prevents, so an expired wait proceeds (and is
-        logged) instead of blocking.  Driven through the real timeout
-        arithmetic by giving the predecessor's config a tiny verify budget.
+        logged) instead of blocking.
+
+        Driven through the REAL timeout arithmetic — the config's real verify
+        budget and the real settle slack — because the deadline is measured
+        against the worker's clock, and that clock is the test's.  The proof
+        that the wait really ran to its deadline rather than falling out early
+        is the clock's own record of what it was asked to sleep.
         """
-        config = _make_config(tmp_path).model_copy(
-            update={'verify_command_timeout_secs': 0.05})
+        config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()
-        worker = _make_worker(queue, config)
+        clock = FakeClock()
+        worker = _make_worker(queue, config, clock=clock)
         pred = _make_single_req('pred', config=config)
         worker._last_merged_request = pred
 
-        with patch(
-            'orchestrator.merge_queue._TRAIN_PREDECESSOR_SETTLE_SLACK_SECS', 0.1,
-        ):
-            assert await worker._await_unadvanced_predecessor('train-x') is True
+        assert await worker._await_unadvanced_predecessor('train-x') is True
 
+        assert sum(clock.sleeps) >= config.verify_command_timeout_secs, (
+            'the interlock must poll all the way to its deadline before '
+            f'proceeding; the clock was asked to sleep {clock.sleeps!r}'
+        )
         assert not pred.result.done(), (
             'the interlock must never resolve or cancel the predecessor Future'
         )

@@ -30,10 +30,11 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _merge_lane_fakes import lane_entry, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import MergeRequest
 from orchestrator.merge_types import DecidedItem, MergeOutcome, QueuedBranch, RealMergeItem
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ─────────
@@ -115,7 +116,7 @@ class TestSnapshotRedispatchEntries:
         from entries and depth undercounts by one.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = make_lane(git_ops, q)
 
         req = _make_req('rd-parked', 'task/rd-parked', config, git_repo)
         item = RealMergeItem(
@@ -138,10 +139,10 @@ class TestSnapshotRedispatchEntries:
             f"Expected depth==1 (the redispatch-parked item), got {snap['depth']}."
         )
 
-        rd_entry = snap['entries'][0]
+        rd_entry = lane_entry(worker, req.request_id)
+        assert rd_entry is not None, 'the parked item is absent from the census'
         assert rd_entry['task_id'] == 'rd-parked'
         assert rd_entry['branch'] == 'rd-parked'  # snapshot emits QueuedBranch.bare_id
-        assert rd_entry['request_id'] == req.request_id
         assert rd_entry['state'] == 'awaiting_host', (
             f"Expected state=='awaiting_host', got {rd_entry['state']!r}."
         )
@@ -151,7 +152,7 @@ class TestSnapshotRedispatchEntries:
     ) -> None:
         """With an empty _redispatch, snapshot() is unaffected (regression guard)."""
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = make_lane(git_ops, q)
 
         snap = worker.snapshot()
 
@@ -175,7 +176,7 @@ class TestSnapshotRedispatchEntries:
         populated there) and the depth/entries-presence checks.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = make_lane(git_ops, q)
 
         rd_req = _make_req('rd-parked', 'task/rd-parked', config, git_repo)
         rd_item = RealMergeItem(
@@ -228,7 +229,7 @@ class TestSnapshotRedispatchEntries:
         None for this case rather than raising or defaulting incorrectly.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = make_lane(git_ops, q)
 
         req = _make_req('rd-decided', 'task/rd-decided', config, git_repo)
         item = DecidedItem(
@@ -245,7 +246,8 @@ class TestSnapshotRedispatchEntries:
         assert 'rd-decided' in entry_task_ids, (
             f"Expected 'rd-decided' in snapshot entries, got {entry_task_ids}."
         )
-        rd_entry = snap['entries'][0]
+        rd_entry = lane_entry(worker, req.request_id)
+        assert rd_entry is not None, 'the parked item is absent from the census'
         assert rd_entry['state'] == 'awaiting_host'
         assert rd_entry['worktree'] is None, (
             "Expected worktree is None for a DecidedItem parked on _redispatch "

@@ -1,0 +1,315 @@
+{
+  "arms": [
+    {
+      "arm": "qwen3-reranker-0.6b",
+      "arm_class": "local_cross_encoder",
+      "model": "Qwen/Qwen3-Reranker-0.6B",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "rank1_rate": 0.20238095238095238,
+      "rank5_rate": 0.5714285714285714,
+      "rank1": {
+        "hits": 17,
+        "total": 84
+      },
+      "rank5": {
+        "hits": 48,
+        "total": 84
+      },
+      "auc": {
+        "value": 0.24074074074074073,
+        "n_true": 57,
+        "n_hard_negative": 9,
+        "unscored": 18
+      },
+      "p50_seconds": 0.6939719880465418,
+      "p95_seconds": 1.9977110840845853,
+      "latency": {
+        "slates_timed": 84,
+        "pairs_per_slate_min": 20,
+        "pairs_per_slate_max": 20,
+        "load_seconds": 49.995650409022346,
+        "warmup_slates": 1
+      },
+      "cost_per_write_usd": 0.0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 3568.14404296875,
+      "max_length": 8192,
+      "pairs_over_max_length": 0
+    },
+    {
+      "arm": "mxbai-rerank-base-v2",
+      "arm_class": "local_cross_encoder",
+      "model": "mixedbread-ai/mxbai-rerank-base-v2",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "rank1_rate": 0.23809523809523808,
+      "rank5_rate": 0.5833333333333334,
+      "rank1": {
+        "hits": 20,
+        "total": 84
+      },
+      "rank5": {
+        "hits": 49,
+        "total": 84
+      },
+      "auc": {
+        "value": 0.40058479532163743,
+        "n_true": 57,
+        "n_hard_negative": 9,
+        "unscored": 18
+      },
+      "p50_seconds": 0.4344133760314435,
+      "p95_seconds": 1.096036666072905,
+      "latency": {
+        "slates_timed": 84,
+        "pairs_per_slate_min": 20,
+        "pairs_per_slate_max": 20,
+        "load_seconds": 28.21785741788335,
+        "warmup_slates": 1
+      },
+      "cost_per_write_usd": 0.0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1793.1865234375,
+      "max_length": 8192,
+      "pairs_over_max_length": 0
+    },
+    {
+      "arm": "bge-reranker-v2-m3",
+      "arm_class": "local_cross_encoder",
+      "model": "BAAI/bge-reranker-v2-m3",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "rank1_rate": 0.38095238095238093,
+      "rank5_rate": 0.6309523809523809,
+      "rank1": {
+        "hits": 32,
+        "total": 84
+      },
+      "rank5": {
+        "hits": 53,
+        "total": 84
+      },
+      "auc": {
+        "value": 0.6686159844054581,
+        "n_true": 57,
+        "n_hard_negative": 9,
+        "unscored": 18
+      },
+      "p50_seconds": 0.27643791609443724,
+      "p95_seconds": 0.46771377604454756,
+      "latency": {
+        "slates_timed": 84,
+        "pairs_per_slate_min": 20,
+        "pairs_per_slate_max": 20,
+        "load_seconds": 64.5719017891679,
+        "warmup_slates": 1
+      },
+      "cost_per_write_usd": 0.0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1183.287109375,
+      "max_length": 1024,
+      "pairs_over_max_length": 336
+    },
+    {
+      "arm": "gpt-4o-mini-pairwise",
+      "arm_class": "llm_pairwise",
+      "model": "gpt-4o-mini",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "rank1_rate": 0.19047619047619047,
+      "rank5_rate": 0.4523809523809524,
+      "rank1": {
+        "hits": 16,
+        "total": 84
+      },
+      "rank5": {
+        "hits": 38,
+        "total": 84
+      },
+      "auc": {
+        "value": 0.40545808966861596,
+        "n_true": 57,
+        "n_hard_negative": 9,
+        "unscored": 18
+      },
+      "p50_seconds": 0.7110664150677621,
+      "p95_seconds": 1.4406749361660331,
+      "latency": {
+        "slates_timed": 84,
+        "pairs_per_slate_min": 20,
+        "pairs_per_slate_max": 20,
+        "load_seconds": 0.010330538963899016,
+        "warmup_slates": 1
+      },
+      "cost_per_write_usd": 0.0021565803571428573,
+      "device": "remote:api.openai.com",
+      "vram_peak_mib": null,
+      "max_length": null,
+      "pairs_over_max_length": null
+    },
+    {
+      "arm": "jina-reranker",
+      "arm_class": "hosted_api",
+      "model": "jina-reranker-v3.5",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "JINA_API_KEY unset",
+      "rank1_rate": null,
+      "rank5_rate": null,
+      "rank1": null,
+      "rank5": null,
+      "auc": null,
+      "p50_seconds": null,
+      "p95_seconds": null,
+      "latency": null,
+      "cost_per_write_usd": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "pairs_over_max_length": null
+    },
+    {
+      "arm": "voyage-rerank",
+      "arm_class": "hosted_api",
+      "model": "rerank-2.5",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "VOYAGE_API_KEY unset",
+      "rank1_rate": null,
+      "rank5_rate": null,
+      "rank1": null,
+      "rank5": null,
+      "auc": null,
+      "p50_seconds": null,
+      "p95_seconds": null,
+      "latency": null,
+      "cost_per_write_usd": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "pairs_over_max_length": null
+    },
+    {
+      "arm": "cohere-rerank",
+      "arm_class": "hosted_api",
+      "model": "rerank-v4.0-pro",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "COHERE_API_KEY / CO_API_KEY unset",
+      "rank1_rate": null,
+      "rank5_rate": null,
+      "rank1": null,
+      "rank5": null,
+      "auc": null,
+      "p50_seconds": null,
+      "p95_seconds": null,
+      "latency": null,
+      "cost_per_write_usd": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "pairs_over_max_length": null
+    },
+    {
+      "arm": "jev-choice",
+      "arm_class": "jev_choice",
+      "model": "jev-1.13.0",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "TYPESAFE_API_KEY unset",
+      "rank1_rate": null,
+      "rank5_rate": null,
+      "rank1": null,
+      "rank5": null,
+      "auc": null,
+      "p50_seconds": null,
+      "p95_seconds": null,
+      "latency": null,
+      "cost_per_write_usd": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "pairs_over_max_length": null
+    }
+  ],
+  "baseline": {
+    "arm": "cosine",
+    "arm_class": "baseline",
+    "model": "store_score",
+    "status": "measured",
+    "skip_reason": null,
+    "skip_detail": null,
+    "rank1_rate": 0.19047619047619047,
+    "rank5_rate": 0.38095238095238093,
+    "rank1": {
+      "hits": 16,
+      "total": 84
+    },
+    "rank5": {
+      "hits": 32,
+      "total": 84
+    },
+    "auc": {
+      "value": 0.4600389863547758,
+      "n_true": 57,
+      "n_hard_negative": 9,
+      "unscored": 18
+    },
+    "p50_seconds": null,
+    "p95_seconds": null,
+    "latency": null,
+    "cost_per_write_usd": null,
+    "device": null,
+    "vram_peak_mib": null,
+    "max_length": null,
+    "pairs_over_max_length": null
+  },
+  "best": {
+    "arm": "bge-reranker-v2-m3",
+    "rank1_rate": 0.38095238095238093,
+    "p95_seconds": 0.46771377604454756,
+    "qualified": true,
+    "p95_ceiling_seconds": 3.0
+  },
+  "caveats": [
+    "Local cross-encoder arms score with each model's published template and default instruction; the LLM pairwise arm uses this script's own same-claim prompt, so the two classes are not prompted alike.",
+    "The cosine baseline orders each slate by store_score, production's attach signal. It is reported for comparison and is never eligible for best.",
+    "AUC is rank-based (Mann-Whitney, ties count half) over each case's canonical-or-alias pair score as the arm scored it on the retrieved slate. 9 hard negative(s) reached their slate; read the value beside that sample size.",
+    "Latency is per-slate wall time on the recorded device after one untimed warm-up slate; remote arms include the network round trip.",
+    "A local arm's cost is the per-call charge (zero), not amortised hardware or power.",
+    "pairs_over_max_length is a lower bound on truncation: it counts entry plus candidate tokens without the template or special tokens. qwen3-reranker-0.6b at 8192 tokens: 0 pair(s) over; mxbai-rerank-base-v2 at 8192 tokens: 0 pair(s) over; bge-reranker-v2-m3 at 1024 tokens: 336 pair(s) over.",
+    "jina-reranker was skipped (no_credential): JINA_API_KEY unset",
+    "voyage-rerank was skipped (no_credential): VOYAGE_API_KEY unset",
+    "cohere-rerank was skipped (no_credential): COHERE_API_KEY / CO_API_KEY unset",
+    "jev-choice was skipped (no_credential): TYPESAFE_API_KEY unset"
+  ],
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "record_count": 104,
+    "canonical_aliases_path": "tests/fixtures/write_triage_calibration.canonical_aliases.json",
+    "canonical_aliases_count": 3,
+    "project_id": "reify",
+    "candidate_k": 20,
+    "retrieval_call": "fused_memory.server.write_triage::retrieve_candidates",
+    "limit": null,
+    "libraries": {
+      "torch": "2.14.0",
+      "sentence-transformers": "6.1.0",
+      "transformers": "5.17.0"
+    },
+    "case_count": 84,
+    "canonical_absent": 21,
+    "degraded_retrievals": 0,
+    "self_retrieved": 0,
+    "p95_ceiling_seconds": 3.0,
+    "max_arm_spend_usd": 2.0,
+    "local_batch_size": 4,
+    "vram_cap_gib": 8.0,
+    "pairwise_concurrency": 20
+  }
+}

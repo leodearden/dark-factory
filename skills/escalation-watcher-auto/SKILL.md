@@ -64,6 +64,10 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
 - RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
 
+**Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
+- Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
+- Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the escalations the record already names as open on the held task: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
+
 ## Shallow-by-default → Deepen-on-signal RCA
 
 RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — the top-level rotation now runs on sonnet/high-effort (task 2629), sized for cheap mechanical triage on a quiet queue, under a $50/day ceiling. When a signal below does call for deepening, delegate the deep dive itself to an opus subagent (see [Delegating deep RCA to an opus subagent](#delegating-deep-rca-to-an-opus-subagent)) rather than deepening in the top-level context.
@@ -213,9 +217,29 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 - `status: 'created'` — new L2 was filed
 - `status: 'updated'` — an existing pending L2 with the same `root_cause` was updated (new members appended)
 
-**Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
+**Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly. The one exception is a member the best-effort cascade MISSED: the drain closes it (see [Draining pending escalations](#draining-pending-escalations)).
 
-Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
+Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already in the drain's already-promoted set (the `member_ids` of pending L2s, plus the stranded members of resolved or dismissed L2s that the archive-inclusive cross-check finds) _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
+
+### Declared pins: a close can be REFUSED (`declared_pin_refused`)
+
+Some pending records are **load-bearing**: something outside the escalation store relies on the record staying OPEN, because an open escalation preserves its subject task (`orchestrator/task_ground_truth.py::_RECOVERY` has no row for that shape, so the task row falls through to `LEAVE`; closing the record flips `has_open_escalation` and the task reverts). Closing one is therefore a **state-changing act on the subject task even under `action='close_only'`**.
+
+Such a record now carries `pin_declared_by` (task 4377). `resolve_issue` refuses **every non-`park` action** — `close_only` included — when the target **or ANY CASCADE MEMBER** carries it, returning:
+
+```json
+{"error": "...", "code": "declared_pin_refused",
+ "declared_pins": [{"escalation_id": "esc-...", "declared_by": ["..."], "reason": "..."}]}
+```
+
+Nothing is mutated on a refusal: the head and every member stay pending and un-archived. Read the structured `declared_pins` payload — don't parse the message.
+
+- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to pull the full record with `get_escalation`.
+- **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
+- **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
+- **You cannot declare a pin yourself — REPORT one.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: leave it pending, `stamp_triage` it with what you found, and say in your report that it is a *candidate pin* naming what appears to rely on it. A human runs `declare_pin` to make it machine-readable.
+
+Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member cluster esc-3237-5 dismissed esc-3371-2 — the only pin preserving mu-gate validation specimen task 3371, which is permanently gone. Every member was indistinguishable by id, level, category, severity, agent_role and summary, and the sole marker lived in prose nothing linked from. The surviving sibling pin is **esc-3105-3** (a 15-member L2 head — exactly the shape a rotation bulk-closes).
 
 ### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
 
@@ -259,11 +283,16 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
 2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
    If YES → use L2 promotion paths throughout (steps 4 and 5)
    If NO  → fall back to LEGACY mode (see Graceful Degradation)
-3. Drain and deduplicate pending L1 escalations:
-   a. Fetch candidates: get_pending_escalations(), filter level==1, status==pending → candidate_l1s
-   b. Fetch pending L2s: get_pending_escalations(), filter level==2, status==pending → pending_l2s
-   c. Build already_promoted = {id for L2 in pending_l2s for id in L2.members}
-   d. work_batch = [e for e in candidate_l1s if e.id not in already_promoted]
+3. Drain and deduplicate pending L1 escalations (exact call shapes: Draining pending escalations):
+   a. get_pending_escalations(level=1) → candidate_l1s
+      (FULL shape: the handlers read agent_role and detail)
+   b. get_pending_escalations(level=2, compact=True) → pending_l2s
+   c. already_promoted = ⋃ member_ids over pending_l2s ∪ stranded, where stranded =
+      candidates listed only by a resolved/dismissed L2, found by the ARCHIVE-INCLUSIVE
+      cross-check get_task_escalations(task_id=tid, level=2, status=None, compact=True),
+      one call per DISTINCT candidate task_id
+   d. work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
+   e. Close each stranded member (its L2's cascade missed it) — see Draining pending escalations
    (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
     and re-promotes the same items, inflating the counter and re-spending RCA budget)
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
@@ -289,15 +318,70 @@ The digest is emitted on rotation-limit exit regardless of mode (promotion or le
 
 On startup and after each watcher fire:
 
-1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations()` → filter `level == 1`, `status == "pending"`
-2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
-3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
+1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations(level=1)` → `candidate_l1s`, in FULL shape
+2. Fetch pending L2s: `mcp__escalation__get_pending_escalations(level=2, compact=True)` → `pending_l2s`
+3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus every **stranded** candidate — one listed in the `member_ids` of a resolved or dismissed L2 that the **archive-inclusive cross-check** returns (one `mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True)` call per DISTINCT candidate `task_id`), and in no pending L2's
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
 5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule. **Carve-out — never skip a path-guard synthetic-anchor record on triage freshness:** if the item matches the path-guard discriminator (`category == "scope_violation"` AND (`agent_role == "fused-memory/path-guard"` OR id starts with `esc-task-path-guard`)), keep it in `work_batch` **however fresh its `triaged_at` is**. Rationale in the contract below — a stamp cannot end the respawn loop these records cause, so skipping one merely defers the only action that can.
 
+Steps 1–4 as calls, one call per line:
+
+```python
+candidate_l1s = mcp__escalation__get_pending_escalations(level=1)                 # FULL rows: handlers read agent_role/detail
+pending_l2s   = mcp__escalation__get_pending_escalations(level=2, compact=True)   # compact rows expose member_ids, NOT members
+
+pending_member_ids = {mid for l2 in pending_l2s for mid in l2.get("member_ids", [])}
+
+# ARCHIVE-INCLUSIVE cross-check: status=None scans queue root + archive/<date>/.
+# Issue these calls in parallel, in one turn.
+dispositioned_l2_of = {}   # member L1 id -> a resolved/dismissed L2 row that lists it
+for tid in {e["task_id"] for e in candidate_l1s if e.get("task_id")}:
+    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True):
+        if l2["status"] != "pending":
+            dispositioned_l2_of |= dict.fromkeys(l2.get("member_ids", []), l2)
+
+stranded = [
+    e for e in candidate_l1s
+    if e["id"] in dispositioned_l2_of and e["id"] not in pending_member_ids
+    and not e.get("pin_declared_by")   # a declared pin keeps it in work_batch
+]
+already_promoted = pending_member_ids | {e["id"] for e in stranded}
+work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
+```
+
+- **Zero session memory.** Every input comes from the queue, so a fresh rotation computes the identical set (`plans/resume-charter-loss-remediation-prd.md` boundary row B2).
+- **Why the archive read.** `get_pending_escalations` is pending-only BY DESIGN: a resolved or dismissed L2 is archived and invisible to it. Member L1s stay `status == "pending"` at L1 after promotion, and the L2→member resolve cascade is best-effort (a member that fails to resolve is logged and skipped). Without this read, a member a human already dispositioned re-enters `work_batch` and is re-triaged. `get_task_escalations` is the archive-inclusive counterpart.
+- **Call shape.**
+  - The lookup is keyed on `task_id` with NO time dimension, so the current tool needs one call per DISTINCT candidate `task_id`; issue them in parallel, in one turn. Each call scans the whole archive; a bulk read that serves the drain from one scan is task 6004. A date-windowed archive scan bounds the wrong axis and is not used.
+  - `level=2` narrows to promotion targets. `status=None` is what makes the read archive-inclusive; `status='pending'` would reproduce the blindness.
+  - Every L2 read is `compact=True`, so both unions read one key, `member_ids`.
+  - The L1 candidate read stays FULL: the compact projection drops `agent_role` and `detail`, which step 5's carve-out and the category handlers read.
+  - `get_task_escalation_history` is the wrong tool here: it has no `compact`, and it returns the full `detail` on every row.
+- **`root_cause` is a FOLD HINT over pending L2s only.** When a `work_batch` item's hypothesis matches a pending L2's `root_cause`, pass that identical string to `promote_to_l2`; the server folds on the canonical form. It is NOT a `work_batch` filter, and it is NOT taken from archived L2s: a resolved L2 cannot be folded into.
+- **Residual.** An L2's stored `task_id` is its FIRST member's `task_id`, so a cluster is reached through that member and then contributes ALL its `member_ids`. The one shape this misses is a cluster whose representative L1 is no longer pending while a sibling member filed under a different `task_id` still is, which arises only from a partially-failed cascade.
+
+**Close every `stranded` member; do not just skip it.** A human already resolved or dismissed its L2, but that L2's cascade missed it. Skipped, it would stay pending forever, and `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts it as actionable, so every poll would launch a rotation that drains to nothing. Complete the cascade before handling `work_batch`:
+
+```python
+for e in stranded:
+    l2 = dispositioned_l2_of[e["id"]]
+    mcp__escalation__resolve_issue(
+        escalation_id=e["id"],
+        resolution=f"L2 cascade completion: member of {l2['id']} ({l2['status']}); that L2's disposition applies here, and its cascade missed this member.",
+        action="close_only",
+        resolved_by="escalation-watcher-auto",
+        resolution_class="actionable",
+    )
+```
+
+- `close_only` closes the record with no workflow or task effect: the human's L2 disposition already took its effect.
+- `actionable`: a human decision on the L2 accompanied this close (see [Classify the resolution](#classify-the-resolution-resolution_class)).
+- A candidate carrying `pin_declared_by` is never `stranded`: closing it would spend the pin (see [Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)). It stays in `work_batch` and is handled like any other item. A `declared_pin_refused` on this close means a pin landed since the drain read; leave the record, and the next drain keeps it in `work_batch`.
+- These closes do not count toward `escalations_handled`. Enumerate each in the digest: `AUTO-CLOSED (L1 <esc_id>): l2-cascade-completion — <task_id> — member of <l2_id> (<l2_status>) [actionable]`
+
 Handle only the filtered `work_batch` before (re)starting the wait. On first assessment of each surviving item, stamp a triage-ack annotation (below) so later drain cycles can skip it instead of re-deriving its disposition from scratch — **EXCEPT** the path-guard synthetic-anchor records the carve-out above just kept in the batch. Those are never skip-eligible, so a stamp buys nothing and actively harms: it makes the NEXT rotation drop the record at this very filter, before the branch that can actually close it runs. Handle them, never stamp them; see [Triage-ack freshness contract](#triage-ack-freshness-contract).
 
-**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server deduplicates, so no duplicate L2s are created). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily. The triage stamp (step 5) generalizes this same cost-avoidance to L1/L2 items that were already assessed but not promoted or resolved — the disposition itself (not just the promotion fact) is now remembered rotation-to-rotation.
+**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server folds into a still-PENDING L2, so no duplicate is created; once that L2 is resolved or dismissed there is nothing to fold into, and a re-promotion re-files a question a human already answered — step 3's archive-inclusive cross-check is what prevents that). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily. The triage stamp (step 5) generalizes this same cost-avoidance to L1/L2 items that were already assessed but not promoted or resolved — the disposition itself (not just the promotion fact) is now remembered rotation-to-rotation.
 
 ### Triage-ack freshness contract
 
@@ -542,9 +626,12 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
        for e in candidate_l1s
    ) or any(
        # L2 cluster escalations: match by representative task_id OR member-escalation-id
-       # prefix (members holds L1 esc ids of form esc-<task_id>-<seq>, per models.py:51/76;
-       # trailing hyphen prevents numeric-prefix collisions, e.g. task 16 vs 162)
-       (e["task_id"] == task_id or any(m.startswith(f"esc-{task_id}-") for m in e.get("members", [])))
+       # prefix. pending_l2s rows are compact (see Draining pending escalations), and
+       # compact rows expose member_ids — renamed from the model's members by
+       # escalation/src/escalation/server.py::_compact_escalation — holding L1 esc ids of
+       # form esc-<task_id>-<seq>. The trailing hyphen prevents numeric-prefix collisions,
+       # e.g. task 16 vs 162.
+       (e["task_id"] == task_id or any(m.startswith(f"esc-{task_id}-") for m in e.get("member_ids", [])))
        for e in pending_l2s
    )
    predicate_holds = (
@@ -757,13 +844,80 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): infra_issue — <task_id or N/A> — <summary>`
 
+#### Recovery veto-streak sentinel L1s (`__recovery_veto_streak__*`)
+
+The orchestrator files ONE blocking L1 when the same recovery veto has held a task for `threshold` consecutive sweeps over a minimum elapsed span (`orchestrator/src/orchestrator/recovery_emission.py::emit_recovery_veto_streak_escalation`). These are **monitor signals**, not work: the record's `task_id` is a SYNTHETIC sentinel (`__recovery_veto_streak__<real_task_id>`) precisely so that observing a hold cannot itself deepen it.
+
+Every record in this class looks alike at the mechanism level, so the generic `"risk:<module-or-area-slug>"` key below folds **unrelated** streaks into one perpetually-growing L2 that eventually self-truncates. Key the promote on the ORIGINATING INCIDENT instead — identified by the escalations the sweep found open on the held task, which the record already names — so streaks belonging to different incidents land in different L2s.
+
+**Class discriminator.** Match a pending L1 where **both** hold:
+- `task_id` starts with `__recovery_veto_streak__` (`RECOVERY_VETO_STREAK_SENTINEL_PREFIX`)
+- `category == "risk_identified"` (`_STREAK_CATEGORY`)
+
+Both come from the emitter. The category half is what keeps an **unrelated** record filed on the same sentinel id out of this class — the sentinel prefix alone does not discriminate it.
+
+**Extraction.** From `esc["detail"]`, take the single line beginning `Pinning escalations: `. Each comma-separated entry reads `<listed_esc_id> (<age> old)` or `<listed_esc_id> (age unknown)`; take the id and discard the parenthetical. So
+
+```
+Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)
+```
+
+yields `esc-1000-2`, `esc-5000-3`, `esc-9999-1`. The emitter already renders these **sorted and deduplicated** across its buckets (`_flatten_ids` returns `sorted(set(...))`), so read them in the order given — do not re-sort, re-order, or drop any. That format is pinned by `orchestrator/tests/test_recovery_emission.py::TestEmitRecoveryVetoStreakEscalation::test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated`, so you may rely on it rather than re-deriving the order.
+
+**That line is not filtered to pins — read this before you word the options.** Despite its label it lists EVERY escalation the pin sweep found open on the task. The emitter flattens all three buckets of `orchestrator/src/orchestrator/recovery_emission.py::pin_buckets`, which the production caller hands it whole: `queue_handoff` (a live supervised handoff — PINS), `dead_l0` (vetoes a done-flip but does NOT pin recovery) and `non_pinning` (an `info`-severity record — never pins, at any level). Those three readings are defined at `escalation/src/escalation/pins.py::PinReport`. No bucket label survives into the text, so from this line alone you **cannot** tell a live hold from an incidental info record. Two consequences to carry, neither fixable from this prompt and both cheaper than the single over-folded bucket this rule replaces:
+
+- Word the options so they do not PROMISE that resolving a listed id releases the task. Say what is true — resolving it releases the task *if* it is what holds it — and leave the human the check you cannot make.
+- The key is over the whole listed set, so two streaks held by the same real pin but differing in one incidental record will NOT fold together. That is residual fragmentation, accepted knowingly.
+
+The same `detail` names the REAL task id (`Task: <id>`), plus `Veto site:`, `Consecutive IDENTICAL vetoes:` and `Elapsed since the streak began:` — quote those as evidence rather than re-deriving them.
+
+Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>"`. When the line names several, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different id sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
+
+**When the line names nothing.** If the `Pinning escalations:` line is absent, reads `(none recorded)`, or yields no id once the age parentheticals are stripped, there is nothing to key on. This is a reachable branch, not a malformed record — the alarm is generic over veto shapes, and `unmapped_shape` is one that holds a task with nothing open on it. Use the **bare stem** `"recovery-veto-streak-noise-from-pending-l2-pin"`, with no suffix of any kind. One spelling, normatively: a site-suffixed variant offered alongside it would give a single rotation two keys for the same fallback, and the two would not fold.
+
+**Never** interpolate the literal `(none recorded)`, or any empty or punctuation-only fragment, into the key. Run the extraction above on that line unguarded and it mints `"...-pending-l2-pin:(none recorded)"` — stable, wrong, and a NEW over-fold bucket, the same defect wearing a different name. Do not expect the server to catch it for you: that key canonicalises to non-empty, so `promote_to_l2` accepts it. The `canonical_root_cause` guard in `escalation/src/escalation/server.py` rejects only a `root_cause` canonicalising to the EMPTY string — a purely punctuation key — so it is a backstop for that case alone. Here the check is yours.
+
+**The stem is new; nothing folds under it yet.** Unpinned streaks land today under the generic `"risk:<module-or-area-slug>"` key, which is unrelated to this stem under `canonical_root_cause`. So the first rotation after this rule lands may find an already-pending `risk:*` L2 covering them: fold into or supersede that L2 rather than minting a second decision point for the same incident.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<the sentinel veto-streak L1 esc ids being clustered — NOT the listed ids>, ...],
+  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>[+<listed_esc_id>...]",
+  evidence=(
+    "Task <real_task_id> held by the same veto at <site> for <n> consecutive "
+    "sweeps over <span> (reason <reason>); open on it: <listed_esc_ids with their ages>."
+  ),
+  options=[
+    "A: resolve or dismiss <listed_esc_id> if it is stale — that releases task <real_task_id> if it is what holds it",
+    "B: drive <listed_esc_id> to completion; check first whether it is a live hold or an incidental info record",
+    "C: retune or silence the detector via the green-tier recovery_emission knobs",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="risk_identified",
+  # severity omitted — inherited from the members, as in `infra_issue` above.
+)
+```
+
+The server ENFORCES the verbatim-sentinel `task_id`: a real task id is refused with `code: 'sentinel_task_id_required'` and nothing is minted, so re-issue the same call with `task_id` set to one of the response's `required_task_ids`.
+
+**The escalations read off that line must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
+
+The options must NAME those escalations, because acting on one of them is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did. Naming them is not the same as vouching for them — per the caveat above, some may not pin at all, so let the option say so rather than assert a release the line cannot support.
+
+**Why key on the listed escalations.** Streaks whose records list the SAME ids fold together, which is the clustering you want; unrelated ones separate. Identical ids rather than identical incident, note — the caveat above is the gap between the two, and it errs toward splitting. The accepted cost either way is more, smaller L2s: that is triage volume, not blocked work, because the sentinel `task_id` is synthetic and pins nothing real, so an open L2 in this class never holds a task.
+
+Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <summary>`
+
 #### `design_concern` / `risk_identified` / `missing_premise`
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
 
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
-- `risk_identified`: `"risk:<module-or-area-slug>"`
+- `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) above and must NOT take this generic key.
 
 ```python
 mcp__escalation__promote_to_l2(
@@ -870,6 +1024,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 
 ### Auto-closed L1 (done-step-commit orphan amend-fold)
 - AUTO-CLOSED (L1 esc-2731-10): orphan-reaper-amend-folded-step-recurring-df — task-2731 — task status=done; deliverable(s) present on main; delivered_checks: none declared; branch task/2731 is-ancestor-of main: YES; orphan 9f8e7d6 not ancestor of main, file(s) present-and-evolved on main [benign]
+
+### Auto-closed L1 (L2 cascade completion)
+- AUTO-CLOSED (L1 esc-12-4): l2-cascade-completion — task-12 — member of esc-12-7 (resolved) [actionable]
 
 ### Auto-closed L1 (path-guard synthetic-anchor audit)
 - AUTO-CLOSED (L1 esc-task-path-guard-37): path-guard-audit — mode=rejection — synthetic anchor task-path-guard (no real task); closed informational [benign]

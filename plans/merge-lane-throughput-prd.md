@@ -453,3 +453,92 @@ E=5056, F=5057, G=5058, H=5059, plus **C′=5097** (below).
    once G (5058) and E (5056) have landed, carrying the full brief (reports to
    read, standing rulings, the two code facts, candidate levers). Chosen over
    authoring now because the PRD's evidence base does not exist yet.
+
+---
+
+## Correction (2026-09-07 — decision 2 withdrawn; born-at-L2 path retained)
+
+Filed from esc-5051-1 (task 5051), a non-blocking design_concern note; 5051
+itself is unaffected and needs no change. The 2026-09-03 correction above
+cancelled task C and showed the cross-project paging premise in § Background
+to be false (per-project lock scoping), but it stopped short of retiring
+decision 2's own text. C also owned the *entire* remedy decision 2 promises —
+`RunnerBusy`, pool fallback to local, the `verify_host_busy` event, and the
+storm counter (§ Contract; Resolved design decisions, item 2; Decomposition
+plan, C) — and that remedy covers both a cross-project case and a
+same-project case. The 2026-09-03 correction resolved only the cross-project
+half. With C cancelled, **nothing owns the same-project half either.**
+
+**(a) Why C is cancelled (restated).** The premise that two projects sharing
+the laptop "would either thrash it or page Leo" (§ Background) is false on
+the paging half: the laptop-side merge-verify lock is scoped to
+`project_root / config.worktree_dir` (`git_ops.py`'s `worktree_base`), so
+reify's and Dark Factory's lock files are distinct and cannot collide. There
+is no cross-project case for a lock to arbitrate, so the cross-project
+arbitration C was built to provide is moot, not merely unimplemented.
+
+**(b) Decision 2 ("A busy host is a scheduling outcome, never an
+escalation") is WITHDRAWN as written.** Its whole remedy — laptop-side
+host-global admission, `RunnerBusy`, workstation-side local fallback, the
+`verify_host_busy` event, and the storm counter — was C's deliverable, and C
+is cancelled (superseded, per the 2026-09-03 ruling). No task currently owns
+any part of that remedy — the remedy is unowned, not the behaviour: what a
+same-project contention does today is still task 2307 β's born-at-L2 path
+(see (c)). Decision 2's text is left in place above per this
+PRD's frozen-text convention; read it as historical design intent, not
+current or implemented behaviour.
+
+**(c) The born-at-L2 flock-contention path (task 2307 β) is RETAINED for
+the same-project case, and it is dormant, not removed.**
+`orchestrator/src/orchestrator/cli.py::verify_merge` (≈ line 747) takes the
+lane + compat flocks, and on a bounded-wait timeout emits
+`make_flock_contention_result`, only when `config.git.persistent_merge_worktree`
+is true. With the knob **false**, `lane_fd`/`compat_fd` stay `None` — cli.py's
+own comment (≈ line 743) calls this "byte-identical back-compat (no lock)".
+So the born-at-L2 path decision 2 was meant to supersede is: **live** for any
+project running with the knob on, **dormant** for any project running with
+it off, and **not addressed by anything this PRD has implemented**.
+`dark-factory-laptop.yaml` sets `persistent_merge_worktree: false` (dormant —
+consistent with D1/5053 making no change here; see that task's own NOTE);
+`reify-laptop.yaml` sets it `true` (live). A project that later flips the
+knob on inherits the live born-at-L2 contention path with no arbitration
+lever in front of it. Decision 2 also promised that C would amend
+`plans/laptop-warm-verify-flock-orphan-prd.md` with a dated pointer (INV-9)
+recording the supersession; with C cancelled, that pointer is moot and will
+not be filed — that PRD's β ruling stands as current, unsuperseded
+behaviour, which is exactly what this item retains.
+
+**(d) Open question, left for the PRD owner — NOT filed as part of this
+correction.** Whether to file a narrowed successor to C, covering only the
+same-project half of the original remedy (`RunnerBusy` plus pool fallback to
+local for a single project's own contention on a shared host) and dropping
+the cross-project arbitration half that the RED-TIER rulings in
+`plans/cpu-load-robust-verify-prd.md` § 6 and
+`plans/integration-test-lane-prd.md` § 11 forbid. This correction records the
+question; it does not decide it and does not file it.
+
+---
+
+## Corrections (2026-09-07 — after G's speculation diagnosis)
+
+Append-only pointer, same discipline as the dated sections above: the
+§ Background table is left untouched as provenance of what was believed on
+2026-09-03.
+
+1. **§ Background's speculative-ahead row does not reproduce.** The cells
+   "Landings that were speculative-ahead (matched, 30d) | 165 / 416 (40%) |
+   10 / 277 (3.6%)" do **not** reproduce under
+   `scripts/merge_lane_throughput.py` (task A/5050) at the *same* dated
+   30-day window `2026-08-04T16:10:00+00:00..2026-09-03T16:10:00+00:00`,
+   which reproduces every other 30d cell in that table exactly — including
+   the speculative-merge/void row (424; 126 and 264; 154). The script reads
+   351/507 (0.692) for dark_factory and 191/323 (0.591) for reify. The
+   divergence is **definitional, not drift**: both the numerators and the
+   denominators differ, and no single definition has been found that
+   reproduces the original pair. The current home for these rates is
+   **`plans/merge-lane-throughput-prd.speculation-diagnosis.md`** (task
+   G/5058), which reports the loose measure above alongside a stricter
+   `speculative_ahead_adopted` (255/507 and 84/323) and says what remains
+   unexplained. Tasks E (5056) and H (5059) compare their before/after
+   reports against this row: read the diagnosis, not this cell, or a false
+   before/after delta follows.
