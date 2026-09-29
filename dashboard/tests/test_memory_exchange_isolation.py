@@ -1,0 +1,218 @@
+"""A caller that gives up on an MCP call must not take the HTTP exchange with it.
+
+The dashboard's budgets are native asyncio cancellations (``wait_for``,
+``asyncio.timeout``, gather). httpcore shields its release path with anyio
+scopes, which a native cancel passes straight through, so a cancel landing
+there strands the connection ACTIVE under a pool request no task holds
+(``dashboard/src/dashboard/http_pool.py`` states the class). The contract
+pinned here is therefore stated at ``memory.py::mcp_tool_call``, the choke
+point every dashboard HTTP call goes through: the caller's deadline still
+fires on time, and the exchange finishes on its own and hands its connection
+back to the pool.
+
+Every assertion reads the pool through ``http_pool.census`` or through what
+the server saw, never through httpcore's bookkeeping.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Iterable
+from typing import Any
+
+import httpcore
+import httpx
+import pytest
+
+from dashboard.data.memory import mcp_tool_call, reset_sessions
+from dashboard.http_pool import PoolCensus, census
+
+_TOOL_RESULT = {'ok': True}
+_QUIESCENCE_SECONDS = 5.0
+
+
+def _mcp_body(request_id: int) -> bytes:
+    """One JSON-RPC result that satisfies initialize, the notify and tools/call."""
+    return json.dumps({
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {'content': [{'type': 'text', 'text': json.dumps(_TOOL_RESULT)}]},
+    }).encode()
+
+
+def _http_response(body: bytes) -> bytes:
+    return (
+        b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n'
+        b'content-length: %d\r\n\r\n' % len(body)
+    ) + body
+
+
+class _HeldToolCallServer:
+    """A keep-alive MCP server on a real socket that can hold one tools/call.
+
+    ``connections_accepted`` is how a test tells a reused connection from a
+    fresh one without looking inside the pool.
+    """
+
+    def __init__(self) -> None:
+        self.connections_accepted = 0
+        self.hold_next_tool_call = True
+        self.tool_call_held = asyncio.Event()
+        self.release = asyncio.Event()
+        self.url = ''
+        self._server: asyncio.Server | None = None
+
+    async def __aenter__(self) -> _HeldToolCallServer:
+        self._server = await asyncio.start_server(self._serve, '127.0.0.1', 0)
+        port = self._server.sockets[0].getsockname()[1]
+        self.url = f'http://127.0.0.1:{port}'
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        assert self._server is not None
+        self._server.close()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections_accepted += 1
+        try:
+            while True:
+                try:
+                    head = await reader.readuntil(b'\r\n\r\n')
+                except asyncio.IncompleteReadError:
+                    return
+                length = next(
+                    int(line.split(b':', 1)[1])
+                    for line in head.split(b'\r\n')
+                    if line.lower().startswith(b'content-length:')
+                )
+                request = json.loads(await reader.readexactly(length))
+                if request['method'] == 'tools/call' and self.hold_next_tool_call:
+                    self.hold_next_tool_call = False
+                    self.tool_call_held.set()
+                    await self.release.wait()
+                writer.write(_http_response(_mcp_body(request.get('id', 0))))
+                await writer.drain()
+        finally:
+            writer.close()
+
+
+async def _census_once_quiet(client: httpx.AsyncClient) -> PoolCensus | None:
+    """The pool's census once every connection is idle, or the last one read."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _QUIESCENCE_SECONDS
+    reading = census(client)
+    while loop.time() < deadline:
+        reading = census(client)
+        if reading is not None and reading.total and reading.total == reading.idle:
+            return reading
+        await asyncio.sleep(0.01)
+    return reading
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sessions() -> Iterable[None]:
+    reset_sessions()
+    yield
+    reset_sessions()
+
+
+async def test_a_caller_that_gives_up_leaves_its_connection_reusable() -> None:
+    async with _HeldToolCallServer() as server, httpx.AsyncClient() as client:
+        call = asyncio.create_task(mcp_tool_call(client, server.url, 'get_status', {}))
+        await server.tool_call_held.wait()
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(call, timeout=0)
+        server.release.set()
+
+        quiet = await _census_once_quiet(client)
+        assert quiet is not None and quiet.total == quiet.idle == 1, (
+            f'the abandoned exchange did not hand its connection back: {quiet}'
+        )
+        assert await mcp_tool_call(client, server.url, 'get_status', {}) == _TOOL_RESULT
+        assert server.connections_accepted == 1
+
+
+# ── the stranded-owned class, reproduced deterministically ─────────────
+#
+# A real socket makes WHERE a cancellation lands a matter of timing, so this
+# half runs the pool over an in-memory network backend and delivers the
+# caller's cancellation after each of a range of exact event-loop steps. One
+# of those positions is inside the release path the module docstring names.
+
+_FAKE_URL = 'http://svc.local'
+_MAX_CANCEL_STEPS = 64
+_SETTLE_STEPS = 64
+
+
+class _CannedStream(httpcore.AsyncNetworkStream):
+    def __init__(self) -> None:
+        self._pending = b''
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._pending = _http_response(_mcp_body(1))
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        chunk, self._pending = self._pending[:max_bytes], self._pending[max_bytes:]
+        return chunk
+
+    async def aclose(self) -> None:
+        self._pending = b''
+
+    def get_extra_info(self, info: str) -> Any:
+        return None
+
+
+class _CannedBackend(httpcore.AsyncNetworkBackend):
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return _CannedStream()
+
+
+def _client_without_sockets() -> httpx.AsyncClient:
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(network_backend=_CannedBackend())
+    return httpx.AsyncClient(transport=transport)
+
+
+async def _steps(count: int) -> None:
+    for _ in range(count):
+        await asyncio.sleep(0)
+
+
+async def _cancel_at(steps: int) -> tuple[bool, PoolCensus | None]:
+    """Cancel a cold-session call after *steps* loop steps.
+
+    Returns whether the call had already finished by then, and the census once
+    everything it started has settled.
+    """
+    reset_sessions()
+    async with _client_without_sockets() as client:
+        call = asyncio.create_task(mcp_tool_call(client, _FAKE_URL, 'get_status', {}))
+        await _steps(steps)
+        finished_first = call.done()
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        await _steps(_SETTLE_STEPS)
+        return finished_first, census(client)
+
+
+async def test_no_cancellation_point_strands_a_connection() -> None:
+    sweep = [(steps, *await _cancel_at(steps)) for steps in range(_MAX_CANCEL_STEPS)]
+    assert sweep[-1][1], 'the sweep ended before the call did, so it missed positions'
+    stranded = [
+        (steps, reading)
+        for steps, _finished, reading in sweep
+        if reading is None or reading.total != reading.idle
+    ]
+    assert stranded == [], (
+        'cancelling the caller at these event-loop steps left a connection that is '
+        f'neither idle nor released: {stranded}'
+    )
