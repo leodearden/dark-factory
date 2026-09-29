@@ -23,6 +23,7 @@ import pytest
 
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.enumeration_guard import (
+    ENUMERATION_UPDATE_NOT_OVERWRITING,
     X_ENUMERATION_SCOPE_KEY,
     X_LIVENESS_EXCEPTIONS_KEY,
     X_LIVENESS_REVERIFIED_AT_KEY,
@@ -1232,7 +1233,7 @@ class TestRenderEnumerationGuardSection:
             X_LIVENESS_EXCEPTIONS_KEY,
             'stores', 'categories', 'exhaustive',
             'EnumeratedIdTruncated', 'EnumerationScopeMissing',
-            'EnumerationScopeMalformed',
+            'EnumerationScopeMalformed', ENUMERATION_UPDATE_NOT_OVERWRITING,
         ):
             assert token in text, token
 
