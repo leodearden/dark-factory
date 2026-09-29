@@ -67,6 +67,7 @@ from audit_manifest_descriptor_drift import (
     format_report,
     load_task_store_scan,
 )
+from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -2024,9 +2025,7 @@ def test_live_sidecars_still_declare_none_of_the_adjudicated_labels(relpath):
     _MEASURED_UNBOUND_ROWS and the sidecar's "Unbound task labels (task 4907
     adjudication)" twin section in the SAME commit. Do not relax this pin.
     """
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     # NON-VACUITY FLOOR: a renamed or deleted sidecar must not pass by finding
     # nothing to check, and neither must one emptied of every label.
@@ -2280,17 +2279,6 @@ def test_the_measured_rows_carry_the_two_differing_field_sets(
 # legitimate live assertion where a tasks.db one would not be.
 # ---------------------------------------------------------------------------
 
-def _repo_root():
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed.stdout.strip() if completed.returncode == 0 else None
-
-
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,resynced",
     [(r[0], r[1], r[2], r[3], r[5]) for r in _MEASURED_DRIFT_ROWS],
@@ -2318,9 +2306,7 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     is the assertion this pin is standing in for. Only a sidecar that disagrees
     with its task record is the defect this test was written to catch.
     """
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
     # renamed or deleted manifest cannot make this test pass by finding
@@ -2367,9 +2353,7 @@ def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
     suite, not prose it merely contains — grepped with the argv of
     orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
     the working tree instead of a ref."""
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
     doc = load_capability_manifest(Path(root) / relpath)

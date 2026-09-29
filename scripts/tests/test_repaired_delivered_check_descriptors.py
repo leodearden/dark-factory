@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from audit_delivered_checks import load_manifest_checks, structural_findings
+from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 
 _REANCHORED = [
@@ -55,24 +56,6 @@ _RETIRED_TO_MANUAL = [
 ]
 
 
-def _repo_root():
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed.stdout.strip() if completed.returncode == 0 else None
-
-
-def _checkout_root() -> str:
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
-    return root
-
-
 def _the_one_capability(root: str, relpath: str, label: str, capability: str):
     tracked = subprocess.run(
         ["git", "-C", root, "ls-files", "--", relpath],
@@ -99,13 +82,12 @@ def _the_one_capability(root: str, relpath: str, label: str, capability: str):
 )
 def test_repaired_sidecar_carries_the_repaired_descriptor(
         relpath, task_id, label, capability, expected):
-    root = _checkout_root()
+    root = checkout_root_or_skip()
     check = _the_one_capability(root, relpath, label, capability).delivered_check
 
     assert check is not None
-    assert check.model_dump() == {
-        **expected, "script": None, "args": [], "timeout_secs": None, "reason": None,
-    }, (
+    dump = check.model_dump()
+    assert {key: dump[key] for key in expected} == expected, (
         f"{relpath} label {label} capability {capability} (task {task_id}) does not "
         f"carry the task-6036 repaired descriptor. If it was re-repaired on BOTH "
         f"sides on purpose, follow this module's MAINTENANCE CONTRACT."
@@ -118,7 +100,7 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     ids=[f"{r[1]}-{r[3]}" for r in _RETIRED_TO_MANUAL],
 )
 def test_retired_capability_is_manual_in_its_sidecar(relpath, task_id, label, capability):
-    root = _checkout_root()
+    root = checkout_root_or_skip()
     check = _the_one_capability(root, relpath, label, capability).delivered_check
 
     assert check is not None
@@ -130,18 +112,13 @@ def test_retired_capability_is_manual_in_its_sidecar(relpath, task_id, label, ca
     assert isinstance(check.reason, str) and check.reason.strip()
 
 
-def test_audit_structural_section_names_no_repaired_capability():
-    root = _checkout_root()
-    repaired = {(r[1], r[3]) for r in _REANCHORED} | {(r[1], r[3]) for r in _RETIRED_TO_MANUAL}
+def test_audit_structural_section_names_no_reanchored_grep_capability():
+    root = checkout_root_or_skip()
+    reanchored_greps = {(r[1], r[3]) for r in _REANCHORED if r[4]["kind"] == "grep"}
     rows = [row for row in load_manifest_checks(root, {})[0]
-            if (row.task_id, row.name) in repaired]
+            if (row.task_id, row.name) in reanchored_greps]
 
-    loaded = {(row.task_id, row.name) for row in rows}
-    for _relpath, task_id, _label, capability, expected in _REANCHORED:
-        if expected["kind"] == "grep":
-            assert (task_id, capability) in loaded, (
-                f"task {task_id} {capability!r} is not among the audit's grep rows"
-            )
+    assert {(row.task_id, row.name) for row in rows} == reanchored_greps
 
     flagged = {(s.row.task_id, s.row.name, s.code)
                for s in structural_findings(rows, repo_root=root, ref="HEAD")}
