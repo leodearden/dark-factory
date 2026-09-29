@@ -202,6 +202,23 @@ def unreaped_zombie_pgid():
         p.wait()
 
 
+def _synthetic_stat_line(
+    pid: int, pgrp: int, *, state: str = 'S', comm: str = 'weird (name) proc'
+) -> str:
+    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp ...``.
+
+    The default *comm* deliberately contains spaces AND a ``)`` so the parser's
+    ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
+    mis-read this line, and the kernel really does allow it (a process can
+    set an arbitrary 15-char comm).
+    """
+    return (
+        f'{pid} ({comm}) {state} 1 {pgrp} {pgrp} 0 -1 4194304 '
+        + ' '.join(['0'] * 20)
+        + '\n'
+    )
+
+
 class _ShellReadinessError(AssertionError):
     """An announced-readiness precondition was not observed.
 
@@ -961,72 +978,31 @@ class TestSnapshotProcessGroup:
         )
 
     def test_stat_line_with_comm_containing_spaces_and_parens(self, monkeypatch, tmp_path):
-        """stat-line parser handles comm names with spaces and nested parens.
+        """The snapshot takes comm, state, ppid and pgrp from one stat parse.
 
-        The kernel's /proc/<pid>/stat format wraps the comm field in parens:
+        The kernel's /proc/<pid>/stat wraps comm in parens:
             "pid (comm with spaces (and parens)) state ppid pgrp ..."
-        The parser uses rfind(')') to locate the end of comm, then reads the
-        remaining fields positionally.  This test locks in that offset logic
-        against a hand-crafted synthetic stat line.
+        so the parser must end comm at the LAST ``)``.  The fabricated pid has
+        no ``comm`` file, so the name in the row can only have come from stat.
         """
-        from pathlib import Path
-        from unittest.mock import patch
-
-        # Synthetic pgid we want to match
         target_pgid = 77777
-
-        # Build a synthetic /proc/<pid>/ tree under tmp_path
         fake_pid = 77778
-        pid_dir = tmp_path / str(fake_pid)
-        pid_dir.mkdir()
-
-        # Comm with embedded spaces and parens — the adversarial case
         comm_name = 'my weird (proc) name'
-        stat_content = (
-            f'{fake_pid} ({comm_name}) S '  # pid (comm) state
-            f'1 {target_pgid} {target_pgid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n'
-            # fields after state: ppid=1, pgrp=target_pgid, session=target_pgid, ...
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            _synthetic_stat_line(fake_pid, target_pgid, comm=comm_name)
         )
-        (pid_dir / 'stat').write_text(stat_content)
-        (pid_dir / 'comm').write_text(comm_name + '\n')
-        (pid_dir / 'wchan').write_text('do_wait\n')
+        (entry / 'wchan').write_text('do_wait\n')
+        (proc_root / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
-        # Make a fake /proc directory that only has our synthetic pid entry plus
-        # some non-numeric entries (should be skipped by the implementation).
-        fake_proc = tmp_path / 'fake_proc'
-        fake_proc.mkdir()
-        # Symlink or recreate the pid subdir under fake_proc
-        import shutil
-        shutil.copytree(str(pid_dir), str(fake_proc / str(fake_pid)))
-        (fake_proc / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        rows = snapshot_process_group(target_pgid).splitlines()
 
-        from shared import proc_group as _pg
-
-        original_exists = Path.exists
-
-        def patched_exists(self) -> bool:
-            if str(self) == '/proc':
-                return True
-            return original_exists(self)
-
-        with (
-            patch.object(Path, 'exists', patched_exists),
-            patch.object(_pg, '_snapshot_process_group_unsafe') as mock_unsafe,
-        ):
-            # Use the real _snapshot_process_group_unsafe but with a fake proc dir.
-            # Because monkeypatching iterdir on Path is fragile, call the internal
-            # function directly with a patched proc_dir reference instead.
-            mock_unsafe.side_effect = lambda pgid: _snapshot_impl_with_proc_dir(
-                pgid, fake_proc
-            )
-            result = snapshot_process_group(target_pgid)
-
-        assert isinstance(result, str)
-        assert result, f'Expected non-empty snapshot, got: {result!r}'
-        # The comm with spaces/parens must be present in the output
-        assert comm_name in result or str(fake_pid) in result, (
-            f'Expected comm {comm_name!r} or pid {fake_pid} in snapshot:\n{result}'
-        )
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=S wchan=do_wait comm={comm_name} cmdline=?'
+        ], rows
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -1055,72 +1031,6 @@ class TestSnapshotProcessGroup:
         finally:
             proc.kill()
             await proc.wait()
-
-
-def _snapshot_impl_with_proc_dir(pgid: int, proc_dir) -> str:
-    """Re-implementation of _snapshot_process_group_unsafe with an injectable proc_dir.
-
-    Used by the synthetic-stat-line test to point at a fake /proc tree built
-    under tmp_path.  Mirrors the real implementation exactly so the test locks
-    in the field-offset logic under the adversarial (spaces+parens in comm) case.
-    """
-    from pathlib import Path
-
-    if pgid <= 0:
-        return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
-
-    proc_dir = Path(proc_dir)
-    if not proc_dir.exists():
-        return f'snapshot_process_group({pgid}): /proc not available'
-
-    rows: list[str] = []
-    try:
-        entries = list(proc_dir.iterdir())
-    except OSError:
-        return f'snapshot_process_group({pgid}): could not list /proc'
-
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
-            continue
-
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            tail = stat_text[rparen + 2:]
-            fields = tail.split()
-            state = fields[0]
-            ppid = int(fields[1])
-            pgrp = int(fields[2])
-        except (IndexError, ValueError):
-            continue
-
-        if pgrp != pgid:
-            continue
-
-        try:
-            comm = (entry / 'comm').read_text().strip()
-        except OSError:
-            comm = '?'
-
-        try:
-            wchan = (entry / 'wchan').read_text().strip()
-        except OSError:
-            wchan = '?'
-
-        rows.append(f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}')
-
-    if not rows:
-        return f'snapshot_process_group({pgid}): no processes found in group'
-
-    header = f'snapshot_process_group({pgid}): {len(rows)} process(es) in group:'
-    return '\n'.join([header] + rows)
 
 
 class TestScanProcessGroupsUnderPath:
@@ -1282,21 +1192,6 @@ class TestScanProcessGroupsAgainstASyntheticProc:
     than adding a test-only parameter to the public function.
     """
 
-    @staticmethod
-    def _stat_line(pid: int, pgrp: int, comm: str = 'weird (name) proc') -> str:
-        """A real-format ``/proc/<pid>/stat``: ``pid (comm) state ppid pgrp ...``.
-
-        *comm* deliberately contains spaces AND a ``)`` so the parser's
-        ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
-        mis-read this line, and the kernel really does allow it (a process can
-        set an arbitrary 15-char comm).
-        """
-        return (
-            f'{pid} ({comm}) S 1 {pgrp} {pgrp} 0 -1 4194304 '
-            + ' '.join(['0'] * 20)
-            + '\n'
-        )
-
     @pytest.fixture
     def fake_proc(self, tmp_path, monkeypatch):
         """Build the fabricated /proc and the root the scan is aimed at.
@@ -1335,7 +1230,7 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         def _pid(pid: int, pgrp: int, cwd) -> None:
             entry = proc_root / str(pid)
             entry.mkdir()
-            (entry / 'stat').write_text(self._stat_line(pid, pgrp))
+            (entry / 'stat').write_text(_synthetic_stat_line(pid, pgrp))
             (entry / 'cwd').symlink_to(cwd)
 
         _pid(100, 100, root)

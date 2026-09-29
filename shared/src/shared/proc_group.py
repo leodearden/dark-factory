@@ -78,6 +78,50 @@ from typing import NamedTuple
 logger = logging.getLogger(__name__)
 
 
+#: The procfs mount every /proc walk in this module reads: the snapshot, the
+#: at-or-under scan and the group-member walk.
+#:
+#: Module-level solely so the synthetic-/proc tests in ``test_proc_group`` can
+#: point those walks at a fabricated tree by monkeypatching it, the same way
+#: other tests there monkeypatch ``os.readlink`` and ``os.killpg``. It is an
+#: INJECTION SEAM FOR TESTS, not a runtime knob: nothing in production reads a
+#: config value into it, and the whole module already assumes Linux procfs
+#: semantics (os.killpg, /proc/<pid>/stat field order), so pointing it
+#: elsewhere at runtime would not make it portable.
+_PROC_ROOT = Path('/proc')
+
+
+class _StatFields(NamedTuple):
+    comm: str
+    state: str
+    ppid: int
+    pgrp: int
+
+
+def _read_stat_fields(entry: Path) -> _StatFields | None:
+    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
+
+    comm is delimited by the LAST ``)``, so a comm containing spaces or parens
+    parses correctly; its bytes are arbitrary, so undecodable ones are replaced
+    rather than costing the pid its entry.
+    """
+    try:
+        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    rparen = text.rfind(')')
+    if rparen < 0:
+        return None
+    comm = text[text.find('(') + 1 : rparen]
+    fields = text[rparen + 2 :].split()
+    try:
+        return _StatFields(
+            comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
+        )
+    except (IndexError, ValueError):
+        return None
+
+
 def snapshot_process_group(pgid: int) -> str:
     """Return a human-readable snapshot of all processes in process group *pgid*.
 
@@ -98,7 +142,7 @@ def snapshot_process_group(pgid: int) -> str:
     process belongs to *pgid*, or a benign "no processes found" note otherwise.
 
     Linux-specific: depends on ``/proc/<pid>/stat``, ``/proc/<pid>/wchan``,
-    and ``/proc/<pid>/comm``.  The whole ``proc_group`` module already relies on
+    and ``/proc/<pid>/cmdline``.  The whole ``proc_group`` module already relies on
     Linux semantics (``os.killpg`` / ``os.getpgrp``), so this is acceptable.
     """
     try:
@@ -115,7 +159,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
     if pgid <= 0:
         return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
 
-    proc_dir = Path('/proc')
+    proc_dir = _PROC_ROOT
     if not proc_dir.exists():
         return f'snapshot_process_group({pgid}): /proc not available'
 
@@ -133,14 +177,6 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         fields = _read_stat_fields(entry)
         if fields is None or fields.pgrp != pgid:
             continue
-        state = fields.state
-        ppid = fields.ppid
-
-        # Read comm (short executable name, capped at 15 chars by the kernel).
-        try:
-            comm = (entry / 'comm').read_text().strip()
-        except OSError:
-            comm = '?'
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
@@ -151,20 +187,21 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         # Read /proc/<pid>/cmdline (NUL-separated argv → spaces) for the full
         # command-line.  Kernel threads have an empty cmdline; fall back to
         # comm so the field is always populated.  Truncate to ~200 chars for
-        # log friendliness.  Mirrors the comm/wchan try/except idiom so
+        # log friendliness.  Mirrors the wchan try/except idiom so
         # snapshot_process_group never raises (module invariant).
         try:
             raw = (entry / 'cmdline').read_bytes()
             cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
             if not cmdline:
-                cmdline = comm  # kernel thread — fall back to short comm
+                cmdline = fields.comm  # kernel thread — fall back to short comm
             if len(cmdline) > 200:
                 cmdline = cmdline[:200] + '…'
         except OSError:
             cmdline = '?'
 
         rows.append(
-            f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm} cmdline={cmdline}'
+            f'  pid={pid} ppid={fields.ppid} state={fields.state} wchan={wchan} '
+            f'comm={fields.comm} cmdline={cmdline}'
         )
 
     if not rows:
@@ -277,49 +314,6 @@ async def terminate_process_group(
 # Linux-specific: depends on /proc/<pid>/{stat,cwd,fd/*,maps}. The whole
 # module already assumes Linux (os.killpg / os.getpgrp), so this is fine.
 # ---------------------------------------------------------------------------
-
-
-#: The procfs mount the at-or-under scan and process_group_members walk.
-#:
-#: Module-level solely so the synthetic-/proc tests can point the scan at a
-#: fabricated tree (``test_proc_group.TestScanProcessGroupsAgainstASyntheticProc``
-#: monkeypatches it, the same way other tests here monkeypatch ``os.readlink``
-#: and ``os.killpg``). It is an INJECTION SEAM FOR TESTS, not a runtime knob:
-#: nothing in production reads a config value into it, and the whole module
-#: already assumes Linux procfs semantics (os.killpg, /proc/<pid>/stat field
-#: order), so pointing it elsewhere at runtime would not make it portable.
-_PROC_ROOT = Path('/proc')
-
-
-class _StatFields(NamedTuple):
-    comm: str
-    state: str
-    ppid: int
-    pgrp: int
-
-
-def _read_stat_fields(entry: Path) -> _StatFields | None:
-    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
-
-    comm is delimited by the LAST ``)``, so a comm containing spaces or parens
-    parses correctly; its bytes are arbitrary, so undecodable ones are replaced
-    rather than costing the pid its entry.
-    """
-    try:
-        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
-    except OSError:
-        return None
-    rparen = text.rfind(')')
-    if rparen < 0:
-        return None
-    comm = text[text.find('(') + 1 : rparen]
-    fields = text[rparen + 2 :].split()
-    try:
-        return _StatFields(
-            comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
-        )
-    except (IndexError, ValueError):
-        return None
 
 
 class ProcessGroupMember(NamedTuple):
