@@ -554,7 +554,15 @@ def render_enumeration_guard_section() -> str:
         'was inconclusive, because inconclusive is not absence. It stamps '
         f'`{X_LIVENESS_REVERIFIED_AT_KEY}`. Never write either key yourself: an '
         'incoming copy is overwritten or stripped.\n'
-        '4. Filing a GATE that carries a Mem0 enumeration requires '
+        "4. Update an enumeration with `metadata_mode='merge'` (the default when "
+        "both flags are omitted) or `'replace'`, never with `append=True` or "
+        "`metadata_mode='additive'`. The additive union keeps every stored member "
+        'and the stored stamp, so the gate could neither drop an absent id nor '
+        'refresh the stamp; such an update is rejected '
+        f'(`{ENUMERATION_UPDATE_NOT_OVERWRITING}`). If the same update also '
+        'attaches `memory_hints`, send the hints in a separate `append=True` '
+        'update.\n'
+        '5. Filing a GATE that carries a Mem0 enumeration requires '
         f'`{X_ENUMERATION_SCOPE_KEY}`, a structured object stating what was '
         f'searched: `stores` (from {stores}), `categories` (from {categories}), '
         '`exhaustive` (a bool: true only if every store and category was swept) '
