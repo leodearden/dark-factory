@@ -9661,6 +9661,8 @@ def create_mcp_server(
             memory_service=memory_service,
             project_root=project_root,
             is_filing=False,
+            metadata_mode=metadata_mode,
+            append=append,
         )
         if _enumeration.rejection is not None:
             return _enumeration.rejection

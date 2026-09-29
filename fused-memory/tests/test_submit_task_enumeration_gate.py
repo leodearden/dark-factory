@@ -445,6 +445,8 @@ class TestUpdatePersistence:
         self, persisting_server, backend, project_root, seeded_task_id,
         task_interceptor, merge_flags,
     ):
+        seeded = await stored_metadata(backend, project_root, seeded_task_id)
+
         result = await update(
             persisting_server, project_root, task_id=seeded_task_id,
             metadata={'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5]},
@@ -455,9 +457,8 @@ class TestUpdatePersistence:
         assert result['enumerations'] == ['mem0_falsified_entries']
         assert 'enumeration_liveness' not in result
         task_interceptor.update_task.assert_not_awaited()
-        assert await stored_metadata(backend, project_root, seeded_task_id) == (
-            SEED_METADATA
-        )
+        assert {key: seeded[key] for key in SEED_METADATA} == SEED_METADATA
+        assert await stored_metadata(backend, project_root, seeded_task_id) == seeded
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
