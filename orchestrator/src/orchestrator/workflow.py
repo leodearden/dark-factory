@@ -508,10 +508,9 @@ class _BriefingLike(Protocol):
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
+        task: dict | None = ...,
     ) -> str: ...
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = ...
-    ) -> str: ...
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict,
         changed_files: list[str], worktree: Path | None = ...,
@@ -10355,6 +10354,7 @@ class TaskWorkflow:
         assert self.worktree is not None and self.artifacts is not None
         prompt = await self.briefing.build_reviewer_prompt(
             role.name, diff, amendment_suggestions=amendment_suggestions,
+            task=self.task,
         )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on

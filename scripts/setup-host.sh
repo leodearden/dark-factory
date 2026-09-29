@@ -854,108 +854,7 @@ systemctl --user restart jcodemunch-watcher
 ok "jcodemunch-watcher unit installed and started"
 
 # ---------------------------------------------------------------------------
-# 7. Skim — context compression for coding agents
-# ---------------------------------------------------------------------------
-info "Installing skim (context compression)"
-
-if command -v skim &>/dev/null; then
-  ok "skim already installed ($(skim --version 2>/dev/null))"
-else
-  # Find cargo: may be on PATH, in ~/.cargo/bin, or only in a rustup toolchain
-  CARGO=""
-  if command -v cargo &>/dev/null; then
-    CARGO="cargo"
-  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
-    CARGO="$HOME/.cargo/bin/cargo"
-  else
-    # Fall back to rustup stable toolchain
-    RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo"
-    [ -x "$RUSTUP_CARGO" ] && CARGO="$RUSTUP_CARGO"
-  fi
-
-  if [ -n "$CARGO" ]; then
-    $CARGO install rskim --quiet
-    ok "skim installed via cargo ($CARGO)"
-  else
-    warn "cargo not found — install Rust (rustup.rs) then: cargo install rskim"
-  fi
-fi
-
-# Install global Claude Code hook (idempotent — skim init checks existing state)
-if command -v skim &>/dev/null && command -v claude &>/dev/null; then
-  if [ -f "$HOME/.claude/hooks/skim-rewrite.sh" ]; then
-    ok "skim hook already installed"
-  else
-    skim init --yes
-    ok "skim hook installed for Claude Code"
-  fi
-
-  # Re-applied on every run: `skim init` replaces a guarded hook entry with its
-  # bare one. See scripts/install_skim_hook_guard.py.
-  _skim_guard_installer="$REPO_ROOT/scripts/install_skim_hook_guard.py"
-  if python3 "$_skim_guard_installer"; then
-    ok "skim hook runs behind scripts/skim_hook_guard.py (multi-line commands pass through unrewritten)"
-  else
-    fail "skim hook is NOT guarded — multi-line Bash commands will be flattened"
-    warn "  Fix: python3 $_skim_guard_installer  (re-run after any 'skim init')"
-  fi
-
-  # The hook rewrites commands to bare `skim`, which must be on PATH for all
-  # shell types (login, interactive, non-interactive bash -c).  ~/.cargo/bin
-  # is only added by profile/bashrc sourcing — symlink into /usr/local/bin
-  # so it's on the base OS PATH unconditionally.
-  SKIM_BIN="$HOME/.cargo/bin/skim"
-  if [ ! -e /usr/local/bin/skim ]; then
-    if [ -x "$SKIM_BIN" ]; then
-      sudo ln -s "$SKIM_BIN" /usr/local/bin/skim
-      ok "symlinked skim → /usr/local/bin/skim"
-    fi
-  else
-    ok "skim already on system PATH (/usr/local/bin/skim)"
-  fi
-fi
-
-# Verify skim is on PATH for all shell types an agent session might use.
-# The hook rewrites commands to bare `skim`, so it must be findable without
-# inheriting a profile-enhanced PATH.  Non-login, non-interactive shells
-# (gnome-terminal -- bash -c '...', systemd ExecStart=, asyncio subprocesses)
-# only get the base OS PATH unless ~/.cargo/env is sourced outside an
-# interactivity guard.
-if command -v skim &>/dev/null; then
-  info "Checking skim PATH visibility across shell types"
-
-  BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-  # Login shell (sources ~/.profile → ~/.cargo/env)
-  if env -i HOME="$HOME" TERM="$TERM" bash --login -c 'command -v skim' &>/dev/null; then
-    ok "skim on PATH: login shell"
-  else
-    fail "skim NOT on PATH: login shell"
-  fi
-
-  # Interactive shell (sources ~/.bashrc — needs to pass interactivity guard)
-  # stderr suppressed: bash -ic warns about missing terminal/job-control
-  if env -i HOME="$HOME" TERM="$TERM" bash -ic 'command -v skim' >/dev/null 2>&1; then
-    ok "skim on PATH: interactive shell"
-  else
-    fail "skim NOT on PATH: interactive shell"
-  fi
-
-  # Non-interactive, non-login shell with base OS PATH only.
-  # This simulates: gnome-terminal -- bash -c '...' when the parent env
-  # was not profile-initialised, or asyncio.create_subprocess_exec with a
-  # stripped env, or a systemd unit without Environment=PATH additions.
-  if env -i HOME="$HOME" PATH="$BASE_PATH" bash -c 'command -v skim' &>/dev/null; then
-    ok "skim on PATH: non-login non-interactive shell (base PATH)"
-  else
-    fail "skim NOT on PATH: non-login non-interactive shell (base PATH)"
-    warn "  Agents spawned without profile init will fail on skim-rewritten commands"
-    warn "  Fix: sudo ln -s $HOME/.cargo/bin/skim /usr/local/bin/skim"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 8. Dashboard systemd units
+# 7. Dashboard systemd units
 # ---------------------------------------------------------------------------
 info "Installing dashboard systemd units"
 
@@ -1147,7 +1046,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Claude Code skill symlinks
+# 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
 
@@ -1207,7 +1106,7 @@ for name in factory-init prd hotspot-survey; do
 done
 
 # ---------------------------------------------------------------------------
-# 10. Git hooks
+# 9. Git hooks
 # ---------------------------------------------------------------------------
 info "Setting up git hooks"
 
@@ -1219,7 +1118,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 11. Manual steps reminder
+# 10. Manual steps reminder
 # ---------------------------------------------------------------------------
 info "Manual steps (if migrating from another host)"
 echo ""
@@ -1234,7 +1133,7 @@ echo "    bash $REPO_ROOT/scripts/import-data.sh ~/dark-factory-export"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 12. Health checks
+# 11. Health checks
 # ---------------------------------------------------------------------------
 info "Health checks"
 

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _escalation_seed import seed_escalation
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
@@ -261,18 +262,13 @@ class TestGetPendingLevelFilter:
     """get_pending_escalations(level=N) filters by escalation level."""
 
     def _seed_esc(self, queue: EscalationQueue, task_id: str, level: int) -> Escalation:
-        """Seed a pending escalation at the given level directly via queue.submit()."""
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='implementer',
-            severity='blocking',
-            category='scope_violation',
+        """Delegates to ``seed_escalation`` with this class's default summary,
+        kept as a method with this positional shape so existing call sites stay
+        unchanged."""
+        return seed_escalation(
+            queue, level=level, task_id=task_id,
             summary=f'level={level} test escalation',
-            level=level,
         )
-        queue.submit(esc)
-        return esc
 
     @pytest.mark.asyncio
     async def test_filter_level2_returns_only_l2(self, tmp_path: Path):

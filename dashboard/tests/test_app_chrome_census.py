@@ -89,9 +89,9 @@ def test_topbar_and_rail_read_the_same_census_binding(app_jsx_body: str) -> None
         f'the topbar tasks pill renders {topbar}; expected ({census!r}, '
         "'runningOfInFlight') — the running sub-view with its in-flight superset."
     )
-    assert rail == (census, 'inFlightCount'), (
+    assert rail == (census, 'inFlightCountReading'), (
         f'the rail Tasks badge renders {rail}; expected ({census!r}, '
-        "'inFlightCount') — the same in-flight number the topbar shows."
+        "'inFlightCountReading') — the same in-flight number the topbar shows."
     )
     sites = re.findall(rf'<DatumReading\s+datum=\{{\s*{census}\s*\}}', body)
     assert len(sites) == 2, (

@@ -13,6 +13,12 @@ modules do. Without this, scripts/ on sys.path alone only makes
 scripts/legibility/ importable as a namespace package (`import legibility`),
 not its contents as bare top-level names.
 
+Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
+the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
+by bare name: importlib mode keeps a test file's own directory off sys.path.
+Like tests/scripts/conftest.py's `_THIS_DIR` entry, but appended rather than
+inserted, so it can never shadow a scripts/ module or an installed package.
+
 Also home to the shared tasks.db test fixtures (`make_tasks_db`,
 `project_root_with_tasks_db`). Each previously existed as three
 near-identical private copies across the sweep-script test files, under
@@ -52,6 +58,10 @@ if str(_LEGIBILITY_DIR) not in sys.path:
 _LMS_DIR = _SCRIPTS_DIR / 'local-model-serving'
 if str(_LMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LMS_DIR))
+
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.append(str(_THIS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
 # this directory does not load the repo-root conftest.py, so each test-root

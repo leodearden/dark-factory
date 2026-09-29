@@ -22,6 +22,7 @@ from fused_memory.reconciliation.prompts import (
     render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
+    MEM0_TOMBSTONE_DELETERS,
     render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
@@ -49,6 +50,13 @@ future change to it cannot leave stale prompt text behind.  Pinned by
 #: byte-identical body turns them red for no behavioural reason.
 EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
 EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+
+#: The live-state freshness section's heading (task 5271), exported for the
+#: same reason, for ``tests/reconciliation/test_stage1.py``.
+LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
+LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
+
+_DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -1009,4 +1017,28 @@ live validation specimen for gate task 3546, and this re-flag twice became an op
 gate task asking for it to be reset — tasks 5080 and 5104, the second born-at-L2 critical. \
 Both were declined by hand. The same false positive has already appeared under three \
 different `flag_type` namings, so renaming it does not make it a new finding.
+
+{LIVE_STATE_FRESHNESS_HEADING}
+A Mem0 memory's "still needs appending" / "caveat still missing" clause records what was \
+true WHEN IT WAS WRITTEN. Before emitting a `premature_widening_evidence_caveat` finding, \
+or any "task N's metadata still lacks X" finding, call `get_task` for that task and read \
+its CURRENT `metadata`. Do not emit it when the caveat, or the source memory id it cites, \
+is already there. When you do emit it, `cite_memory` the caveat-source memory: the code \
+gate `flag_dedup.filter_already_recorded_caveat_flags` drops the flag once the task's live \
+metadata records every cited memory id, and keeps it whenever the lookup is inconclusive.
+
+The buffered-event deletion log shows THAT a Mem0 record was deleted, never WHY. Before \
+counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, call \
+`get_memory_by_id` on it. A miss carrying a `tombstone` whose `deleter` is one of \
+{_DOCUMENTED_SWEEP_DELETERS} is a designed recon sweep — expected, not an anomaly — and \
+must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
+supports the flag. Name every swept id's full UUID in the description, and do not bundle \
+unrelated deletions into this flag type. The code gate \
+`sweep_deletion_guard.filter_benign_sweep_deletion_flags` drops a flag when every swept id \
+it can see is benign-tombstoned. It sees an id only if the id carries a tombstone or was \
+deleted in this cycle's event buffer, so an untombstoned deletion from an EARLIER cycle is \
+invisible to it: report such an id in a flag of its own, never alongside benign-tombstoned \
+ids. This rule exists because solar_challenge_platform run 09f2829f \
+(finding c4639ec8) reported three "new occurrences" that all carried \
+`stage1_cycle_summary_trim` / `stage2_cycle_summary_trim` tombstones from the same run.
 """

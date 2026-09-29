@@ -29,7 +29,11 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
 )
-from fused_memory.server.write_triage_judge import JUDGE_VERDICTS, VERDICT_KEY
+from fused_memory.server.write_triage_judge import (
+    CANDIDATE_ID_KEY,
+    JUDGE_VERDICTS,
+    VERDICT_KEY,
+)
 from fused_memory.services.memory_service import SearchResults
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
@@ -67,22 +71,37 @@ _CORPUS = (
 )
 
 
+#: A candidate line of the rendered user prompt, capturing its id.
+_ID_LINE = re.compile(r'^- id: (\S+)$', re.MULTILINE)
+
+
+def _user_turn(messages: list[dict]) -> str:
+    return next(m['content'] for m in messages if m['role'] == 'user')
+
+
 def _openai(word: str) -> MagicMock:
     """A fake `AsyncOpenAI` that is its own async context manager, as the SDK is.
 
-    Every completion answers *word* and bills :data:`_USAGE`. The response is
-    plain namespaces because a MagicMock `usage` would hand `int()` a 1.
+    Every completion answers *word* about the FIRST candidate its own prompt
+    names (an attach verdict must name one; `distinct` names none) and bills
+    :data:`_USAGE`. The response is plain namespaces because a MagicMock
+    `usage` would hand `int()` a 1.
     """
-    response = types.SimpleNamespace(
-        choices=[types.SimpleNamespace(
-            message=types.SimpleNamespace(content=json.dumps({VERDICT_KEY: word})),
-        )],
-        usage=types.SimpleNamespace(**_USAGE),
-    )
+    async def _complete(**kwargs) -> types.SimpleNamespace:
+        answer = {VERDICT_KEY: word}
+        if JUDGE_VERDICTS[word] != OUTCOME_STORED:
+            answer[CANDIDATE_ID_KEY] = _ID_LINE.findall(_user_turn(kwargs['messages']))[0]
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                message=types.SimpleNamespace(content=json.dumps(answer)),
+            )],
+            usage=types.SimpleNamespace(**_USAGE),
+        )
+
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
-    client.chat.completions.create = AsyncMock(return_value=response)
+    client.chat.completions.create = AsyncMock(side_effect=_complete)
     return client
 
 
@@ -99,11 +118,10 @@ def _judge_config() -> types.SimpleNamespace:
 
 def _prompt_ids(create: AsyncMock) -> list[list[str]]:
     """The candidate ids each awaited completion's user prompt named, in order."""
-    prompts = [
-        next(m['content'] for m in call.kwargs['messages'] if m['role'] == 'user')
+    return [
+        _ID_LINE.findall(_user_turn(call.kwargs['messages']))
         for call in create.await_args_list
     ]
-    return [re.findall(r'^- id: (\S+)$', prompt, re.MULTILINE) for prompt in prompts]
 
 
 def _resolved(plan, index: int) -> list:

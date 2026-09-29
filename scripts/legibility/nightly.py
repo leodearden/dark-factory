@@ -55,6 +55,7 @@ from legibility import (  # noqa: E402
 )
 from legibility.config import (  # noqa: E402
     LegibilityConfig,
+    TrickleCensusCaps,
     _require_absolute,
     configure_logging,
     load_config,
@@ -602,9 +603,25 @@ _RELATIVE_CENSUS_ARG_DETAIL = (
     "(legibility-trickle@.service's WorkingDirectory) -- task 3269's defect."
 )
 
+_SCHEMA_DEFAULT_TRICKLE_CAPS = TrickleCensusCaps()
+
+
+def _census_cap_args(caps: TrickleCensusCaps) -> list[str]:
+    """census.py's cost-control flags for *caps*; a ``None`` cap omits its flag."""
+    args: list[str] = []
+    if caps.max_batches is not None:
+        args += ['--max-batches', str(caps.max_batches)]
+    if caps.max_verify_clusters is not None:
+        args += ['--max-verify-clusters', str(caps.max_verify_clusters)]
+    return args
+
 
 def _default_census_launcher(
-    project_root: str | Path, *, config_path: str | Path | None = None, env=None,
+    project_root: str | Path,
+    *,
+    config_path: str | Path | None = None,
+    caps: TrickleCensusCaps = _SCHEMA_DEFAULT_TRICKLE_CAPS,
+    env=None,
 ) -> None:
     """Best-effort subprocess launch of the census entrypoint (task η)
     against the project named by *project_root*.
@@ -632,6 +649,13 @@ def _default_census_launcher(
     unchanged", which is what this launcher did before the parameter existed
     and what it must keep doing whenever no account is available: a census
     launch is best-effort, so a pool problem must never be able to block one.
+
+    *caps* is the trickle's census bound (task 5900, task 5782's precondition
+    (b)), emitted as census.py's own ``--max-batches`` /
+    ``--max-verify-clusters`` flags, which remain the single cap mechanism.
+    Omitted, it is the bounded ``TrickleCensusCaps`` schema default, never
+    uncapped. ``None`` has one meaning here, on a caps FIELD only: the
+    explicit uncapped opt-out for that one flag.
     """
     argv = [
         sys.executable,
@@ -646,6 +670,7 @@ def _default_census_launcher(
             str(config_path), field_name='census config_path',
             detail=_RELATIVE_CENSUS_ARG_DETAIL,
         )]
+    argv += _census_cap_args(caps)
     result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(
@@ -679,9 +704,12 @@ def evaluate_census_step(
     best-effort subprocess launch) is called once.
 
     The *launcher* seam's contract is ``launcher(project_root, *,
-    config_path=None)``, always called with the CONFIG's ``project_root`` --
-    never argv-less, so the census target is never left to the process cwd
-    (task 3269). *config_path* is forwarded unchanged.
+    config_path=None, caps)``, always called with the CONFIG's
+    ``project_root`` AND the config's ``census.trickle_caps`` -- never
+    argv-less, so the census target is never left to the process cwd (task
+    3269), and the census bound is decided by the project's legibility.yaml
+    here, where config maps to launch, never by the launcher's own fallback
+    (task 5900). *config_path* is forwarded unchanged.
 
     This function never raises and never fails the run, and that guarantee is
     its OWN: both the *decide* call and the *launcher* call are guarded here,
@@ -761,7 +789,7 @@ def evaluate_census_step(
         return line, True
 
     try:
-        launcher(cfg.project_root, config_path=config_path)
+        launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 

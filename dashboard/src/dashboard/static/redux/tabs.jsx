@@ -26,9 +26,9 @@ const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
-const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS, CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
+const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // data.js's one copy of the on-demand terminal window's key.
-const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -265,7 +265,7 @@ function OrchTab({ projectFilter, search }) {
   const DEFAULT_FILTER = { in_flight: true };
   const getFilter = (pid) => {
     const f = filterMap[pid] && typeof filterMap[pid] === 'object' ? filterMap[pid] : DEFAULT_FILTER;
-    return Object.fromEntries(CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
+    return Object.fromEntries(TASK_CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
   };
   const flipFilter = (pid, key) => {
     const cur = getFilter(pid);
@@ -276,7 +276,7 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        {CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
+        {TASK_CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -284,7 +284,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (
@@ -298,7 +298,7 @@ function OrchTab({ projectFilter, search }) {
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            {CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
+            {TASK_CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -310,7 +310,7 @@ function OrchTab({ projectFilter, search }) {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
                     <div className="seg" role="group" aria-label="Task filter">
-                      {CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
+                      {TASK_CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
                     </div>
                   </div>
 
@@ -398,7 +398,7 @@ function OrchTab({ projectFilter, search }) {
                       {censusSegments(census).map(s => <span key={s.key} style={{ width: `${s.share}%`, background: CP[s.tone] }} />)}
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      {CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
+                      {TASK_CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
                     </div>
                   </div>
                   <div>

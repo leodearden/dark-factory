@@ -64,6 +64,8 @@ Why: a first census cannot rely on saturation to bound spend — against an empt
 
 What you're trading for that: a bounded first census is a *sample*, not a sweep, and nothing re-sweeps the remainder automatically. If you want full coverage of the first window, either run uncapped, or plan on rolling `last_census_at` back (per the bullets above) and running again.
 
+The recurring census the nightly trickle launches is capped by the project's `legibility.yaml` `census.trickle_caps` block, which the trickle passes as these same two flags. Its schema default is `max_batches: 50` / `max_verify_clusters: 150`, the same bound as the first-census command above. Set a key to `null` for an uncapped unattended census. A capped trickle census reports partial coverage exactly like a flagged manual run. The flags you type on a manual run are unaffected by that block.
+
 ## Post-run checklist
 
 1. **Read the dated report.** `plans/confusion-census-<date>.md` in the *censused* project's own checkout — open it and read the origin × manifestation matrix (where confusions came from vs. how they showed up) plus the narrative sections. This is the actual deliverable; don't just trust the one-line CLI summary.

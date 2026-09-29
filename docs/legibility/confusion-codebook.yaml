@@ -3808,7 +3808,7 @@ entries:
 - id: entry-cand-20260722-6
   title: A Bash command whose FIRST LINE carries a skim-rewrite target (`git status`, `git log`, `cat`/`head -N` on a source-file path) reaches the shell with every newline collapsed to a single space, breaking heredocs and inline multi-line scripts
   severity: medium
-  status: open
+  status: fixed
   origin_phase: unknown
   manifested_phase: unknown
   sightings:
@@ -4265,6 +4265,12 @@ entries:
     origin_phase: ops
     manifested_phase: unknown
     note: Host PreToolUse skim rewrite hook substituted skim for a multi-file cat command (cat family_driver.py fm.py), but skim accepts only one file argument, producing 'unexpected argument fm.py' error. Umbrella entry for skim rewrite hook interventions; variant affects cat with multiple files.
+  - date: '2026-09-29'
+    project: dark_factory
+    session: skim-hook-removal-2026-09-29
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'CAUSE REMOVED, not worked around. On 2026-09-29 the operator removed the host-level PreToolUse `Bash` hook (~/.claude/hooks/skim-rewrite.sh -> `skim rewrite --hook`) from ~/.claude/settings.json, and this change removes scripts/setup-host.sh section 7, which installed skim and ran `skim init` on every host bootstrap. Dispatched agents symlink that same settings.json, so no agent on this host is rewritten any more; the same `cat` that came back annotation-stripped before the removal returned the file verbatim afterwards. Decision basis (a four-seat study on 2026-09-28, worst cases reproduced against skim 2.3.1): 26/584 sampled agent Bash calls were rewritten and the net token effect was slightly NEGATIVE (`skim git diff` renders whole files, 12,052 -> 63,898 chars), while bare or piped `cargo test`/`cargo nextest run` became a no-op exiting 0, `grep -rn X dir` returned rc 2 with empty output, `ls -la` returned empty output, `git status --porcelain` became prose, `git log -p` fabricated its commit count and pseudo-mode `cat` stripped `self` and type annotations. The task-5955 guard (scripts/skim_hook_guard.py) prevented only the whitespace flattening this entry records and was deleted uninstalled in the same change; task 5683''s COMPOUND_COMMAND_REWRITE_GUIDANCE is retired under its own retirement clause (no host running the factory wires the hook). A recurrence of this symptom after 2026-09-29 means the hook has been reinstalled (a manual `skim init` re-adds it); check ~/.claude/settings.json before reopening.'
   cause: 'A host PreToolUse `skim rewrite` hook flattens a Bash command -- every newline to a single space, `skim` substituted onto the matched clause -- when and only when its FIRST LINE carries `git status`, `git log`, or `cat`/`head -N` on a source-file path. UMBRELLA entry for this family: file recurrences HERE, not on entry-cand-20260919-1 (heredoc-quoted git commit) or entry-cand-20260918-19 (`python3 -c` script), which record the same mechanism. That first-line discriminator is checkable against every sighting below. The chain is ~/.claude/settings.json PreToolUse matcher `Bash` -> ~/.claude/hooks/skim-rewrite.sh (skim-hook v2.1.0) -> `skim rewrite --hook`; re-measured against skim 2.3.1. Nothing is rejected and no static pre-check is involved -- the flattened one-liner is handed to the shell, which is why the symptom is an IndentationError, a `fatal: ambiguous argument`, or `syntax error near unexpected token` at exit 127, never a refusal. TWO QUALIFIERS an earlier framing of this cause omitted, both measured: (1) the target scan reads the FIRST LINE ONLY -- `echo a && git status\necho b` is flattened, but `echo a\ngit status && echo b` and `# comment\ngit status` are passed through byte-identical, so a multi-line script whose first line is plain is unaffected however many targets follow; (2) `git status`/`git log` match unconditionally, but `cat`/`head` match on the path''s EXTENSION and not on whether it exists -- a MISSING foo.md, foo.py, foo.rs, foo.ts, foo.json, foo.yaml or foo.toml is rewritten, while an EXISTING /etc/hostname and any .txt/.log/.sh/.csv/.xml/.html or extensionless path is not. Two further corollaries: the match is on the command WORD, not the text, so a quoted `echo "git status"` does NOT trigger it; and a TOP-LEVEL heredoc redirect (`python3 - <<''PY'' ... PY`) makes the hook decline the whole command even when a target IS present -- that is the safe way to pass a multi-line script. The cause is a third-party binary under the operator''s ~/.claude and is not fixable in this repository; the agent-facing rule is owned by task 5683.'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
@@ -16768,7 +16774,7 @@ entries:
 - id: entry-cand-20260918-19
   title: Host PreToolUse `skim rewrite` hook flattens a multi-line `python3 -c` script's embedded newlines into single spaces, producing an IndentationError -- not the Bash tool
   severity: medium
-  status: open
+  status: fixed
   origin_phase: unknown
   manifested_phase: implement
   sightings:
@@ -16790,6 +16796,12 @@ entries:
     origin_phase: implement
     manifested_phase: implement
     note: 'Direct evidence match: python3 -c script with for-loop flattened to single line, producing IndentationError; cluster evidence quote directly reflects this case'
+  - date: '2026-09-29'
+    project: dark_factory
+    session: skim-hook-removal-2026-09-29
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Cause removed 2026-09-29: the host skim PreToolUse hook that flattened the `python3 -c` script was uninstalled from ~/.claude/settings.json and scripts/setup-host.sh no longer installs it. Umbrella entry-cand-20260722-6 carries the full record. Task 5683''s COMPOUND_COMMAND_REWRITE_GUIDANCE, filed from this sighting, is retired in the same change.'
   cause: 'Umbrella entry for this family is entry-cand-20260722-6 -- file recurrences THERE, not here. Not the Bash tool: a host PreToolUse `skim rewrite` hook flattens a Bash command (every newline to a single space) when its FIRST LINE carries `git status`, `git log`, or `cat`/`head -N` on a source-file path, so a multi-line `python3 -c` script sharing that line arrives as one line and raises IndentationError. The chain is ~/.claude/settings.json PreToolUse matcher `Bash` -> ~/.claude/hooks/skim-rewrite.sh (skim-hook v2.1.0) -> `skim rewrite --hook`; re-measured against skim 2.3.1. Nothing is rejected and no static pre-check is involved -- the flattened one-liner is handed to the shell, which is why the symptom is an IndentationError, a `fatal: ambiguous argument`, or `syntax error near unexpected token` at exit 127, never a refusal. TWO QUALIFIERS an earlier framing of this cause omitted, both measured: (1) the target scan reads the FIRST LINE ONLY -- `echo a && git status\necho b` is flattened, but `echo a\ngit status && echo b` and `# comment\ngit status` are passed through byte-identical, so a multi-line script whose first line is plain is unaffected however many targets follow; (2) `git status`/`git log` match unconditionally, but `cat`/`head` match on the path''s EXTENSION and not on whether it exists -- a MISSING foo.md, foo.py, foo.rs, foo.ts, foo.json, foo.yaml or foo.toml is rewritten, while an EXISTING /etc/hostname and any .txt/.log/.sh/.csv/.xml/.html or extensionless path is not. Two further corollaries: the match is on the command WORD, not the text, so a quoted `echo "git status"` does NOT trigger it; and a TOP-LEVEL heredoc redirect (`python3 - <<''PY'' ... PY`) makes the hook decline the whole command even when a target IS present -- that is the safe way to pass a multi-line script. The cause is a third-party binary under the operator''s ~/.claude and is not fixable in this repository; the agent-facing rule is owned by task 5683.'
 - id: entry-cand-20260917-22
   title: Bash tool collapses a multi-line python3 -c script's newlines into a single line, producing IndentationError instead of running as written
@@ -16889,7 +16901,7 @@ entries:
 - id: entry-cand-20260919-1
   title: Host PreToolUse `skim rewrite` hook collapses a compound command's newlines and prefixes `skim` onto the matched subcommand, corrupting a heredoc-quoted git commit into an exit-127 syntax error
   severity: medium
-  status: open
+  status: fixed
   origin_phase: implement
   manifested_phase: implement
   sightings:
@@ -16925,6 +16937,12 @@ entries:
     origin_phase: prd
     manifested_phase: implement
     note: skim rewrite hook collapses heredoc newlines in multi-line git commit command (turn 945); exit 127 syntax error near unexpected token '('
+  - date: '2026-09-29'
+    project: dark_factory
+    session: skim-hook-removal-2026-09-29
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Cause removed 2026-09-29: the host skim PreToolUse hook that collapsed the compound command''s newlines and prefixed `skim` was uninstalled from ~/.claude/settings.json and scripts/setup-host.sh no longer installs it. Umbrella entry-cand-20260722-6 carries the full record.'
   cause: 'Umbrella entry for this family is entry-cand-20260722-6 -- file recurrences THERE, not here. Same mechanism: a host PreToolUse `skim rewrite` hook flattens a Bash command (every newline to a single space) when its FIRST LINE carries `git status`, `git log`, or `cat`/`head -N` on a source-file path, so a heredoc-quoted `git commit` sharing that line loses the newlines its heredoc needs and dies as `syntax error near unexpected token` at exit 127. A bare heredoc `git commit` is NOT affected -- the founding sighting broke only because the same first line also carried `git status` and `git log`. The chain is ~/.claude/settings.json PreToolUse matcher `Bash` -> ~/.claude/hooks/skim-rewrite.sh (skim-hook v2.1.0) -> `skim rewrite --hook`; re-measured against skim 2.3.1. Nothing is rejected and no static pre-check is involved -- the flattened one-liner is handed to the shell, which is why the symptom is an IndentationError, a `fatal: ambiguous argument`, or `syntax error near unexpected token` at exit 127, never a refusal. TWO QUALIFIERS an earlier framing of this cause omitted, both measured: (1) the target scan reads the FIRST LINE ONLY -- `echo a && git status\necho b` is flattened, but `echo a\ngit status && echo b` and `# comment\ngit status` are passed through byte-identical, so a multi-line script whose first line is plain is unaffected however many targets follow; (2) `git status`/`git log` match unconditionally, but `cat`/`head` match on the path''s EXTENSION and not on whether it exists -- a MISSING foo.md, foo.py, foo.rs, foo.ts, foo.json, foo.yaml or foo.toml is rewritten, while an EXISTING /etc/hostname and any .txt/.log/.sh/.csv/.xml/.html or extensionless path is not. Two further corollaries: the match is on the command WORD, not the text, so a quoted `echo "git status"` does NOT trigger it; and a TOP-LEVEL heredoc redirect (`python3 - <<''PY'' ... PY`) makes the hook decline the whole command even when a target IS present -- that is the safe way to pass a multi-line script. The cause is a third-party binary under the operator''s ~/.claude and is not fixable in this repository; the agent-facing rule is owned by task 5683.'
 - id: entry-cand-20260919-2
   title: Python heredoc edit script pastes a docstring INCLUDING its own closing triple-quote, ending the script's own literal early and leaving the tail as bare code (SyntaxError)

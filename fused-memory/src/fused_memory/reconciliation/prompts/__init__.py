@@ -784,15 +784,8 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 #   Stage 3 — "## Report Channel" section header + read-only NOTE inserted
 #             between the cite-tool list and the stats line.
 #
-# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected task-1594):
-#   _derive_affected_ids reads cited_tasks (not the top-level task_id field of
-#   add_finding) when building the fingerprint identity for compute_content_fingerprint.
-#   Always call cite_task for the primary subject task so the fingerprint is stable.
-#   For multi-task findings, the cited_tasks signature shifts as citations grow or
-#   shrink — pass task_id=<primary> at the top level of add_finding as a supplementary
-#   stable anchor when one primary subject exists.
-#   Exception: cross_project findings use task_id=None (operator routing); cite_task
-#   is the sole dedup anchor there (see ## Cross-Project Routing in stage2.py).
+# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected tasks 1594, 4772):
+#   the rule is stated once, in _GUIDANCE_TOOL_PROSE['cite_task'], and not restated here.
 #
 # Call shapes below are GENERATED from live FastMCP tool signatures (task-2559
 # root-cause fix for run_id-omission drift that survived two reviewer rounds) —
@@ -959,15 +952,15 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
     ),
     'cite_task': (
-        '- `{call}` — both project_id and task_id are required. **Dedup anchor**:'
-        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
-        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
-        ' supplementary stable anchor when one clear primary subject exists. Exception:'
-        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-        ' sole dedup anchor there.\n'
+        '- `{call}` — both project_id and task_id are required. **Dedup anchor**: cross-cycle'
+        ' dedup keys a finding on its whole citation set: `_derive_affected_ids` feeds every'
+        ' cited task, entity, edge and memory into `compute_content_fingerprint`, and never'
+        ' the top-level `task_id` field of `add_finding`. Always call `cite_task` for the'
+        ' primary subject task, and cite the same set every cycle: the primary subject plus'
+        ' only citations that are stable evidence. Adding or dropping any citation re-keys'
+        ' the finding. Keep passing the top-level `task_id` for the subject task anyway: it'
+        ' keys in-run dedup and the `actionable` default. Exception: cross_project findings'
+        ' use `task_id=None` (operator routing); `cite_task` is the sole dedup anchor there.\n'
     ),
     'cite_memory': (
         '- `{call}` — `memory_id` must be the full 36-char UUID from the `id` field of a'

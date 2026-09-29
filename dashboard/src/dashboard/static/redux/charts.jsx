@@ -3,9 +3,8 @@
 const { useRef, useEffect, useState, useMemo } = React;
 
 // The Datum render decision. Module scope, no fallback, bound under datum.js's
-// own name — a text/babel tag joins no classic-script scope, so there is
-// nothing to collide with. See the CANONICAL note in datum.js's header; the
-// spark_path.js destructure below follows the same rule.
+// own name, which is safe here — see the CANONICAL note in datum.js's header;
+// the spark_path.js destructure below follows the same rule.
 const { datumView } = window.DF_DATUM;
 
 // The scale+path math for every chart primitive here lives in the plain-JS
