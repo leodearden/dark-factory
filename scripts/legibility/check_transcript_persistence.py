@@ -228,24 +228,33 @@ def _normalize_ws(text: str) -> str:
     return ' '.join(text.split())
 
 
-_COMMAND_NAME_RE = re.compile(r'<command-name>(.*?)</command-name>', re.DOTALL)
-_COMMAND_ARGS_RE = re.compile(r'<command-args>(.*?)</command-args>', re.DOTALL)
+_SLASH_COMMAND_TURN_RE = re.compile(
+    r"""
+    \s*(?:<command-message>[^<]*</command-message>\s*)?
+    <command-name>(?P<name>[^<]*)</command-name>\s*
+    (?:<command-message>[^<]*</command-message>\s*)?
+    <command-args>(?P<args>.*?)</command-args>
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+"""Claude Code's expanded slash-command turn, matched from the turn's START:
+the ``<command-name>``/``<command-args>`` pair, adjacent and in that order,
+with ``<command-message>`` written either before or between them (both orders
+occur on disk). The anchor rejects a turn that merely QUOTES an expansion."""
 
 
 def _typed_slash_command(text: str) -> str | None:
     """Rebuild the typed ``/name args`` from Claude Code's expanded slash-command turn.
 
     ``record.prompt`` holds the literal argv (``/unblock 4743 ...``) while the
-    transcript stores the ``<command-name>``/``<command-args>`` tagged
-    expansion; this is the inverse that lets the unchanged prompt-prefix
-    needle match. Returns None when either tag is absent (not a slash-command
-    turn).
+    transcript stores the tagged expansion (:data:`_SLASH_COMMAND_TURN_RE`);
+    this is the inverse that lets the unchanged prompt-prefix needle match.
+    Returns None when *text* is not itself such an expansion.
     """
-    name = _COMMAND_NAME_RE.search(text)
-    args = _COMMAND_ARGS_RE.search(text)
-    if name is None or args is None:
+    expansion = _SLASH_COMMAND_TURN_RE.match(text)
+    if expansion is None:
         return None
-    return '/' + name.group(1).strip().lstrip('/') + ' ' + args.group(1)
+    return '/' + expansion['name'].strip().lstrip('/') + ' ' + expansion['args']
 
 
 def find_matching_transcript(
@@ -278,17 +287,21 @@ def find_matching_transcript(
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir), in one of three
     tiers:
-      - EXACT (bound ``record.claude_session_id``): ``<expected_dir>/<id>.jsonl``
-        is the transcript, or there is none. Authoritative, with NO fallback —
-        a same-prompt re-spawn or an in-window sibling would otherwise mask a
-        genuine loss.
+      - EXACT (bound id, per :func:`_bound_session_id`):
+        ``<expected_dir>/<id>.jsonl`` is the transcript, or there is none.
+        Authoritative, with NO fallback — a same-prompt re-spawn, an in-window
+        sibling, or a later session that quotes the prompt would otherwise mask
+        a genuine loss. The accepted cost: ``/clear`` re-mints the id and the
+        registry re-binds to it, so a session that exits before writing under
+        the new id is reported missing although its launch transcript survives.
       - STRONG (unbound, usable prompt): :func:`_match_prompt_prefix`.
       - WEAK (unbound, prompt too short/empty): :func:`_match_mtime_window`,
         never reached for a usable prompt.
     """
     session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
-    if record.claude_session_id:
-        return _bound_transcript(session_dir, record.claude_session_id)
+    bound_id = _bound_session_id(record)
+    if bound_id is not None:
+        return _bound_transcript(session_dir, bound_id)
     if not session_dir.is_dir():
         return None
     candidates = sorted(session_dir.glob('*.jsonl'))
@@ -296,6 +309,27 @@ def find_matching_transcript(
     if prefix is not None:
         return _match_prompt_prefix(prefix, candidates)
     return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
+
+
+def _bound_session_id(record: session_registry.SessionRecord) -> str | None:
+    """Return *record*'s bound Claude Code session id, or None to match it as unbound.
+
+    The id becomes a filename inside the expected dir, so one that is not a
+    single path component (a hand-edited ``../x`` or an absolute path) could
+    resolve to an unrelated file elsewhere and hide a real loss. Such an id
+    is rejected loudly rather than trusted.
+    """
+    session_id = record.claude_session_id
+    if not session_id:
+        return None
+    if Path(session_id).name != session_id:
+        logger.warning(
+            '%s: claude_session_id %r is not a single path component; '
+            'matching the record as unbound',
+            record.session_slug, session_id,
+        )
+        return None
+    return session_id
 
 
 def _bound_transcript(session_dir: Path, claude_session_id: str) -> Path | None:
@@ -534,7 +568,11 @@ def _build_escalation_arguments(
         'falls back to prompt-prefix containment (whitespace-normalized) in a '
         'transcript first user turn under expected_dir, with a slash-command '
         'expansion de-expanded to its typed form, or to a file-mtime window when '
-        'the prompt is too short to match. Inspect expected_dir before acting.'
+        'the prompt is too short to match. Known false-positive class: /clear '
+        're-mints the session id and the registry re-binds to it, so a session '
+        'that exited before writing under the new id is listed here although '
+        'its launch transcript (first user turn = the prompt) may still be in '
+        'expected_dir. Inspect expected_dir before acting.'
     )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'
