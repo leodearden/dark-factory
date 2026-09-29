@@ -1556,6 +1556,49 @@ class TestReapProcessGroups:
         os.killpg(pgid, 0)
 
     @pytest.mark.timeout(5)
+    def test_one_proc_walk_judges_every_group_killpg_still_sees(self, tmp_path, monkeypatch):
+        """Each poll walks /proc once for all still-visible groups, never once per group.
+
+        Three zombie-only groups stay visible to killpg, a fourth is already
+        gone, and the fabricated /proc also holds one unrelated live pid. Every
+        pgid is above PID_MAX_LIMIT (2**22), so none can be a real group. One
+        walk reads each fabricated stat exactly once; a walk per visible group
+        would read each of them three times, and a reap of only gone groups
+        needs no walk at all. Stat reads are counted the same way
+        test_two_pids_in_one_group_are_inspected_once counts its per-pid
+        inspection.
+        """
+        zombie_groups = (5_000_100, 5_000_200, 5_000_300)
+        gone_group = 5_000_900
+        proc_root = tmp_path / 'proc'
+        planted = [(pgid + 1, pgid, 'Z') for pgid in zombie_groups] + [(5_000_401, 5_000_400, 'S')]
+        for pid, pgrp, state in planted:
+            (proc_root / str(pid)).mkdir(parents=True)
+            (proc_root / str(pid) / 'stat').write_text(_synthetic_stat_line(pid, pgrp, state=state))
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        def killpg(pgid: int, sig: int) -> None:
+            if pgid == gone_group:
+                raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+
+        monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
+        stat_reads: list[str] = []
+        real_read = proc_group_module._read_stat_fields
+        monkeypatch.setattr(
+            'shared.proc_group._read_stat_fields',
+            lambda entry: stat_reads.append(entry.name) or real_read(entry),
+        )
+
+        outcomes = reap_process_groups({*zombie_groups, gone_group}, grace_secs=0)
+
+        assert outcomes == dict.fromkeys((*zombie_groups, gone_group), 'reaped')
+        assert sorted(stat_reads) == sorted(str(pid) for pid, _, _ in planted)
+
+        stat_reads.clear()
+        assert reap_process_groups({gone_group}, grace_secs=0) == {gone_group: 'reaped'}
+        assert stat_reads == []
+
+    @pytest.mark.timeout(5)
     def test_reap_refuses_unsafe_pgids(self, monkeypatch):
         """os.getpgrp() and pgid 1 are REFUSED and never signalled.
 

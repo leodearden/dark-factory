@@ -328,31 +328,66 @@ class ProcessGroupMember(NamedTuple):
         return self.state in ('Z', 'X')
 
 
+def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupMember]]:
+    """One /proc walk: the members of every positive pgid in *pgids*, keyed by pgid.
+
+    Each list holds zombies too and is sorted by pid; a group with no visible
+    member maps to an empty list.  A pid that vanishes or cannot be read
+    mid-walk is skipped, and no positive pgid means no walk.  Never raises OSError.
+    """
+    members: dict[int, list[ProcessGroupMember]] = {p: [] for p in pgids if p > 0}
+    if not members:
+        return members
+    try:
+        entries = list(_PROC_ROOT.iterdir())
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fields = _read_stat_fields(entry)
+        if fields is None or fields.pgrp not in members:
+            continue
+        members[fields.pgrp].append(
+            ProcessGroupMember(
+                pid=int(entry.name), ppid=fields.ppid, state=fields.state, comm=fields.comm
+            )
+        )
+    for group in members.values():
+        group.sort()
+    return members
+
+
 def process_group_members(pgid: int) -> list[ProcessGroupMember]:
     """Every process whose pgrp is *pgid*, zombies included, sorted by pid.
 
     Walks ``/proc``; a pid that vanishes or cannot be read mid-walk is skipped.
     Never raises OSError.
     """
-    if pgid <= 0:
-        return []
-    try:
-        entries = list(_PROC_ROOT.iterdir())
-    except OSError:
-        return []
-    members: list[ProcessGroupMember] = []
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        fields = _read_stat_fields(entry)
-        if fields is None or fields.pgrp != pgid:
-            continue
-        members.append(
-            ProcessGroupMember(
-                pid=int(entry.name), ppid=fields.ppid, state=fields.state, comm=fields.comm
-            )
-        )
-    return sorted(members)
+    return _group_members_by_pgid((pgid,)).get(pgid, [])
+
+
+def _terminated_pgids(pgids: Iterable[int]) -> set[int]:
+    """The subset of *pgids* that :func:`process_group_terminated` would pass.
+
+    Probes each group with ``killpg(pgid, 0)``, then walks /proc once for all
+    the groups that probe still sees, however many there are.
+    """
+    gone: set[int] = set()
+    visible: list[int] = []
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            gone.add(pgid)
+        else:
+            visible.append(pgid)
+    walked = _group_members_by_pgid(visible)
+    return gone | {
+        pgid
+        for pgid, members in walked.items()
+        if members and all(m.terminated for m in members)
+    }
 
 
 def process_group_terminated(pgid: int) -> bool:
@@ -363,12 +398,7 @@ def process_group_terminated(pgid: int) -> bool:
     sees at least one member, all terminated.  An empty walk while killpg
     still sees the group is inconclusive and yields False.
     """
-    try:
-        os.killpg(pgid, 0)
-    except OSError:
-        return True
-    members = process_group_members(pgid)
-    return bool(members) and all(m.terminated for m in members)
+    return pgid in _terminated_pgids((pgid,))
 
 
 def _path_at_or_under(candidate: str, root: str) -> bool:
@@ -492,7 +522,8 @@ def _drop_dead_pgids(pgids: list[int], grace_secs: float, poll_step: float) -> l
     remaining = list(pgids)
     deadline = time.monotonic() + max(0.0, grace_secs)
     while True:
-        remaining = [p for p in remaining if not process_group_terminated(p)]
+        terminated = _terminated_pgids(remaining)
+        remaining = [p for p in remaining if p not in terminated]
         if not remaining or time.monotonic() >= deadline:
             return remaining
         time.sleep(poll_step)
