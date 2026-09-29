@@ -9287,15 +9287,9 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
     @pytest.mark.asyncio
     async def test_default_max_age_days_is_the_wired_in_seven_day_ttl(self):
-        """Pins the wired-in default TTL end-to-end through the real code
-        path — the entire behavioral payload of task 4374's
-        _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS change (14 -> 7).
-
-        The two fixtures straddle the 7-day cutoff by one hour on each
-        side, so the delete set below is produced only when
-        max_age_days == 7 and by no other integer (measured: 14, 8, and 6
-        each disagree with it). max_age_days is deliberately NOT passed —
-        the default itself is the behavior under test.
+        """Pins the default TTL: two markers one hour either side of the
+        7-day cutoff; max_age_days deliberately omitted so the default is
+        what is exercised.
         """
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_stale_mem0_flag_for_stage2_markers,
@@ -9315,6 +9309,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
             },
         ]
         memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
