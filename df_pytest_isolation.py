@@ -1437,9 +1437,9 @@ def _unsafe_pgid_reason(pgid: int) -> str | None:
     exists to reap are themselves reparented to ``systemd --user``.
 
     Takes no ``proc_pid`` companion argument, unlike the ``shared`` version:
-    the single caller captures ``pgid = p.pid`` at the instant of spawn and
-    passes that same value here, so a ``pgid != proc.pid`` check would compare
-    a variable against itself.
+    every pgid reaching here is the ``p.pid`` that :func:`_spawn_in_new_session`
+    captured at the instant of spawn, so a ``pgid != proc.pid`` check would
+    compare a variable against itself.
     """
     if pgid <= 1:
         return f'pgid <= 1 ({pgid!r})'
@@ -1518,17 +1518,7 @@ def run_in_new_session(
     their ``_decode`` / ``_boundary_decode`` helpers, which normalise both
     ``bytes`` and ``str`` and so keep working unchanged).
     """
-    p = subprocess.Popen(
-        cmd,
-        env=env,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        start_new_session=True,
-    )
-    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
-    pgid = p.pid
+    p, pgid = _spawn_in_new_session(cmd, env=env, cwd=cwd, text=text)
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as expired:
@@ -1588,16 +1578,7 @@ def run_in_new_session_until(
     same stop, and every exit path stops the group -- including an exception
     raised by *condition* itself, which then propagates.
     """
-    p = subprocess.Popen(
-        cmd,
-        env=env,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        start_new_session=True,
-    )
-    pgid = p.pid
+    p, pgid = _spawn_in_new_session(cmd, env=env, cwd=cwd, text=text)
     deadline = time.monotonic() + timeout
     try:
         while True:
@@ -1622,13 +1603,40 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def _spawn_in_new_session(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None,
+    cwd: str | os.PathLike[str] | None,
+    text: bool,
+) -> tuple[subprocess.Popen, int]:
+    """Spawn *cmd* as its own session leader; return it with its FROZEN pgid.
+
+    The spawn half of the containment both spawners share, paired with
+    :func:`_stop_group_and_drain` as the stop half. The reasoning for the
+    frozen pgid is :func:`run_in_new_session`'s docstring.
+    """
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=True,
+    )
+    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
+    return p, p.pid
+
+
 def _stop_group_and_drain(
     p: subprocess.Popen, pgid: int, *, text: bool,
 ) -> tuple[Any, Any]:
     """SIGKILL the captured *pgid*, then collect what the child printed, BOUNDED.
 
-    The one copy of the containment both spawners share; the reasoning for
-    each half (the frozen pgid, the bounded drain) is
+    The stop half of the containment both spawners share, paired with
+    :func:`_spawn_in_new_session` as the spawn half; the reasoning for each
+    half of the stop (the frozen pgid, the bounded drain) is
     :func:`run_in_new_session`'s docstring.
     """
     _kill_process_group(p, pgid)
