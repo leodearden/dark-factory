@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import (
     as_async_run_git,
     assert_id_title_pairing,
@@ -55,6 +56,8 @@ from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+    _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -66,6 +69,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
+    _sweep_stale_mem0_flag_for_stage2_markers,
+    retire_flag_markers_for_terminal_task,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
@@ -9279,6 +9284,122 @@ class TestSweepStaleMem0FlagForStage2Markers:
         assert result == 1
         assert tombstone.await_args is not None
         assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
+
+
+_RETIRE_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
+_STALE_DAYS = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6
+
+
+def _relay_marker(mid: str, age_days: int, **metadata) -> dict:
+    return {
+        'id': mid,
+        'created_at': (_RETIRE_NOW - timedelta(days=age_days)).isoformat(),
+        'metadata': {'flag_for_stage2': True, **metadata},
+    }
+
+
+def _every_gate_pool() -> LiveFlagPool:
+    """One marker per gate for task T, plus one for another task."""
+    stale = _STALE_DAYS
+    return LiveFlagPool([
+        _relay_marker('eligible', stale, task_id='T', run_id='prior-run'),
+        _relay_marker('fresh', 1, task_id='T', run_id='prior-run'),
+        _relay_marker('mirror', stale, task_id='T', kind='cycle_summary'),
+        _relay_marker('audit', stale, task_id='T', kind='cadence_check'),
+        _relay_marker('other-task', stale, task_id='OTHER', run_id='prior-run'),
+    ])
+
+
+class TestRetireFlagMarkersForTerminalTask:
+    """retire_flag_markers_for_terminal_task is the done-transition hook's
+    public seam onto the per-cycle flag_for_stage2 retirement (task 4376): the
+    sweep's own composite rule, scoped to the one task that just closed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inherits_every_sweep_gate_end_to_end(self):
+        from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+        assert 'cadence_check' in PROTECTED_AUDIT_KINDS
+        pool = _every_gate_pool()
+
+        result = await retire_flag_markers_for_terminal_task(
+            pool, 'dark_factory', 'run-1', task_id='  T  ', now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['eligible']
+        assert pool.delete_memory.await_args is not None
+        kwargs = pool.delete_memory.await_args.kwargs
+        assert kwargs['store'] == 'mem0'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['causation_id'] == 'run-1'
+        assert kwargs['_source'] == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_never_retires_what_the_sweep_would_keep(self):
+        hook_pool, sweep_pool = _every_gate_pool(), _every_gate_pool()
+
+        await retire_flag_markers_for_terminal_task(
+            hook_pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+        )
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            sweep_pool, 'dark_factory', 'cycle-run',
+            terminal_task_ids={'T', 'OTHER'}, now=_RETIRE_NOW,
+        )
+
+        hook_deleted = set(hook_pool.deleted_ids())
+        sweep_deleted = set(sweep_pool.deleted_ids())
+        assert hook_deleted == {'eligible'}
+        assert hook_deleted <= sweep_deleted
+        assert sweep_deleted - hook_deleted == {'other-task'}
+
+    @pytest.mark.asyncio
+    async def test_reads_only_the_closing_tasks_markers(self):
+        pool = LiveFlagPool([
+            _relay_marker(f'other-{n}', _STALE_DAYS, task_id=f'OTHER-{n}')
+            for n in range(5)
+        ])
+
+        result = await retire_flag_markers_for_terminal_task(
+            pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+        )
+
+        assert result == 0
+        assert pool.filters_read(), 'the hook must at least probe for the task'
+        assert all(f.get('task_id') == 'T' for f in pool.filters_read())
+        pool.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emits_none_of_the_sweeps_pool_wide_diagnostics(self, caplog):
+        stale = _STALE_DAYS
+        pool = LiveFlagPool([
+            _relay_marker('eligible', stale, task_id='T'),
+            _relay_marker('open-task', stale, task_id='OPEN'),
+            _relay_marker('audit', stale, task_id='OPEN', kind='cadence_check'),
+            {
+                'id': 'string-typed', 'created_at': _RETIRE_NOW.isoformat(),
+                'metadata': {'flag_for_stage2': 'true', 'task_id': 'OPEN'},
+            },
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            retired = await retire_flag_markers_for_terminal_task(
+                pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+            )
+        hook_warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+            )
+        sweep_warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        assert retired == 1
+        assert hook_warnings == []
+        assert any('RETAINED 1 age-stale' in m for m in sweep_warnings), sweep_warnings
+        assert any('RETAINED 1 protected audit' in m for m in sweep_warnings), sweep_warnings
+        assert any("stored as the string 'true'" in m for m in sweep_warnings), sweep_warnings
 
 
 class TestWarnOnFlagForStage2TypeDrift:
