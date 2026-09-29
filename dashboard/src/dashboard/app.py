@@ -1033,17 +1033,17 @@ async def api_costs(request: Request) -> JSONResponse:
     """COSTS — flat summary, per-project / per-account / per-role / trend / events."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
+    window = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
-        aggregate_cost_summary(dbs, days=days, now=now),
-        aggregate_cost_by_project(dbs, days=days, now=now),
-        aggregate_cost_by_account(dbs, days=days, now=now),
-        aggregate_cost_by_role(dbs, days=days, now=now),
-        aggregate_cost_trend(dbs, days=days, now=now),
-        aggregate_account_events(dbs, days=days, now=now),
-        aggregate_model_role_rollup(dbs, days=days, now=now),
+        aggregate_cost_summary(dbs, days=window.days, now=now),
+        aggregate_cost_by_project(dbs, days=window.days, now=now),
+        aggregate_cost_by_account(dbs, days=window.days, now=now),
+        aggregate_cost_by_role(dbs, days=window.days, now=now),
+        aggregate_cost_trend(dbs, days=window.days, now=now),
+        aggregate_account_events(dbs, days=window.days, now=now),
+        aggregate_model_role_rollup(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
     return JSONResponse(
@@ -1067,13 +1067,13 @@ async def api_performance(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
-    days = _parse_window(request.query_params, default=7)
+    window = _parse_window(request.query_params, default='7d')
     paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
         aggregate_completion_paths(dbs, esc_dirs),
         aggregate_escalation_rates(dbs, esc_dirs),
         aggregate_loop_histograms(dbs),
         aggregate_time_centiles(dbs),
-        aggregate_performance_history(dbs, days=days),
+        aggregate_performance_history(dbs, days=window.days),
         return_exceptions=True,
     )
     return JSONResponse(

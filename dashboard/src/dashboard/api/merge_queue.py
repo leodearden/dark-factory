@@ -47,8 +47,8 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     """MERGE_QUEUE — per-project depth/outcomes/latency/recent/active/speculative."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
-    hours = days * 24
+    window = _parse_window(request.query_params)
+    hours = window.days * 24
     effective_now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     project_dbs = await _project_scoped_dbs_labeled(
