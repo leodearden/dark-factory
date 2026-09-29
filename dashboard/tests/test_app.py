@@ -14,27 +14,68 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.api.window import _parse_window
+from dashboard.api.burndown import _BURNDOWN_WINDOWS
+from dashboard.api.window import ServedWindow, _parse_window, with_window
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
-# _parse_window helper
+# _parse_window: the served-window record, for both vocabularies
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('value, expected', [
-    ('24h', 1),
-    ('7d', 7),
-    ('30d', 30),
-    ('all', 3650),
-    ('weird', 30),  # default
-    (None, 30),
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '24h'}, ServedWindow(requested='24h', served='24h', days=1)),
+    ({'window': '7d'}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '30d'}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='all', days=3650)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='30d', days=30)),
+    ({'window': 'weird'}, ServedWindow(requested='weird', served='30d', days=30)),
+    ({}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': ''}, ServedWindow(requested='30d', served='30d', days=30)),
 ])
-def test_parse_window_known_and_unknown(value, expected):
-    query_params: dict[str, str] = {}
-    if value is not None:
-        query_params['window'] = value
-    assert _parse_window(query_params) == expected
+def test_parse_window_standard_vocabulary(params, expected):
+    assert _parse_window(params) == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='7d', days=7)),
+])
+def test_parse_window_caller_default(params, expected):
+    assert _parse_window(params, default='7d') == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '90d'}, ServedWindow(requested='90d', served='90d', days=90)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='30d', days=30)),
+])
+def test_parse_window_burndown_vocabulary(params, expected):
+    assert _parse_window(params, vocabulary=_BURNDOWN_WINDOWS) == expected
+
+
+def test_parse_window_refuses_a_default_the_vocabulary_cannot_serve():
+    with pytest.raises(ValueError, match='90d'):
+        _parse_window({'window': '7d'}, default='90d')
+
+
+def test_served_window_wire_shape_and_immutability():
+    window = ServedWindow(requested='90d', served='30d', days=30)
+    assert window.to_wire() == {'requested': '90d', 'served': '30d', 'days': 30}
+    with pytest.raises(AttributeError):
+        window.served = '90d'  # type: ignore[misc]
+
+
+def test_with_window_echoes_without_mutating_the_payload():
+    payload = {'COSTS': {'total': 1}, 'served_at': 'S'}
+    window = ServedWindow(requested='7d', served='7d', days=7)
+    echoed = with_window(payload, window)
+    assert echoed == {
+        'COSTS': {'total': 1},
+        'served_at': 'S',
+        'WINDOW': {'requested': '7d', 'served': '7d', 'days': 7},
+    }
+    assert payload == {'COSTS': {'total': 1}, 'served_at': 'S'}
+    assert echoed is not payload
 
 
 # ---------------------------------------------------------------------------
