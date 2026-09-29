@@ -2215,7 +2215,8 @@ class TestReadSideSeesMeasuredRowsOnly:
         assert series['labels'] == [_hours_before_read(2)]
         assert series['done'] == [7]
 
-    async def test_projects_omit_a_gap_only_project(self, tmp_path):
+    async def test_projects_list_a_gap_only_project(self, tmp_path):
+        """The shaper renders a never-measured project unknown; its series stays empty."""
         db = tmp_path / 'burndown.db'
         _create_burndown_db(db)
         conn = sqlite3.connect(str(db))
@@ -2227,8 +2228,39 @@ class TestReadSideSeesMeasuredRowsOnly:
         conn.close()
 
         async with aiosqlite.connect(str(db)) as c:
-            assert await get_burndown_projects(c) == ['legacy', 'measured']
-            assert await aggregate_burndown_projects([c]) == ['legacy', 'measured']
+            window = {'days': 7, 'now': _READ_NOW}
+            assert await get_burndown_projects(c, **window) == ['gap-only', 'legacy', 'measured']
+            assert await aggregate_burndown_projects([c], **window) == [
+                'gap-only', 'legacy', 'measured',
+            ]
+        assert (await _series_of(db, 'gap-only'))['labels'] == []
+
+    async def test_projects_list_only_what_the_window_sampled(self, tmp_path):
+        """A project with no row at all inside the window is not part of its tally.
+
+        The sampler writes one value-or-gap row per root per tick, so a project
+        still being sampled has a row in any window, a gap if every read failed.
+        A retired root's rows linger until downsample expires them at 90 days.
+        """
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'retired', _hours_before_read(8 * 24), done=1)
+        _insert_gap(conn, 'retired', _hours_before_read(8 * 24 - 1))
+        _insert_value(conn, 'failing', _hours_before_read(8 * 24), done=1)
+        _insert_gap(conn, 'failing', _hours_before_read(1))
+        _insert_value(conn, 'sampled', _hours_before_read(1), done=1)
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c, days=7, now=_READ_NOW) == ['failing', 'sampled']
+            assert await aggregate_burndown_projects([c], days=7, now=_READ_NOW) == [
+                'failing', 'sampled',
+            ]
+            assert await get_burndown_projects(c, days=30, now=_READ_NOW) == [
+                'failing', 'retired', 'sampled',
+            ]
 
     async def test_series_carries_the_new_columns_null_before_the_migration(self, tmp_path):
         db = tmp_path / 'migrated.db'
@@ -2275,7 +2307,7 @@ class TestReadSideSeesMeasuredRowsOnly:
         for key in _NEW_SERIES_KEYS:
             assert series[key] == [None], key
         async with aiosqlite.connect(str(db)) as c:
-            assert await get_burndown_projects(c) == [project_id]
+            assert await get_burndown_projects(c, now=read_now) == [project_id]
 
     async def test_aggregate_merges_the_new_keys(self, tmp_path):
         db1, db2 = tmp_path / 'one.db', tmp_path / 'two.db'
@@ -3446,3 +3478,56 @@ class TestComputeWindowCompletion:
         })
         assert result['completed'] == 0
         assert result['velocity'] == 0.0
+
+    def test_completed_per_day_has_one_entry_per_distinct_day(self):
+        """One row per day: day 1's baseline is the window's first row, later days
+        subtract the previous day's last done — N entries for N days, summing to
+        ``completed`` (the agreement a client N-1-entry re-derivation broke).
+        """
+        labels = [f'2026-05-{19 + i:02d}T00:00:00' for i in range(7)]
+        done = [0, 0, 1, 1, 1, 2, 3]
+        result = compute_window_completion({'labels': labels, 'done': done, 'pending': [10] * 7})
+        per_day = result['completed_per_day']
+        assert per_day['labels'] == [f'2026-05-{19 + i:02d}' for i in range(7)]
+        assert per_day['values'] == [0, 0, 1, 0, 0, 1, 1]
+        assert len(per_day['values']) == result['window_days']
+        assert sum(per_day['values']) == result['completed']
+
+    def test_completed_per_day_buckets_several_rows_of_one_day(self):
+        """Rows inside one day collapse to that day's last done."""
+        result = compute_window_completion({
+            'labels': [
+                '2026-05-20T01:00:00',
+                '2026-05-20T09:00:00',
+                '2026-05-20T17:00:00',
+                '2026-05-21T02:00:00',
+            ],
+            'done': [5, 6, 8, 9],
+        })
+        assert result['completed_per_day'] == {
+            'labels': ['2026-05-20', '2026-05-21'],
+            'values': [3, 1],
+        }
+
+    def test_completed_per_day_floors_a_reopen_dip_at_zero(self):
+        """A day whose done falls (a reopen) reads 0, never negative."""
+        labels = [f'2026-05-{20 + i:02d}T00:00:00' for i in range(4)]
+        result = compute_window_completion({'labels': labels, 'done': [5, 6, 7, 6]})
+        assert result['completed_per_day']['values'] == [0, 1, 1, 0]
+        assert result['completed'] == 1
+
+    @pytest.mark.parametrize(
+        'series',
+        [
+            {'labels': [], 'done': [], 'pending': []},
+            {'labels': ['2026-05-20T00:00:00'], 'done': [42], 'pending': [5]},
+            {'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00'], 'done': [1]},
+        ],
+        ids=['empty', 'single-snapshot', 'mismatched-lengths'],
+    )
+    def test_completed_per_day_is_empty_without_a_usable_delta(self, series):
+        """No delta to report → an empty series beside the zeroed fields."""
+        result = compute_window_completion(series)
+        assert result['completed_per_day'] == {'labels': [], 'values': []}
+        assert result['completed'] == 0
+        assert result['window_days'] == 0

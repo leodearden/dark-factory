@@ -1,8 +1,11 @@
 """`/api/v2/dashboard/burndown` — task burndown series, aggregate and per-project.
 
 Reads the snapshot history that ``dashboard.loops::_burndown_loop`` writes,
-capturing ``now`` once per request and threading that one value through
-every per-project aggregate so the series cannot skew across projects.
+capturing ``now`` once per request. That one instant is the window cutoff for
+the project listing and every per-project aggregate, so the series cannot skew
+across projects and the listing names exactly the projects the window sampled,
+and it is the instant every burndown Datum is judged at, served as
+``served_at``.
 """
 
 from __future__ import annotations
@@ -41,16 +44,16 @@ _BURNDOWN_WINDOWS: dict[str, int] = {
 
 @router.get('/api/v2/dashboard/burndown')
 async def api_burndown(request: Request) -> JSONResponse:
-    """BURNDOWN + BURNDOWN_BY_PROJECT — per-project status time series."""
+    """BURNDOWN + BURNDOWN_BY_PROJECT + served_at — per-project status time series."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs = await _burndown_dbs(config, pool)
     window_raw = request.query_params.get('window', '30d')
     days = _BURNDOWN_WINDOWS.get(window_raw, 30)
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     try:
-        projects = await aggregate_burndown_projects(dbs)
-        now = datetime.now(UTC)  # clock-exempt: single-capture route
+        projects = await aggregate_burndown_projects(dbs, days=days, now=now)
         per_pid = await asyncio.gather(
             *(aggregate_burndown_series(dbs, pid, days=days, now=now) for pid in projects)
         )
@@ -58,4 +61,5 @@ async def api_burndown(request: Request) -> JSONResponse:
     except Exception:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
-    return JSONResponse(redux_api.shape_burndown(series))
+    shaped = redux_api.shape_burndown(series, served_at=now)
+    return JSONResponse({**shaped, 'served_at': now.isoformat()})

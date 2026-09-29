@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 import enum
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -30,10 +30,9 @@ from typing import Any
 
 import aiosqlite
 import httpx
-from shared.task_statuses import TaskStatus
 
 from dashboard.config import DashboardConfig
-from dashboard.data.census import TaskCensus
+from dashboard.data.census import SERIES_KEYS, TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
@@ -75,6 +74,11 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 # 60.0 is ~3x the floor. Both bounds pinned by TestCollectSnapshotPerRootBudget
 # in dashboard/tests/test_burndown_data.py.
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
+
+# The age past which a burndown sample is no longer fresh: two sample
+# intervals of dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS (not imported —
+# loops imports this module). Pinned through the wire by test_redux_api.py.
+SAMPLE_FRESHNESS_BOUND_SECONDS = 1200
 
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -147,18 +151,6 @@ class SnapshotState(enum.StrEnum):
 
     VALUE = 'value'
     GAP = 'gap'
-
-
-MEMBER_COLUMNS: Mapping[TaskStatus, str] = MappingProxyType(
-    {member: member.value.replace('-', '_') for member in TaskStatus}
-)
-"""The ``snapshots`` column holding each ``TaskStatus`` member's census count.
-
-ONE naming rule over the closed enum, in ``TaskStatus`` order, so the columns
-follow the vocabulary rather than restating it. A tenth member maps to a
-column that does not exist, and its INSERT fails loudly instead of the count
-being absorbed into another member.
-"""
 
 
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
@@ -242,7 +234,7 @@ def _value_row(
         state=SnapshotState.VALUE,
         reason=None,
         measured=MappingProxyType({
-            **{column: counts[member] for member, column in MEMBER_COLUMNS.items()},
+            **{column: counts[member] for member, column in SERIES_KEYS.items()},
             'in_progress_live': live,
             'in_progress_stranded': stranded,
             # The unit's own partition of the rows, whole. Not a recount of
@@ -570,20 +562,29 @@ _NULLABLE_SERIES_KEYS = (
 _SERIES_KEYS = (*_ZONES, *_SPLIT, *_NULLABLE_SERIES_KEYS)
 
 
+def _window_start(days: int, now: datetime | None) -> str:
+    """The ISO instant a *days*-long burndown window ending at *now* opens at."""
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
+
+
 async def aggregate_burndown_projects(
     dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+    now: datetime | None = None,
 ) -> list[str]:
     """Return distinct project IDs across *all* burndown DBs, sorted.
 
     Calls :func:`get_burndown_projects` for each DB in *dbs* concurrently via
-    ``asyncio.gather``, then unions the results and returns a sorted list.
-    ``None`` entries are tolerated (``get_burndown_projects`` returns ``[]``
-    for ``None``).
+    ``asyncio.gather`` over one window, then unions the results and returns a
+    sorted list. ``None`` entries are tolerated (``get_burndown_projects``
+    returns ``[]`` for ``None``).
     """
     if not dbs:
         return []
+    now = resolve_now(now)
     per_db: list[list[str]] = list(await asyncio.gather(
-        *(get_burndown_projects(db) for db in dbs)
+        *(get_burndown_projects(db, days=days, now=now) for db in dbs)
     ))
     seen: set[str] = set()
     for project_list in per_db:
@@ -663,20 +664,28 @@ async def aggregate_burndown_series(
     return result
 
 
-async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
-    """Return distinct project IDs that have at least one MEASURED snapshot row.
+async def get_burndown_projects(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+    now: datetime | None = None,
+) -> list[str]:
+    """Return distinct project IDs with any snapshot row in the window, gap rows included.
 
-    A project whose only rows are gaps stays off this list: how a gap renders
-    is for the shaper to decide (task 5592), not for this read to imply.
+    The window is :func:`get_burndown_series`'s. A project whose only rows in
+    it are gaps is listed so the shaper renders it unknown rather than leaving
+    it out; its series still carries no row (the series reads measured rows
+    only). A project with no row at all in the window was not sampled during
+    it — the sampler writes one value-or-gap row per root per tick — so it is
+    not listed, and a retired root cannot mark every total a lower bound until
+    :func:`downsample` expires its rows.
     """
     if db is None:
         return []
     try:
-        measured = _measured_rows(await _snapshot_columns(db))
         async with db.execute(
-            f'SELECT DISTINCT project_id FROM snapshots WHERE {measured.sql} '
-            'ORDER BY project_id',
-            measured.params,
+            'SELECT DISTINCT project_id FROM snapshots WHERE ts >= ? ORDER BY project_id',
+            (_window_start(days, now),),
         ) as cur:
             rows = await cur.fetchall()
         return [row[0] for row in rows]
@@ -699,66 +708,90 @@ def compute_forecast_confidence(series: Mapping[str, Any]) -> dict[str, Any]:
     Returns ``{forecast_low: None, forecast_high: None}`` when the series
     has fewer than 7 distinct days of history (no synthesis on sparse
     history; the dashboard renders ``—``).
+
+    One project's forecast is the fold of that one series: see
+    :func:`aggregate_forecast_confidence`.
+    """
+    return aggregate_forecast_confidence([series])
+
+
+def aggregate_forecast_confidence(
+    per_project_series: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return ``{forecast_low, forecast_high}`` days over several projects' series.
+
+    Measured rows only: each project contributes its OWN rows, never a
+    carried copy or a gap row. Pending is the sum of each project's last
+    measured ``pending``, wherever that row sits. Velocity over a window is
+    the sum of each project's measured ``done`` gain inside it, divided by
+    the window's days — :func:`aggregate_window_completion`'s
+    sum-of-per-project-deltas shape, for the same reason: a delta over a
+    summed ``done`` series reads a project entering mid-window as that
+    project's whole done count completed at once.
+
+    Windows are the most recent 7 distinct days and every distinct day, over
+    the UNION of the projects' labels. An empty series contributes nothing;
+    any project whose ``labels``/``done``/``pending`` lengths disagree, or
+    fewer than 7 distinct days overall, gives
+    ``{forecast_low: None, forecast_high: None}`` (no synthesis on sparse or
+    ragged history).
     """
     none = {'forecast_low': None, 'forecast_high': None}
-    labels = series.get('labels') or []
-    done = series.get('done') or []
-    pending = series.get('pending') or []
-    if not labels or not done or not pending:
-        return none
-    if len(labels) != len(done) or len(labels) != len(pending):
-        return none
+    measured: list[tuple[list[Any], list[Any]]] = []
+    last_pending = 0
+    for series in per_project_series:
+        labels = list(series.get('labels') or [])
+        done = list(series.get('done') or [])
+        pending = list(series.get('pending') or [])
+        if not (labels or done or pending):
+            continue
+        if not len(labels) == len(done) == len(pending):
+            return none
+        measured.append((labels, done))
+        last_pending += pending[-1] or 0
 
-    # Distinct day count from ISO labels (date prefix).
-    day_keys: list[str] = []
-    seen: set[str] = set()
-    for lbl in labels:
-        day = (lbl[:10] if isinstance(lbl, str) and len(lbl) >= 10 else None)
-        if day and day not in seen:
-            seen.add(day)
-            day_keys.append(day)
+    day_keys = sorted(
+        {day for labels, _ in measured for day in map(_iso_day, labels) if day is not None}
+    )
     if len(day_keys) < 7:
         return none
-
-    last_pending = pending[-1] or 0
     if last_pending <= 0:
         return {'forecast_low': 0, 'forecast_high': 0}
 
-    last_done = done[-1] or 0
-
-    def _velocity_over(window_days: int) -> float:
+    def velocity_over(window_days: int) -> float:
         cutoff = day_keys[-window_days]
-        # First label whose day >= cutoff.
-        first_idx = 0
-        for i, lbl in enumerate(labels):
-            if isinstance(lbl, str) and len(lbl) >= 10 and lbl[:10] >= cutoff:
-                first_idx = i
-                break
-        first_done = done[first_idx] or 0
-        delta_done = max(0, last_done - first_done)
-        # Duration in days, with a minimum of 1.0 to avoid div-by-zero on
-        # narrow windows.
-        return max(_VELOCITY_FLOOR, delta_done / max(1.0, window_days))
+        gained = sum(_done_gain_since(cutoff, labels, done) for labels, done in measured)
+        # A minimum of 1.0 day avoids div-by-zero on narrow windows.
+        return max(_VELOCITY_FLOOR, gained / max(1.0, window_days))
 
-    v_recent = _velocity_over(7)
-    v_lifetime = _velocity_over(len(day_keys))
-
-    f_recent = last_pending / v_recent
-    f_lifetime = last_pending / v_lifetime
+    f_recent = last_pending / velocity_over(7)
+    f_lifetime = last_pending / velocity_over(len(day_keys))
     return {
         'forecast_low': round(min(f_recent, f_lifetime), 1),
         'forecast_high': round(max(f_recent, f_lifetime), 1),
     }
 
 
+def _done_gain_since(cutoff: str, labels: list[Any], done: list[Any]) -> int:
+    """One project's ``done`` gain from its first row on or after day *cutoff*.
+
+    0 when the project has no row that late; a fall (a reopen) clamps to 0.
+    """
+    for label, first_done in zip(labels, done, strict=True):
+        day = _iso_day(label)
+        if day is not None and day >= cutoff:
+            return max(0, (done[-1] or 0) - (first_done or 0))
+    return 0
+
+
+def _iso_day(label: Any) -> str | None:
+    """The ISO date prefix of a snapshot label, or ``None`` if it has none."""
+    return label[:10] if isinstance(label, str) and len(label) >= 10 else None
+
+
 def distinct_iso_days(labels: list[Any]) -> int:
     """Count distinct ISO-date prefixes in *labels* (min 1 to avoid div-by-zero)."""
-    seen: set[str] = set()
-    for lbl in labels:
-        day = (lbl[:10] if isinstance(lbl, str) and len(lbl) >= 10 else None)
-        if day:
-            seen.add(day)
-    return max(1, len(seen))
+    return max(1, len({day for day in map(_iso_day, labels) if day is not None}))
 
 
 def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
@@ -871,10 +904,22 @@ def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     the series has no usable delta, i.e. on empty / mismatched / single-
     snapshot input).
 
-    Returns ``{completed: 0, velocity: 0.0, window_days: 0}`` on empty /
-    mismatched / single-snapshot input.
+    ``completed_per_day`` is ``{labels: [YYYY-MM-DD, ...], values: [...]}``,
+    one entry per distinct ISO day: that day's last ``done`` minus the
+    previous day's, the first day measured from the window's first row, each
+    clamped at 0. It has ``window_days`` entries, and sums to ``completed``
+    whenever ``done`` never falls. It is what the OrchTab "Completed / day"
+    spark plots, so the client re-derives nothing.
+
+    Returns ``{completed: 0, velocity: 0.0, window_days: 0}`` with an empty
+    ``completed_per_day`` on empty / mismatched / single-snapshot input.
     """
-    zero: dict[str, Any] = {'completed': 0, 'velocity': 0.0, 'window_days': 0}
+    zero: dict[str, Any] = {
+        'completed': 0,
+        'velocity': 0.0,
+        'window_days': 0,
+        'completed_per_day': {'labels': [], 'values': []},
+    }
     labels = list(series.get('labels') or [])
     done = list(series.get('done') or [])
     if not labels or not done:
@@ -887,7 +932,33 @@ def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     completed = max(0, (done[-1] or 0) - (done[0] or 0))
     day_count = distinct_iso_days(labels)
     velocity = completed / day_count
-    return {'completed': completed, 'velocity': velocity, 'window_days': day_count}
+    return {
+        'completed': completed,
+        'velocity': velocity,
+        'window_days': day_count,
+        'completed_per_day': _completed_per_day(labels, done),
+    }
+
+
+def _completed_per_day(labels: list[Any], done: list[Any]) -> dict[str, list[Any]]:
+    """Each ISO day's ``done`` gain over the previous day's last row, floored at 0.
+
+    Labels arrive ascending, so each day's rows are contiguous and the last
+    one written per day is that day's last row. A label with no date prefix
+    is skipped.
+    """
+    last_done_by_day: dict[str, int] = {}
+    for label, count in zip(labels, done, strict=True):
+        day = _iso_day(label)
+        if day is not None:
+            last_done_by_day[day] = count or 0
+
+    values: list[int] = []
+    previous = done[0] or 0
+    for last_done in last_done_by_day.values():
+        values.append(max(0, last_done - previous))
+        previous = last_done
+    return {'labels': list(last_done_by_day), 'values': values}
 
 
 def aggregate_window_completion(
@@ -931,7 +1002,7 @@ async def get_burndown_series(
     empty: dict = {'labels': [], **{key: [] for key in _SERIES_KEYS}}
     if db is None:
         return empty
-    since = (resolve_now(now) - timedelta(days=days)).isoformat()
+    since = _window_start(days, now)
     try:
         # Which of the later columns this DB actually has: a hardcoded widened
         # SELECT would raise 'no such column' on an un-migrated peer DB, hit the

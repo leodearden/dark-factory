@@ -25,15 +25,19 @@ invent one after a cut.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
+from dashboard.data import redux_api
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
+    aggregate_burndown_projects,
     aggregate_burndown_series,
     compute_parity_alarm,
     get_burndown_series,
@@ -60,14 +64,12 @@ _LOGGER = 'dashboard.data.burndown'
 
 def _ts(minute: int) -> str:
     """A recent timestamp inside the default 7-day window."""
-    from datetime import UTC, datetime, timedelta
-
     return (datetime.now(UTC) - timedelta(minutes=minute)).isoformat()
 
 
 _FIXTURE_COLUMNS = (
     'project_id', 'ts', 'pending', 'in_progress', 'blocked', 'deferred', 'cancelled',
-    'done', 'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+    'done', 'in_progress_live', 'in_progress_stranded', 'concurrency_cap', 'state',
 )
 _INSERT_FIXTURE_ROW = (
     f'INSERT INTO snapshots ({", ".join(_FIXTURE_COLUMNS)}) '
@@ -93,8 +95,21 @@ def _make_db(path: Path, rows: list[dict]) -> None:
                 row.get('in_progress_live', row.get('in_progress', 0)),
                 row.get('in_progress_stranded', 0),
                 row.get('concurrency_cap'),
+                # NULL, a legacy measured row, unless the fixture says 'value'.
+                row.get('state'),
             ),
         )
+    conn.commit()
+    conn.close()
+
+
+def _add_gap_row(path: Path, project_id: str, ts: str) -> None:
+    """A gap row exactly as the collector writes one: no count column named."""
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        'INSERT INTO snapshots (project_id, ts, state, reason) VALUES (?, ?, ?, ?)',
+        (project_id, ts, 'gap', 'rows: offline'),
+    )
     conn.commit()
     conn.close()
 
@@ -544,3 +559,141 @@ class TestComputeParityAlarm:
         compute_parity_alarm(series)
 
         assert {k: list(v) for k, v in series.items()} == before
+
+
+# ---------------------------------------------------------------------------
+# Sketch #7: a ragged two-project store, read and shaped as the route does
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+_WINDOW_DAYS = 30
+_T2 = _NOW - timedelta(minutes=5)
+_T1 = _T2 - timedelta(days=1)
+
+
+def _day(index: int) -> datetime:
+    """The *index*-th daily sample, index 7 being t2."""
+    return _T2 - timedelta(days=7 - index)
+
+
+def _project_a_row(index: int) -> dict:
+    return {
+        'project_id': 'A', 'ts': _day(index).isoformat(), 'state': 'value',
+        'done': 10 + 2 * index, 'pending': 40 - 2 * index, 'blocked': 1,
+        'in_progress': 3, 'in_progress_live': 3, 'in_progress_stranded': 0,
+        'concurrency_cap': 24,
+    }
+
+
+def _project_b_row(index: int) -> dict:
+    """B's last row (index 6, t1) breaches on the LIVE count: 30 against 24."""
+    live = 30 if _day(index) == _T1 else 5
+    return {
+        'project_id': 'B', 'ts': _day(index).isoformat(), 'state': 'value',
+        'done': 100 + index, 'pending': 20 - index, 'blocked': 0,
+        'in_progress': live, 'in_progress_live': live, 'in_progress_stranded': 0,
+        'concurrency_cap': 24,
+    }
+
+
+def _ragged_store(path: Path, *, with_b_gap: bool, other_rows: tuple[dict, ...] = ()) -> None:
+    """A measured daily t-7d..t2; B measured t-7d..t1, then (optionally) a gap at t2."""
+    _make_db(path, [
+        *(_project_a_row(index) for index in range(8)),
+        *(_project_b_row(index) for index in range(7)),
+        *other_rows,
+    ])
+    if with_b_gap:
+        _add_gap_row(path, 'B', _T2.isoformat())
+
+
+async def _shaped_as_the_route_does(path: Path) -> dict:
+    async with aiosqlite.connect(str(path)) as db:
+        projects = await aggregate_burndown_projects([db], days=_WINDOW_DAYS, now=_NOW)
+        per_pid = await asyncio.gather(
+            *(aggregate_burndown_series([db], pid, days=_WINDOW_DAYS, now=_NOW) for pid in projects)
+        )
+    return redux_api.shape_burndown(dict(zip(projects, per_pid, strict=True)), served_at=_T2)
+
+
+class TestRaggedTwoProjectStore:
+    """B's newest instant is a gap: B is carried, never re-measured or re-judged."""
+
+    @pytest.fixture
+    async def shaped(self, tmp_path):
+        with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
+        _ragged_store(with_gap, with_b_gap=True)
+        _ragged_store(without_gap, with_b_gap=False)
+        return (
+            await _shaped_as_the_route_does(with_gap),
+            await _shaped_as_the_route_does(without_gap),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_gap_row_changes_nothing(self, shaped):
+        with_gap, without_gap = shaped
+        assert with_gap == without_gap
+
+    @pytest.mark.asyncio
+    async def test_the_newest_point_carries_b_from_t1(self, shaped):
+        agg = shaped[0]['BURNDOWN']
+        at_t2 = agg['labels'].index(_T2.isoformat())
+        assert agg['pending'][at_t2] == _project_a_row(7)['pending'] + _project_b_row(6)['pending']
+
+    @pytest.mark.asyncio
+    async def test_b_is_judged_once_at_t1_never_again_where_only_carried(self, shaped):
+        body = shaped[0]
+        assert body['BURNDOWN_BY_PROJECT']['B']['parity_breach_count'] == 1
+        assert body['BURNDOWN']['parity_breach_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_b_is_served_stale_as_of_t1(self, shaped):
+        latest = shaped[0]['BURNDOWN_BY_PROJECT']['B']['latest']
+        assert latest['state'] == 'stale'
+        assert datetime.fromisoformat(latest['as_of']) == _T1
+        assert _T2 - datetime.fromisoformat(latest['as_of']) == _T2 - _T1
+
+    @pytest.mark.asyncio
+    async def test_a_is_served_fresh(self, shaped):
+        assert shaped[0]['BURNDOWN_BY_PROJECT']['A']['latest']['state'] == 'fresh'
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_is_stale_as_of_b_and_names_it(self, shaped):
+        latest = shaped[0]['BURNDOWN']['latest']
+        assert latest['state'] == 'stale'
+        assert datetime.fromisoformat(latest['as_of']) == _T1
+        assert 'B' in latest['reason']
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_forecast_is_measured_so_equality_is_not_vacuous(self, shaped):
+        """The window spans eight days, so the payloads compared above hold a forecast."""
+        assert shaped[0]['BURNDOWN']['forecast']['value'] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_gap_only_project_is_listed_and_served_unknown(self, tmp_path):
+        """C's sampler never measured it: C renders unknown and the total a lower bound."""
+        path = tmp_path / 'with_gap_only_project.db'
+        _ragged_store(path, with_b_gap=True)
+        _add_gap_row(path, 'C', _T1.isoformat())
+        _add_gap_row(path, 'C', _T2.isoformat())
+
+        body = await _shaped_as_the_route_does(path)
+
+        assert body['BURNDOWN_BY_PROJECT']['C']['latest']['state'] == 'unknown'
+        aggregate = body['BURNDOWN']['latest']
+        assert aggregate['state'] == 'lower_bound'
+        assert 'C' in aggregate['reason']
+
+    @pytest.mark.asyncio
+    async def test_a_project_whose_rows_all_predate_the_window_changes_nothing(
+        self, tmp_path, shaped,
+    ):
+        """R stopped being sampled before the window opened: it is outside this window's tally."""
+        before_the_window = (_NOW - timedelta(days=_WINDOW_DAYS + 1)).isoformat()
+        path = tmp_path / 'with_retired_project.db'
+        _ragged_store(path, with_b_gap=True, other_rows=(
+            {'project_id': 'R', 'ts': before_the_window, 'state': 'value', 'pending': 9},
+        ))
+        _add_gap_row(path, 'R', before_the_window)
+
+        assert await _shaped_as_the_route_does(path) == shaped[0]

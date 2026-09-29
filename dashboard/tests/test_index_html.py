@@ -876,6 +876,23 @@ def test_burndown_bands_js_loads_before_tabs(index_html_body: str) -> None:
     )
 
 
+def test_burndown_bands_js_loads_after_its_datum_and_vocabulary(index_html_body: str) -> None:
+    """burndown_bands.js destructures window.DF_DATUM and window.DF_TASK_VOCAB
+    at module scope with no fallback, so both definitions must run first."""
+    for before_prefix, before_label in (
+        (_DATUM_PREFIX, 'datum.js'),
+        (_TASK_VOCAB_PREFIX, 'task_vocab.js'),
+    ):
+        assert_script_loads_before(
+            index_html_body,
+            before_prefix,
+            _BURNDOWN_BANDS_PREFIX,
+            before_label=before_label,
+            after_label='burndown_bands.js',
+            consumer_note='burndown_bands.js ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+        )
+
+
 def test_pins_recovery_js_is_served(client) -> None:
     """GET /static/redux/pins_recovery.js returns 200.
 
