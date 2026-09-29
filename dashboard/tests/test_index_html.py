@@ -1460,6 +1460,72 @@ def test_datum_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: window_chip.js is served, versioned, and sits between the
+# module it reads and the two surfaces that read it (task 5593, PRD leaf ε1)
+#
+# window_chip.js destructures window.DF_DATUM at module scope, and tabs.jsx and
+# app.jsx destructure window.DF_WINDOW_CHIP at module scope — none with a
+# fallback. Each edge is its own case because each blanks a different surface.
+# ---------------------------------------------------------------------------
+
+_WINDOW_CHIP_PREFIX = '/static/redux/window_chip.js'
+
+
+def test_window_chip_js_is_served(client) -> None:
+    """GET /static/redux/window_chip.js returns 200.
+
+    The load-order guards below only read tag positions, which a file present
+    in git but not served would still pass — while tabs.jsx and app.jsx throw
+    on their top-level destructure.
+    """
+    resp = client.get(_WINDOW_CHIP_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_WINDOW_CHIP_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_window_chip_js_has_cache_buster(index_html_body: str) -> None:
+    """window_chip.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/window_chip\.js\?v=\d+', index_html_body), (
+        'window_chip.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tabs.jsx and app.jsx destructure '
+        'window.DF_WINDOW_CHIP at top level with no fallback. Bump all '
+        '/static/redux/* ?v= uniformly.'
+    )
+
+
+_WINDOW_CHIP_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _WINDOW_CHIP_PREFIX, 'window_chip.js'),
+    (_WINDOW_CHIP_PREFIX, 'window_chip.js', _TABS_PREFIX, 'tabs.jsx'),
+    (_WINDOW_CHIP_PREFIX, 'window_chip.js', _APP_JSX_PREFIX, 'app.jsx'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _WINDOW_CHIP_ORDER_CASES,
+    ids=['datum-before-window-chip', 'window-chip-before-tabs', 'window-chip-before-app'],
+)
+def test_window_chip_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """The window chip loads after what it reads and before what reads it."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 

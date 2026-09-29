@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import logging
-import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -20,8 +17,6 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
-
-import dashboard.data.merge_queue as _mqmod
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -155,6 +150,7 @@ def counted_fetch_tasks(monkeypatch):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.merge_queue import (  # noqa: E402
+    RECENT_MERGES_CAP,
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
@@ -822,9 +818,11 @@ class TestLatencyStats:
 # ---------------------------------------------------------------------------
 
 class TestRecentMerges:
+    """``recent_merges`` returns the newest ``limit`` rows of the window plus its total."""
+
     @pytest.mark.asyncio
     async def test_populated(self, merge_events_db):
-        """recent_merges returns up to limit rows, newest first."""
+        """Newest ``limit`` rows first, and ``total`` counts the whole window."""
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
         for i in range(25):
@@ -838,27 +836,29 @@ class TestRecentMerges:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=20)
+            result = await recent_merges(db, limit=20, hours=24, now=now)
 
-        assert len(result) == 20
+        assert len(result['rows']) == 20
         # Ordered by timestamp DESC (newest first → task-024 is first)
-        assert result[0]['task_id'] == 'task-024'
-        # Keys present
-        assert {'task_id', 'outcome', 'duration_ms', 'timestamp', 'run_id'} <= set(result[0].keys())
+        assert result['rows'][0]['task_id'] == 'task-024'
+        assert {'task_id', 'outcome', 'duration_ms', 'timestamp', 'run_id'} <= set(
+            result['rows'][0].keys()
+        )
+        assert result['total'] == 25
 
     @pytest.mark.asyncio
     async def test_none_db(self):
-        result = await recent_merges(None, limit=20)
-        assert result == []
+        result = await recent_merges(None, limit=20, hours=24)
+        assert result == {'rows': [], 'total': 0}
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
-        result = await recent_merges(empty_merge_events_conn, limit=20)
-        assert result == []
+        result = await recent_merges(empty_merge_events_conn, limit=20, hours=24)
+        assert result == {'rows': [], 'total': 0}
 
     @pytest.mark.asyncio
     async def test_custom_limit(self, merge_events_db):
-        """limit=5 returns 5 rows."""
+        """limit=5 returns 5 rows while ``total`` still counts every in-window row."""
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
         for i in range(10):
@@ -870,9 +870,17 @@ class TestRecentMerges:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=5)
+            result = await recent_merges(db, limit=5, hours=24, now=now)
 
-        assert len(result) == 5
+        assert len(result['rows']) == 5
+        assert result['total'] == 10
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('limit', [0, -1])
+    async def test_non_positive_limit_is_refused(self, empty_merge_events_conn, limit):
+        """With LIMIT 0 the same-statement total is unobservable, so it is refused."""
+        with pytest.raises(ValueError):
+            await recent_merges(empty_merge_events_conn, limit=limit, hours=24)
 
     @pytest.mark.xfail(
         reason=(
@@ -923,12 +931,12 @@ class TestRecentMerges:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=20, hours=1)
+            result = await recent_merges(db, limit=20, hours=1, now=now)
 
         # The event is 3 h old in UTC — well outside the 1-h window.
         # With correct UTC comparison it should not appear; with string
         # comparison it is incorrectly included.
-        assert len(result) == 0, (
+        assert len(result['rows']) == 0, (
             f"Event stored as '{ts_non_utc}' (= event_utc {event_utc.isoformat()}) "
             "was included by the 1-hour filter despite being 3 h before the cutoff. "
             "This is the known SQLite string-comparison limitation."
@@ -936,7 +944,7 @@ class TestRecentMerges:
 
     @pytest.mark.asyncio
     async def test_hours_window_excludes_old_events(self, merge_events_db):
-        """recent_merges with hours=1 excludes events older than 1 hour."""
+        """hours=1 excludes 3h-old events from BOTH the rows and the total."""
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
         # 3 events at now-30min (within the 1-hour window)
@@ -956,115 +964,17 @@ class TestRecentMerges:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=20, hours=1)
+            result = await recent_merges(db, limit=20, hours=1, now=now)
 
-        assert len(result) == 3
-        task_ids = [r['task_id'] for r in result]
+        assert len(result['rows']) == 3
+        task_ids = [r['task_id'] for r in result['rows']]
         assert all(tid.startswith('recent-') for tid in task_ids)
+        assert result['total'] == 3
 
-    @pytest.mark.asyncio
-    async def test_limit_none_returns_all_rows(self, merge_events_db, caplog):
-        """recent_merges with limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP.
 
-        Inserts 60 merge_attempt events all within the last 5 minutes, then
-        asserts that limit=None returns all 60 (60 < 100_000 default hard cap,
-        so no truncation occurs) and that no WARNING is emitted (the 'below
-        cap → silent' branch).
-        """
-        now = datetime.now(UTC)
-        with contextlib.closing(sqlite3.connect(str(merge_events_db))) as conn_sync:
-            for i in range(60):
-                _insert_event(
-                    conn_sync,
-                    event_type='merge_attempt',
-                    timestamp=now - timedelta(seconds=i * 5),
-                    task_id=f'burst-{i:03d}',
-                    run_id=f'run-burst-{i:03d}',
-                    data={'outcome': 'done'},
-                    duration_ms=100 + i,
-                )
-            conn_sync.commit()
-
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
-            async with aiosqlite.connect(str(merge_events_db)) as db:
-                db.row_factory = aiosqlite.Row
-                result = await recent_merges(db, limit=None, hours=1)
-
-        assert len(result) == 60, (
-            f'Expected 60 rows with limit=None, got {len(result)}. '
-            'limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP '
-            '(no truncation for normal-sized result sets).'
-        )
-        warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert not warn_records, (
-            f'Expected no WARNING for 60 rows (well below hard cap), '
-            f'but got: {[r.message for r in warn_records]}'
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('limit_arg', [None, 8])
-    async def test_hard_cap_truncates_and_warns(
-        self, tmp_path, monkeypatch, caplog, limit_arg
-    ):
-        """recent_merges truncates to _RECENT_MERGES_HARD_CAP and logs WARN when cap is in effect.
-
-        Covers both cap-in-effect triggers symmetrically:
-          - limit_arg=None  → the original limit=None path
-          - limit_arg=8     → explicit limit > patched hard cap (8 > 5)
-
-        Patches _RECENT_MERGES_HARD_CAP to 5, inserts 10 events (all within the
-        1-hour window), and asserts:
-          1. Only 5 rows are returned (truncation/clamping to the patched cap).
-          2. At least one WARNING record contains 'hard cap' (or 'hard_cap').
-          3. The cap value (5) appears as a standalone token in that WARNING,
-             so the message is actionable and the assertion is digit-boundary safe.
-        """
-        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_HARD_CAP', 5)
-
-        now = datetime.now(UTC)
-        db_path = tmp_path / f'hard_cap_limit_{limit_arg!s}.db'
-
-        with contextlib.closing(sqlite3.connect(str(db_path))) as conn_sync:
-            conn_sync.executescript(MERGE_EVENTS_SCHEMA)
-            for i in range(10):
-                _insert_event(
-                    conn_sync,
-                    event_type='merge_attempt',
-                    timestamp=now - timedelta(seconds=i * 5),
-                    task_id=f'task-{i:03d}',
-                    run_id=f'run-{i:03d}',
-                    data={'outcome': 'done'},
-                    duration_ms=100 + i,
-                )
-            conn_sync.commit()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
-                result = await recent_merges(db, limit=limit_arg, hours=1)
-
-        assert len(result) == 5, (
-            f'Expected 5 rows (hard cap=5, limit={limit_arg!r}), got {len(result)}. '
-            'recent_merges must truncate/clamp to _RECENT_MERGES_HARD_CAP rows '
-            'whenever the cap is in effect (limit=None or limit > cap).'
-        )
-        warn_msgs = [
-            r.getMessage() for r in caplog.records
-            if r.levelno >= logging.WARNING
-        ]
-        assert any('hard cap' in m or 'hard_cap' in m for m in warn_msgs), (
-            f'Expected a WARNING containing "hard cap" or "hard_cap", got: {warn_msgs}'
-        )
-        # The cap value (5) must appear as a whole token so the message is
-        # actionable. Use \b word-boundaries to avoid false matches on e.g. '15'
-        # or '500' that might appear in future message enrichment.
-        assert any(
-            ('hard cap' in m or 'hard_cap' in m) and re.search(r'\b5\b', m)
-            for m in warn_msgs
-        ), (
-            f'Expected the cap value (5) as a standalone token in the hard-cap '
-            f'WARNING, got: {warn_msgs}'
-        )
+def test_recent_merges_cap_is_two_hundred():
+    """PRD open question 5, decided at the suggested value."""
+    assert RECENT_MERGES_CAP == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1297,96 +1207,6 @@ class TestProjectScopedDbsLabeled:
         assert len(result) == 1
         _pid, db = result[0]
         assert db is None  # file does not exist → None connection
-
-
-# ---------------------------------------------------------------------------
-# TestFilterMergesWithin (step-3)
-# ---------------------------------------------------------------------------
-
-
-class TestFilterMergesWithin:
-    """Tests for merge_queue.filter_merges_within."""
-
-    def _make_row(self, offset_minutes, task_id='t1'):
-        """Build a merge row dict with timestamp = NOW - offset_minutes."""
-        ts = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC) - timedelta(minutes=offset_minutes)
-        return {'task_id': task_id, 'timestamp': ts.isoformat(), 'outcome': 'done'}
-
-    def test_keeps_rows_within_window(self):
-        """Rows at -5m, -10m, -14m59s survive a 15-minute window."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        rows = [
-            self._make_row(5, task_id='t_5m'),    # 5m ago  → in
-            self._make_row(10, task_id='t_10m'),  # 10m ago → in
-            {'task_id': 't3', 'timestamp': (now - timedelta(minutes=14, seconds=59)).isoformat(),
-             'outcome': 'done'},                   # 14m59s ago → in (< 15m)
-            self._make_row(20, task_id='t_20m'),  # 20m ago → out
-            {'task_id': 't5', 'timestamp': (now - timedelta(minutes=15, seconds=1)).isoformat(),
-             'outcome': 'done'},                   # 15m01s ago → out
-        ]
-        result = filter_merges_within(rows, minutes=15, now=now)
-        task_ids = [r['task_id'] for r in result]
-        assert 't_5m' in task_ids   # 5m ago — must survive
-        assert 't_10m' in task_ids  # 10m ago — must survive (both rows, not just one)
-        assert 't3' in task_ids     # 14m59s — must survive
-        assert 't_20m' not in task_ids  # 20m ago — must be filtered
-        assert 't5' not in task_ids     # 15m01s — must be filtered
-
-    def test_filters_out_old_rows(self):
-        """Rows older than the window are excluded."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        rows = [self._make_row(20), self._make_row(30)]
-        result = filter_merges_within(rows, minutes=15, now=now)
-        assert result == []
-
-    def test_empty_list_passthrough(self):
-        """Empty input returns empty output."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        assert filter_merges_within([], minutes=15, now=now) == []
-
-    def test_malformed_timestamp_filtered_out(self):
-        """A row with unparseable timestamp is dropped defensively."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        rows = [
-            {'task_id': 'bad', 'timestamp': 'not-a-date', 'outcome': 'done'},
-            self._make_row(5),  # valid, should survive
-        ]
-        result = filter_merges_within(rows, minutes=15, now=now)
-        task_ids = [r['task_id'] for r in result]
-        assert 'bad' not in task_ids
-        assert 't1' in task_ids
-
-    def test_preserves_input_order(self):
-        """Output order matches input order (no re-sorting)."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        rows = [
-            {'task_id': 'first', 'timestamp': (now - timedelta(minutes=1)).isoformat(), 'outcome': 'done'},
-            {'task_id': 'second', 'timestamp': (now - timedelta(minutes=2)).isoformat(), 'outcome': 'done'},
-            {'task_id': 'third', 'timestamp': (now - timedelta(minutes=3)).isoformat(), 'outcome': 'done'},
-        ]
-        result = filter_merges_within(rows, minutes=15, now=now)
-        assert [r['task_id'] for r in result] == ['first', 'second', 'third']
-
-    def test_now_defaults_to_current_time(self):
-        """When now=None, filter uses the current wall clock (smoke test)."""
-        from dashboard.data.merge_queue import filter_merges_within
-
-        # A row timestamped 2 minutes ago should survive a 15-minute window
-        ts = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
-        rows = [{'task_id': 'recent', 'timestamp': ts, 'outcome': 'done'}]
-        result = filter_merges_within(rows, minutes=15)
-        assert len(result) == 1
-        assert result[0]['task_id'] == 'recent'
 
 
 # ---------------------------------------------------------------------------
@@ -1784,7 +1604,7 @@ class TestBuildPerProjectMergeQueue:
             conn2.row_factory = aiosqlite.Row
             project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
             result = await build_per_project_merge_queue(
-                project_dbs, hours=24, now=now, recent_window_minutes=15,
+                project_dbs, hours=24, now=now,
             )
 
         # (a) dict with both pid keys
@@ -1819,7 +1639,7 @@ class TestBuildPerProjectMergeQueue:
             conn2.row_factory = aiosqlite.Row
             project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
             result = await build_per_project_merge_queue(
-                project_dbs, hours=24, now=now, recent_window_minutes=15,
+                project_dbs, hours=24, now=now,
             )
 
         # (c) '/tmp/A' stats reflect only db1's rows (2 attempts)
@@ -1833,31 +1653,29 @@ class TestBuildPerProjectMergeQueue:
         assert 'task-B1' in b_task_ids
 
     async def test_recent_trimmed_to_window(self, tmp_path):
-        """The recent list is already filtered to recent_window_minutes."""
+        """The recent list covers exactly the ``hours`` window every other leg uses."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         db_path = _make_db(tmp_path, 'a.db', [
-            # within window (5 min ago)
+            # within the 1h window (5 min ago)
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
              'task_id': 'in-window', 'run_id': 'r1', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
-            # outside window (30 min ago)
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=30),
+            # outside the 1h window (90 min ago)
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=90),
              'task_id': 'out-window', 'run_id': 'r2', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
         ])
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             project_dbs = [('/tmp/A', conn)]
-            result = await build_per_project_merge_queue(
-                project_dbs, hours=24, now=now, recent_window_minutes=15,
-            )
+            result = await build_per_project_merge_queue(project_dbs, hours=1, now=now)
 
-        # (d) only in-window row survives
         recent = result['/tmp/A']['recent']
         task_ids = {r['task_id'] for r in recent}
         assert 'in-window' in task_ids
         assert 'out-window' not in task_ids
+        assert result['/tmp/A']['recent_total'] == 1
 
     async def test_none_db_entry_skipped(self, tmp_path):
         """A (pid, None) pair yields the declared full-default shape (all 5 keys,
@@ -1867,7 +1685,7 @@ class TestBuildPerProjectMergeQueue:
         now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         project_dbs = [('/tmp/nofile', None)]
         result = await build_per_project_merge_queue(
-            project_dbs, hours=24, now=now, recent_window_minutes=15,
+            project_dbs, hours=24, now=now,
         )
 
         assert '/tmp/nofile' in result
@@ -1877,6 +1695,7 @@ class TestBuildPerProjectMergeQueue:
         assert data['outcomes'] == {'labels': [], 'values': []}
         assert data['latency'] == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
         assert data['recent'] == []
+        assert data['recent_total'] == 0
         assert data['speculative'] == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
     async def test_mixed_real_and_none_dbs(self, tmp_path):
@@ -1897,7 +1716,7 @@ class TestBuildPerProjectMergeQueue:
                 ('/tmp/none', None),
             ]
             result = await build_per_project_merge_queue(
-                project_dbs, hours=24, now=now, recent_window_minutes=15,
+                project_dbs, hours=24, now=now,
             )
 
         # Both pids present — None entry must not be dropped
@@ -1907,6 +1726,7 @@ class TestBuildPerProjectMergeQueue:
         none_data = result['/tmp/none']
         assert none_data['latency']['count'] == 0
         assert none_data['recent'] == []
+        assert none_data['recent_total'] == 0
 
         # Real-db entry has the expected top-level keys
         real_data = result['/tmp/real']
@@ -1962,7 +1782,7 @@ class TestBuildPerProjectMergeQueue:
             ):
                 task = asyncio.create_task(
                     build_per_project_merge_queue(
-                        project_dbs, hours=24, now=now, recent_window_minutes=15,
+                        project_dbs, hours=24, now=now,
                     )
                 )
                 try:
@@ -1983,237 +1803,69 @@ class TestBuildPerProjectMergeQueue:
         assert set(result.keys()) == {f'/tmp/P{i}' for i in range(N)}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('recent_window_minutes,expected_hours', [
-        (15, 1),
-        (60, 1),
-        (90, 2),
-        (120, 2),
+    @pytest.mark.parametrize('hours, expected_ids, expected_total', [
+        (168, ['day0-0', 'day0-1', 'day1-0', 'day1-1', 'day1-2', 'day2-0', 'day2-1', 'day2-2', 'day2-3'], 9),
+        (24, ['day0-0', 'day0-1'], 2),
     ])
-    async def test_recent_merges_called_with_ceil_hours_and_no_limit(
-        self, tmp_path, recent_window_minutes, expected_hours,
+    async def test_recent_follows_the_selected_window(
+        self, tmp_path, hours, expected_ids, expected_total,
     ):
-        """build_per_project_merge_queue calls recent_merges with hours=ceil(window/60) and limit=None.
-
-        Parametrized over recent_window_minutes ∈ {15, 60, 90, 120} to lock in
-        the max(1, ceil(x/60)) semantics.  Fails on the pre-fix implementation
-        which passes limit=50 and hours=<outer dashboard window>.
-        """
-        from unittest.mock import patch
-
+        """Sketch #9: widening the window widens both the rows and the total."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
-        db_path = _make_db(tmp_path, 'p.db', [])
-
-        captured_kwargs: dict = {}
-
-        async def fake_recent_merges(db, **kwargs):
-            captured_kwargs.update(kwargs)
-            return []
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with patch('dashboard.data.merge_queue.recent_merges', new=fake_recent_merges):
-                await build_per_project_merge_queue(
-                    [('/tmp/P', conn)],
-                    hours=24,
-                    now=now,
-                    recent_window_minutes=recent_window_minutes,
-                )
-
-        assert captured_kwargs.get('limit') is None, (
-            f'Expected limit=None, got limit={captured_kwargs.get("limit")!r}'
-        )
-        assert captured_kwargs.get('hours') == expected_hours, (
-            f'recent_window_minutes={recent_window_minutes}: '
-            f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('recent_window_minutes, in_window_offset_min, over_fetch_offset_min', [
-        (15,  5, 30),   # SQL hours=1, Python window=15 min; over-fetch zone=(15,60]
-        (30, 10, 45),   # SQL hours=1, Python window=30 min; over-fetch zone=(30,60]
-        (45, 20, 50),   # SQL hours=1, Python window=45 min; over-fetch zone=(45,60]
-        (90, 45, 100),  # SQL hours=2, Python window=90 min; over-fetch zone=(90,120]
-    ])
-    async def test_sql_over_fetches_are_trimmed_to_exact_minute_boundary(
-        self, tmp_path, recent_window_minutes, in_window_offset_min, over_fetch_offset_min,
-    ):
-        """SQL hour-granularity over-fetches are trimmed to the exact minute boundary by filter_merges_within.
-
-        When recent_window_minutes is not a multiple of 60, SQL uses hours=ceil(minutes/60),
-        which over-fetches rows in the zone (recent_window_minutes, ceil(minutes/60)*60] minutes.
-        build_per_project_merge_queue must call filter_merges_within to drop those extra rows.
-
-        Setup: two events per case — one at -in_window_offset_min (inside Python window) and
-        one at -over_fetch_offset_min (inside SQL hours window but outside Python window).
-        Asserts: only the in-window event survives in result['recent'], proving the two-layer
-        contract (SQL over-fetches, Python post-filter drops the excess).
-        """
-        from math import ceil
-
-        from dashboard.data.merge_queue import build_per_project_merge_queue
-
-        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
-
-        # Sanity-check: over_fetch_offset_min must be in the over-fetch zone
-        sql_hours = max(1, ceil(recent_window_minutes / 60))
-        assert recent_window_minutes < over_fetch_offset_min <= sql_hours * 60, (
-            f'Test setup error: over_fetch_offset_min={over_fetch_offset_min} not in '
-            f'over-fetch zone ({recent_window_minutes}, {sql_hours * 60}]'
-        )
-        assert in_window_offset_min < recent_window_minutes, (
-            f'Test setup error: in_window_offset_min={in_window_offset_min} not inside '
-            f'Python window ({recent_window_minutes} min)'
-        )
-
-        in_window_task_id = f'in-window-{recent_window_minutes}min'
-        over_fetch_task_id = f'over-fetch-{recent_window_minutes}min'
-
-        db_path = _make_db(tmp_path, 'p.db', [
-            {
-                'event_type': 'merge_attempt',
-                'timestamp': now - timedelta(minutes=in_window_offset_min),
-                'task_id': in_window_task_id,
-                'run_id': f'run-in-{recent_window_minutes}',
-                'data': {'outcome': 'done'},
-                'duration_ms': 200,
-            },
-            {
-                'event_type': 'merge_attempt',
-                'timestamp': now - timedelta(minutes=over_fetch_offset_min),
-                'task_id': over_fetch_task_id,
-                'run_id': f'run-over-{recent_window_minutes}',
-                'data': {'outcome': 'done'},
-                'duration_ms': 300,
-            },
-        ])
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            result = await build_per_project_merge_queue(
-                [('/tmp/P', conn)],
-                hours=24,
-                now=now,
-                recent_window_minutes=recent_window_minutes,
-            )
-
-        recent = result['/tmp/P']['recent']
-        assert len(recent) == 1, (
-            f'recent_window_minutes={recent_window_minutes}: '
-            f'expected 1 row (in-window only), got {len(recent)}. '
-            f'Rows: {[r["task_id"] for r in recent]}'
-        )
-        assert recent[0]['task_id'] == in_window_task_id, (
-            f'Expected in-window row task_id={in_window_task_id!r}, '
-            f'got task_id={recent[0]["task_id"]!r}'
-        )
-        over_fetch_ids = [r['task_id'] for r in recent if r['task_id'] == over_fetch_task_id]
-        assert not over_fetch_ids, (
-            f'Over-fetch row {over_fetch_task_id!r} survived filter_merges_within — '
-            f'the SQL+Python two-layer contract is broken (recent_window_minutes={recent_window_minutes})'
-        )
-
-    @pytest.mark.asyncio
-    async def test_burst_exceeding_50_within_window_not_dropped(self, tmp_path):
-        """60 merge_attempt events within the 15-min window are all returned (none silently dropped).
-
-        This is the end-to-end regression gate: the old limit=50 call would silently
-        truncate a burst of >50 events even if every event was within recent_window_minutes.
-        With the fix (limit=None + SQL hours window), all 60 events survive the pipeline.
-        """
-        from dashboard.data.merge_queue import build_per_project_merge_queue
-
-        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
-        # 60 events spread across the last ~14 minutes (14s apart), all within 15-min window.
+        per_day = {0: 2, 1: 3, 2: 4}
         events = [
             {
                 'event_type': 'merge_attempt',
-                'timestamp': now - timedelta(seconds=i * 14),
+                'timestamp': now - timedelta(days=day, hours=1, minutes=i),
+                'task_id': f'day{day}-{i}',
+                'run_id': f'run-{day}-{i}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 100,
+            }
+            for day, count in per_day.items()
+            for i in range(count)
+        ]
+        db_path = _make_db(tmp_path, 'spread.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=hours, now=now)
+
+        project = result['/tmp/P']
+        assert [r['task_id'] for r in project['recent']] == expected_ids
+        assert project['recent_total'] == expected_total
+
+    @pytest.mark.asyncio
+    async def test_burst_beyond_the_cap_keeps_the_newest_and_counts_them_all(self, tmp_path):
+        """A window holding more than RECENT_MERGES_CAP merges shows the newest cap, totals all."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        burst = RECENT_MERGES_CAP + 5
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 10),
                 'task_id': f'burst-task-{i:03d}',
                 'run_id': f'burst-run-{i:03d}',
                 'data': {'outcome': 'done'},
                 'duration_ms': 500 + i,
             }
-            for i in range(60)
+            for i in range(burst)
         ]
         db_path = _make_db(tmp_path, 'burst.db', events)
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await build_per_project_merge_queue(
-                [('/tmp/P', conn)],
-                hours=24,
-                now=now,
-                recent_window_minutes=15,
-            )
+            result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
 
-        recent = result['/tmp/P']['recent']
-        assert len(recent) == 60, (
-            f'Expected 60 rows in recent burst, got {len(recent)}. '
-            'The SQL LIMIT cap must not silently truncate burst events within the window.'
-        )
-        returned_task_ids = {r['task_id'] for r in recent}
-        expected_task_ids = {f'burst-task-{i:03d}' for i in range(60)}
-        assert returned_task_ids == expected_task_ids, (
-            f'Missing task_ids: {expected_task_ids - returned_task_ids}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_build_per_project_burst_warn_uses_module_constant(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """_one_project WARN references _RECENT_MERGES_BURST_WARN, not the bare 1_000 literal.
-
-        Patches _RECENT_MERGES_BURST_WARN to 5, inserts 10 events all within the
-        15-minute recent_window_minutes window (above the patched soft threshold,
-        well below the 100_000 hard cap), and asserts:
-          1. At least one WARNING log record contains 'runaway burst'.
-          2. The same record mentions the row count (10).
-        Fails before step-4 (bare 1_000 literal ignores the patched constant),
-        passes after step-4 (_RECENT_MERGES_BURST_WARN drives the comparison).
-        """
-        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_BURST_WARN', 5)
-
-        from dashboard.data.merge_queue import build_per_project_merge_queue
-
-        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
-        # 10 events spread across ~9 minutes (56 s apart), all within the 15-min window.
-        events = [
-            {
-                'event_type': 'merge_attempt',
-                'timestamp': now - timedelta(seconds=i * 56),
-                'task_id': f'bw-task-{i:03d}',
-                'run_id': f'bw-run-{i:03d}',
-                'data': {'outcome': 'done'},
-                'duration_ms': 100 + i,
-            }
-            for i in range(10)
+        project = result['/tmp/P']
+        assert [r['task_id'] for r in project['recent']] == [
+            f'burst-task-{i:03d}' for i in range(RECENT_MERGES_CAP)
         ]
-        db_path = _make_db(tmp_path, 'burst_warn.db', events)
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
-                await build_per_project_merge_queue(
-                    [('/tmp/P', conn)],
-                    hours=24,
-                    now=now,
-                    recent_window_minutes=15,
-                )
-
-        warn_msgs = [
-            r.getMessage() for r in caplog.records
-            if r.levelno >= logging.WARNING
-        ]
-        assert any('runaway burst' in m for m in warn_msgs), (
-            f'Expected a WARNING containing "runaway burst", got: {warn_msgs!r}. '
-            'Ensure _RECENT_MERGES_BURST_WARN (patched to 5) controls the threshold '
-            'in _one_project, not the bare 1_000 literal.'
-        )
-        assert any('runaway burst' in m and '10' in m for m in warn_msgs), (
-            f'Expected the row count (10) in the runaway-burst WARNING, got: {warn_msgs!r}'
-        )
+        assert project['recent_total'] == burst
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
@@ -2245,7 +1897,6 @@ class TestBuildPerProjectMergeQueue:
                     [('/tmp/P', conn)],
                     hours=24,
                     now=now,
-                    recent_window_minutes=15,
                 )
 
 
@@ -2270,7 +1921,6 @@ class TestBuildPerProjectMergeQueueActive:
                 [('/tmp/P', conn)],
                 hours=24,
                 now=now,
-                recent_window_minutes=15,
             )
 
         assert '/tmp/P' in result
@@ -2330,7 +1980,6 @@ class TestBuildPerProjectMergeQueueActive:
                 [('/tmp/P', conn)],
                 hours=24,
                 now=now,
-                recent_window_minutes=15,
             )
 
         active = result['/tmp/P']['active']
@@ -2708,41 +2357,29 @@ class TestRecentTrainEvents:
 
 
 # ---------------------------------------------------------------------------
-# Acceptance lock: build_per_project_merge_queue at window=1440 (24h)
+# Acceptance lock: recent merges follow the selected window
 # ---------------------------------------------------------------------------
 
 
-class TestRecentWindow1440AcceptanceLock:
-    """Acceptance-criterion lock for task-1607.
+class TestRecentFollowsTheWindow:
+    """Acceptance-criterion lock (task-1607, retargeted by task 5593).
 
-    Validates that with recent_window_minutes=1440, a merge ~5h old appears in
-    result[pid]['recent'] and a merge ~25h old does not.
-
-    At window=1440 min, recent_hours = ceil(1440/60) = 24, so the SQL
-    look-back boundary and the Python filter_merges_within boundary are
-    *identical*.  The 25h row is therefore excluded at the SQL layer and never
-    reaches the Python trim — this test does **not** exercise filter_merges_within's
-    exclusion edge.  The Python trim's minute-precise boundary is exercised at
-    windows where SQL hours ≠ window minutes (e.g. window=90 min → SQL fetches
-    2h, Python trims to 90 min), covered by
-    TestBuildPerProjectMergeQueue.test_sql_over_fetches_are_trimmed_to_exact_minute_boundary.
-
-    This test's purpose is to codify the end-user acceptance criterion for the
-    task ("a merge from earlier today appears; one from yesterday does not")
-    through the full build_per_project_merge_queue pipeline at the deployed
-    window value.
+    At the 24h chip window, a merge ~5h old appears in result[pid]['recent']
+    and a merge ~25h old does not: the recent list is bounded by the same
+    ``hours`` window every other leg of the merge-queue payload uses — "a
+    merge from earlier today appears; one from yesterday does not".
     """
 
     @pytest.mark.asyncio
-    async def test_recent_window_1440_includes_hours_old_excludes_yesterday(self, tmp_path):
-        """A merge 5h ago appears; one 25h ago does not — at window=1440."""
+    async def test_24h_window_includes_hours_old_excludes_yesterday(self, tmp_path):
+        """A merge 5h ago appears; one 25h ago does not — at hours=24."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
         pid = '/tmp/test-proj'
 
         db_path = _make_db(tmp_path, 'acceptance.db', [
-            # Inside 1440-min (24h) window: 5h ago
+            # Inside the 24h window: 5h ago
             {
                 'event_type': 'merge_attempt',
                 'timestamp': now - timedelta(hours=5),
@@ -2751,7 +2388,7 @@ class TestRecentWindow1440AcceptanceLock:
                 'data': {'outcome': 'done'},
                 'duration_ms': 1000,
             },
-            # Outside 1440-min window: 25h ago (outside the 24h SQL look-back too)
+            # Outside the 24h window: 25h ago
             {
                 'event_type': 'merge_attempt',
                 'timestamp': now - timedelta(hours=25),
@@ -2768,15 +2405,14 @@ class TestRecentWindow1440AcceptanceLock:
                 [(pid, conn)],
                 hours=24,
                 now=now,
-                recent_window_minutes=1440,
             )
 
         recent_task_ids = [row['task_id'] for row in result[pid]['recent']]
         assert 'task-recent' in recent_task_ids, (
-            f'Expected task-recent (5h old) in recent list at window=1440; got {recent_task_ids}'
+            f'Expected task-recent (5h old) in recent list at hours=24; got {recent_task_ids}'
         )
         assert 'task-old' not in recent_task_ids, (
-            f'Expected task-old (25h old) absent from recent list at window=1440; got {recent_task_ids}'
+            f'Expected task-old (25h old) absent from recent list at hours=24; got {recent_task_ids}'
         )
 
 
@@ -3451,7 +3087,6 @@ class TestAggregatorTrainThroughput:
             [('/tmp/proj-none', None)],
             hours=24,
             now=now,
-            recent_window_minutes=15,
         )
 
         assert 'train_throughput' in result['/tmp/proj-none'], (
@@ -3486,7 +3121,6 @@ class TestAggregatorTrainThroughput:
                 [('/tmp/proj-train', conn)],
                 hours=24,
                 now=now,
-                recent_window_minutes=15,
             )
 
         assert 'train_throughput' in result['/tmp/proj-train'], (

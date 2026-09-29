@@ -38,7 +38,7 @@ from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
-from dashboard.api.window import _parse_window
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
@@ -1037,32 +1037,31 @@ async def api_costs(request: Request) -> JSONResponse:
     """COSTS — flat summary, per-project / per-account / per-role / trend / events."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
+    window = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
-        aggregate_cost_summary(dbs, days=days, now=now),
-        aggregate_cost_by_project(dbs, days=days, now=now),
-        aggregate_cost_by_account(dbs, days=days, now=now),
-        aggregate_cost_by_role(dbs, days=days, now=now),
-        aggregate_cost_trend(dbs, days=days, now=now),
-        aggregate_account_events(dbs, days=days, now=now),
-        aggregate_model_role_rollup(dbs, days=days, now=now),
+        aggregate_cost_summary(dbs, days=window.days, now=now),
+        aggregate_cost_by_project(dbs, days=window.days, now=now),
+        aggregate_cost_by_account(dbs, days=window.days, now=now),
+        aggregate_cost_by_role(dbs, days=window.days, now=now),
+        aggregate_cost_trend(dbs, days=window.days, now=now),
+        aggregate_account_events(dbs, days=window.days, now=now),
+        aggregate_model_role_rollup(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
-    return JSONResponse(
-        redux_api.shape_costs(
-            summary=safe_gather_result(summary, {}, 'costs/summary'),
-            by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
-            by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
-            by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
-            trend=safe_gather_result(trend, {}, 'costs/trend'),
-            events=safe_gather_result(events, [], 'costs/events'),
-            by_model_role=safe_gather_result(
-                by_model_role, {'rows': [], 'turn_cap_saturation': {}}, 'costs/by_model_role',
-            ),
-        )
+    shaped = redux_api.shape_costs(
+        summary=safe_gather_result(summary, {}, 'costs/summary'),
+        by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
+        by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
+        by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
+        trend=safe_gather_result(trend, {}, 'costs/trend'),
+        events=safe_gather_result(events, [], 'costs/events'),
+        by_model_role=safe_gather_result(
+            by_model_role, {'rows': [], 'turn_cap_saturation': {}}, 'costs/by_model_role',
+        ),
     )
+    return JSONResponse(with_window(shaped, window))
 
 
 @app.get('/api/v2/dashboard/performance')
@@ -1071,24 +1070,23 @@ async def api_performance(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
-    days = _parse_window(request.query_params, default=7)
+    window = _parse_window(request.query_params, default='7d')
     paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
         aggregate_completion_paths(dbs, esc_dirs),
         aggregate_escalation_rates(dbs, esc_dirs),
         aggregate_loop_histograms(dbs),
         aggregate_time_centiles(dbs),
-        aggregate_performance_history(dbs, days=days),
+        aggregate_performance_history(dbs, days=window.days),
         return_exceptions=True,
     )
-    return JSONResponse(
-        redux_api.shape_performance(
-            paths=safe_gather_result(paths_r, {}, 'perf/paths'),
-            escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
-            histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
-            ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
-            history=safe_gather_result(history_r, {}, 'perf/history'),
-        )
+    shaped = redux_api.shape_performance(
+        paths=safe_gather_result(paths_r, {}, 'perf/paths'),
+        escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
+        histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
+        ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
+        history=safe_gather_result(history_r, {}, 'perf/history'),
     )
+    return JSONResponse(with_window(shaped, window))
 
 
 # Cap str(exc) inside the 502 `detail` field to bound arbitrary-length

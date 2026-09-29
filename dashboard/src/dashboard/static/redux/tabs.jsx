@@ -29,6 +29,8 @@ const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STA
 const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // data.js's one copy of the on-demand terminal window's key.
 const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+// Windowed headers are labelled from the payload's served-window echo — window_chip.js.
+const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -43,6 +45,7 @@ const EP = Object.freeze({
   memory:        '/api/v2/dashboard/memory',        memoryGraphs: '/api/v2/dashboard/memory-graphs',
   recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
   costs:         '/api/v2/dashboard/costs',         scheduler:    '/api/v2/dashboard/scheduler',
+  burndown:      '/api/v2/dashboard/burndown',
 });
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
@@ -404,7 +407,7 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
-                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
                     <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
@@ -1075,7 +1078,7 @@ function MergeTab({ projectFilter }) {
                 )}
 
                 <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
-                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{d.recent.length} matching</span></div>
+                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{recentMergesCaption(d.recent.length, d.recent_total, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>
                       <tbody>
@@ -1180,7 +1183,7 @@ function CostsTab({ projectFilter }) {
       </div>
 
       <div className="col-span-7 panel">
-        <div className="panel-head"><span className="title">Spend trend · 30d</span></div>
+        <div className="panel-head"><span className="title">Spend trend · {windowLabel(windowEcho(DF.__receipt, EP.costs))}</span></div>
         <div className="panel-body"><LC labels={c.trend.labels} series={[{ values: c.trend.values, color: CP.accent }]} height={200} formatY={v => `$${v.toFixed(0)}`} /></div>
       </div>
 
@@ -1317,7 +1320,7 @@ function BurnTab({ projectFilter, displayWindow }) {
       {view === 'aggregate' && (
         <div className="col-span-12 panel">
           <div className="panel-head">
-            <span className="title">Status mix · 30d</span>
+            <span className="title">Status mix · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</span>
             <span className="meta">aggregate · all projects</span>
           </div>
           <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -1380,7 +1383,7 @@ function BurnTab({ projectFilter, displayWindow }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-8 panel">
                   <div className="panel-head">
-                    <span className="title">Status mix · 30d</span>
+                    <span className="title">Status mix · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</span>
                   </div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {parityBanner(pb, null)}
