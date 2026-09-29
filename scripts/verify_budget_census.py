@@ -316,8 +316,9 @@ def _twin_key(record: Record) -> tuple[str, int, str | None, str]:
     """Identify "the same attempt record" across the two corpora.
 
     Twins share task, attempt and module scope and carry identical content,
-    because the writer builds both copies from one ``_build_summary_payload``
-    call (``orchestrator/src/orchestrator/verify.py::_archive_attempt_summary``).
+    because ``orchestrator/src/orchestrator/verify.py::run_verification`` builds
+    one ``_build_summary_payload`` record and hands that same dict to both
+    writers.
     Content is part of the key, not just the name: an infra retry reuses the
     attempt number and overwrites the worktree copy, so only the archived run
     whose content matches is its twin.

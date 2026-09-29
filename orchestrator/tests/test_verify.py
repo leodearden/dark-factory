@@ -3941,19 +3941,15 @@ class TestVerifyResultCategoryAndPaths:
 
 
 class TestPersistAttemptLogs:
-    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)``.
+    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, summary_record)``.
 
     Tests fail until step 8 implements the helper.
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
-        import asyncio  # noqa: PLC0415
-
         from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
-        return asyncio.run(
-            _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
-        ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
-            worktree, attempt_id, runs, category, cause_hint
+        return _persist_attempt_logs(
+            worktree, attempt_id, runs, _build_summary_payload(runs, category, cause_hint),
         )
 
     def _make_runs(self):
@@ -4112,14 +4108,17 @@ class TestPersistAttemptLogs:
 
 
 class TestArchiveAttemptLog:
-    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)``.
+    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category, *, stamp)``.
 
     Tests fail until step 10 implements the helper.
     """
 
     def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
-        return _archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)
+        from orchestrator.verify import _archive_attempt_log, _archive_stamp  # noqa: PLC0415
+        return _archive_attempt_log(
+            worktree_log_paths, archive_root, task_id, attempt_id, category,
+            stamp=_archive_stamp(),
+        )
 
     def _make_source_logs(self, tmp_path: Path) -> list[Path]:
         """Create two fake worktree log files and return their paths."""
@@ -5175,24 +5174,38 @@ class TestTaskPathSummaryArchival:
     async def test_no_archive_tree_without_an_archiving_caller(self, tmp_path: Path):
         """``archive_root=None`` is how cold-shadow and drift probes opt out."""
         worktree = self._worktree(tmp_path)
+        before = set(tmp_path.rglob('*'))
 
         await self._verify(worktree, None, 1, self._all_green)
 
         assert (worktree / '.task' / 'verify' / 'attempt-1.summary.json').is_file()
-        assert not (tmp_path / 'data').exists(), (
-            'a non-archiving caller must not create an archive tree'
+        created = sorted(p.relative_to(tmp_path) for p in set(tmp_path.rglob('*')) - before)
+        assert all(p.parts[0] == '.task' for p in created), (
+            f'a non-archiving caller may write only inside its worktree .task/; created {created}'
         )
 
-    async def test_fresh_summary_survives_an_archive_prune(self, tmp_path: Path):
+    async def test_summary_and_logs_of_one_attempt_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a task-path attempt's archived logs to its summary by stamp."""
         worktree = self._worktree(tmp_path)
         archive_root = tmp_path / 'data' / 'verify-logs'
-        await self._verify(worktree, archive_root, 3, self._all_green)
-        archived = self._archived_summaries(archive_root, 'attempt-3')
-        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
 
-        verify._prune_archive(archive_root)
+        async def cargo_cli_error(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'error: --exclude can only be used together with --workspace\n', False
+            return 0, 'ok', False
 
-        assert archived[0].is_file(), 'a default prune pass must not remove a fresh summary'
+        result = await self._verify(worktree, archive_root, 2, cargo_cli_error)
+
+        assert result.archive_log_paths, (
+            f'precondition: fixture must classify into an archived category; got {result.category!r}'
+        )
+        summaries = self._archived_summaries(archive_root, 'attempt-2')
+        assert len(summaries) == 1, f'expected exactly one archived summary; got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        for log in result.archive_log_paths:
+            assert Path(log).name.endswith(f'-{stamp}.log'), (
+                f'log {Path(log).name!r} does not carry the summary stamp {stamp!r}'
+            )
 
 
 class TestPersistAttemptLogsModulePrefix:
@@ -5216,7 +5229,8 @@ class TestPersistAttemptLogsModulePrefix:
         kwargs = {}
         if module_prefix is not None:
             kwargs['module_prefix'] = module_prefix
-        return _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint, **kwargs)
+        summary = _build_summary_payload(runs, category, cause_hint)
+        return _persist_attempt_logs(worktree, attempt_id, runs, summary, **kwargs)
 
     def _make_runs(self):
         return [
@@ -6968,6 +6982,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 task_id='42',
                 attempt_id=1,
                 category='cargo_cli_error',
+                stamp=verify._archive_stamp(),
             )
             assert spy.call_count == 0, (
                 f'_archive_attempt_log must not call _prune_archive; '
