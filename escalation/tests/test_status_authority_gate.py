@@ -36,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
@@ -68,24 +69,13 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``,
-    bypassing the MCP tools entirely (mirrors test_server.py's ``_seed_esc``
-    and test_capability_guard_http.py's ``_seed``)."""
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'status-authority-gate test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
+    """Delegates to ``seed_escalation`` with this module's default summary."""
+    if summary is None:
+        summary = f'status-authority-gate test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
 # ---------------------------------------------------------------------------

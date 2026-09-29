@@ -331,8 +331,8 @@ class TestOrchTabReadsTheCensus:
 
     def test_every_pip_reads_the_census_through_a_view_reading(self, orch_tab_code, census):
         pips = re.findall(r'<Pip\b', orch_tab_code)
-        assert len(pips) == 1, f'OrchTab renders {len(pips)} <Pip> sites; expected one, mapped over CENSUS_VIEWS'
-        view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<Pip')
+        assert len(pips) == 1, f'OrchTab renders {len(pips)} <Pip> sites; expected one, mapped over TASK_CENSUS_VIEWS'
+        view, call = _the_map_rendering(orch_tab_code, 'TASK_CENSUS_VIEWS', '<Pip')
         assert f'datum={{{census}}}' in call
         assert f'format={{{view}.reading}}' in call
 
@@ -347,15 +347,15 @@ class TestOrchTabReadsTheCensus:
     def test_the_legend_maps_the_views_through_datum_reading(self, orch_tab_code, census):
         calls = [
             (view, call)
-            for view, call in _map_calls(orch_tab_code, 'CENSUS_VIEWS')
+            for view, call in _map_calls(orch_tab_code, 'TASK_CENSUS_VIEWS')
             if '<DatumReading' in call and '<button' not in call
         ]
-        assert len(calls) == 1, f'expected one legend map over CENSUS_VIEWS, found {len(calls)}'
+        assert len(calls) == 1, f'expected one legend map over TASK_CENSUS_VIEWS, found {len(calls)}'
         view, call = calls[0]
         assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.reading\}}', call)
 
     def test_the_filter_buttons_are_the_views_with_census_counts(self, orch_tab_code, census):
-        view, call = _the_map_rendering(orch_tab_code, 'CENSUS_VIEWS', '<button')
+        view, call = _the_map_rendering(orch_tab_code, 'TASK_CENSUS_VIEWS', '<button')
         assert re.search(rf'flipFilter\(\s*o\.pid\s*,\s*{view}\.key\s*\)', call)
         assert re.search(rf'<DatumReading\s+datum=\{{{census}\}}\s+format=\{{{view}\.count\}}', call)
         assert f'{{{view}.label}}' in call
@@ -376,22 +376,22 @@ class TestOrchTabReadsTheCensus:
     def test_the_task_tiles_are_one_mapped_member_tile(self, orch_tab_code):
         scope = re.search(r'\bconst\s+(\w+)\s*=\s*censusOver\(\s*DF\s*,', orch_tab_code)
         assert scope, 'OrchTab does not bind a scope census from censusOver(DF, ...)'
-        tile, call = _the_map_rendering(orch_tab_code, 'CENSUS_TILES', '<ST')
+        tile, call = _the_map_rendering(orch_tab_code, 'TASK_CENSUS_TILES', '<ST')
         assert f'datum={{{scope.group(1)}}}' in call
         assert f'format={{{tile}.reading}}' in call
         assert 'history={censusHistory(' in call
         assert len(re.findall(r'<ST\b', orch_tab_code)) == 2, (
-            'OrchTab keeps the Orchestrators tile plus ONE tile mapped over CENSUS_TILES'
+            'OrchTab keeps the Orchestrators tile plus ONE tile mapped over TASK_CENSUS_TILES'
         )
 
     def test_the_rows_come_from_the_snapshot_by_view(self, orch_tab_code):
         assert re.search(
             r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
-            r'unrequestedTerminalRows\(\s*DF\[\s*ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
+            r'unrequestedTerminalRows\(\s*DF\[\s*LOADER_ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
             orch_tab_code,
         ), (
             'OrchTab rows do not come from viewRows(projectRows(DF, o.project), '
-            'unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
+            'unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
             'OrchTab never requests the terminal window, so an absent one must say so '
             'rather than datumFor\'s "not yet fetched".'
         )

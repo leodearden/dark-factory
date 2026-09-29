@@ -2073,16 +2073,18 @@ class TestRepairReadAfterWrite:
         This test owns the POST-write window specifically. A writer landing
         BEFORE the write is refused as ``concurrent_modification`` by the
         compare-and-set (see ``TestRepairConcurrentModification``), so the
-        competing write here is staged to land after a SUCCESSFUL CAS — which
-        is the window the compare-and-set structurally cannot see, and the one
-        the harness actually produces: it calls ``complete_run(...)`` BEFORE its
-        trailing ``update_run_stage_reports``, so a run reads ``completed``
-        while a writer still holds a loaded copy it is about to write back
-        whole — and the operator script runs out-of-process with an empty
-        ``live_run_ids``, so the row status is its only other guard. Reporting
-        ``repaired`` for a write that was overwritten is the exact failure the
-        liveness gate exists to prevent, so the read-after-write turns it into a
-        loud refusal.
+        competing write here is staged to land after a SUCCESSFUL CAS — the
+        window the compare-and-set structurally cannot see.
+
+        The harness no longer produces this window: the run owner's trailing
+        ``update_run_stage_reports`` carries persisted repairs forward (see
+        ``test_owner_trailing_rewrite_no_longer_clobbers_a_reported_repair``).
+        The competing writer here is therefore a raw wholesale compare-and-set
+        that BYPASSES that path, standing for any future writer that does not
+        preserve repairs. Reporting ``repaired`` for a write that was
+        overwritten is the exact failure the liveness gate exists to prevent,
+        so the read-after-write stays as the backstop that turns it into a loud
+        refusal.
         """
         journal = await build_journal_with_closed_run(
             tmp_path,
@@ -2097,7 +2099,6 @@ class TestRepairReadAfterWrite:
             # unaffected by the mutation the repair applies to its own.
             other_writers_copy = await journal.get_run(RUN_ID)
             assert other_writers_copy is not None
-            real_update = journal.update_run_stage_reports
             real_cas = journal.compare_and_set_run_stage_reports
 
             async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
@@ -2105,11 +2106,17 @@ class TestRepairReadAfterWrite:
                 # valid, so this is not the concurrent_modification window.
                 applied = await real_cas(run_id, stage_reports, **kw)
                 assert applied is True
-                # Only THEN does the competing writer win wholesale, exactly as
-                # harness's end-of-stage rewrite does: it writes back its own
-                # loaded copy, which predates the repair, so the just-written
-                # provenance record is overwritten.
-                await real_update(run_id, other_writers_copy.stage_reports)
+                # Only THEN does the competing writer win wholesale, through a
+                # raw compare-and-set on a fresh token rather than the owner's
+                # repair-preserving write: it writes back its own loaded copy,
+                # which predates the repair, so the just-written provenance
+                # record is overwritten.
+                fresh = await journal.get_run_with_stage_reports_text(run_id)
+                assert fresh is not None
+                clobbered = await real_cas(
+                    run_id, other_writers_copy.stage_reports, expected_text=fresh[1]
+                )
+                assert clobbered is True
                 return applied
 
             journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
@@ -2149,6 +2156,12 @@ class TestRepairReadAfterWrite:
         non-container. Without the shape check that is a ``TypeError`` out of an
         MCP tool — the unstructured failure INV-2 forbids — instead of the
         ``repair_clobbered`` a blob rewritten out from under the write deserves.
+
+        As in ``test_clobbered_repair_is_refused_not_reported_as_repaired``, the
+        clobbering writer is a raw wholesale compare-and-set that bypasses the
+        owner's repair-preserving ``update_run_stage_reports``: the harness no
+        longer produces this window, and the read-after-write is the backstop
+        for a writer that skips that path.
         """
         journal = await build_journal_with_closed_run(
             tmp_path,
@@ -2166,13 +2179,17 @@ class TestRepairReadAfterWrite:
             clobbering_finding['cited_memories'] = [_citation(SUCCESSOR)]
             clobbering_finding[citation_repair.CITATION_REPAIRS_KEY] = 'not-a-list'
 
-            real_update = journal.update_run_stage_reports
             real_cas = journal.compare_and_set_run_stage_reports
 
             async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
                 applied = await real_cas(run_id, stage_reports, **kw)
                 assert applied is True
-                await real_update(run_id, other_writers_copy.stage_reports)
+                fresh = await journal.get_run_with_stage_reports_text(run_id)
+                assert fresh is not None
+                clobbered = await real_cas(
+                    run_id, other_writers_copy.stage_reports, expected_text=fresh[1]
+                )
+                assert clobbered is True
                 return applied
 
             journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
@@ -2190,6 +2207,50 @@ class TestRepairReadAfterWrite:
 
             assert outcome['error'] == 'repair_clobbered'
             assert 'status' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_trailing_rewrite_no_longer_clobbers_a_reported_repair(
+        self, tmp_path
+    ):
+        """The harness rewrite that used to clobber a reported repair.
+
+        A run owner calls ``complete_run`` BEFORE its trailing
+        ``update_run_stage_reports``, so a repair can land on a run that reads
+        ``completed`` while the owner still holds a loaded copy that predates
+        it. That trailing write now carries the persisted repair forward, so a
+        repair reported ``repaired`` stays repaired.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            other_writers_copy = await journal.get_run(RUN_ID)
+            assert other_writers_copy is not None
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+            assert outcome['status'] == 'repaired'
+
+            await journal.update_run_stage_reports(RUN_ID, other_writers_copy.stage_reports)
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            assert len(repaired[CITATION_REPAIRS_KEY]) == 1
+            assert repaired[CITATION_REPAIRS_KEY][0]['memory_id'] == DANGLING
         finally:
             await journal.close()
 
@@ -2263,9 +2324,9 @@ class TestRepairConcurrentModification:
     """A competing wholesale rewrite landing between the repair's READ and its
     WRITE is refused, not silently lost.
 
-    The read-after-write ``repair_clobbered`` check narrows this window but
-    cannot close it, because it only ever observes the blob AFTER this call's
-    own write. The surviving interleaving:
+    The read-after-write ``repair_clobbered`` check cannot see this window,
+    because it only ever observes the blob AFTER this call's own write. The
+    interleaving it would miss:
 
         A.read -> B.read -> A.write -> A.verify(sees own blob -> 'repaired')
                           -> B.write (B's blob predates A's record -> A's LOST)

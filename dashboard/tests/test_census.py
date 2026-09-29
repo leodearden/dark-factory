@@ -6,7 +6,9 @@ Pins the contract declared in ``plans/dashboard-one-datum-one-path-prd.md``
 copy of the vocabulary is exactly the drift this module exists to remove. The
 sole exceptions are ``REVIEW`` and ``INFRA_HOLD``, named explicitly below
 because their in-flight membership is the PRD's decision-3 amendment and
-therefore the claim a future reader is most likely to doubt.
+therefore the claim a future reader is most likely to doubt, and the three
+hyphenated members' series keys, spelled out because they are also the
+burndown store's column names.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import pytest
 from shared.task_statuses import TERMINAL, TaskStatus
 
 from dashboard.data.census import (
+    SERIES_KEYS,
     SUB_VIEWS,
     TONES,
     VIEWS,
@@ -83,7 +86,39 @@ def test_tones_cover_every_status_exactly_once():
     assert all(TONES[member] for member in TaskStatus)
 
 
-@pytest.mark.parametrize('constant', [VIEWS, SUB_VIEWS, TONES], ids=['VIEWS', 'SUB_VIEWS', 'TONES'])
+def test_tones_are_pairwise_distinct():
+    """The Status mix stacks all nine members, one band and one legend swatch each.
+
+    Two members sharing a tone would make two bands — and their legend
+    swatches — indistinguishable, so the map must be injective.
+    """
+    assert len(set(TONES.values())) == len(TaskStatus)
+
+
+def test_series_keys_name_every_status_in_declaration_order():
+    """One key per member, in the enum's order, so a band loop can iterate it."""
+    assert list(SERIES_KEYS) == list(TaskStatus)
+
+
+def test_series_keys_are_distinct_identifiers():
+    """Each key is a store column and a wire key, so it must be identifier-safe."""
+    keys = list(SERIES_KEYS.values())
+    assert all(key.isidentifier() for key in keys)
+    assert len(set(keys)) == len(keys)
+
+
+def test_series_keys_spell_the_hyphenated_members_as_their_store_columns():
+    """The burndown snapshots columns delta-1 created are these exact spellings."""
+    assert SERIES_KEYS[TaskStatus.IN_PROGRESS] == 'in_progress'
+    assert SERIES_KEYS[TaskStatus.MERGE_DEFERRED] == 'merge_deferred'
+    assert SERIES_KEYS[TaskStatus.INFRA_HOLD] == 'infra_hold'
+
+
+@pytest.mark.parametrize(
+    'constant',
+    [VIEWS, SUB_VIEWS, TONES, SERIES_KEYS],
+    ids=['VIEWS', 'SUB_VIEWS', 'TONES', 'SERIES_KEYS'],
+)
 def test_vocabulary_constants_reject_mutation(constant):
     """These are imported by beta, the generator and the parity test — SPOT."""
     with pytest.raises(TypeError):

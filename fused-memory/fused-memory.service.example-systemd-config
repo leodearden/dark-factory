@@ -1,7 +1,12 @@
 [Unit]
 Description=Fused Memory MCP Server (dark-factory)
 Documentation=file:///home/leo/src/dark-factory/DESIGN.md
-After=network.target
+After=network.target fused-memory.socket
+# The port is held by fused-memory.socket so it stays bound across restarts
+# (see that unit). Starting this service starts the socket; stopping the
+# SOCKET stops both. Stopping only this service leaves the port listening,
+# and the next connection starts the service again.
+Requires=fused-memory.socket
 
 # Restart-rate guard: 10 starts within 600s is generous enough for cap-rotation
 # churn and recoverable cascades, but blocks a true tight loop. No

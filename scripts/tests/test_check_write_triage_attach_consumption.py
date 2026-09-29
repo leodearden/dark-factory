@@ -31,23 +31,14 @@ import sys
 from pathlib import Path
 
 import pytest
-
-_HERE = Path(__file__).resolve().parent
-# The repo-wide `--import-mode=importlib` addopts means pytest does NOT put a
-# test file's own directory on sys.path, and scripts/tests/conftest.py inserts
-# scripts/ but not scripts/tests/. Without this the sibling fixture module —
-# which the gate suite imports too, and which is a plain module rather than a
-# conftest fixture precisely so BOTH files can reach it — is unimportable.
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-from write_triage_attach_fixtures import (  # noqa: E402
+from write_triage_attach_fixtures import (
     JUDGE_STATIC_NEAR_MISS_VARIANTS,
     PROVIDER_REACHED_MARKER,
     write_fake_judge,
     write_fake_triage,
 )
 
+_HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
 

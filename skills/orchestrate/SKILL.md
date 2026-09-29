@@ -38,23 +38,21 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 # If "unset": continue below.
 ```
 
-If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+If unset, the config is the target project's `dark-factory-orchestrator.yaml` — the
+canonical, required filename for every factory-operated project (`CLAUDE.md`, "Repo Map";
+it is what the dashboard's escalation-URL discovery keys on):
 
 ```bash
-ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator-config.yaml \
-   "$TARGET_PROJECT"/config.yaml \
-   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+TARGET_CONFIG="$TARGET_PROJECT"/dark-factory-orchestrator.yaml
+ls "$TARGET_CONFIG"
 ```
 
-Known locations for the three current projects:
-
-| Project | TARGET_CONFIG |
-|---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
+The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
+`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
+project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
+one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
+glob over the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -323,7 +321,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 

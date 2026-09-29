@@ -22,6 +22,7 @@ load_dotenv()
 from functools import partial  # noqa: E402
 
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
@@ -1172,6 +1173,7 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_sockets = _claim_systemd_listener(config.server.port)
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1234,7 +1236,9 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=primary_sockets), name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -2000,6 +2004,27 @@ def _build_uvicorn_config(
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
     return uvicorn.Config(app, **kwargs)
+
+
+def _claim_systemd_listener(port: int) -> list[socket.socket] | None:
+    """The systemd-held listening socket for *port*, as uvicorn ``serve(sockets=)``.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. Returns None (uvicorn binds the
+    port itself) when not socket-activated or when systemd holds no socket
+    for *port*.
+    """
+    listeners = take_systemd_listeners()
+    sock = listeners.pop(port, None)
+    if listeners:
+        logger.warning(
+            'systemd passed listening sockets for ports %s that nothing here serves',
+            sorted(listeners),
+        )
+    if sock is None:
+        return None
+    logger.info('  Serving on systemd-held socket %s (survives restarts)', sock.getsockname())
+    return [sock]
 
 
 def _build_recon_report_components(

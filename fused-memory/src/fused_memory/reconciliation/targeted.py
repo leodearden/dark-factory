@@ -26,6 +26,9 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    retire_flag_markers_for_terminal_task,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     extract_batch_plan_task_ids,
@@ -610,6 +613,31 @@ class TargetedReconciler:
             )
         except Exception as e:
             logger.warning(f'Fast-path write failed for task {task_id}: {e}')
+
+        # 0.6. Latency layer (task 4376), ahead of section 1's search so an expired
+        #      marker is gone before it can surface: fail-open, leaving any miss
+        #      to the per-cycle sweep. Contract:
+        #      stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task.
+        try:
+            retired = await retire_flag_markers_for_terminal_task(
+                self.memory, str(scope.project_id), run_id, task_id=task_id,
+            )
+            if retired > 0:
+                # Tombstones share the sweep's deleter tag; their deleting
+                # run_id (this task_done run) is what tells hook from sweep.
+                await self.journal.add_run_action(
+                    run_id, 'retire', 'flag_for_stage2', 'delete',
+                    {'task_id': task_id, 'retired': retired},
+                    causation_id=run_id,
+                )
+                result['actions'].append(
+                    {'type': 'flag_for_stage2_retired', 'task_id': task_id, 'count': retired}
+                )
+        except Exception as e:
+            logger.warning(
+                f'flag_for_stage2 retirement failed for task {task_id}: {e}; '
+                'leaving it to the per-cycle sweep (fail-open)'
+            )
 
         # 1. Search for existing knowledge about this task
         #
