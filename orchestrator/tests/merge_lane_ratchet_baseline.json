@@ -112,7 +112,7 @@
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 55, "function_local_imports": 0, "lines": 747, "prose_lines": 428, "reexport_names": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"cognitive": 5, "function_local_imports": 0, "lines": 106, "prose_lines": 45, "reexport_names": 0},
     "orchestrator/tests/_serial_merge_worker.py": {"cognitive": 33, "function_local_imports": 0, "lines": 393, "prose_lines": 134, "reexport_names": 0},
-    "orchestrator/tests/conftest.py": {"cognitive": 47, "function_local_imports": 6, "lines": 1201, "prose_lines": 773, "reexport_names": 5}
+    "orchestrator/tests/conftest.py": {"cognitive": 50, "function_local_imports": 6, "lines": 1242, "prose_lines": 786, "reexport_names": 5}
   },
   "functions": {
     "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,
@@ -877,6 +877,7 @@
     "orchestrator/tests/conftest.py::_neutralize_verify_admission": 2,
     "orchestrator/tests/conftest.py::_no_dry_run_unblock": 1,
     "orchestrator/tests/conftest.py::_no_mock_derived_stray_dirs": 1,
+    "orchestrator/tests/conftest.py::_no_unexpected_exit_contract_violation": 3,
     "orchestrator/tests/conftest.py::_reap_leaked_aiosqlite_connections": 0,
     "orchestrator/tests/conftest.py::_reap_leaked_claimant_heartbeats": 0,
     "orchestrator/tests/conftest.py::_reap_leaked_merge_workers": 12,
