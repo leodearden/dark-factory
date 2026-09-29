@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
@@ -1571,6 +1572,53 @@ class TestProcessGroupTermination:
         beyond_pid_max = 2**30
         assert process_group_members(beyond_pid_max) == []
         assert process_group_terminated(beyond_pid_max) is True
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_the_walk_cannot_see_is_not_terminated(self, tmp_path, monkeypatch):
+        """killpg sees the group but /proc shows no member: inconclusive, so False.
+
+        This stands in for an unreadable /proc (hidepid, another pid namespace), which
+        must never pass a live group as dead.
+        """
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+            assert process_group_members(pgid) == []
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_a_group_killpg_may_not_signal_is_terminated(self, monkeypatch):
+        """EPERM means the pgid now belongs to another user, so our group is gone.
+
+        The group is really alive, so True can only come from the failed probe and
+        never from the /proc walk.
+        """
+
+        def eperm(pgid: int, sig: int) -> None:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            with monkeypatch.context() as patched:
+                patched.setattr('shared.proc_group.os.killpg', eperm)
+                assert process_group_terminated(p.pid) is True
+        finally:
+            _kill_group(p.pid)
+            p.wait()
 
 
 class TestReapProcessGroups:
