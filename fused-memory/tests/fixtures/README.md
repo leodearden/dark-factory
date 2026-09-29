@@ -785,7 +785,7 @@ for the rule that only a verdict the CLI ACCEPTED is ever salvaged (task
 3995). Consumed by `fused-memory/tests/test_task_curator_timeout_evidence.py`,
 which materializes each file at
 `<curator config dir>/projects/<slug>/<session_id>.jsonl` and drives
-`TaskCurator._call_llm` against it, and which also feeds the records straight
+`TaskCurator.curate` against it, and which also feeds the records straight
 to `shared.cli_invoke.transcript_evidence`.
 
 The source files live in the operator's home under random neutral-cwd slugs

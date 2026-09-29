@@ -14,6 +14,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_helpers import agent_result as _agent_result
+from _curator_helpers import make_config as _make_config
+from _curator_helpers import pool_with_ids as _pool_with_ids
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
@@ -548,34 +551,6 @@ class TestNormalizeKeyDelegatesToCandidateKey:
 # ----------------------------------------------------------------------
 
 
-def _agent_result(structured: dict | None = None, output: str = '') -> AgentResult:
-    return AgentResult(
-        success=True,
-        output=output,
-        structured_output=structured,
-        cost_usd=0.01,
-    )
-
-
-def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
-    """Build a pool with the given (task_id, status) pairs."""
-    return [
-        _PoolEntry(
-            task_id=tid,
-            title='t',
-            description='',
-            details='',
-            files_to_modify=[],
-            module_keys=[],
-            status=status,
-            priority='medium',
-            source='module',
-            combine_eligible=is_combine_eligible_status(status),
-        )
-        for tid, status in pairs
-    ]
-
-
 def _carries_guidance(text: str) -> bool:
     """Does *text* carry the pool-truncation decision-safety guidance?
 
@@ -753,12 +728,6 @@ class TestCuratorOutputSchema:
 # ----------------------------------------------------------------------
 # TaskCurator.curate() — idempotency cache + fallback behavior
 # ----------------------------------------------------------------------
-
-
-def _make_config() -> FusedMemoryConfig:
-    cfg = FusedMemoryConfig()
-    cfg.curator = CuratorConfig()
-    return cfg
 
 
 class TestCurateIdempotency:

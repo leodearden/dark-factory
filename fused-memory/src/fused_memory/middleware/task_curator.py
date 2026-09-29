@@ -193,6 +193,29 @@ def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _TranscriptScope:
+    """Where one gated curator call's transcript lands, and its first-turn grace.
+
+    config_dir and session_id together make ``transcript_turns`` stampable,
+    which is what makes ``is_zero_output_timeout`` transcript-authoritative.
+    The grace equals the call's own timeout because the curator's measured
+    first-turn latency tail exceeds the 120s default (task 3995 plan).
+    """
+
+    config_dir: TaskConfigDir
+    session_id: str
+    startup_grace_secs: float
+
+    def as_invoke_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that thread this scope."""
+        return {
+            'config_dir': self.config_dir,
+            'session_id': self.session_id,
+            'startup_grace_secs': self.startup_grace_secs,
+        }
+
+
 def _salvageable_verdict(
     agent_result: AgentResult, evidence: TranscriptEvidence | None,
 ) -> dict | None:
@@ -2879,8 +2902,11 @@ class TaskCurator:
     def _transcript_config_dir(self) -> TaskConfigDir | None:
         """This process's curator config dir, or None when there is no UsageGate.
 
-        Gate-less, ``invoke_with_cap_retry`` writes no credentials into a config
-        dir, so an isolated one would leave the CLI logged out.
+        Gate-less, no per-call OAuth token is passed, so the CLI needs the login
+        in its default config dir, which an isolated one would hide. Concurrent
+        gated calls share this dir safely: each authenticates from its own
+        ``CLAUDE_CODE_OAUTH_TOKEN``, never from the ``.credentials.json`` they
+        all rewrite (``shared/tests/test_config_dir_credentials_live.py``).
         """
         if self._usage_gate is None:
             return None
@@ -2891,38 +2917,27 @@ class TaskCurator:
             )
         return self._config_dir
 
-    def _transcript_scope(self, timeout_seconds: float) -> dict[str, Any]:
-        """The ``invoke_with_cap_retry`` kwargs that locate this call's transcript.
-
-        config_dir and session_id are set together or not at all: together they
-        make ``transcript_turns`` stampable, which is what makes
-        ``is_zero_output_timeout`` transcript-authoritative. The startup grace
-        equals the call's own timeout because the curator's measured first-turn
-        latency tail exceeds the 120s default (task 3995 plan).
-        """
+    def _transcript_scope(self, timeout_seconds: float) -> _TranscriptScope | None:
+        """A fresh transcript scope for one call, or None when there is no UsageGate."""
         config_dir = self._transcript_config_dir()
         if config_dir is None:
-            return {'config_dir': None}
-        return {
-            'config_dir': config_dir,
-            'session_id': str(uuid_mod.uuid4()),
-            'startup_grace_secs': timeout_seconds,
-        }
+            return None
+        return _TranscriptScope(config_dir, str(uuid_mod.uuid4()), timeout_seconds)
 
-    def _read_failure_evidence(
-        self, transcript_scope: Mapping[str, Any],
+    async def _read_failure_evidence(
+        self, transcript_scope: _TranscriptScope,
     ) -> TranscriptEvidence | None:
         """What a failed call's own transcript recorded, or None when unknown.
 
-        Reads once per failed call and never raises: a transcript fault must not
-        replace the LLM failure on the synchronous add_task path.
+        Reads once per failed call, off the event loop (a bisected batch fails
+        as several concurrent calls), and never raises: a transcript fault must
+        not replace the LLM failure on the synchronous add_task path.
         """
-        config_dir = transcript_scope.get('config_dir')
-        if config_dir is None:
-            return None
-        session_id = transcript_scope['session_id']
+        session_id = transcript_scope.session_id
         try:
-            evidence = transcript_evidence_for_session(config_dir.path, session_id)
+            evidence = await asyncio.to_thread(
+                transcript_evidence_for_session, transcript_scope.config_dir.path, session_id,
+            )
         except Exception:
             logger.warning(
                 'TaskCurator: could not read the transcript of failed session %s; '
@@ -2939,13 +2954,14 @@ class TaskCurator:
             )
         return evidence
 
-    def _resolve_failed_result(
-        self, agent_result: AgentResult, transcript_scope: Mapping[str, Any],
+    async def _resolve_failed_result(
+        self, agent_result: AgentResult, transcript_scope: _TranscriptScope | None,
     ) -> tuple[AgentResult, TranscriptEvidence | None]:
         """Read a failed call's transcript evidence, and salvage its verdict if allowed.
 
-        Returns ``(result, evidence)``. A successful result comes back unchanged
-        and unread. A failed one gets ONE evidence read, for reporting.
+        Returns ``(result, evidence)``. A successful or gate-less result comes
+        back unchanged and unread. A failed gated one gets ONE evidence read,
+        for reporting.
         Salvage is only for a run KILLED after the CLI accepted its verdict (the
         transcript's ``structured_output`` attachment). The result then becomes
         a success carrying that verdict, which meets exactly the parsing and
@@ -2959,16 +2975,16 @@ class TaskCurator:
         salvage, never a false one, since a capped or rejected attempt has no
         acceptance record.
         """
-        if agent_result.success:
+        if agent_result.success or transcript_scope is None:
             return agent_result, None
-        evidence = self._read_failure_evidence(transcript_scope)
+        evidence = await self._read_failure_evidence(transcript_scope)
         verdict = _salvageable_verdict(agent_result, evidence)
         if verdict is None:
             return agent_result, evidence
         logger.warning(
             'TaskCurator: salvaged an accepted verdict from the transcript of killed '
             'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
-            transcript_scope.get('session_id'), agent_result.subtype,
+            transcript_scope.session_id, agent_result.subtype,
             agent_result.transcript_turns, json.dumps(verdict, default=str),
         )
         salvaged = replace(
@@ -3040,10 +3056,10 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
-            **transcript_scope,
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
-        agent_result, evidence = self._resolve_failed_result(agent_result, transcript_scope)
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
@@ -3146,10 +3162,10 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
-            **transcript_scope,
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
-        agent_result, evidence = self._resolve_failed_result(agent_result, transcript_scope)
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
