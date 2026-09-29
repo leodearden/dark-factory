@@ -619,17 +619,39 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
         conn.close()
 
 
-def _load_statuses(db_path: str) -> tuple[dict[int, tuple[str, str]], dict[int, str]]:
-    """``{task_id: (tag, status)}`` and ``{task_id: updated_at}``, read-only."""
+class TaskIndex(NamedTuple):
+    """What the join needs from tasks.db beyond the grep rows, read in one pass.
+
+    ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
+    delivered_check, whatever its kind — the set a sidecar capability is
+    deduplicated against.
+    """
+
+    statuses: dict[int, tuple[str, str]]
+    stamps: dict[int, str]
+    stamped_names: frozenset[tuple[int, str]]
+
+
+def _load_task_index(db_path: str) -> TaskIndex:
+    """Statuses, ``updated_at`` stamps and stamped check names, read-only."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
         statuses: dict[int, tuple[str, str]] = {}
         stamps: dict[int, str] = {}
-        for record in conn.execute("SELECT tag, id, status, updated_at FROM tasks"):
-            statuses[int(record["id"])] = (record["tag"], record["status"])
-            stamps[int(record["id"])] = record["updated_at"]
-        return statuses, stamps
+        stamped_names: set[tuple[int, str]] = set()
+        for record in conn.execute(
+            "SELECT tag, id, status, updated_at, metadata FROM tasks"
+        ):
+            task_id = int(record["id"])
+            statuses[task_id] = (record["tag"], record["status"])
+            stamps[task_id] = record["updated_at"]
+            stamped_names.update(
+                (task_id, check["name"])
+                for check in extract_delivered_checks(record["metadata"])
+                if isinstance(check.get("name"), str) and check["name"]
+            )
+        return TaskIndex(statuses, stamps, frozenset(stamped_names))
     finally:
         conn.close()
 
@@ -642,19 +664,21 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     per root, or a raise. Returning a sentinel to "skip" would silently break
     the exit-3 gate that stops a total-failure sweep reading as clean.
 
-    Deduplication is by ``(task_id, name)`` with the METADATA copy winning:
-    that is the artifact the runtime gate actually evaluates, so when the
-    sidecar and the stamped metadata disagree, the stamped one is the live
-    behaviour and the sidecar row would be a phantom.
+    Deduplication is by ``(task_id, name)`` with the METADATA copy winning,
+    regardless of kind: that is the artifact the runtime gate actually
+    evaluates, so when the sidecar and the stamped metadata disagree — even
+    when the stamped copy is a path check the sweep does not evaluate — the
+    stamped one is the live behaviour and the sidecar row would be a phantom.
     """
     db = str(tasks_db_path(project_root))
-    statuses, stamps = _load_statuses(db)
+    index = _load_task_index(db)
     open_dependents = load_open_dependents(db)
     metadata_rows = load_metadata_checks(db)
-    manifest_rows, unloadable = load_manifest_checks(project_root, statuses)
+    manifest_rows, unloadable = load_manifest_checks(project_root, index.statuses)
 
-    seen = {(r.task_id, r.name) for r in metadata_rows}
-    rows = metadata_rows + [r for r in manifest_rows if (r.task_id, r.name) not in seen]
+    rows = metadata_rows + [
+        r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names
+    ]
 
     findings: list[Finding] = []
     for row in rows:
@@ -662,7 +686,7 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
         superseded_by = None
         if outcome is CheckOutcome.FAIL and row.status in DONE_STATUSES:
             superseded_by = find_superseding_task(
-                row, repo_root=project_root, since=stamps.get(row.task_id)
+                row, repo_root=project_root, since=index.stamps.get(row.task_id)
             )
         disposition = classify_descriptor(
             outcome, status=row.status, superseded_by=superseded_by
