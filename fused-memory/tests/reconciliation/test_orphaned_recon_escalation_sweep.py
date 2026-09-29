@@ -936,41 +936,31 @@ class TestSweepOrphanedReconEscalations:
         Classifying a foreign record against the querying project's census is
         exactly the conflation that turns a live record into a reap
         instruction; each record is checked against ITS OWN project's store.
-        Each project's cycle flags only its own orphans, so the reap set is
-        the union over one run per project — and every run classifies the
-        whole queue, so the counts are the same in both.
         """
         dark_done = make_escalation(task_id='650', project_id='dark_factory')
         reify_blocked = make_escalation(task_id='5943', project_id='reify')
         reify_missing = make_escalation(task_id='5944', project_id='reify')
         queue = make_queue([dark_done, reify_blocked, reify_missing])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}},
+            REIFY_ROOT: {'master': {'5943': 'blocked'}},
+        })
 
-        flagged_by_run: dict[str, set[str]] = {}
-        for running_project_id in ('dark_factory', 'reify'):
-            taskmaster = make_taskmaster({
-                DARK_ROOT: {'master': {'650': 'done'}},
-                REIFY_ROOT: {'master': {'5943': 'blocked'}},
-            })
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='reify',
+        )
 
-            stats = await sweep_orphaned_recon_escalations(
-                queue, taskmaster, KNOWN_PROJECTS,
-                running_project_id=running_project_id,
-            )
-
-            assert stats['terminal'] == 1
-            assert stats['live'] == 1, "reify's blocked subject must stay live"
-            assert stats['missing'] == 1
-            assert {c.args[0] for c in taskmaster.list_tags.await_args_list} == {
-                DARK_ROOT, REIFY_ROOT,
-            }
-            flagged_by_run[running_project_id] = {f['task_id'] for f in stats['flags']}
-
-        assert set().union(*flagged_by_run.values()) == {'650', '5944'}
-        for running_project_id, flagged in flagged_by_run.items():
-            assert '5943' not in flagged, (
-                "task 650 being done in dark_factory says nothing about reify's "
-                f'5943 (flagged in the {running_project_id} run)'
-            )
+        assert stats['terminal'] == 1
+        assert stats['live'] == 1, "reify's blocked subject must stay live"
+        assert stats['missing'] == 1
+        assert {c.args[0] for c in taskmaster.list_tags.await_args_list} == {
+            DARK_ROOT, REIFY_ROOT,
+        }
+        flagged = {f['task_id'] for f in stats['flags']}
+        assert flagged == {'5944'}
+        assert '5943' not in flagged, (
+            "task 650 being done in dark_factory says nothing about reify's 5943"
+        )
 
     @pytest.mark.asyncio
     async def test_census_is_fetched_at_most_once_per_project(self):

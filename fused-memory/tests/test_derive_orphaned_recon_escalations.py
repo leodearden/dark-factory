@@ -30,7 +30,6 @@ from escalation.queue import EscalationQueue
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
-    escalation_project_id,
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.utils.target_store_preflight import TargetStoreMissing
@@ -125,19 +124,20 @@ def seeded_queue(tmp_path):
     return queue, tmp_path, records
 
 
+DARK_STORE = {
+    'master': {
+        '650': 'done',
+        '651': 'blocked',
+        '653': 'cancelled',
+        '654': 'done',
+        '656': 'done',
+    },
+}
+
+
 @pytest.fixture
 def taskmaster():
-    return _make_taskmaster({
-        DARK_ROOT: {
-            'master': {
-                '650': 'done',
-                '651': 'blocked',
-                '653': 'cancelled',
-                '654': 'done',
-                '656': 'done',
-            },
-        },
-    })
+    return _make_taskmaster({DARK_ROOT: DARK_STORE})
 
 
 def _resolution_note_of(queue: EscalationQueue, esc_id: str) -> str:
@@ -390,22 +390,30 @@ class TestDeriveOrphanedReconEscalations:
 
     @pytest.mark.asyncio
     async def test_the_script_and_the_in_cycle_sweep_agree_record_for_record(
-        self, seeded_queue, taskmaster,
+        self, seeded_queue,
     ):
         """ONE derivation, two channels: the counts and the selected set must match.
 
         Stage 1 flags and this script closes, so a drift between them hands
         the sole closer a set the in-cycle finding never named.  Sharing only
         the leaf predicates did not prevent that — the composition that
-        produces the counts is what has to be shared.
+        produces the counts is what has to be shared.  A cycle flags only its
+        own project's share of the reap set, so a reapable reify record is
+        seeded to put the agreement across that boundary.
         """
-        _, queue_dir, _ = seeded_queue
+        queue, queue_dir, _ = seeded_queue
+        foreign = _submit(queue, '5944', project_id='reify')
+        roots = {**PROJECT_ROOTS, 'reify': REIFY_ROOT}
+        taskmaster = _make_taskmaster({
+            DARK_ROOT: DARK_STORE,
+            REIFY_ROOT: {'master': {'5944': 'cancelled'}},
+        })
 
         report = await _mod.run(
-            queue_dir=queue_dir, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+            queue_dir=queue_dir, project_roots=roots, taskmaster=taskmaster,
         )
         stats = await sweep_orphaned_recon_escalations(
-            EscalationQueue(queue_dir), taskmaster, PROJECT_ROOTS,
+            EscalationQueue(queue_dir), taskmaster, roots,
             running_project_id='dark_factory',
         )
 
@@ -416,11 +424,11 @@ class TestDeriveOrphanedReconEscalations:
             assert report[key] == stats[key], (
                 f'{key}: {report[key]} via the script, {stats[key]} in-cycle'
             )
-        reread = EscalationQueue(queue_dir)
-        own_project_reapable = [
-            esc_id for esc_id in report['reapable_ids']
-            if escalation_project_id(reread.get(esc_id)) == 'dark_factory'
-        ]
+        assert foreign.id in report['reapable_ids'], 'the script reaps the fleet'
+        assert not any(foreign.id in f['description'] for f in stats['flags']), (
+            "dark_factory's cycle flagged reify's orphan"
+        )
+        own_project_reapable = set(report['reapable_ids']) - {foreign.id}
         assert own_project_reapable, 'the seeded queue must exercise the agreement'
         assert len(stats['flags']) == len(own_project_reapable)
         for esc_id in own_project_reapable:
