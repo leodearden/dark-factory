@@ -457,7 +457,7 @@ class TestUpdatePersistence:
         assert result['enumerations'] == ['mem0_falsified_entries']
         assert 'enumeration_liveness' not in result
         task_interceptor.update_task.assert_not_awaited()
-        assert {key: seeded[key] for key in SEED_METADATA} == SEED_METADATA
+        assert seeded == {**SEED_METADATA, 'pending_since': seeded['pending_since']}
         assert await stored_metadata(backend, project_root, seeded_task_id) == seeded
 
     @pytest.mark.asyncio
