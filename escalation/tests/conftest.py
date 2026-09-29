@@ -25,8 +25,12 @@ import collections
 import sys
 import types
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    import socket
 
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
@@ -172,30 +176,78 @@ def pytest_configure(config):
 # * Readiness is an MCP handshake, not a TCP connect (`_mcp_handshake_ready`),
 #   and any startup failure is captured as BaseException — reasoning inherited
 #   from the hardened `test_status_authority_gate.py` variant when task 3736
-#   deduped these copies by UNION rather than by intersection.
+#   deduped these copies by UNION rather than by intersection. Each attempt is
+#   bounded by the remaining readiness deadline, and the wait ends as soon as
+#   the serving thread exits.
 #
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
-# How long `_start` waits for a server to complete its first MCP handshake.
-# A module-level constant rather than a literal inside `_start` so a test that
-# deliberately drives the timeout path (the not-a-RuntimeError startup-failure
-# regression test) can `monkeypatch.setattr` it down instead of paying the full
-# production bound on every run -- `_start` reads it as a global at call time.
+# Read by `_start` as a global at call time, so tests may shorten it.
 _READY_TIMEOUT_S = 10.0
 
 
-def _free_escalation_port() -> int:
-    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call.
+class EscalationServerNotReady(RuntimeError):
+    """The escalation HTTP test server never completed an MCP handshake.
 
-    Binds to port 0 (OS-assigned free port) and immediately closes the socket.
-    There is an inherent (small) TOCTOU window before the real server binds the
-    same port; acceptable for a single-threaded test run.
+    The fields are the contract; the message is for humans. ``server_exited``
+    records why the readiness wait ENDED: True when the serving thread had
+    exited, False when the deadline passed with the thread still alive.
+    ``serve_error`` is the startup failure that thread raised, if any, and
+    ``last_handshake_error`` the final client-side handshake failure, if any
+    attempt ran -- so whichever side of the wire failed is named.
+
+    A RuntimeError, so every ``pytest.raises(RuntimeError)`` consumer still
+    catches it.
+    """
+
+    def __init__(
+        self,
+        *,
+        port: int,
+        server_exited: bool,
+        serve_error: BaseException | None,
+        last_handshake_error: BaseException | None,
+    ) -> None:
+        self.port = port
+        self.server_exited = server_exited
+        self.serve_error = serve_error
+        self.last_handshake_error = last_handshake_error
+        ending = (
+            'its serving thread exited' if server_exited
+            else 'the readiness deadline passed'
+        )
+        serve_detail = (
+            f' (server thread raised: {serve_error!r})'
+            if serve_error is not None else ''
+        )
+        handshake_detail = (
+            f' (last handshake error: {last_handshake_error!r})'
+            if last_handshake_error is not None else ''
+        )
+        super().__init__(
+            f'escalation HTTP test server on 127.0.0.1:{port} did not complete '
+            f'an MCP handshake: {ending}{serve_detail}{handshake_detail}'
+        )
+
+
+def _bind_escalation_listener() -> socket.socket:
+    """Return a TCP socket bound to an OS-assigned port on 127.0.0.1, for the
+    server to listen and serve on.
+
+    The port is HELD from allocation onward: the socket stays open and does
+    not set SO_REUSEADDR, so no other socket can bind that port, not even one
+    that sets SO_REUSEADDR itself. Handing this very socket to the server is
+    what leaves no gap between choosing a port and serving on it (task 5934).
+
+    It does NOT listen(): connects are refused until the server's own
+    ``create_server()`` calls listen(), so a server that never starts gives
+    ECONNREFUSED instead of accepting into a backlog nobody answers.
     """
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    return listener
 
 
 def _drain_pending_tasks(loop) -> None:
@@ -204,7 +256,7 @@ def _drain_pending_tasks(loop) -> None:
     Mirrors ``asyncio.run()``'s own internal shutdown sequence
     (``_cancel_all_tasks``).  Without this, a task still suspended
     mid-``await`` when the loop is stopped -- the server's own root task
-    (``run_http_async``), or an internal one it spawns (e.g. sse_starlette's
+    (``uvicorn.Server.serve``), or an internal one it spawns (e.g. sse_starlette's
     ``_shutdown_watcher``) -- is only unwound later at uncontrolled
     garbage-collection time, outside of any running task context, which
     crashes anyio's shielded lifespan cleanup with an unraisable
@@ -223,6 +275,7 @@ def _drain_pending_tasks(loop) -> None:
 
 async def _mcp_handshake_ready(
     base_url: str, error_box: list[BaseException] | None = None,
+    *, timeout_s: float,
 ) -> bool:
     """True iff a real MCP client completes initialize+ping against
     ``{base_url}/mcp/``.
@@ -242,15 +295,22 @@ async def _mcp_handshake_ready(
     exists to prevent, just from the other end. So when *error_box* is passed,
     the most recent exception is recorded into it (last write wins: the final
     poll's failure is the one that describes why the deadline was reached) for
-    the caller to name in its timeout message.
+    the caller to carry in its ``EscalationServerNotReady``.
+
+    Each attempt is bounded by the required *timeout_s*: an endpoint that
+    accepts but never answers would otherwise hold the attempt far past the
+    caller's readiness deadline, since the client's own read timeout is minutes.
     """
+    import asyncio
+
     from fastmcp import Client
     from fastmcp.client.transports import StreamableHttpTransport
 
     transport = StreamableHttpTransport(f'{base_url}/mcp/')
     try:
-        async with Client(transport) as client:
-            await client.ping()
+        async with asyncio.timeout(timeout_s):
+            async with Client(transport) as client:
+                await client.ping()
     except Exception as exc:  # noqa: BLE001 - any failure just means "not ready yet"
         if error_box is not None:
             error_box[:] = [exc]
@@ -271,12 +331,16 @@ def _serve_escalation_mcp_impl():
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
-    startup_sweep=False, dedupe_config=...)`` and serves it via
-    ``FastMCP.run_http_async`` on an OS-assigned free localhost port inside a
-    daemon thread running its own event loop.  Readiness is polled by a real
-    MCP handshake (``_mcp_handshake_ready``, bounded ~10s total) -- not a bare
-    TCP connect, and no fixed sleep.  Every server started through the factory
-    is torn down when the test finishes.
+    startup_sweep=False, dedupe_config=...)`` and serves its ``http_app()``
+    through ``uvicorn.Server`` -- production's shape -- on a localhost listener
+    the fixture binds and holds from allocation onward
+    (``_bind_escalation_listener``), inside a daemon thread running its own
+    event loop; teardown closes that listener.  Readiness is polled by a real
+    MCP handshake (``_mcp_handshake_ready``) -- not a bare TCP connect, and no
+    fixed sleep -- until it succeeds, the serving thread exits, or ~10s pass;
+    each attempt is bounded by the time remaining.  Failure raises
+    ``EscalationServerNotReady``.  Every server started through the factory is
+    torn down when the test finishes.
 
     ``startup_sweep=False`` so pre-seeded queue files are not relocated by the
     startup sweep (the existing test convention in this suite).
@@ -313,6 +377,8 @@ def _serve_escalation_mcp_impl():
     import threading
     import time
 
+    import uvicorn
+
     from escalation.dedupe import DedupeConfig
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
@@ -326,7 +392,8 @@ def _serve_escalation_mcp_impl():
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
         )
-        port = _free_escalation_port()
+        listener = _bind_escalation_listener()
+        port = listener.getsockname()[1]
         loop = asyncio.new_event_loop()
         serve_error: BaseException | None = None
         state = {'stopping': False}
@@ -335,12 +402,11 @@ def _serve_escalation_mcp_impl():
             nonlocal serve_error
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(
-                    mcp.run_http_async(
-                        host='127.0.0.1', port=port,
-                        show_banner=False, log_level='error',
-                    )
-                )
+                # MCP here is plain HTTP: no websocket implementation to load.
+                server = uvicorn.Server(uvicorn.Config(
+                    mcp.http_app(), log_level='error', ws='none',
+                ))
+                loop.run_until_complete(server.serve(sockets=[listener]))
             except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
                 # Two distinct cases, told apart by the `stopping` flag:
                 #
@@ -350,14 +416,14 @@ def _serve_escalation_mcp_impl():
                 # * Anything raised before teardown began is a genuine startup
                 #   failure and must be surfaced below.
                 #
-                # BaseException, not RuntimeError: _free_escalation_port()
-                # binds-then-closes, so a TOCTOU port steal (or any other bind
-                # failure) reaches here as an OSError -- or, since uvicorn
-                # calls sys.exit(1) on a failed bind, as SystemExit, which is
-                # not even an Exception subclass. Narrowing to RuntimeError
-                # leaves serve_error None for both, so the readiness timeout
-                # below reports only the generic "did not complete an MCP
-                # handshake" and silently drops the one fact a reader needs.
+                # BaseException, not RuntimeError: a startup failure need not
+                # be a RuntimeError. asyncio rejects a listener it cannot serve
+                # on with ValueError, and uvicorn's own startup error paths end
+                # in sys.exit(1), i.e. SystemExit, which is not even an
+                # Exception subclass. Narrowing to RuntimeError leaves
+                # serve_error None for those, so the readiness timeout below
+                # reports only the generic "did not complete an MCP handshake"
+                # and silently drops the one fact a reader needs.
                 if not state['stopping']:
                     serve_error = exc
             finally:
@@ -368,47 +434,46 @@ def _serve_escalation_mcp_impl():
             target=_serve_forever, name=f'escalation-mcp-http-{port}', daemon=True,
         )
         thread.start()
-        started.append((loop, thread, state, port))
+        started.append((loop, thread, state, port, listener))
 
         # Gate readiness on a real MCP handshake (initialize+ping), not a bare
         # TCP connect: a successful connect only proves the OS accept queue is
         # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
         # poll implicitly re-probes the TCP layer too (a refused/reset connect
         # just fails the handshake and retries), so no separate TCP wait is
-        # needed. Bounded ~10s instead of a fixed sleep.
+        # needed. Bounded ~10s instead of a fixed sleep, and ended early by the
+        # serving thread's death: past that point nothing of ours is listening
+        # on the port. Thread death is checked BEFORE the deadline so a thread
+        # that died during the final poll interval is still reported as exited.
         base_url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + _READY_TIMEOUT_S
         handshake_errors: list[BaseException] = []
-        ready = False
-        while time.monotonic() < deadline:
-            if asyncio.run(_mcp_handshake_ready(base_url, handshake_errors)):
-                ready = True
+        server_exited = False
+        while True:
+            if not thread.is_alive():
+                server_exited = True
+                thread.join()
                 break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if asyncio.run(_mcp_handshake_ready(
+                base_url, handshake_errors, timeout_s=remaining,
+            )):
+                return base_url, port, queue
             time.sleep(0.05)
-        if not ready:
-            # BOTH sides of the wire get named. `serve_error` covers a server
-            # thread that died; `handshake_errors` covers the case where the
-            # thread is perfectly healthy and it is the CLIENT half that cannot
-            # complete -- without it that case reports only "did not complete an
-            # MCP handshake", i.e. restates the timeout and explains nothing.
-            detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
-            handshake_detail = (
-                f' (last handshake error: {handshake_errors[-1]!r})'
-                if handshake_errors else ''
-            )
-            raise RuntimeError(
-                f'escalation HTTP test server did not complete an MCP handshake '
-                f'on 127.0.0.1:{port} within {_READY_TIMEOUT_S:g}s'
-                f'{detail}{handshake_detail}'
-            )
-
-        return f'http://127.0.0.1:{port}', port, queue
+        raise EscalationServerNotReady(
+            port=port,
+            server_exited=server_exited,
+            serve_error=serve_error,
+            last_handshake_error=handshake_errors[-1] if handshake_errors else None,
+        )
 
     try:
         yield _start
     finally:
         hung = []
-        for loop, thread, state, port in started:
+        for loop, thread, state, port, listener in started:
             state['stopping'] = True
             # A thread that died during startup already ran `loop.close()` in
             # its own `finally`, and stopping a CLOSED loop raises
@@ -420,6 +485,9 @@ def _serve_escalation_mcp_impl():
             thread.join(timeout=5.0)
             if thread.is_alive():
                 hung.append(f'escalation-mcp-http-{port}')
+            # Released only once its server is gone -- hung, stopped, or dead
+            # at startup alike. close() is idempotent.
+            listener.close()
         # Collected, not asserted in-loop: an in-loop assert would abort
         # teardown of every server started AFTER the first hung one, leaking
         # precisely the daemon threads this assert exists to prevent.
@@ -483,7 +551,7 @@ def escalation_conftest():
 
     The fixtures above auto-resolve by name, but some of this module's
     contents are not fixtures at all (``_mcp_handshake_ready``,
-    ``_free_escalation_port``) and some tests need the UNDECORATED generator
+    ``_bind_escalation_listener``) and some tests need the UNDECORATED generator
     behind ``serve_escalation_mcp`` via ``__wrapped__``, so that one server's
     startup and teardown can be observed in isolation. Handing the module over
     through a fixture is how those tests reach it; see
@@ -504,10 +572,9 @@ def escalation_conftest():
     and not a second import of the same file -- is that ``sys.modules[__name__]``
     is the LIVE module object pytest itself loaded, so ``monkeypatch.setattr``
     against it really does patch what ``_serve_escalation_mcp_impl``'s body
-    reads. That is pinned behaviourally rather than by introspection: the
-    startup-failure and readiness-bound tests in
+    reads. That is pinned behaviourally rather than by introspection: tests in
     ``test_serve_escalation_mcp_fixture.py`` monkeypatch
-    ``_free_escalation_port`` / ``_READY_TIMEOUT_S`` here and observe the
+    ``_bind_escalation_listener`` / ``_READY_TIMEOUT_S`` here and observe the
     fixture pick both up, which no second import could satisfy.
 
     Function-scoped deliberately -- it holds no state and is cheap, so it

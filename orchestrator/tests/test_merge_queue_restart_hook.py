@@ -22,7 +22,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, fails, hangs_until
+from _merge_lane_fakes import (
+    FakeVerifier,
+    fails,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -76,7 +82,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -630,6 +636,7 @@ async def test_anti_retry_deterministic_failure_not_requeued(
     outcome = await asyncio.wait_for(req.result, timeout=60)
 
     assert outcome.status == 'blocked', f'Expected blocked, got: {outcome}'
+    assert not main_health_probe_spawned(outcome), outcome.reason
     assert 'Merge worker shutting down' not in outcome.reason, (
         f'Expected a non-shutdown reason; got {outcome.reason!r}'
     )

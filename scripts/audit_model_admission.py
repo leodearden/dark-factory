@@ -7,13 +7,13 @@ completing, are the per-model ceiling and the scoped account cap behaving, and
 has M leaked onto a role outside R.
 
 Written for the D6 claude-fable-5-1 admission milestone checks (tasks 5440 and
-5441), but parameterized by --model / --expect-roles / --since / --window /
---ceiling so any future model admission is the same command with different
+5441), but parameterized by --model / --expect-roles / --since / --until /
+--window / --ceiling so any future model admission is the same command with different
 arguments, rather than a fresh set of hand-written SQL that quietly disagrees
 with the last one.
 
 STRICTLY READ-ONLY.  Every connection is a `mode=ro` SQLite URI
-(:func:`_connect_ro`); this script writes nothing, files nothing, and emits no
+(:func:`connect_ro`); this script writes nothing, files nothing, and emits no
 events.  It is safe to run against a live store while the orchestrator is
 merging.
 
@@ -68,7 +68,7 @@ MODEL_REJECTION_REASONS = frozenset({
 })
 
 
-def _connect_ro(path: str | Path) -> sqlite3.Connection:
+def connect_ro(path: str | Path) -> sqlite3.Connection:
     """Open *path* strictly read-only, via a `mode=ro` SQLite URI.
 
     `mode=ro` (rather than a bare `sqlite3.connect`) is the house convention for
@@ -83,7 +83,7 @@ def _connect_ro(path: str | Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
-def _iso(moment: datetime) -> str:
+def iso(moment: datetime) -> str:
     """Format *moment* in the exact ISO-8601 spelling the store writes.
 
     `event_store.py::EventStore.emit` and the cost store both write
@@ -93,6 +93,20 @@ def _iso(moment: datetime) -> str:
     correct chronological one.
     """
     return moment.astimezone(UTC).isoformat()
+
+
+def _time_bounds(
+    column: str, since: datetime, until: datetime | None
+) -> tuple[str, tuple[str, ...]]:
+    """The WHERE fragment ``since <= column < until`` and its parameters.
+
+    Half-open, like :func:`spend_in_window`: a row stamped exactly at *until*
+    is out, so two adjacent windows never both count it.  *until* None leaves
+    the range open above.
+    """
+    if until is None:
+        return f'{column} >= ?', (iso(since),)
+    return f'{column} >= ? AND {column} < ?', (iso(since), iso(until))
 
 
 def _loads_object(raw: Any) -> dict[str, Any] | None:
@@ -162,9 +176,13 @@ class RoutingScan:
 
 
 def scan_routing_decisions(
-    conn: sqlite3.Connection, *, model: str, since: datetime
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    until: datetime | None = None,
 ) -> RoutingScan:
-    """Scan `routing_decision` events at or after *since*, once, for two answers.
+    """Scan `routing_decision` events in ``[since, until)``, once, for two answers.
 
     SELECTIONS are the decisions that resolved to *model*, each carrying the
     ``source_layer``/``rule_id``/``routing_tier`` that say WHY — which is the
@@ -176,10 +194,11 @@ def scan_routing_decisions(
     there is.  See :func:`_is_model_rejection` for why they cannot be filtered
     to *model* itself.
     """
+    bounds, params = _time_bounds('timestamp', since, until)
     cursor = conn.execute(
         'SELECT timestamp, task_id, data FROM events '
-        'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
-        ('routing_decision', _iso(since)),
+        f'WHERE event_type = ? AND {bounds} ORDER BY timestamp, id',
+        ('routing_decision', *params),
     )
     selections: list[RoutingSelection] = []
     rejections: list[RoutingRejection] = []
@@ -244,6 +263,16 @@ DEFAULT_ROLE_CEILINGS_SECS: dict[str, int] = {'merger': 600}
 # merger run, and `merge_finalized` events carry no role of their own.
 MERGER_ROLE = 'merger'
 
+# Roles whose `routing_decision` is recorded BEFORE dispatch, by
+# orchestrator/src/orchestrator/routing_dispatch.py::resolve_and_record_route
+# (these are the role_name literals its callers pass). Every other role runs
+# through orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke,
+# which records the decision AFTER the run's invocation_end. So a run's own
+# decision sits on a different side of the run depending on its role.
+PRE_DISPATCH_DECISION_ROLES = frozenset({
+    'steward', 'triage', 'deep_reviewer', 'unblock_auto', 'module_tagger',
+})
+
 
 @dataclass(frozen=True)
 class MergeOutcome:
@@ -270,6 +299,11 @@ class InvocationRecord:
     :data:`DEFAULT_ROLE_CEILINGS_SECS` for why a healthy run exceeds it.
     ``timed_out`` is the producer's own kill verdict, and is the field to read
     for "did this run die at a wall clock".
+
+    ``subtype`` is the end event's CLI result subtype (e.g. ``error_max_turns``).
+    ``escalation_id`` is the escalation the end event names (steward runs only).
+    ``routing_tier`` and ``dispatch_max_turns`` come from the run's own
+    `routing_decision` (see :func:`_dispatch_decision`).
     """
 
     task_id: str | None
@@ -287,6 +321,10 @@ class InvocationRecord:
     end_event_model: str | None
     merge_outcome: MergeOutcome | None
     at_or_over_flat_role_ceiling: bool | None
+    subtype: str | None
+    escalation_id: str | None
+    routing_tier: int | None
+    dispatch_max_turns: int | None
 
 
 @dataclass(frozen=True)
@@ -299,20 +337,28 @@ class EventRow:
     payload: dict[str, Any]
 
 
-def _load_events(
-    conn: sqlite3.Connection, event_type: str, since: datetime
+def load_events(
+    conn: sqlite3.Connection,
+    event_type: str,
+    since: datetime,
+    until: datetime | None = None,
 ) -> list[EventRow]:
-    """Load *event_type* rows at or after *since*, in (timestamp, id) order.
+    """Load *event_type* rows in ``[since, until)``, in (timestamp, id) order.
 
     Rows whose payload is not a JSON object are skipped — see
     :func:`_loads_object` for why tolerance is the right posture against a live
     store.
     """
-    cursor = conn.execute(
+    bounds, params = _time_bounds('timestamp', since, until)
+    return _event_rows(conn.execute(
         'SELECT timestamp, task_id, role, data FROM events '
-        'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
-        (event_type, _iso(since)),
-    )
+        f'WHERE event_type = ? AND {bounds} ORDER BY timestamp, id',
+        (event_type, *params),
+    ))
+
+
+def _event_rows(cursor: Iterable[tuple[Any, ...]]) -> list[EventRow]:
+    """Parse (timestamp, task_id, role, data) rows, skipping non-object payloads."""
     rows = []
     for timestamp, task_id, role, raw in cursor:
         payload = _loads_object(raw)
@@ -325,8 +371,9 @@ def _by_task(rows: Iterable[EventRow]) -> dict[str | None, list[EventRow]]:
     """Group *rows* by task_id, preserving each task's chronological order.
 
     Grouping in Python rather than issuing a correlated subquery per invocation:
-    the whole of :func:`scan_invocations` is three table reads regardless of how
-    many runs match, which is what makes it safe against a 181 MB live store.
+    the whole of :func:`scan_invocations` is a fixed handful of table reads
+    regardless of how many runs match, which is what makes it safe against a
+    181 MB live store.
     """
     grouped: dict[str | None, list[EventRow]] = {}
     for row in rows:
@@ -335,7 +382,7 @@ def _by_task(rows: Iterable[EventRow]) -> dict[str | None, list[EventRow]]:
 
 
 def _merger_starts_by_task(
-    conn: sqlite3.Connection, *, model: str, since: datetime
+    conn: sqlite3.Connection, *, model: str, since: datetime, until: datetime | None
 ) -> dict[str | None, list[str]]:
     """When each task's merger runs started — ON ANY MODEL — in chronological order.
 
@@ -348,19 +395,62 @@ def _merger_starts_by_task(
     Bounded below by the earliest audited merger start (computed in SQL, so the
     bound cannot drift from the rows it bounds), because no boundary earlier
     than that can end any audited run's window.  One extra scan of the same
-    table, not a correlated subquery per audited row.
+    table, not a correlated subquery per audited row.  Unbounded ABOVE: a
+    later start ends a window even when it falls after *until*.
     """
     grouped: dict[str | None, list[str]] = {}
+    bounds, params = _time_bounds('completed_at', since, until)
     cursor = conn.execute(
         'SELECT task_id, started_at FROM invocations WHERE role = ? AND started_at > '
         '(SELECT MIN(started_at) FROM invocations '
-        'WHERE model = ? AND role = ? AND completed_at >= ?) '
+        f'WHERE model = ? AND role = ? AND {bounds}) '
         'ORDER BY started_at, id',
-        (MERGER_ROLE, model, MERGER_ROLE, _iso(since)),
+        (MERGER_ROLE, model, MERGER_ROLE, *params),
     )
     for task_id, started_at in cursor:
         grouped.setdefault(task_id, []).append(started_at)
     return grouped
+
+
+def _dispatch_decisions_by_task(
+    conn: sqlite3.Connection, *, model: str, since: datetime, until: datetime | None
+) -> dict[str | None, list[EventRow]]:
+    """Every `routing_decision` on a task that one of the matched runs worked on.
+
+    Restricted by TASK rather than by time, because a run's own decision falls
+    outside the runs' own time span on both sides: a pre-dispatch decision
+    precedes its run's start (by minutes when the dispatch waits on an account),
+    and a post-completion one follows its run's completion, even past *until*.
+    """
+    bounds, params = _time_bounds('completed_at', since, until)
+    return _by_task(_event_rows(conn.execute(
+        'SELECT timestamp, task_id, role, data FROM events WHERE event_type = ? '
+        f'AND task_id IN (SELECT task_id FROM invocations WHERE model = ? AND {bounds}) '
+        'ORDER BY timestamp, id',
+        ('routing_decision', model, *params),
+    )))
+
+
+def _dispatch_decision(
+    decisions: Sequence[EventRow], *, role: str, started_at: str, completed_at: str
+) -> dict[str, Any] | None:
+    """The run's OWN routing decision, looked for on the side its producer records it.
+
+    For a :data:`PRE_DISPATCH_DECISION_ROLES` role, the last same-role decision
+    at or before the run started. For every other role, the first at or after
+    it completed. The last one before the start belongs to the PREVIOUS run of
+    that role on the task, so borrowing it would report that run's tier and cap.
+    """
+    same_role = [row for row in decisions if row.role == role]
+    if role in PRE_DISPATCH_DECISION_ROLES:
+        before = [row for row in same_role if row.timestamp <= started_at]
+        return before[-1].payload if before else None
+    return next((row.payload for row in same_role if row.timestamp >= completed_at), None)
+
+
+def _int_or_none(value: Any) -> int | None:
+    """*value* if it is a real int (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _merge_outcome(
@@ -399,32 +489,44 @@ def scan_invocations(
     *,
     model: str,
     since: datetime,
+    until: datetime | None = None,
     role_ceilings_secs: dict[str, int] | None = None,
 ) -> tuple[InvocationRecord, ...]:
-    """Every run of *model* completed at or after *since*, with its outcome.
+    """Every run of *model* completed in ``[since, until)``, with its outcome.
 
-    Two enrichments the `invocations` table cannot supply on its own:
+    Three enrichments the `invocations` table cannot supply on its own:
 
-    TURNS, from the matching `invocation_end` event — `invocations` has no turns
-    column, so this join is the only way to answer the question at all.  Matched
-    on task_id + role, taking the first such event at or after the invocation's
-    ``started_at``.
+    TURNS (and the end's subtype and escalation_id), from the matching
+    `invocation_end` event — `invocations` has no turns column, so this join is
+    the only way to answer the question at all.  Matched on task_id + role,
+    taking the first such event at or after the invocation's ``started_at``.
 
     MERGE OUTCOME, for merger runs, from the `merge_finalized` events inside
     this run's attribution window — see :func:`_merge_outcome` for the window
     and :func:`_merger_starts_by_task` for the boundary that closes it.
     Matched on task_id ALONE — the producer leaves these events' `role` column
-    empty — which is exactly why the window has to do the attributing.
+    empty — which is exactly why the window has to do the attributing.  A
+    merge finalized at or after *until* is not attributed, so a later re-run
+    over the same window reproduces the same outcomes.
+
+    DISPATCH TIER AND CAP, from the run's own `routing_decision` — see
+    :func:`_dispatch_decision` for which side of the run it sits on.
+
+    The `invocation_end` load is NOT bounded by *until*: it is the run's OWN
+    record, stamped a few ms after ``invocations.completed_at``, so bounding it
+    would drop the turns of a run completing just inside the window.
     """
     ceilings = DEFAULT_ROLE_CEILINGS_SECS if role_ceilings_secs is None else role_ceilings_secs
-    ends = _by_task(_load_events(conn, 'invocation_end', since))
-    merges = _by_task(_load_events(conn, 'merge_finalized', since))
-    merger_starts = _merger_starts_by_task(conn, model=model, since=since)
+    ends = _by_task(load_events(conn, 'invocation_end', since))
+    merges = _by_task(load_events(conn, 'merge_finalized', since, until))
+    merger_starts = _merger_starts_by_task(conn, model=model, since=since, until=until)
+    decisions = _dispatch_decisions_by_task(conn, model=model, since=since, until=until)
+    bounds, params = _time_bounds('completed_at', since, until)
     cursor = conn.execute(
         'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
         'capped, started_at, completed_at FROM invocations '
-        'WHERE model = ? AND completed_at >= ? ORDER BY completed_at, id',
-        (model, _iso(since)),
+        f'WHERE model = ? AND {bounds} ORDER BY completed_at, id',
+        (model, *params),
     )
     records = []
     for (task_id, project_id, role, account_name, cost_usd, duration_ms,
@@ -432,8 +534,12 @@ def scan_invocations(
         end = next(
             (row.payload for row in ends.get(task_id, ())
              if row.role == role and row.timestamp >= started_at),
-            None,
+            {},
         )
+        decision = _dispatch_decision(
+            decisions.get(task_id, ()), role=role,
+            started_at=started_at, completed_at=completed_at,
+        ) or {}
         merge = None
         if role == MERGER_ROLE:
             later_starts = merger_starts.get(task_id, ())
@@ -453,14 +559,18 @@ def scan_invocations(
             capped=bool(capped),
             started_at=started_at,
             completed_at=completed_at,
-            turns=end.get('turns') if end else None,
-            succeeded=end.get('success') if end else None,
-            timed_out=end.get('timed_out') if end else None,
-            end_event_model=end.get('model') if end else None,
+            turns=end.get('turns'),
+            succeeded=end.get('success'),
+            timed_out=end.get('timed_out'),
+            end_event_model=end.get('model'),
             merge_outcome=merge,
             at_or_over_flat_role_ceiling=(
                 None if ceiling_secs is None else duration_ms >= ceiling_secs * 1000
             ),
+            subtype=end.get('subtype'),
+            escalation_id=end.get('escalation_id'),
+            routing_tier=_int_or_none(decision.get('routing_tier')),
+            dispatch_max_turns=_int_or_none(decision.get('max_turns')),
         ))
     return tuple(records)
 
@@ -493,14 +603,18 @@ class ScopedCapScan:
 
 
 def scan_scoped_cap(
-    conn: sqlite3.Connection, *, model: str, since: datetime
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    until: datetime | None = None,
 ) -> ScopedCapScan:
-    """Cap hits attributable to *model*'s scope, plus the restarts since *since*.
+    """Cap hits attributable to *model*'s scope, plus the restarts, in ``[since, until)``.
 
     The writer of the shape read here is ``shared/src/shared/usage_gate.py::
-    AccountPool`` — its scoped path emits ``{"reason": ..., "scope": <model>}``
-    and deliberately bypasses the account-level site, which emits a payload with
-    no ``scope`` key at all.  So the KEY'S PRESENCE is the discriminator; a
+    UsageGate._handle_cap_detected`` — its scoped path emits ``{"reason": ...,
+    "scope": <model>}`` and deliberately bypasses the account-level site,
+    ``UsageGate._transition``, which emits a payload with no ``scope`` key at all.  So the KEY'S PRESENCE is the discriminator; a
     substring scan for the model name is not, since it would also match
     unrelated cap-message prose.
 
@@ -514,10 +628,11 @@ def scan_scoped_cap(
     restart reloads a restart-tier leaf, so a count that lumps in dashboard and
     fused-memory restarts answers "has it had a chance to take effect?" wrongly.
     """
+    bounds, params = _time_bounds('created_at', since, until)
     cursor = conn.execute(
         'SELECT created_at, account_name, details FROM account_events '
-        'WHERE event_type = ? AND created_at >= ? ORDER BY created_at, id',
-        ('cap_hit', _iso(since)),
+        f'WHERE event_type = ? AND {bounds} ORDER BY created_at, id',
+        ('cap_hit', *params),
     )
     scoped: list[ScopedCapHit] = []
     unscoped = 0
@@ -541,7 +656,7 @@ def scan_scoped_cap(
             service=row.payload.get('service') or '',
             reason=row.payload.get('reason'),
         )
-        for row in _load_events(conn, 'service_restart', since)
+        for row in load_events(conn, 'service_restart', since, until)
     ]
     return ScopedCapScan(
         scoped_hits=tuple(scoped),
@@ -602,11 +717,11 @@ def spend_in_window(
     total, count = conn.execute(
         'SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM invocations '
         'WHERE model = ? AND completed_at >= ? AND completed_at < ?',
-        (model, _iso(window_start), _iso(window_end)),
+        (model, iso(window_start), iso(window_end)),
     ).fetchone()
     return SpendInWindow(
-        window_start=_iso(window_start),
-        window_end=_iso(window_end),
+        window_start=iso(window_start),
+        window_end=iso(window_end),
         total_usd=total,
         invocation_count=count,
         ceiling_usd=ceiling_usd,
@@ -638,6 +753,7 @@ def roles_on_model(
     *,
     model: str,
     since: datetime,
+    until: datetime | None = None,
     expected_roles: Sequence[str],
 ) -> RoleContainment:
     """Group *model*'s runs by role and compare against *expected_roles*.
@@ -649,12 +765,13 @@ def roles_on_model(
     merger never ran on this model at all" is the loudest finding this check can
     make, and an omitted row would render it as silence.
     """
+    bounds, params = _time_bounds('completed_at', since, until)
     observed = {
         role: (count, total)
         for role, count, total in conn.execute(
             'SELECT role, COUNT(*), COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            'WHERE model = ? AND completed_at >= ? GROUP BY role ORDER BY role',
-            (model, _iso(since)),
+            f'WHERE model = ? AND {bounds} GROUP BY role ORDER BY role',
+            (model, *params),
         )
     }
     ordered = list(expected_roles) + [r for r in observed if r not in expected_roles]
@@ -675,6 +792,7 @@ class AuditResult:
 
     model: str
     since: str
+    until: str | None
     window_start: str
     window_end: str
     expected_roles: tuple[str, ...]
@@ -705,33 +823,37 @@ def audit(
     expected_roles: Sequence[str],
     window: tuple[datetime, datetime],
     ceiling_usd: float | None,
+    until: datetime | None = None,
     role_ceilings_secs: dict[str, int] | None = None,
 ) -> AuditResult:
     """Run all five scans against one connection and freeze the results.
 
-    *since* anchors the "has anything happened since the admission?" sections;
-    *window* is the separate, usually shorter, half-open span the spend-versus-
-    ceiling section is computed over (the ceiling is a trailing-24h rule, while
-    the admission may be weeks old).  Keeping them separate is why the report
-    can label each section with the window it actually used.
+    *since* anchors the "has anything happened since the admission?" sections,
+    and *until*, when given, bounds them above (half-open); *window* is the
+    separate, usually shorter, half-open span the spend-versus-ceiling section
+    is computed over (the ceiling is a trailing-24h rule, while the admission
+    may be weeks old).  Keeping them separate is why the report can label each
+    section with the window it actually used.
     """
     return AuditResult(
         model=model,
-        since=_iso(since),
-        window_start=_iso(window[0]),
-        window_end=_iso(window[1]),
+        since=iso(since),
+        until=None if until is None else iso(until),
+        window_start=iso(window[0]),
+        window_end=iso(window[1]),
         expected_roles=tuple(expected_roles),
-        routing=scan_routing_decisions(conn, model=model, since=since),
+        routing=scan_routing_decisions(conn, model=model, since=since, until=until),
         invocations=scan_invocations(
-            conn, model=model, since=since, role_ceilings_secs=role_ceilings_secs,
+            conn, model=model, since=since, until=until,
+            role_ceilings_secs=role_ceilings_secs,
         ),
-        scoped_cap=scan_scoped_cap(conn, model=model, since=since),
+        scoped_cap=scan_scoped_cap(conn, model=model, since=since, until=until),
         spend=spend_in_window(
             conn, model=model, window_start=window[0],
             window_end=window[1], ceiling_usd=ceiling_usd,
         ),
         containment=roles_on_model(
-            conn, model=model, since=since, expected_roles=expected_roles,
+            conn, model=model, since=since, until=until, expected_roles=expected_roles,
         ),
     )
 
@@ -742,6 +864,7 @@ def render_json(result: AuditResult) -> str:
         'meta': {
             'model': result.model,
             'since': result.since,
+            'until': result.until,
             'window_start': result.window_start,
             'window_end': result.window_end,
             'expected_roles': list(result.expected_roles),
@@ -763,7 +886,7 @@ def render_json(result: AuditResult) -> str:
     }, indent=2)
 
 
-def _table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
+def markdown_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     """A markdown table, or a single italic line when there are no rows.
 
     The empty case is spelled out rather than emitted as a headed table with no
@@ -787,49 +910,52 @@ def render_markdown(result: AuditResult) -> str:
     a report that pastes this output cannot disagree with the queries that
     produced it.
     """
-    model, since = result.model, result.since
+    model = result.model
+    span = f'since {result.since}' + (f' until {result.until}' if result.until else '')
     out: list[str] = []
 
-    out += [f'### 1. Routing decisions for `{model}` since {since}', '']
-    out += _table(
+    out += [f'### 1. Routing decisions for `{model}` {span}', '']
+    out += markdown_table(
         ['timestamp', 'task', 'role', 'source_layer', 'rule_id', 'tier'],
         [(s.timestamp, s.task_id or '-', s.role, s.source_layer, s.rule_id or '-',
           s.routing_tier) for s in result.routing.selections],
     )
-    out += ['', f'Rejections naming a model, any role, since {since}:', '']
-    out += _table(
+    out += ['', f'Rejections naming a model, any role, {span}:', '']
+    out += markdown_table(
         ['timestamp', 'task', 'role', 'resolved to', 'reasons'],
         [(r.timestamp, r.task_id or '-', r.role, r.resolved_model, ', '.join(r.reasons))
          for r in result.routing.rejections],
     )
     out += ['', f'Unparseable payloads skipped: {result.routing.skipped_rows}', '']
 
-    out += [f'### 2. Invocations on `{model}` and how they ended, since {since}', '']
-    out += _table(
-        ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok', 'timed out',
-         'model @end', 'duration ms', 'over flat ceiling', 'merge'],
-        [(r.task_id or '-', r.project_id, r.role, r.account_name, f'{r.cost_usd:.2f}',
+    out += [f'### 2. Invocations on `{model}` and how they ended, {span}', '']
+    out += markdown_table(
+        ['task', 'project', 'role', 'tier', 'subtype', 'account', 'cost $', 'turns',
+         'ok', 'timed out', 'model @end', 'duration ms', 'over flat ceiling', 'merge'],
+        [(r.task_id or '-', r.project_id, r.role,
+          '-' if r.routing_tier is None else r.routing_tier, r.subtype or '-',
+          r.account_name, f'{r.cost_usd:.2f}',
           '-' if r.turns is None else r.turns, r.succeeded, r.timed_out,
           r.end_event_model or '-', r.duration_ms, r.at_or_over_flat_role_ceiling,
           _merge_cell(r.merge_outcome)) for r in result.invocations],
     )
     out += ['']
 
-    out += [f'### 3. Dispatches at retry tier >= 1 since {since}', '']
+    out += [f'### 3. Dispatches at retry tier >= 1 {span}', '']
     if result.tier_escalations:
-        out += _table(
+        out += markdown_table(
             ['timestamp', 'task', 'role', 'tier', 'rule_id'],
             [(s.timestamp, s.task_id or '-', s.role, s.routing_tier, s.rule_id or '-')
              for s in result.tier_escalations],
         )
     else:
         out += [f'_Not yet exercised: no dispatch resolved to `{model}` at tier >= 1 '
-                f'since {since}. Absence of a tier-escalated dispatch is not a '
+                f'{span}. Absence of a tier-escalated dispatch is not a '
                 f'failure of the rule; it means the rule has not been reached._']
     out += ['']
 
-    out += [f'### 4. Scoped cap posture for `{model}` since {since}', '']
-    out += _table(
+    out += [f'### 4. Scoped cap posture for `{model}` {span}', '']
+    out += markdown_table(
         ['created_at', 'account', 'reason'],
         [(h.created_at, h.account_name, h.reason) for h in result.scoped_cap.scoped_hits],
     )
@@ -837,7 +963,7 @@ def render_markdown(result: AuditResult) -> str:
                 f'{result.scoped_cap.unscoped_cap_hit_count}', '',
             'Service restarts since then (only an orchestrator restart reloads a '
             'restart-tier leaf):', '']
-    out += _table(
+    out += markdown_table(
         ['timestamp', 'service', 'reason'],
         [(r.timestamp, r.service, r.reason or '-') for r in result.scoped_cap.restarts],
     )
@@ -852,7 +978,7 @@ def render_markdown(result: AuditResult) -> str:
     headroom = '-' if spend.headroom_usd is None else f'{spend.headroom_usd:.2f}'
     over_ceiling = '-' if spend.at_or_over_ceiling is None else spend.at_or_over_ceiling
     out += [f'### 5. Spend on `{model}` over [{spend.window_start}, {spend.window_end})', '']
-    out += _table(
+    out += markdown_table(
         ['invocations', 'total $', 'ceiling $', 'headroom $', 'at/over ceiling'],
         [(spend.invocation_count, f'{spend.total_usd:.2f}', ceiling, headroom,
           over_ceiling)],
@@ -860,9 +986,9 @@ def render_markdown(result: AuditResult) -> str:
     out += ['']
 
     containment = result.containment
-    out += [f'### 6. Roles observed on `{model}` since {since}', '',
+    out += [f'### 6. Roles observed on `{model}` {span}', '',
             f'Admitted roles: {", ".join(containment.expected_roles)}', '']
-    out += _table(
+    out += markdown_table(
         ['role', 'invocations', 'total $', 'admitted'],
         [(u.role, u.count, f'{u.total_usd:.2f}', u.role in containment.expected_roles)
          for u in containment.by_role],
@@ -897,7 +1023,7 @@ def _parse_window(spec: str) -> timedelta:
     return timedelta(hours=size) if match.group(2) == 'h' else timedelta(days=size)
 
 
-def _parse_moment(spec: str) -> datetime:
+def parse_moment(spec: str) -> datetime:
     """Parse an ISO-8601 instant, reading a naive one as UTC.
 
     Naive-means-UTC rather than naive-means-local: the store is UTC throughout,
@@ -940,12 +1066,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help='comma-separated roles the model was admitted for, e.g. merger,steward',
     )
     parser.add_argument(
-        '--since', required=True, type=_parse_moment,
-        help='ISO-8601 instant the admission was applied; anchors sections 1-4 and 6',
+        '--since', required=True, type=parse_moment,
+        help='ISO-8601 instant the admission was applied; anchors sections 1-4 and 6, '
+             'which --until bounds above',
+    )
+    parser.add_argument(
+        '--until', default=None, type=parse_moment,
+        help='ISO-8601 instant that ends sections 1-4 and 6 (half-open: a row at '
+             'it is out) and the spend window; omitted means now, open-ended. '
+             'Fix it for a report that must reproduce on a re-run.',
     )
     parser.add_argument(
         '--window', default='24h', type=_parse_window,
-        help='trailing window for the spend-vs-ceiling section (default: 24h)',
+        help='trailing window, ending at --until, for the spend-vs-ceiling section '
+             '(default: 24h)',
     )
     parser.add_argument(
         '--ceiling', default=None, type=float,
@@ -965,13 +1099,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
     args = parser.parse_args(argv)
 
-    window_end = datetime.now(UTC)
-    conn = _connect_ro(args.runs_db)
+    window_end = args.until or datetime.now(UTC)
+    conn = connect_ro(args.runs_db)
     try:
         result = audit(
             conn,
             model=args.model,
             since=args.since,
+            until=args.until,
             expected_roles=tuple(
                 r.strip() for r in args.expect_roles.split(',') if r.strip()
             ),

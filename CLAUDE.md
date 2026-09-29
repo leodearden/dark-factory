@@ -219,6 +219,12 @@ when they can answer there is nothing to anchor.
 | `add_memory` | 0-3 LLM calls | Discrete, distilled facts — **prefer this** |
 | `add_episode` | 5-15 LLM calls | Raw content needing extraction — use sparingly |
 
+```
+add_memory(content="Task 3127 moved retries into the caller because they hid latency",
+           category="decisions_and_rationale", project_id="dark_factory",
+           agent_id="claude-interactive", entities=[{'kind': 'task', 'id': 3127}])
+```
+
 ### Category routing
 
 | Category | Primary Store | Use for |
@@ -235,6 +241,7 @@ when they can answer there is nothing to anchor.
 Always pass these parameters on write operations:
 - **`project_id`**: `"dark_factory"`
 - **`agent_id`**: descriptive identifier, e.g. `"claude-interactive"`, `"claude-task-7"`, `"reconciliation-stage-1"`
+- **`entities`**: declare what the write is about (`[]` if nothing), e.g. `[{'kind': 'task', 'id': 3127}]`. Omitting it always succeeds; a declaration your own content contradicts is rejected.
 
 ## Task Routing
 
@@ -392,21 +399,22 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
-- A direct-to-main commit does **not** need to wait for an idle merge
-  queue. When main moves under a verify that is in flight, a solo merge
-  rebases onto the new main and lands without re-verifying, provided the
-  new commits and the branch touch no files in common
-  (`orchestrator/src/orchestrator/merge_gates.py::_reverify_rebased_tree`).
-  Two cases still cost real time. (1) Your paths overlap the in-flight
-  branch's changed files: that forces a full re-verify (~40 min), even
-  for `*.md`, until task 5293 excludes prose paths. (2) A coalesce train
-  is verifying: *any* move of main makes the train's final compare-and-swap
-  fail, the whole train verify (27–72 min measured) is discarded, and every
-  member re-merges solo (`merge_queue.py::_do_train_merge`, task 5070).
-  `get_merge_queue` does not show a train's verify (task 5245), so check
-  `data/orchestrator/runs.db` for a `train_started` in the last ~2h with no
-  `train_merged`/`train_derailed` for the same `train_id` — a heuristic:
-  restart-orphaned trains leave `train_started` rows that never close.
+- Do not direct-commit to main while a merge verify is **in flight**;
+  queued-only is fine (`depth` counts queued entries, not work). Moving main
+  under a solo merge forces a full re-verify however disjoint the files:
+  `orchestrator/src/orchestrator/merge_gates.py::_disjoint_skip_blockers`
+  refuses the disjoint skip here on two counts — this project's
+  `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
+  not itself land green (commit `fa95988c8e`). Under a coalesce train it is
+  worse: the train's CAS fails and the whole train verify is discarded (task
+  5070). Commit when
+  `get_merge_queue` shows `verify_in_progress` null and
+  `occupancy.inflight_total` 0. It does not show a train's verify (task
+  5245), so also check `data/orchestrator/runs.db` for a `train_started` in the
+  last ~2h with no `train_merged`/`train_derailed` for that `train_id` (a
+  heuristic: restart-orphaned trains leave rows that never close). On a busy
+  lane, sending the docs change through the merge queue costs a verify slot
+  but interrupts nothing.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

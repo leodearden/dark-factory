@@ -29,6 +29,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from shared.asyncio_tasks import abandon_task, track_task
 
 from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import escalations as api_escalations_routes
@@ -58,7 +59,7 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
-from dashboard.data.db import DbPool, track_task
+from dashboard.data.db import DbPool
 from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
@@ -526,17 +527,9 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
     ]
 
 
-# Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
-# reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight; this set holds the strong reference until track_task's
-# done-callback removes it.
+# Abandoned _probe_db tasks (see below): the strong references that keep them
+# alive until they unwind, per shared/src/shared/asyncio_tasks.py::track_task.
 _ABANDONED_PROBES: set[asyncio.Task] = set()
-
-
-def _abandon_probe(task: asyncio.Task) -> None:
-    """Cancel *task* fire-and-forget and hold a strong reference until it ends."""
-    task.cancel()  # fire-and-forget — do NOT await the unwinding
-    track_task(task, _ABANDONED_PROBES)
 
 
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
@@ -606,10 +599,10 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         # asyncio.wait() does not cancel what it waits on, and we catch
         # BaseException (not just CancelledError) so no exceptional exit
         # from this await leaves the task untracked — rationale above.
-        _abandon_probe(task)
+        abandon_task(task, _ABANDONED_PROBES)
         raise
     if task not in done:
-        _abandon_probe(task)
+        abandon_task(task, _ABANDONED_PROBES)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
@@ -645,10 +638,8 @@ class _LiveProbe(NamedTuple):
 _mcp_probe: _LiveProbe | None = None
 _mcp_fanout_last_ok: float | None = None
 
-# Strong references to live probe tasks. The event loop holds only a WEAK
-# reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight -- the same hazard _ABANDONED_PROBES exists for, and track_task's
-# done-callback removes the entry when it ends.
+# Strong references to live probe tasks, held until they end -- the same hazard
+# _ABANDONED_PROBES exists for; see shared/src/shared/asyncio_tasks.py::track_task.
 _MCP_PROBES: set[asyncio.Task] = set()
 
 

@@ -8,17 +8,17 @@
 // LIE: data.js seeded `DONE_COUNTS: {}`, so `DONE_COUNTS[p]` read undefined and
 // both consumers fell through to a count of the done rows in ACTIVE_TASKS. The
 // default render fetches none of those, so every healthy project rendered a
-// confident "0 done". The same two halves as orch_summary_guard.test.mjs, for
-// the same reason (nothing executes a .jsx file):
+// confident "0 done". So the suite has two halves, because nothing executes a
+// .jsx file:
 //
 //   1. BEHAVIOUR: the guard, run over real wire entries, answers a measured
 //      count or datum.js's placeholder, and never a zero it did not read.
 //   2. WIRING: neither consumer still reads DONE_COUNTS, and both take the
 //      guard off window.DF_TASK_DONE_COUNT.
 //
-// LOADED THROUGH A WINDOW SHIM, unlike orch_summary.js. The guard takes its
-// placeholder from window.DF_DATUM at module scope, and datum.js in turn
-// destructures window.DF_ENDPOINT_STALENESS at module scope. So the shim is
+// LOADED THROUGH A WINDOW SHIM. The guard takes its placeholder from
+// window.DF_DATUM at module scope, and datum.js in turn destructures
+// window.DF_ENDPOINT_STALENESS at module scope. So the shim is
 // installed first, datum.js is required through it, and only then the guard:
 // data_poll.test.mjs::loadDataJs has the same shape, and index.html gives the
 // three files the same order.
@@ -230,7 +230,9 @@ test('(c) the verdict is read off the census alone, whatever banner the rows ear
 
 // ── Wiring: no consumer reads DONE_COUNTS, both take the guard ─────────────
 
-const CONSUMERS = ['tab_tasks.jsx', 'tabs.jsx'];
+// tabs.jsx left in task 5589 (gamma2): OrchTab reads the census through
+// task_snapshot.js. tab_tasks.jsx is gamma3's, which deletes this module.
+const CONSUMERS = ['tab_tasks.jsx'];
 
 test('no consumer still reads DONE_COUNTS', () => {
   for (const name of CONSUMERS) {
@@ -256,4 +258,14 @@ test('every consumer destructures the guard it depends on', () => {
         'has no guard to go through',
     );
   }
+});
+
+test('tabs.jsx no longer takes the interim guard', () => {
+  const source = fs.readFileSync(path.join(REDUX_DIR, 'tabs.jsx'), 'utf8');
+  assert.equal(
+    /window\.DF_TASK_DONE_COUNT/.test(source),
+    false,
+    'tabs.jsx still destructures window.DF_TASK_DONE_COUNT; OrchTab reads the ' +
+      "census's terminal view through task_snapshot.js instead",
+  );
 });

@@ -1,10 +1,13 @@
-"""Behavioural coverage for the `producer | grep -q PAT` probes in three scripts.
+"""Behavioural coverage for `producer | grep -q PAT` probes.
 
-Covers scripts/export-data.sh, scripts/import-data.sh and
-scripts/deploy-w5-recon-reliability.sh. The sibling suite
-test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh,
-and the two share one slicer, one probe scaffold (`SIGPIPE_BULK_BYTES` and
-`dispatch_stub_body`) and one detector — all in tests/scripts/shell_sections.py.
+The sections cover scripts/export-data.sh, scripts/import-data.sh and
+scripts/verify-migration.sh. The sibling suite
+test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh;
+the two share one slicer and one probe scaffold, both in
+tests/scripts/shell_sections.py.
+
+The companion source-level sweep that forbids the construct itself is
+test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q.
 
 WHY THESE EXIST. `producer | grep -q PAT` reports the PRODUCER's exit status
 under `set -o pipefail`, not grep's verdict, so an `if` guarding on it can take
@@ -21,7 +24,8 @@ happens, both covered below per site:
 EVERY ONE OF THESE SITES SITS INSIDE AN `if`, so the failure mode is a WRONG
 ANSWER, not an abort: export-data.sh decides a running FalkorDB is not running
 and skips the BGSAVE, import-data.sh decides live containers need no stopping
-and then reports a healthy FalkorDB as not responding. Nothing crashes and
+and then reports a healthy FalkorDB as not responding, verify-migration.sh
+fails a good migration on a FalkorDB that answered PONG. Nothing crashes and
 nothing is logged as a failure — the scripts just quietly do the wrong thing,
 which is why these need behavioural tests rather than a lint.
 
@@ -30,20 +34,19 @@ script by CODE anchors and runs it against PATH stubs, so a test asserts on
 what the script DOES, never on how the fix is spelled. The anchors were all
 verified to survive the fix, which matters because the same anchors must slice
 the unfixed text and the fixed text.
-
-The companion source-level sweep at the bottom forbids the construct itself.
 """
 
 from __future__ import annotations
 
 import pathlib
 
-import pytest
 from shell_sections import (
     REPO_ROOT,
-    SIGPIPE_BULK_BYTES,
+    SILENT_FAILURE,
+    clean_match,
     dispatch_stub_body,
-    grep_q_offenders,
+    match_then_bulk,
+    match_then_nonzero,
     run_with_preamble,
     slice_section,
     slice_shell_function,
@@ -53,7 +56,7 @@ from shell_sections import (
 
 EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
 IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"
-DEPLOY_W5_PATH = REPO_ROOT / "scripts" / "deploy-w5-recon-reliability.sh"
+VERIFY_MIGRATION_PATH = REPO_ROOT / "scripts" / "verify-migration.sh"
 
 
 # --- the shared scaffold ----------------------------------------------------
@@ -111,46 +114,25 @@ def _run_probe(tmp_path, section_text, *, docker_body):
     return run_with_preamble(tmp_path, _preamble(tmp_path), section_text)
 
 
-# Scenario bodies for a scripted docker branch, indented to sit inside `case`.
-#
-# Parameterized by the reply token rather than frozen as constants: the two
-# `ps --status running` sites look for `falkordb` and the two `redis-cli ping`
-# sites look for `PONG`, and eight near-identical constants is how the four
-# sites drift apart.
-def _match_then_nonzero(reply):
-    """Producer emits the match, then exits non-zero for its own reasons — case (a)."""
-    return f"    printf '{reply}\\n'\n    exit 1\n"
-
-
-def _match_then_bulk(reply):
-    """Producer emits the match, then keeps writing until grep closes the pipe — case (b)."""
-    return f"    printf '{reply}\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
-
-
-def _clean_match(reply):
-    """Characterization: the ordinary path — the match, then exit 0."""
-    return f"    printf '{reply}\\n'\n    exit 0\n"
-
-
 def _nonmatching_output(reply):
     """Producer SUCCEEDS, saying something that does not contain the token.
 
     The second negative direction, and the one that actually happens in
     production: `docker compose ps --status running` exits 0 listing only
     qdrant because falkordb is genuinely down, or redis-cli answers an error
-    string instead of PONG. Distinct from `_SILENT_FAILURE` below in the path
-    it takes through the fixed code, not merely in its wording — the producer
+    string instead of PONG. Distinct from `SILENT_FAILURE` in the path it
+    takes through the fixed code, not merely in its wording — the producer
     exits 0, so the capture's `|| true` never fires and the `[[ ]]` decides on
     real content rather than on the empty string left behind by a failure.
     Nothing pinned that direction before, so every site's negative branch was
     reachable only via a producer that had failed.
 
-    Body-identical to `_clean_match` by construction (print, exit 0) and
+    Body-identical to `clean_match` by construction (print, exit 0) and
     deliberately kept as its own name: what distinguishes the two scenarios is
-    the argument, and a call site reading `_clean_match("qdrant")` would say
+    the argument, and a call site reading `clean_match("qdrant")` would say
     the opposite of what it means.
     """
-    return _clean_match(reply)
+    return clean_match(reply)
 
 
 # What each pair of sites sees when the thing it asks about is honestly absent.
@@ -160,11 +142,6 @@ def _nonmatching_output(reply):
 # the whole content of the scenario.
 _LISTING_WITHOUT_FALKORDB = "qdrant"
 _REPLY_WITHOUT_PONG = "ERR unknown command"
-
-
-# A producer that says NOTHING and fails. The honest verdict for every site is
-# the negative branch, reached WITHOUT aborting — see each site's guard test.
-_SILENT_FAILURE = "    exit 1\n"
 
 
 # --- export-data.sh section 3: the FalkorDB BGSAVE flush --------------------
@@ -234,7 +211,7 @@ def test_export_flushes_falkordb_when_the_listing_exits_nonzero(tmp_path):
     skips the BGSAVE on a live database and exports a stale dump.rdb — silent
     data loss, logged as a routine warning.
     """
-    result = _run_export_bgsave(tmp_path, _match_then_nonzero("falkordb"))
+    result = _run_export_bgsave(tmp_path, match_then_nonzero("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -248,7 +225,7 @@ def test_export_flushes_falkordb_when_the_listing_is_sigpiped(tmp_path):
     signal 13, `pipefail` turns that into 141, and the `if` reads "not running"
     off a listing that began with the container's own name.
     """
-    result = _run_export_bgsave(tmp_path, _match_then_bulk("falkordb"))
+    result = _run_export_bgsave(tmp_path, match_then_bulk("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -264,7 +241,7 @@ def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
     else branch. `returncode == 0` is the only assertion in this file that
     distinguishes the correct fix from that plausible-looking regression.
     """
-    result = _run_export_bgsave(tmp_path, _SILENT_FAILURE)
+    result = _run_export_bgsave(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -293,7 +270,7 @@ def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
 
 def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
-    result = _run_export_bgsave(tmp_path, _clean_match("falkordb"))
+    result = _run_export_bgsave(tmp_path, clean_match("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -345,7 +322,7 @@ def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
     replace the data trees underneath them — the import's whole reason for
     stopping them first.
     """
-    result = _run_import_stop(tmp_path, _match_then_nonzero("falkordb"))
+    result = _run_import_stop(tmp_path, match_then_nonzero("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -353,7 +330,7 @@ def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
 
 def test_import_stops_the_containers_when_the_listing_is_sigpiped(tmp_path):
     """Same misread via SIGPIPE: `grep -q` closes the pipe, the producer dies, 141."""
-    result = _run_import_stop(tmp_path, _match_then_bulk("falkordb"))
+    result = _run_import_stop(tmp_path, match_then_bulk("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -366,7 +343,7 @@ def test_import_stops_nothing_when_the_listing_says_nothing(tmp_path):
     the bare-assignment spelling: `returncode == 0` pins that the fix must not
     turn an unavailable docker into a `set -e` abort of the whole import.
     """
-    result = _run_import_stop(tmp_path, _SILENT_FAILURE)
+    result = _run_import_stop(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -386,7 +363,7 @@ def test_import_stops_nothing_when_the_listing_omits_falkordb(tmp_path):
 
 def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
-    result = _run_import_stop(tmp_path, _clean_match("falkordb"))
+    result = _run_import_stop(tmp_path, clean_match("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -440,7 +417,7 @@ def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
     pipeline's status conflates the two and polls a live FalkorDB for thirty
     seconds before declaring it never came up.
     """
-    result = _run_import_wait(tmp_path, _match_then_nonzero("PONG"))
+    result = _run_import_wait(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -449,7 +426,7 @@ def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
 
 def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
     """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
-    result = _run_import_wait(tmp_path, _match_then_bulk("PONG"))
+    result = _run_import_wait(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -458,7 +435,7 @@ def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
 
 def test_import_wait_times_out_when_the_ping_says_nothing(tmp_path):
     """No reply is still not-healthy — and the loop must reach that verdict without aborting."""
-    result = _run_import_wait(tmp_path, _SILENT_FAILURE)
+    result = _run_import_wait(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -483,7 +460,7 @@ def test_import_wait_times_out_when_the_ping_answers_something_else(tmp_path):
 
 def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
-    result = _run_import_wait(tmp_path, _clean_match("PONG"))
+    result = _run_import_wait(tmp_path, clean_match("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -525,7 +502,7 @@ def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
     is the operator's closing signal: a successful import reported as a
     database that never came back.
     """
-    result = _run_import_health(tmp_path, _match_then_nonzero("PONG"))
+    result = _run_import_health(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
@@ -534,7 +511,7 @@ def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
 
 def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
     """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
-    result = _run_import_health(tmp_path, _match_then_bulk("PONG"))
+    result = _run_import_health(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
@@ -543,7 +520,7 @@ def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
 
 def test_import_health_reports_not_responding_when_the_ping_says_nothing(tmp_path):
     """No reply is genuinely not responding — reached WITHOUT aborting the import."""
-    result = _run_import_health(tmp_path, _SILENT_FAILURE)
+    result = _run_import_health(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -565,72 +542,204 @@ def test_import_health_reports_not_responding_when_the_ping_answers_something_el
 
 def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
-    result = _run_import_health(tmp_path, _clean_match("PONG"))
+    result = _run_import_health(tmp_path, clean_match("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
     assert _NOT_RESPONDING not in combined, combined
 
 
-# --- the file-scoped contract ----------------------------------------------
+# --- verify-migration.sh section 1: the FalkorDB checks ---------------------
+# This script sets `-uo pipefail` WITHOUT -e, its `fail` only prints and its
+# `check_fail` only counts, so it cannot share `_PREAMBLE`, whose `fail` exits.
+#
+# `end_after` IS REQUIRED, and was MEASURED: without it the slice stops at the
+# column-0 `fi` closing the `command -v redis-cli` capture and never reaches
+# either site. All three anchors are code, unique, and survive the fix.
+_VERIFY_FALKORDB_START = 'info "FalkorDB checks"'
+_VERIFY_FALKORDB_END = "\nfi\n"
+_VERIFY_FALKORDB_END_AFTER = 'check_fail "FalkorDB not reachable on port 6379'
 
-
-@pytest.mark.parametrize(
-    "script",
-    [EXPORT_DATA_PATH, IMPORT_DATA_PATH, DEPLOY_W5_PATH],
-    ids=lambda p: p.name,
+_VERIFY_PREAMBLE = (
+    "set -uo pipefail\n"
+    "info()  { printf '==> %s\\n' \"$*\"; }\n"
+    "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
+    "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
+    "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
 )
-def test_never_pipes_a_producer_into_grep_q(script):
-    """No code line in these three scripts may decide anything through `producer | grep --quiet PAT`.
 
-    The behavioural tests above pin what each site DOES; this pins that the
-    defective CONSTRUCT does not come back. Task 4204 added its equivalent
-    sweep AFTER its fixes for the same reason this one lands last: a sweep
-    added first would sit RED across every intervening commit and break
-    per-step greenness.
+_PING_OK = "OK FalkorDB PING"
+_NOT_REACHABLE = "FAIL FalkorDB not reachable on port 6379"
+_CONTAINER_RUNNING = "OK FalkorDB container running"
+_CONTAINER_NOT_FOUND = (
+    "WARN FalkorDB port 6379 responds but container not found via docker ps"
+)
 
-    GUARD-THE-GUARD lives elsewhere, deliberately. The detector is the shared
-    `grep_q_offenders` in tests/scripts/shell_sections.py, and
-    test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline
-    pins it against every planted spelling that must match and every shape that
-    must not — on behalf of BOTH sweeps. One detector deserves one guard; a
-    second copy of that case set here would be the drift this arrangement
-    removes.
 
-    SCOPE IS FILE-SCOPED AND THAT IS A DECISION, not an oversight. Running
-    this same detector over every *.sh in the repo finds 295 lines. The
-    overwhelming majority are warm-lane SHELL TEST assertions of the
-    `printf "%s\n" "$1" | grep -q ...` shape — a different risk profile and a
-    different owner. But the scan also finds genuine same-class PRODUCTION
-    sites in other scripts (notably a `docker ps --format ... | grep -q
-    falkordb`, the identical construct fixed here) which are outside this
-    task's file locks and are filed as follow-up work. Widening this sweep
-    would turn it into that much larger task and leave it red until every one
-    of them is fixed; narrowing the claim keeps it honest. Task 4204 set the
-    same precedent by scoping its sweep to setup-host.sh alone.
+def _verify_preamble(tmp_path):
+    """`_VERIFY_PREAMBLE`, $COMPOSE_FILE, and the SHIPPED counters and check_* helpers.
 
-    WHAT THE RULE DOES NOT FORBID. It is scoped to greps that EXIT ON FIRST
-    MATCH — every spelling of that, short cluster or long `--quiet`/`--silent`,
-    since they share one defect. A `| grep -F ... || true` inside a command
-    substitution is a different, safe shape: a non-quiet grep drains its input
-    rather than SIGPIPE-ing the producer. Neither is a `grep -q` reading a
-    FILE swept in: with no producer upstream there is nothing for `pipefail`
-    to conflate.
-
-    And it mandates NO replacement spelling. These scripts happen to use
-    `[[ ]]`, but `case` or a `<<<` here-string remain open to a future author
-    — this forbids one known-defective construct, nothing more.
+    The not-reachable message interpolates $COMPOSE_FILE, so under `set -u` an
+    unset one aborts. The helpers are sliced live, so every verdict below is
+    the script's own `check_pass` / `check_fail` / `check_warn`.
     """
-    source = script.read_text(encoding="utf-8")
-
-    # FIRST, because it is what makes the rule load-bearing: without pipefail
-    # there is no defect here and the sweep below would be guarding nothing.
-    assert "set -euo pipefail" in source, (
-        f"{script.name} no longer sets `-o pipefail`, so this sweep would pass "
-        f"vacuously. Either restore it or retire this test deliberately."
+    return (
+        _VERIFY_PREAMBLE
+        + f'COMPOSE_FILE="{tmp_path / "docker-compose.yml"}"\n'
+        + slice_section(VERIFY_MIGRATION_PATH, "CHECKS_PASSED=0", "check_warn() {")
     )
 
-    offenders = grep_q_offenders(source)
-    assert not offenders, f"producer piped into `grep -q` in {script.name}:\n" + "\n".join(
-        f"  line {n}: {line.strip()}" for n, line in offenders
+
+def _run_verify_falkordb(tmp_path, *, ping_body, ps_body):
+    """Slice verify-migration.sh's section 1 and run it against scripted redis-cli and docker.
+
+    A `redis-cli` on PATH sends `command -v redis-cli` down the direct branch;
+    its DBSIZE answer is a constant, since only the PING verdict is under test.
+    The docker glob is `"ps "*` because the argv `ps --format {{.Names}}` has
+    no leading space for the export suite's `*" ps "*` to match.
+    """
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(
+        stub_bin,
+        "redis-cli",
+        dispatch_stub_body((("*ping*", ping_body), ("*DBSIZE*", clean_match("5")))),
     )
+    write_stub(stub_bin, "docker", dispatch_stub_body((('"ps "*', ps_body),)))
+    return run_with_preamble(
+        tmp_path,
+        _verify_preamble(tmp_path),
+        slice_section(
+            VERIFY_MIGRATION_PATH,
+            _VERIFY_FALKORDB_START,
+            _VERIFY_FALKORDB_END,
+            end_after=_VERIFY_FALKORDB_END_AFTER,
+        ),
+    )
+
+
+def _run_verify_ping(tmp_path, ping_body):
+    """The PING site under *ping_body*, with the docker listing held clean."""
+    return _run_verify_falkordb(
+        tmp_path, ping_body=ping_body, ps_body=clean_match("falkordb")
+    )
+
+
+def _run_verify_listing(tmp_path, ps_body):
+    """The `docker ps` site under *ps_body*, with the PING held clean."""
+    return _run_verify_falkordb(
+        tmp_path, ping_body=clean_match("PONG"), ps_body=ps_body
+    )
+
+
+def test_verify_reports_ping_ok_when_the_reply_is_sigpiped(tmp_path):
+    """A captured PONG re-fed through `echo | grep -q` is misread as unreachable.
+
+    The capture holds the whole reply, but `echo` writes it into a pipe that
+    `grep -q` closes on PONG; echo dies of SIGPIPE, `pipefail` makes that 141,
+    and a good migration is verified as broken.
+    """
+    result = _run_verify_ping(tmp_path, match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_reports_ping_ok_when_redis_cli_exits_nonzero_after_pong(tmp_path):
+    """Characterization: the capture's `|| echo "FAIL"` appends a line, and PONG still counts."""
+    result = _run_verify_ping(tmp_path, match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_reports_unreachable_when_the_ping_says_nothing(tmp_path):
+    """A silent redis-cli is genuinely unreachable — reported, and the section runs to the end."""
+    result = _run_verify_ping(tmp_path, SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_REACHABLE in combined, combined
+    assert _PING_OK not in combined, combined
+
+
+def test_verify_reports_unreachable_when_the_ping_answers_something_else(tmp_path):
+    """redis-cli's connection-refused message is not a PONG."""
+    result = _run_verify_ping(
+        tmp_path,
+        _nonmatching_output(
+            "Could not connect to Redis at 127.0.0.1:6379: Connection refused"
+        ),
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_REACHABLE in combined, combined
+    assert _PING_OK not in combined, combined
+
+
+def test_verify_reports_ping_ok_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_verify_ping(tmp_path, clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_sees_the_container_when_the_listing_exits_nonzero(tmp_path):
+    """A `docker ps` listing that NAMED falkordb means the container is running, whatever its status.
+
+    Misreading it warns the operator that a running FalkorDB container is
+    missing, on a host where the migration succeeded.
+    """
+    result = _run_verify_listing(tmp_path, match_then_nonzero("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+def test_verify_sees_the_container_when_the_listing_is_sigpiped(tmp_path):
+    """Same misread via SIGPIPE: `grep -q` closes the pipe, the listing dies, 141."""
+    result = _run_verify_listing(tmp_path, match_then_bulk("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+def test_verify_warns_when_the_listing_says_nothing(tmp_path):
+    """An unavailable docker warns, and must not abort the section.
+
+    The script has no -e today; `returncode == 0` keeps an unavailable docker
+    from ever becoming an abort should one be added.
+    """
+    result = _run_verify_listing(tmp_path, SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _CONTAINER_NOT_FOUND in combined, combined
+    assert _CONTAINER_RUNNING not in combined, combined
+
+
+def test_verify_warns_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing naming only qdrant is a real "container not found"."""
+    result = _run_verify_listing(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _CONTAINER_NOT_FOUND in combined, combined
+    assert _CONTAINER_RUNNING not in combined, combined
+
+
+def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
+    """Characterization: the ordinary path lists falkordb and exits 0."""
+    result = _run_verify_listing(tmp_path, clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined

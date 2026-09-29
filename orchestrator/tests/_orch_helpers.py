@@ -2436,3 +2436,27 @@ def make_prompt_resolution_workflow(
         mcp=None,
         prompt_store=prompt_store,
     )
+
+
+class ExitContractViolationCollector(logging.Handler):
+    """Collects the run()-exit contract's VIOLATION records.
+
+    Keyed on the structured extra that
+    ``orchestrator/src/orchestrator/exit_contract.py::record_exit_verdict``
+    attaches, never on message text: a store-unavailable record, or any other
+    warning from the same logger, is not a violation. Backs conftest.py's
+    autouse ``_no_unexpected_exit_contract_violation`` guard.
+    """
+
+    def __init__(self) -> None:
+        # Function-local: importing this module costs no orchestrator import.
+        from orchestrator.exit_contract import VERDICT_LOG_ATTRIBUTE, ExitVerdictKind
+
+        super().__init__()
+        self._verdict_attribute = VERDICT_LOG_ATTRIBUTE
+        self._violation = ExitVerdictKind.VIOLATION.value
+        self.violations: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, self._verdict_attribute, None) == self._violation:
+            self.violations.append(record)

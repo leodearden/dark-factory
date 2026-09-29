@@ -62,7 +62,7 @@ this module through ``importlib.util.spec_from_file_location`` because it is
 not importable, and γ/δ will want the same registry and report vocabulary. At
 that point extract the registry model/loader and the pure metric functions
 into ``fused_memory/eval/retrieval_probe.py`` (importable, type-checked, no
-path loading) and leave this file as the thin argparse/``_run`` band, which is
+path loading) and leave this file as the thin argparse/``main`` band, which is
 what D8's runner pattern and D2's precedent (artifact shapes live in
 ``shared.memory_eval_metrics``, not in a runner) both point at. Deliberately
 not done now: one leaf's runner is not yet a shared contract, and a second
@@ -85,6 +85,12 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
+
+from shared.cli_boundary import (
+    LoudArgumentParser,
+    reset_stdout_failure_state,
+    run_cli,
+)
 
 logger = logging.getLogger('memory_eval_retrieval_probe')
 
@@ -218,6 +224,13 @@ class EmptySelectionError(ValueError):
     genuine first run. So the selection miss aborts BEFORE emission, exactly as
     a failed registry load does, and the message names both what was asked for
     and what the registry actually carries.
+    """
+
+
+class ProbeRunError(RuntimeError):
+    """The run could not complete; the message is attributed at the seam that raised it.
+
+    Deliberately not an ``OSError``; see ``shared/src/shared/cli_boundary.py::run_cli``.
     """
 
 
@@ -2661,6 +2674,17 @@ later tidy-up; read that directory's README before relocating it.
 DEFAULT_CALIBRATION_PATH = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
 DEFAULT_CENSUS_PATH = _REPO_ROOT / 'plans' / 'memory-metadata-census-report.json'
 
+EXIT_RUN_FAILED = 1
+"""The run did not finish: the store could not be opened, the artifacts could
+not be written, a derivation source could not be read, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+EXIT_BAD_INPUT = 2
+"""Nothing can be measured until the input is fixed: the registry did not load,
+or ``--project-id`` selected nothing."""
+
 
 def corpus_categories() -> tuple[str, ...]:
     """The category vocabulary, taken from the store's own enums.
@@ -2742,6 +2766,15 @@ def normalise_ks(ks: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(dict.fromkeys((*ks, TRIPWIRE_K)))
 
 
+@contextlib.contextmanager
+def _artifact_write_seam(out_root: str | Path):
+    """Attribute an ``OSError`` from the wrapped artifact write to *out_root*."""
+    try:
+        yield
+    except OSError as exc:
+        raise ProbeRunError(f'cannot write the probe artifacts under {out_root}: {exc}') from exc
+
+
 @dataclass(frozen=True)
 class ProbeOutcome:
     """Everything one run produced, for a caller that wants more than an exit code."""
@@ -2782,7 +2815,7 @@ async def run_probe(
     methods touched.
 
     THE chokepoint for *ks*: normalising here means every caller — ``main``,
-    ``_run``, a test, a notebook — inherits the guarantee that the pinned
+    ``_probe``, a test, a notebook — inherits the guarantee that the pinned
     metrics are emitted, so no path can produce an artifact missing them.
     """
     measured_ks = normalise_ks(tuple(ks))
@@ -2829,7 +2862,8 @@ async def run_probe(
     series = build_series(
         observations, counts, corpus_project_id(selected), stamp, measured_ks,
     )
-    metrics_path, report_path = emit_series(series, out_root, stamp=stamp)
+    with _artifact_write_seam(out_root):
+        metrics_path, report_path = emit_series(series, out_root, stamp=stamp)
 
     # emit_series wrote the shared render_report as the companion; replace it
     # with the extended one — through the same atomic path, so the widening
@@ -2853,7 +2887,8 @@ async def run_probe(
         measured_ks=measured_ks,
     )
     report = join_report_sections(sections)
-    write_report_text(report_path, report)
+    with _artifact_write_seam(out_root):
+        write_report_text(report_path, report)
 
     return ProbeOutcome(
         series=series,
@@ -2885,7 +2920,7 @@ class _ReplacingAppend(argparse.Action):
         setattr(namespace, self.dest, (*current, values))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """The CLI. Every flag here is a read parameter; none of them mutate anything.
 
     There is deliberately no ``--apply``, ``--fix``, ``--prune`` or any other
@@ -2895,7 +2930,7 @@ def build_parser() -> argparse.ArgumentParser:
     # The module docstring carries an RST table that argparse's default
     # formatter reflows into rubble; the first line plus the guarantee is what
     # an operator at the terminal actually needs.
-    parser = argparse.ArgumentParser(
+    parser = LoudArgumentParser(
         description=(
             f'{(__doc__ or EVAL_ID).splitlines()[0]}\n\n'
             'This script never writes to the live corpus and never evaluates a\n'
@@ -2942,56 +2977,87 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run(args: argparse.Namespace) -> int:
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
-    )
-
-    if args.derive_registry:
-        print(run_derive_registry(DEFAULT_CALIBRATION_PATH, DEFAULT_CENSUS_PATH), end='')
-        return 0
-
-    # Before the store, deliberately. A fixture typo must not cost an embedder
-    # spin-up to discover, and — the load-bearing half — a registry that failed
-    # to load must never reach emission: an artifact reporting zero topics is
-    # indistinguishable, downstream, from a healthy corpus that found nothing.
+def _derive_registry_text() -> str:
+    """``--derive-registry``'s output, with an unreadable source attributed to it."""
     try:
-        registry = load_topic_registry(args.registry)
-    except RegistryError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+        return run_derive_registry(DEFAULT_CALIBRATION_PATH, DEFAULT_CENSUS_PATH)
+    except OSError as exc:
+        raise ProbeRunError(f'cannot read a registry derivation source: {exc}') from exc
 
+
+async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutcome:
+    """Open the store, measure *registry* against it, and close it again.
+
+    Only the open is converted to :class:`ProbeRunError`; see
+    ``shared/src/shared/cli_boundary.py::run_cli``.
+    """
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
+    memory = MemoryService(FusedMemoryConfig())
     try:
-        outcome = await run_probe(
+        try:
+            await memory.initialize()
+        except OSError as exc:
+            raise ProbeRunError(
+                f'the memory store could not be opened ({type(exc).__name__}): {exc}'
+            ) from exc
+        return await run_probe(
             memory, registry,
             project_ids=tuple(args.project_id),
             ks=tuple(args.k),
             out_root=args.out_root,
         )
-    except EmptySelectionError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
     finally:
         await memory.close()
 
-    print(outcome.report, end='')
-    logger.info('metrics: %s', outcome.metrics_path)
-    logger.info('report:  %s', outcome.report_path)
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse, run, print. Every stdout print sits outside every handled failure,
+    so a stdout failure always reaches ``shared/src/shared/cli_boundary.py::run_cli``."""
+    outcome: ProbeOutcome | None = None
+
+    def _written_artifacts() -> str | None:
+        if outcome is None:
+            return None
+        return (
+            f'the metrics were written to {outcome.metrics_path} '
+            f'and the report to {outcome.report_path}'
+        )
+
+    reset_stdout_failure_state(detail=_written_artifacts)
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+    try:
+        if args.derive_registry:
+            text = _derive_registry_text()
+        else:
+            # Before the store, deliberately. A fixture typo must not cost an
+            # embedder spin-up to discover, and — the load-bearing half — a
+            # registry that failed to load must never reach emission: an
+            # artifact reporting zero topics is indistinguishable, downstream,
+            # from a healthy corpus that found nothing.
+            registry = load_topic_registry(args.registry)
+            outcome = asyncio.run(_probe(args, registry))
+            text = outcome.report
+    except (RegistryError, EmptySelectionError) as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_BAD_INPUT
+    except ProbeRunError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return EXIT_RUN_FAILED
+
+    print(text, end='')
+    if outcome is not None:
+        logger.info('metrics: %s', outcome.metrics_path)
+        logger.info('report:  %s', outcome.report_path)
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    return asyncio.run(_run(build_parser().parse_args(argv)))
-
-
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

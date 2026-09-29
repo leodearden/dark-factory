@@ -1,6 +1,6 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
 const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick } = window.DF_CHARTS;
-const { Glyph: GL, ProjectGroup, Pip, Segmented, ChipGroup } = window.DF_SHELL;
+const { Glyph: GL, ProjectGroup, Pip, DatumReading, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 // Unguarded, like the DF_* destructures above: index.html loads
@@ -22,12 +22,13 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, unknownDatum, EM_DASH } = window.DF_DATUM;
-const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
+const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
+const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
-// Interim, deleted by task 5589 (γ2) — orch_summary.js's and task_done_count.js's headers say why.
-const { hasOrchSummary, orchSummary, orchSummaryTotal, ORCH_SUMMARY_ABSENT_REASON } = window.DF_ORCH_SUMMARY;
-const { doneCount } = window.DF_TASK_DONE_COUNT;
+// Every OrchTab count is a named reading over the served census — task_snapshot.js.
+const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
+// data.js's one copy of the on-demand terminal window's key.
+const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -41,10 +42,8 @@ const EP = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators', performance:  '/api/v2/dashboard/performance',
   memory:        '/api/v2/dashboard/memory',        memoryGraphs: '/api/v2/dashboard/memory-graphs',
   recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
-  costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
-  scheduler:     '/api/v2/dashboard/scheduler',
+  costs:         '/api/v2/dashboard/costs',         scheduler:    '/api/v2/dashboard/scheduler',
 });
-const orchTotalDatum = (orchs, key) => derivedDatum(orchSummaryTotal(orchs, key), EP.orchestrators, ORCH_SUMMARY_ABSENT_REASON);
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
 // actually MEASURED — plainDatum answers the absent case itself — so none
@@ -253,17 +252,20 @@ function LocksCell({ task, datum }) {
 // ── Orchestrators ──
 function OrchTab({ projectFilter, search }) {
   const matches = DF.ORCHESTRATORS.filter(o => projectFilter.length === 0 || projectFilter.includes(o.project));
-  const tasks = DF.ACTIVE_TASKS.filter(t => (projectFilter.length === 0 || projectFilter.includes(t.project))
-    && (!search || (t.title + t.id).toLowerCase().includes(search.toLowerCase())));
+  // The tiles' census and their sparks count one population: task roots.
+  const scope = projectFilter.length === 0 ? null : projectFilter;
+  const scopeCensus = censusOver(DF, scope);
+  const matchesSearch = t => !search || (t.title + t.id).toLowerCase().includes(search.toLowerCase());
   const orchIds = matches.map(o => o.pid);
   const [openMap, toggle, setAll] = useOpenSet(orchIds.map(String), true, 'df.open.orch');
   const allOpen = orchIds.every(p => openMap[String(p)]);
-  const [filterMap, setFilterMap] = usePersistedState('df.orch.filter', {}); // { [pid]: { active, pending, complete } }
-  const DEFAULT_FILTER = { active: true, pending: false, complete: false };
+  // A new key, not 'df.orch.filter': an old {active,pending,complete} object
+  // would read as "nothing selected" under the view keys.
+  const [filterMap, setFilterMap] = usePersistedState('df.orch.views', {}); // { [pid]: { in_flight, backlog, terminal } }
+  const DEFAULT_FILTER = { in_flight: true };
   const getFilter = (pid) => {
-    const f = filterMap[pid];
-    if (!f || typeof f !== 'object') return { ...DEFAULT_FILTER }; // back-compat: ignore old string values
-    return { active: !!f.active, pending: !!f.pending, complete: !!f.complete };
+    const f = filterMap[pid] && typeof filterMap[pid] === 'object' ? filterMap[pid] : DEFAULT_FILTER;
+    return Object.fromEntries(TASK_CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
   };
   const flipFilter = (pid, key) => {
     const cur = getFilter(pid);
@@ -274,44 +276,29 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" datum={orchTotalDatum(matches, 'in_progress')} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" datum={orchTotalDatum(matches, 'blocked')} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" datum={orchTotalDatum(matches, 'pending')} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        {TASK_CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {matches.map(o => {
-        const orchCounts = orchSummary(o);
-        const total = orchCounts.total || 1;
-        const projTasks = tasks.filter(t => t.project === o.project);
+        const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        // partition by filter (multi-select)
-        const filtered = projTasks.filter(t => {
-          if (filter.active   && (t.status === 'in-progress' || t.status === 'blocked')) return true;
-          if (filter.pending  && t.status === 'pending') return true;
-          if (filter.complete && t.status === 'done')    return true;
-          return false;
-        });
-        const counts = {
-          active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
-          pending:  projTasks.filter(t => t.status === 'pending').length,
-          complete: doneCount(DF.TASKS_SNAPSHOT[o.project]),
-        };
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const filtered = rows.filter(matchesSearch);
 
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
             {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
                 them sends an operator to restart a healthy service. Neither fires since task 5587:
-                discovery attempts no read, so nothing sets either flag (handed to γ2, task 5589).
+                discovery attempts no read, so nothing sets either flag. γ2 (task 5589) kept both
+                because /orchestrators still projects them; count health travels on the census.
                 The !o.offline guard states the precedence here rather than trusting the
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            <Pip datum={orchTotalDatum([o], 'done')} color={CP.ok} format={done => `${done}/${total}`} />
-            {orchCounts.in_progress > 0 && <Pip datum={orchTotalDatum([o], 'in_progress')} color={CP.accent} label="active" />}
-            {orchCounts.blocked > 0 && <Pip datum={orchTotalDatum([o], 'blocked')} color={CP.bad} label="blocked" />}
+            {TASK_CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -323,9 +310,7 @@ function OrchTab({ projectFilter, search }) {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
                     <div className="seg" role="group" aria-label="Task filter">
-                      <button className={filter.active   ? 'on' : ''} onClick={() => flipFilter(o.pid, 'active')}>Active · {counts.active}</button>
-                      <button className={filter.pending  ? 'on' : ''} onClick={() => flipFilter(o.pid, 'pending')}>Pending · {counts.pending}</button>
-                      <button className={filter.complete ? 'on' : ''} onClick={() => flipFilter(o.pid, 'complete')}>Complete · {counts.complete}</button>
+                      {TASK_CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
                     </div>
                   </div>
 
@@ -353,7 +338,8 @@ function OrchTab({ projectFilter, search }) {
                       <th>Status</th>
                     </tr></thead>
                     <tbody>
-                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
+                      {placeholder && <tr><td colSpan={12} className="empty" style={{ padding: 20 }} title={placeholder.title}>{placeholder.text}</td></tr>}
+                      {!placeholder && filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
                       {filtered.map(t => {
                         const isDone = t.status === 'done';
                         const isPending = t.status === 'pending';
@@ -397,6 +383,7 @@ function OrchTab({ projectFilter, search }) {
                           </tr>
                         );
                       })}
+                      {notes.map(note => <tr key={note}><td colSpan={12} className="empty" style={{ padding: 8 }}>{note}</td></tr>)}
                     </tbody>
                   </table>
                 </div>
@@ -405,30 +392,20 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>
                       <span>Progress</span>
-                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : EM_DASH}</span>
+                      <span className="mono" style={{ color: 'var(--fg-1)' }}><DatumReading datum={census} format={terminalOfTotal} /></span>
                     </div>
                     <div className="stack-bar" style={{ height: 12 }}>
-                      <span style={{ width: `${orchCounts.done/total*100}%`, background: CP.ok }} />
-                      <span style={{ width: `${orchCounts.in_progress/total*100}%`, background: CP.accent }} />
-                      <span style={{ width: `${orchCounts.blocked/total*100}%`, background: CP.bad }} />
-                      <span style={{ width: `${orchCounts.pending/total*100}%`, background: CP.warn }} />
+                      {censusSegments(census).map(s => <span key={s.key} style={{ width: `${s.share}%`, background: CP[s.tone] }} />)}
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      <span style={{ color: CP.ok }}>{orchCounts.done} done</span>
-                      <span style={{ color: CP.accent }}>{orchCounts.in_progress} active</span>
-                      <span style={{ color: CP.bad }}>{orchCounts.blocked} blocked</span>
-                      <span style={{ color: CP.warn }}>{orchCounts.pending} pending</span>
+                      {TASK_CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
                     </div>
                   </div>
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
-                    {(() => {
-                      const pb = DF.BURNDOWN_BY_PROJECT[o.project];
-                      const rates = window.DF_SHELL.dailyDeltas(pb?.labels, pb?.done);
-                      return <div style={{ height: 50 }}><SP values={rates} color={CP.accent} /></div>;
-                    })()}
+                    <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
               </div>
@@ -1309,48 +1286,24 @@ function BurnTab({ projectFilter, displayWindow }) {
     );
   };
 
+  const latest = burndownDatum(DF, b, 'latest');
+  const pendingThen = b.pending.length ? b.pending[0] : 0;
+  const pendingNow = b.pending.length ? b.pending[b.pending.length-1] : 0;
+
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      {(() => {
-        const velocity = b.velocity ?? 0;  // tasks/day — server-computed delta / distinct-day count
-        const lastPending = b.pending.length ? b.pending[b.pending.length-1] : 0;
-        const firstPending = b.pending.length ? b.pending[0] : 0;
-        const forecastDays = velocity > 0 ? Math.round(lastPending / velocity) : null;
-        return (
-          <div className="col-span-12 grid cols-4">
-            <ST label="Net velocity" datum={plainDatum(velocity, EP.burndown)} format={v => v.toFixed(1)} unit="/day"
-                hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
-                history={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
-            <ST label="Completed (window)" datum={plainDatum(b.completed, EP.burndown)}
-                history={b.done} sparkColor={CP.ok} />
-            <ST label="Backlog" datum={plainDatum(lastPending, EP.burndown)}
-                delta={`${lastPending - firstPending}`}
-                deltaDir={lastPending < firstPending ? 'down' : 'up'}
-                history={b.pending} sparkColor={CP.warn} />
-            {(() => {
-              // Server-computed forecast confidence (recent 7d vs lifetime
-              // velocity) is null when <7 days of history. Fall back to the
-              // simple point estimate above so the tile still shows a value
-              // once any history exists.
-              const lo = b.forecast_low;
-              const hi = b.forecast_high;
-              const haveRange = lo != null && hi != null;
-              const display = haveRange
-                ? (lo === hi ? `${lo}d` : `${lo}–${hi}d`)
-                : (forecastDays != null ? `${forecastDays}d` : null);
-              const hint = haveRange
-                ? `${lastPending} pending · 7d vs lifetime velocity`
-                : (forecastDays != null
-                    ? `${lastPending} / ${velocity.toFixed(1)} per day · need 7d for range`
-                    : (velocity === 0 ? 'velocity is zero' : 'no data'));
-              return (
-                <ST label="Forecast clear" datum={derivedDatum(display, EP.burndown, hint)} hint={hint}
-                    history={b.pending} sparkColor={CP.ok} />
-              );
-            })()}
-          </div>
-        );
-      })()}
+      <div className="col-span-12 grid cols-4">
+        <ST label="Net velocity" datum={latest} format={r => r.velocity.toFixed(1)} unit="/day" hint="window avg"
+            history={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
+        <ST label="Completed (window)" datum={latest} format={r => fmtCount(r.completed)}
+            history={b.done} sparkColor={CP.ok} />
+        <ST label="Pending" datum={latest} format={r => fmtCount(r.counts.pending)}
+            delta={`${pendingNow - pendingThen}`}
+            deltaDir={pendingNow < pendingThen ? 'down' : 'up'}
+            history={b.pending} sparkColor={CP.warn} />
+        <ST label="Forecast clear" datum={burndownDatum(DF, b, 'forecast')} format={forecastText}
+            hint="7d vs lifetime velocity" history={b.pending} sparkColor={CP.ok} />
+      </div>
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Segmented options={[{ value: 'aggregate', label: 'Aggregate' }, { value: 'per-project', label: 'Per project' }]} value={view} onChange={setView} />
@@ -1374,11 +1327,6 @@ function BurnTab({ projectFilter, displayWindow }) {
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
-            {/* in_progress is banded as live + stranded, never alongside them:
-                stacking the whole beside its parts would draw a total no
-                census ever produced. The server guarantees they sum. The rule
-                is enforced (and tested) in burndown_bands.js — burndownStacks
-                below never emits an undivided in_progress band. */}
             <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
@@ -1389,22 +1337,19 @@ function BurnTab({ projectFilter, displayWindow }) {
           <div className="panel-head"><span className="title">Per project · summary</span></div>
           <div className="panel-body flush">
             <table className="tbl">
-              <thead><tr><th>Project</th><th className="num">Completed</th><th className="num">Active</th><th className="num">Blocked</th><th className="num">Pending</th><th>Trend</th></tr></thead>
+              <thead><tr><th>Project</th><th className="num">Completed</th><th className="num">Running</th><th className="num">Blocked</th><th className="num">Pending</th><th>Trend</th></tr></thead>
               <tbody>
                 {projects.map(p => {
                   const pb = DF.BURNDOWN_BY_PROJECT[p.id];
                   if (!pb) return null;
-                  const completed = pb.completed ?? 0;
-                  const active = pb.in_progress[pb.in_progress.length-1];
-                  const blocked = pb.blocked[pb.blocked.length-1];
-                  const pending = pb.pending[pb.pending.length-1];
+                  const pbLatest = burndownDatum(DF, pb, 'latest');
                   return (
                     <tr key={p.id}>
                       <td className="mono">{p.id}</td>
-                      <td className="num" style={{ color: CP.ok }}>{completed}</td>
-                      <td className="num" style={{ color: CP.accent }}>{active}</td>
-                      <td className="num" style={{ color: CP.bad }}>{blocked}</td>
-                      <td className="num" style={{ color: CP.warn }}>{pending}</td>
+                      <td className="num" style={{ color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.completed} /></td>
+                      <td className="num" style={{ color: CP.accent }}><DatumReading datum={pbLatest} format={r => r.counts.in_progress} /></td>
+                      <td className="num" style={{ color: CP.bad }}><DatumReading datum={pbLatest} format={r => r.counts.blocked} /></td>
+                      <td className="num" style={{ color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></td>
                       <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.accent} /></div></td>
                     </tr>
                   );
@@ -1418,15 +1363,15 @@ function BurnTab({ projectFilter, displayWindow }) {
       {view === 'per-project' && projects.map(p => {
         const pb = DF.BURNDOWN_BY_PROJECT[p.id];
         if (!pb) return null;
-        const pbVelocity = pb.velocity ?? 0;
+        const pbLatest = burndownDatum(DF, pb, 'latest');
         const last = i => pb[i][pb[i].length-1];
         const summary = (
           <>
-            <Pip datum={plainDatum(pb.completed, EP.burndown)} color={CP.ok} label="done" />
-            <Pip datum={plainDatum(last('in_progress'), EP.burndown)} color={CP.accent} label="active" />
-            {last('blocked') > 0 && <Pip datum={plainDatum(last('blocked'), EP.burndown)} color={CP.bad} label="blocked" />}
-            <Pip datum={plainDatum(last('pending'), EP.burndown)} color={CP.warn} label="pending" />
-            <span style={{ color: 'var(--fg-3)' }}>· {pbVelocity.toFixed(1)}/day</span>
+            <Pip datum={pbLatest} format={r => r.completed} color={CP.ok} label="done" />
+            <Pip datum={pbLatest} format={r => r.counts.in_progress} color={CP.accent} label="running" />
+            {last('blocked') > 0 && <Pip datum={pbLatest} format={r => r.counts.blocked} color={CP.bad} label="blocked" />}
+            <Pip datum={pbLatest} format={r => r.counts.pending} color={CP.warn} label="pending" />
+            <span style={{ color: 'var(--fg-3)' }}>· <DatumReading datum={pbLatest} format={r => `${r.velocity.toFixed(1)}/day`} /></span>
           </>
         );
         return (
@@ -1455,8 +1400,8 @@ function BurnTab({ projectFilter, displayWindow }) {
                   <div className="panel-head"><span className="title">Velocity</span></div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}>{pbVelocity.toFixed(1)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}>{last('pending')}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>backlog now</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>pending now</div></div>
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Completion trend</div>

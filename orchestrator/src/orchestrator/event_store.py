@@ -876,6 +876,23 @@ class EventType(StrEnum):
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
 
+    # workflow_exit_contract — one row per run() exit whose contract verdict is
+    # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
+    # §5/E11; task theta 3542).  The canonical WHY lives in
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    # Payload vocabulary:
+    #   {verdict, mode, check, outcome, status, report_phase, machine_state,
+    #    failed_write, escalation_id}
+    #   verdict       — 'violation' | 'store_unavailable'.
+    #   mode          — 'log' | 'enforce' (workflow_exit_contract_enforce).
+    #   check         — 'phase' | 'outcome_status' for a violation, else null.
+    #   failed_write  — {target_status, error} for store_unavailable, else null.
+    #   escalation_id — the L1 an enforce-mode violation filed; null when
+    #                   deduped against an open one, or in log mode.
+    # task_id is ALSO a first-class column.  Task mu's soak counts
+    # verdict='violation' rows with mode='log' before flipping enforce on.
+    workflow_exit_contract = 'workflow_exit_contract'
+
 
 class EventStore:
     """Append-only SQLite event store.

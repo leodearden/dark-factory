@@ -57,6 +57,24 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'required': ['thinking', 'tool_calls'],
 }
 
+# max_turns for ONE reconciliation-agent CLI invocation.  It caps a single
+# assistant round-trip, not the conversation: AgentLoop.run() drives multi-turn
+# externally, one _call_claude_cli per outer step (bounded by
+# ``agent_max_steps``), threaded with ``resume_session_id``.
+#
+# Never 1.  With --json-schema the model emits a prose turn before it calls
+# ``StructuredOutput``, and a cap of 1 leaves no room for it: the CLI returns
+# ``error_max_turns``, which in the measured runs carried no structured payload,
+# so schema salvage had nothing to recover and the call failed.  That is
+# measured CLI behaviour, not a guarantee — the rates, sample sizes and CLI
+# versions are recorded only in fused-memory/scripts/probe_schema_max_turns.py;
+# re-run it rather than trusting a number copied elsewhere.
+#
+# 10 over-provisions deliberately: max_turns is a ceiling, not a target, and
+# spend stays bounded by cli_invoke's ``max_budget_usd`` and
+# ``agent_cli_timeout_seconds``.
+_AGENT_CLI_MAX_TURNS = 10
+
 
 class CircuitBreakerError(Exception):
     """Raised when mutation count exceeds the per-stage limit."""
@@ -411,11 +429,8 @@ class AgentLoop:
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
                 model=self.config.agent_llm_model,
-                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-                # _call_claude_cli again with resume_session_id.  A single CLI
-                # invocation only needs one assistant turn (schema tool-use → JSON
-                # response happens within the same turn when --json-schema is used).
-                max_turns=1,
+                # See _AGENT_CLI_MAX_TURNS for why this is not 1.
+                max_turns=_AGENT_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
@@ -475,8 +490,11 @@ class AgentLoop:
             )
 
             if not result.success:
-                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-                # so `not result.success` is the complete failure guard.
+                # schema_salvaged=True implies success=True (see the
+                # ``schema_salvaged`` assignment in cli_invoke's CLI result
+                # parser), so `not result.success` is the complete failure guard.
+                # Salvage is not the backstop here (see _AGENT_CLI_MAX_TURNS):
+                # this guard is what fires on an ``error_max_turns`` failure.
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.

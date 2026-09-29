@@ -190,7 +190,7 @@ window.DF_DATA = {
   // in_progress_live + in_progress_stranded band the in_progress census; the
   // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
   // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], forecast_low: null, forecast_high: null, parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -426,6 +426,33 @@ function recordFailure(st, deps) {
   st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
 }
 
+// Slowness pacing: one viewer's poll loop keeps an endpoint busy at most
+// MAX_POLL_DUTY_CYCLE of the wall clock, so the next request may not start
+// sooner than serviceMs / MAX_POLL_DUTY_CYCLE after the last one started. It
+// engages only above MAX_POLL_DUTY_CYCLE times the caller's poll interval:
+// below that, the tick alone already holds the endpoint under the cap. Pacing
+// lives in nextAllowedAt, so the chip-change bypass covers it too. Pinned by
+// data_poll.test.mjs's "Slowness pacing" section.
+const MAX_POLL_DUTY_CYCLE = 0.5;
+
+// Unlike recordFailure, a forced attempt still paces: pacing is a pure
+// function of the latest measurement, so clicks cannot inflate it.
+// Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
+// The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
+// slow body read, an injected deps.timeoutMs or a wall-clock jump
+// (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
+// with failures at 0 and no staleness banner.
+function recordSuccess(st, deps, startedAt, receivedAt) {
+  const serviceMs = receivedAt - startedAt;
+  const paced = deps.pollIntervalMs !== undefined
+    && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
+  st.failures = 0;
+  st.lastSuccessAt = receivedAt;
+  st.nextAllowedAt = paced
+    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
+    : 0;
+}
+
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
 // instead of every tick firing all 13 at once (task 185's lesson — 13
 // simultaneous requests hammering a single aiosqlite worker thread). Capped
@@ -552,6 +579,9 @@ function onDemandView(value, outcome) {
 // a datum-kinded key applyKey then REFUSED is reported by its own console.warn
 // above, because that is a server schema break rather than an outcome this
 // request can act on.
+//
+// `deps.pollIntervalMs` is the cadence the caller re-polls at, set by
+// refreshDFData; when it is absent the request is one-shot and never paced.
 async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
   // already in flight for this endpoint — skip this tick, do not queue
@@ -589,6 +619,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
         reject(new Error(`DF_DATA fetch timed out after ${timeoutMs}ms: ${url}`));
       }, timeoutMs);
     });
+    const startedAt = deps.now();
     const resp = await Promise.race([
       deps.fetchImpl(url, { credentials: 'same-origin', signal: controller ? controller.signal : undefined }),
       timedOut,
@@ -603,9 +634,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // from `receivedAt` by however long the applies took.
     const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now() };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
-    st.failures = 0;
-    st.nextAllowedAt = 0;
-    st.lastSuccessAt = receipt.receivedAt;
+    recordSuccess(st, deps, startedAt, receipt.receivedAt);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {
@@ -663,12 +692,13 @@ const DEFAULT_POLL_DEPS = {
 // — the other 9 endpoints have no bearing on the chip and must keep
 // respecting whatever backoff the TIMER path already accumulated for them,
 // otherwise a chip click during an outage would re-hammer every endpoint,
-// recreating exactly the load this task removes. A forced attempt that
-// still fails does not touch failures/nextAllowedAt (see recordFailure), so
-// repeated chip clicks cannot escalate the timer path's own backoff
-// schedule. The in-flight check in refreshOne is unconditional regardless
-// of ignoreBackoff, so a chip change still cannot stack a second concurrent
-// request for an endpoint that's already running.
+// recreating exactly the load this task removes. The same bypass skips
+// slowness pacing, which shares nextAllowedAt (see recordSuccess). A forced
+// attempt that still fails does not touch failures/nextAllowedAt (see
+// recordFailure), so repeated chip clicks cannot escalate the timer path's
+// own backoff schedule. The in-flight check in refreshOne is unconditional
+// regardless of ignoreBackoff, so a chip change still cannot stack a second
+// concurrent request for an endpoint that's already running.
 async function refreshDFData(win, opts) {
   const o = opts || {};
   const isChipChange = typeof win === 'string' && win;
@@ -678,6 +708,7 @@ async function refreshDFData(win, opts) {
     ...DEFAULT_POLL_DEPS,
     ...o.deps,
     jitterMaxMs: o.jitterMaxMs ?? JITTER_MAX_MS,
+    pollIntervalMs: POLL_INTERVAL_MS,
   };
   await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keySpecs]) => {
     const ignoreBackoff = !!(isChipChange && url.includes('?window='));
@@ -708,6 +739,11 @@ async function refreshDFData(win, opts) {
 // single user-triggered request has nothing to spread against, and delaying it
 // would only be latency the user sees.
 //
+// NO PACING. startOnDemand clears deps.pollIntervalMs after the overrides, so a
+// poll deps object spread in cannot switch pacing on: a duty-cycle cap is a
+// property of a repeating loop, and pacing a user action would turn a
+// re-request of a slow listing into skippedBackoff.
+//
 // RETURNS the refreshOne outcome of the request serving this call. A user
 // action is the one caller that cannot just wait for the next tick: without
 // it, an awaited request resolves identically whether the Datum landed, the
@@ -737,7 +773,7 @@ async function requestOnDemand(name, param, opts) {
 
 function startOnDemand(name, param, state, depsOverrides, ledger) {
   const row = ON_DEMAND_KEYS[name];
-  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0 };
+  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0, pollIntervalMs: undefined };
   const request = refreshOne(
     row.url(param),
     { [row.key(param)]: row.spec },

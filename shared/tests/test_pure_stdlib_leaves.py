@@ -60,6 +60,7 @@ _SRC = Path(__file__).resolve().parent.parent / 'src'
 #: See the module docstring: this list is a contract, not a snapshot.
 PURE_STDLIB_LEAVES = (
     'agent_result',
+    'asyncio_tasks',
     'branch_names',
     'cli_boundary',
     'config_dir',

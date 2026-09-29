@@ -22,6 +22,7 @@ load_dotenv()
 from functools import partial  # noqa: E402
 
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -749,6 +751,7 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    topic_cluster_store: TopicClusterStore | None = None
     # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
     # populate recon_report_state before the harness is constructed, threading the
     # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
@@ -995,6 +998,12 @@ async def run_server():
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
 
+    # Machine-derived topic clusters (task 3135). Built in both branches above
+    # and never gated on reconciliation.enabled or the autoseed leaf: both of
+    # its consumers (consolidate_memories and the add_memory guard) run either
+    # way, and the leaf is read live at each of them.
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
+
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
@@ -1003,6 +1012,7 @@ async def run_server():
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
+        topic_cluster_store=topic_cluster_store,
     )
 
     # Both ToolManager.call_tool wrappers, in the ONE order that works. The
@@ -1163,6 +1173,7 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_sockets = _claim_systemd_listener(config.server.port)
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1225,7 +1236,9 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=primary_sockets), name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -1263,6 +1276,9 @@ async def run_server():
             # so a close hiccup can't mask the original shutdown cause.
             with contextlib.suppress(BaseException):
                 recon_report_state.stop_persistence()
+        if topic_cluster_store is not None:
+            with contextlib.suppress(BaseException):
+                topic_cluster_store.close()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1732,6 +1748,23 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
     return store
 
 
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+    """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
+
+    Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the
+    store is. A :class:`~fused_memory.server.topic_cluster_store.TopicClusterStoreError`
+    from a corrupt row propagates on purpose, failing startup the way an
+    invalid config cluster does.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+
+    store = TopicClusterStore(data_dir / 'topic_clusters.db')
+    store.open()
+    return store
+
+
 async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
     """Construct and initialise a :class:`ReconLedgerStore` for the given data directory.
 
@@ -1971,6 +2004,27 @@ def _build_uvicorn_config(
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
     return uvicorn.Config(app, **kwargs)
+
+
+def _claim_systemd_listener(port: int) -> list[socket.socket] | None:
+    """The systemd-held listening socket for *port*, as uvicorn ``serve(sockets=)``.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. Returns None (uvicorn binds the
+    port itself) when not socket-activated or when systemd holds no socket
+    for *port*.
+    """
+    listeners = take_systemd_listeners()
+    sock = listeners.pop(port, None)
+    if listeners:
+        logger.warning(
+            'systemd passed listening sockets for ports %s that nothing here serves',
+            sorted(listeners),
+        )
+    if sock is None:
+        return None
+    logger.info('  Serving on systemd-held socket %s (survives restarts)', sock.getsockname())
+    return [sock]
 
 
 def _build_recon_report_components(

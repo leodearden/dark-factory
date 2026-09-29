@@ -52,7 +52,9 @@ from _merge_lane_fakes import (
     fails,
     hangs_until,
     lane_finalizing,
+    lane_scene_config,
     lane_state,
+    main_health_probe_spawned,
     make_lane,
     passes,
     raises,
@@ -106,7 +108,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
@@ -142,7 +144,7 @@ def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
     """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
-    return OrchestratorConfig(project_root=git_repo, git=warm_git_config)
+    return lane_scene_config(git_repo, warm_git_config)
 
 
 def _make_request(
@@ -1652,6 +1654,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'path, not the busy-loop-capped path — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
+        assert not main_health_probe_spawned(result2.outcome), result2.outcome.reason
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
             'a completed (even failed) verify proves the subprocess was not '
             'hung -- it must clear the counter just like a pass'
@@ -3044,6 +3047,7 @@ class TestContendedLeaseDefers:
             f'a completed-but-failed verify must be handed back as the blocked '
             f'outcome the lane built for it, got {result_b.outcome!r}'
         )
+        assert not main_health_probe_spawned(result_b.outcome), result_b.outcome.reason
         assert 'verify failed: 3 tests' in (result_b.outcome.reason or ''), (
             f'the blocked reason must carry the verify summary, got '
             f'{result_b.outcome.reason!r}'

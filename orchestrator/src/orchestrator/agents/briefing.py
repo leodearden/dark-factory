@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+from shared.briefing_queries import (
+    BriefingQuerySpec,
+    BriefingScope,
+    queries_for,
+)
 
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +547,361 @@ def filter_foreign_project_results(
     return json.dumps(payload, indent=2, ensure_ascii=False), dropped, nested_dropped
 
 
+UNCATEGORIZED = 'uncategorized'
+UNDATED = 'undated'
+UNKNOWN_STORE = 'unknown'
+"""Placeholders for the three tag fields a result may not carry.
+
+Measured live, not assumed: Graphiti-sourced results carry ``category:
+null`` and ``created_at: null``, and every edge of a queried task node came
+back with ``temporal: null``. The tag is therefore best-effort and the
+content is not — a missing field renders as one of these words rather than
+as ``None``, and never suppresses the entry it describes.
+"""
+
+
+def _entry_category(entry: dict) -> str:
+    """Label an entry: its own category, else its metadata copy, else its kind."""
+    metadata = entry.get('metadata')
+    metadata_category = metadata.get('category') if isinstance(metadata, dict) else None
+    for value in (entry.get('category'), metadata_category, entry.get('kind')):
+        if isinstance(value, str) and value:
+            return value
+    return UNCATEGORIZED
+
+
+def _entry_date(entry: dict) -> str:
+    """Date an entry: its ``created_at``, else the date its fact became valid.
+
+    Rendered date-only. A memory's usefulness turns on how old it is, not on
+    what second it was written, and the full ISO timestamp is envelope.
+    """
+    temporal = entry.get('temporal')
+    valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
+    for value in (entry.get('created_at'), valid_at):
+        if isinstance(value, str) and len(value) >= 10:
+            return value[:10]
+    return UNDATED
+
+
+def _memory_bullet(entry: dict, store: str, indent: str = '') -> str | None:
+    """Render one recalled entry as ``- [category · date · store] content``.
+
+    Returns ``None`` for an entry carrying no text at all: a bullet with an
+    empty body would spend tokens telling an agent that something it cannot
+    read exists. Content is rendered WHOLE (D5) with continuation lines
+    indented so a multi-paragraph memory stays inside its own bullet.
+    """
+    if not isinstance(entry, dict):
+        return None
+    content = entry.get('content') or entry.get('digest')
+    if not isinstance(content, str) or not content.strip():
+        return None
+    body = content.strip().replace('\n', '\n' + indent + '  ')
+    return f'{indent}- [{_entry_category(entry)} · {_entry_date(entry)} · {store}] {body}'
+
+
+def _is_search_reply(text: str) -> bool:
+    """False only for text that parses as JSON yet is no ``{"results": [...]}`` reply.
+
+    The server reports a rejected search (``{"error": ..., "error_type": ...}``)
+    as a normal, non-``isError`` document, which recalled nothing. Text that
+    does not parse at all is left to the renderers' fail-open path, which
+    keeps the multi-text-block limitation :meth:`BriefingAssembler._scoped_search`
+    documents.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True
+    return isinstance(payload, dict) and isinstance(payload.get('results'), list)
+
+
+def render_memory_results(payload_text: str) -> str:
+    """Distil a filtered ``search`` payload into markdown bullets (D5).
+
+    One bullet per surviving result, plus one nested bullet per grouped child
+    (:data:`GROUPED_CHILD_KEYS`) — those children carry an amendment's digest
+    or a pinned body, which reach the prompt today as nested JSON and would
+    otherwise vanish silently, making the nested-drop note announce blocking
+    a leak of content nobody renders.
+
+    Fails OPEN on a malformed payload, exactly as
+    :func:`filter_foreign_project_results` does and for the same reason: a
+    serialisation surprise must not blank a section that has real facts in
+    it. The raw text is returned unchanged and a WARNING is logged. Returns
+    ``''`` when the payload is well-formed but holds nothing renderable, so
+    the caller skips the section the same way it skips an empty one.
+    """
+    try:
+        payload = json.loads(payload_text)
+        results = payload['results']
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
+        logger.warning(
+            f'render_memory_results: payload is not a renderable search reply ({e}); '
+            'rendering it unfiltered'
+        )
+        return payload_text
+    if not isinstance(results, list):
+        logger.warning(
+            f"render_memory_results: payload['results'] is a {type(results).__name__}, "
+            'not a list; rendering it unfiltered'
+        )
+        return payload_text
+
+    bullets: list[str] = []
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        store = entry.get('source_store')
+        store = store if isinstance(store, str) and store else UNKNOWN_STORE
+        bullet = _memory_bullet(entry, store)
+        if bullet is None:
+            continue
+        bullets.append(bullet)
+        grouped = entry.get('grouped')
+        if not isinstance(grouped, dict):
+            continue
+        for key in GROUPED_CHILD_KEYS:
+            children = grouped.get(key)
+            if not isinstance(children, list):
+                continue
+            bullets.extend(
+                child_bullet
+                for child in children
+                if (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
+            )
+    return '\n'.join(bullets)
+
+
+def render_entity_block(payload_text: str, expected_name: str) -> str:
+    """Render a ``get_entity`` reply, but ONLY for an exactly-named node (D3).
+
+    ``get_entity`` tries an exact name match and then falls back to fuzzy /
+    semantic matching, so a task node that does not exist is answered with a
+    NEIGHBOURING task's node — measured — whose facts would then be read as
+    this task's own. Admitting a reply only when the node's name equals
+    *expected_name* character-for-character is what makes the channel safe to
+    render. The guard is client-side by decision: the PRD puts server-side
+    fuzzy-path changes out of scope, and a consumer that cannot tolerate a
+    wrong neighbour should not depend on the server to stop sending one.
+
+    An edge's date is best-effort: measured live, every edge of a queried
+    task node carried ``temporal: null`` (the exact-match path builds edges
+    from an EdgeDict that has no ``valid_at`` at all), so a dated edge is the
+    exception and a date is never required.
+
+    Returns ``''`` — never raises — for a missing, mis-shaped, empty or
+    wrong-named reply.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f'render_entity_block: reply for {expected_name!r} is not JSON ({e})')
+        return ''
+    if not isinstance(payload, dict):
+        return ''
+
+    nodes = payload.get('nodes')
+    nodes = nodes if isinstance(nodes, list) else []
+    node = next(
+        (n for n in nodes if isinstance(n, dict) and n.get('name') == expected_name),
+        None,
+    )
+    if node is None:
+        # A degraded reply makes "no such node" unanswerable — the store that
+        # would have held it is the one that failed — so the same empty
+        # render means two different things and only the level separates them.
+        degraded = bool(payload.get('degraded'))
+        logger.log(
+            logging.WARNING if degraded else logging.DEBUG,
+            f'render_entity_block: no node named exactly {expected_name!r} in '
+            f'the reply; nothing rendered (degraded={degraded})',
+        )
+        return ''
+
+    summary = node.get('summary')
+    heading = f'**{expected_name}**'
+    if isinstance(summary, str) and summary.strip():
+        heading += f' — {summary.strip()}'
+
+    lines = [heading]
+    edges = payload.get('edges')
+    for edge in edges if isinstance(edges, list) else []:
+        if not isinstance(edge, dict):
+            continue
+        fact = edge.get('fact')
+        if not isinstance(fact, str) or not fact.strip():
+            continue
+        temporal = edge.get('temporal')
+        valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
+        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
+        lines.append(f'- {fact.strip()}{dated}')
+    return '\n'.join(lines)
+
+
+MEMORY_FAILURE_TIMEOUT = 'timeout'
+MEMORY_FAILURE_TRANSPORT = 'transport'
+MEMORY_FAILURE_MALFORMED = 'malformed'
+"""Why a memory query produced nothing, when the answer is "it broke".
+
+Three classes, because they call for three different operator responses: a
+timeout says the service is alive and slow, a transport failure says it is
+unreachable, and a malformed reply says it answered with something that is
+not a USABLE tool result. "The corpus holds nothing" is NOT one of them —
+that is an empty outcome carrying no failure at all, and conflating the two
+is the defect this vocabulary exists to end.
+
+``malformed`` covers two reply shapes, because both leave the caller with no
+facts and send an operator to the same place — the server: a JSON-RPC error
+envelope (no ``result`` dict at all; see ``mcp_lifecycle._raw_call``) and a
+tool-level failure, which FastMCP returns as a well-formed envelope carrying
+``isError: True`` and the error prose in a text block. The second is the
+dangerous one: its text block reads exactly like a recalled result, so
+without the flag it renders into the prompt as remembered fact.
+"""
+
+MEMORY_EMPTY_NOTICE = '_No memory context available._'
+MEMORY_OUTAGE_NOTICE = '_Memory unavailable ({reasons}) — proceed with codebase exploration._'
+"""The two "nothing recalled" outcomes, deliberately worded apart.
+
+Measured over live briefings, 234 said "no memory context available" because
+the service was failing and 77 because the corpus genuinely had nothing to
+say — in byte-identical prose. An operator reading one could not tell which
+had happened, so neither number was actionable.
+"""
+
+MEMORY_OUTAGE_STREAK_THRESHOLD = 5
+"""Consecutive dispatches recalling NOTHING before the outage is escalated.
+
+INV-4. The per-query WARNING and the in-block notice report one dispatch;
+neither can say "this has now failed five running", which is the difference
+between one flaky call and a memory service nobody has noticed is down. Five
+is a judgement, not a measurement: low enough that a real outage is named
+within a few minutes of dispatch traffic, high enough that a single restart
+of the memory container does not page anyone.
+
+CODE, not a config knob (D7). The threshold is revisited on evidence like
+the query table beside it; hot-reload buys nothing for a module constant,
+and a per-project knob would let "what counts as an outage" drift between
+projects for no stated reason.
+
+Deliberately NOT ``shared.storm_counter.StormCounter``, which is a rolling
+TIME-WINDOW burst detector: it would fire on N failures inside a window even
+with successes interleaved, and would fall silent on a permanent outage once
+dispatches slowed below the window rate — the exact opposite of what a
+consecutive-failure streak must report. The house precedent for a streak is
+a plain counter attribute (``shared/api_health.py``'s
+``consecutive_successes``, ``usage_gate``'s ``consecutive_cap_hits``), and
+there is no shared streak primitive to reuse.
+"""
+
+MEMORY_SECTION_FAILURE_NOTICE = (
+    '_The **{section}** section is missing: the memory query failed ({reason})._'
+)
+MEMORY_DEGRADED_STORES_NOTICE = (
+    '_Partial recall for **{section}**: the {stores} store(s) failed._'
+)
+
+
+@dataclass(frozen=True)
+class MemoryQueryOutcome:
+    """What one memory query produced: facts, or a named reason there are none.
+
+    ``text`` is the reply payload (filtered, once it has passed
+    :func:`filter_foreign_project_results`); ``failure`` names one of the
+    reason classes above. Both being absent is the honest empty answer —
+    the query worked and the corpus had nothing.
+    """
+
+    text: str | None = None
+    failure: str | None = None
+    dropped: int = 0
+    nested_dropped: int = 0
+    failed_stores: tuple[str, ...] = ()
+
+
+def _section_notices(section: str, outcome: MemoryQueryOutcome) -> list[str]:
+    """The lines a dispatch owes its reader about one query's health (D6).
+
+    Both notices name their *section*, because a reader looking at a block
+    with one section missing needs to know WHICH question went unanswered —
+    "memory degraded" alone leaves them unable to tell a missing convention
+    from a missing task history. Takes the title rather than the spec it
+    usually comes from: one section can be answered by more than one channel
+    (D3's dual-channel Task Context), and each channel names itself.
+    """
+    notices = []
+    if outcome.failure:
+        notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
+            section=section, reason=outcome.failure,
+        ))
+    if outcome.failed_stores:
+        notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
+            section=section, stores=', '.join(outcome.failed_stores),
+        ))
+    return notices
+
+
+ENTITY_CHANNEL_SUFFIX = ' (knowledge graph)'
+"""Distinguishes D3's graph channel from the semantic one in a notice.
+
+Both answer the same SECTION, so an unqualified notice would name "Task
+Context" twice — identical prose, no way to tell which of the two corpora
+went missing, and a duplicated line when both fail together.
+"""
+
+
+def _failed_stores(payload_text: str) -> tuple[str, ...]:
+    """Which stores the server reported failing on this query.
+
+    ``degraded``/``failed_stores`` are emitted FAULT-ONLY — a healthy reply
+    carries neither key — so their presence is itself the signal. Read from
+    the RAW reply rather than the filtered one: the filter preserves these
+    sibling keys, but it returns ``''`` when every result was foreign, and a
+    partial store outage is worth reporting even when nothing survived the
+    cross-project filter.
+
+    Silent on a payload that will not parse: the caller has already run it
+    through :func:`filter_foreign_project_results`, which logs that WARNING
+    once. A second copy of the same diagnosis is noise.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ()
+    if not isinstance(payload, dict) or not payload.get('degraded'):
+        return ()
+    stores = payload.get('failed_stores')
+    if not isinstance(stores, list):
+        return ()
+    return tuple(store for store in stores if isinstance(store, str) and store)
+
+
+def _tool_error_text(reply: dict) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
+
+    An MCP tool reports its own failure IN the response body rather than by
+    breaking the transport: FastMCP answers with a well-formed
+    ``{'isError': True, 'content': [{'type': 'text', 'text': 'Error: ...'}]}``.
+    Nothing about that envelope's SHAPE says it failed, so a reader that
+    checks only the shape extracts the error prose and renders it as recalled
+    memory — and, worse, counts it as a successful recall that resets the
+    outage streak.
+
+    Spelled as ``orchestrator/src/orchestrator/scheduler.py``'s reader of the
+    same envelope spells it (see its ``update_task`` call site and the
+    ``extract_rejection`` docstring), so the two cannot drift apart on what
+    "the tool errored" looks like on the wire.
+    """
+    if not reply.get('isError'):
+        return None
+    for block in reply.get('content', []) or []:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            return str(block.get('text', ''))
+    return ''
+
+
 MEMORY_CONTEXT_CAVEAT = (
     "_This context was recalled from the `{project_id}` project's memory — "
     'it is NOT a description of this worktree. It may name tasks, repos, '
@@ -557,6 +919,30 @@ renders verbatim. The tag filter is the permanent chokepoint for taggable
 into a recalled foreign path" into "agent verifies the path first" for the
 untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
 """
+
+
+def _caller_agent_id(task_id: str | None, role: str) -> str:
+    """The agent-id a dispatch is known by, in its prompt and in the journal.
+
+    One home for the format (INV-5): :meth:`BriefingAssembler._agent_identity`
+    renders the prompt's ``## Agent Identity`` block from this, and every
+    memory search declares the same string as ``caller_agent_id`` (D8). A
+    second copy at the search call site would let the identity an agent is
+    TOLD it has drift from the one the journal records it asking under.
+    """
+    return f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+
+
+def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
+    """Scope a post-planning role from the plan it was handed.
+
+    An explicitly-passed *task_id* wins over the plan's own copy, exactly as
+    the ``task_id or plan.get('task_id')`` these call sites used to spell did:
+    the workflow holds the authoritative id, and a plan written in an earlier
+    session can carry a stale one.
+    """
+    scope = BriefingScope.from_plan(plan)
+    return replace(scope, task_id=str(task_id)) if task_id else scope
 
 
 @dataclass
@@ -597,9 +983,27 @@ class BriefingAssembler:
         self.config = config
         self.memory_url = config.fused_memory.url
         self.project_id = config.fused_memory.project_id
+        self._memory_outage_streak = 0
+        """Consecutive dispatches whose memory recall produced nothing at all.
+
+        Lives on the assembler because the harness holds exactly one for the
+        life of the process and hands it to every workflow, so the count is
+        per-process dispatch history — which is the thing INV-4 asks about.
+
+        "Consecutive" therefore means consecutive across INTERLEAVED
+        dispatches from up to ``max_concurrent_tasks`` unrelated workflows,
+        not consecutive within one task. That is deliberate — the question
+        INV-4 asks is about the SERVICE, which is shared — and it is
+        deliberately conservative in one direction: because any dispatch
+        that recalled something resets the count, a partial outage that
+        still lets some queries through stays below the threshold rather
+        than escalating. The escalation is a floor on how loud a TOTAL
+        outage gets, never a detector for a flaky one; the per-query WARNING
+        and the in-block notices are what report those, once per dispatch.
+        """
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
-        agent_id = f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+        agent_id = _caller_agent_id(task_id, role)
         return (
             f'## Agent Identity\n\n'
             f'- **agent_id:** `{agent_id}`\n'
@@ -636,7 +1040,9 @@ class BriefingAssembler:
                 the common path.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task, include_files=False)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -725,7 +1131,9 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         and either confirms, updates, or recreates it.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -820,7 +1228,9 @@ and either confirm it, update it, or recreate it from scratch.
         flawed approach.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -908,7 +1318,9 @@ to start over from nothing.
         beyond the current ``plan.files`` set.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -1003,7 +1415,9 @@ triage it.
         without invoking the implementer.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'simple_task',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'simple_task')
@@ -1084,11 +1498,11 @@ suggestions-only on this exact tree — call
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
         orchestrator/tests/test_briefing_progress_spot.py.
         """
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         rebase_section = ''
         if rebase_notice:
@@ -1204,11 +1618,11 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         :meth:`build_implementer_prompt`: iterations.jsonl is its single home
         and the Action section below mandates reading it.
         """
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         modules_list = '\n'.join(f'- `{m}`' for m in sorted(locked_modules))
 
@@ -1292,11 +1706,11 @@ This task holds locks for the following modules:
         task_id: str | None = None,
     ) -> str:
         """Build prompt for the debugger agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'debugger')
 
-        identity = self._agent_identity(effective_tid, 'debugger')
+        identity = self._agent_identity(scope.task_id, 'debugger')
 
         return f"""\
 {context}
@@ -1325,8 +1739,16 @@ This task holds locks for the following modules:
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
+
+        *task* scopes the memory block to the work under review (D7). The
+        reviewer is the highest-volume role in the fleet and had only the
+        generic project-wide block, even though the workflow holds the task
+        at every dispatch site. It stays optional so callers that hold no
+        task — and every test that passes ``context`` directly — keep
+        working, falling back to the generic conventions query.
 
         When *amendment_suggestions* is provided, this review immediately
         follows an in-workflow amendment round; an advisory "# Amendment
@@ -1338,7 +1760,7 @@ This task holds locks for the following modules:
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
         """
         if context is None:
-            context = await self._get_memory_context()
+            context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
 
         # Truncate very large diffs to avoid blowing the context
         if len(diff) > 50000:
@@ -1391,11 +1813,11 @@ Prior suggestions the amendment was asked to address:
         context: str | None = None,
     ) -> str:
         """Build prompt for the completion judge agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'judge')
 
-        identity = self._agent_identity(effective_tid, 'judge')
+        identity = self._agent_identity(scope.task_id, 'judge')
 
         # Truncate diff (same cap as reviewer)
         if len(diff) > 50000:
@@ -1448,16 +1870,17 @@ your verdict as JSON matching the schema. Follow the safety rules: if the
 diff is empty or trivial, `substantive_work=false` and `complete=false`.
 """
 
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = None
-    ) -> str:
-        """Build prompt for the merger agent."""
-        if context is None:
-            context = await self._get_memory_context()
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str:
+        """Build prompt for the merger agent.
 
+        Carries NO memory block, by decision (D7). Merging is mechanical —
+        read both sides of a conflict, preserve both intents, test — and the
+        role is rare (7 dispatches in 14 days, measured). What it had was the
+        generic project-wide recall nobody could show helped it, so the block
+        and its ``context`` parameter are gone rather than rescoped: this
+        absence is deliberate, not an oversight.
+        """
         return f"""\
-{context}
-
 # Task Intent
 
 {task_intent}
@@ -1487,7 +1910,7 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         worktree: Path | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
-        context = await self._get_memory_context(task.get('id'))
+        context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
 
         return f"""\
@@ -1525,7 +1948,9 @@ from where the previous agent left off.
         Includes memory context, task details, escalation info, and action
         instructions.  Used for the initial session and after cap-hit resets.
         """
-        context = await self._get_memory_context(task.get('id'))
+        context = await self._get_memory_context(
+            BriefingScope.from_task(task), 'steward',
+        )
         identity = self._agent_identity(task.get('id'), 'steward')
         task_block = self._format_task(task)
         esc_block = self._format_escalation(escalation)
@@ -1603,63 +2028,80 @@ Handle this escalation, then call `resolve_issue` with a summary.
             lines.append(f'- **Suggested action:** {escalation["suggested_action"]}')
         return chr(10).join(lines)
 
-    async def _get_memory_context(self, task_id: str | None = None) -> str:
-        """Call fused-memory search for project context."""
+    async def _get_memory_context(self, scope: BriefingScope, role: str) -> str:
+        """Recall memory for one dispatch and render it as the ``# Context`` block.
+
+        *scope* says what this dispatch is about and *role* says who is
+        asking. WHAT is asked belongs to :mod:`shared.briefing_queries` — the
+        single home the memory-eval registry pins its phrasings against
+        (D9/INV-5) — so this method only fires the table, filters each reply
+        for cross-project leaks and renders what survives.
+        """
+        caller_agent_id = _caller_agent_id(scope.task_id, role)
         recalled_sections: list[str] = []
-        foreign_dropped = 0
-        nested_dropped = 0
-        queries_fired = 0
-        memory_unavailable = False
+        notices: list[str] = []
+        outcomes: list[MemoryQueryOutcome] = []
+        loop_failure: str | None = None
 
         try:
-            # Project overview
-            overview, dropped, nested = await self._scoped_search('project overview architecture goals')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if overview:
-                recalled_sections.append(f'## Project Context\n\n{overview}')
-
-            # Conventions
-            conventions, dropped, nested = await self._scoped_search('coding conventions and project norms')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if conventions:
-                recalled_sections.append(f'## Conventions\n\n{conventions}')
-
-            # Recent decisions
-            decisions, dropped, nested = await self._scoped_search('recent decisions and rationale')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if decisions:
-                recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
-
-            # Task-specific context
-            if task_id:
-                task_ctx, dropped, nested = await self._scoped_search(
-                    f'task {task_id} context and related decisions'
+            for spec, query in queries_for(scope):
+                outcome = await self._scoped_search(
+                    spec, query,
+                    caller_agent_id=caller_agent_id,
+                    caller_task_id=scope.task_id,
                 )
-                foreign_dropped += dropped
-                nested_dropped += nested
-                queries_fired += 1
-                if task_ctx:
-                    recalled_sections.append(f'## Task Context\n\n{task_ctx}')
+                outcomes.append(outcome)
+                notices.extend(_section_notices(spec.section_title, outcome))
+
+                blocks = [render_memory_results(outcome.text)] if outcome.text else []
+                if spec.wants_entity_block and scope.task_id:
+                    # The graph channel reports its own health but is kept out
+                    # of `outcomes`: that list answers "did the SEARCH table
+                    # work", which is what the outage streak and the drop
+                    # note's query arithmetic are both counting.
+                    entity = await self._task_entity_block(scope.task_id)
+                    notices.extend(_section_notices(
+                        spec.section_title + ENTITY_CHANNEL_SUFFIX, entity,
+                    ))
+                    blocks.append(entity.text or '')
+                body = '\n\n'.join(block for block in blocks if block)
+                if body:
+                    recalled_sections.append(f'## {spec.section_title}\n\n{body}')
 
         except Exception as e:
+            # The loop itself broke — a filter or renderer surprise, not a
+            # per-query fault, so no section can name it. It still counts as
+            # an outage for the notice below.
             logger.warning(f'Failed to fetch memory context: {e}')
-            memory_unavailable = True
+            loop_failure = MEMORY_FAILURE_TRANSPORT
+
+        foreign_dropped = sum(outcome.dropped for outcome in outcomes)
+        nested_dropped = sum(outcome.nested_dropped for outcome in outcomes)
+        queries_fired = len(outcomes)
+        failures = [outcome.failure for outcome in outcomes if outcome.failure]
+        reasons = list(dict.fromkeys(failures + ([loop_failure] if loop_failure else [])))
+        # An outage is "nothing worked", not "something didn't": one failed
+        # query among two is a partial recall, already named section by
+        # section in `notices` above. Gated on `recalled_sections` as well as
+        # on the reasons, because the loop can break AFTER a section was
+        # genuinely recalled — and a dispatch that recalled something has not
+        # suffered an outage, however badly its remaining queries went.
+        outage = (
+            not recalled_sections
+            and bool(reasons)
+            and (loop_failure is not None or len(failures) == queries_fired)
+        )
+        self._note_memory_outage(outage)
 
         # Compute (and log) the filtered-result summary BEFORE any early
         # return below: an all-foreign result set and a partial failure are
         # both "no facts survived" outcomes, and the fact that a leak was
         # caught and blocked must never be discarded along with them — see
         # filter_foreign_project_results' loud-over-silent fail-open stance.
-        # foreign_dropped sums per-query drops over the SAME corpus (four
-        # queries can all match one distinct foreign memory), so the note
-        # names both numbers rather than implying `foreign_dropped` distinct
-        # facts were found.
+        # foreign_dropped sums per-query drops over the SAME corpus (every
+        # query can match one distinct foreign memory), so the note names
+        # both numbers rather than implying `foreign_dropped` distinct facts
+        # were found.
         #
         # Top-level and NESTED drops are named as separate quantities (task
         # 4008 amendment). A nested drop removed an amendment digest or a
@@ -1686,16 +2128,26 @@ Handle this escalation, then call `resolve_issue` with a summary.
             )
 
         if not recalled_sections:
-            if memory_unavailable:
-                if drop_note:
-                    return (
-                        '# Context\n\n_Memory unavailable — proceed with codebase '
-                        f'exploration. Note: {drop_note} before the failure._'
-                    )
-                return '# Context\n\n_Memory unavailable — proceed with codebase exploration._'
+            # The per-section notices are owed to the reader whether or not
+            # some OTHER query happened to render: D6 conditions the failure
+            # line on a per-query failure, and `_failed_stores` promises a
+            # partial store outage is reported "even when nothing survived
+            # the cross-project filter". Dropping them here made a broken
+            # dispatch read as a healthy empty corpus — byte-identically.
+            #
+            # The family line stays FIRST: scripts/legibility/digest.py
+            # recognises this block by leading substring, and `outage` keeps
+            # meaning "nothing worked" (the streak predicate above is
+            # untouched), so a partial failure still leads with
+            # MEMORY_EMPTY_NOTICE and a total one with MEMORY_OUTAGE_NOTICE.
+            notice = (
+                MEMORY_OUTAGE_NOTICE.format(reasons=', '.join(reasons))
+                if outage else MEMORY_EMPTY_NOTICE
+            )
+            body = '\n\n'.join([notice, *notices])
             if drop_note:
-                return f'# Context\n\n_No memory context available ({drop_note})._'
-            return '# Context\n\n_No memory context available._'
+                body += f'\n\n_Note: {drop_note}._'
+            return f'# Context\n\n{body}'
 
         # recalled_sections is non-empty: gate the provenance caveat on that
         # fact alone, NOT on memory_unavailable — a later query failing must
@@ -1708,65 +2160,230 @@ Handle this escalation, then call `resolve_issue` with a summary.
             caveat += f'\n\n_In total, {drop_note}._'
 
         rendered_sections = list(recalled_sections)
-        if memory_unavailable:
-            rendered_sections.append(
+        if loop_failure is not None:
+            notices.append(
                 '_Memory unavailable for the remaining queries — proceed with '
                 'codebase exploration for anything not covered above._'
             )
+        if notices:
+            rendered_sections.append('\n'.join(notices))
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
 
-    async def _scoped_search(self, query: str) -> tuple[str | None, int, int]:
-        """Search fused-memory and drop cross-project results from the reply.
+    def _note_memory_outage(self, outage: bool) -> None:
+        """Track the consecutive-outage streak and escalate once per crossing.
 
-        Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
-        which queries fire or their ``limit`` (task 3253 owns that
-        adjudication) — that applies :func:`filter_foreign_project_results`
-        to the raw text before it reaches :meth:`_get_memory_context`.
-        Returns the filter's ``(text, dropped, nested_dropped)`` triple
-        verbatim, or ``(None, 0, 0)`` when the underlying search itself
-        returned nothing (nothing to filter).
-
-        Assumes :meth:`_mcp_search` answers with a single JSON document: it
-        joins every MCP response text block with ``'\\n'`` before returning
-        (unchanged by this task, to keep its silent-fallthrough allowlist
-        entry valid). If the search tool ever replies with more than one
-        text block, the joined text is not valid JSON and the filter fails
-        open (unfiltered, WARNING logged) for that query — see
-        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
-        pinned limitation.
+        Re-alarms on every further multiple of the threshold rather than
+        once and then never again: a permanent outage must keep saying so,
+        and an operator who missed the first line still gets another without
+        one line per dispatch.
         """
-        raw = await self._mcp_search(query)
-        if not raw:
-            return None, 0, 0
-        return filter_foreign_project_results(raw, self.project_id)
+        if not outage:
+            self._memory_outage_streak = 0
+            return
+        self._memory_outage_streak += 1
+        if self._memory_outage_streak % MEMORY_OUTAGE_STREAK_THRESHOLD == 0:
+            logger.error(
+                f'_get_memory_context: {self._memory_outage_streak} consecutive '
+                f'dispatches recalled no memory at all for {self.project_id!r} — '
+                'the memory service looks unavailable, and every briefing since '
+                'the streak began was assembled without it'
+            )
 
-    async def _mcp_search(self, query: str) -> str | None:
-        """Search fused-memory via its MCP HTTP endpoint."""
+    async def _task_entity_block(self, task_id: str) -> MemoryQueryOutcome:
+        """The knowledge-graph half of D3's dual-channel task context.
+
+        The semantic search answers "what memory reads like this task"; this
+        answers "what the graph records ABOUT this task", which is a
+        different question and a different corpus. Asked only when there is a
+        task id to name — an entity called ``Task None`` matches nothing, and
+        the fuzzy fallback would answer that miss with a stranger.
+
+        Returns the RENDERED block as its ``text``, and carries the channel's
+        health in the same shape the search channel uses: ``get_entity``
+        answers a Graphiti fault with the very same fault-only
+        ``degraded``/``failed_stores`` keys
+        (``fused_memory/services/memory_service.py``), so a graph outage here
+        would otherwise be indistinguishable from "the graph holds nothing
+        about this task" — the exact defect the search half of D6 closes.
+        """
+        expected_name = f'Task {task_id}'
+        reply = await self._mcp_get_entity(expected_name)
+        if not reply.text:
+            return reply
+        return replace(
+            reply,
+            text=render_entity_block(reply.text, expected_name),
+            failed_stores=_failed_stores(reply.text),
+        )
+
+    async def _mcp_get_entity(self, name: str) -> MemoryQueryOutcome:
+        """Look one entity up over fused-memory's MCP HTTP endpoint.
+
+        Named failures rather than a bare ``None``, for the reason
+        :meth:`_mcp_search` documents: this channel's reader cannot tell an
+        empty graph from an unreachable one, and only the caller can say so
+        in the prompt.
+        """
         try:
             result = await mcp_call(
                 f'{self.memory_url}/mcp',
                 'tools/call',
-                {
-                    'name': 'search',
-                    'arguments': {
-                        'query': query,
-                        'project_id': self.project_id,
-                        'limit': 5,
-                    },
-                },
+                {'name': 'get_entity', 'arguments': {'name': name, 'project_id': self.project_id}},
                 timeout=10,
             )
-            content = result.get('result', {}).get('content', [])
-            texts = []
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    texts.append(block['text'])
-            return '\n'.join(texts) if texts else None
-
         except Exception as e:
-            logger.debug(f'MCP search failed for "{query}": {e}')
-            return None
+            failure = (
+                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
+                else MEMORY_FAILURE_TRANSPORT
+            )
+            logger.warning(f'MCP get_entity failed for {name!r} ({failure}): {e}')
+            return MemoryQueryOutcome(failure=failure)
+
+        reply = result.get('result') if isinstance(result, dict) else None
+        if not isinstance(reply, dict):
+            logger.warning(f'MCP get_entity for {name!r} answered with no tool result: {result!r}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        error_text = _tool_error_text(reply)
+        if error_text is not None:
+            logger.warning(f'MCP get_entity for {name!r} returned a tool error: {error_text!r}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        texts = [
+            block['text']
+            for block in reply.get('content', [])
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        return MemoryQueryOutcome(text='\n'.join(texts) if texts else None)
+
+    async def _scoped_search(
+        self,
+        spec: BriefingQuerySpec,
+        query: str,
+        *,
+        caller_agent_id: str,
+        caller_task_id: str | None,
+    ) -> MemoryQueryOutcome:
+        """Search fused-memory and drop cross-project results from the reply.
+
+        Thin wrapper over :meth:`_mcp_search` that applies
+        :func:`filter_foreign_project_results` to the raw text before it
+        reaches :meth:`_get_memory_context`, and carries the reply's
+        ``failed_stores`` alongside. A failed or empty search passes through
+        with its outcome intact — there is nothing to filter, and the reason
+        it produced nothing must survive to the renderer.
+
+        Assumes :meth:`_mcp_search` answers with a single JSON document: it
+        joins every MCP response text block with ``'\\n'`` before returning.
+        If the search tool ever replies with more than one text block, the
+        joined text is not valid JSON and the filter fails open (unfiltered,
+        WARNING logged) for that query — see
+        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
+        pinned limitation.
+        """
+        reply = await self._mcp_search(
+            spec, query,
+            caller_agent_id=caller_agent_id,
+            caller_task_id=caller_task_id,
+        )
+        if not reply.text:
+            return reply
+        text, dropped, nested_dropped = filter_foreign_project_results(reply.text, self.project_id)
+        return replace(
+            reply,
+            text=text,
+            dropped=dropped,
+            nested_dropped=nested_dropped,
+            failed_stores=_failed_stores(reply.text),
+        )
+
+    async def _mcp_search(
+        self,
+        spec: BriefingQuerySpec,
+        query: str,
+        *,
+        caller_agent_id: str,
+        caller_task_id: str | None,
+    ) -> MemoryQueryOutcome:
+        """Ask one query of fused-memory over its MCP HTTP endpoint.
+
+        The spec supplies the retrieval scoping — which stores, which
+        categories, how many results — and the caller identity is declared
+        for the journal (D8). An empty ``stores``/``categories`` tuple is
+        omitted rather than sent empty, so the server applies its own routing
+        instead of being handed a filter that matches nothing.
+
+        A failure is NAMED (see the reason classes above) and logged at
+        WARNING, never swallowed at DEBUG: an unreachable memory service used
+        to be indistinguishable here from an empty corpus, which left the
+        caller's honest outage branch unreachable and masked a live transient
+        server error for 234 briefings.
+        """
+        arguments: dict[str, Any] = {
+            'query': query,
+            'project_id': self.project_id,
+            'limit': spec.limit,
+            'caller_agent_id': caller_agent_id,
+        }
+        if spec.stores:
+            arguments['stores'] = list(spec.stores)
+        if spec.categories:
+            arguments['categories'] = list(spec.categories)
+        if caller_task_id:
+            arguments['caller_task_id'] = caller_task_id
+
+        try:
+            result = await mcp_call(
+                f'{self.memory_url}/mcp',
+                'tools/call',
+                {'name': 'search', 'arguments': arguments},
+                timeout=10,
+            )
+        except Exception as e:
+            # One handler, because the TYPE raised here says nothing: on retry
+            # exhaustion `mcp_call` re-raises a plain RuntimeError that keeps
+            # the original only as `__cause__`, so an `except TimeoutError`
+            # branch could never fire and every timeout was reported as a
+            # transport failure. `is_timeout_failure` does the unwrap, in the
+            # module that does the wrap.
+            failure = (
+                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
+                else MEMORY_FAILURE_TRANSPORT
+            )
+            logger.warning(f'Memory search failed for {query!r} ({failure}): {e}')
+            return MemoryQueryOutcome(failure=failure)
+
+        reply = result.get('result') if isinstance(result, dict) else None
+        if not isinstance(reply, dict):
+            logger.warning(
+                f'Memory search for {query!r} answered with no tool result: {result!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        error_text = _tool_error_text(reply)
+        if error_text is not None:
+            logger.warning(
+                f'Memory search for {query!r} returned a tool error: {error_text!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        texts = [
+            block['text']
+            for block in reply.get('content', [])
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        # No text blocks is an honest empty answer, not a fault: the tool
+        # replied, it simply recalled nothing.
+        if not texts:
+            return MemoryQueryOutcome(text=None)
+        text = '\n'.join(texts)
+        if not _is_search_reply(text):
+            logger.warning(
+                f'Memory search for {query!r} answered without a results list: {text!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+        return MemoryQueryOutcome(text=text)
 
     def _format_prior_proposal(self, task: dict) -> str:
         """Format the most recent dry-run block-time proposal, if any.

@@ -90,17 +90,16 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
     },
 }
 
-# max_turns for the judge CLI invocation.  NOT 1: ``max_turns=1`` is incompatible
-# with ``--json-schema`` because the schema mechanism burns a tool-use turn, so
-# the CLI returns ``error_max_turns`` even when the structured payload is already
-# attached (task_curator.py:2366-2372).  3 is the floor both migrated siblings
-# use (curator ``ge=3``, path_scope_adjudicator ``ge=3``): schema tool-use +
-# optional reasoning + final response.  We deliberately do NOT rely on
-# cli_invoke's ``schema_salvaged`` boundary fallback (:1794-1797), which would
-# make every judge run report an internal ``is_error`` and spend its turn on an
-# error path.  Cost/duration exposure stays bounded by
-# ``judge_cli_timeout_seconds`` (validated ≤ stage_timeout_seconds) and
-# cli_invoke's ``max_budget_usd`` default.
+# max_turns for the judge CLI invocation.  Never 1 — see
+# fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS
+# for why a cap of 1 fails with --json-schema and why schema salvage does not
+# cover it.  3 is the floor both migrated siblings use (curator ``ge=3``,
+# path_scope_adjudicator ``ge=3``).  The judge's own prompt/schema shape has not
+# been measured, so 3 is the established value, not a revalidated one: run
+# fused-memory/scripts/probe_schema_max_turns.py --shape judge before retuning.
+#
+# Cost/duration exposure stays bounded by ``judge_cli_timeout_seconds``
+# (validated ≤ stage_timeout_seconds) and cli_invoke's ``max_budget_usd`` default.
 _JUDGE_CLI_MAX_TURNS = 3
 
 # run_id for the throwaway JudgeVerdict built by _call_judge_cli's validation
@@ -658,9 +657,7 @@ Review this run and provide your verdict as JSON.
                 # must stay truthy, or --strict-mcp-config is never emitted.
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
-                # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
-                # (the schema mechanism burns a tool-use turn — see
-                # task_curator.py:2366-2372).
+                # See _JUDGE_CLI_MAX_TURNS for why this is not 1.
                 max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),

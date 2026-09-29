@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
+from _mem0_record_shapes import mem0_record, raw_record
 
 from fused_memory.models.reconciliation import RunStatus, StageReport
 from fused_memory.reconciliation import citation_repair
@@ -1781,23 +1782,19 @@ class TestRepairFingerprintProvenance:
     ):
         """The RAW Qdrant payload, deliberately not ``MemoryService.get_memory``.
 
-        ``get_memory`` is the primitive ``cite_memory`` uses, so matching it
-        would make a repaired citation byte-identical to an in-run one — but
-        matching it would also reproduce a defect. mem0's ``AsyncMemory.get``
-        lifts its ``promoted_payload_keys`` (``agent_id`` among them) to the TOP
-        level and EXCLUDES them from ``metadata``, while every other payload key
-        — ``category`` included — stays INSIDE ``metadata``; ``get_memory``
-        reads ``category`` off the top level and ``agent_id`` out of
-        ``metadata``, i.e. neither where mem0 put it. Its mem0 fingerprint is
-        therefore structurally ``{category: None, agent_id: None, created_at:
-        <real>}``.
+        The repair reads the replacement's fingerprint straight off
+        ``get_memory_by_id``'s full unprocessed payload, where all three fields
+        sit at one level. Since task 5265 ``get_memory`` reads the SAME VALUES
+        out of mem0's processed record, this is no longer a choice between a
+        correct source and a broken one. The source is still pinned,
+        because a durable audit record should name where its provenance came
+        from rather than acquire it through whichever primitive happens to be
+        equivalent today.
 
-        ``get_memory_by_id`` returns the full unprocessed payload, where all
-        three genuinely live. A durable audit record is the wrong place to
-        reproduce a known-broken read for the sake of agreeing with it, so this
-        pins BOTH halves: the real values are recorded, and ``get_memory`` is
-        not called at all. (Convergence belongs in ``get_memory``; that module
-        is outside this task's scope and the fix is filed separately.)
+        Both halves stay asserted: the real values are recorded, and
+        ``get_memory`` is not called at all. The two extractions'
+        value-agreement is a separate claim, pinned by
+        ``TestFingerprintExtractionConvergence`` below.
         """
 
         class RecordingLookup(FakeMemoryLookup):
@@ -1811,9 +1808,11 @@ class TestRepairFingerprintProvenance:
                 self, memory_id: str, store: str, project_id: str
             ) -> dict[str, Any]:
                 self.get_memory_calls.append((memory_id, store, project_id))
-                # What the real one returns for a mem0 id: two fields always
-                # None. Recording it makes the fingerprint assertion below fail
-                # too, so switching the source breaks this test twice over.
+                # Deliberately NOT what the real get_memory returns today —
+                # this arm must never be reached, and returning a distinguishable
+                # wrong answer makes the fingerprint assertion below fail too, so
+                # switching the source breaks this test twice over rather than
+                # once.
                 return {
                     'category': None,
                     'agent_id': None,
@@ -1852,6 +1851,90 @@ class TestRepairFingerprintProvenance:
             }
         finally:
             await journal.close()
+
+
+class TestFingerprintExtractionConvergence:
+    """The two `{category, agent_id, created_at}` extractions must agree on VALUES.
+
+    ``citation_repair._fingerprint_from_record`` and
+    ``MemoryService.get_memory`` produce the same SHAPE from the same stored
+    memory by two different readings, because they consume two different INPUT
+    SHAPES:
+
+      * ``_fingerprint_from_record`` consumes ``get_memory_by_id``'s record,
+        whose ``metadata`` is the FULL unprocessed Qdrant payload — all three
+        fields at ONE level;
+      * ``get_memory`` consumes mem0's PROCESSED record, where
+        ``promoted_payload_keys`` (``agent_id`` among them) are lifted to the
+        top level and EXCLUDED from ``metadata``, while ``category`` stays
+        inside it.
+
+    Before task 5265 they disagreed: ``get_memory`` read both of the first two
+    at the wrong level and returned ``None`` for each.  This is the test that
+    would have caught that, and it is the executable form of the claim
+    ``_fingerprint_from_record``'s docstring makes.  Both record shapes are
+    DERIVED from one stored payload here, so the two cannot silently drift onto
+    different source data.
+    """
+
+    #: One stored Qdrant point payload — the single source of truth below.
+    _PAYLOAD = {
+        'data': 'the memory text',
+        'hash': 'abc123hash',
+        'created_at': '2026-07-26T04:34:05Z',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'recon-stage-memory_consolidator',
+        'category': 'procedural_knowledge',
+        'topic': 'citation-repair',
+    }
+
+    _UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    @classmethod
+    def _raw_record(cls) -> dict[str, Any]:
+        """What ``MemoryService.get_memory_by_id`` returns: the FULL payload."""
+        return raw_record(cls._PAYLOAD, memory_id=cls._UUID)
+
+    @classmethod
+    def _mem0_record(cls) -> dict[str, Any]:
+        """What mem0's ``get`` returns, derived from the SAME payload."""
+        return mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
+
+    @pytest.mark.asyncio
+    async def test_both_extractions_agree_on_category_and_agent_id(self, mock_config):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        from_get_memory = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+        from_raw = citation_repair._fingerprint_from_record(self._raw_record())
+
+        assert from_get_memory['category'] == from_raw['category'] == 'procedural_knowledge'
+        assert (
+            from_get_memory['agent_id']
+            == from_raw['agent_id']
+            == 'recon-stage-memory_consolidator'
+        ), (
+            f'the two extractions disagree on agent_id: get_memory={from_get_memory!r}, '
+            f'_fingerprint_from_record={from_raw!r}'
+        )
+
+        # ``created_at`` is asserted PRESENT on both and deliberately NOT
+        # asserted EQUAL: mem0's ``get`` passes it through
+        # ``_normalize_iso_timestamp_to_utc`` while the raw Qdrant payload is
+        # unnormalised, so a record stored with a non-UTC offset yields the
+        # same instant in two spellings.  Equality here would pin an accident
+        # of this fixture's already-UTC timestamp and fail on real data the
+        # code handles correctly.  The ``get_memory`` side is the half that
+        # discriminates — mem0 excludes ``created_at`` from ``metadata``, so
+        # reading it at the wrong level would yield None.
+        assert from_get_memory['created_at'] is not None
+        assert from_raw['created_at'] is not None
 
 
 class TestRepairJournalIoErrors:
@@ -1990,16 +2073,18 @@ class TestRepairReadAfterWrite:
         This test owns the POST-write window specifically. A writer landing
         BEFORE the write is refused as ``concurrent_modification`` by the
         compare-and-set (see ``TestRepairConcurrentModification``), so the
-        competing write here is staged to land after a SUCCESSFUL CAS — which
-        is the window the compare-and-set structurally cannot see, and the one
-        the harness actually produces: it calls ``complete_run(...)`` BEFORE its
-        trailing ``update_run_stage_reports``, so a run reads ``completed``
-        while a writer still holds a loaded copy it is about to write back
-        whole — and the operator script runs out-of-process with an empty
-        ``live_run_ids``, so the row status is its only other guard. Reporting
-        ``repaired`` for a write that was overwritten is the exact failure the
-        liveness gate exists to prevent, so the read-after-write turns it into a
-        loud refusal.
+        competing write here is staged to land after a SUCCESSFUL CAS — the
+        window the compare-and-set structurally cannot see.
+
+        The harness no longer produces this window: the run owner's trailing
+        ``update_run_stage_reports`` carries persisted repairs forward (see
+        ``test_owner_trailing_rewrite_no_longer_clobbers_a_reported_repair``).
+        The competing writer here is therefore a raw wholesale compare-and-set
+        that BYPASSES that path, standing for any future writer that does not
+        preserve repairs. Reporting ``repaired`` for a write that was
+        overwritten is the exact failure the liveness gate exists to prevent,
+        so the read-after-write stays as the backstop that turns it into a loud
+        refusal.
         """
         journal = await build_journal_with_closed_run(
             tmp_path,
@@ -2014,7 +2099,6 @@ class TestRepairReadAfterWrite:
             # unaffected by the mutation the repair applies to its own.
             other_writers_copy = await journal.get_run(RUN_ID)
             assert other_writers_copy is not None
-            real_update = journal.update_run_stage_reports
             real_cas = journal.compare_and_set_run_stage_reports
 
             async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
@@ -2022,11 +2106,17 @@ class TestRepairReadAfterWrite:
                 # valid, so this is not the concurrent_modification window.
                 applied = await real_cas(run_id, stage_reports, **kw)
                 assert applied is True
-                # Only THEN does the competing writer win wholesale, exactly as
-                # harness's end-of-stage rewrite does: it writes back its own
-                # loaded copy, which predates the repair, so the just-written
-                # provenance record is overwritten.
-                await real_update(run_id, other_writers_copy.stage_reports)
+                # Only THEN does the competing writer win wholesale, through a
+                # raw compare-and-set on a fresh token rather than the owner's
+                # repair-preserving write: it writes back its own loaded copy,
+                # which predates the repair, so the just-written provenance
+                # record is overwritten.
+                fresh = await journal.get_run_with_stage_reports_text(run_id)
+                assert fresh is not None
+                clobbered = await real_cas(
+                    run_id, other_writers_copy.stage_reports, expected_text=fresh[1]
+                )
+                assert clobbered is True
                 return applied
 
             journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
@@ -2066,6 +2156,12 @@ class TestRepairReadAfterWrite:
         non-container. Without the shape check that is a ``TypeError`` out of an
         MCP tool — the unstructured failure INV-2 forbids — instead of the
         ``repair_clobbered`` a blob rewritten out from under the write deserves.
+
+        As in ``test_clobbered_repair_is_refused_not_reported_as_repaired``, the
+        clobbering writer is a raw wholesale compare-and-set that bypasses the
+        owner's repair-preserving ``update_run_stage_reports``: the harness no
+        longer produces this window, and the read-after-write is the backstop
+        for a writer that skips that path.
         """
         journal = await build_journal_with_closed_run(
             tmp_path,
@@ -2083,13 +2179,17 @@ class TestRepairReadAfterWrite:
             clobbering_finding['cited_memories'] = [_citation(SUCCESSOR)]
             clobbering_finding[citation_repair.CITATION_REPAIRS_KEY] = 'not-a-list'
 
-            real_update = journal.update_run_stage_reports
             real_cas = journal.compare_and_set_run_stage_reports
 
             async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
                 applied = await real_cas(run_id, stage_reports, **kw)
                 assert applied is True
-                await real_update(run_id, other_writers_copy.stage_reports)
+                fresh = await journal.get_run_with_stage_reports_text(run_id)
+                assert fresh is not None
+                clobbered = await real_cas(
+                    run_id, other_writers_copy.stage_reports, expected_text=fresh[1]
+                )
+                assert clobbered is True
                 return applied
 
             journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
@@ -2107,6 +2207,50 @@ class TestRepairReadAfterWrite:
 
             assert outcome['error'] == 'repair_clobbered'
             assert 'status' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_trailing_rewrite_no_longer_clobbers_a_reported_repair(
+        self, tmp_path
+    ):
+        """The harness rewrite that used to clobber a reported repair.
+
+        A run owner calls ``complete_run`` BEFORE its trailing
+        ``update_run_stage_reports``, so a repair can land on a run that reads
+        ``completed`` while the owner still holds a loaded copy that predates
+        it. That trailing write now carries the persisted repair forward, so a
+        repair reported ``repaired`` stays repaired.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            other_writers_copy = await journal.get_run(RUN_ID)
+            assert other_writers_copy is not None
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+            assert outcome['status'] == 'repaired'
+
+            await journal.update_run_stage_reports(RUN_ID, other_writers_copy.stage_reports)
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            assert len(repaired[CITATION_REPAIRS_KEY]) == 1
+            assert repaired[CITATION_REPAIRS_KEY][0]['memory_id'] == DANGLING
         finally:
             await journal.close()
 
@@ -2180,9 +2324,9 @@ class TestRepairConcurrentModification:
     """A competing wholesale rewrite landing between the repair's READ and its
     WRITE is refused, not silently lost.
 
-    The read-after-write ``repair_clobbered`` check narrows this window but
-    cannot close it, because it only ever observes the blob AFTER this call's
-    own write. The surviving interleaving:
+    The read-after-write ``repair_clobbered`` check cannot see this window,
+    because it only ever observes the blob AFTER this call's own write. The
+    interleaving it would miss:
 
         A.read -> B.read -> A.write -> A.verify(sees own blob -> 'repaired')
                           -> B.write (B's blob predates A's record -> A's LOST)

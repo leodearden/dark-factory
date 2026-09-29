@@ -12,9 +12,12 @@ This module is NOT a CLI in its own right — the leading underscore marks it as
 importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
-  :func:`resolve_project_roots`, :func:`discover_project_roots`,
-  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts, plus
-  ``census_tagger_debris.py`` (task 4525). :func:`connect_ro`, with
+  :func:`decode_metadata`, :func:`resolve_project_roots`,
+  :func:`discover_project_roots`, :func:`discover_db_paths`) — adopted by ALL
+  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525).
+  :func:`decode_metadata` is the exception to "adopted by all four": it is
+  used only by the two AUDIT scripts (task 4782), which are the only ones
+  that decode a ``metadata`` column at all. :func:`connect_ro`, with
   :class:`TaskDbUnreadable` and :class:`TaskDbProblem`, is the same tier's
   "…and OPEN it" half (task 5330): Tier 1 owned the path and nothing owned the
   open, so ~10 call sites spell it themselves and none turns a wrong path into
@@ -144,6 +147,28 @@ _DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
 def tasks_db_path(project_root: str) -> Path:
     """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
     return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
+
+
+def decode_metadata(raw: object) -> dict:
+    """Decode a raw tasks.db ``metadata`` blob into a dict, degrading to ``{}``.
+
+    Promoted from a copy verbatim-duplicated across
+    ``audit_combine_gate_marker_loss.py`` and ``audit_manifest_descriptor_drift.py``
+    (task 4782, closing the code-reuse finding from the task 4545 amendment
+    pass). Degrades for NULL, an empty string, malformed JSON, or a payload
+    that decodes to anything other than a dict (a list, a bare scalar,
+    ``null``). A corrupt metadata blob is data to be skipped, never a reason
+    to abort a sweep over thousands of tasks.
+    """
+    if not raw or not isinstance(raw, (str, bytes)):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
 
 
 class TaskDbProblem(Enum):

@@ -2,7 +2,8 @@
 
 This generator OWNS NO VOCABULARY. Every fact it emits comes from
 ``shared/src/shared/task_statuses.py`` (the members) and
-``dashboard/src/dashboard/data/census.py`` (the views and tones), so the
+``dashboard/src/dashboard/data/census.py`` (the views, tones and burndown
+series keys), so the
 committed JS cannot disagree with the Python the server shapes payloads
 with. That property is the whole point: a generator that invented a fact of
 its own would be a SECOND source, and byte-equality between a file and the
@@ -48,7 +49,7 @@ HEADER = """// GENERATED FILE — DO NOT EDIT BY HAND.
 //
 // Rendered by scripts/gen_dashboard_task_vocab.py from the Python vocabulary:
 // shared/src/shared/task_statuses.py (members) and
-// dashboard/src/dashboard/data/census.py (views, tones).
+// dashboard/src/dashboard/data/census.py (views, tones, series keys).
 //
 // Regenerate with:
 //   python3 scripts/gen_dashboard_task_vocab.py \\
@@ -63,10 +64,11 @@ def task_vocab_payload() -> dict[str, object]:
     """Build the vocabulary the SPA reads, entirely from the Python sources.
 
     Returns:
-        ``{MEMBERS, VIEWS, SUB_VIEWS, TONES}``. ``MEMBERS`` keeps the enum's
-        declaration order; each view's member list is SORTED so the rendered
-        bytes are stable across runs (a ``frozenset``'s iteration order is
-        not), which is what makes byte-equality a meaningful guard.
+        ``{MEMBERS, VIEWS, SUB_VIEWS, TONES, SERIES_KEYS}``. ``MEMBERS``,
+        ``TONES`` and ``SERIES_KEYS`` keep the enum's declaration order; each
+        view's member list is SORTED so the rendered bytes are stable across
+        runs (a ``frozenset``'s iteration order is not), which is what makes
+        byte-equality a meaningful guard.
     """
     return {
         "MEMBERS": [member.value for member in TaskStatus],
@@ -79,6 +81,7 @@ def task_vocab_payload() -> dict[str, object]:
             for view, members in census.SUB_VIEWS.items()
         },
         "TONES": {member.value: census.TONES[member] for member in TaskStatus},
+        "SERIES_KEYS": {member.value: census.SERIES_KEYS[member] for member in TaskStatus},
     }
 
 

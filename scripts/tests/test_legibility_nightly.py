@@ -31,11 +31,12 @@ from legibility import (
     digest,
     nightly,
     trickle_state,
+    unlanded,
 )
 from legibility import (
     config as config_mod,
 )
-from legibility.config import load_config
+from legibility.config import TrickleCensusCaps, load_config
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -65,6 +66,7 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
 def _write_config(
     root: Path, *, project_id: str, escalation_port: int = 8199, cwd_prefixes=None,
     agent_transcript_roots=None, max_daily_digest_bytes: int | None = None,
+    trickle_caps: dict | None = None,
 ) -> Path:
     """Write a minimal valid docs/legibility/legibility.yaml under *root*.
 
@@ -81,6 +83,11 @@ def _write_config(
     ``budget_skipped > 0``) through the supported config seam, rather than
     by resurrecting task 3268's already-fixed raw-transcript-bytes cost
     basis.
+
+    When *trickle_caps* is given, a ``census:`` block carrying those
+    ``trickle_caps:`` keys is appended. Values are spelled with
+    ``json.dumps`` so a ``None`` cap lands as YAML ``null``, not the string
+    ``'None'``.
     """
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(root / "work")]
     legibility_dir = root / "docs" / "legibility"
@@ -99,6 +106,9 @@ def _write_config(
     if max_daily_digest_bytes is not None:
         lines.append("budgets:")
         lines.append(f"  max_daily_digest_bytes: {max_daily_digest_bytes}")
+    if trickle_caps is not None:
+        lines += ["census:", "  trickle_caps:"]
+        lines += [f"    {key}: {json.dumps(value)}" for key, value in trickle_caps.items()]
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
 
@@ -1365,11 +1375,88 @@ def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
     assert seen == {}, 'a refused target must never reach subprocess.run'
 
 
+# ---------------------------------------------------------------------------
+# task 5900 (5782's precondition (b)): the trickle-launched census is BOUNDED
+#
+# The launcher translates census.trickle_caps into census.py's EXISTING
+# --max-batches / --max-verify-clusters flags. An absent caps argument is the
+# bounded schema default, never uncapped; null fields are the explicit
+# per-project uncapped opt-out and omit their flag.
+# ---------------------------------------------------------------------------
+
+def test_default_census_launcher_argv_carries_the_given_caps(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=7, max_verify_clusters=9),
+    )
+
+    argv = seen['args']
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/project']
+
+
+def test_default_census_launcher_without_caps_uses_the_bounded_schema_default(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/project')
+
+    argv = seen['args']
+    defaults = TrickleCensusCaps()
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', str(defaults.max_batches)]
+    assert _adjacent_pair(argv, '--max-verify-clusters') == [
+        '--max-verify-clusters', str(defaults.max_verify_clusters),
+    ]
+
+
+def test_default_census_launcher_null_caps_omit_the_flags(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=None, max_verify_clusters=None),
+    )
+
+    argv = seen['args']
+    assert '--max-batches' not in argv
+    assert '--max-verify-clusters' not in argv
+
+
+def test_default_census_launcher_one_null_cap_omits_only_that_flag(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher(
+        '/some/project', caps=TrickleCensusCaps(max_batches=None, max_verify_clusters=9),
+    )
+
+    argv = seen['args']
+    assert '--max-batches' not in argv
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+
+
+def test_default_census_launcher_composes_caps_config_path_and_pool_env(monkeypatch):
+    """Caps, the pinned config path and the pool env ride ONE launch."""
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
+    config_path = '/p/docs/legibility/legibility.yaml'
+
+    nightly._default_census_launcher(
+        '/p', config_path=config_path, caps=TrickleCensusCaps(max_batches=7), env=env,
+    )
+
+    argv = seen['args']
+    assert seen['env'] is env
+    assert seen['check'] is False
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/p']
+    assert _adjacent_pair(argv, '--config') == ['--config', config_path]
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
+
+
 def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path):
     cfg = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
     _line, fire = nightly.evaluate_census_step(
@@ -1389,7 +1476,7 @@ def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(
     cfg_b = load_config(_write_config(tmp_path / 'proj_b', project_id='proj_b'))
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append(project_root)
 
     for cfg in (cfg_a, cfg_b):
@@ -1406,7 +1493,7 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
     cfg = load_config(config_path)
     calls = []
 
-    def rec(project_root, *, config_path=None):
+    def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
     nightly.evaluate_census_step(
@@ -1415,6 +1502,30 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
     )
 
     assert calls == [(cfg.project_root, config_path)]
+
+
+def test_evaluate_census_step_forwards_the_configs_trickle_caps_to_launcher(tmp_path):
+    """The census bound is decided by the project's legibility.yaml at the one
+    place config maps to launch -- never by the launcher's own fallback, so
+    the caps here are NON-default."""
+    cfg = load_config(_write_config(
+        tmp_path / 'proj_a', project_id='proj_a',
+        trickle_caps={'max_batches': 7, 'max_verify_clusters': 9},
+    ))
+    calls = []
+
+    def rec(project_root, *, config_path=None, caps=None):
+        calls.append(caps)
+
+    nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec,
+    )
+
+    assert len(calls) == 1
+    assert calls[0] is not None
+    assert calls[0].max_batches == 7
+    assert calls[0].max_verify_clusters == 9
 
 
 def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
@@ -1449,6 +1560,68 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     assert Path(kwargs['config_path']).is_absolute()
     # The cfg and the config path name the SAME project.
     assert cfg.project_root == str(tmp_path / 'proj_a')
+
+
+def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
+    tmp_path, monkeypatch, install_fake_httpx,
+):
+    """End to end: a max-interval FIRE through run_nightly and the REAL default
+    launcher carries the project's census.trickle_caps into census.py's argv.
+
+    The injected invoke means no pool is built, so run_nightly hands
+    evaluate_census_step no launcher and the default one runs. Only
+    subprocess.run is spied -- recording every call, since nightly.subprocess
+    is the global module -- so no census really starts. Non-default caps
+    (7/9) make a silent fall-back to the schema default fail.
+    """
+    install_fake_httpx(_no_outbound_post)
+    root = tmp_path / 'proj_a'
+    config_path = _write_config(
+        root, project_id='proj_a',
+        trickle_caps={'max_batches': 7, 'max_verify_clusters': 9},
+    )
+    legibility_dir = root / 'docs' / 'legibility'
+    now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
+    # 11 days stale with a null done-count: only max-interval can fire, and
+    # condition (b) never reaches a status fetcher.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (now - timedelta(days=11)).isoformat(),
+            'last_census_done_count': None,
+        }),
+        encoding='utf-8',
+    )
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+    runs = []
+
+    def _record_run(args, **kwargs):
+        runs.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', _record_run)
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=now,
+        invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: None,
+    )
+
+    assert result.census_fire is True
+    census_launches = [
+        argv for argv in runs if len(argv) > 1 and str(argv[1]).endswith('census.py')
+    ]
+    assert len(census_launches) == 1
+    argv = census_launches[0]
+    assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
+    assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(root)]
 
 
 class TestRunNightlyBindsTheCensusLauncherToThePool:
@@ -1492,13 +1665,19 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
         return seen
 
-    @staticmethod
-    def _env_the_census_would_get(launcher, monkeypatch):
-        """Resolve *launcher* the way evaluate_census_step does, run it with
-        subprocess.run spied, and return the env the census subprocess got."""
+    CAPS = TrickleCensusCaps(max_batches=7)
+
+    @classmethod
+    def _census_run_the_launcher_makes(cls, launcher, monkeypatch):
+        """Resolve *launcher* and call it the way evaluate_census_step does --
+        with caps, here the NON-default ``CAPS`` so a binding that drops them
+        cannot pass on the schema default -- and return the spied
+        subprocess.run call (``'args'``, ``'env'``)."""
         seen = _spy_subprocess_run(monkeypatch)
-        (launcher if launcher is not None else nightly._default_census_launcher)('/some/project')
-        return seen.get('env')
+        (launcher if launcher is not None else nightly._default_census_launcher)(
+            '/some/project', caps=cls.CAPS,
+        )
+        return seen
 
     def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
         self, tmp_path, monkeypatch, install_fake_httpx,
@@ -1525,7 +1704,8 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
             tmp_path, invoke=None,
         )
 
-        env = self._env_the_census_would_get(seen['launcher'], monkeypatch)
+        census_run = self._census_run_the_launcher_makes(seen['launcher'], monkeypatch)
+        env = census_run.get('env')
         assert env is not None, (
             'the census inherited the parent env -- after the account-pin '
             'drop-in is retired that means ~/.claude, and preflight_headroom '
@@ -1533,6 +1713,9 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         )
         assert env['CLAUDE_CODE_OAUTH_TOKEN'] == gate.token
         assert 'ANTHROPIC_API_KEY' not in env
+        assert _adjacent_pair(census_run['args'], '--max-batches') == [
+            '--max-batches', str(self.CAPS.max_batches),
+        ], 'the pool-bound launcher must still forward the caps it is called with'
 
     def test_a_run_with_no_pool_leaves_the_census_env_inherited(
         self, tmp_path, monkeypatch, install_fake_httpx,
@@ -1550,7 +1733,7 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
             tmp_path, invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
         )
 
-        assert self._env_the_census_would_get(seen['launcher'], monkeypatch) is None
+        assert self._census_run_the_launcher_makes(seen['launcher'], monkeypatch).get('env') is None
 
 
 # ---------------------------------------------------------------------------
@@ -2533,6 +2716,8 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     before_log = subprocess.run(
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    head_bytes = codebook_path.read_bytes()
 
     fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
@@ -2562,16 +2747,102 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     assert 'commit' in arguments['summary'].lower()
 
     # No NEW commit exists -- the escalation + non-zero exit is the loud
-    # signal (the dump already landed in the working tree, uncommitted).
+    # signal, and the unlanded dump is rolled back out of the checkout.
     after_log = subprocess.run(
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert after_log == before_log
 
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    assert 'cannot lock ref (simulated)' in arguments['detail']
+    assert str(quarantine_dir) in arguments['detail']
+
+
+def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> Path:
+    """The checkout is back at HEAD and the refused dump -- with the night's
+    one 'known-cause' sighting -- survives only in the quarantine, whose
+    directory is returned."""
     status = subprocess.run(
         ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
-    assert 'confusion-codebook.yaml' in status
+    assert status == ''
+    assert (repo / 'docs' / 'legibility' / 'confusion-codebook.yaml').read_bytes() == head_bytes
+
+    rollback = result.rollback
+    assert rollback is not None and rollback.restored
+    assert rollback.quarantine_dir.parent == unlanded.quarantine_root('testproj')
+    assert rollback.quarantine_dir.name.startswith('trickle-2026-07-13-')
+    quarantined = codebook.load(
+        rollback.quarantine_dir / 'docs' / 'legibility' / 'confusion-codebook.yaml',
+    )
+    entry = next(e for e in quarantined['entries'] if e['id'] == 'known-cause')
+    assert [s['session'] for s in entry['sightings']] == ['session-1']
+    return rollback.quarantine_dir
+
+
+def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp_path):
+    """A real refusal through the DEFAULT committer, in the shape of reify's
+    cited-test-path gate (core.hooksPath pointing outside the tracked tree)."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    hook = tmp_path / 'hooks' / 'pre-commit'
+    hook.parent.mkdir()
+    hook.write_text(
+        '#!/bin/sh\n'
+        'echo "cited-test-path gate: tests/moved_test.rs does not exist"\n'
+        'exit 1\n'
+    )
+    hook.chmod(0o755)
+    subprocess.run(
+        ['git', 'config', 'core.hooksPath', str(hook.parent)], cwd=repo, check=True,
+    )
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    head_bytes = codebook_path.read_bytes()
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    def _run():
+        return nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=target_date,
+            now=fixed_now,
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    result = _run()
+
+    assert result.exit_code == 1
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    assert len(escalation_calls) == 1
+    detail = escalation_calls[0][1]['params']['arguments']['detail']
+    assert 'cited-test-path gate' in detail
+    assert str(quarantine_dir) in detail
+
+    # The next night starts from HEAD, not from the refused dump.
+    hook.unlink()
+    result_2 = _run()
+
+    assert result_2.commit_made is True
+    committed = codebook.load(codebook_path)
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
+    assert len(entry['sightings']) == 1
 
 
 # ---------------------------------------------------------------------------
