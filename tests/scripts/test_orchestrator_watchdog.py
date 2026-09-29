@@ -5070,6 +5070,7 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
     clock_file = tmp_path / "clock.json"
     trace_path = tmp_path / "drain-poll-trace.tsv"
     busy_polls_needed = 2
+    largest_leak_safe_grace = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     def r_polled_busy_enough() -> bool:
         polls_so_far = read_drain_poll_trace(trace_path, complete_only=True)
@@ -5083,9 +5084,7 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
                 "RESTART_VERIFY_TIMEOUT": "5",
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
                 "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
-                    wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
-                ),
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(largest_leak_safe_grace),
             },
         )
     except subprocess.TimeoutExpired as exc:
