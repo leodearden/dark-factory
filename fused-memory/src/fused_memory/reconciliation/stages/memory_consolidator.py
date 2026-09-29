@@ -356,7 +356,9 @@ class MemoryConsolidator(BaseStage):
         # that found nothing (scanned > 0, flags_emitted == 0, errors == 0)
         # from a degraded one (errors > 0), from a registry gap
         # (unresolvable > 0) and from a cross-tag id collision
-        # (ambiguous > 0), without a .get(..., 0) fallback.
+        # (ambiguous > 0), without a .get(..., 0) fallback.  The classification
+        # counts are fleet-wide while flags_emitted is this project's only, so
+        # terminal + missing > flags_emitted is normal.
         report.stats['orphaned_recon_escalations_scanned'] = 0
         report.stats['orphaned_recon_escalations_terminal'] = 0
         report.stats['orphaned_recon_escalations_missing'] = 0
@@ -590,6 +592,10 @@ class MemoryConsolidator(BaseStage):
         # watcher session is the sole closer, reached via
         # skills/recon-escalation-watcher/SKILL.md.
         #
+        # The sweep emits flags only for THIS project's orphans, while its
+        # counts cover the whole shared queue; the trade-off is stated at
+        # orphaned_recon_escalation_sweep.py::sweep_orphaned_recon_escalations.
+        #
         # Placement mirrors the curator-gate block above, for the same two
         # reasons: this sweep EMITS flags, so it must sit ABOVE dedup_flags so
         # (1) each appended flag earns a stage1_flag_marker ledger row keyed on
@@ -613,6 +619,7 @@ class MemoryConsolidator(BaseStage):
                     self._escalation_queue,
                     self.taskmaster,
                     self.known_projects,
+                    running_project_id=self.project_id,
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise

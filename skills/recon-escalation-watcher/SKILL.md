@@ -690,7 +690,11 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   cycle: read the report stats `orphaned_recon_escalations_terminal` and
   `orphaned_recon_escalations_missing`, and the emitted
   `orphaned_recon_escalation` flags, each of which names the escalation id,
-  the subject's project, and the observed subject status. (ii) On demand,
+  the subject's project, and the observed subject status. The stats count the
+  WHOLE shared queue, but since task 5813 a cycle's flags name only the
+  orphans whose subject belongs to THAT cycle's project, so no single report's
+  flags list every orphan. The fleet-wide view is the reaper in (ii), which
+  the main loop already runs with `--apply` every cycle. (ii) On demand,
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
