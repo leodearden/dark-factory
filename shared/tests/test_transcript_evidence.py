@@ -27,6 +27,7 @@ from test_liveness_boundary_gate import _write_transcript
 
 from shared.cli_invoke import (
     TranscriptEvidence,
+    count_transcript_turns,
     transcript_evidence,
     transcript_evidence_for_session,
 )
@@ -280,3 +281,22 @@ class TestTranscriptEvidenceForSession:
         )
 
         assert transcript_evidence_for_session(tmp_path, 'sess-2') == _evidence(1, _DECISION, ())
+
+    def test_turns_are_the_count_the_watchdog_stamps(self, tmp_path: Path) -> None:
+        """The curator reports both numbers for one run, so they must not disagree."""
+        project_dir = tmp_path / 'projects' / 'proj'
+        project_dir.mkdir(parents=True)
+        records = (
+            _preamble()
+            + [_assistant(_thinking()), {'type': 'assistant'}, _assistant(nested=False)]
+            + _rejected({'action': 'bogus'}, _SCHEMA_MISMATCH)
+            + _accepted(dict(_DECISION))
+        )
+        (project_dir / 'sess-3.jsonl').write_text(
+            '\n'.join(json.dumps(record) for record in records) + '\n',
+        )
+
+        evidence = transcript_evidence_for_session(tmp_path, 'sess-3')
+
+        assert evidence is not None
+        assert evidence.assistant_turns == count_transcript_turns(tmp_path, 'sess-3') == 5

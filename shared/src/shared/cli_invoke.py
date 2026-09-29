@@ -589,6 +589,11 @@ def read_transcript_records(
         return None
 
 
+def _is_assistant_turn(record: object) -> bool:
+    """True iff *record* is one assistant turn; every transcript turn count uses this."""
+    return isinstance(record, dict) and record.get('type') == 'assistant'
+
+
 def count_transcript_turns(
     config_dir: Path,
     session_id: str,
@@ -607,7 +612,7 @@ def count_transcript_turns(
     records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
-    return sum(1 for r in records if r.get('type') == 'assistant')
+    return sum(1 for r in records if _is_assistant_turn(r))
 
 
 def note_unreadable_transcript(
@@ -1197,7 +1202,7 @@ def ended_awaiting_background_for_session(
 class TranscriptEvidence:
     """What a run did, as recorded in its transcript.
 
-    - ``assistant_turns``: records with ``type == 'assistant'``.
+    - ``assistant_turns``: the turn count ``count_transcript_turns`` reports.
     - ``accepted_schema_payload``: the ``data`` of the last ``structured_output``
       attachment, i.e. the CLI's record that it accepted a ``StructuredOutput``
       call against the schema, else None. A rejected or merely attempted call
@@ -1252,7 +1257,7 @@ def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
         if accepted is not None:
             accepted_schema_payload = accepted
             continue
-        if not isinstance(record, dict) or record.get('type') != 'assistant':
+        if not _is_assistant_turn(record):
             continue
         assistant_turns += 1
         other_tool_uses += [
@@ -4187,7 +4192,7 @@ async def _run_subprocess(
         transcript_turns = None
         ended_awaiting_background = False
     else:
-        transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
+        transcript_turns = sum(1 for r in transcript_records if _is_assistant_turn(r))
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
 
     return _SubprocessResult(
