@@ -10,16 +10,24 @@ interceptor actually receives. The gate's own rule matrix lives in
 
 Harness modelled on ``test_delete_memory_citation_guard.py``:
 ``create_mcp_server`` + ``_tool_manager.call_tool`` + ``_parse_result``.
+``TestUpdatePersistence`` forwards the interceptor's ``update_task`` to a real
+``SqliteTaskBackend`` so the backend's own metadata merge decides what is
+stored, and asserts on the stored row rather than on the forwarded payload.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator, Mapping
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.server.tools import create_mcp_server
 
 RECON_AGENT = 'recon-stage-task_knowledge_sync'
@@ -204,17 +212,23 @@ class TestSubmitTask:
         assert project_ids == {'reify'}
 
 
+MERGE: Mapping[str, Any] = {'metadata_mode': 'merge'}
+
+
 async def update(
     server, project_root: str, *,
     metadata: dict[str, Any] | None = None,
     description: str | None = None,
     agent_id: str = RECON_AGENT,
+    task_id: str = '5537',
+    merge_flags: Mapping[str, Any] = MERGE,
 ) -> dict[str, Any]:
+    """*merge_flags* ride along with *metadata*; ``{}`` omits both flags."""
     arguments: dict[str, Any] = {
-        'id': '5537', 'project_root': project_root, 'agent_id': agent_id,
+        'id': task_id, 'project_root': project_root, 'agent_id': agent_id,
     }
     if metadata is not None:
-        arguments |= {'metadata': metadata, 'metadata_mode': 'merge'}
+        arguments |= {'metadata': metadata, **merge_flags}
     if description is not None:
         arguments['description'] = description
     return _parse_result(await server._tool_manager.call_tool('update_task', arguments))
@@ -348,3 +362,158 @@ class TestUpdateTask:
         assert kwargs['metadata'] is None
         memory_service.get_memory_by_id.assert_not_awaited()
         task_interceptor.get_task.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# What an update actually persists under the backend's real metadata merge
+# --------------------------------------------------------------------------- #
+
+SEED_STAMP = '2026-01-01T00:00:00+00:00'
+FINDING_IDS = [
+    'f11018d4-be96-456b-9ab9-cf6814155500',
+    '00004132-cd91-41dc-a059-bcd698bdd73c',
+]
+
+# Gate 5537 as stored after an earlier write: the four-entry enumeration, a
+# stale stamp, a stale exception for an unrelated id, and attached hints.
+SEED_METADATA: dict[str, Any] = {
+    'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5],
+    'x_liveness_reverified_at': SEED_STAMP,
+    'x_liveness_exceptions': [{
+        'memory_id': '9a4e568b-0000-4000-8000-000000000000',
+        'path': 'x_old[0]',
+        'outcome': 'absent',
+    }],
+    'memory_hints': {'entities': ['E1'], 'queries': ['Q1']},
+}
+
+
+@pytest_asyncio.fixture
+async def backend(project_root) -> AsyncIterator[SqliteTaskBackend]:
+    task_backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await task_backend.start()
+    try:
+        yield task_backend
+    finally:
+        await task_backend.close()
+
+
+@pytest_asyncio.fixture
+async def seeded_task_id(backend, project_root) -> str:
+    added = await backend.add_task(
+        project_root,
+        title='Human gate: decide the fate of the falsified entries',
+        description=GATE_DESCRIPTION,
+        metadata=json.dumps(SEED_METADATA),
+    )
+    return str(added['id'])
+
+
+@pytest.fixture
+def persisting_server(backend, memory_service, task_interceptor):
+    """The MCP server over an interceptor whose update_task writes through the
+    real backend, so none of the TaskInterceptor's unrelated recon gates can
+    reject and the stored row is the backend's own merge of the payload."""
+
+    async def _write_through(**kwargs: Any) -> dict[str, Any]:
+        rest = {
+            key: value for key, value in kwargs.items()
+            if key not in ('agent_id', 'client_op_id')
+        }
+        await backend.update_task(**rest)
+        return {'success': True}
+
+    task_interceptor.update_task.side_effect = _write_through
+    return create_mcp_server(memory_service, task_interceptor=task_interceptor)
+
+
+async def stored_metadata(
+    backend: SqliteTaskBackend, project_root: str, task_id: str,
+) -> dict[str, Any]:
+    return (await backend.get_task(task_id, project_root))['metadata']
+
+
+class TestUpdatePersistence:
+    """The gate's report must describe what the backend actually stores."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'merge_flags', [{'append': True}, {'metadata_mode': 'additive'}],
+        ids=['append', 'additive'],
+    )
+    async def test_a_non_overwriting_enumeration_update_is_refused_unwritten(
+        self, persisting_server, backend, project_root, seeded_task_id,
+        task_interceptor, merge_flags,
+    ):
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata={'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5]},
+            merge_flags=merge_flags,
+        )
+
+        assert result['error_type'] == 'EnumerationUpdateNotOverwriting'
+        assert result['enumerations'] == ['mem0_falsified_entries']
+        assert 'enumeration_liveness' not in result
+        task_interceptor.update_task.assert_not_awaited()
+        assert await stored_metadata(backend, project_root, seeded_task_id) == (
+            SEED_METADATA
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'merge_flags', [MERGE, {}], ids=['merge', 'flags-omitted'],
+    )
+    async def test_an_overwriting_update_stores_what_the_gate_reports(
+        self, persisting_server, backend, project_root, seeded_task_id,
+        merge_flags,
+    ):
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata={'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5]},
+            merge_flags=merge_flags,
+        )
+
+        assert 'error' not in result
+        assert result['enumeration_liveness']['dropped_absent'] == 1
+        stored = await stored_metadata(backend, project_root, seeded_task_id)
+        assert stored['mem0_falsified_entries'] == list(LIVE_IDS)
+        stamp = stored['x_liveness_reverified_at']
+        assert stamp != SEED_STAMP
+        assert datetime.fromisoformat(stamp).utcoffset() == timedelta(0)
+        assert stored['x_liveness_exceptions'] == [{
+            'memory_id': DELETED_0D5,
+            'path': 'mem0_falsified_entries[3]',
+            'outcome': 'absent',
+        }]
+
+    @pytest.mark.asyncio
+    async def test_a_stage2_memory_hints_attach_stays_additive(
+        self, persisting_server, backend, project_root, seeded_task_id,
+        memory_service,
+    ):
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata={'memory_hints': {'entities': ['E2'], 'queries': ['Q2']}},
+            merge_flags={'append': True},
+        )
+
+        assert 'error' not in result
+        memory_service.get_memory_by_id.assert_not_awaited()
+        stored = await stored_metadata(backend, project_root, seeded_task_id)
+        assert stored['memory_hints'] == {
+            'entities': ['E1', 'E2'], 'queries': ['Q1', 'Q2'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_append_to_an_unproven_id_list_stays_legal(
+        self, persisting_server, backend, project_root, seeded_task_id,
+    ):
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata={'origin_finding_ids': list(FINDING_IDS)},
+            merge_flags={'append': True},
+        )
+
+        assert 'error' not in result
+        stored = await stored_metadata(backend, project_root, seeded_task_id)
+        assert stored['origin_finding_ids'] == FINDING_IDS
