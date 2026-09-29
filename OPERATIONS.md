@@ -1395,7 +1395,7 @@ is `scripts/orchestrator-watchdog.py::_unit_is_active`.
 
 ### fused-memory socket activation (port 8002 survives restarts)
 
-`fused-memory.socket` (committed at `scripts/fused-memory.socket`) owns the
+`fused-memory.socket` (committed at `scripts/fused-memory.socket.template`) owns the
 listening socket on `0.0.0.0:8002`; `fused-memory.service` requires it, and
 the server adopts it via
 `shared/src/shared/systemd_listeners.py::take_systemd_listeners`. The port
@@ -1418,8 +1418,8 @@ What changes for an operator:
 | `systemctl --user stop fused-memory.socket fused-memory` | Actually takes fused-memory down; stopping the socket stops the service too. |
 
 Installing on a host that predates it: `scripts/setup-host.sh` section 4
-installs and enables the socket. By hand: copy `scripts/fused-memory.socket`
-to `~/.config/systemd/user/`, re-render the service unit (it now carries
+installs and enables the socket. By hand: copy `scripts/fused-memory.socket.template`
+to `~/.config/systemd/user/fused-memory.socket`, re-render the service unit (it now carries
 `Requires=`/`After=fused-memory.socket`), `systemctl --user daemon-reload`,
 `systemctl --user enable fused-memory.socket`, then
 `systemctl --user stop fused-memory` **before**

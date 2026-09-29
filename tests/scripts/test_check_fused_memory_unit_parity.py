@@ -1785,7 +1785,7 @@ def _section_4_repo(tmp_path: pathlib.Path, *, with_renderer: bool = True) -> pa
     """
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
-    for name in ("fused-memory.service.template", "fused-memory.socket"):
+    for name in ("fused-memory.service.template", "fused-memory.socket.template"):
         (repo / "scripts" / name).write_text(
             (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"), encoding="utf-8"
         )

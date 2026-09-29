@@ -1,3 +1,7 @@
+# Installed as ~/.config/systemd/user/fused-memory.socket. Committed as
+# .socket.template only because `.socket` is not in the shared lock-charter
+# extension allowlist (shared/src/shared/locking.py::FILE_EXTENSIONS); it has
+# no placeholders and is installed verbatim.
 [Unit]
 Description=Fused Memory MCP listening socket (held across service restarts)
 

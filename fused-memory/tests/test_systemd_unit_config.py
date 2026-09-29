@@ -157,7 +157,7 @@ class TestWatchdogSecContract:
 # ---------------------------------------------------------------------------
 
 _FM_DIR = Path(__file__).resolve().parent.parent
-_SOCKET_UNIT = _FM_DIR.parent / "scripts" / "fused-memory.socket"
+_SOCKET_UNIT = _FM_DIR.parent / "scripts" / "fused-memory.socket.template"
 _SERVICE_UNITS = [
     _FM_DIR / "fused-memory.service.example-systemd-config",
     _FM_DIR.parent / "scripts" / "fused-memory.service.template",

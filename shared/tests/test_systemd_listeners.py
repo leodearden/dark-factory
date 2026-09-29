@@ -61,6 +61,7 @@ def _spawn(sock: socket.socket, env_extra: dict[str, str], *, argv_prefix=(), se
 
 
 def _report(proc: subprocess.Popen) -> dict:
+    assert proc.stdout is not None
     line = proc.stdout.readline()
     assert line, 'child printed no report'
     return json.loads(line)

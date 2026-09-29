@@ -278,8 +278,9 @@ else
 fi
 
 # The socket unit holds port 8002 across service restarts. It carries no
-# host-local values, so it is copied rather than rendered.
-install -m 0644 "$REPO_ROOT/scripts/fused-memory.socket" "$UNIT_DIR/fused-memory.socket"
+# host-local values, so it is copied rather than rendered (see the template's
+# header for why its committed name ends in .template).
+install -m 0644 "$REPO_ROOT/scripts/fused-memory.socket.template" "$UNIT_DIR/fused-memory.socket"
 
 # UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
 # a no-op when nothing changed, and skipping it on a degraded path would leave
