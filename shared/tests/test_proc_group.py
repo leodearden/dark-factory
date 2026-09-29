@@ -28,46 +28,14 @@ from shared.proc_group import (
 )
 
 
-async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
-    """Poll until a process group is fully reaped by the kernel.
-
-    After terminate_process_group reaps the bash leader, any grandchild
-    processes are reparented to the user's ``systemd --user`` subreaper
-    (or pid 1) and become zombies until that subreaper waitpids them.
-    Until that happens, ``os.killpg(pgid, 0)`` still returns 0 rather
-    than raising ProcessLookupError.  Observed subreaper latency is
-    0–500 ms in isolation but stretches under 32-worker xdist load.
-    The default 5 s budget is comfortably longer than any observed reap
-    latency; a genuine leak (regression) causes the caller's assert to
-    fire.
-
-    PermissionError (EPERM): in the theoretically possible (though
-    practically negligible) case where the kernel recycles *pgid* to a
-    process owned by another user during the poll window,
-    ``os.killpg(pgid, 0)`` raises EPERM rather than ESRCH.  Both mean
-    "no longer our group to worry about", so EPERM is treated as success.
-    This cannot mask a genuine leak: EPERM only fires once the pgid has
-    been assigned to a different user's process, at which point the group
-    we spawned is definitively gone.
-    """
-    iterations = max(1, int(timeout / step))
-    for _ in range(iterations):
-        try:
-            os.killpg(pgid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
-        await asyncio.sleep(step)
-    return False
-
-
 async def _await_group_membership(
     pgid: int,
     *,
     total: int,
     comm: str,
     comm_count: int,
-    # Must-not-hang guard, not a latency SLA — matches the 5.0s budget
-    # already justified for _pgid_gone_within above.
+    # Must-not-hang guard, not a latency SLA — the same 5.0s budget as
+    # _await_group_terminated below.
     timeout: float = 5.0,
     # A single snapshot_process_group walk (all of /proc: stat/wchan/comm/
     # cmdline per pid) measured median 448ms idle / 911ms loaded, p95
@@ -95,8 +63,8 @@ async def _await_group_membership(
 
     Bounded by BOTH *timeout* (wall-clock) AND *min_attempts* — exhaustion
     requires both to be exceeded, whichever is more generous. *timeout*
-    defaults to 5.0s, matching the budget already justified for
-    ``_pgid_gone_within`` above. *min_attempts* defaults to 3 because a
+    defaults to 5.0s, the same budget as ``_await_group_terminated``.
+    *min_attempts* defaults to 3 because a
     single ``snapshot_process_group`` walk measured median 448ms idle /
     911ms loaded, p95 ~2.4-2.6s, max 3.95s — a deadline-only bound could
     admit just ONE attempt on a slower or larger-/proc host, silently
@@ -624,8 +592,10 @@ class TestTerminateProcessGroup:
         Spawn bash with start_new_session=True so it leads its own process
         group. After terminate_process_group returns:
         - proc.returncode must be set (process reaped)
-        - os.killpg(pgid, 0) must eventually raise ProcessLookupError once
-          the kernel reaps any reparented grandchild zombies (bounded 5 s poll)
+        - every member of the group must have terminated; a zombie still
+          awaiting its reparented reap by systemd --user counts as
+          terminated, because that reap is not terminate_process_group's to
+          perform
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 30',
@@ -640,10 +610,7 @@ class TestTerminateProcessGroup:
         assert proc.returncode is not None, (
             f'Process group {pgid} not reaped: proc.returncode is None'
         )
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'kernel zombie-reap race or genuine leak.'
-        )
+        await _await_group_terminated(pgid)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -683,7 +650,7 @@ class TestTerminateProcessGroup:
 
         Reproduces the canonical cargo → rustc incident shape: bash spawns two
         background sleeps and waits for them.  After terminate_process_group,
-        pgrep must report no processes in the group.
+        every member of the group must have terminated.
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 60 & sleep 60 & echo ready; wait',
@@ -726,10 +693,7 @@ class TestTerminateProcessGroup:
             with contextlib.suppress(Exception):
                 await proc.wait()
 
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'grandchildren leaked.'
-        )
+        await _await_group_terminated(pgid)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -1630,9 +1594,7 @@ class TestReapProcessGroups:
             # asyncio.to_thread(reap...) call site).
             outcomes = await asyncio.to_thread(reap_process_groups, {pgid})
             assert outcomes.get(pgid) == 'reaped', f'unexpected outcomes: {outcomes}'
-            assert await _pgid_gone_within(pgid), (
-                f'process group {pgid} not gone after reap'
-            )
+            await _await_group_terminated(pgid)
         finally:
             _kill_group(pgid)
             with contextlib.suppress(Exception):
