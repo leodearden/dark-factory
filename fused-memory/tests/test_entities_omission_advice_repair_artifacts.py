@@ -7,7 +7,9 @@ the corpus takes concurrent writes, and a store outage must not turn into a
 spurious task failure. Same stance as ``test_toolcall_xml_leak_sweep_artifacts.py``.
 
 ``census.json`` is the pre-mutation capture: every target, its verbatim
-pre-image, and the searches that found it.
+pre-image, and the searches that found it. ``phase1-apply.json`` is the
+mutation record: each amendment's raw ``update_memory`` reply, its raw
+``get_memory_by_id`` readback, and the census searches re-run afterwards.
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_resolution import resolve_referents
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / 'docs' / 'entities-omission-advice-repair'
@@ -118,3 +123,101 @@ def test_every_auto_memory_hit_is_classified_with_its_excerpt(census):
         assert entry['excerpt'].strip()
         assert entry['path']
         assert isinstance(entry['line'], int)
+
+
+FIX_TASK_NUMBER = '6059'
+LOCAL_PROJECT = 'dark_factory'
+REPLY_FAILURE_KEYS = ('error', 'error_type', '_mcp_is_error', '_raw')
+
+
+@pytest.fixture(scope='module')
+def phase1() -> dict:
+    return _load('phase1-apply.json')
+
+
+@pytest.fixture(scope='module')
+def census_by_key(census) -> dict[tuple[str, str], dict]:
+    return {_record_key(r): r for r in census['records']}
+
+
+def _census_targets(census) -> set[tuple[str, str]]:
+    return {_record_key(r) for r in census['records'] if r['disposition'] != NOT_TARGET}
+
+
+def _found_ids(hits_by_query: dict) -> set[str]:
+    found: set[str] = set()
+    for hits in hits_by_query.values():
+        assert isinstance(hits, list), hits
+        found.update(hits)
+    return found
+
+
+def test_phase1_amended_exactly_the_census_targets_once_each(census, phase1):
+    keys = [_record_key(a) for a in phase1['amendments']]
+    assert len(keys) == len(set(keys))
+    assert set(keys) == _census_targets(census)
+
+
+def test_every_phase1_update_reply_is_a_success_naming_its_target(phase1):
+    for amendment in phase1['amendments']:
+        reply = amendment['update_reply']
+        for key in REPLY_FAILURE_KEYS:
+            assert key not in reply, (amendment['memory_id'], key, reply)
+        assert reply['status'] == 'updated'
+        assert reply['id'] == amendment['memory_id']
+        assert amendment['reason'].strip()
+
+
+def test_every_amendment_landed_in_place_and_changed_the_text(phase1, census_by_key):
+    for amendment in phase1['amendments']:
+        readback = amendment['readback']
+        assert readback['found'] is True
+        assert readback['memory_id'] == amendment['memory_id']
+        assert readback['content'] == amendment['amended_content']
+        before = census_by_key[_record_key(amendment)]['before_content']
+        assert amendment['amended_content'] != before
+
+
+def test_every_amendment_leads_with_the_task_neutral_correction_marker(phase1):
+    marker = phase1['correction_marker']
+    assert marker.strip()
+    for project_id in {a['project_id'] for a in phase1['amendments']}:
+        marker_scan = resolve_referents(
+            declared=None, metadata=None, content=marker, group_id=project_id,
+        )
+        assert marker_scan.referents == ()
+    for amendment in phase1['amendments']:
+        assert amendment['amended_content'].startswith(marker)
+
+
+def test_every_correction_attributes_the_fix_task_to_dark_factory(phase1):
+    for amendment in phase1['amendments']:
+        project_id = amendment['project_id']
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content=amendment['amended_content'],
+            group_id=project_id,
+        )
+        qualifier = '' if project_id == LOCAL_PROJECT else LOCAL_PROJECT
+        expected = Referent(number=FIX_TASK_NUMBER, kind='task', project_id=qualifier)
+        assert expected in resolution.referents, (project_id, amendment['memory_id'])
+        assert all(r.number != FIX_TASK_NUMBER for r in resolution.ambiguous)
+        if project_id != LOCAL_PROJECT:
+            local_fix = Referent(number=FIX_TASK_NUMBER, kind='task', project_id='')
+            assert local_fix not in resolution.referents, amendment['memory_id']
+
+
+def test_amended_records_stay_findable_and_no_duplicate_correction_appeared(census, phase1):
+    marker = phase1['correction_marker']
+    targets = _census_targets(census)
+    for project_id, memory_id in targets:
+        assert memory_id in _found_ids(phase1['search_hits_after'][project_id]), memory_id
+    target_ids = {memory_id for _, memory_id in targets}
+    for project_id, hits_by_query in phase1['search_hits_after'].items():
+        for query, hits in hits_by_query.items():
+            before = census['search_hits'][project_id][query]
+            new_ids = set(hits) - set(before) - target_ids
+            for memory_id in new_ids:
+                readback = phase1['new_hit_readbacks'][memory_id]
+                assert marker not in readback.get('content', ''), memory_id
