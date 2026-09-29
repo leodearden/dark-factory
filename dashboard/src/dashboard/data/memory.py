@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Any
 
 import anyio
 import httpx
@@ -17,9 +18,9 @@ from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import (
-    _REAP_UNWIND_TIMEOUT_SECONDS,
     FANOUT_FAILURE_EXCEPTIONS,
     call_with_deadline,
+    cancel_and_await,
     describe_exc,
     first_success,
     log_fanout_failure,
@@ -53,12 +54,6 @@ MCP_HEADERS = {
 # never dedup and a caller-supplied key is preserved.
 
 
-# httpx applies one ``timeout`` to each of four phases separately: pool, connect,
-# write and read. Bounding the whole exchange by their sum lets httpx's own
-# timeouts fire first; this bound ends only what they cannot, such as a response
-# trickled in under the per-read timeout.
-_HTTPX_TIMEOUT_PHASES = 4
-
 _exchanges: set[asyncio.Task[httpx.Response]] = set()
 
 
@@ -72,44 +67,51 @@ async def _post(
     so a caller that gives up stops waiting while the exchange runs on to
     completion under an anyio bound, which httpcore's shields do honour.
     """
-    exchange = asyncio.create_task(_bounded_post(client, url, payload, headers, timeout))
+    exchange = asyncio.create_task(
+        _bounded_post(client, url, payload, headers, timeout), name=f'MCP exchange {url}',
+    )
     _exchanges.add(exchange)
-    exchange.add_done_callback(_exchanges.discard)
+    exchange.add_done_callback(_settle)
     return await asyncio.shield(exchange)
+
+
+def _settle(exchange: asyncio.Task[httpx.Response]) -> None:
+    """Forget *exchange*, consuming an error an abandoning caller never will.
+
+    Not logged: a caller still waiting reports the error itself, and one that
+    gave up has already reported its own deadline.
+    """
+    _exchanges.discard(exchange)
+    if not exchange.cancelled():
+        exchange.exception()
 
 
 async def _bounded_post(
     client: httpx.AsyncClient, url: str, payload: dict, headers: dict, timeout: float,
 ) -> httpx.Response:
-    with anyio.fail_after(timeout * _HTTPX_TIMEOUT_PHASES):
+    # A whole-exchange ceiling: the sum of httpx's per-phase budgets. Those
+    # budgets are per socket operation, so a trickled or many-chunk response can
+    # outlive every one of them; this deliberately ends it.
+    phases = httpx.Timeout(timeout).as_dict().values()
+    with anyio.fail_after(sum(budget for budget in phases if budget is not None)):
         return await client.post(url, json=payload, headers=headers, timeout=timeout)
 
 
 async def cancel_inflight_exchanges() -> None:
-    """Cancel every exchange still running on this loop, and await them.
+    """Cancel and await every exchange still running on this loop.
 
     For ``dashboard.app.lifespan`` teardown, so no exchange outlives the client
-    it runs on. Scoped to the running loop and bounded, for the reasons
-    ``mcp_fanout.py::TTLCache.cancel_live_bypasses`` gives; residue of a closed
-    loop can never finish, so it is dropped.
+    it runs on. Only this loop's tasks can be cancelled safely; one whose loop
+    has closed can never finish, so it is dropped.
     """
     loop = asyncio.get_running_loop()
-    running_here: list[asyncio.Task[httpx.Response]] = []
+    running_here: dict[asyncio.Task[Any], str] = {}
     for exchange in list(_exchanges):
         if exchange.get_loop().is_closed():
             _exchanges.discard(exchange)
         elif exchange.get_loop() is loop:
-            running_here.append(exchange)
-    for exchange in running_here:
-        exchange.cancel()
-    if not running_here:
-        return
-    _ended, abandoned = await asyncio.wait(running_here, timeout=_REAP_UNWIND_TIMEOUT_SECONDS)
-    if abandoned:
-        logger.warning(
-            '%d MCP exchange(s) did not unwind within %.1fs; shutdown continues without them',
-            len(abandoned), _REAP_UNWIND_TIMEOUT_SECONDS,
-        )
+            running_here[exchange] = exchange.get_name()
+    await cancel_and_await(running_here, 'MCP exchange(s)')
 
 
 def _parse_mcp_response(resp: httpx.Response) -> dict:

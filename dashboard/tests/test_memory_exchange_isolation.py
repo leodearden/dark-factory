@@ -17,8 +17,10 @@ the server saw, never through httpcore's bookkeeping.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
-from collections.abc import Iterable
+import logging
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -119,6 +121,11 @@ async def _census_once_quiet(client: httpx.AsyncClient) -> PoolCensus | None:
     return reading
 
 
+def _pool_is_empty(client: httpx.AsyncClient) -> bool:
+    reading = census(client)
+    return reading is not None and reading.total == 0
+
+
 @pytest.fixture(autouse=True)
 def _fresh_sessions() -> Iterable[None]:
     reset_sessions()
@@ -141,6 +148,31 @@ async def test_a_caller_that_gives_up_leaves_its_connection_reusable() -> None:
         )
         assert await mcp_tool_call(client, server.url, 'get_status', {}) == _TOOL_RESULT
         assert server.connections_accepted == 1
+
+
+async def test_an_abandoned_exchange_that_fails_is_settled_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nobody awaits an abandoned exchange, so nobody else can retrieve its error."""
+    async with _HeldToolCallServer() as server, httpx.AsyncClient() as client:
+        call = asyncio.create_task(
+            mcp_tool_call(client, server.url, 'get_status', {}, timeout=0.3),
+        )
+        await server.tool_call_held.wait()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(call, timeout=0)
+
+        with caplog.at_level(logging.ERROR, logger='asyncio'):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _QUIESCENCE_SECONDS
+            while not _pool_is_empty(client) and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            gc.collect()
+            await asyncio.sleep(0)
+        server.release.set()
+
+    assert _pool_is_empty(client), f'the exchange never failed: {census(client)}'
+    assert not [r for r in caplog.records if 'never retrieved' in r.getMessage()]
 
 
 async def test_an_abandoned_exchange_does_not_outlive_the_apps_client(
@@ -194,12 +226,13 @@ async def test_an_abandoned_exchange_does_not_outlive_the_apps_client(
 # ── the stranded-owned class, reproduced deterministically ─────────────
 #
 # A real socket makes WHERE a cancellation lands a matter of timing, so this
-# half runs the pool over an in-memory network backend and delivers the
-# caller's cancellation after each of a range of exact event-loop steps. One
-# of those positions is inside the release path the module docstring names.
+# half runs the pool over an in-memory network backend and interrupts the call
+# after each of a range of exact event-loop steps. One of those positions is
+# inside the release path the module docstring names. Two interruptions: the
+# caller giving up, and the exchange's own time bound expiring.
 
 _FAKE_URL = 'http://svc.local'
-_MAX_CANCEL_STEPS = 64
+_MAX_STEPS = 64
 _SETTLE_STEPS = 64
 
 
@@ -244,8 +277,27 @@ async def _steps(count: int) -> None:
         await asyncio.sleep(0)
 
 
-async def _cancel_at(steps: int) -> tuple[bool, PoolCensus | None]:
-    """Cancel a cold-session call after *steps* loop steps.
+class _ManualClock:
+    """Stands in for the loop's clock, so a time bound expires on a chosen step."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._now = loop.time()
+
+    def time(self) -> float:
+        return self._now
+
+    def pass_every_deadline(self, _call: asyncio.Task[Any]) -> None:
+        self._now += 1e9
+
+
+def _cancel(call: asyncio.Task[Any]) -> None:
+    call.cancel()
+
+
+async def _interrupt_at(
+    steps: int, interrupt: Callable[[asyncio.Task[Any]], None],
+) -> tuple[bool, PoolCensus | None]:
+    """Interrupt a cold-session call after *steps* loop steps.
 
     Returns whether the call had already finished by then, and the census once
     everything it started has settled.
@@ -255,21 +307,41 @@ async def _cancel_at(steps: int) -> tuple[bool, PoolCensus | None]:
         call = asyncio.create_task(mcp_tool_call(client, _FAKE_URL, 'get_status', {}))
         await _steps(steps)
         finished_first = call.done()
-        call.cancel()
+        interrupt(call)
         await asyncio.gather(call, return_exceptions=True)
         await _steps(_SETTLE_STEPS)
         return finished_first, census(client)
 
 
-async def test_no_cancellation_point_strands_a_connection() -> None:
-    sweep = [(steps, *await _cancel_at(steps)) for steps in range(_MAX_CANCEL_STEPS)]
+async def _stranded_by(
+    interrupt: Callable[[asyncio.Task[Any]], None],
+) -> list[tuple[int, PoolCensus | None]]:
+    sweep = [(steps, *await _interrupt_at(steps, interrupt)) for steps in range(_MAX_STEPS)]
     assert sweep[-1][1], 'the sweep ended before the call did, so it missed positions'
-    stranded = [
+    return [
         (steps, reading)
         for steps, _finished, reading in sweep
         if reading is None or reading.total != reading.idle
     ]
+
+
+async def test_no_cancellation_point_strands_a_connection() -> None:
+    stranded = await _stranded_by(_cancel)
     assert stranded == [], (
         'cancelling the caller at these event-loop steps left a connection that is '
         f'neither idle nor released: {stranded}'
+    )
+
+
+async def test_no_expiry_point_of_the_exchange_bound_strands_a_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound must be one httpcore's shields honour, or it strands as a caller would."""
+    loop = asyncio.get_running_loop()
+    clock = _ManualClock(loop)
+    monkeypatch.setattr(loop, 'time', clock.time)
+    stranded = await _stranded_by(clock.pass_every_deadline)
+    assert stranded == [], (
+        "the exchange's own bound expiring at these event-loop steps left a "
+        f'connection that is neither idle nor released: {stranded}'
     )
