@@ -151,6 +151,34 @@ async def _await_group_membership(
         await asyncio.sleep(step)
 
 
+async def _await_group_terminated(
+    pgid: int,
+    *,
+    timeout: float = 5.0,
+    min_attempts: int = 3,
+    step: float = 0.05,
+) -> None:
+    """Poll until every member of group *pgid* has terminated.
+
+    A zombie awaiting its subreaper's reap counts as terminated (see
+    ``shared.proc_group.ProcessGroupMember.terminated``).  Bounded like
+    ``_await_group_membership``, by BOTH *timeout* and *min_attempts*, since
+    one /proc walk can take seconds on a loaded host; raises
+    ``_GroupTerminationTimeout`` on exhaustion.
+    """
+    started = asyncio.get_running_loop().time()
+    attempts = 0
+    while True:
+        attempts += 1
+        if process_group_terminated(pgid):
+            return
+        elapsed = asyncio.get_running_loop().time() - started
+        if attempts >= min_attempts and elapsed >= timeout:
+            running = tuple(m for m in process_group_members(pgid) if not m.terminated)
+            raise _GroupTerminationTimeout(pgid, running, attempts, elapsed)
+        await asyncio.sleep(step)
+
+
 async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
     """Spawn a real ``sleep 30`` leading its own process group, with cwd *cwd*.
 
@@ -235,6 +263,37 @@ class _GroupMembershipTimeout(AssertionError):
     contract; the message stays free to carry the full last-observed
     snapshot for diagnosis.
     """
+
+
+class _GroupTerminationTimeout(AssertionError):
+    """A process group still had a running member when the poll ran out.
+
+    Subclasses AssertionError, like _GroupMembershipTimeout, so exhaustion is
+    a test FAILURE, never a bare TimeoutError and never a silent return.  The
+    concrete TYPE and the structured ``running`` members are the contract;
+    the message stays free to change.
+    """
+
+    def __init__(
+        self,
+        pgid: int,
+        running: tuple[ProcessGroupMember, ...],
+        attempts: int,
+        elapsed: float,
+    ) -> None:
+        self.running = running
+        budget = f'after {attempts} attempt(s) / {elapsed:.3f}s'
+        if running:
+            members = '; '.join(
+                f'pid={m.pid} ppid={m.ppid} state={m.state} comm={m.comm}' for m in running
+            )
+            message = f'group {pgid} still had running member(s) {budget}: {members}'
+        else:
+            message = (
+                f'group {pgid} was never concluded terminated {budget}: killpg '
+                f'still saw the group but /proc showed no running member'
+            )
+        super().__init__(message)
 
 
 async def _await_shell_ready(
