@@ -139,12 +139,13 @@ async def _warn_on_untrimmable_pool_residue(
     reintroduced in a shape nothing reports (reviewer finding robustness,
     task 3041 amendment pass).
 
-    That shape is realistic, not theoretical: cycle_summary metadata is
-    LLM-supplied on the narrative write path, and
-    ``_apply_cycle_summary_metadata_tagging`` backfills ``run_id`` precisely
-    BECAUSE prompt compliance is not guaranteed — a write that lands
-    ``recon_pool`` (or has it auto-stamped from ``metadata.stage``) while
-    dropping ``kind`` produces exactly this residue.
+    New ``add_memory``/``add_system_record`` writes can no longer produce
+    that shape: since task 3239
+    ``services/memory_service.py::_apply_cycle_summary_metadata_tagging``
+    strips ``recon_pool`` from any write whose ``kind`` is not
+    ``cycle_summary``. The residue this backstop reports is what remains —
+    records written before task 3239, and ``update_memory`` patches, which do
+    not run the add-path tagging helper.
 
     So the narrowed delete filter stays and the pool gets an observability
     backstop instead: one ``count_memories_by_metadata`` on the ``recon_pool``
@@ -276,11 +277,11 @@ async def enforce_summary_pool_cap(
     ``cap``. Reaching it therefore logs a WARNING and still trims, instead of
     silently returning a count that reads as "pool trimmed to cap".
 
-    The ``kind`` filter constraint is load-bearing, not decorative:
-    ``_apply_cycle_summary_metadata_tagging`` is additive-only and never
-    strips a caller-supplied ``recon_pool``, so filtering on ``recon_pool``
-    alone would let a mis-tagged non-summary record join this pool and either
-    be trimmed by it or evict a real mirror.
+    The ``kind`` filter constraint is load-bearing, not decorative: the add
+    path strips a stray ``recon_pool`` since task 3239, but records written
+    before it and ``update_memory`` patches can still carry one, so filtering
+    on ``recon_pool`` alone would let a mis-tagged non-summary record join
+    this pool and either be trimmed by it or evict a real mirror.
 
     **This pool is cap-bounded BY DESIGN, and that is not a bug.** A mirror
     older than the newest *cap* ledger_stamps IS expected to be evicted — the
@@ -312,11 +313,12 @@ async def enforce_summary_pool_cap(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            # kind is load-bearing, not decorative (task 3041):
-            # _apply_cycle_summary_metadata_tagging is ADDITIVE-only and never
-            # strips a caller-supplied recon_pool, so filtering on recon_pool
-            # alone would let a mis-tagged non-summary record join this cap-2
-            # pool — and then either be trimmed by it or evict a real mirror.
+            # kind is load-bearing, not decorative (task 3041): the add path
+            # strips a stray recon_pool since task 3239, but pre-3239 records
+            # and update_memory patches can still carry one, so filtering on
+            # recon_pool alone would let a mis-tagged non-summary record join
+            # this cap-2 pool — and then either be trimmed by it or evict a
+            # real mirror.
             filters={'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY},
             limit=SUMMARY_POOL_SCROLL_LIMIT,
         )
@@ -636,9 +638,9 @@ async def write_cycle_summary(
                 # record_type discriminates this deterministic code mirror
                 # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
                 # write in prompts/stage2.py (NARRATIVE) — task 2468.
-                # _apply_cycle_summary_metadata_tagging (memory_service.py)
-                # is additive-only and never strips unknown keys, so this
-                # survives through to storage unchanged.
+                # services/memory_service.py::_apply_cycle_summary_metadata_tagging
+                # strips nothing from a kind='cycle_summary' write, so
+                # record_type survives through to storage unchanged.
                 metadata={
                     'kind': 'cycle_summary',
                     'stage': stage,

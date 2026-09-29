@@ -4,16 +4,18 @@ LEAF module: must NOT import anything from ``fused_memory`` (not even
 ``fused_memory.reconciliation``). That rule is enforced, not just documented:
 ``tests/test_mem0_tombstone.py::TestReconPoolMapIsImportFreeLeaf`` imports this
 module in a fresh interpreter and fails if doing so loads any other
-``fused_memory.*`` module. This map has two independent consumers,
-each keying on a different half of it, for ``metadata.kind ==
-'cycle_summary'`` writes: reconciliation/summary_pool.py trims a pool by
-the ``recon_pool`` *value* (passed in as a parameter — see
-``filters={'recon_pool': recon_pool}``), while
-scripts/prune_recon_cycle_summaries.py buckets records by
-``metadata.stage`` against this map's *keys* (``_POOL_STAGES =
-('memory_consolidator', 'task_knowledge_sync')``). Both derive from this
-single map, which is what makes tagging independent of LLM prompt
-compliance (task 2077).
+``fused_memory.*`` module. This map's two halves are read in different
+places for ``metadata.kind == 'cycle_summary'`` records.
+reconciliation/summary_pool.py::enforce_summary_pool_cap enumerates a pool
+on the ``recon_pool`` *value* together with ``kind='cycle_summary'``.
+fused-memory/scripts/prune_recon_cycle_summaries.py never filters on
+``recon_pool``: it scrolls on ``kind='cycle_summary'`` and buckets by
+``metadata.stage`` against its own local ``_POOL_STAGES`` tuple, which
+mirrors this map's *keys* by hand rather than importing it.
+services/memory_service.py::_apply_cycle_summary_metadata_tagging stamps
+``recon_pool`` from this map on cycle_summary writes, which is what makes
+tagging independent of LLM prompt compliance (task 2077), and strips it
+from every other write (task 3239).
 
 Before task 2140 these values were duplicated three ways — once here (well,
 once in services/memory_service.py) and once each in
