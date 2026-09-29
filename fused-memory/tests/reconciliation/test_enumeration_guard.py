@@ -303,6 +303,12 @@ TRUNCATED_PAYLOADS = {
         {'mem0_falsified_entries': [LIVE_B3F, '21F78DE1']},
         [('mem0_falsified_entries[1]', '21F78DE1')],
     ),
+    # Measured on dark-factory task 1141: an all-decimal fragment is still a
+    # truncation, so an 8-digit list element is flagged (a named residual).
+    'all-decimal': (
+        {'memory_hints': {'memory_ids': ['12851553']}},
+        [('memory_hints.memory_ids[0]', '12851553')],
+    ),
 }
 
 # Shapes measured in the live stores that must never be read as fragments.

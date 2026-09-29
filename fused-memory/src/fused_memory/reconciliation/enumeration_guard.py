@@ -23,7 +23,8 @@ as bare 8-char fragments with no full id anywhere beside them.
    both task stores, 70 of 70 list elements that are exactly 8 hex chars are
    truncated UUIDs, while commit-SHA lists are 10 or 40 chars. 8-char commit
    SHAs DO appear as scalars and in prose, so scalars, dict keys, prose and
-   the description are never shape-checked.
+   the description are never shape-checked. Two of those 70 are all-decimal,
+   so digits-only elements are not exempt.
 2. *Scope shape.* A present ``x_enumeration_scope`` must be the structured
    ``{stores, categories, exhaustive, note?}`` object, on every path.
 3. *Liveness.* Each canonical-UUID string element of a TOP-LEVEL list is
@@ -61,7 +62,8 @@ are all deleted is not proven and stays unstamped; an enumeration carried only
 in description prose is not checked, which is why the rendered Stage-2 section
 demands top-level metadata lists; under ``merge`` a stored
 ``x_liveness_exceptions`` from an earlier write survives a later write that
-records nothing.
+records nothing; any 8-hex list element reads as a fragment, so a list of
+``YYYYMMDD`` dates or a hex word such as ``deadbeef`` is rejected on filing.
 """
 
 from __future__ import annotations
