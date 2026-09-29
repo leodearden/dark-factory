@@ -11,11 +11,15 @@ import logging
 import os
 import re
 import signal
+import subprocess
 
 import pytest
 
 import shared.proc_group as proc_group_module
 from shared.proc_group import (
+    ProcessGroupMember,
+    process_group_members,
+    process_group_terminated,
     reap_process_groups,
     scan_process_groups_under_path,
     snapshot_process_group,
@@ -175,6 +179,29 @@ def _kill_group(pgid: int) -> None:
     """
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.fixture
+def unreaped_zombie_pgid():
+    """Yield the pgid of a one-member group whose only member is an unreaped zombie.
+
+    ``waitid(..., WNOWAIT)`` blocks until the SIGKILLed child has terminated
+    without reaping it, and this process stays its parent until teardown, so
+    the group provably still exists (and its pgid cannot be recycled) for the
+    whole test.
+    """
+    p = subprocess.Popen(
+        ['sleep', '30'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        os.kill(p.pid, signal.SIGKILL)
+        os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+        yield p.pid
+    finally:
+        p.wait()
 
 
 class _ShellReadinessError(AssertionError):
@@ -1379,6 +1406,91 @@ class TestScanProcessGroupsAgainstASyntheticProc:
             str(tmp_path), frozenset()
         ) == set()
         assert scan_process_groups_under_path(tmp_path) == set()
+
+
+class TestProcessGroupTermination:
+    """A group has terminated once every member is dead, zombies included.
+
+    A zombie has exited and awaits only its parent's reap; once orphaned that
+    parent is systemd --user, whose latency the group's signaller neither
+    owns nor bounds.  ``os.killpg(pgid, 0)`` still succeeds on such a group,
+    which is why it is not the termination criterion.
+    """
+
+    @pytest.mark.parametrize(
+        ('state', 'terminated'),
+        [
+            ('Z', True),
+            ('X', True),
+            ('R', False),
+            ('S', False),
+            ('D', False),
+            ('T', False),
+            ('t', False),
+            ('I', False),
+        ],
+    )
+    def test_terminated_is_true_exactly_for_zombie_and_dead_states(self, state, terminated):
+        member = ProcessGroupMember(pid=4242, ppid=1, state=state, comm='x')
+        assert member.terminated is terminated
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_has_one_running_member_and_is_not_terminated(self):
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            members = process_group_members(pgid)
+            assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                (pgid, 'sleep', False)
+            ], members
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_group_counts_as_terminated(self, unreaped_zombie_pgid):
+        """The group still exists (killpg succeeds) yet has terminated."""
+        pgid = unreaped_zombie_pgid
+        members = process_group_members(pgid)
+        assert [(m.pid, m.state, m.terminated) for m in members] == [
+            (pgid, 'Z', True)
+        ], members
+        assert process_group_terminated(pgid) is True
+        os.killpg(pgid, 0)
+
+    @pytest.mark.timeout(15)
+    def test_a_zombie_leader_with_a_live_member_is_not_terminated(self):
+        """Termination needs EVERY member dead, so a leaked member always fails."""
+        with subprocess.Popen(
+            ['sh', '-c', 'sleep 30 & echo ready; exec sleep 31'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                os.kill(pgid, signal.SIGKILL)
+                os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOWAIT)
+
+                members = process_group_members(pgid)
+                assert [m.pid for m in members if m.terminated] == [pgid], members
+                assert [m for m in members if not m.terminated], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    def test_a_nonexistent_group_is_terminated_with_no_members(self):
+        beyond_pid_max = 2**30
+        assert process_group_members(beyond_pid_max) == []
+        assert process_group_terminated(beyond_pid_max) is True
 
 
 class TestReapProcessGroups:
