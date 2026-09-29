@@ -33,6 +33,18 @@ _REANCHORED = [
         {"kind": "grep", "pattern": "resolver=", "expect": "present",
          "paths": ["fused-memory/src/fused_memory/reconciliation/harness.py"]},
     ),
+    (
+        "plans/agent-transcript-archival-prd.capability-manifest.yaml",
+        2792, "β", "backstop-at-cleanup-worktree-chokepoint",
+        {"kind": "grep", "pattern": "archive_before_delete", "expect": "present",
+         "paths": ["orchestrator/src/orchestrator/git_ops.py"]},
+    ),
+    (
+        "plans/fable-architect-eval-admission-prd.capability-manifest.yaml",
+        2862, "τ1", "eval-bootstrap-smoke-gate",
+        {"kind": "path", "pattern": None, "expect": "present",
+         "paths": ["scripts/eval_bootstrap_smoke.sh"]},
+    ),
 ]
 
 _RETIRED_TO_MANUAL = [
