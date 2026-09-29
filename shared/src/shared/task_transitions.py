@@ -345,7 +345,9 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # 'in-progress' -> 'blocked' only after the slot clears;
     # orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status
     # writes the park / restart row before the kill; a parked train member
-    # stays 'merge-deferred'.
+    # stays 'merge-deferred'. Keeping IN_PROGRESS / MERGE_DEFERRED is a
+    # reviewed divergence from spec §5's "never wherever it was": the park is
+    # written after the exit, not before it (still open in the spec's §8-E10).
     'soft-cancelled': frozenset(
         {
             TaskStatus.IN_PROGRESS,

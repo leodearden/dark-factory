@@ -39,6 +39,7 @@ from _workflow_helpers import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.exit_contract import VERDICT_LOG_ATTRIBUTE, ExitVerdictKind
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.scheduler import TaskAssignment
@@ -451,10 +452,10 @@ class TestRunReturnsTerminalReport:
 
 @pytest.mark.asyncio
 class TestRunExitConsistencyAssert:
-    """SM-2: the run()-exit consistency assert (boundary row 6).
+    """SM-2: the run()-exit consistency check (boundary row 6).
 
     Positive: a DONE run, a BLOCKED run, and a REQUEUED (warm-lane) run each
-    complete WITHOUT raising, and the resulting report is consistent with
+    record NO violation, and the resulting report is consistent with
     both the last persisted DB status (``outcome_allows_status``) and
     ``workflow.machine.state`` (covers the 'blocked'->blocked and
     'requeued'->pending rows of ``_OUTCOME_ALLOWED``).
@@ -542,7 +543,7 @@ class TestRunExitConsistencyAssert:
 
     @pytest.mark.exit_contract_violation_expected
     async def test_outcome_status_mismatch_is_recorded_not_raised(
-        self, config, git_ops, task_assignment, monkeypatch,
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
     ):
         """Negative: DB row says 'done' while the actual exit is BLOCKED.
 
@@ -582,6 +583,12 @@ class TestRunExitConsistencyAssert:
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.phase == workflow.machine.state
         assert report.reason.lower().startswith('all accounts capped')
+        [violation] = [
+            r for r in caplog.records
+            if getattr(r, VERDICT_LOG_ATTRIBUTE, None) == ExitVerdictKind.VIOLATION.value
+        ]
+        assert 'blocked' in violation.getMessage()
+        assert 'done' in violation.getMessage()
 
     async def test_guard_skips_when_status_is_none(
         self, config, git_ops, task_assignment, monkeypatch,

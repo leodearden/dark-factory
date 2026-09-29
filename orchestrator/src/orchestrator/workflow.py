@@ -16426,7 +16426,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already proven at ``_handle_ready_to_merge_report``, which also runs
         from the merge region.  ``_record`` reads ``self.machine.state`` at call
         time, so entering BLOCKED here keeps SM-2's ``report.phase ==
-        machine.state`` assertion satisfied.
+        machine.state`` check satisfied.
 
         See spec §8-E2 and the MERGE_PHASE_RATIONALE paragraph in
         :meth:`_mark_blocked`'s docstring for why the entry gate stays.

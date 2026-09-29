@@ -372,6 +372,19 @@ class TestExitContractViolationCollector:
         logging.getLogger(_LOGGER).warning('run()-exit contract would-violate: prose only')
         assert collector.violations == []
 
+    def test_the_suite_wide_guard_hears_the_real_recorder(self):
+        """If the conftest guard were dropped, or hung on a logger the recorder
+        no longer writes to, "zero would-violate under the full suite" would
+        pass vacuously. The logger is derived from the recorder, not typed."""
+        recorder_logger = logging.getLogger(record_exit_verdict.__module__)
+        guards = [
+            h for h in recorder_logger.handlers
+            if isinstance(h, ExitContractViolationCollector)
+        ]
+        assert len(guards) == 1
+        _record(_violation())
+        assert len(guards[0].violations) == 1
+
 
 def test_enforce_flag_ships_dark():
     assert OrchestratorConfig().workflow_exit_contract_enforce is False

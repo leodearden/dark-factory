@@ -437,6 +437,8 @@ _SPEC_EXIT_CONTRACT: dict[str, frozenset[str]] = {
     'requeued': frozenset({'pending'}),
     'cancelled': frozenset({'cancelled'}),
     'merge-deferred': frozenset({'merge-deferred'}),
+    # Not §5's text: the reviewed contract. release_workflow parks only after
+    # the slot clears, so the row at exit is still 'wherever it was' (§8-E10).
     'soft-cancelled': frozenset({'in-progress', 'blocked', 'pending', 'merge-deferred'}),
 }
 
