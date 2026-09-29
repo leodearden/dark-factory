@@ -812,10 +812,13 @@ _COVERAGE_CAVEAT = (
     "COVERAGE — what this sweep could NOT classify. A descriptor whose task is\n"
     "  absent from tasks.db, or whose sidecar would not load, is counted here\n"
     "  rather than dropped: a report that showed only findings would let a\n"
-    "  partial sweep read as a complete one. The orphan class is real and\n"
-    "  measured, not hypothetical — of 543 mechanical sidecar capabilities, 35\n"
-    "  reach no task at all; 34 of those sit on tasks carrying no\n"
-    "  delivered_checks whatsoever, and 10 of THOSE are still open."
+    "  partial sweep read as a complete one. Two classes are counted: a\n"
+    "  sidecar task_id with no row in this store (including a producer filed\n"
+    "  in a FOREIGN registry whose block is not yet rebound through task\n"
+    "  4731's external_task_id), and a sidecar that would not load. A foreign\n"
+    "  id that COLLIDES with a local task is not counted here; it is\n"
+    "  classified against that unrelated task. The reconciliation record is\n"
+    "  docs/sidecar-orphan-reconciliation-2026-09-29/investigation.md."
 )
 
 
