@@ -67,6 +67,7 @@ from dashboard.data.escalation_analytics import (
 from dashboard.data.escalations import fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
+    FANOUT_FAILURE_EXCEPTIONS,
     PreformattedFanoutError,
     TTLCache,
     describe_exc,
@@ -1162,12 +1163,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
                 'cancel_ticket',
                 {'ticket_id': ticket_id},
             )
-        except (
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            ValueError,
-        ) as exc:
+        except FANOUT_FAILURE_EXCEPTIONS as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
             # PreformattedFanoutError, not ValueError: the message below is
             # already a rendered 'Type: message', and first_success renders
@@ -1408,12 +1404,7 @@ async def _scheduler_proxy(
     async def _call(url: str) -> JSONResponse:
         try:
             result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
-        except (
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            ValueError,
-        ) as exc:
+        except FANOUT_FAILURE_EXCEPTIONS as exc:
             # describe_exc, not the bare exc: several exceptions on this path
             # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
             # client's pool is saturated rather than the server being down), so

@@ -43,13 +43,13 @@ case is invisible to it by construction. Nothing here counts sockets or
 CLOSE-WAIT entries — the measure 3857 correctly rejected. The reading is pool
 occupancy, taken from the pool's own bookkeeping.
 
-THE PREDICATE, and why it is sound without a timestamp. ``pool._requests``
-holds one ``AsyncPoolRequest`` per live request, each carrying ``.connection``;
-a connection owned by none, neither idle nor closed, is unreachable, while an
-in-flight one is owned and so never reaped. One exit never delists its request,
-``httpcore/_async/connection_pool.py::PoolByteStream.aclose``: a native asyncio
-cancel pierces its anyio shield, stranding an OWNED connection ACTIVE, unseen
-here. ``dashboard/data/memory.py::_post`` keeps caller cancels off that path.
+THE PREDICATE, and its blind spot. ``pool._requests`` holds one pool request
+per live request, carrying ``.connection``: a connection none owns, neither idle
+nor closed, is unreachable, and an in-flight one is owned, so never reaped.
+``httpcore/_async/connection_pool.py::PoolByteStream.aclose`` delists its
+request on every path but one: a native asyncio cancel at ``_response_closed``'s
+lock checkpoint (no anyio shield stops one) strands an OWNED connection ACTIVE,
+unseen here. ``dashboard/data/memory.py::_post`` keeps such cancels out.
 
 VERIFIED AGAINST httpx 0.28.1 / httpcore 1.0.9 — the same discipline, and the
 same reason, as ``app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS``: this module reads
