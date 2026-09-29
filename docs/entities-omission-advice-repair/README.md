@@ -40,10 +40,11 @@ replaced, by a pointer to the correction. The rest of the observation is kept.
 - `fused-memory/tests/test_entities_omission_advice_repair_artifacts.py`
   validates both files and never touches a live store. It checks that every
   target was found by a recorded search, that exactly the census targets were
-  amended, and that each amendment landed under the same id. It also runs each
-  correction through the production `resolve_referents` to confirm the fix task
-  is attributed to dark_factory, and checks that no new record carries the
-  correction marker.
+  amended, that each amendment landed under the same id, and that each body
+  still carries the original observation. It also runs each correction
+  through the production `resolve_referents` to confirm the fix task is
+  attributed to dark_factory. Finally it checks that the re-run repeated every
+  census search, and that no new record carries the correction marker.
 
 ## How the amendments were made
 
@@ -67,5 +68,10 @@ write `~/.claude`, so that edit was handed to the steward.
 ## Phase 2
 
 Once task 6059 lands, the corrections should say the defect is fixed. That
-work is filed as a follow-up with a dependency on 6059, ticket
-`tkt_0RV7E46RG462T68VVYQS0NMDZT`.
+work is task 6067, which depends on 6059 and 6060. It was first filed as
+ticket `tkt_0RV7E46RG462T68VVYQS0NMDZT`. That ticket failed on a server
+restart, and the escalation watcher recovered it as 6067.
+
+The validator's attribution checks run the frozen phase-1 text through the
+live `resolve_referents`, and 6059 changes that scanner. So 6067 must re-run
+this validator after 6059 lands, as well as extend it for phase 2.
