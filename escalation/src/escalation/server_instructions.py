@@ -4,10 +4,13 @@ Every client of ``escalation/src/escalation/server.py::create_server`` receives
 :data:`ESCALATION_SERVER_INSTRUCTIONS` at initialize, and Claude Code shows it
 in the agent's system prompt even when this server's tools are deferred.
 
-Two rules keep it worth sending, both enforced by
-``escalation/tests/test_server_instructions.py``: it must stay under the
-2048-char client cap, because text past the cap never reaches the agent; and
-every ``mcp__escalation__<tool>`` it names must be a registered tool.
+Two rules keep it worth sending. It must stay under the 2048-char client cap,
+because text past the cap never reaches the agent. And every tool it names must
+be registered on the server its prefix names. Two test files enforce these:
+``escalation/tests/test_server_instructions.py`` checks the cap and the
+``mcp__escalation__<tool>`` names, and
+``fused-memory/tests/test_escalation_instructions_cite_registered_tools.py``
+checks the ``mcp__fused-memory__<tool>`` names.
 """
 
 ESCALATION_SERVER_INSTRUCTIONS = """\

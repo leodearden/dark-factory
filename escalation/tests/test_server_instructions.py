@@ -9,6 +9,12 @@ even with its tools deferred, so they carry that fact.
 Everything here is read OFF THE HANDSHAKE through ``fastmcp.Client``: the
 behaviour under test is that a connecting client receives the text and that
 the text is true of the tools the same client can list.
+
+The check that each cited ``mcp__fused-memory__<tool>`` is registered on
+fused-memory is in
+``fused-memory/tests/test_escalation_instructions_cite_registered_tools.py``,
+because fused-memory's server cannot be built from this package's test
+environment.
 """
 
 from __future__ import annotations
