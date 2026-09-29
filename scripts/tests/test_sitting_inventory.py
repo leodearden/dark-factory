@@ -229,6 +229,32 @@ class TestCollectOpenItems:
         }
         assert set(inv.escalation_index[_recon_queue(df_root)]) == {'esc-60-2'}
 
+    def test_pending_keeps_every_pending_root_record_of_any_level_by_task(self, fleet, df_root):
+        queue = df_root / 'data' / 'escalations'
+        _write_escalation(queue, id='esc-70-1', level=2)
+        _write_escalation(queue, id='esc-70-2', level=1)
+        _write_escalation(queue, id='esc-71-1', level=0)
+        _write_escalation(queue, id='esc-72-1', level=2, status='resolved')
+        _write_escalation(queue, subdir='archive/2026-09-01', id='esc-73-1', level=2)
+
+        records = _collect([_queue(df_root)], fleet).pending[_queue(df_root)]
+
+        assert {task: sorted(e.id for e in escs) for task, escs in records.by_task.items()} == {
+            '70': ['esc-70-1', 'esc-70-2'], '71': ['esc-71-1']}
+        assert records.complete and records.unreadable == ()
+
+    def test_an_unreadable_root_record_makes_its_queues_pending_incomplete(self, fleet, df_root):
+        queue = df_root / 'data' / 'escalations'
+        _write_escalation(queue, id='esc-74-1', level=2)
+        (queue / 'esc-74-2.json').write_text('{not json')
+
+        inv = _collect([_queue(df_root)], fleet)
+
+        records = inv.pending[_queue(df_root)]
+        assert not records.complete
+        assert [s.path for s in records.unreadable] == [str(queue / 'esc-74-2.json')]
+        assert set(records.unreadable) <= set(inv.shortfalls)
+
 
 class TestDecisionProject:
     """The linked record's own project, as read: the close payload's compare-and-swap expectation, never ``project``."""

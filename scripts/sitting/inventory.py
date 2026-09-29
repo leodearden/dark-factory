@@ -9,9 +9,11 @@ into a pending L2 only when its recorded queue AND its escalation id both match.
 
 Read-only. Queues are read through the module-level scan helpers of
 ``escalation.queue``, never through ``EscalationQueue``, whose constructor
-creates the directory it is handed. Only a queue's root tier is parsed: its
-``archive/`` subtree holds resolved records by construction, so it is indexed
-by filename (the id) and read only when a citation asks for it.
+creates the directory it is handed. Only a queue's root tier is parsed, once
+per run, and every pending record it holds is kept in ``Inventory.pending`` so
+later readers derive from the same parse rather than re-reading a live tree.
+The ``archive/`` subtree holds resolved records by construction, so it is
+indexed by filename (the id) and read only when a citation asks for it.
 """
 from __future__ import annotations
 
@@ -103,9 +105,22 @@ class OpenItem:
 
 
 @dataclass(frozen=True)
+class PendingRecords:
+    """One queue's root-tier pending records, every level, by task id, and each root record that could not be read."""
+
+    by_task: Mapping[str, tuple[Escalation, ...]]
+    unreadable: tuple[Shortfall, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.unreadable
+
+
+@dataclass(frozen=True)
 class Inventory:
     items: tuple[OpenItem, ...]
     escalation_index: Mapping[str, Mapping[str, Path]]
+    pending: Mapping[str, PendingRecords]
     shortfalls: tuple[Shortfall, ...]
 
 
@@ -206,12 +221,14 @@ def collect_open_items(
         raise ValueError('now must be timezone-aware')
     shortfalls: list[Shortfall] = []
     index: dict[str, Mapping[str, Path]] = {}
+    pending: dict[str, PendingRecords] = {}
     items: dict[ItemKey, OpenItem] = {}
     for queue_dir in dict.fromkeys(normalize_escalations_dir(q) for q in queue_dirs):
-        queue_index, pending, queue_shortfalls = _scan_queue(queue_dir)
+        queue_index, records = _scan_queue(queue_dir)
         index[queue_dir] = MappingProxyType(queue_index)
-        shortfalls += queue_shortfalls
-        for esc in pending:
+        pending[queue_dir] = records
+        shortfalls += records.unreadable
+        for esc in (esc for escs in records.by_task.values() for esc in escs if esc.level == 2):
             item = _escalation_item(queue_dir, esc, now)
             items[item.key] = item
 
@@ -238,6 +255,7 @@ def collect_open_items(
     return Inventory(
         items=tuple(sorted(selected, key=_oldest_first)),
         escalation_index=MappingProxyType(index),
+        pending=MappingProxyType(pending),
         shortfalls=tuple(shortfalls),
     )
 
@@ -332,21 +350,22 @@ def read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
     return esc, None
 
 
-def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], list[Escalation], list[Shortfall]]:
+def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], PendingRecords]:
     root = Path(queue_dir)
     index: dict[str, Path] = {}
-    pending: list[Escalation] = []
-    shortfalls: list[Shortfall] = []
+    by_task: dict[str, list[Escalation]] = defaultdict(list)
+    unreadable: list[Shortfall] = []
     for path in iter_all_escalation_paths(root):
         index[path.stem] = path
         if path.parent != root:
             continue
         esc, problem = read_escalation(path)
         if problem is not None:
-            shortfalls.append(problem)
-        if esc is not None and esc.status == 'pending' and esc.level == 2:
-            pending.append(esc)
-    return index, pending, shortfalls
+            unreadable.append(problem)
+        if esc is not None and esc.status == 'pending':
+            by_task[esc.task_id].append(esc)
+    frozen = MappingProxyType({task_id: tuple(escs) for task_id, escs in by_task.items()})
+    return index, PendingRecords(frozen, tuple(unreadable))
 
 
 def read_decisions(fleet: Path | str | None) -> tuple[list[DecisionRecord], list[Shortfall]]:

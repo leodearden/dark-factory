@@ -116,8 +116,7 @@ def build(
         window=window,
         sitting=sitting,
         preparation=_freshness(sources, sitting),
-        projects=fleet_state.measure_projects(project_roots, sources.inventory.escalation_index,
-                                              window=window, now=now),
+        projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now),
         closes=fleet_state.autonomous_closes(decisions_root, window, now=now),
     )
 

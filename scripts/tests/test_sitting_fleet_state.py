@@ -144,9 +144,9 @@ def df(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Path:
     return root
 
 
-def _index(*queues: Path, tmp_path: Path):
+def _pending(*queues: Path, tmp_path: Path):
     return inventory.collect_open_items(queue_dirs=[str(q) for q in queues], decisions_root=tmp_path / 'fleet',
-                                        now=NOW).escalation_index
+                                        now=NOW).pending
 
 
 class TestMeasurement:
@@ -279,9 +279,9 @@ class TestQueryFailureAfterTheProbe:
 
 class TestStuck:
     def test_one_row_per_blocked_task_with_its_open_escalation_or_an_explicit_none(self, df, tmp_path):
-        index = _index(df / 'data' / 'escalations', tmp_path=tmp_path)
+        pending = _pending(df / 'data' / 'escalations', tmp_path=tmp_path)
 
-        measurement = mod.stuck(df, index, now=NOW)
+        measurement = mod.stuck(df, pending, now=NOW)
 
         assert measurement.status == 'ok'
         assert measurement.source == str(df / '.taskmaster' / 'tasks' / 'tasks.db')
@@ -298,8 +298,28 @@ class TestStuck:
         assert rows['11'].reason == mod.NO_OPEN_ESCALATION == 'blocked with no open escalation'
         assert rows['10'].title == 'blocked behind an open escalation'
 
+    def test_reasons_come_from_the_inventorys_parse_not_a_later_read_of_the_queue(self, df, tmp_path):
+        queue = df / 'data' / 'escalations'
+        pending = _pending(queue, tmp_path=tmp_path)
+        (queue / 'esc-10-1.json').unlink()
+        _write_escalation(queue, id='esc-11-1', level=1)
+
+        rows = {row.task_id: row for row in mod.stuck(df, pending, now=NOW).value}
+
+        assert [e.escalation_id for e in rows['10'].open_escalations or ()] == ['esc-10-1']
+        assert rows['11'].open_escalations == ()
+
+    def test_an_unreadable_root_record_is_a_stated_shortfall(self, df, tmp_path):
+        queue = df / 'data' / 'escalations'
+        (queue / 'esc-11-9.json').write_text('{not json')
+
+        measurement = mod.stuck(df, _pending(queue, tmp_path=tmp_path), now=NOW)
+
+        assert measurement.status == 'ok'
+        assert [s.path for s in measurement.shortfalls] == [str(queue / 'esc-11-9.json')]
+
     def test_rows_are_frozen(self, df, tmp_path):
-        row = mod.stuck(df, _index(df / 'data' / 'escalations', tmp_path=tmp_path), now=NOW).value[0]
+        row = mod.stuck(df, _pending(df / 'data' / 'escalations', tmp_path=tmp_path), now=NOW).value[0]
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             row.title = 'changed'  # type: ignore[misc]
@@ -504,9 +524,9 @@ class TestCrossProject:
     def test_keyed_by_canonical_token_and_an_absent_root_is_stated_not_omitted(self, df, tmp_path):
         bare = tmp_path / 'src' / 'reify'
         bare.mkdir(parents=True)
-        index = _index(df / 'data' / 'escalations', tmp_path=tmp_path)
+        pending = _pending(df / 'data' / 'escalations', tmp_path=tmp_path)
 
-        states = mod.measure_projects([df, bare], index, window=WINDOW, now=NOW)
+        states = mod.measure_projects([df, bare], pending, window=WINDOW, now=NOW)
 
         assert set(states) == {'dark_factory', 'reify'}
         assert states['dark_factory'].landed.value == 3
@@ -520,9 +540,9 @@ class TestCrossProject:
     def test_a_projects_queues_are_its_own(self, df, tmp_path):
         recon = df / 'data' / 'reconciliation' / 'escalations'
         _write_escalation(recon, id='esc-11-1', level=0, category='risk_identified')
-        index = _index(df / 'data' / 'escalations', recon, tmp_path=tmp_path)
+        pending = _pending(df / 'data' / 'escalations', recon, tmp_path=tmp_path)
 
-        state = mod.measure_projects([df], index, window=WINDOW, now=NOW)['dark_factory']
+        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW)['dark_factory']
 
         rows = {row.task_id: row for row in state.stuck.value}
         assert rows['11'].open_escalations is not None
@@ -541,14 +561,14 @@ class TestReadOnly:
         before = _snapshot(tmp_path)
         dirs_before = sorted(path for path in tmp_path.rglob('*') if path.is_dir())
 
-        index = _index(queue, tmp_path=tmp_path)
+        pending = _pending(queue, tmp_path=tmp_path)
         mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
         mod.spend_and_cap_hits(mod.runs_db_path(df), WINDOW, now=NOW)
-        mod.stuck(df, index, now=NOW)
+        mod.stuck(df, pending, now=NOW)
         mod.autonomous_closes(fleet, WINDOW, now=NOW)
         mod.standing_policy_rulings([str(queue), str(tmp_path / 'nowhere')], WINDOW, now=NOW)
         mod.preparer_trial([str(queue)], WINDOW, now=NOW)
-        mod.measure_projects([df, tmp_path / 'src' / 'absent'], index, window=WINDOW, now=NOW)
+        mod.measure_projects([df, tmp_path / 'src' / 'absent'], pending, window=WINDOW, now=NOW)
 
         assert _snapshot(tmp_path) == before
         assert sorted(path for path in tmp_path.rglob('*') if path.is_dir()) == dirs_before

@@ -52,7 +52,7 @@ from orchestrator.session_registry import (
     normalize_project_token,
 )
 from sitting import inventory, payloads
-from sitting.inventory import QUEUE_SUBDIRS, Shortfall
+from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
 from sitting.payloads import RejectedMarker
 
 Status = Literal['ok', 'source_missing', 'unreadable']
@@ -268,25 +268,26 @@ def spend_and_cap_hits(runs_db: Path | str, window: Window, *, now: datetime) ->
 
 def stuck(
     project_root: Path | str,
-    escalation_index: Mapping[str, Mapping[str, Path]],
+    pending: Mapping[str, PendingRecords],
     *,
     now: datetime,
 ) -> Measurement[tuple[StuckRow, ...]]:
-    """One row per blocked task, reasoned from the pending records of this project's queues in *escalation_index*."""
+    """One row per blocked task, reasoned from the inventory's *pending* records of this project's queues."""
     stamp = _stamp(now)
     db = tasks_db_path(str(project_root))
     blocked = _blocked_tasks(db)
     if isinstance(blocked, tuple):
         status, shortfall = blocked
         return Measurement((), stamp, str(db), status, (shortfall,))
-    queues = [queue for queue in project_queue_dirs(project_root) if queue in escalation_index]
+    queues = [queue for queue in project_queue_dirs(project_root) if queue in pending]
     if not queues:
         unreasoned = tuple(StuckRow(task_id, title, None) for task_id, title in blocked.items())
-        missing = Shortfall('escalation_queue', str(project_root), 'no queue of this project is in the inventory index')
+        missing = Shortfall('escalation_queue', str(project_root), 'no queue of this project is in the inventory')
         return Measurement(unreasoned, stamp, str(db), 'ok', (missing,))
-    open_by_task, shortfalls = _open_escalations(queues, escalation_index, set(blocked), now)
+    open_by_task = _open_escalations(queues, pending, now)
     rows = tuple(StuckRow(task_id, title, open_by_task.get(task_id, ())) for task_id, title in blocked.items())
-    return Measurement(rows, stamp, str(db), 'ok', tuple(shortfalls))
+    unreadable = tuple(shortfall for queue in queues for shortfall in pending[queue].unreadable)
+    return Measurement(rows, stamp, str(db), 'ok', unreadable)
 
 
 def autonomous_closes(decisions_root: Path | str, window: Window, *, now: datetime) -> Measurement[AutonomousCloses]:
@@ -339,7 +340,7 @@ def preparer_trial(queue_dirs: Iterable[str], window: Window, *, now: datetime) 
 
 def measure_projects(
     project_roots: Iterable[Path | str],
-    escalation_index: Mapping[str, Mapping[str, Path]],
+    pending: Mapping[str, PendingRecords],
     *,
     window: Window,
     now: datetime,
@@ -356,7 +357,7 @@ def measure_projects(
             project=project,
             root=str(root),
             landed=landed(runs_db, window, now=now),
-            stuck=stuck(root, escalation_index, now=now),
+            stuck=stuck(root, pending, now=now),
             spend=spend_and_cap_hits(runs_db, window, now=now),
             standing_policy=standing_policy_rulings(queues, window, now=now),
             trial=preparer_trial(queues, window, now=now),
@@ -466,29 +467,19 @@ def _blocked_tasks(db: Path) -> dict[str, str] | Refusal:
 
 
 def _open_escalations(
-    queues: Iterable[str],
-    escalation_index: Mapping[str, Mapping[str, Path]],
-    task_ids: set[str],
-    now: datetime,
-) -> tuple[dict[str, tuple[OpenEscalation, ...]], list[Shortfall]]:
+    queues: Iterable[str], pending: Mapping[str, PendingRecords], now: datetime,
+) -> dict[str, tuple[OpenEscalation, ...]]:
     found: dict[str, list[OpenEscalation]] = defaultdict(list)
-    shortfalls: list[Shortfall] = []
     for queue in queues:
-        for path in escalation_index[queue].values():
-            if path.parent != Path(queue):
-                continue
-            esc, problem = inventory.read_escalation(path)
-            if problem is not None:
-                shortfalls.append(problem)
-            if esc is not None and esc.status == 'pending' and esc.task_id in task_ids:
-                found[esc.task_id].append(OpenEscalation(
-                    esc.id, queue, esc.category, esc.level, inventory.age_days(esc.timestamp, now),
-                ))
-    oldest_first = {
+        for task_id, escs in pending[queue].by_task.items():
+            found[task_id] += [
+                OpenEscalation(esc.id, queue, esc.category, esc.level, inventory.age_days(esc.timestamp, now))
+                for esc in escs
+            ]
+    return {
         task_id: tuple(sorted(escs, key=lambda e: (-(e.age_days or 0.0), e.escalation_id)))
         for task_id, escs in found.items()
     }
-    return oldest_first, shortfalls
 
 
 def _autonomous_close(record: DecisionRecord) -> AutonomousClose:

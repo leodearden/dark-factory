@@ -52,6 +52,7 @@ from sitting.inventory import (  # noqa: E402
     Glossary,
     Inventory,
     OpenItem,
+    PendingRecords,
     Shortfall,
     cited_ids,
     key_str,
@@ -89,20 +90,11 @@ DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
 
 
 @dataclass(frozen=True)
-class PendingRecords:
-    """A queue's root-tier pending records by task id; ``complete`` is False when any root record was unreadable."""
-
-    by_task: Mapping[str, tuple[Escalation, ...]]
-    complete: bool
-
-
-@dataclass(frozen=True)
 class Sources:
     """What the stores of record said, read once per run."""
 
     inventory: Inventory
     queues_scanned: tuple[str, ...]
-    pending: Mapping[str, PendingRecords]
     sessions: SessionIndex
     task_rows: Mapping[str, TaskRows]
     handover_path: Path | None
@@ -173,7 +165,6 @@ def read_sources(
     return Sources(
         inventory=found,
         queues_scanned=queues,
-        pending=MappingProxyType({q: _pending_records(q, index) for q, index in found.escalation_index.items()}),
         sessions=sessions,
         task_rows=task_rows,
         handover_path=handover_path,
@@ -195,7 +186,7 @@ def gather_facts(item: OpenItem, sources: Sources, preparation: Preparation | No
         pins_recovery=agent.pins_recovery,
         pin_declared_by=item.pin_declared_by,
         root_cause=item.root_cause,
-        do_not_close_companions=_do_not_close_companions(item, sources.pending),
+        do_not_close_companions=_do_not_close_companions(item, sources.inventory.pending),
         sideways=sideways,
         members=members,
     )
@@ -366,19 +357,6 @@ def _load_preparations(path: Path) -> tuple[PreparationStore, Shortfall | None]:
         return preparations.load(path), None
     except PreparationStoreCorrupt as exc:
         return PreparationStore(), Shortfall('preparation', str(exc.path), exc.reason)
-
-
-def _pending_records(queue_dir: str, index: Mapping[str, Path]) -> PendingRecords:
-    by_task: dict[str, list[Escalation]] = defaultdict(list)
-    complete = True
-    for path in index.values():
-        if path.parent != Path(queue_dir):
-            continue
-        esc, problem = inventory.read_escalation(path)
-        complete = complete and problem is None
-        if esc is not None and esc.status == 'pending':
-            by_task[esc.task_id].append(esc)
-    return PendingRecords(MappingProxyType({task: tuple(found) for task, found in by_task.items()}), complete)
 
 
 def _read_in_queue(found: Inventory, queue_dir: str, esc_id: str) -> Escalation | None:
