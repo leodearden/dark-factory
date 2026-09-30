@@ -42,10 +42,13 @@ from df_pytest_isolation import (  # noqa: E402
     CLOCK_PROVENANCE_SOURCE_KEY,
     PIPE_CLOSING_LEAKER_SRC,
     PYTEST_SESSION_TOKEN_ENV,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     assert_synthetic_units,
     load_scaled_grace,
+    read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -4527,10 +4530,11 @@ _BOUNDARY_DRAIN_RUN_BASE_SECS = 20
 
 # _BOUNDARY_DRAIN_RUN_CAP_SECS: derived, not tuned -- same value and same
 # reasoning as `tests/scripts/test_spawn_claude.py::_SPAWN_RUN_CAP_SECS`.
-# This budget bounds ONE subprocess and does not feed wait_proof_grace_secs
-# (the callers relying on the default set no force-fire grace), so the only
-# ceiling above it is pytest-timeout's --timeout=300 per-test axe that both
-# test roots' test_command carries. 120 leaves >2x margin inside it.
+# This budget bounds ONE subprocess and never FEEDS a force-fire grace: boundary4
+# uses it as its readiness deadline and does set a grace, but anchors that grace
+# to the gate's defer line, not to this budget. So the only ceiling above it is
+# pytest-timeout's --timeout=300 per-test axe that both test roots'
+# test_command carries. 120 leaves >2x margin inside it.
 #
 # A subprocess wall-clock bound can afford a larger cap than a readiness
 # wait: it is paid only when the child genuinely HANGS, since the happy path
@@ -4587,6 +4591,40 @@ def _boundary_run_drain_script(
     hazard can no longer recur -- there is only one copy.
     """
     timeout = _boundary_drain_run_budget() if timeout is None else timeout
+    cmd, full_env = _boundary_drain_script_invocation(
+        bin_dir, state_path, fleet_dir, clock_file, env,
+    )
+    return run_in_new_session(cmd, env=full_env, timeout=timeout)
+
+
+def _boundary_run_drain_script_until(
+    bin_dir, state_path, fleet_dir, clock_file, *, condition, env=None, timeout=None
+):
+    """`_boundary_run_drain_script`, stopped as soon as *condition* holds.
+
+    Returns df_pytest_isolation.run_in_new_session_until's RunUntilOutcome.
+    For a proof that must observe the script MID-RUN, stopping it on a
+    readiness condition it makes observable (its drain poll ledger, say)
+    rather than on a wall-clock kill. ``timeout`` follows
+    `_boundary_run_drain_script`'s ``None`` sentinel and never-double-scale
+    rules; here it is a must-not-hang deadline, paid only when *condition*
+    never holds.
+    """
+    timeout = _boundary_drain_run_budget() if timeout is None else timeout
+    cmd, full_env = _boundary_drain_script_invocation(
+        bin_dir, state_path, fleet_dir, clock_file, env,
+    )
+    return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+def _boundary_drain_script_invocation(bin_dir, state_path, fleet_dir, clock_file, env):
+    """The argv and env both boundary spawn wrappers run the drain script with:
+    the fake systemctl prepended onto PATH, the fleet dir and deploy clock
+    pointed into the test's tmpdir, then *env* on top.
+
+    RESTART_ALL_SCRIPT is read HERE, at call time, which is what lets the
+    containment tests redirect it at a synthetic leaker.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
@@ -4594,11 +4632,7 @@ def _boundary_run_drain_script(
     full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
     if env:
         full_env.update(env)
-    return run_in_new_session(
-        ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
-        env=full_env,
-        timeout=timeout,
-    )
+    return ["bash", str(RESTART_ALL_SCRIPT), "--drain"], full_env
 
 
 def _boundary_load_state(state_path):
@@ -4676,6 +4710,55 @@ def test_boundary_run_drain_script_timeout_kills_the_whole_process_group(
             "the script forked is now an orphan free to spend its grace and "
             "then issue a REAL systemctl restart. Fix: spawn via "
             "df_pytest_isolation.run_in_new_session."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
+
+
+def test_boundary_run_drain_script_until_stops_the_whole_process_group(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_boundary_run_drain_script_until's condition stop must reach the forked
+    poll loops too, as the timeout does in
+    test_boundary_run_drain_script_timeout_kills_the_whole_process_group above,
+    whose pipe-closing leaker and RESTART_ALL_SCRIPT redirect this reuses for
+    the same reasons. Pins that the wrapper routes through
+    df_pytest_isolation.run_in_new_session_until.
+    """
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setattr(sys.modules[__name__], "RESTART_ALL_SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    unit_r = synthetic_unit("reify")
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
+    )
+
+    def leaked_pid_recorded() -> bool:
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+
+    leaked_pid = None
+    try:
+        outcome = _boundary_run_drain_script_until(
+            bin_dir, state_path, fleet_dir, tmp_path / "clock.json",
+            condition=leaked_pid_recorded,
+            env={"LEAK_PIDFILE": str(pidfile)},
+        )
+
+        leaked_pid = read_leaked_pid(pidfile)
+        assert outcome.stopped_on_condition is True, outcome
+        assert wait_pid_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _boundary_run_drain_script_until "
+            "stopped on its condition. The stop reached only the direct child. "
+            "Fix: spawn via df_pytest_isolation.run_in_new_session_until."
         )
     finally:
         if leaked_pid is not None:
@@ -4858,10 +4941,11 @@ def test_boundary_drain_run_budget_is_load_scaled_off_the_unchanged_base(
 def test_boundary_drain_run_cap_stays_inside_the_per_test_axe() -> None:
     """The cap is DERIVED from pytest-timeout's axe, not tuned to taste.
 
-    This budget does not feed `wait_proof_grace_secs` (the callers that rely
-    on the default set no force-fire grace), so the binding ceiling is the
-    `--timeout=300` per-test axe both roots' test_command carries, and a
-    single spawn is the only thing this budget bounds. Constants only, no
+    This budget never FEEDS a force-fire grace (boundary4 sets one, but
+    anchors it to the gate's defer line rather than to this budget), so the
+    binding ceiling is the `--timeout=300` per-test axe both roots'
+    test_command carries, and a single spawn is the only thing this budget
+    bounds. Constants only, no
     monkeypatching: the scale/floor/clamp arithmetic is already pinned by
     `TestLoadScaledGrace` in tests/scripts/test_fleet_dir_isolation.py, and
     re-deriving it here would be pure duplication. Mirrors the identical
@@ -4957,13 +5041,20 @@ def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) 
 
 def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path) -> None:
     """Scenario 4 (I3) -- drain-defer: a unit R with a fresh
-    merge_idle:false heartbeat is withheld from restart while a large
-    ORCH_RESTART_FORCE_FIRE_AFTER_SECS is in effect -- proven via a bounded
-    subprocess timeout (the script is still polling, not merely fast),
-    mirroring scripts/tests/test_restart_all_orchestrators.py::
+    merge_idle:false heartbeat is withheld from restart while its force-fire
+    grace is in effect, mirroring scripts/tests/test_restart_all_orchestrators.py::
     test_defer_withholds_restart_while_busy. R is ordered AFTER a plain idle
-    unit, so the idle unit's restart being recorded before the timeout shows
-    other units proceed while R defers.
+    unit, so the idle unit's restart being recorded while R defers shows
+    other units proceed.
+
+    The run is stopped on the gate's own poll ledger, not by a wall-clock
+    kill. Once R has polled busy twice -- the opening read that produced the
+    defer, then one in-loop re-read after a sleep -- the busy loop has
+    provably iterated without force-firing or restarting: the script is
+    still polling, not merely fast. drain_gate anchors its force-fire clock
+    at the defer line, so the grace only has to outlast one poll after it
+    rather than the spawn budget, which is what frees the deadline to
+    load-scale (task 5838's approach in the unit suite).
     """
     fleet_dir = tmp_path / "fleet"
     unit_idle = synthetic_unit("alpha")
@@ -4977,50 +5068,59 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
     _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=False, ts_epoch=time.time())
 
     clock_file = tmp_path / "clock.json"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    busy_polls_needed = 2
+    largest_leak_safe_grace = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
-    # 20s (not 8s): under full tests/scripts/ suite load (32-way xdist), the
-    # handful of bash+python3 subprocess spawns needed to reach the assertion
-    # point below (SELF_UNIT/list-units, the idle unit's
-    # drain-check+baseline+restart, R's drain-check) can collectively take long
-    # enough under CPU contention that an 8s wall-clock cap kills the child
-    # before R's "deferring restart of ...: mid-merge" line (a plain,
-    # unbuffered bash `echo`) is even reached -- not a buffering issue, just
-    # insufficient scheduling margin. 20s matches _boundary_run_drain_script's
-    # own default timeout, which every other caller in this file already relies
-    # on safely.
-    #
-    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift.
-    # The grace is DERIVED rather than typed (task 3798): wait_proof_grace_secs
-    # gives 80s here, a 4x margin over this 20s timeout -- wide enough that
-    # widening the timeout cannot accidentally let R's own restart land first,
-    # and small enough that a poller which escapes the timeout's kill
-    # self-terminates in 80s. It was hardcoded 99999s (27.8 HOURS), which is
-    # what let 86 leaked pollers accumulate on 2026-08-06 and 82 more the next
-    # day, each eventually reaching expiry after its fake systemctl had been
-    # GC'd out of pytest's tmpdir. See wait_proof_grace_secs for both sides of
-    # that invariant.
-    spawn_timeout = 20
+    def r_polled_busy_enough() -> bool:
+        polls_so_far = read_drain_poll_trace(trace_path, complete_only=True)
+        return polls_so_far.count(("busy", unit_r)) >= busy_polls_needed
 
-    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
-        _boundary_run_drain_script(
+    try:
+        outcome = _boundary_run_drain_script_until(
             bin_dir, state_path, fleet_dir, clock_file,
+            condition=r_polled_busy_enough,
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
-                    wait_proof_grace_secs(spawn_timeout)
-                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(largest_leak_safe_grace),
             },
-            timeout=spawn_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"{unit_r} never polled busy {busy_polls_needed} times inside the "
+            f"{exc.timeout}s must-not-hang budget (cap "
+            f"{_BOUNDARY_DRAIN_RUN_CAP_SECS}s); "
+            f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r} "
+            f"stdout={_boundary_decode(exc.stdout)!r}"
         )
 
-    stdout = _boundary_decode(exc_info.value.stdout)
-    assert f"deferring restart of {unit_r}: mid-merge" in stdout, (
-        f"expected a stable defer-prefix line naming {unit_r}; got stdout={stdout!r}"
+    polls = read_drain_poll_trace(trace_path)
+    stdout = outcome.completed.stdout
+    context = f"ledger={polls!r} stdout={stdout!r} stderr={outcome.completed.stderr!r}"
+    assert outcome.stopped_on_condition is True, (
+        f"the script exited on its own before {unit_r} polled busy "
+        f"{busy_polls_needed} times, i.e. it stopped deferring (force-fired or "
+        f"restarted {unit_r}) instead of still polling; {context}"
     )
+    assert polls[:1] == [("idle", unit_idle)], (
+        f"the gate's first poll must read {unit_idle} idle: it is ordered "
+        f"first and passes the gate transparently, before {unit_r}'s; {context}"
+    )
+    assert len(polls[1:]) >= busy_polls_needed, (
+        f"expected at least {busy_polls_needed} polls of {unit_r} after "
+        f"{unit_idle}'s; a short ledger means the run was stopped early; {context}"
+    )
+    assert all(poll == ("busy", unit_r) for poll in polls[1:]), (
+        f"every poll after {unit_idle}'s must read {unit_r} busy; a different "
+        f"record means drain_check_verdict wrote the wrong thing; {context}"
+    )
+    assert f"deferring restart of {unit_r}: mid-merge" in stdout, context
+    assert "force-restarting" not in stdout.lower(), context
     state = _boundary_load_state(state_path)
     assert ["--user", "restart", unit_r] not in state["calls"], (
-        f"{unit_r}'s restart must NOT have been recorded yet; got calls={state['calls']!r}"
+        f"{unit_r}'s restart must NOT have been recorded; got calls={state['calls']!r}"
     )
     assert ["--user", "restart", unit_idle] in state["calls"], (
         f"the idle unit ordered before {unit_r} must already be restarted "
