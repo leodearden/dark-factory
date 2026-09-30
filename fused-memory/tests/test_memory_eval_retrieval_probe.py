@@ -2746,6 +2746,8 @@ class _ServiceDouble:
         self._counts = dict(counts or {})
         self._default = default
         self.searches: list[tuple[str, str, int]] = []
+        self.search_kwargs: list[dict] = []
+        """The remaining keyword arguments of each search, parallel to ``searches``."""
         self.count_calls: list[tuple[str, dict]] = []
         self.initialized = False
         self.closed = False
@@ -2753,6 +2755,7 @@ class _ServiceDouble:
     # -- the two read paths the probe is allowed to use --------------------
     async def search(self, query, project_id='main', limit=10, **kwargs):
         self.searches.append((query, project_id, limit))
+        self.search_kwargs.append(dict(kwargs))
         if query in self._by_query:
             return self._by_query[query]
         return self._default() if self._default else _canned()
@@ -3097,6 +3100,116 @@ class TestReadOnlyGuarantee:
         assert outcome.skipped_topics == ('beta-topic',)
         assert 'beta-topic' in outcome.report
         assert set(pid for _, pid, _ in double.searches) == {'dark_factory'}
+
+
+BRIEFING_CONVENTIONS_SCOPE = {
+    'stores': ['mem0'],
+    'categories': ['preferences_and_norms', 'procedural_knowledge'],
+}
+"""The scope the briefing's conventions channel searches with."""
+
+
+class TestRegistrySearchScope:
+    """An entry may declare the store/category scope its real caller searches with.
+
+    The briefing's conventions channel is store- and category-scoped
+    (``orchestrator/src/orchestrator/agents/briefing.py::_mcp_search``), so
+    probing its phrasings unscoped would measure a query nobody issues.
+    """
+
+    def test_a_declared_scope_loads_as_tuples(self, tmp_path):
+        path = _write_registry(tmp_path, _registry_payload(_entry_payload(
+            'scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE,
+        )))
+        entry = _mod().load_topic_registry(path).entries[0]
+
+        assert entry.search_scope.stores == ('mem0',)
+        assert entry.search_scope.categories == (
+            'preferences_and_norms', 'procedural_knowledge',
+        )
+
+    def test_an_entry_without_a_scope_has_none_and_leaks_nothing_into_extra(
+        self, tmp_path,
+    ):
+        path = _write_registry(tmp_path, _registry_payload(
+            _entry_payload('unscoped-topic'),
+            _entry_payload('scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE),
+        ))
+        by_topic = _mod().load_topic_registry(path).by_topic
+
+        assert by_topic['unscoped-topic'].search_scope is None
+        assert 'search_scope' not in by_topic['unscoped-topic'].extra
+        assert 'search_scope' not in by_topic['scoped-topic'].extra
+
+    @pytest.mark.parametrize('scope', [
+        pytest.param(['mem0'], id='non-object'),
+        pytest.param({}, id='declares-neither-dimension'),
+        pytest.param({'stores': [], 'categories': []}, id='both-dimensions-empty'),
+        pytest.param({'stores': 'mem0'}, id='non-list-dimension'),
+        pytest.param({'stores': ['']}, id='empty-item'),
+        pytest.param({'categories': [3]}, id='non-string-item'),
+        pytest.param({'categories': ['telepathy']}, id='unknown-category'),
+        pytest.param({'stores': ['redis']}, id='unknown-store'),
+        pytest.param(
+            {'stores': ['mem0'], 'categorie': ['procedural_knowledge']},
+            id='unknown-scope-key',
+        ),
+    ])
+    def test_a_malformed_scope_names_the_topic(self, tmp_path, scope):
+        path = _write_registry(tmp_path, _registry_payload(_entry_payload(
+            'bad-scope', search_scope=scope,
+        )))
+
+        with pytest.raises(_mod().RegistryError) as exc:
+            _mod().load_topic_registry(path)
+        assert 'bad-scope' in str(exc.value)
+        assert 'search_scope' in str(exc.value)
+
+    def test_a_scoped_entry_searches_scoped_and_an_unscoped_one_does_not(
+        self, tmp_path,
+    ):
+        import asyncio  # noqa: PLC0415
+        from dataclasses import replace  # noqa: PLC0415
+
+        m = _mod()
+        scoped = replace(
+            _scoped_entry('scoped-topic'),
+            search_scope=m.SearchScope(
+                stores=('mem0',),
+                categories=('preferences_and_norms', 'procedural_knowledge'),
+            ),
+        )
+        unscoped = _scoped_entry('unscoped-topic')
+        registry = m.TopicRegistry(schema_version=1, entries=(scoped, unscoped))
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        asyncio.run(m.run_probe(
+            double, registry, project_ids=('dark_factory',), ks=(5,),
+            out_root=tmp_path, stamp='20260930T090000Z',
+        ))
+
+        kwargs_by_query = {
+            query: kwargs
+            for (query, _, _), kwargs in zip(
+                double.searches, double.search_kwargs, strict=True,
+            )
+        }
+        scoped_queries = [p.text for p in scoped.phrasings] + [
+            c.query for c in scoped.claim_queries
+        ]
+        unscoped_queries = [p.text for p in unscoped.phrasings] + [
+            c.query for c in unscoped.claim_queries
+        ]
+        for query in scoped_queries:
+            assert kwargs_by_query[query]['stores'] == ['mem0']
+            assert kwargs_by_query[query]['categories'] == [
+                'preferences_and_norms', 'procedural_knowledge',
+            ]
+        # Omitted, not empty: briefing.py::_mcp_search omits an empty scope so
+        # the server applies its own routing, and the probe must do the same.
+        for query in unscoped_queries:
+            assert 'stores' not in kwargs_by_query[query]
+            assert 'categories' not in kwargs_by_query[query]
 
 
 class TestCorpusCounting:
