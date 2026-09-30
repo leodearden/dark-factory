@@ -9637,7 +9637,9 @@ class TestNonCycleSummaryReconPoolStrip:
             if r.levelno == logging.WARNING and r.name == self._LOGGER
         ]
 
-    async def _add_note_with_pool_tag(self, service, recon_pool='stage1_cycle_summary'):
+    async def _add_note_with_pool_tag(
+        self, service, recon_pool: object = 'stage1_cycle_summary',
+    ):
         await service.add_memory(
             content='An ordinary observation',
             category='observations_and_summaries',
