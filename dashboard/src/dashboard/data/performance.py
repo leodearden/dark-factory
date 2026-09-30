@@ -13,11 +13,11 @@ import enum
 import json
 import logging
 from collections import defaultdict
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import aiosqlite
 from escalation.queue import iter_all_escalation_paths
@@ -29,6 +29,8 @@ from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
+
+_Tally = TypeVar('_Tally')
 
 
 def _load_escalations(escalations_dir: Path) -> list[dict]:
@@ -193,13 +195,47 @@ async def get_completion_paths(
 # ===========================================================================
 
 
+def _per_db_listings(
+    projects_by_db: Sequence[Collection[str]] | None, db_count: int,
+) -> Sequence[Collection[str] | None]:
+    """Each DB's ``projects=`` argument; ``None`` lets a DB tally all it holds."""
+    return projects_by_db if projects_by_db is not None else [None] * db_count
+
+
+def _drop_partial_tallies(
+    results: Sequence[dict[str, _Tally]],
+    projects_by_db: Sequence[Collection[str]] | None,
+) -> list[dict[str, _Tally]]:
+    """The one merge rule for a family's per-DB *results*: drop, from every
+    result, each project some DB was listed for but returned no tally for.
+
+    A healthy per-DB call tallies every project it is listed for (an idle one
+    reads its empty tally), while a call that failed open under ``with_db``
+    returns ``{}``. So after this a merged reading lists a project only when
+    every DB holding it tallied it, and a partial tally is never served as the
+    whole project's. With *projects_by_db* ``None`` the results are unchanged.
+    """
+    if projects_by_db is None:
+        return list(results)
+    partial = {
+        project_id
+        for result, listed in zip(results, projects_by_db, strict=True)
+        for project_id in listed
+        if project_id not in result
+    }
+    return [
+        {project_id: tally for project_id, tally in result.items() if project_id not in partial}
+        for result in results
+    ]
+
+
 async def aggregate_completion_paths(
     dbs: list[aiosqlite.Connection | None],
     escalations_dirs: list[Path],
     *,
     days: int = 7,
     now: datetime | None = None,
-    projects: Collection[str] | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, list[dict]]:
     """Merge :func:`get_completion_paths` results from multiple databases.
 
@@ -207,12 +243,15 @@ async def aggregate_completion_paths(
     zipped with ``strict=True`` so a mismatch raises immediately.  Each
     element of ``escalations_dirs`` must be the escalation directory
     corresponding to the project root whose runs.db is ``dbs[i]``.
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
 
     Merging rule: for a given project_id the *count* for each completion
     path is summed across DBs; ``pct`` is recomputed from the new totals.
 
     Shape contract: every project_id that appears in any per-DB
-    :func:`get_completion_paths` result is a key in the returned dict.  Its
+    :func:`get_completion_paths` result kept by
+    :func:`_drop_partial_tallies` is a key in the returned dict.  Its
     value list contains only paths whose merged count is > 0 (the
     ``if count > 0`` guard on the list comprehension), so the list may be
     empty if every per-DB result for that project had an empty list — the
@@ -229,11 +268,15 @@ async def aggregate_completion_paths(
         return {}
 
     now = resolve_now(now)
-    results = await asyncio.gather(
-        *(
-            get_completion_paths(db, edir, days=days, now=now, projects=projects)
-            for db, edir in zip(dbs, escalations_dirs, strict=True)
-        )
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_completion_paths(db, edir, days=days, now=now, projects=projects)
+                for db, edir, projects in zip(dbs, escalations_dirs, listings, strict=True)
+            )
+        ),
+        projects_by_db,
     )
 
     # Merge: sum counts per project_id per path
@@ -268,11 +311,13 @@ async def aggregate_escalation_rates(
     *,
     days: int = 7,
     now: datetime | None = None,
-    projects: Collection[str] | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_escalation_rates` results from multiple databases.
 
     ``dbs`` and ``escalations_dirs`` must have the same length.
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
     For each project_id: total_tasks, steward_count, interactive_count, and
     each human_attention bucket are summed across DBs.  steward_rate and
     interactive_rate are recomputed from the merged totals (not averaged).
@@ -281,11 +326,15 @@ async def aggregate_escalation_rates(
         return {}
 
     now = resolve_now(now)
-    results = await asyncio.gather(
-        *(
-            get_escalation_rates(db, edir, days=days, now=now, projects=projects)
-            for db, edir in zip(dbs, escalations_dirs, strict=True)
-        )
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_escalation_rates(db, edir, days=days, now=now, projects=projects)
+                for db, edir, projects in zip(dbs, escalations_dirs, listings, strict=True)
+            )
+        ),
+        projects_by_db,
     )
 
     merged: dict[str, dict] = {}
@@ -318,10 +367,12 @@ async def aggregate_loop_histograms(
     *,
     days: int = 7,
     now: datetime | None = None,
-    projects: Collection[str] | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_loop_histograms` results from multiple databases.
 
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
     For each project_id: merge outer.values and inner.values by label key
     across DBs.  In the canonical case all DBs return the same label lists
     (4 bins for outer, 6 for inner), so the merge is equivalent to the
@@ -337,8 +388,15 @@ async def aggregate_loop_histograms(
         return {}
 
     now = resolve_now(now)
-    results = await asyncio.gather(
-        *(get_loop_histograms(db, days=days, now=now, projects=projects) for db in dbs),
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_loop_histograms(db, days=days, now=now, projects=projects)
+                for db, projects in zip(dbs, listings, strict=True)
+            ),
+        ),
+        projects_by_db,
     )
 
     merged: dict[str, dict] = {}
@@ -416,7 +474,7 @@ async def aggregate_time_centiles(
     *,
     days: int = 7,
     now: datetime | None = None,
-    projects: Collection[str] | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge time-centile data from multiple databases.
 
@@ -424,14 +482,23 @@ async def aggregate_time_centiles(
     samples, concatenates them per project_id, then computes p50/p75/p90/p95
     from the unified sample distribution so percentiles are exact (not
     averages of per-DB percentiles).  ``count`` is the total number of tasks
-    across all DBs.
+    across all DBs. ``projects_by_db[i]`` lists the projects ``dbs[i]``
+    tallies (default: every project it has a completion for); see
+    :func:`_drop_partial_tallies`.
     """
     if not dbs:
         return {}
 
     now = resolve_now(now)
-    results = await asyncio.gather(
-        *(_durations_by_project(db, days=days, now=now, projects=projects) for db in dbs),
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                _durations_by_project(db, days=days, now=now, projects=projects)
+                for db, projects in zip(dbs, listings, strict=True)
+            ),
+        ),
+        projects_by_db,
     )
 
     # Merge: concatenate raw duration lists per project_id
@@ -975,11 +1042,9 @@ def _cards_provenance(
     return latest, DatumState.FRESH, None
 
 
-async def _latest_completion_instants(
-    dbs: list[aiosqlite.Connection | None],
-) -> dict[str, datetime | None]:
-    """``{project_id: latest completion across dbs}``; ``None`` where none parses."""
-    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
+def _latest_instants(per_db: Sequence[Mapping[str, str]]) -> dict[str, datetime | None]:
+    """``{project_id: latest completion across the per-DB discovery maps}``;
+    ``None`` where none parses."""
     latest: dict[str, datetime | None] = {}
     for raw_by_project in per_db:
         for project_id, raw in raw_by_project.items():
@@ -1007,9 +1072,10 @@ async def _read_card_families(
     *,
     days: int,
     now: datetime,
-    projects: frozenset[str],
+    projects_by_db: Sequence[frozenset[str]],
 ) -> dict[_CardFamily, Mapping[str, Any]]:
-    """Each card family's ``{project_id: tally}`` over the listed *projects*.
+    """Each card family's ``{project_id: tally}``, each DB tallying the
+    projects *projects_by_db* lists for it.
 
     Gathered with ``return_exceptions=True``: a family that raises reads as
     ``{}``, blanking only its own tallies. A listed project a family did not
@@ -1017,16 +1083,19 @@ async def _read_card_families(
     """
     reads = {
         _CardFamily.PATHS: aggregate_completion_paths(
-            dbs, escalations_dirs, days=days, now=now, projects=projects,
+            dbs, escalations_dirs, days=days, now=now, projects_by_db=projects_by_db,
         ),
         _CardFamily.ESCALATION: aggregate_escalation_rates(
-            dbs, escalations_dirs, days=days, now=now, projects=projects,
+            dbs, escalations_dirs, days=days, now=now, projects_by_db=projects_by_db,
         ),
         _CardFamily.HISTOGRAMS: aggregate_loop_histograms(
-            dbs, days=days, now=now, projects=projects,
+            dbs, days=days, now=now, projects_by_db=projects_by_db,
         ),
-        _CardFamily.TTC: aggregate_time_centiles(dbs, days=days, now=now, projects=projects),
+        _CardFamily.TTC: aggregate_time_centiles(
+            dbs, days=days, now=now, projects_by_db=projects_by_db,
+        ),
     }
+    projects = frozenset[str]().union(*projects_by_db)
     results = await asyncio.gather(*reads.values(), return_exceptions=True)
     readings: dict[_CardFamily, Mapping[str, Any]] = {}
     for family, result in zip(reads, results, strict=True):
@@ -1083,20 +1152,24 @@ async def aggregate_performance_cards(
 ) -> dict[str, Datum[PerformanceCards]]:
     """Each project's card block for the window ``[now - days, now]``, as one Datum.
 
-    The projects are discovered once per DB: every project with a recorded
-    completion is listed, and each family tallies exactly those. The value is
-    the project's window tally; ``as_of`` is its newest contributing event,
-    its latest completion. So "fresh" means the last completion lies inside
-    the window, and an idle project (completions ever, none in the window) is
-    stale by the envelope's own bound. A project some family could not tally
-    is UNKNOWN rather than dropped.
+    The projects are discovered once per DB, and each DB tallies only the
+    projects it holds (a runs.db whose own discovery query fails lists none;
+    ``with_db`` logs the failure). A project is served a value only when
+    every DB holding it tallied every family; otherwise it is UNKNOWN, and
+    the reason names the families. The value is the project's window tally;
+    ``as_of`` is its newest contributing event, its latest completion. So
+    "fresh" means the last completion lies inside the window, and an idle
+    project (completions ever, none in the window) is stale by the
+    envelope's own bound.
     """
     served_at = resolve_now(now)
-    latest = await _latest_completion_instants(dbs)
+    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
+    latest = _latest_instants(per_db)
     if not latest:
         return {}
     readings = await _read_card_families(
-        dbs, escalations_dirs, days=days, now=served_at, projects=frozenset(latest),
+        dbs, escalations_dirs, days=days, now=served_at,
+        projects_by_db=[frozenset(found) for found in per_db],
     )
     return {
         project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)

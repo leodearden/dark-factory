@@ -2702,7 +2702,7 @@ class TestPerformanceCardsDatum:
 
 async def _cards_across(db_paths: list[Path], escalations_dir: Path) -> dict:
     async with contextlib.AsyncExitStack() as stack:
-        conns = [
+        conns: list[aiosqlite.Connection | None] = [
             await stack.enter_async_context(aiosqlite.connect(str(db_path)))
             for db_path in db_paths
         ]
