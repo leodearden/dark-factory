@@ -2716,11 +2716,17 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # ---------------------------------------------------------------------------
 
 def _write_scan_tree(
-    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+    root: Path,
+    relative_paths: list[str],
+    *,
+    untracked: tuple[str, ...] = (),
+    symlinks: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Build a real git repo at *root*: *relative_paths* end up TRACKED via
     ``git init`` + ``git add -A -f``; any *untracked* paths are written only
-    AFTER the add, so they stay out of the index.
+    AFTER the add, so they stay out of the index. Each *symlinks* pair is
+    ``(link_relative_path, target_as_written_in_the_link)``, created BEFORE the
+    add so the link itself is tracked.
 
     A real repo, not a bare directory: task 4971 re-sources the scan from
     ``git ls-files``, so trackedness must be exercised by the fixture rather
@@ -2735,6 +2741,11 @@ def _write_scan_tree(
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
+
+    for link, target in symlinks:
+        path = root / link
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
 
     for args in (("init", "-q"), ("add", "-A", "-f")):
         _run_git(list(args), cwd=root)
@@ -2967,6 +2978,24 @@ def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
     )
 
     assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
+
+
+def test_walk_repo_files_skips_a_tracked_symlink(tmp_path: Path) -> None:
+    """A tracked symlink's indexed content is its target PATH, and the target is
+    scanned in its own right, so scanning the link double-counts one file. For an
+    untracked target it would read untracked content, against task 4971's
+    tracked-only oracle.
+    """
+    _write_scan_tree(
+        tmp_path, ["docs/real.md"], symlinks=(("notes/alias.md", "../docs/real.md"),)
+    )
+    index = _run_git(["ls-files", "-s"], cwd=tmp_path).stdout
+    assert any(
+        line.startswith("120000") and line.endswith("notes/alias.md")
+        for line in index.splitlines()
+    ), index
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "real.md"]
 
 
 # ---------------------------------------------------------------------------
