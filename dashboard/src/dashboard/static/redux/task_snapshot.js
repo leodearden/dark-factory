@@ -1,7 +1,8 @@
 // task_snapshot.js — the CLIENT twin of dashboard/src/dashboard/data/task_snapshot.py,
 // and the ONE reader of DF_DATA.TASKS_SNAPSHOT for every census surface: the
 // OrchTab pips, tiles, filter bar and Progress card, the Overview tile and
-// pipeline, the topbar pill and the rail badge. Named for its server twin so
+// pipeline, the topbar pill, the rail badge, and the Tasks tab's header pips
+// and rows. Named for its server twin so
 // the two halves of the snapshot unit can find each other (the datum.js
 // precedent).
 //
@@ -77,6 +78,25 @@ function projectCensus(data, project) {
 
 function projectRows(data, project) {
   return snapshotDatum(data, project, 'rows');
+}
+
+// Every row the snapshot holds, across projects, in entry order: what the Tasks
+// tab probes and looks a selected task up in. An aged rows Datum still
+// contributes; a hole contributes nothing.
+function snapshotRowsOver(data) {
+  return Object.values(snapshotEntries(data)).flatMap(entry =>
+    entry && isSnapshotDatum(entry.rows) ? entry.rows.value || [] : [],
+  );
+}
+
+// Whether a fresh read renders exactly as the Datum a caller already holds:
+// the same fields, the value compared by reference. projectRows and the
+// terminal readers stamp a new object per call, so identity cannot say it; a
+// new payload or a new receipt makes it false, and so re-reads the age.
+function sameDatum(held, fresh) {
+  const keys = Object.keys(held);
+  return keys.length === Object.keys(fresh).length
+    && keys.every(key => Object.prototype.hasOwnProperty.call(fresh, key) && Object.is(held[key], fresh[key]));
 }
 
 // ── A census over several projects ──
@@ -158,6 +178,8 @@ const CENSUS_VIEWS = Object.freeze([
   censusView('backlog', 'backlog', 'warn'),
   censusView('terminal', 'terminal', 'ok'),
 ]);
+
+const EVERY_VIEW = Object.freeze(Object.fromEntries(CENSUS_VIEWS.map(view => [view.key, true])));
 
 // The OrchTab census tiles show MEMBERS, not views. Burndown persists members,
 // so each tile's `series` is the history of the very member its headline
@@ -249,7 +271,7 @@ function viewReason([view, datum]) {
   return view.label + ': ' + datum.reason;
 }
 
-// ── The terminal window, for a surface that lists it without requesting it ──
+// ── The terminal window ──
 // Terminal rows come only from the on-demand ?terminal=<project> window.
 // OrchTab lists that window when another surface's request has landed one, but
 // never requests it itself. data.js::datumFor would call an absent window
@@ -261,6 +283,18 @@ function unrequestedTerminalRows(served) {
   return isSnapshotDatum(served) ? served : unknownSnapshotDatum(TERMINAL_NOT_REQUESTED);
 }
 
+// PRD decision 5: the projects whose window a surface requests — every one
+// while the terminal view is selected, else each one grouped by PRD.
+function terminalWindowProjects(projectIds, filter, groupedIds) {
+  return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
+}
+
+// The projects in `wanted` that were not in `wantedBefore`: the only ones a
+// change to the wanted set owes a request, since the rest already had theirs.
+function terminalWindowEntrants(wantedBefore, wanted) {
+  return wanted.filter(id => !wantedBefore.includes(id));
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced by classic_script_scope.test.mjs.
 const TASK_SNAPSHOT_API = {
@@ -268,6 +302,7 @@ const TASK_SNAPSHOT_API = {
   projectCensus,
   censusOver,
   CENSUS_VIEWS,
+  EVERY_VIEW,
   CENSUS_TILES,
   inFlightCount,
   runningOfInFlight,
@@ -277,8 +312,12 @@ const TASK_SNAPSHOT_API = {
   censusSegments,
   censusHistory,
   projectRows,
+  snapshotRowsOver,
   viewRows,
   unrequestedTerminalRows,
+  terminalWindowProjects,
+  terminalWindowEntrants,
+  sameDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

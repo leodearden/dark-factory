@@ -1,4 +1,4 @@
-"""`/api/v2/dashboard/tasks` — the active-task table and its done counts.
+"""`/api/v2/dashboard/tasks` — the per-project task snapshot (census and rows).
 
 Fans out over every known project root, reporting four distinct failure
 facts separately (offline / degraded / count-unknown / no root measured)
@@ -158,18 +158,13 @@ def _terminal_key(project: str) -> str:
 
 @router.get('/api/v2/dashboard/tasks')
 async def api_tasks(request: Request) -> JSONResponse:
-    """ACTIVE_TASKS (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
+    """TASKS_SNAPSHOT per project root (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
 
-    Each task in ACTIVE_TASKS includes a ``meta_files`` field (taskmaster
-    ``metadata.files``) that is retained on the wire for debugging and tooling.
-    No frontend UI reads it directly — lock display routes through D.SCHEDULER.
-
-    ACTIVE_TASKS is the concatenation, in canonical root order, of every
-    ``TASKS_SNAPSHOT[p].rows.value``. They are the same row dicts, so every
-    active row crosses the wire TWICE until leaf γ3 (task 5590) moves the
-    readers onto the snapshot and deletes this key. That doubles the largest
-    part of the payload. The measured cost is recorded beside the budget it
-    spends, ``active_tasks._TASKS_TOTAL_BUDGET``.
+    The rows travel only as ``TASKS_SNAPSHOT[p].rows``, a ``Datum`` per root;
+    there is no flat row list on the wire. Each row includes a ``meta_files``
+    field (taskmaster ``metadata.files``) that is retained on the wire for
+    debugging and tooling. No frontend UI reads it directly — lock display
+    routes through D.SCHEDULER.
 
     **Four distinct failure facts (plus a denominator), deliberately not
     collapsed:**
@@ -255,8 +250,8 @@ async def api_tasks(request: Request) -> JSONResponse:
     silently. The exemption machinery that used to widen the window per-PRD is
     gone with it: its own constant comment recorded that it could only ever
     exempt rows that were FETCHED, so it never met that contract either. The
-    CLIENT half — reading the state and rendering the disclosure — belongs to
-    leaf γ3, which migrates the Tasks tab.
+    client half is ``tab_tasks.jsx``: it requests the window and renders the
+    ``lower_bound`` disclosure.
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
@@ -282,7 +277,7 @@ async def api_tasks(request: Request) -> JSONResponse:
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
     render_at = resolve_now(None)
-    active, snapshots = await collect_tasks_with_counts(
+    _, snapshots = await collect_tasks_with_counts(
         http_client, config, resolve_external=True, now=render_at,
     )
     served_at = resolve_now(None)
@@ -310,7 +305,7 @@ async def api_tasks(request: Request) -> JSONResponse:
     # The loop above routes each root to at most one banner, so a root in
     # neither of these two lists had its rows read this render, with or
     # without a count, and either case vetoes the flag. An offline root's
-    # last-good rows do not veto it, although they are in ACTIVE_TASKS. A set,
+    # last-good rows do not veto it, although they are served, aged. A set,
     # not a sum, so a duplicate label can only ever UNDERcount and fail safe
     # (flag stays False).
     no_root_measured = (
@@ -335,7 +330,6 @@ async def api_tasks(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             **payload,
-            'ACTIVE_TASKS': active,
             'TASKS_SNAPSHOT': wire_snapshots,
             'TASKS_OFFLINE': (
                 bool(total_roots) and bool(offline_projects) and no_root_measured
