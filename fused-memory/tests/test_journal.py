@@ -24,6 +24,7 @@ from fused_memory.reconciliation.journal import (
     REPAIRABLE_RUN_STATUSES,
     ReconciliationJournal,
 )
+from fused_memory.services.memory_service import MemoryService
 
 
 @pytest_asyncio.fixture
@@ -1455,3 +1456,328 @@ class TestUpdateRunStageReportsPreservesCitationRepairs:
         assert competitor_texts
         assert stored_text == competitor_texts[-1]
         assert 'must never land' not in stored_text
+
+
+class TestGetRunStageExecution:
+    """The narrow runs-table read behind typed cycle-summary absence (task 3731).
+
+    ``get_cycle_summary_presence`` cannot tell "the stage ran and lost its
+    ledger write" from "the stage never ran" or "the row was gc()'d" from the
+    ledger alone — a reaped ``cycle_summary`` row is hard-DELETEd and is then
+    byte-for-byte indistinguishable from one that was never written. The
+    ``runs`` table carries no TTL, so it is the durable evidence that outlives
+    the ledger; this projection is the read that reaches it.
+
+    Deliberately narrower than ``get_run``: project-scoped (the ledger's
+    identity is project-scoped too) and a four-column projection rather than
+    ``SELECT *`` piped through ``_row_to_run``, which materialises every
+    ``StageReport`` including the multi-KB ``items_flagged`` blobs.
+    """
+
+    @staticmethod
+    async def _start(journal, run_id, project_id='test-project', started_at=None):
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=project_id,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=started_at or datetime.now(UTC),
+                status=RunStatus.running,
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_such_run(self, journal):
+        assert (
+            await journal.get_run_stage_execution(
+                'test-project', 'nonexistent-id', 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_run_under_a_different_project(self, journal):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id, project_id='owning-project')
+
+        # get_run would happily return this row — it is keyed on id alone. The
+        # presence lookup must not, because the ledger identity it explains is
+        # project-scoped.
+        assert await journal.get_run(run_id) is not None
+        assert (
+            await journal.get_run_stage_execution(
+                'other-project', run_id, 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_stage_ran_with_run_status_and_timestamps(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'task_knowledge_sync': StageReport(
+                    stage=StageId.task_knowledge_sync,
+                    started_at=now,
+                    completed_at=now,
+                    llm_calls=1,
+                )
+            },
+        )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert set(execution) == {
+            'status', 'stage_ran', 'resumed', 'settled', 'started_at', 'completed_at',
+        }
+        assert execution['stage_ran'] is True
+        assert execution['status'] == 'interrupted'
+        assert execution['started_at'] is not None
+        assert execution['completed_at'] is not None
+
+    @pytest.mark.asyncio
+    async def test_empty_stage_reports_is_positive_evidence_the_stage_never_ran(
+        self, journal
+    ):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+        assert execution['status'] == 'running'
+        assert execution['completed_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_out_of_band_error_and_resume_keys_are_not_stage_evidence(
+        self, journal
+    ):
+        """``reconciliation/harness.py`` writes ``_error``/``_resume`` straight
+        into ``run.stage_reports`` before persisting. A run that holds only
+        those must still read as "the stage never ran" — the lookup is
+        stage-keyed, never "is there any report at all"."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                '_error': {'error': 'boom', 'stage': 'task_knowledge_sync'},
+                '_resume': {'resumed_from': 'memory_consolidator'},
+            },
+        )
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
+        self, journal
+    ):
+        """``status`` alone cannot tell a settled run from one that is running
+        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
+        run and ``run_full_cycle`` marks it running only on the in-memory
+        object, leaving the column ``'interrupted'``. The adopt pass does
+        persist its ``_resume`` bookkeeping first, so that key is the one
+        durable signal that the blob may be a stale mid-flight snapshot, and
+        the projection surfaces it rather than making every caller re-parse
+        ``stage_reports`` to find out."""
+        settled = str(uuid.uuid4())
+        await self._start(journal, settled)
+        await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
+
+        adopted = str(uuid.uuid4())
+        await self._start(journal, adopted)
+        await journal.update_run_stage_reports(
+            adopted, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+        )
+
+        settled_exec = await journal.get_run_stage_execution(
+            'test-project', settled, 'task_knowledge_sync'
+        )
+        adopted_exec = await journal.get_run_stage_execution(
+            'test-project', adopted, 'task_knowledge_sync'
+        )
+
+        assert settled_exec['resumed'] is False
+        assert adopted_exec['resumed'] is True
+        # The resume key is bookkeeping, never stage evidence, in both shapes.
+        assert settled_exec['stage_ran'] is False
+        assert adopted_exec['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', ['completed', 'failed', 'rolled_back', 'circuit_breaker'],
+    )
+    async def test_every_status_that_flushes_the_blob_reads_as_settled(
+        self, journal, status
+    ):
+        """Statuses spelled out rather than parametrized over the frozenset
+        itself: reading the roster from the code under test would let a
+        narrowing edit silently drop a status while the suite stayed green,
+        which is the regression this pins. ``interrupted`` is covered
+        separately — it alone needs the resume evidence."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.complete_run(run_id, status)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == status
+        assert execution['settled'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_run_still_executing_has_not_settled(self, journal):
+        """The dominant shape: Stage 3 verifies the run it is running inside,
+        whose blob the harness has not flushed yet."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'running'
+        assert execution['stage_ran'] is False
+        assert execution['settled'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('adopted,settled', [(False, True), (True, False)])
+    async def test_interrupted_settles_only_when_it_was_never_adopted(
+        self, journal, adopted, settled
+    ):
+        """``interrupted`` is the one terminal status a run can leave: the
+        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
+        re-runs the run behind a status column only ``complete_run`` ever
+        writes. So the SAME terminal status means "finished account" or
+        "executing again" depending on that key, and the projection — not its
+        caller — is what knows the difference."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        if adopted:
+            await journal.update_run_stage_reports(
+                run_id, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+            )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'interrupted'
+        assert execution['resumed'] is adopted
+        assert execution['settled'] is settled
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_leaves_resumed_indeterminate(
+        self, journal
+    ):
+        """A blob that does not parse cannot answer either question, and
+        ``resumed`` must not collapse to False there — that would read as
+        positive evidence the run was never adopted and hand a caller back the
+        confident answer the indeterminate ``stage_ran`` exists to withhold."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?',
+                ('["not", "a", "dict"]', run_id),
+            )
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['stage_ran'] is None
+        assert execution['resumed'] is None
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_keyed_on_the_requested_stage(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                )
+            },
+        )
+
+        ran = await journal.get_run_stage_execution(
+            'test-project', run_id, 'memory_consolidator'
+        )
+        did_not_run = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert ran is not None and ran['stage_ran'] is True
+        assert did_not_run is not None and did_not_run['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_is_indeterminate_and_loud(
+        self, journal, caplog
+    ):
+        """Unparseable stored JSON is a FAULT. It must not masquerade as the
+        definitive "the stage never ran" — that would silently suppress a real
+        data-loss finding — so it reports ``None`` and logs a WARNING."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?', ('not json', run_id)
+            )
+
+        with caplog.at_level('WARNING'):
+            execution = await journal.get_run_stage_execution(
+                'test-project', run_id, 'task_knowledge_sync'
+            )
+
+        assert execution is not None
+        assert execution['stage_ran'] is None
+        assert execution['status'] == 'running'
+        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
+
+
+class TestMemoryServiceReconJournalWiring:
+    """The service-side seam for the runs lookup (task 3731).
+
+    Mirrors the ``set_recon_ledger`` precedent in
+    ``tests/test_recon_ledger.py`` verbatim. The journal is a SEPARATE
+    availability signal from the ledger: ``server/main.py`` constructs it
+    unconditionally inside the reconciliation-init block while the ledger sits
+    behind ``recon_ledger_enabled``, so the presence payload has to report the
+    two independently.
+    """
+
+    def test_recon_journal_defaults_to_none(self, mock_config):
+        svc = MemoryService(mock_config)
+
+        assert svc.recon_journal is None
+
+    def test_set_recon_journal_wires_the_journal(self, mock_config, tmp_path):
+        svc = MemoryService(mock_config)
+        journal = ReconciliationJournal(tmp_path / 'test_recon')
+
+        svc.set_recon_journal(journal)
+
+        assert svc.recon_journal is journal

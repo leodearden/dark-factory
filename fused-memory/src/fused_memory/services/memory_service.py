@@ -14,7 +14,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
@@ -79,6 +79,9 @@ from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
 )
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS,
+)
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_MERGE,
     STATE_ACTIVE,
@@ -138,6 +141,7 @@ from fused_memory.utils.validation import _safe_repr, require_full_uuid
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
@@ -2105,6 +2109,7 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root} registry snapshot (task 3088). Injected by
         # set_known_projects at server startup — MemoryService is constructed
         # before build_known_projects_map runs, so it cannot arrive by
@@ -2264,6 +2269,24 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_recon_journal(self, journal: ReconciliationJournal) -> None:
+        """Wire the reconciliation journal in as a READ-ONLY runs-table source.
+
+        ``get_cycle_summary_presence`` uses it, and only it, to tell a reaped
+        or never-written ``cycle_summary`` row from a genuinely lost one. The
+        service never calls a journal WRITER — the harness owns every write —
+        and it takes the same already-``initialize()``d instance the harness
+        holds rather than opening a second connection: one process, and
+        aiosqlite serialises its own connection.
+
+        Wired UNCONDITIONALLY at startup, above the ``recon_ledger_enabled``
+        gate that guards ``set_recon_ledger``. That asymmetry is the point:
+        journal availability and ledger availability are independent signals,
+        and the presence payload reports them separately as
+        ``run_lookup_available`` and ``ledger_available``.
+        """
+        self.recon_journal = journal
 
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
@@ -8300,6 +8323,7 @@ class MemoryService:
         project_id: str,
         run_id: str,
         stage: str,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
 
@@ -8327,8 +8351,83 @@ class MemoryService:
         cycle_summary — Stage 1 still runs a focused turn on such a pass and
         may still emit findings; it only skips its own per-cycle summary
         write, by design (task 2652) — from a genuine Stage 1 write failure.
+
+        **Typed absence (task 3731).** ``present=False`` on its own conflates
+        four unrelated situations, only ONE of which is a defect:
+
+        1. the stage RAN and its ledger write was lost — a genuine gap;
+        2. the stage never ran (the run died before reaching it);
+        3. the row existed and was reaped by ``ReconLedgerStore.gc()``, which
+           hard-DELETEs, leaving nothing to distinguish it from (2);
+        4. nothing is wired to answer the question.
+
+        ``reason`` names which one, resolved by joining the ``runs`` table —
+        which carries no TTL and so outlives the ledger — through
+        ``recon_journal``. It is single-valued and evaluated top-down:
+
+        ================== ========================================= ========
+        reason             meaning                                   expected
+        ================== ========================================= ========
+        present            row found                                 True
+        ledger_unavailable no ledger wired                           None
+        run_unknown        journal unwired, no runs row, read
+                           raised, stage_reports unparseable, or
+                           the run is in flight and has not
+                           settled its stage_reports yet             None
+        stage_not_run      SETTLED runs row present, stage absent
+                           from stage_reports                        False
+        expired            run older than the retention window, so
+                           any row would have been gc()'d            None
+        missing            stage ran, within retention, no row       True
+        ================== ========================================= ========
+
+        ``stage_not_run`` deliberately outranks ``expired``: it is a positive
+        fact from the never-reaped ``runs`` table and stays true regardless of
+        TTL, whereas ``expired`` only says the evidence was destroyed.
+
+        ``stage_not_run`` is reachable only for a run whose ``stage_reports``
+        have SETTLED (the journal projection's ``settled`` verdict, see
+        ``reconciliation/journal.py::ReconciliationJournal._stage_reports_are_settled``).
+        A run still executing
+        has not had the blob written yet, so the absence of a stage key there is
+        not evidence — and Stage 3 checks the CURRENT run from inside the
+        still-running stage loop, which is the common case, not an edge one.
+        Such a run reports ``run_unknown``, sending the caller to its existing
+        fallback rather than declaring the stage never ran. That covers the
+        adopt-and-resume case too, where the run is executing again behind a
+        disk status that still reads ``'interrupted'``.
+
+        **The consumer rule is: flag a genuine gap ONLY when ``present`` is
+        False AND ``expected`` is True.** ``expected=False`` means there was
+        nothing to write; ``expected=None`` means the question is unanswerable
+        and the caller should fall through to its existing best-effort
+        fallback exactly as it does today.
+
+        ``run_status`` is carried as evidence for a finding's report line and
+        is **DIAGNOSTIC ONLY — never gate on it**. Gating on it looks right on
+        the majority case and is wrong: three measured ``failed`` runs really
+        did execute Stage 2 and lose the ledger write, so a status gate would
+        suppress precisely the real data-loss findings it appears to filter.
+
+        Residual false negative, accepted deliberately: if a stage ran but
+        BOTH its ``stage_reports`` entry and its ledger row were lost, this
+        reports ``stage_not_run`` and the gap is suppressed. That is the
+        fail-safe direction — never flag on uncertainty — and matches the
+        contract's existing inconclusive-means-do-not-report norm (PRD
+        plans/stage3-ledger-presence-prd.md §8.3).
+
+        Now that reaping is routine, ``present=False`` on any run older than
+        the retention window carries NO information about whether the stage
+        wrote a summary — the row would have been hard-DELETEd either way.
+        That is exactly why ``expected`` is ``None`` there rather than True.
+
+        *now* injects the clock for the retention comparison, matching the
+        convention ``ReconLedgerStore`` and ``summary_pool.write_cycle_summary``
+        already follow, so tests can pin the boundary deterministically. The
+        MCP tool surface does not expose it.
         """
         ledger = getattr(self, 'recon_ledger', None)
+        journal = getattr(self, 'recon_journal', None)
         if ledger is None:
             return {
                 'present': False,
@@ -8337,6 +8436,10 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
                 'remediation': None,
+                'reason': 'ledger_unavailable',
+                'expected': None,
+                'run_lookup_available': journal is not None,
+                'run_status': None,
             }
         # Presence is intentionally state-agnostic here: any row matching the
         # five-part identity counts as present, regardless of `record.state`.
@@ -8359,6 +8462,8 @@ class MemoryService:
             # a malformed payload degrades to remediation=None rather than
             # crashing presence detection, while a genuine ledger read error
             # still propagates uncaught (test_ledger_read_error_is_not_swallowed_as_definitive_absent).
+            # The runs-table guard below follows the same rule for the same
+            # reason: it wraps only the journal read, never the ledger read.
             try:
                 payload = json.loads(record.payload_json)
             except (TypeError, ValueError):
@@ -8371,6 +8476,15 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
+
+        reason, expected, run_status = await self._classify_summary_absence(
+            journal,
+            project_id,
+            run_id,
+            stage,
+            present=record is not None,
+            now=now or datetime.now(UTC),
+        )
         return {
             'present': record is not None,
             'ledger_available': True,
@@ -8378,7 +8492,105 @@ class MemoryService:
             'run_id': run_id,
             'stage': stage,
             'remediation': remediation,
+            'reason': reason,
+            'expected': expected,
+            'run_lookup_available': journal is not None,
+            'run_status': run_status,
         }
+
+    async def _classify_summary_absence(
+        self,
+        journal: ReconciliationJournal | None,
+        project_id: str,
+        run_id: str,
+        stage: str,
+        *,
+        present: bool,
+        now: datetime,
+    ) -> tuple[str, bool | None, str | None]:
+        """Explain an absent cycle_summary row as ``(reason, expected, run_status)``.
+
+        See :meth:`get_cycle_summary_presence` for the full ladder. Best-effort
+        by construction: it only ever EXPLAINS an absence the ledger has
+        already established, so every failure degrades to the inconclusive
+        ``run_unknown`` rather than propagating.
+        """
+        if present:
+            # Presence needs no explanation — don't pay for the runs query.
+            return 'present', True, None
+        if journal is None:
+            return 'run_unknown', None, None
+
+        try:
+            execution = await journal.get_run_stage_execution(project_id, run_id, stage)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell a broken
+            # runs lookup from an unrecorded run by the return value alone.
+            logger.warning(
+                'get_cycle_summary_presence: runs lookup FAILED for run_id=%s '
+                'stage=%s in project=%s; cannot type the absence',
+                run_id,
+                stage,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, None
+
+        if execution is None:
+            return 'run_unknown', None, None
+        run_status = execution['status']
+        if execution['stage_ran'] is None:
+            return 'run_unknown', None, run_status
+        if execution['stage_ran'] is False:
+            if not execution['settled']:
+                # The blob is not a finished account of this run, so the
+                # absence of the key is not evidence of anything.
+                return 'run_unknown', None, run_status
+            # Checked BEFORE retention: a positive fact from the never-reaped
+            # runs table, true regardless of TTL.
+            return 'stage_not_run', False, run_status
+
+        # The stage ran. Whether its missing row is data loss depends on
+        # whether the row could still exist at all: past the retention window
+        # gc() has hard-DELETEd it either way, so absence says nothing.
+        #
+        # Aged from started_at, never completed_at, because the two cliffs must
+        # not cross. write_cycle_summary stamps expires_at from ITS OWN write
+        # time, which falls between the two: the run row is completed only
+        # after the whole stage loop — after Stage 3's LLM turn, and far later
+        # for an interrupted-then-resumed run. Aging from completed_at would
+        # put the reader's cliff AFTER gc()'s, and every absence in that window
+        # would read as a confident `missing` for a row that was merely reaped.
+        # started_at is always <= the write time, so the reader's cliff lands
+        # at or before gc()'s and the ambiguous window degrades to the
+        # inconclusive `expired` — the fail-safe direction.
+        reference_iso = execution['started_at']
+        try:
+            reference = datetime.fromisoformat(reference_iso)
+            # A naive journal timestamp is UTC, the convention every other
+            # reader of this column already applies (throughput.py,
+            # summary_pool.py::_assume_utc). Normalising INSIDE the guard keeps
+            # the docstring's promise that every failure here degrades to
+            # run_unknown: a residual mixed-awareness comparison raises
+            # TypeError, which a read-only presence check must not propagate.
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=UTC)
+            expired = reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now
+        except (TypeError, ValueError):
+            logger.warning(
+                'get_cycle_summary_presence: could not age run timestamp %r '
+                'for run_id=%s stage=%s in project=%s; cannot age the absence',
+                reference_iso,
+                run_id,
+                stage,
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, run_status
+        if expired:
+            return 'expired', None, run_status
+        return 'missing', True, run_status
 
     # ------------------------------------------------------------------
     # Delete
