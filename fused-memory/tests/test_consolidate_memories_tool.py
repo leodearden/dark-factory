@@ -1042,10 +1042,10 @@ class TestClosureIsCorroboratedNeverClaimed:
     @pytest.mark.asyncio
     async def test_a_truncated_closure_listing_says_so(self):
         """(d) A capped listing must never read as the whole closure."""
-        from fused_memory.server.tools import _TOPIC_MEMBER_LIMIT
+        from fused_memory.services.consolidation_ops import TOPIC_MEMBER_LIMIT
 
         svc = make_service(
-            topic_members=[f'member-{i}' for i in range(_TOPIC_MEMBER_LIMIT)],
+            topic_members=[f'member-{i}' for i in range(TOPIC_MEMBER_LIMIT)],
             topic_total=512,
         )
 
@@ -1053,7 +1053,7 @@ class TestClosureIsCorroboratedNeverClaimed:
 
         assert result['topic_members_truncated'] is True
         assert result['topic_members_total'] == 512
-        assert len(result['topic_members']) == _TOPIC_MEMBER_LIMIT
+        assert len(result['topic_members']) == TOPIC_MEMBER_LIMIT
 
     @pytest.mark.asyncio
     async def test_the_common_path_pays_for_no_count(self):
@@ -2391,3 +2391,160 @@ class TestASeedShortfallIsDisclosedNotFatal:
 
         assert result['status'] == 'consolidated'
         assert result['topic_cluster_seed'] == seed
+
+
+class TestTheEnvelopeSurvivesTheExtraction:
+    """Task β's before/after signal (PRD §10 β): the tool's envelope must be
+    identical across the extraction of its retain arm into
+    `services/consolidation_ops.py`.
+
+    This is a CHARACTERIZATION pin, GREEN at the commit that introduces it
+    by construction — both literals were captured from the unmodified tree
+    before any production edit, which is what makes them evidence of the
+    PRE-extraction behaviour rather than a rewritten expectation. A pure
+    refactor has no new behaviour to drive red-first, so its TDD signal is
+    INVARIANCE, and these two cases are what make that signal checkable by
+    a test rather than by a reviewer diffing two runs.
+
+    The comparison is whole-dict `==`, never a key subset: the property
+    under test is that no key appears, vanishes or changes value, and a
+    subset assertion is blind to exactly that.
+
+    The two cases are the op's two arms. The fixture cluster exercises the
+    delete arm alongside the retain arm; the retain-only shape is the
+    gate-3200 ratified default and the only shape the auto-consolidation
+    executor takes, so it is pinned in its own right rather than assumed to
+    be covered by the first.
+    """
+
+    #: The closure listing every member of this fixture's topic, as
+    #: `get_memories_by_metadata` lifts it (`created_at` flat, not nested).
+    _TOPIC_MEMBERS = [
+        {
+            'id': S1,
+            'content': f'record {S1}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+        {
+            'id': S2,
+            'content': f'record {S2}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+        {
+            'id': S3,
+            'content': f'record {S3}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+    ]
+
+    @pytest.mark.asyncio
+    async def test_the_fixture_cluster_envelope_is_pinned(self):
+        result = await call_consolidate(make_service(), known_projects=KNOWN_PROJECTS)
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [S1, S2, S3],
+            'deleted': [S1, S2, S3],
+            'failed_deletes': [],
+            'retained': [],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 3,
+            'tombstones_expected': 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_retain_only_envelope_is_pinned(self):
+        result = await call_consolidate(
+            make_service(), supersedes=[], retain=[RETAIN_1, RETAIN_2], run_id=None
+        )
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [],
+            'deleted': [],
+            'failed_deletes': [],
+            'retained': [RETAIN_1, RETAIN_2],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 0,
+            'tombstones_expected': 0,
+        }
+
+
+class TestTheClosureListingIsReadAfterTheFold:
+    """The envelope must never report as a LIVE topic member an id it
+    reports in `deleted`.
+
+    The flagship case is not exotic: the ratchet this op exists to end is
+    "a cluster ends up containing the consolidator's own prior
+    canonicals", so a supersede that already carries the topic — the
+    incumbent being reaped — is the ordinary shape of a fold. A listing
+    taken before the deletes names it; a listing taken after does not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_reaped_topic_member_is_not_listed_as_live(self):
+        svc = make_service()
+
+        # The scroll answers from the world, which the op changes: a record
+        # this call has deleted is no longer a topic member. A constant
+        # answer would make any placement of the read look correct.
+        async def _live_topic_rows(**_):
+            reaped = {c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list}
+            return [
+                _scroll_row(m)
+                for m in (CANONICAL, RETAIN_1, RETAIN_2, S1)
+                if m not in reaped
+            ]
+
+        svc.get_memories_by_metadata = AsyncMock(side_effect=_live_topic_rows)
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        assert [m['id'] for m in result['topic_members']] == [
+            CANONICAL,
+            RETAIN_1,
+            RETAIN_2,
+        ]
+        assert S1 in result['deleted']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'shape',
+        [
+            {'retain': [RETAIN_1, RETAIN_2]},
+            {'supersedes': [], 'retain': [RETAIN_1, RETAIN_2], 'run_id': None},
+        ],
+        ids=['with-a-fold', 'retain-only'],
+    )
+    async def test_the_closure_is_scrolled_exactly_once(self, shape):
+        """The envelope's `topic_members*` fields have ONE source: the
+        listing read once the fold is done. A second read would be a second
+        source for the same fields, and a wasted scroll on every call."""
+        svc = make_service()
+
+        await call_consolidate(svc, **shape)
+
+        svc.get_memories_by_metadata.assert_awaited_once()

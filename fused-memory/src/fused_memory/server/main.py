@@ -22,6 +22,7 @@ load_dotenv()
 from functools import partial  # noqa: E402
 
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
@@ -554,6 +555,7 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
     memory_service = MemoryService(config)
@@ -784,6 +786,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
@@ -969,6 +977,9 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
             server_ready_event=recon_server_ready,
+            escalation_listener=_claim_listener(
+                systemd_listeners, config.reconciliation.escalation_port,
+            ),
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -1172,6 +1183,12 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_socket = _claim_listener(systemd_listeners, config.server.port)
+            if systemd_listeners:
+                logger.warning(
+                    'systemd passed listening sockets for ports %s that nothing here serves',
+                    sorted(systemd_listeners),
+                )
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1234,7 +1251,10 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=[primary_socket] if primary_socket else None),
+                name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -2000,6 +2020,19 @@ def _build_uvicorn_config(
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
     return uvicorn.Config(app, **kwargs)
+
+
+def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
+    """Remove and return the systemd-held listening socket for *port*, if any.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. None means the caller binds the
+    port itself (not socket-activated, or systemd holds no socket for it).
+    """
+    sock = listeners.pop(port, None)
+    if sock is not None:
+        logger.info('  Port %d: serving on the systemd-held socket (survives restarts)', port)
+    return sock
 
 
 def _build_recon_report_components(

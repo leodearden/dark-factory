@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import inspect
 import json
@@ -16,11 +17,13 @@ import logging
 import os
 import threading
 import time
+import weakref
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
 from pydantic import BaseModel
@@ -1265,56 +1268,70 @@ class HermeticMcpSession:
         )
 
 
+_created_mock_call_coroutines: deque[weakref.ref] = deque()
+
+
+def track_async_mock_coroutines() -> None:
+    """Register every AsyncMock call coroutine at creation, for ``drain_async_mock_coroutines``.
+
+    The registry holds weak references, so an orphan that ref-counting reclaims
+    still warns inside the test that leaked it; only an orphan kept alive by a
+    reference cycle survives to the drain.  ``deque.append`` is atomic, so a
+    background thread calling an AsyncMock can never corrupt a drain in progress.
+
+    A silent no-op here would hand the task-1714 order-dependent failures back
+    to innocent tests, so this refuses to start when ``_execute_mock_call`` is
+    no longer a coroutine function.  That AsyncMock calls still GO THROUGH it is
+    pinned by test_async_mock_coroutine_isolation.py, which plants an orphan and
+    requires the drain to find it without searching the heap.
+    """
+    create_coroutine = AsyncMockMixin._execute_mock_call
+    if not inspect.iscoroutinefunction(create_coroutine):
+        raise RuntimeError(
+            'unittest.mock.AsyncMockMixin._execute_mock_call is no longer a '
+            'coroutine function, so AsyncMock call coroutines cannot be tracked '
+            'at creation — re-derive track_async_mock_coroutines against this '
+            "interpreter's unittest.mock before trusting the suite's verdicts"
+        )
+
+    @functools.wraps(create_coroutine)
+    def create_tracked_coroutine(self, /, *args, **kwargs):
+        coroutine = create_coroutine(self, *args, **kwargs)
+        _created_mock_call_coroutines.append(weakref.ref(coroutine))
+        return coroutine
+
+    # pyright reads this package as Python 3.11; markcoroutinefunction arrived in 3.12.
+    AsyncMockMixin._execute_mock_call = inspect.markcoroutinefunction(  # pyright: ignore[reportAttributeAccessIssue]
+        create_tracked_coroutine
+    )
+
+
 def drain_async_mock_coroutines() -> int:
-    """Close all orphaned AsyncMock._execute_mock_call coroutines in the GC graph.
+    """Close every AsyncMock call coroutine created since the last drain and never awaited.
 
-    Task 1714 / esc-1702-13 — fix for order-dependent orchestrator test failures.
+    Task 1714 / esc-1702-13.  Calling an AsyncMock without awaiting the result
+    leaves an ``_execute_mock_call`` coroutine in CORO_CREATED.  Held in a
+    reference cycle (common in mock object graphs) it outlives its test and is
+    finalized by whichever later test the garbage collector happens to run in,
+    where ``RuntimeWarning("coroutine '...' was never awaited")`` — promoted to
+    an error by orchestrator/pyproject.toml — fails that innocent test.
+    ``.close()`` on a CORO_CREATED coroutine finalizes it without the warning,
+    so closing each test's orphans at its own boundary keeps them out of its
+    siblings.
 
-    ROOT CAUSE: Calling an AsyncMock without awaiting the returned coroutine
-    produces a ``_execute_mock_call`` coroutine (cr_code.co_name ==
-    ``"_execute_mock_call"``, state CORO_CREATED).  When that orphan is held in
-    a reference cycle (common in mock object graphs) it survives ref-count
-    reclamation and is only finalized by a gc.collect() that may run during an
-    arbitrary *later* test.  CPython then emits
-    ``RuntimeWarning("coroutine '...' was never awaited")`` (or pytest's
-    PytestUnraisableExceptionWarning wrapper).  orchestrator/pyproject.toml
-    promotes BOTH to hard errors via ``filterwarnings``, failing whichever test
-    the GC ran during — producing order-dependent suite failures.
+    Only coroutines registered by ``track_async_mock_coroutines`` are touched:
+    a forgotten ``await`` on product code still trips filterwarnings=error.
+    The cost is proportional to the AsyncMock calls made since the last drain.
+    Its predecessor searched ``gc.get_objects()`` instead, which with the whole
+    suite collected was 88% of a full run's CPU (task 5668).
 
-    FIX: .close() on a CORO_CREATED coroutine finalizes it WITHOUT emitting the
-    warning (verified under warnings.simplefilter("error") on CPython 3.13.9).
-    Walking gc.get_objects() and closing every CORO_CREATED ``_execute_mock_call``
-    coroutine before the test boundary ensures each test's orphans are reclaimed
-    at its OWN boundary and cannot be promoted into a sibling.
-
-    SAFETY NET preserved: only AsyncMock's internal ``_execute_mock_call``
-    coroutines are closed; a genuinely forgotten ``await`` on product code yields
-    a coroutine with a different co_name and still trips filterwarnings=error.
-    Product coroutines are intentionally NOT reclaimed here, so a missing
-    ``await`` in production code will still raise under filterwarnings=error.
-
-    PERFORMANCE NOTE: ``gc.get_objects()`` materialises every live Python object
-    (O(total live objects)) on every call.  The teardown ``gc.collect()`` is
-    skipped when ``closed == 0`` to avoid a full-generation collection on the
-    common no-orphan path.  If profiling shows the walk itself is a bottleneck
-    across the full suite, consider a pytest opt-in marker for tests that use
-    AsyncMock to scope the walk — the current unconditional path is a safe
-    default.
-
-    DIAGNOSTIC: a DEBUG-level log is emitted for each test that leaks AsyncMock
-    orphans, so tests that routinely call AsyncMock without awaiting can be
-    identified and fixed at source rather than being masked indefinitely.
-
-    Returns the number of coroutines closed (useful for assertions in tests).
+    Returns the number of coroutines closed.
     """
     closed = 0
-    for obj in gc.get_objects():
-        if (
-            inspect.iscoroutine(obj)
-            and getattr(getattr(obj, 'cr_code', None), 'co_name', None) == '_execute_mock_call'
-            and inspect.getcoroutinestate(obj) == inspect.CORO_CREATED
-        ):
-            obj.close()
+    for _ in range(len(_created_mock_call_coroutines)):
+        coroutine = _created_mock_call_coroutines.popleft()()
+        if coroutine is not None and inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
+            coroutine.close()
             closed += 1
     if closed:
         _log.debug(
@@ -1323,7 +1340,6 @@ def drain_async_mock_coroutines() -> int:
             'AsyncMock calls in the preceding test',
             closed,
         )
-        gc.collect()
     return closed
 
 
@@ -1384,11 +1400,10 @@ async def reap_leaked_aiosqlite_connections() -> int:
     makes the degradation loud; it does not restore the reaping, so the
     re-verification instruction stands.
 
-    PERFORMANCE NOTE: mirrors ``drain_async_mock_coroutines``'s gc-walk
-    shape, but gates the (relatively expensive) ``gc.get_objects()`` walk
-    behind a cheap ``threading.enumerate()`` pre-check for a live aiosqlite
-    worker thread, so the common no-leak path costs a single thread-list scan
-    rather than a full object-graph walk on every test.
+    PERFORMANCE NOTE: the ``gc.get_objects()`` walk is gated behind a cheap
+    ``threading.enumerate()`` pre-check for a live aiosqlite worker thread, so
+    the common no-leak path costs a single thread-list scan rather than a full
+    object-graph walk on every test.
 
     Returns the number of connections reaped (useful for assertions in tests).
     """
@@ -2436,3 +2451,27 @@ def make_prompt_resolution_workflow(
         mcp=None,
         prompt_store=prompt_store,
     )
+
+
+class ExitContractViolationCollector(logging.Handler):
+    """Collects the run()-exit contract's VIOLATION records.
+
+    Keyed on the structured extra that
+    ``orchestrator/src/orchestrator/exit_contract.py::record_exit_verdict``
+    attaches, never on message text: a store-unavailable record, or any other
+    warning from the same logger, is not a violation. Backs conftest.py's
+    autouse ``_no_unexpected_exit_contract_violation`` guard.
+    """
+
+    def __init__(self) -> None:
+        # Function-local: importing this module costs no orchestrator import.
+        from orchestrator.exit_contract import VERDICT_LOG_ATTRIBUTE, ExitVerdictKind
+
+        super().__init__()
+        self._verdict_attribute = VERDICT_LOG_ATTRIBUTE
+        self._violation = ExitVerdictKind.VIOLATION.value
+        self.violations: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, self._verdict_attribute, None) == self._violation:
+            self.violations.append(record)

@@ -22,6 +22,7 @@ from orchestrator.mcp.plan_tools import (
     _coerce_files,
     _confirm_plan,
     _create_plan,
+    _drop_plan_file,
     _mark_step_done,
     _remove_plan_step,
     _replace_plan_step,
@@ -518,6 +519,115 @@ class TestUpdatePlanMetadata:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+    def test_redeclaring_a_dropped_path_clears_its_drop_record(self, artifacts):
+        """``files`` and ``dropped_files`` stay disjoint: re-declaration wins."""
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+        _drop_plan_file(artifacts, path='mod_a/bar.py', reason='Needed no edit')
+        _drop_plan_file(artifacts, path='mod_a/baz.py', reason='Also needed no edit')
+
+        result = _update_plan_metadata(
+            artifacts, files=['mod_a/foo.py', 'mod_a/bar.py'],
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/baz.py', 'reason': 'Also needed no edit'}
+        ]
+
+
+class TestDropPlanFile:
+    """``_drop_plan_file``: drop a declared entry and record why, atomically."""
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    def test_drops_the_entry_and_records_the_reason(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        reason = 'Declared defensively; the branch never needed to touch it'
+        result = _drop_plan_file(artifacts, path='mod_a/bar.py', reason=reason)
+
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        # (a) the dropped path is gone from the gate's re-check surface.
+        assert 'mod_a/bar.py' not in plan['files']
+        # (b) the entries the architect did NOT drop survive, in order — the
+        # partial-narrow half of the signal: an entry left in the list still
+        # reaches the gate's re-check.
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        # (c) the provenance the drop would otherwise have destroyed.
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/bar.py', 'reason': reason}
+        ]
+
+    def _assert_record_untouched(self, artifacts, files):
+        """A refusal must leave the durable record exactly as it was."""
+        plan = artifacts.read_plan()
+        assert plan['files'] == files
+        assert plan.get('dropped_files', []) == []
+
+    def test_unknown_path_is_refused(self, artifacts):
+        """A hallucinated or already-dropped entry must not silently no-op.
+
+        Appending a note explaining an absence that was never a declaration
+        would manufacture provenance rather than preserve it.
+        """
+        self._three_file_plan(artifacts)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/nope.py', reason='Never needed'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(
+            artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        )
+
+    def test_blank_reason_is_refused(self, artifacts):
+        """An unrecorded reason is exactly the falsified provenance
+        ``merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX`` objects to,
+        so an empty (or whitespace-only) one must not be accepted."""
+        self._three_file_plan(artifacts)
+
+        for reason in ('', '   '):
+            result = _drop_plan_file(
+                artifacts, path='mod_a/bar.py', reason=reason
+            )
+
+            assert result['status'] == 'error', f'reason={reason!r} was accepted'
+            assert result['message']
+            self._assert_record_untouched(
+                artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+            )
+
+    def test_refuses_to_drop_the_last_remaining_file(self, artifacts):
+        """Narrowing to empty silences the gate wholesale.
+
+        ``_task_files`` returns None for an empty list, so
+        ``workflow._check_plan_files_touched_in_branch`` is handed ``[]`` and
+        flags nothing — a plan with no files is not a narrowed plan, it is an
+        unchecked one.
+        """
+        _create_plan(artifacts, 'test-1', 'Test task', 'Analysis', ['mod_a/only.py'])
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(artifacts, ['mod_a/only.py'])
 
 
 class TestRemovePlanStep:
@@ -1466,3 +1576,55 @@ class TestMarkStepCommitted:
         confirm = plan_tools._confirm_plan(artifacts)
         assert confirm['status'] == 'ok'
         assert confirm['finalized'] is True
+
+
+@pytest.mark.asyncio
+class TestDropPlanFileTool:
+    """The REGISTERED ``drop_plan_file`` MCP tool, not only its helper."""
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    async def test_registered_tool_drops_via_fn(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        # drop_plan_file is a sync def — call tool.fn() directly.
+        result = tool.fn(  # type: ignore[union-attr]
+            path='mod_a/bar.py',
+            reason='Declared for a rename that the final design avoided',
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        assert plan['dropped_files'] == [{
+            'path': 'mod_a/bar.py',
+            'reason': 'Declared for a rename that the final design avoided',
+        }]
+
+    async def test_registered_tool_refuses_unknown_path_via_run(self, artifacts):
+        # tool.run() goes through FastMCP's pydantic argument validation,
+        # which tool.fn() bypasses — the real wire-level boundary.
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        result = await tool.run({
+            'path': 'mod_a/nope.py',
+            'reason': 'Never needed',
+        })
+
+        assert result.structured_content is not None
+        assert result.structured_content['status'] == 'error'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        assert plan.get('dropped_files', []) == []

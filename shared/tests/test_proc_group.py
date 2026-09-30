@@ -7,52 +7,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
 import signal
+import subprocess
+import sys
 
 import pytest
 
 import shared.proc_group as proc_group_module
 from shared.proc_group import (
+    ProcessGroupMember,
+    process_group_members,
+    process_group_terminated,
     reap_process_groups,
     scan_process_groups_under_path,
     snapshot_process_group,
     terminate_process_group,
 )
-
-
-async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
-    """Poll until a process group is fully reaped by the kernel.
-
-    After terminate_process_group reaps the bash leader, any grandchild
-    processes are reparented to the user's ``systemd --user`` subreaper
-    (or pid 1) and become zombies until that subreaper waitpids them.
-    Until that happens, ``os.killpg(pgid, 0)`` still returns 0 rather
-    than raising ProcessLookupError.  Observed subreaper latency is
-    0–500 ms in isolation but stretches under 32-worker xdist load.
-    The default 5 s budget is comfortably longer than any observed reap
-    latency; a genuine leak (regression) causes the caller's assert to
-    fire.
-
-    PermissionError (EPERM): in the theoretically possible (though
-    practically negligible) case where the kernel recycles *pgid* to a
-    process owned by another user during the poll window,
-    ``os.killpg(pgid, 0)`` raises EPERM rather than ESRCH.  Both mean
-    "no longer our group to worry about", so EPERM is treated as success.
-    This cannot mask a genuine leak: EPERM only fires once the pgid has
-    been assigned to a different user's process, at which point the group
-    we spawned is definitively gone.
-    """
-    iterations = max(1, int(timeout / step))
-    for _ in range(iterations):
-        try:
-            os.killpg(pgid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
-        await asyncio.sleep(step)
-    return False
 
 
 async def _await_group_membership(
@@ -61,8 +35,8 @@ async def _await_group_membership(
     total: int,
     comm: str,
     comm_count: int,
-    # Must-not-hang guard, not a latency SLA — matches the 5.0s budget
-    # already justified for _pgid_gone_within above.
+    # Must-not-hang guard, not a latency SLA — the same 5.0s budget as
+    # _await_group_terminated below.
     timeout: float = 5.0,
     # A single snapshot_process_group walk (all of /proc: stat/wchan/comm/
     # cmdline per pid) measured median 448ms idle / 911ms loaded, p95
@@ -90,8 +64,8 @@ async def _await_group_membership(
 
     Bounded by BOTH *timeout* (wall-clock) AND *min_attempts* — exhaustion
     requires both to be exceeded, whichever is more generous. *timeout*
-    defaults to 5.0s, matching the budget already justified for
-    ``_pgid_gone_within`` above. *min_attempts* defaults to 3 because a
+    defaults to 5.0s, the same budget as ``_await_group_terminated``.
+    *min_attempts* defaults to 3 because a
     single ``snapshot_process_group`` walk measured median 448ms idle /
     911ms loaded, p95 ~2.4-2.6s, max 3.95s — a deadline-only bound could
     admit just ONE attempt on a slower or larger-/proc host, silently
@@ -146,6 +120,34 @@ async def _await_group_membership(
         await asyncio.sleep(step)
 
 
+async def _await_group_terminated(
+    pgid: int,
+    *,
+    timeout: float = 5.0,
+    min_attempts: int = 3,
+    step: float = 0.05,
+) -> None:
+    """Poll until every member of group *pgid* has terminated.
+
+    A zombie awaiting its subreaper's reap counts as terminated (see
+    ``shared.proc_group.ProcessGroupMember.terminated``).  Bounded like
+    ``_await_group_membership``, by BOTH *timeout* and *min_attempts*, since
+    one /proc walk can take seconds on a loaded host; raises
+    ``_GroupTerminationTimeout`` on exhaustion.
+    """
+    started = asyncio.get_running_loop().time()
+    attempts = 0
+    while True:
+        attempts += 1
+        if process_group_terminated(pgid):
+            return
+        elapsed = asyncio.get_running_loop().time() - started
+        if attempts >= min_attempts and elapsed >= timeout:
+            running = tuple(m for m in process_group_members(pgid) if not m.terminated)
+            raise _GroupTerminationTimeout(pgid, running, attempts, elapsed)
+        await asyncio.sleep(step)
+
+
 async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
     """Spawn a real ``sleep 30`` leading its own process group, with cwd *cwd*.
 
@@ -175,6 +177,46 @@ def _kill_group(pgid: int) -> None:
     """
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.fixture
+def unreaped_zombie_pgid():
+    """Yield the pgid of a one-member group whose only member is an unreaped zombie.
+
+    ``waitid(..., WNOWAIT)`` blocks until the SIGKILLed child has terminated
+    without reaping it, and this process stays its parent until teardown, so
+    the group provably still exists (and its pgid cannot be recycled) for the
+    whole test.
+    """
+    p = subprocess.Popen(
+        ['sleep', '30'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        os.kill(p.pid, signal.SIGKILL)
+        os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+        yield p.pid
+    finally:
+        p.wait()
+
+
+def _synthetic_stat_line(
+    pid: int, pgrp: int, *, state: str = 'S', comm: str = 'weird (name) proc'
+) -> str:
+    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp ...``.
+
+    The default *comm* deliberately contains spaces AND a ``)`` so the parser's
+    ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
+    mis-read this line, and the kernel really does allow it (a process can
+    set an arbitrary 15-char comm).
+    """
+    return (
+        f'{pid} ({comm}) {state} 1 {pgrp} {pgrp} 0 -1 4194304 '
+        + ' '.join(['0'] * 20)
+        + '\n'
+    )
 
 
 class _ShellReadinessError(AssertionError):
@@ -207,6 +249,37 @@ class _GroupMembershipTimeout(AssertionError):
     contract; the message stays free to carry the full last-observed
     snapshot for diagnosis.
     """
+
+
+class _GroupTerminationTimeout(AssertionError):
+    """A process group still had a running member when the poll ran out.
+
+    Subclasses AssertionError, like _GroupMembershipTimeout, so exhaustion is
+    a test FAILURE, never a bare TimeoutError and never a silent return.  The
+    concrete TYPE and the structured ``running`` members are the contract;
+    the message stays free to change.
+    """
+
+    def __init__(
+        self,
+        pgid: int,
+        running: tuple[ProcessGroupMember, ...],
+        attempts: int,
+        elapsed: float,
+    ) -> None:
+        self.running = running
+        budget = f'after {attempts} attempt(s) / {elapsed:.3f}s'
+        if running:
+            members = '; '.join(
+                f'pid={m.pid} ppid={m.ppid} state={m.state} comm={m.comm}' for m in running
+            )
+            message = f'group {pgid} still had running member(s) {budget}: {members}'
+        else:
+            message = (
+                f'group {pgid} was never concluded terminated {budget}: killpg '
+                f'still saw the group but /proc showed no running member'
+            )
+        super().__init__(message)
 
 
 async def _await_shell_ready(
@@ -498,6 +571,34 @@ async def test_await_group_membership_polls_through_fork_exec_window():
             await proc2.wait()
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_group_terminated_accepts_unreaped_zombies_and_fails_loudly_on_a_live_member(
+    unreaped_zombie_pgid, tmp_path
+):
+    """_await_group_terminated concludes on termination, never on anyone's reap.
+
+    (a) It returns while the zombie group still exists (killpg succeeds
+    afterwards): the state on which the killpg-based probe it replaces timed
+    out, red in task 6024's merge verify while systemd --user stalled.
+    (b) A running member exhausts the budget and raises the typed failure,
+    carrying the running members as data.
+    """
+    await _await_group_terminated(unreaped_zombie_pgid)
+    os.killpg(unreaped_zombie_pgid, 0)
+
+    proc = await _spawn_sleeper_in(tmp_path)
+    pgid = proc.pid
+    try:
+        with pytest.raises(_GroupTerminationTimeout) as excinfo:
+            await _await_group_terminated(pgid, timeout=0.2, min_attempts=2)
+        assert isinstance(excinfo.value, AssertionError)
+        assert [m.pid for m in excinfo.value.running] == [pgid]
+    finally:
+        _kill_group(pgid)
+        await proc.wait()
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
@@ -509,8 +610,10 @@ class TestTerminateProcessGroup:
         Spawn bash with start_new_session=True so it leads its own process
         group. After terminate_process_group returns:
         - proc.returncode must be set (process reaped)
-        - os.killpg(pgid, 0) must eventually raise ProcessLookupError once
-          the kernel reaps any reparented grandchild zombies (bounded 5 s poll)
+        - every member of the group must have terminated; a zombie still
+          awaiting its reparented reap by systemd --user counts as
+          terminated, because that reap is not terminate_process_group's to
+          perform
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 30',
@@ -525,10 +628,7 @@ class TestTerminateProcessGroup:
         assert proc.returncode is not None, (
             f'Process group {pgid} not reaped: proc.returncode is None'
         )
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'kernel zombie-reap race or genuine leak.'
-        )
+        await _await_group_terminated(pgid)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -568,7 +668,7 @@ class TestTerminateProcessGroup:
 
         Reproduces the canonical cargo → rustc incident shape: bash spawns two
         background sleeps and waits for them.  After terminate_process_group,
-        pgrep must report no processes in the group.
+        every member of the group must have terminated.
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 60 & sleep 60 & echo ready; wait',
@@ -611,10 +711,7 @@ class TestTerminateProcessGroup:
             with contextlib.suppress(Exception):
                 await proc.wait()
 
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'grandchildren leaked.'
-        )
+        await _await_group_terminated(pgid)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -881,72 +978,31 @@ class TestSnapshotProcessGroup:
         )
 
     def test_stat_line_with_comm_containing_spaces_and_parens(self, monkeypatch, tmp_path):
-        """stat-line parser handles comm names with spaces and nested parens.
+        """The snapshot takes comm, state, ppid and pgrp from one stat parse.
 
-        The kernel's /proc/<pid>/stat format wraps the comm field in parens:
+        The kernel's /proc/<pid>/stat wraps comm in parens:
             "pid (comm with spaces (and parens)) state ppid pgrp ..."
-        The parser uses rfind(')') to locate the end of comm, then reads the
-        remaining fields positionally.  This test locks in that offset logic
-        against a hand-crafted synthetic stat line.
+        so the parser must end comm at the LAST ``)``.  The fabricated pid has
+        no ``comm`` file, so the name in the row can only have come from stat.
         """
-        from pathlib import Path
-        from unittest.mock import patch
-
-        # Synthetic pgid we want to match
         target_pgid = 77777
-
-        # Build a synthetic /proc/<pid>/ tree under tmp_path
         fake_pid = 77778
-        pid_dir = tmp_path / str(fake_pid)
-        pid_dir.mkdir()
-
-        # Comm with embedded spaces and parens — the adversarial case
         comm_name = 'my weird (proc) name'
-        stat_content = (
-            f'{fake_pid} ({comm_name}) S '  # pid (comm) state
-            f'1 {target_pgid} {target_pgid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n'
-            # fields after state: ppid=1, pgrp=target_pgid, session=target_pgid, ...
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            _synthetic_stat_line(fake_pid, target_pgid, comm=comm_name)
         )
-        (pid_dir / 'stat').write_text(stat_content)
-        (pid_dir / 'comm').write_text(comm_name + '\n')
-        (pid_dir / 'wchan').write_text('do_wait\n')
+        (entry / 'wchan').write_text('do_wait\n')
+        (proc_root / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
-        # Make a fake /proc directory that only has our synthetic pid entry plus
-        # some non-numeric entries (should be skipped by the implementation).
-        fake_proc = tmp_path / 'fake_proc'
-        fake_proc.mkdir()
-        # Symlink or recreate the pid subdir under fake_proc
-        import shutil
-        shutil.copytree(str(pid_dir), str(fake_proc / str(fake_pid)))
-        (fake_proc / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        rows = snapshot_process_group(target_pgid).splitlines()
 
-        from shared import proc_group as _pg
-
-        original_exists = Path.exists
-
-        def patched_exists(self) -> bool:
-            if str(self) == '/proc':
-                return True
-            return original_exists(self)
-
-        with (
-            patch.object(Path, 'exists', patched_exists),
-            patch.object(_pg, '_snapshot_process_group_unsafe') as mock_unsafe,
-        ):
-            # Use the real _snapshot_process_group_unsafe but with a fake proc dir.
-            # Because monkeypatching iterdir on Path is fragile, call the internal
-            # function directly with a patched proc_dir reference instead.
-            mock_unsafe.side_effect = lambda pgid: _snapshot_impl_with_proc_dir(
-                pgid, fake_proc
-            )
-            result = snapshot_process_group(target_pgid)
-
-        assert isinstance(result, str)
-        assert result, f'Expected non-empty snapshot, got: {result!r}'
-        # The comm with spaces/parens must be present in the output
-        assert comm_name in result or str(fake_pid) in result, (
-            f'Expected comm {comm_name!r} or pid {fake_pid} in snapshot:\n{result}'
-        )
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=S wchan=do_wait comm={comm_name} cmdline=?'
+        ], rows
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -975,72 +1031,6 @@ class TestSnapshotProcessGroup:
         finally:
             proc.kill()
             await proc.wait()
-
-
-def _snapshot_impl_with_proc_dir(pgid: int, proc_dir) -> str:
-    """Re-implementation of _snapshot_process_group_unsafe with an injectable proc_dir.
-
-    Used by the synthetic-stat-line test to point at a fake /proc tree built
-    under tmp_path.  Mirrors the real implementation exactly so the test locks
-    in the field-offset logic under the adversarial (spaces+parens in comm) case.
-    """
-    from pathlib import Path
-
-    if pgid <= 0:
-        return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
-
-    proc_dir = Path(proc_dir)
-    if not proc_dir.exists():
-        return f'snapshot_process_group({pgid}): /proc not available'
-
-    rows: list[str] = []
-    try:
-        entries = list(proc_dir.iterdir())
-    except OSError:
-        return f'snapshot_process_group({pgid}): could not list /proc'
-
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
-            continue
-
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            tail = stat_text[rparen + 2:]
-            fields = tail.split()
-            state = fields[0]
-            ppid = int(fields[1])
-            pgrp = int(fields[2])
-        except (IndexError, ValueError):
-            continue
-
-        if pgrp != pgid:
-            continue
-
-        try:
-            comm = (entry / 'comm').read_text().strip()
-        except OSError:
-            comm = '?'
-
-        try:
-            wchan = (entry / 'wchan').read_text().strip()
-        except OSError:
-            wchan = '?'
-
-        rows.append(f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}')
-
-    if not rows:
-        return f'snapshot_process_group({pgid}): no processes found in group'
-
-    header = f'snapshot_process_group({pgid}): {len(rows)} process(es) in group:'
-    return '\n'.join([header] + rows)
 
 
 class TestScanProcessGroupsUnderPath:
@@ -1202,21 +1192,6 @@ class TestScanProcessGroupsAgainstASyntheticProc:
     than adding a test-only parameter to the public function.
     """
 
-    @staticmethod
-    def _stat_line(pid: int, pgrp: int, comm: str = 'weird (name) proc') -> str:
-        """A real-format ``/proc/<pid>/stat``: ``pid (comm) state ppid pgrp ...``.
-
-        *comm* deliberately contains spaces AND a ``)`` so the parser's
-        ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
-        mis-read this line, and the kernel really does allow it (a process can
-        set an arbitrary 15-char comm).
-        """
-        return (
-            f'{pid} ({comm}) S 1 {pgrp} {pgrp} 0 -1 4194304 '
-            + ' '.join(['0'] * 20)
-            + '\n'
-        )
-
     @pytest.fixture
     def fake_proc(self, tmp_path, monkeypatch):
         """Build the fabricated /proc and the root the scan is aimed at.
@@ -1255,7 +1230,7 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         def _pid(pid: int, pgrp: int, cwd) -> None:
             entry = proc_root / str(pid)
             entry.mkdir()
-            (entry / 'stat').write_text(self._stat_line(pid, pgrp))
+            (entry / 'stat').write_text(_synthetic_stat_line(pid, pgrp))
             (entry / 'cwd').symlink_to(cwd)
 
         _pid(100, 100, root)
@@ -1381,6 +1356,166 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         assert scan_process_groups_under_path(tmp_path) == set()
 
 
+class TestProcessGroupTermination:
+    """A group has terminated once every member is dead, zombies included.
+
+    A zombie has exited and awaits only its parent's reap; once orphaned that
+    parent is systemd --user, whose latency the group's signaller neither
+    owns nor bounds.  ``os.killpg(pgid, 0)`` still succeeds on such a group,
+    which is why it is not the termination criterion.
+    """
+
+    @pytest.mark.parametrize(
+        ('state', 'terminated'),
+        [
+            ('Z', True),
+            ('X', True),
+            ('R', False),
+            ('S', False),
+            ('D', False),
+            ('T', False),
+            ('t', False),
+            ('I', False),
+        ],
+    )
+    def test_terminated_is_true_exactly_for_zombie_and_dead_states(self, state, terminated):
+        member = ProcessGroupMember(pid=4242, ppid=1, state=state, comm='x')
+        assert member.terminated is terminated
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_has_one_running_member_and_is_not_terminated(self):
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            members = process_group_members(pgid)
+            assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                (pgid, 'sleep', False)
+            ], members
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_group_counts_as_terminated(self, unreaped_zombie_pgid):
+        """The group still exists (killpg succeeds) yet has terminated."""
+        pgid = unreaped_zombie_pgid
+        members = process_group_members(pgid)
+        assert [(m.pid, m.state, m.terminated) for m in members] == [
+            (pgid, 'Z', True)
+        ], members
+        assert process_group_terminated(pgid) is True
+        os.killpg(pgid, 0)
+
+    @pytest.mark.timeout(15)
+    def test_a_zombie_leader_with_a_live_member_is_not_terminated(self):
+        """Termination needs EVERY member dead, so a leaked member always fails."""
+        with subprocess.Popen(
+            ['sh', '-c', 'sleep 30 & echo ready; exec sleep 31'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                os.kill(pgid, signal.SIGKILL)
+                os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOWAIT)
+
+                members = process_group_members(pgid)
+                assert [m.pid for m in members if m.terminated] == [pgid], members
+                assert [m for m in members if not m.terminated], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    @pytest.mark.timeout(15)
+    def test_a_member_with_an_undecodable_comm_is_still_listed(self):
+        """comm is arbitrary bytes; a member must never drop out of the walk over them."""
+        pr_set_name = 15
+        script = (
+            'import ctypes, time\n'
+            f"ctypes.CDLL(None).prctl({pr_set_name}, b'\\xff\\xfe', 0, 0, 0)\n"
+            "print('ready', flush=True)\n"
+            'time.sleep(30)\n'
+        )
+        with subprocess.Popen(
+            [sys.executable, '-c', script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                members = process_group_members(pgid)
+                assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                    (pgid, '��', False)
+                ], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    def test_a_nonexistent_group_is_terminated_with_no_members(self):
+        beyond_pid_max = 2**30
+        assert process_group_members(beyond_pid_max) == []
+        assert process_group_terminated(beyond_pid_max) is True
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_the_walk_cannot_see_is_not_terminated(self, tmp_path, monkeypatch):
+        """killpg sees the group but /proc shows no member: inconclusive, so False.
+
+        This stands in for an unreadable /proc (hidepid, another pid namespace), which
+        must never pass a live group as dead.
+        """
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+            assert process_group_members(pgid) == []
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_a_group_killpg_may_not_signal_is_terminated(self, monkeypatch):
+        """EPERM means the pgid now belongs to another user, so our group is gone.
+
+        The group is really alive, so True can only come from the failed probe and
+        never from the /proc walk.
+        """
+
+        def eperm(pgid: int, sig: int) -> None:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            with monkeypatch.context() as patched:
+                patched.setattr('shared.proc_group.os.killpg', eperm)
+                assert process_group_terminated(p.pid) is True
+        finally:
+            _kill_group(p.pid)
+            p.wait()
+
+
 class TestReapProcessGroups:
     """Tests for reap_process_groups — SIGTERM→wait→SIGKILL over a set of pgids.
 
@@ -1402,13 +1537,66 @@ class TestReapProcessGroups:
             # asyncio.to_thread(reap...) call site).
             outcomes = await asyncio.to_thread(reap_process_groups, {pgid})
             assert outcomes.get(pgid) == 'reaped', f'unexpected outcomes: {outcomes}'
-            assert await _pgid_gone_within(pgid), (
-                f'process group {pgid} not gone after reap'
-            )
+            await _await_group_terminated(pgid)
         finally:
             _kill_group(pgid)
             with contextlib.suppress(Exception):
                 await proc.wait()
+
+    @pytest.mark.timeout(15)
+    def test_reap_reports_a_group_of_only_unreaped_zombies_as_reaped(self, unreaped_zombie_pgid):
+        """Members awaiting their parent's reap have terminated; that is 'reaped'.
+
+        The zombie is held unreaped for the whole call, so the verdict does
+        not depend on grace_secs; it is small only to keep a regression fast.
+        """
+        pgid = unreaped_zombie_pgid
+        outcomes = reap_process_groups({pgid}, grace_secs=0.2)
+        assert outcomes == {pgid: 'reaped'}
+        os.killpg(pgid, 0)
+
+    @pytest.mark.timeout(5)
+    def test_one_proc_walk_judges_every_group_killpg_still_sees(self, tmp_path, monkeypatch):
+        """Each poll walks /proc once for all still-visible groups, never once per group.
+
+        Three zombie-only groups stay visible to killpg, a fourth is already
+        gone, and the fabricated /proc also holds one unrelated live pid. Every
+        pgid is above PID_MAX_LIMIT (2**22), so none can be a real group. One
+        walk reads each fabricated stat exactly once; a walk per visible group
+        would read each of them three times, and a reap of only gone groups
+        needs no walk at all. Stat reads are counted the same way
+        test_two_pids_in_one_group_are_inspected_once counts its per-pid
+        inspection.
+        """
+        zombie_groups = (5_000_100, 5_000_200, 5_000_300)
+        gone_group = 5_000_900
+        proc_root = tmp_path / 'proc'
+        planted = [(pgid + 1, pgid, 'Z') for pgid in zombie_groups] + [(5_000_401, 5_000_400, 'S')]
+        for pid, pgrp, state in planted:
+            (proc_root / str(pid)).mkdir(parents=True)
+            (proc_root / str(pid) / 'stat').write_text(_synthetic_stat_line(pid, pgrp, state=state))
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        def killpg(pgid: int, sig: int) -> None:
+            if pgid == gone_group:
+                raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+
+        monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
+        stat_reads: list[str] = []
+        real_read = proc_group_module._read_stat_fields
+        monkeypatch.setattr(
+            'shared.proc_group._read_stat_fields',
+            lambda entry: stat_reads.append(entry.name) or real_read(entry),
+        )
+
+        outcomes = reap_process_groups({*zombie_groups, gone_group}, grace_secs=0)
+
+        assert outcomes == dict.fromkeys((*zombie_groups, gone_group), 'reaped')
+        assert sorted(stat_reads) == sorted(str(pid) for pid, _, _ in planted)
+
+        stat_reads.clear()
+        assert reap_process_groups({gone_group}, grace_secs=0) == {gone_group: 'reaped'}
+        assert stat_reads == []
 
     @pytest.mark.timeout(5)
     def test_reap_refuses_unsafe_pgids(self, monkeypatch):

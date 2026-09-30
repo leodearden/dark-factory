@@ -265,6 +265,9 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_reuse_item',
     # Revalidation tools (blast-radius requeue)
     'mcp__plan-tools__update_plan_metadata',
+    # Narrowing-pass option (c); see
+    # orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt
+    'mcp__plan-tools__drop_plan_file',
     'mcp__plan-tools__remove_plan_step',
     'mcp__plan-tools__replace_plan_step',
     'mcp__plan-tools__confirm_plan',
@@ -594,10 +597,64 @@ NEVER — each of these cost a real session a turn or an entire wait
 """
 
 
-# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# Third member of the wait block (task 5519): reading the exit code a wait
+# returned -- your own timeout, or an external kill.  Constraint (b) above binds
+# it, and it stays brace-free like the two members above.  It reads shell
+# 128 + N codes against the clock; verify_classify.py::is_external_kill_rc is a
+# different rule, over negative asyncio returncodes, that ignores a shell 137.
+EXTERNAL_KILL_GUIDANCE = """
+## Reading an exit code: your own timeout, or an external kill?
+
+Read the code against the CLOCK: a command that died far short of the
+`timeout` you set was not timed out, whatever the code says. The three codes:
+- 143 = 128 + 15, SIGTERM: your own Bash `timeout` (120000 ms when omitted).
+- 124: a GNU `timeout N` prefix YOU wrote into the command, as above.
+- 137 = 128 + 9, SIGKILL. Well short of your budget, that is an EXTERNAL
+  killer: the Linux OOM killer, or an operator or sweep `kill -9`. It is NOT
+  the session watchdog: that kill takes your whole session, so if you are
+  reading the code, it was not the watchdog. Raising `timeout` cannot fix an
+  external kill, and re-running the identical command usually reproduces it.
+
+A killed run says NOTHING about the code under test: it is neither failing nor
+hanging. Never report it as a test failure or a hang. Say it was killed
+externally, and quote the raw code.
+
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
+without `pipefail`, so a pipeline reports its LAST stage's status and the real
+exit code is thrown away. A kill that takes the process group also takes
+whatever was buffered in the pipe, leaving a code and no output. Redirect to a
+file and `Read` the file: a killed run then still leaves its partial output
+on disk.
+
+To diagnose a 137, re-run it once, on ONE line:
+
+    /usr/bin/time -v <cmd> > <log> 2>&1; echo "rc=$?"
+
+Make the log path unique (carry your task id): /tmp is shared by every agent
+on the host. `Read` the END of the log: "Command terminated by signal 9", the
+elapsed wall clock, and the max RSS (the largest single process; xdist workers
+are not summed). Before and after that run, read the `oom_kill` line of
+`/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.events`. A rise is
+strong evidence of OOM, not proof: other agents share that cgroup.
+
+Then, in order:
+- Elapsed close to your budget: it was your timeout. Re-size it, or
+  background it per the rules above.
+- Short of budget with `oom_kill` risen or a large max RSS: shrink the run.
+  Shard by directory, cut xdist workers (`-n 4`, not `-n auto`, which starts
+  one per core), or run the heaviest subset alone.
+- Neither: escalate rather than guess a cause (`escalate_blocker` with
+  `category='infra_issue'` if you hold it, otherwise `escalate_info`), quoting
+  the raw code, elapsed time, max RSS and `oom_kill` before and after.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never any member on its
 # own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
-# composition so the two rules cannot drift apart.
-BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+# composition so the three rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = (
+    BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE + EXTERNAL_KILL_GUIDANCE
+)
 
 
 # Pointer form for a TURN prompt whose role system_prompt already carries the
@@ -607,11 +664,12 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~11% of the block's bytes.
+# that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
+# BACKGROUND_WAIT_GUIDANCE 9128 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2418),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9128 = 8.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -1120,159 +1178,13 @@ GREP_LOOKAROUND_GUIDANCE = _GREP_ENGINE_LIMITS + _GREP_PCRE_BASH_RECOURSE
 GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_RECOURSE
 
 
-# Census finding, task 5683 (`metadata.source: legibility_census`) -- census
-# 2026-09-20 section 1.1, codebook candidate `entry-cand-20260918-19`, whose
-# umbrella entry `entry-cand-20260722-6` records the mechanism.
-#
-# MEASURED against skim 2.3.1 on 2026-09-22, and how to re-measure: pipe a
-# PreToolUse payload for each command into the host hook below and read
-# `hookSpecificOutput.updatedInput.command` from its stdout -- no output
-# means the command passes through untouched -- then confirm the key rows
-# live through the Bash tool. The script is the same two-line `import sys` /
-# indented `print` in every row:
-#
-#     git log --oneline -1 && python3 -c "<script>"
-#         -> rewritten to `skim git log ...` with the script joined onto one
-#            line; live: `SyntaxError: invalid syntax` at line 1, or
-#            `IndentationError: unexpected indent` when the script opens
-#            with a newline
-#     echo "git status" && python3 -c "<script>"
-#         -> passed through; live: ran
-#     head -1 NO_SUCH_FILE_XYZ_5683.md && python3 -c "<script>"
-#         -> rewritten although the file does not exist; live: skim's
-#            `Error: No such file or directory (os error 2)`, and python
-#            never ran
-#     head -1 /etc/hostname && python3 -c "<script>"
-#     head -1 NO_SUCH_FILE_XYZ_5683.txt && python3 -c "<script>"
-#         -> both passed through: `cat` and `head` gate on the operand's
-#            extension, never on whether it exists
-#     git log --oneline -1 && python3 - <<'PY' <script> PY
-#         -> passed through, git output raw: the hook declines the whole
-#            command, which is why the escape works
-#
-# Also rewritten when chained to the script: `git status`, `git diff` (not
-# `git diff --stat`), `tail` of a source file, `ls -la` (not `ls -l`),
-# `grep -rn` (not `grep -n`), `rg`, `find`, `tree`, `pytest`,
-# `python3 -m pytest`, `ruff check`, `mypy`, `cargo test`, `go test` -- far
-# wider than the four commands the codebook entry names. Passed through:
-# `uv run ... pytest`, `pyright`, `make`, `jq`, a target inside `$(...)`,
-# and a target on any line but the first. A heredoc nested in `$(...)` gets
-# no immunity of its own: beside `git status` it is flattened. Because the
-# set is broad, turns on flags, and belongs to a third-party binary that can
-# change under us, the prose describes it by category and makes the rule
-# independent of it.
-#
-# An earlier revision, following the frozen plan, called the match TEXTUAL,
-# gave `git status`, `git log`, `head` and `cat` as the whole trigger set, and
-# named only the IndentationError. The measurements above refute all three;
-# see esc-5683-4.
-#
-# THE HOST LAYER, identified so nobody searches this repo for it.
-# ~/.claude/settings.json carries a PreToolUse hook with matcher `Bash`
-# running ~/.claude/hooks/skim-rewrite.sh, whose body is
-# `exec ~/.cargo/bin/skim rewrite --hook`; a dispatched agent's config dir
-# carries the same hook. When it rewrites any part of a command it
-# re-serialises the WHOLE command with every newline turned into a space.
-#
-# RETIRE THIS BLOCK when no host running the factory wires that hook, or when
-# re-running the first row above keeps the script's newlines. The rule it
-# gives is harmless under any rewriter, so outliving the hook costs only its
-# tokens on every invocation of the seven roles that carry it.
-#
-# WHAT IS AND IS NOT ADDRESSED. The cause is a third-party binary wired in by
-# host-level operator config under ~/.claude/, outside this repository and any
-# worktree's scope, so nothing here can stop the rewrite. Only the
-# told-upfront/recovery facet is in scope -- the same carve-out tasks 4273,
-# 4578, 4964 and 5331 documented for the four findings above.
-#
-# DISCRIMINATION, NOT DUPLICATION -- a FIFTH shape against three neighbours,
-# and the discriminator is WHERE the defect sits relative to the tool call.
-# TOOL_CALL_REJECTION_GUIDANCE covers a MALFORMED call, rejected before it
-# runs, with an `InputValidationError` naming it as such.
-# ERROR_REMEDY_HINT_GUIDANCE covers a well-formed call that failed on CONTENT
-# and printed a remedy naming a real PARAMETER of the erroring tool.
-# _GREP_ENGINE_LIMITS covers a well-formed call whose printed remedy is
-# UNREACHABLE through the tool that printed it. This is none of the three: the
-# call was well-formed AND accepted, and what reached the shell is not what
-# was sent. The command was SILENTLY ALTERED between the tool call and the
-# shell, no error names the alteration, and the error that does surface (a
-# `SyntaxError` or `IndentationError`) accuses the agent's own script --
-# which is exactly why the census records a session rewriting that script
-# repeatedly without ever diagnosing it. None of the four blocks may be
-# deleted as redundant with another.
-#
-# ONE VARIANT, not two, unlike GREP_LOOKAROUND_GUIDANCE directly above. There
-# the LIMITATION applied to every role and only the RECOURSE had to be varied
-# for JUDGE. Here the whole block is inapplicable to JUDGE: its grant is
-# `Bash(git:*)`, so it can run neither `python3 -c` nor the heredoc escape,
-# and a splice there would be dead weight rather than a fix. The carrier set
-# is the seven roles with a literal system_prompt and unqualified `Bash`,
-# pinned against that capability rather than against a sibling constant by
-# orchestrator/tests/test_roles_compound_command_rewrite.py::test_role_set_matches_its_bash_capability.
-#
-# HARD CONSTRAINTS: the four stated above _GREP_ENGINE_LIMITS bind this
-# constant too.
-COMPOUND_COMMAND_REWRITE_GUIDANCE = """
-## A compound Bash command can silently flatten a multi-line script
-
-THE RULE: a multi-line script — a `python3 -c` whose argument spans lines —
-goes in a `Bash` call of its own. Do not chain it to any other command: not
-with `&&`, `;` or `|`, and not on another line of the same call. That costs
-one extra tool call; the alternative costs a turn and a misdiagnosis.
-
-THE SYMPTOM, so you recognise it instead of rewriting a script that was
-already correct. The interpreter reports your whole script as ONE line —
-line 1 of `<string>` — with the statements space-joined, and raises
-"SyntaxError: invalid syntax", or "IndentationError: unexpected indent" if
-the script opened with a newline. Nothing reports that the command was
-altered, so the natural reading is that your script is malformed. It is not.
-Re-issuing the same script ALONE runs it unchanged, and that is the
-one-command diagnostic: passes by itself, fails when chained, means you are
-looking at this and not at your code. Do not start editing the script.
-
-THE TRIGGER: a host PreToolUse hook on `Bash` rewrites many common
-commands into another tool's equivalents, and when it rewrites ANY part of a
-command it re-serialises the WHOLE command onto one physical line, turning
-the newlines inside your `-c` argument into spaces. What it rewrites is
-broad — `git status` and `git log`, `cat` or `head` of a source file, search
-and listing commands, test runners and linters among them — and even turns
-on which flags you pass, so do not try to predict it. Follow the rule
-instead.
-
-Whether a file EXISTS does not protect you. A `head` of a missing `.md` file
-is rewritten exactly as a present one is; it then fails with
-"Error: No such file or directory (os error 2)" instead of `head`'s own
-message, and that non-zero exit short-circuits the `&&`, so your script never
-runs at all and you get no interpreter diagnostic.
-
-THE ESCAPE, when you genuinely need one command: pass the script on stdin via
-a heredoc redirect rather than as a `-c` argument.
-
-    python3 - <<'PY'
-    import sys
-    if sys.version_info >= (3, 12):
-        print('newlines survived')
-    PY
-
-The hook declines to process a command carrying shell syntax it cannot
-statically analyse, so this form passes through with its newlines intact even
-alongside `git log`. Measurably declined, not merely tolerated: chained to
-`-c`, the `git log` output comes back in the hook's rewritten shape; in the
-heredoc form that same `git log` comes back raw.
-
-Scope that escape narrowly. It covers a heredoc REDIRECT SUPPLYING THE SCRIPT.
-A heredoc nested inside a `$(...)` substitution to build an argument is NOT
-covered, and has been observed destroyed.
-"""
-
-
 # The harness guidance every role with a literal system_prompt and unqualified
 # `Bash` carries, spliced straight after its one-line role statement. One
 # composite, so a new block is one edit here rather than one per carrier. Each
 # block's own test module still pins its carrier set against a capability, so
 # a role for which some block stops applying builds its own chain rather than
-# dropping that block from this one -- JUDGE already does: no wait block, the
-# read-only grep variant, and no compound-command block.
+# dropping that block from this one -- JUDGE already does: no wait block and
+# the read-only grep variant.
 #
 # APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
 # own test module (each asserts it starts exactly where its predecessor ends),
@@ -1285,7 +1197,6 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + TOOL_CALL_REJECTION_GUIDANCE
     + ERROR_REMEDY_HINT_GUIDANCE
     + GREP_LOOKAROUND_GUIDANCE
-    + COMPOUND_COMMAND_REWRITE_GUIDANCE
 )
 
 
@@ -1423,9 +1334,9 @@ The server runs the same checks as a backstop, in this order:
 # shared across every project this orchestrator dispatches for, so an
 # unconditional enforcement promise would be false on a host or project that
 # runs unsandboxed (task 4370 review, suggestion 1). Composed the same way
-# BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE compose
-# BACKGROUND_WAIT_GUIDANCE above: each half is self-contained with its own
-# leading/trailing blank line, plain `+` concatenation.
+# BACKGROUND_WAIT_GUIDANCE above is composed from its members: each half is
+# self-contained with its own leading/trailing blank line, plain `+`
+# concatenation.
 #
 # SCOPE_BOUNDARY_GUIDANCE / SCOPE_BOUNDARY_GUIDANCE_SIMPLE remain the public
 # splice units, spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the

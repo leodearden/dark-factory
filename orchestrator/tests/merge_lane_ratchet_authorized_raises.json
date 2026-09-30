@@ -433,6 +433,48 @@
           "current": 31590
         }
       ]
+    },
+    {
+      "task_id": "3542",
+      "reason": "Net-additive work, not a refactor that failed to lower anything: orchestrator/tests/conftest.py gains the autouse _no_unexpected_exit_contract_violation guard, which fails any test that drives an unexpected TaskWorkflow.run() exit-contract violation. It restores the oracle SM-2's AssertionError gave every run()-driving test now that run() records verdicts instead of raising, and it is the zero-would-violate soak signal PRD task theta requires and the task-mu enforce gate depends on (esc-3542-5).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 47,
+          "current": 50
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1201,
+          "current": 1242
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 773,
+          "current": 786
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4727,
+          "current": 4730
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56236,
+          "current": 56277
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31574,
+          "current": 31587
+        }
+      ]
     }
   ]
 }

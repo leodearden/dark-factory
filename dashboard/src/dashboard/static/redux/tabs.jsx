@@ -23,12 +23,14 @@ const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
 const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
-const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
+const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
-const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS, CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
+const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // data.js's one copy of the on-demand terminal window's key.
-const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+// Windowed headers are labelled from the payload's served-window echo — window_chip.js.
+const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -42,8 +44,8 @@ const EP = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators', performance:  '/api/v2/dashboard/performance',
   memory:        '/api/v2/dashboard/memory',        memoryGraphs: '/api/v2/dashboard/memory-graphs',
   recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
-  costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
-  scheduler:     '/api/v2/dashboard/scheduler',
+  costs:         '/api/v2/dashboard/costs',         scheduler:    '/api/v2/dashboard/scheduler',
+  burndown:      '/api/v2/dashboard/burndown',
 });
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
@@ -266,7 +268,7 @@ function OrchTab({ projectFilter, search }) {
   const DEFAULT_FILTER = { in_flight: true };
   const getFilter = (pid) => {
     const f = filterMap[pid] && typeof filterMap[pid] === 'object' ? filterMap[pid] : DEFAULT_FILTER;
-    return Object.fromEntries(CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
+    return Object.fromEntries(TASK_CENSUS_VIEWS.map(v => [v.key, !!f[v.key]]));
   };
   const flipFilter = (pid, key) => {
     const cur = getFilter(pid);
@@ -277,7 +279,7 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        {CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
+        {TASK_CENSUS_TILES.map(t => <ST key={t.key} label={t.label} datum={scopeCensus} format={t.reading} history={censusHistory(DF, scope, t)} sparkColor={CP[t.tone]} />)}
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -285,7 +287,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (
@@ -299,7 +301,7 @@ function OrchTab({ projectFilter, search }) {
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            {CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
+            {TASK_CENSUS_VIEWS.map(v => <Pip key={v.key} datum={census} color={CP[v.tone]} format={v.reading} />)}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -311,7 +313,7 @@ function OrchTab({ projectFilter, search }) {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
                     <div className="seg" role="group" aria-label="Task filter">
-                      {CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
+                      {TASK_CENSUS_VIEWS.map(v => <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(o.pid, v.key)}>{v.label} · <DatumReading datum={census} format={v.count} /></button>)}
                     </div>
                   </div>
 
@@ -399,18 +401,14 @@ function OrchTab({ projectFilter, search }) {
                       {censusSegments(census).map(s => <span key={s.key} style={{ width: `${s.share}%`, background: CP[s.tone] }} />)}
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      {CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
+                      {TASK_CENSUS_VIEWS.map(v => <span key={v.key} style={{ color: CP[v.tone] }}><DatumReading datum={census} format={v.reading} /></span>)}
                     </div>
                   </div>
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
-                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
-                    {(() => {
-                      const pb = DF.BURNDOWN_BY_PROJECT[o.project];
-                      const rates = window.DF_SHELL.dailyDeltas(pb?.labels, pb?.done);
-                      return <div style={{ height: 50 }}><SP values={rates} color={CP.accent} /></div>;
-                    })()}
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
+                    <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
               </div>
@@ -1080,7 +1078,7 @@ function MergeTab({ projectFilter }) {
                 )}
 
                 <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
-                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{d.recent.length} matching</span></div>
+                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{recentMergesCaption(d.recent.length, d.recent_total, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>
                       <tbody>
@@ -1185,7 +1183,7 @@ function CostsTab({ projectFilter }) {
       </div>
 
       <div className="col-span-7 panel">
-        <div className="panel-head"><span className="title">Spend trend · 30d</span></div>
+        <div className="panel-head"><span className="title">Spend trend · {windowLabel(windowEcho(DF.__receipt, EP.costs))}</span></div>
         <div className="panel-body"><LC labels={c.trend.labels} series={[{ values: c.trend.values, color: CP.accent }]} height={200} formatY={v => `$${v.toFixed(0)}`} /></div>
       </div>
 
@@ -1291,48 +1289,24 @@ function BurnTab({ projectFilter, displayWindow }) {
     );
   };
 
+  const latest = burndownDatum(DF, b, 'latest');
+  const pendingThen = b.pending.length ? b.pending[0] : 0;
+  const pendingNow = b.pending.length ? b.pending[b.pending.length-1] : 0;
+
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      {(() => {
-        const velocity = b.velocity ?? 0;  // tasks/day — server-computed delta / distinct-day count
-        const lastPending = b.pending.length ? b.pending[b.pending.length-1] : 0;
-        const firstPending = b.pending.length ? b.pending[0] : 0;
-        const forecastDays = velocity > 0 ? Math.round(lastPending / velocity) : null;
-        return (
-          <div className="col-span-12 grid cols-4">
-            <ST label="Net velocity" datum={plainDatum(velocity, EP.burndown)} format={v => v.toFixed(1)} unit="/day"
-                hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
-                history={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
-            <ST label="Completed (window)" datum={plainDatum(b.completed, EP.burndown)}
-                history={b.done} sparkColor={CP.ok} />
-            <ST label="Backlog" datum={plainDatum(lastPending, EP.burndown)}
-                delta={`${lastPending - firstPending}`}
-                deltaDir={lastPending < firstPending ? 'down' : 'up'}
-                history={b.pending} sparkColor={CP.warn} />
-            {(() => {
-              // Server-computed forecast confidence (recent 7d vs lifetime
-              // velocity) is null when <7 days of history. Fall back to the
-              // simple point estimate above so the tile still shows a value
-              // once any history exists.
-              const lo = b.forecast_low;
-              const hi = b.forecast_high;
-              const haveRange = lo != null && hi != null;
-              const display = haveRange
-                ? (lo === hi ? `${lo}d` : `${lo}–${hi}d`)
-                : (forecastDays != null ? `${forecastDays}d` : null);
-              const hint = haveRange
-                ? `${lastPending} pending · 7d vs lifetime velocity`
-                : (forecastDays != null
-                    ? `${lastPending} / ${velocity.toFixed(1)} per day · need 7d for range`
-                    : (velocity === 0 ? 'velocity is zero' : 'no data'));
-              return (
-                <ST label="Forecast clear" datum={derivedDatum(display, EP.burndown, hint)} hint={hint}
-                    history={b.pending} sparkColor={CP.ok} />
-              );
-            })()}
-          </div>
-        );
-      })()}
+      <div className="col-span-12 grid cols-4">
+        <ST label="Net velocity" datum={latest} format={r => r.velocity.toFixed(1)} unit="/day" hint="window avg"
+            history={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
+        <ST label="Completed (window)" datum={latest} format={r => fmtCount(r.completed)}
+            history={b.done} sparkColor={CP.ok} />
+        <ST label="Pending" datum={latest} format={r => fmtCount(r.counts.pending)}
+            delta={`${pendingNow - pendingThen}`}
+            deltaDir={pendingNow < pendingThen ? 'down' : 'up'}
+            history={b.pending} sparkColor={CP.warn} />
+        <ST label="Forecast clear" datum={burndownDatum(DF, b, 'forecast')} format={forecastText}
+            hint="7d vs lifetime velocity" history={b.pending} sparkColor={CP.ok} />
+      </div>
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Segmented options={[{ value: 'aggregate', label: 'Aggregate' }, { value: 'per-project', label: 'Per project' }]} value={view} onChange={setView} />
@@ -1346,7 +1320,7 @@ function BurnTab({ projectFilter, displayWindow }) {
       {view === 'aggregate' && (
         <div className="col-span-12 panel">
           <div className="panel-head">
-            <span className="title">Status mix · 30d</span>
+            <span className="title">Status mix · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</span>
             <span className="meta">aggregate · all projects</span>
           </div>
           <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -1356,11 +1330,6 @@ function BurnTab({ projectFilter, displayWindow }) {
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
-            {/* in_progress is banded as live + stranded, never alongside them:
-                stacking the whole beside its parts would draw a total no
-                census ever produced. The server guarantees they sum. The rule
-                is enforced (and tested) in burndown_bands.js — burndownStacks
-                below never emits an undivided in_progress band. */}
             <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
@@ -1371,22 +1340,19 @@ function BurnTab({ projectFilter, displayWindow }) {
           <div className="panel-head"><span className="title">Per project · summary</span></div>
           <div className="panel-body flush">
             <table className="tbl">
-              <thead><tr><th>Project</th><th className="num">Completed</th><th className="num">Active</th><th className="num">Blocked</th><th className="num">Pending</th><th>Trend</th></tr></thead>
+              <thead><tr><th>Project</th><th className="num">Completed</th><th className="num">Running</th><th className="num">Blocked</th><th className="num">Pending</th><th>Trend</th></tr></thead>
               <tbody>
                 {projects.map(p => {
                   const pb = DF.BURNDOWN_BY_PROJECT[p.id];
                   if (!pb) return null;
-                  const completed = pb.completed ?? 0;
-                  const active = pb.in_progress[pb.in_progress.length-1];
-                  const blocked = pb.blocked[pb.blocked.length-1];
-                  const pending = pb.pending[pb.pending.length-1];
+                  const pbLatest = burndownDatum(DF, pb, 'latest');
                   return (
                     <tr key={p.id}>
                       <td className="mono">{p.id}</td>
-                      <td className="num" style={{ color: CP.ok }}>{completed}</td>
-                      <td className="num" style={{ color: CP.accent }}>{active}</td>
-                      <td className="num" style={{ color: CP.bad }}>{blocked}</td>
-                      <td className="num" style={{ color: CP.warn }}>{pending}</td>
+                      <td className="num" style={{ color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.completed} /></td>
+                      <td className="num" style={{ color: CP.accent }}><DatumReading datum={pbLatest} format={r => r.counts.in_progress} /></td>
+                      <td className="num" style={{ color: CP.bad }}><DatumReading datum={pbLatest} format={r => r.counts.blocked} /></td>
+                      <td className="num" style={{ color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></td>
                       <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.accent} /></div></td>
                     </tr>
                   );
@@ -1400,15 +1366,15 @@ function BurnTab({ projectFilter, displayWindow }) {
       {view === 'per-project' && projects.map(p => {
         const pb = DF.BURNDOWN_BY_PROJECT[p.id];
         if (!pb) return null;
-        const pbVelocity = pb.velocity ?? 0;
+        const pbLatest = burndownDatum(DF, pb, 'latest');
         const last = i => pb[i][pb[i].length-1];
         const summary = (
           <>
-            <Pip datum={plainDatum(pb.completed, EP.burndown)} color={CP.ok} label="done" />
-            <Pip datum={plainDatum(last('in_progress'), EP.burndown)} color={CP.accent} label="active" />
-            {last('blocked') > 0 && <Pip datum={plainDatum(last('blocked'), EP.burndown)} color={CP.bad} label="blocked" />}
-            <Pip datum={plainDatum(last('pending'), EP.burndown)} color={CP.warn} label="pending" />
-            <span style={{ color: 'var(--fg-3)' }}>· {pbVelocity.toFixed(1)}/day</span>
+            <Pip datum={pbLatest} format={r => r.completed} color={CP.ok} label="done" />
+            <Pip datum={pbLatest} format={r => r.counts.in_progress} color={CP.accent} label="running" />
+            {last('blocked') > 0 && <Pip datum={pbLatest} format={r => r.counts.blocked} color={CP.bad} label="blocked" />}
+            <Pip datum={pbLatest} format={r => r.counts.pending} color={CP.warn} label="pending" />
+            <span style={{ color: 'var(--fg-3)' }}>· <DatumReading datum={pbLatest} format={r => `${r.velocity.toFixed(1)}/day`} /></span>
           </>
         );
         return (
@@ -1417,7 +1383,7 @@ function BurnTab({ projectFilter, displayWindow }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-8 panel">
                   <div className="panel-head">
-                    <span className="title">Status mix · 30d</span>
+                    <span className="title">Status mix · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</span>
                   </div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {parityBanner(pb, null)}
@@ -1437,8 +1403,8 @@ function BurnTab({ projectFilter, displayWindow }) {
                   <div className="panel-head"><span className="title">Velocity</span></div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}>{pbVelocity.toFixed(1)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}>{last('pending')}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>backlog now</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>pending now</div></div>
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Completion trend</div>

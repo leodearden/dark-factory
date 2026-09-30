@@ -3,8 +3,8 @@
 const { ProjectGroup: PG_T, Segmented: SEG_T, Pip, DatumReading } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
-// One namespace alias, never destructured: data.js's top-level consts share this
-// file's global scope (see test_tab_tasks_prose.py's load-safety pin).
+// One namespace alias, so no data.js const is rebound under its own name —
+// see the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;

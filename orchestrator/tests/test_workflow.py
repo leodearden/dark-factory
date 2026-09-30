@@ -2006,7 +2006,7 @@ class TestHandleSoftCancelOutcome:
 
         Case 1 reports the OBSERVED terminal rather than collapsing both
         terminal statuses onto DONE: _OUTCOME_ALLOWED['done'] == {DONE}, so a
-        DONE exit here fails run()'s SM-2 assertion, and the completed tally
+        DONE exit here is an SM-2 exit violation, and the completed tally
         (outcome == DONE) counted a cancellation as a completion.
         """
         wf = self._make_wf(tmp_path, status='cancelled')

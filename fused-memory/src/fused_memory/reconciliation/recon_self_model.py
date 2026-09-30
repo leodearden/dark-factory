@@ -189,11 +189,18 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # since these markers carry no source metadata field.
         #
         # That collector is NO LONGER age-based (task 4375). Retirement is now
-        # COMPOSITE: a marker is deleted only when it is past the 14-day age
-        # cutoff AND is not a protected cycle_summary mirror AND its kind is
-        # not in mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is
-        # confirmed terminal. The age-only rule destroyed 40 kind='cadence_check'
-        # audit records in autopilot_video, all citing a merely-'deferred' task.
+        # COMPOSITE: a marker is deleted only when it is past the
+        # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
+        # cycle_summary mirror AND its kind is not in
+        # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
+        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
+        # records in autopilot_video, all citing a merely-'deferred' task.
+        #
+        # Second firing site (task 4376), a latency layer applying the same
+        # rule to the one task that just closed:
+        # stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task,
+        # called from reconciliation/targeted.py::TargetedReconciler._on_task_done.
+        # The per-cycle sweep in TaskKnowledgeSync.run() stays primary.
         #
         # The terminal-closure arm NARROWS the declared-vs-actual gap this
         # comment documents, without closing it: the Mem0 side now applies the
@@ -381,7 +388,10 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     'get_cycle_summary_presence': (
         'get_cycle_summary_presence(project_id, run_id, stage) -> '
         "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
-        "'run_id': ..., 'stage': ...}"
+        "'run_id': ..., 'stage': ..., 'remediation': bool|None, "
+        "'reason': 'present'|'missing'|'stage_not_run'|'expired'|"
+        "'run_unknown'|'ledger_unavailable', 'expected': bool|None, "
+        "'run_lookup_available': bool, 'run_status': str|None}"
     ),
 }
 

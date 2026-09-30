@@ -456,7 +456,7 @@ def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: fl
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def _read_direct_children(pid: int) -> set[int] | None:
+def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[int] | None:
     """Cheap probe: the DIRECT children of *pid*, from ``/proc/<pid>/task/*/children``.
 
     A ~2700x cheaper stand-in for a full ``read_ppid_map()`` rescan, used ONLY
@@ -480,41 +480,49 @@ def _read_direct_children(pid: int) -> set[int] | None:
       NEGATIVE: the caller can skip the expensive walk this tick.
     * ``{pid, ...}`` -- direct children exist; worth confirming with the
       production walker.
-    * ``None``   -- CANNOT probe.  Either the ``children`` files are absent
-      (a kernel built without ``CONFIG_PROC_CHILDREN``) or ``/proc/<pid>``
-      itself is gone (the leader exited mid-poll).  The caller must fall back
-      to the full walk for that tick; conflating this with the cheap negative
-      would make the poll spin to its timeout on such a kernel, and letting
-      the OSError escape would turn a leader exiting mid-poll into an
-      unhandled error inside the timeout diagnostic.
+    * ``None``   -- CANNOT probe: ``/proc/<pid>`` is gone (the leader has
+      exited), a LIVE thread's ``children`` file cannot be read (a kernel
+      built without ``CONFIG_PROC_CHILDREN``, or fd exhaustion), or no thread
+      was read at all (the leader exited before its first thread was read).
+      The caller must fall back to the full walk for that tick; conflating
+      this with the cheap negative would make the poll spin to its timeout,
+      and letting the OSError escape would turn a leader exiting mid-poll
+      into an unhandled error inside the timeout diagnostic.
 
-    Any OSError anywhere in the read collapses to ``None``.  Distinguishing
-    "no CONFIG_PROC_CHILDREN" from "this thread just exited" would buy
-    nothing: both answers are "don't trust the probe on this tick", and the
-    fallback they select is precisely this helper's pre-4014 behaviour.
+    A failed ``children`` read is judged PER THREAD, because threads exit
+    routinely in the probed processes -- pytest's own per-test faulthandler /
+    pytest-timeout watchdog threads included (task 5945).  If the tid
+    directory is gone, the thread exited after the listing and is skipped; if
+    it still exists, the probe cannot be trusted and answers ``None``.  So one
+    tick can under-report: a child the kernel re-parents from a skipped thread
+    onto a sibling already read is missed, and a leader that exits after some
+    of its threads were read answers the partial set those threads gave
+    (possibly ``set()``), not ``None``.  Either only defers the caller's walk
+    by one poll interval -- the next tick sees the re-parented child, or finds
+    ``/proc/<pid>`` gone and answers ``None`` -- and the kernel documents
+    ``children`` as best-effort anyway.
 
-    The empty-``task``-listing branch below is DEFENSIVE-ONLY, and therefore
-    deliberately uncovered: a live ``/proc/<pid>/task`` always holds at least
-    one tid, and a dead one makes ``iterdir()`` itself raise OSError, which
-    the handler already maps to ``None``.  It is retained rather than deleted
-    because falling THROUGH it would return the cheap negative ``set()`` --
-    "leader is live and has forked nothing" -- for a listing that in fact told
-    us nothing, and that is the single answer which makes the caller skip its
-    walk every tick and spin to the timeout.
+    *_proc_root* is a private injectable seam (defaulting to the real
+    ``/proc``) so the tri-state can be covered against a fake task listing in
+    ``tmp_path``, for the branches (no ``CONFIG_PROC_CHILDREN``, every thread
+    vanished) that this kernel cannot produce on demand.
     """
-    children: set[int] = set()
     try:
-        tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
-        if not tid_dirs:
-            # Defensive only (see docstring): not reachable on a live or a dead
-            # /proc entry, so never trust an empty listing as a cheap negative.
-            return None
-        for tid_dir in tid_dirs:
-            raw = (tid_dir / 'children').read_text()
-            children.update(int(token) for token in raw.split())
+        tid_dirs = list((_proc_root / str(pid) / 'task').iterdir())
     except OSError:
         return None
-    return children
+    children: set[int] = set()
+    any_thread_read = False
+    for tid_dir in tid_dirs:
+        try:
+            raw = (tid_dir / 'children').read_text()
+        except OSError:
+            if tid_dir.exists():
+                return None
+            continue
+        any_thread_read = True
+        children.update(int(token) for token in raw.split())
+    return children if any_thread_read else None
 
 
 def wait_subtree_live(
@@ -2248,6 +2256,8 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 #
 # Deliberate, narrow exceptions to "zero real subprocess" (task 4312,
 # joining test_read_direct_children_sees_a_real_fork_including_off_main_thread
+# and task 5945's
+# test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe
 # below): the two timeout-diagnostic tests spawn a real `proc` because the
 # diagnostic message's CONTENT -- the leader's actual returncode and, where
 # applicable, its stderr tail -- is exactly what is under test.  The poll
@@ -2601,6 +2611,149 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
         if off_main is not None:
             off_main.kill()
             off_main.wait()
+
+
+def test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe():
+    """A sibling thread exiting mid-probe must not make a LIVE process read as "cannot probe".
+
+    The probe lists ``/proc/<pid>/task`` and then reads each tid's
+    ``children``; a thread that exits in between has no ``children`` left to
+    read.  That is routine in any threaded process -- pytest itself brackets
+    every test with faulthandler / pytest-timeout watchdog threads -- and it
+    says nothing about the threads still alive.  Task 5945: the recorded
+    flake of the test above was exactly ``assert None is not None`` on a live
+    xdist worker.
+
+    Two churner threads keep starting and joining no-op threads while this
+    thread probes.  The probe loop is bounded by a CONDITION -- at least
+    ``required_exits`` sibling-thread exits observed while probing -- not by
+    a probe count or a clock, so its power does not depend on scheduler
+    speed.  The ``Event`` waits are handoff barriers, not timing assertions.
+
+    No single exit is guaranteed to land between the listing and a
+    ``children`` read, so this catches the pre-fix collapse only
+    probabilistically; the deterministic regression guard is
+    :func:`test_read_direct_children_tri_state_over_a_fake_task_listing`.  This
+    test confirms, on the real kernel, the behaviour that fake listing models:
+    an exited thread's tid directory is gone, so its failed read is skipped.
+    """
+    required_exits = 200
+    stop = threading.Event()
+    exit_counts = [0, 0]
+    ready = [threading.Event() for _ in exit_counts]
+
+    def churn(slot: int) -> None:
+        while not stop.is_set():
+            sibling = threading.Thread(target=lambda: None)
+            try:
+                sibling.start()
+            except RuntimeError:
+                return  # "can't start new thread" -- fails the exit-count assert
+            sibling.join()
+            exit_counts[slot] += 1
+            ready[slot].set()
+
+    churners = [threading.Thread(target=churn, args=(slot,)) for slot in range(len(exit_counts))]
+    child = subprocess.Popen(_DURABLE_CHILD_ARGV)
+    probes = none_count = missing_count = 0
+    try:
+        for churner in churners:
+            churner.start()
+        for event in ready:
+            assert event.wait(timeout=30.0), 'churner never completed a thread lifecycle'
+        exits_before = sum(exit_counts)
+        while sum(exit_counts) - exits_before < required_exits and any(
+            churner.is_alive() for churner in churners
+        ):
+            probed = _read_direct_children(os.getpid())
+            probes += 1
+            if probed is None:
+                none_count += 1
+            elif child.pid not in probed:
+                missing_count += 1
+        exits_during = sum(exit_counts) - exits_before
+    finally:
+        stop.set()
+        for churner in churners:
+            churner.join(timeout=30.0)
+        child.kill()
+        child.wait()
+
+    assert exits_during >= required_exits, (
+        f'only {exits_during} sibling-thread exits (needed {required_exits}) '
+        f'overlapped {probes} probes -- the churners stopped early, so the churn '
+        f'never overlapped the probes and this test proved nothing'
+    )
+    assert none_count == 0, (
+        f'{none_count} of {probes} probes of this LIVE process reported "cannot '
+        f'probe" across {exits_during} sibling-thread exits -- a thread that exits '
+        f'between the task/ listing and its children read must be skipped, not '
+        f'collapse the whole probe to None'
+    )
+    assert missing_count == 0, (
+        f'{missing_count} of {probes} answered probes missed direct child '
+        f'{child.pid}, forked from this thread -- it must appear in every one'
+    )
+
+
+def _build_fake_task_listing(
+    proc_root: Path,
+    pid: int,
+    *,
+    live: dict[int, list[int]],
+    without_children_file: tuple[int, ...] = (),
+    exited: tuple[int, ...] = (),
+) -> None:
+    task_dir = proc_root / str(pid) / 'task'
+    task_dir.mkdir(parents=True)
+    for tid, kids in live.items():
+        (task_dir / str(tid)).mkdir()
+        (task_dir / str(tid) / 'children').write_text(''.join(f'{kid} ' for kid in kids))
+    for tid in without_children_file:
+        (task_dir / str(tid)).mkdir()
+    for tid in exited:
+        # Listed, yet `children` raises FileNotFoundError and exists() is False: a thread released after the listing.
+        (task_dir / str(tid)).symlink_to(proc_root / 'gone' / str(tid))
+
+
+@pytest.mark.parametrize(
+    ('live', 'without_children_file', 'exited', 'expected', 'consequence'),
+    [
+        pytest.param(
+            {1234: [5678, 9012], 1240: []}, (), (1241,), {5678, 9012},
+            'None would drop wait_subtree_live to the full read_ppid_map walk on '
+            'every tick a sibling thread exits -- the cost task 4014 removed',
+            id='exited-thread-beside-a-live-one-is-skipped',
+        ),
+        pytest.param(
+            {1234: [5678]}, (1238,), (), None,
+            'a live thread whose children cannot be read hides its children, so '
+            'any answer here can be a false cheap negative that makes '
+            'wait_subtree_live skip its walk every tick and spin to its timeout '
+            'on a kernel without CONFIG_PROC_CHILDREN',
+            id='live-thread-without-children-file-cannot-probe',
+        ),
+        pytest.param(
+            {}, (), (1234,), None,
+            'set() here is a false cheap negative for a process that exited '
+            'mid-probe, which makes wait_subtree_live skip its walk instead of '
+            'falling back to it',
+            id='every-listed-thread-exited-cannot-probe',
+        ),
+    ],
+)
+def test_read_direct_children_tri_state_over_a_fake_task_listing(
+    tmp_path, live, without_children_file, exited, expected, consequence,
+):
+    """The probe's tri-state on the branches this kernel cannot produce on demand."""
+    pid = 4321
+    _build_fake_task_listing(
+        tmp_path, pid, live=live, without_children_file=without_children_file, exited=exited,
+    )
+
+    result = _read_direct_children(pid, _proc_root=tmp_path)
+
+    assert result == expected, f'expected {expected!r}, got {result!r} -- {consequence}'
 
 
 def test_read_proc_state_reports_an_unreaped_zombie_as_exited():

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import subprocess
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2696,6 +2697,467 @@ tasks:
     # The flip PROCEEDED despite the malformed sidecar.
     assert gamma_task['status'] == 'pending'
     assert 'delivered_checks' not in gamma_task['metadata']
+
+
+# ---------------------------------------------------------------------------
+# commit_planning delivered_check POLARITY gate (task 3500, step-11 RED /
+# step-12 GREEN)
+#
+# The invariant: a sound delivered_check FAILS at the authoring tree and
+# PASSES once its producer lands. `commit_planning` runs BEFORE the task is
+# implemented, so HEAD *is* the pre-task tree — a check that is already green
+# here can never signal anything, and one that can never go green wedges its
+# dependent forever (the measured 5799 -> 5919 wedge).
+#
+# Modelled on the lock-charter commit_planning exemplar above: same
+# `mcp_server_with_tasks`/`task_interceptor` fixtures, same `get_task`
+# side_effect shape, same `_tool_manager.call_tool` invocation, and the same
+# all-or-nothing `set_task_status.assert_not_called()` assertion. The one
+# addition is a REAL git repo — the gate greps a tree, so a synthetic
+# `/project` root cannot exercise a verdict (it exercises the fail-open-on-
+# infra path instead, which is step-13's business).
+# ---------------------------------------------------------------------------
+
+#: Token COMMITTED into the polarity fixture repo. An `expect='present'`
+#: grep for it already matches at the authoring tree -> vacuous_present.
+_POLARITY_COMMITTED_TOKEN = 'AlreadyLandedSymbol'
+#: Token absent from the fixture repo. An `expect='present'` grep for it is
+#: the healthy forward-looking majority case; an `expect='absent'` grep for
+#: it is already satisfied -> vacuous_absent.
+_POLARITY_FUTURE_TOKEN = 'NotYetWrittenSymbol'
+#: Token committed into BOTH fixture files. An `expect='absent'` grep for it
+#: is healthy under the 2x2 (it still matches, so it can go green) but is
+#: over-broad relative to a task declaring only the seed file -> warn.
+_POLARITY_WIDE_TOKEN = 'WidelyUsedSymbol'
+_POLARITY_SEED_REL = 'src/seeded.py'
+_POLARITY_OTHER_REL = 'src/other.py'
+
+
+def _run_polarity_git(root, *args):
+    subprocess.run(
+        ['git', '-C', str(root), *args], check=True, capture_output=True, text=True,
+    )
+
+
+@pytest.fixture
+def polarity_repo(tmp_path):
+    """A real one-commit git repo whose tree contains _POLARITY_COMMITTED_TOKEN.
+
+    Returns the repo root as a str, ready to pass as ``project_root`` — the
+    autouse ``passthrough_main_checkout`` fixture makes ``resolve_main_checkout``
+    the identity, so the path arrives at the gate unchanged.
+    """
+    root = tmp_path / 'polarity_repo'
+    root.mkdir()
+    subprocess.run(
+        ['git', 'init', '-b', 'main', str(root)],
+        check=True, capture_output=True, text=True,
+    )
+    _run_polarity_git(root, 'config', 'user.email', 'polarity-test@example.com')
+    _run_polarity_git(root, 'config', 'user.name', 'Polarity Test')
+    seed = root / _POLARITY_SEED_REL
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text(
+        f'class {_POLARITY_COMMITTED_TOKEN}:\n'
+        f'    pass\n'
+        f'\n'
+        f'{_POLARITY_WIDE_TOKEN} = 1\n',
+        encoding='utf-8',
+    )
+    other = root / _POLARITY_OTHER_REL
+    other.write_text(f'use({_POLARITY_WIDE_TOKEN})\n', encoding='utf-8')
+    _run_polarity_git(root, 'add', _POLARITY_SEED_REL, _POLARITY_OTHER_REL)
+    _run_polarity_git(root, 'commit', '-m', 'seed the authoring tree')
+    return str(root)
+
+
+def _grep_check(name, pattern, expect, paths=None):
+    """A minimal metadata.delivered_checks entry."""
+    return {
+        'name': name,
+        'kind': 'grep',
+        'pattern': pattern,
+        'expect': expect,
+        'paths': list(paths or []),
+    }
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_vacuous_present_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """A check already green at the authoring tree rejects the WHOLE batch.
+
+    The 5799 shape: the producer asserted ``expect=present`` for a pattern its
+    own diff was scoped to REMOVE, so the pattern was necessarily present when
+    the check was written — the check passed on day one, gated nothing, and its
+    dependent dispatched as if unguarded.
+    """
+    async def _get_task(tid, *args, **kwargs):
+        if tid == '43':
+            return {
+                'id': '43',
+                'metadata': {
+                    'files': [_POLARITY_SEED_REL],
+                    'delivered_checks': [
+                        _grep_check(
+                            'seeded-symbol-present',
+                            _POLARITY_COMMITTED_TOKEN,
+                            'present',
+                            [_POLARITY_SEED_REL],
+                        ),
+                    ],
+                },
+            }
+        return {'id': tid, 'metadata': {'files': ['a/b.py']}}
+
+    task_interceptor.get_task = AsyncMock(side_effect=_get_task)
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '42,43'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    # The offending task id and check name must both be in the error message.
+    assert '43' in result.get('error', '')
+    assert 'seeded-symbol-present' in result.get('error', '')
+    codes = [c['code'] for c in result.get('checks', [])]
+    assert codes == ['vacuous_present'], f'got {result.get("checks")!r}'
+    # All-or-nothing: the gate runs BEFORE the flip, exactly like lock-charter.
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_vacuous_absent_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """The symmetric cell: expect='absent' for a pattern already absent."""
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '44',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'future-symbol-gone', _POLARITY_FUTURE_TOKEN, 'absent',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '44'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    assert '44' in result.get('error', '')
+    codes = [c['code'] for c in result.get('checks', [])]
+    assert codes == ['vacuous_absent'], f'got {result.get("checks")!r}'
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_a_check_naming_a_declared_file(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """MODE 3 as task 3536 measured it: the pattern is the name of a file the
+    task declares but has not created, so only metadata.files reveals it."""
+    declared = 'tests/test_zeta_strand.py'
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '46',
+            'metadata': {
+                'files': [declared],
+                'delivered_checks': [
+                    _grep_check('strand-suite-exists', 'test_zeta_strand', 'present', ['tests/']),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '46'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    assert [c['code'] for c in result.get('checks', [])] == ['filename_shaped']
+    assert declared in result['checks'][0]['message']
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_accepts_forward_looking_present_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """The healthy MAJORITY case commits normally and reports no polarity error.
+
+    An ``expect='present'`` grep for a symbol the producer has not written yet
+    fails at the authoring tree and passes once it lands — a 0->N transition,
+    which is exactly what a dep-gate is for. The gate must be invisible here.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '45',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'new-symbol-present', _POLARITY_FUTURE_TOKEN, 'present',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '45'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    assert result == {'success': True}
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_lock_charter_still_wins_over_polarity(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """When one task violates BOTH gates, lock-charter is the reported one.
+
+    Ordering assertion: the polarity lint is layered AFTER the existing
+    directory-lock scan inside the same loop, so the new gate can never mask
+    the one already in place.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '46',
+            'metadata': {
+                'files': ['orchestrator/'],
+                'delivered_checks': [
+                    _grep_check(
+                        'seeded-symbol-present',
+                        _POLARITY_COMMITTED_TOKEN,
+                        'present',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '46'},
+    )
+
+    assert result.get('error_type') == 'LockCharterViolation'
+    assert 'orchestrator/' in result.get('directory_paths', [])
+    task_interceptor.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# commit_planning polarity gate — SCOPING, fail-open-on-infra, and
+# response-shape stability (task 3500, step-13 RED / step-14 GREEN)
+#
+# These are the properties that keep the rest of this file green. The gate is
+# fail-closed on a VERDICT and fail-open on INFRASTRUCTURE: an unevaluable
+# check must degrade toward the pre-gate status quo (task commits, dependent
+# dispatches ungated) and be LOUDLY reported, never toward the wedge the gate
+# exists to prevent, and never toward a silent pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_polarity_fails_open_on_non_git_root(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A non-git project_root reports 'errored', it does not reject.
+
+    `/project` (and `real_task_stack`'s bare tmp_path) are not git trees, so
+    the lint cannot reach a verdict there. Blocking would redden this whole
+    file and would halt planning on any non-git root; silently passing would
+    make an availability failure read as a clean bill of health. The third
+    option — report it and commit — is the only one that is both.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'metadata': {
+                'files': ['src/seeded.py'],
+                'delivered_checks': [
+                    _grep_check('unevaluable-check', 'AnySymbol', 'present'),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '50'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+    warnings = result.get('delivered_check_warnings')
+    assert warnings, f'an unevaluable check must be REPORTED, got {result!r}'
+    assert [w['severity'] for w in warnings] == ['errored']
+    assert warnings[0]['name'] == 'unevaluable-check'
+    assert warnings[0]['task_id'] == '50'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target_status', ['cancelled', 'deferred'])
+async def test_commit_planning_polarity_gate_is_pending_scoped(
+    mcp_server_with_tasks, task_interceptor, polarity_repo, target_status,
+):
+    """A reject-tier batch still commits at a non-'pending' target status.
+
+    `pending` is the only status that releases a task for scheduling, and so
+    the only one at which its delivered_checks begin gating dependents.
+    Gating a `cancelled`/`deferred` commit would block cleanup of exactly the
+    mis-authored batch the author is trying to discard.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '51',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'seeded-symbol-present',
+                        _POLARITY_COMMITTED_TOKEN,
+                        'present',
+                        [_POLARITY_SEED_REL],
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {
+            'project_root': polarity_repo,
+            'task_ids': '51',
+            'target_status': target_status,
+        },
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_reports_absent_overbroad_as_warning(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """An over-broad expect='absent' check commits AND is reported.
+
+    MODE 2 is genuinely undecidable at authoring time — task 3534's pattern
+    legitimately matched inside the very file it owned — so on a hard gate a
+    false reject costs more than a missed catch. It lands as a warn.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '52',
+            'metadata': {
+                # Declares ONLY the seed file, but the pattern also matches
+                # src/other.py, which this task does not own.
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check('wide-symbol-gone', _POLARITY_WIDE_TOKEN, 'absent'),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '52'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+    warnings = result.get('delivered_check_warnings')
+    assert warnings, f'an over-broad absent check must be reported, got {result!r}'
+    assert [(w['name'], w['code'], w['severity']) for w in warnings] == [
+        ('wide-symbol-gone', 'absent_overbroad', 'warn'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_clean_batch_response_is_byte_identical(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """A clean batch's response gains NO new key.
+
+    `delivered_check_warnings` is attached only when non-empty, following the
+    precedent `manifest_stamping` already sets — the exact
+    `result == {'success': True}` assertions elsewhere in this file depend on
+    it.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '53',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'new-symbol-present',
+                        _POLARITY_FUTURE_TOKEN,
+                        'present',
+                        [_POLARITY_SEED_REL],
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '53'},
+    )
+
+    assert result == {'success': True}
+    assert 'delivered_check_warnings' not in result
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_polarity_gate_tolerates_malformed_metadata(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """An unparseable metadata JSON string commits normally and never crashes.
+
+    Benign-absent: an unreadable blob means "no checks to lint" here. A gate
+    that raised on a metadata shape it was not built to catch would take down
+    planning for a defect it does not even diagnose.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': '54', 'metadata': '{not valid json'},
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '54'},
+    )
+
+    assert result == {'success': True}
+    assert 'delivered_check_warnings' not in result
+    task_interceptor.set_task_status.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -193,6 +193,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 from fused_memory.reconciliation.task_filter import (
     # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
     # `src/` and `scripts/` (tests/test_task_filter.py
@@ -2940,6 +2942,15 @@ def _apply_refusal_reason(
     return None
 
 
+EXIT_RUN_FAILED = 1
+"""The run did not finish: the store could not be opened, the metrics artifact
+could not be written, ``--apply`` was refused or had nothing to apply, a
+deletion failed, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+
 async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
@@ -3013,8 +3024,15 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize()
     try:
+        try:
+            await memory.initialize()
+        except OSError as exc:
+            logger.error(
+                'ABORT: the memory store could not be opened (%s): %s',
+                type(exc).__name__, exc,
+            )
+            return EXIT_RUN_FAILED
         # The ANN cutoff is READ from the calibration (or an explicit
         # override), PER CATEGORY. An empty mapping means no category is
         # calibrated: the ANN path is disabled and counted, never run against
@@ -3076,7 +3094,9 @@ async def _run(args: argparse.Namespace) -> int:
             ),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
+        # A failed stdout stops the run before any side effect.
         print(json.dumps(plan, indent=2, default=str))
+        sys.stdout.flush()
 
         # build_sweep_plan owns the remap-stage losses (a cross-category or
         # unswept-category ANN pair), so the plan's echoed copy — not the dict
@@ -3122,9 +3142,16 @@ async def _run(args: argparse.Namespace) -> int:
                 corpus_counts={c: len(v) for c, v in records_by_category.items()},
                 eval_id=args.eval_id, run_stamp=stamp,
             )
-            metrics_path, _report, _details = emit_metrics_artifact(
-                series, details, args.metrics_root, stamp,
-            )
+            try:
+                metrics_path, _report, _details = emit_metrics_artifact(
+                    series, details, args.metrics_root, stamp,
+                )
+            except OSError as exc:
+                logger.error(
+                    'ABORT: cannot write the metrics artifact under %s: %s',
+                    args.metrics_root, exc,
+                )
+                return EXIT_RUN_FAILED
             logger.info('Wrote metrics artifact %s', metrics_path)
 
         if not args.apply:
@@ -3134,7 +3161,7 @@ async def _run(args: argparse.Namespace) -> int:
         refusal = _apply_refusal_reason(records, scan_stats, args.scan_limit)
         if refusal:
             logger.error('ABORT: %s.', refusal)
-            return 1
+            return EXIT_RUN_FAILED
 
         # The apply gate: clusters whose only evidence is an ANN CHAIN stay in
         # the report but never reach an irreversible delete.
@@ -3154,7 +3181,7 @@ async def _run(args: argparse.Namespace) -> int:
                 'cluster(s) withheld by the apply gate) — nothing to apply.',
                 len(plan['delete_candidates']), len(withheld),
             )
-            return 1
+            return EXIT_RUN_FAILED
 
         result = await apply_deletions(
             memory, args.project_id, plan, dry_run=False,
@@ -3164,7 +3191,7 @@ async def _run(args: argparse.Namespace) -> int:
             'Applied: deleted %d/%d memory/memories; %d error(s)',
             result['deleted'], len(apply_candidates), result['delete_errors'],
         )
-        return 1 if result['delete_errors'] > 0 else 0
+        return EXIT_RUN_FAILED if result['delete_errors'] > 0 else 0
     finally:
         await memory.close()
 
@@ -3187,14 +3214,14 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
     3136 schedules — must keep parsing byte-for-byte, so all of this task's
     flags carry defaults.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', required=True,
         help='Project id to scan for near-duplicate memories',
@@ -3255,4 +3282,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

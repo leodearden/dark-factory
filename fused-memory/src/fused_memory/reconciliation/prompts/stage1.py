@@ -15,12 +15,14 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
     render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
+    MEM0_TOMBSTONE_DELETERS,
     render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
@@ -48,6 +50,13 @@ future change to it cannot leave stale prompt text behind.  Pinned by
 #: byte-identical body turns them red for no behavioural reason.
 EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
 EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+
+#: The live-state freshness section's heading (task 5271), exported for the
+#: same reason, for ``tests/reconciliation/test_stage1.py``.
+LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
+LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
+
+_DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -88,8 +97,17 @@ against the ReconLedgerStore `cycle_summary` row (the source of truth written by
 `write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
 `count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
 `{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
-'stage': ...}}`. `ledger_available: false` means the ledger is not wired — treat that \
-as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY cycle-summary \
+'stage': ..., 'remediation': bool|null, 'reason': str, 'expected': bool|null, \
+'run_lookup_available': bool, 'run_status': str|null}}`. \
+`present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+`expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+`expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+retention window, so the row would have been reaped whether or not it was ever written. \
+`run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+decide whether to flag. Use this as the PRIMARY cycle-summary \
 presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
@@ -342,6 +360,8 @@ genuinely older than the {_STAGE1_GATE_STALL_THRESHOLD_HOURS}h stall threshold \
 (`stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`). A gate stamped \
 more recently than that is NOT stalled and must not be reported as such. This check \
 needs no escalation read at all: the stamp lives on the task record, which you do hold.
+
+{REFERENT_DECLARATION_GUIDANCE}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
@@ -669,10 +689,18 @@ finding): \
 stage='task_knowledge_sync')`
 - `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
 emit the missing-summary finding.
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Emit the missing-summary finding for this run.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
+2 and is within the ledger's retention window, so the row is genuinely lost. Emit the \
+missing-summary finding for this run.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run never \
+reached Stage 2, so no summary was ever owed. Do NOT emit the finding and do NOT frame \
+it as a defect — this is ordinary, and it is what MOST absences turn out to be.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='task_knowledge_sync'`.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 **B. Stage 1's own prior-run summary** (presence audit only — the Stage 1 summary is \
 written deterministically by Python (`write_stage1_cycle_summary`) and is never \
@@ -682,11 +710,14 @@ informs your cycle report): \
 stage='memory_consolidator')`
 - `ledger_available: true` and `present: true` → your own prior-run summary is present. \
 No action needed.
-- `ledger_available: true` and `present: false` → your own prior-run summary is \
-genuinely absent. Note this in your cycle report — do NOT attempt to reconstruct it \
-yourself and do NOT emit a missing-summary finding for it; only the Stage-2 case (A) \
-above is actionable.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → your own prior-run \
+summary is genuinely absent. Note this in your cycle report — do NOT attempt to \
+reconstruct it yourself and do NOT emit a missing-summary finding for it; only the \
+Stage-2 case (A) above is actionable.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
+reached Stage 1, so no summary was owed. Nothing to note.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='memory_consolidator'`.
 
 ### FALLBACK (used ONLY when the corresponding ledger check above is inconclusive)
@@ -1006,4 +1037,28 @@ live validation specimen for gate task 3546, and this re-flag twice became an op
 gate task asking for it to be reset — tasks 5080 and 5104, the second born-at-L2 critical. \
 Both were declined by hand. The same false positive has already appeared under three \
 different `flag_type` namings, so renaming it does not make it a new finding.
+
+{LIVE_STATE_FRESHNESS_HEADING}
+A Mem0 memory's "still needs appending" / "caveat still missing" clause records what was \
+true WHEN IT WAS WRITTEN. Before emitting a `premature_widening_evidence_caveat` finding, \
+or any "task N's metadata still lacks X" finding, call `get_task` for that task and read \
+its CURRENT `metadata`. Do not emit it when the caveat, or the source memory id it cites, \
+is already there. When you do emit it, `cite_memory` the caveat-source memory: the code \
+gate `flag_dedup.filter_already_recorded_caveat_flags` drops the flag once the task's live \
+metadata records every cited memory id, and keeps it whenever the lookup is inconclusive.
+
+The buffered-event deletion log shows THAT a Mem0 record was deleted, never WHY. Before \
+counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, call \
+`get_memory_by_id` on it. A miss carrying a `tombstone` whose `deleter` is one of \
+{_DOCUMENTED_SWEEP_DELETERS} is a designed recon sweep — expected, not an anomaly — and \
+must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
+supports the flag. Name every swept id's full UUID in the description, and do not bundle \
+unrelated deletions into this flag type. The code gate \
+`sweep_deletion_guard.filter_benign_sweep_deletion_flags` drops a flag when every swept id \
+it can see is benign-tombstoned. It sees an id only if the id carries a tombstone or was \
+deleted in this cycle's event buffer, so an untombstoned deletion from an EARLIER cycle is \
+invisible to it: report such an id in a flag of its own, never alongside benign-tombstoned \
+ids. This rule exists because solar_challenge_platform run 09f2829f \
+(finding c4639ec8) reported three "new occurrences" that all carried \
+`stage1_cycle_summary_trim` / `stage2_cycle_summary_trim` tombstones from the same run.
 """

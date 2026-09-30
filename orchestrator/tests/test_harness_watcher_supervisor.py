@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -28,6 +29,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
@@ -3153,6 +3155,151 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
 
+    def test_archive_inclusive_read_tool_is_granted(self) -> None:
+        """get_task_escalations must be allowed, and not disallowed.
+
+        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas").
+        Without this entry the drain protocol's archive-inclusive read
+        (task 3999) is permission-denied: a silent no-op.
+        """
+        tool = 'mcp__escalation__get_task_escalations'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the drain can read '
+            "archived L2s' member_ids and keep already-promoted L1s out of "
+            f'work_batch (task 3999); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'silently blind the drain to archived L2s (task 3999); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3999: the drain protocol in the rotation's system prompt
+# ---------------------------------------------------------------------------
+
+_DRAIN_HEADING = '### Draining pending escalations'
+
+
+def _watcher_skill_text() -> str:
+    return load_skill_system_prompt('escalation-watcher-auto')
+
+
+def _fenced_code_blocks(text: str) -> list[str]:
+    return re.findall(r'```.*?\n(.*?)```', text, re.S)
+
+
+def _skill_section(text: str, heading: str) -> str:
+    """The `heading` line up to (not including) the next line starting '### '."""
+    lines = text.splitlines()
+    start = lines.index(heading)
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith('### ')),
+        len(lines),
+    )
+    return '\n'.join(lines[start:end])
+
+
+class TestWatcherSkillDrainProtocol:
+    """The rotation's drain protocol, read as the harness injects it.
+
+    SKILL.md's body IS the rotation's system prompt, and its fenced code
+    blocks are the calls the rotation makes. These tests pin only that API
+    surface: tool names, call shapes and projection keys.
+    """
+
+    def test_every_mcp_tool_the_skill_calls_is_granted(self) -> None:
+        called = {
+            token
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for token in re.findall(r'mcp__[a-z-]+__[a-z0-9_]+', block)
+        }
+        assert called, 'found no MCP tool calls in SKILL.md code blocks'
+        ungranted = sorted(called - set(_WATCHER_ALLOWED_TOOLS))
+        assert not ungranted, (
+            'SKILL.md code blocks call MCP tools missing from '
+            '_WATCHER_ALLOWED_TOOLS; --allowed-tools is an allowlist, so each '
+            f'call is permission-denied (a silent no-op): {ungranted}'
+        )
+
+    def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        assert 'get_task_escalations' in drain, (
+            'the drain must read L2s archive-inclusively via '
+            'get_task_escalations: get_pending_escalations is pending-only, so '
+            "a resolved L2's members re-enter work_batch "
+            '(delivered_check drain-loop-reads-the-escalation-archive)'
+        )
+        assert 'member_ids' in drain, (
+            'the drain must union member_ids, the compact projection key '
+            '(escalation/src/escalation/server.py::_compact_escalation)'
+        )
+
+    def test_drain_reads_l2s_compact_and_l1_candidates_full(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        lines = [
+            line
+            for block in _fenced_code_blocks(drain)
+            for line in block.splitlines()
+        ]
+        pending_l2_reads = [
+            line for line in lines if 'get_pending_escalations(level=2' in line
+        ]
+        archive_l2_reads = [line for line in lines if 'get_task_escalations(' in line]
+        l1_reads = [line for line in lines if 'get_pending_escalations(level=1' in line]
+        assert pending_l2_reads and archive_l2_reads and l1_reads, (
+            'the drain section must show the pending-L2, archive-L2 and L1 '
+            'candidate reads as one-line calls in a code block; found '
+            f'{pending_l2_reads=} {archive_l2_reads=} {l1_reads=}'
+        )
+        full_l2_reads = [
+            line
+            for line in pending_l2_reads + archive_l2_reads
+            if 'compact=True' not in line
+        ]
+        assert not full_l2_reads, (
+            'every L2 read must pass compact=True: member_ids exists only on '
+            f'compact rows (server.py::_compact_escalation): {full_l2_reads}'
+        )
+        compact_l1_reads = [line for line in l1_reads if 'compact=True' in line]
+        assert not compact_l1_reads, (
+            'the L1 candidate read must stay FULL-shape: the compact projection '
+            'drops agent_role and detail, which the path-guard carve-out and '
+            f'the handlers read: {compact_l1_reads}'
+        )
+
+    def test_skill_never_reads_members_off_an_escalation_row(self) -> None:
+        """No code block reads the model field `members` off an escalation row.
+
+        Every L2 read in this skill is compact (pinned by
+        test_drain_reads_l2s_compact_and_l1_candidates_full), and
+        server.py::_compact_escalation emits the projection key `member_ids`;
+        the model field `members` exists only in the FULL shape. Reading
+        `members` off an L2 row therefore silently yields nothing — in the
+        stranded_blocked guard that fails OPEN and re-resumes a task a
+        sibling escalation is already handling.
+
+        A read is `.members`, `.get("members"` or `["members"]` in either
+        quote style, off any receiver. The one legitimate read is
+        promote_to_l2's RESPONSE key `members`, so a read is exempt exactly
+        when its receiver is a variable bound to a promote_to_l2 call.
+        """
+        code = '\n'.join(_fenced_code_blocks(_watcher_skill_text()))
+        promote_results = set(
+            re.findall(r'(\w+)\s*=\s*mcp__escalation__promote_to_l2\(', code)
+        )
+        reads = re.finditer(
+            r'''(\w*)\s*(?:\.\s*get\(\s*["']|\[\s*["']|\.)\s*members\b''', code
+        )
+        found = [m.group(0) for m in reads if m.group(1) not in promote_results]
+        assert not found, (
+            'SKILL.md reads `members` off an escalation row; compact rows carry '
+            f'only `member_ids`, so the read silently yields nothing: {found}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
@@ -3230,6 +3377,35 @@ class TestWatcherHasActionableL1:
         promoted_id = _submit_sample_l1(queue, 'task-promoted')
         _submit_sample_l1(queue, 'task-unpromoted')
         _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_member_missed_by_a_dispositioned_l2_cascade_returns_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pending L1 whose resolved L2's cascade missed it — actionable.
+
+        The rotation's drain closes such a stranded member (SKILL.md
+        "Draining pending escalations"), so launching for it is how it leaves
+        the queue. Excluding archived L2s' members here would strand it.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-stranded')
+        l2_id = _submit_sample_l2(queue, 'task-stranded', members=[l1_id])
+        resolve = EscalationQueue.resolve
+
+        def resolve_missing_the_member(
+            self: EscalationQueue, escalation_id: str, *args, **kwargs,
+        ):
+            if escalation_id == l1_id:
+                raise OSError('simulated cascade failure')
+            return resolve(self, escalation_id, *args, **kwargs)
+
+        with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
+            queue.resolve(l2_id, 'human answered the cluster')
+
+        l2, l1 = queue.get(l2_id), queue.get(l1_id)
+        assert l2 is not None and l2.status == 'resolved'
+        assert l1 is not None and l1.status == 'pending'
         assert h._watcher_has_actionable_l1() is True
 
     def test_only_l0_returns_false(self, tmp_path: Path) -> None:

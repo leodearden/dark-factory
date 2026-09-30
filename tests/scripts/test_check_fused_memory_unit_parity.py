@@ -116,6 +116,7 @@ Type=simple
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 RestartSteps=4
@@ -192,6 +193,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 
 [Install]
 WantedBy=default.target
@@ -210,6 +212,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 RestartMaxDelaySec=60
@@ -233,6 +236,7 @@ Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
@@ -342,6 +346,7 @@ Description=Installed Fused Memory
 Type=notify
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
 [Install]
@@ -925,16 +930,16 @@ def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
 ):
     """The '[fixed] Appended N' count reflects only the EXACT directives appended.
 
-    find_drift(_MISSING_MEM0_UNIT) returns the 5 missing exact directives PLUS
-    the ExecStartPre= prefix miss (6 total), but fix_unit_text only appends the
-    5 exact directives. The reported count must therefore be 5, never the
-    inflated len(drift)==6.
+    find_drift(_MISSING_MEM0_UNIT) returns the missing exact directives PLUS
+    every required-prefix miss (ExecStartPre=, ExecStopPost=), but
+    fix_unit_text only appends the exact directives. The reported count must
+    therefore be the exact-directive count, never the inflated len(drift).
     """
     mod = _load_checker()
     monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
     exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
-    assert len(full_drift) == len(exact_only) + 1  # exactly the ExecStartPre miss
+    assert len(full_drift) == len(exact_only) + len(mod.REQUIRED_SERVICE_DIRECTIVE_PREFIXES)
     installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
     mod.main(["--installed", str(installed), "--fix"])
     out = capsys.readouterr().out
@@ -1785,9 +1790,10 @@ def _section_4_repo(tmp_path: pathlib.Path, *, with_renderer: bool = True) -> pa
     """
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
-    (repo / "scripts" / "fused-memory.service.template").write_text(
-        TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    for name in ("fused-memory.service.template", "fused-memory.socket.template"):
+        (repo / "scripts" / name).write_text(
+            (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
     if with_renderer:
         for name in ("render_systemd_unit.py", "systemd_unit_parity.py"):
             (repo / "scripts" / name).write_text(
@@ -1834,6 +1840,11 @@ def _verbs(tmp_path: pathlib.Path) -> list[str]:
     therefore invisible to a unit-token filter.
     """
     return [argv[1] for argv in systemctl_calls(tmp_path) if len(argv) > 1]
+
+
+# Every verb that bounces the server. The restart is stop-then-start so the
+# socket can take over port 8002 from a pre-socket process on first install.
+_BOUNCE_VERBS = frozenset({"restart", "stop", "start"})
 
 
 def _write_env(repo: pathlib.Path) -> pathlib.Path:
@@ -1945,7 +1956,7 @@ def test_section_4_missing_renderer_leaves_the_unit_alone(tmp_path: pathlib.Path
         "the missing-renderer path modified the installed unit"
     )
     assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
-    assert "restart" not in _verbs(tmp_path), (
+    assert not _BOUNCE_VERBS & set(_verbs(tmp_path)), (
         "a render that never happened restarted the server anyway: "
         f"{systemctl_calls(tmp_path)}"
     )
@@ -1982,7 +1993,7 @@ def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
         "a refused render modified the installed unit"
     )
     assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
-    assert "restart" not in _verbs(tmp_path), (
+    assert not _BOUNCE_VERBS & set(_verbs(tmp_path)), (
         "a refused render restarted the server anyway: "
         f"{systemctl_calls(tmp_path)}"
     )
@@ -1999,9 +2010,11 @@ def test_section_4_restarts_when_the_render_succeeded_and_env_exists(
     only meaningful next to "restart on success". This is also the only test that
     reaches the section's closing `ok` line.
 
-    The restart is the destructive step (it severs the MCP tooling of whatever
-    session is running the installer), so it is asserted as an EXACT argv rather
-    than a substring: `restart` naming some other unit must not satisfy it.
+    The restart is the destructive step, so it is asserted as EXACT argvs rather
+    than substrings: a stop or start naming some other unit must not satisfy it.
+    It is stop-then-start, not `restart`, because on a first install the old
+    process still binds port 8002 and must release it before
+    fused-memory.socket can take it.
     """
     repo = _section_4_repo(tmp_path)
     _write_env(repo)
@@ -2011,7 +2024,11 @@ def test_section_4_restarts_when_the_render_succeeded_and_env_exists(
 
     assert result.returncode == 0, result.stderr
     calls = systemctl_calls(tmp_path)
-    assert ["--user", "restart", "fused-memory"] in calls, calls
+    bounce = [c for c in calls if c[1] in _BOUNCE_VERBS]
+    assert bounce == [
+        ["--user", "stop", "fused-memory"],
+        ["--user", "start", "fused-memory.socket", "fused-memory"],
+    ], calls
     assert ["--user", "daemon-reload"] in calls, calls
     assert "fused-memory" in enabled_units(tmp_path), calls
     # The render still preserved this host's roots on the way through.
@@ -2032,7 +2049,7 @@ def test_section_4_greenfield_without_env_does_not_restart(tmp_path: pathlib.Pat
     result = _run_section_4(tmp_path, repo, unit_dir)
 
     assert result.returncode == 0, result.stderr
-    assert "restart" not in _verbs(tmp_path), systemctl_calls(tmp_path)
+    assert not _BOUNCE_VERBS & set(_verbs(tmp_path)), systemctl_calls(tmp_path)
     assert "fused-memory" in enabled_units(tmp_path), systemctl_calls(tmp_path)
     assert "WARN" in result.stdout, result.stdout
 

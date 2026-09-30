@@ -1733,6 +1733,22 @@ test('receipts: a successful refresh records servedAt from the body and received
   assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], {
     servedAt: '2026-09-20T12:00:00+00:00',
     receivedAt: 555,
+    window: null,
+  });
+});
+
+test('receipts: a windowed body\'s WINDOW echo is recorded verbatim beside servedAt', async () => {
+  // Transported, not validated: window_chip.js::windowEcho validates at read.
+  const { api, window: win } = loadDataJs();
+  const echo = { requested: '90d', served: '30d', days: 30 };
+  const deps = { fetchImpl: okResponse({ served_at: 'S', WINDOW: echo }), now: () => 555 };
+
+  await api.refreshOne(COSTS_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH], {
+    servedAt: 'S',
+    receivedAt: 555,
+    window: { requested: '90d', served: '30d', days: 30 },
   });
 });
 
@@ -1744,7 +1760,7 @@ test('receipts: a body with no served_at records null, never undefined', async (
 
   await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
 
-  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42 });
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null });
 });
 
 test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {
@@ -1772,6 +1788,35 @@ test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep age
 
     assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], afterSuccess, 'the receipt advanced on a failure');
     assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+  }
+});
+
+test('receipts: a FAILED refresh keeps the WINDOW echo describing the values still on screen', async () => {
+  // A failed refresh replaced no values, so it must not relabel them: the echo
+  // shares the receipt's success-only lifetime.
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({ WINDOW: { requested: '7d', served: '7d', days: 7 } }) }),
+  ]) {
+    const { api, window: win } = loadDataJs();
+    const state = api.createPollState();
+    const echo = { requested: '90d', served: '30d', days: 30 };
+    await api.refreshOne(COSTS_PATH, {}, state, {
+      fetchImpl: okResponse({ served_at: 'S', WINDOW: echo }),
+      now: () => 100,
+    });
+    const before = JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]);
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await api.refreshOne(COSTS_PATH, {}, state, { fetchImpl, now: () => 900 });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]), before, 'a failed refresh relabelled the window');
+    assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH].window, echo);
   }
 });
 
@@ -1953,7 +1998,7 @@ test('on-demand: flow-control and staleness are recorded under the request\'s OW
   assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
   assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
   assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
-  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77 });
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null });
   assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
 });
 

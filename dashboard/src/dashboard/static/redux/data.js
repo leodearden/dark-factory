@@ -173,9 +173,10 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency, recent, speculative,
-  //   active, active_spark, halt, train_events: [{event_type, task_id, run_id,
-  //   timestamp, data: {train_id, member_task_ids, ...event-specific keys}}]}}
+  // MERGE_QUEUE: {project_label: {depth, outcomes, latency, recent, recent_total,
+  //   speculative, active, active_spark, halt, train_events: [{event_type,
+  //   task_id, run_id, timestamp, data: {train_id, member_task_ids,
+  //   ...event-specific keys}}]}}
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -191,7 +192,7 @@ window.DF_DATA = {
   // in_progress_live + in_progress_stranded band the in_progress census; the
   // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
   // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], forecast_low: null, forecast_high: null, parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -300,9 +301,17 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt}`, published by refreshOne on the
-  // SUCCESS path only. datum.js::plainDatum reads this to give a value that
-  // is not yet served as a Datum the provenance it does have.
+  // each entry is `{servedAt, receivedAt, window}`, published by refreshOne
+  // on the SUCCESS path only. datum.js::plainDatum reads this to give a value
+  // that is not yet served as a Datum the provenance it does have.
+  //
+  // `window` is the served-window echo (`WINDOW: {requested, served, days}`)
+  // the four windowed endpoints carry, or null. It lives here, not in the key
+  // registry, because it describes the values currently in DF_DATA and must
+  // share their success-only lifetime: a failed refresh must not relabel data
+  // it did not replace. (It also could not be a registry key: four endpoints
+  // share the body key, and a registry key is both the body key and the
+  // DF_DATA key.) window_chip.js::windowEcho validates it at read.
   //
   // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
   // The two answer different questions and have different lifetimes. __stale
@@ -653,7 +662,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // ONE clock reading for the whole response, so every key it carries shares
     // a single arrival instant — and so `lastSuccessAt` below cannot drift
     // from `receivedAt` by however long the applies took.
-    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now() };
+    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now(), window: body.WINDOW ?? null };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
     recordSuccess(st, deps, startedAt, receipt.receivedAt);
     publishReceipt(stateKey, receipt);

@@ -6,7 +6,7 @@ const D = window.DF_DATA;
 // the CANONICAL note in datum.js's header.
 const {
   projectCensus, censusOver, censusSegments, censusHistory, censusTotal, terminalOfTotal, viewShareText,
-  CENSUS_VIEWS, CENSUS_TILES,
+  CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES,
 } = window.DF_TASK_SNAPSHOT;
 const { plainDatum, derivedDatum } = window.DF_DATUM;
 const { useState, useEffect } = React;
@@ -198,7 +198,7 @@ function OverviewTab({ paused }) {
   // Compute live numbers
   const orchRunning = D.ORCHESTRATORS.filter(o => o.running).length;
   const fleetCensus = censusOver(D, null);
-  const runningTile = CENSUS_TILES.find(t => t.key === 'running');
+  const runningTile = TASK_CENSUS_TILES.find(t => t.key === 'running');
   const memTotal = Object.values(D.MEMORY_STATUS.projects).reduce((s, p) => s + p.graphiti_nodes + p.mem0_memories, 0);
   const queue = D.MEMORY_STATUS.queue.counts;
   const queueDepth = queue.pending + queue.retry + queue.dead;
@@ -276,7 +276,7 @@ function OverviewTab({ paused }) {
               <span key={s.key} style={{ width: `${s.share}%`, background: P[s.tone] }} />
             ))}
           </div>
-          {CENSUS_VIEWS.map(v => (
+          {TASK_CENSUS_VIEWS.map(v => (
             <div key={v.key} style={{ display: 'grid', gridTemplateColumns: '12px 1fr auto auto', gap: 8, alignItems: 'center', fontSize: 12 }}>
               <span style={{ width: 8, height: 8, background: P[v.tone], borderRadius: 2 }}></span>
               <span style={{ color: 'var(--fg-2)' }}>{v.label}</span>

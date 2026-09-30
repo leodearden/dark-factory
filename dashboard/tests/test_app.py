@@ -9,31 +9,73 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.api.window import _parse_window
+from dashboard.api.burndown import _BURNDOWN_WINDOWS
+from dashboard.api.window import ServedWindow, _parse_window, with_window
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
-# _parse_window helper
+# _parse_window: the served-window record, for both vocabularies
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('value, expected', [
-    ('24h', 1),
-    ('7d', 7),
-    ('30d', 30),
-    ('all', 3650),
-    ('weird', 30),  # default
-    (None, 30),
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '24h'}, ServedWindow(requested='24h', served='24h', days=1)),
+    ({'window': '7d'}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '30d'}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='all', days=3650)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='30d', days=30)),
+    ({'window': 'weird'}, ServedWindow(requested='weird', served='30d', days=30)),
+    ({}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': ''}, ServedWindow(requested='30d', served='30d', days=30)),
 ])
-def test_parse_window_known_and_unknown(value, expected):
-    query_params: dict[str, str] = {}
-    if value is not None:
-        query_params['window'] = value
-    assert _parse_window(query_params) == expected
+def test_parse_window_standard_vocabulary(params, expected):
+    assert _parse_window(params) == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='7d', days=7)),
+])
+def test_parse_window_caller_default(params, expected):
+    assert _parse_window(params, default='7d') == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '90d'}, ServedWindow(requested='90d', served='90d', days=90)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='30d', days=30)),
+])
+def test_parse_window_burndown_vocabulary(params, expected):
+    assert _parse_window(params, vocabulary=_BURNDOWN_WINDOWS) == expected
+
+
+def test_parse_window_refuses_a_default_the_vocabulary_cannot_serve():
+    with pytest.raises(ValueError, match='90d'):
+        _parse_window({'window': '7d'}, default='90d')
+
+
+def test_served_window_wire_shape_and_immutability():
+    window = ServedWindow(requested='90d', served='30d', days=30)
+    assert window.to_wire() == {'requested': '90d', 'served': '30d', 'days': 30}
+    with pytest.raises(AttributeError):
+        window.served = '90d'  # type: ignore[misc]
+
+
+def test_with_window_echoes_without_mutating_the_payload():
+    payload = {'COSTS': {'total': 1}, 'served_at': 'S'}
+    window = ServedWindow(requested='7d', served='7d', days=7)
+    echoed = with_window(payload, window)
+    assert echoed == {
+        'COSTS': {'total': 1},
+        'served_at': 'S',
+        'WINDOW': {'requested': '7d', 'served': '7d', 'days': 7},
+    }
+    assert payload == {'COSTS': {'total': 1}, 'served_at': 'S'}
+    assert echoed is not payload
 
 
 # ---------------------------------------------------------------------------
@@ -1394,22 +1436,51 @@ def test_merge_queue_returns_merge_queue(client):
     assert isinstance(body['MERGE_QUEUE'], dict)
 
 
-def test_merge_queue_uses_24h_recent_window(client):
-    """The /api/v2/dashboard/merge-queue endpoint must pass recent_window_minutes=1440
-    to build_per_project_merge_queue.  Asserted via call-site kwargs because the
-    test fixture carries no per-project DBs, so the window is not observable in
-    the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
+@pytest.mark.parametrize('query, expected_hours', [
+    ('?window=7d', 168),
+    ('?window=24h', 24),
+])
+def test_merge_queue_threads_the_chip_window(client, query, expected_hours):
+    """Every merge-queue leg, recent merges included, follows the chip window.
+
+    Asserted via call-site kwargs because the test fixture carries no
+    per-project DBs, so the window is not observable in the JSON payload.
+    There is no separate recent-merges window to pass: the smallest chip is
+    24h, so following the chip can only widen what the old fixed 1440-minute
+    recent window showed."""
     mock_build = AsyncMock(return_value={})
     with (
         patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
         patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+        resp = client.get(f'/api/v2/dashboard/merge-queue{query}')
     assert resp.status_code == 200
     assert mock_build.await_args is not None, "build_per_project_merge_queue was never awaited"
-    assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
-        f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
-    )
+    assert mock_build.await_args.kwargs['hours'] == expected_hours
+    assert 'recent_window_minutes' not in mock_build.await_args.kwargs
+
+
+@pytest.mark.parametrize('path, payload_key, expected_window', [
+    ('/api/v2/dashboard/costs?window=90d', 'COSTS', {'requested': '90d', 'served': '30d', 'days': 30}),
+    ('/api/v2/dashboard/costs?window=7d', 'COSTS', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance', 'PERFORMANCE', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance?window=all', 'PERFORMANCE',
+     {'requested': 'all', 'served': 'all', 'days': 3650}),
+    ('/api/v2/dashboard/merge-queue?window=24h', 'MERGE_QUEUE',
+     {'requested': '24h', 'served': '24h', 'days': 1}),
+    ('/api/v2/dashboard/burndown?window=90d', 'BURNDOWN', {'requested': '90d', 'served': '90d', 'days': 90}),
+    ('/api/v2/dashboard/burndown?window=all', 'BURNDOWN', {'requested': 'all', 'served': '30d', 'days': 30}),
+])
+def test_windowed_payload_echoes_the_served_window(client, path, payload_key, expected_window):
+    """Sketch #8: every windowed payload says which window it was computed over."""
+    with patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)):
+        resp = client.get(path)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['WINDOW'] == expected_window
+    assert payload_key in body
+    if payload_key == 'BURNDOWN':
+        assert 'served_at' in body
 
 
 def test_costs_returns_full_costs_block(client):
@@ -1548,7 +1619,7 @@ def test_burndown_returns_aggregate_and_per_project(client):
     resp = client.get('/api/v2/dashboard/burndown?window=30d')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
+    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'served_at'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
 
@@ -1592,6 +1663,45 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     assert all(n == nows[0] for n in nows), (
         f'expected all per-project aggregates to share one reference now, got {nows!r}'
     )
+
+
+def test_burndown_route_lists_projects_over_the_series_window(client):
+    """The listing and every series share one cutoff, so a project the window
+    never sampled is neither listed nor counted as unmeasured."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        assert client.get('/api/v2/dashboard/burndown?window=7d').status_code == 200
+
+    (listing,) = mock_projects.await_args_list
+    (series,) = mock_series.await_args_list
+    assert listing.kwargs == {'days': 7, 'now': series.kwargs['now']}
+    assert series.kwargs['days'] == 7
+
+
+def test_burndown_route_serves_its_datums_at_the_window_instant(client):
+    """The one captured instant is the window cutoff AND the instant every
+    burndown Datum is judged at, and it crosses the wire as ``served_at`` —
+    which data.js::refreshOne reads into the receipt datum.js ages against."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        body = client.get('/api/v2/dashboard/burndown?window=30d').json()
+
+    assert isinstance(body['served_at'], str)
+    (call,) = mock_series.await_args_list
+    assert datetime.fromisoformat(body['served_at']) == call.kwargs['now']
+    assert set(body['BURNDOWN']['latest']) == {
+        'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds',
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -317,12 +317,26 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
 
+    # Each unit also Wants=/After= and (in [Install]) Also= its OWN
+    # `orchestrator-<project>.socket` (escalation socket activation), so every
+    # line naming that socket differs by project the same way the ORCH_UNIT
+    # line does. Checked by SUBSTITUTION rather than another allowed-fragment
+    # pair: those lines are not fixed strings (After= carries a
+    # space-separated list, the comment above Wants= is prose), so the only
+    # exact claim available is "this line becomes reify's line if you swap in
+    # reify's socket name" — which still fails on any OTHER difference on the
+    # same line.
+    df_socket = "orchestrator-dark-factory.socket"
+    reify_socket = "orchestrator-reify.socket"
+
     unexpected: list[tuple[int, str, str]] = []
     for lineno, dl, rl in diff_lines:
         if (
             dl.strip() == expected_df_orch_unit_line
             and rl.strip() == expected_reify_orch_unit_line
         ):
+            continue
+        if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
         reify_ok = any(frag in rl for frag in allowed_reify_fragments)

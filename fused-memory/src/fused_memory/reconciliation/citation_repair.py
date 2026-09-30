@@ -24,7 +24,10 @@ rewrites, through the journal's ``get_run_with_stage_reports_text`` /
 compare-and-set is one extra WHERE clause on the existing UPDATE. The rewrite is
 a read-modify-write of the WHOLE blob, so it is conditioned on the column text
 the read returned: a competing wholesale rewrite that lands in between is
-refused as ``concurrent_modification`` rather than silently clobbered.
+refused as ``concurrent_modification`` rather than silently clobbered. The run
+owner's own wholesale rewrites carry persisted repairs forward
+(``ReconciliationJournal.update_run_stage_reports``), so a landed repair is not
+undone by the run it belongs to.
 
 **Two defect classes, and the corroboration each one owes.** ``reason`` names
 which, and this module CHECKS it rather than trusting it: ``memory_not_found``
@@ -77,50 +80,21 @@ from fused_memory.models.reconciliation import RunStatus, StageReport
 # ``citation_verifier._CANONICAL_UUID_RE`` already exist, and a third copy of the
 # same gate is exactly the lockstep duplication INV-5 forbids.
 from fused_memory.reconciliation.citation_verifier import is_concrete_memory_id
+from fused_memory.reconciliation.journal import (
+    CITATION_REPAIRS_KEY,
+    REPAIRABLE_RUN_STATUS_VALUES,
+    flagged_findings_by_id,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = ['build_citation_repair_record', 'repair_memory_citation']
-
-# The provenance key appended to a repaired finding. Deliberate sibling of the
-# ``citation_failures`` key ``verify_cited_memories`` writes: a reader of any
-# finding sees both "this claim lost its backing" and "this claim's backing was
-# re-pointed", in the same shape.
-CITATION_REPAIRS_KEY = 'citation_repairs'
 
 # The only store this path can corroborate against. ``get_memory_by_id`` is a
 # Mem0/Qdrant point read, so a graphiti id would resolve to None and be
 # false-flagged as dangling — the same hazard ``verify_cited_memories``
 # documents as its reason for skipping non-mem0 entries.
 SUPPORTED_STORE = 'mem0'
-
-# The run statuses a repair may touch — an ALLOWLIST, deliberately inverted from
-# the "refuse status == 'running'" check this replaces, because the two failure
-# directions are asymmetric: wrongly PERMITTING yields a write that reports
-# ``status: repaired`` and is then silently overwritten (what the run_still_live
-# hint itself calls worse than a clean refusal), while wrongly REFUSING yields a
-# loud, recoverable error. So a status absent from the enum-of-today must land on
-# the refusing side by default.
-#
-# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
-# excluded precisely because something does — ``journal.get_interrupted_runs()``
-# is ``SELECT * FROM runs WHERE status = 'interrupted'``, the startup
-# adopt-and-resume pass re-claims exactly those runs, and the resumed cycle
-# rewrites the whole stage_reports blob from its own loaded copy.
-REPAIRABLE_RUN_STATUSES = frozenset(
-    {
-        RunStatus.completed,
-        RunStatus.failed,
-        RunStatus.rolled_back,
-        RunStatus.circuit_breaker,
-    }
-)
-
-# Compared on raw ``.value`` strings so the gate holds whether ``run.status``
-# arrives as a coerced ``RunStatus`` or as a bare ``str`` off the journal row.
-# Every member's name happens to equal its value today, so StrEnum hashing would
-# coincide — the gate deliberately does not rest on that coincidence.
-_REPAIRABLE_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
 
 
 # The citation's DEFECT CLASS — a closed enum, because it is written verbatim
@@ -270,17 +244,20 @@ _ERR_CONCURRENT_MODIFICATION: dict[str, str] = {
 }
 
 # The write was issued but did NOT survive: the read-after-write check could not
-# find THIS repair in the durable blob. The producer the terminal-status
-# allowlist cannot see, because the row already reads terminal: harness calls
-# ``complete_run(...)`` BEFORE its trailing ``update_run_stage_reports(...)``, so
-# there is a window in which a completed run still has a writer holding a loaded
-# copy it is about to write back wholesale. Returning ``repaired`` for a repair
-# that was overwritten is the precise "worse than a clean refusal" outcome
-# REPAIRABLE_RUN_STATUSES' own comment exists to prevent.
+# find THIS repair in the durable blob. The terminal-status allowlist cannot see
+# a writer that lands after this call, because the row already reads terminal.
+# The run owner's trailing rewrite is no longer one — it carries persisted repairs
+# forward (``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.update_run_stage_reports``)
+# — so this verdict is the backstop for a writer that bypasses that path.
+# Returning ``repaired`` for a repair that was overwritten is the precise "worse
+# than a clean refusal" outcome the allowlist's own comment
+# (``fused-memory/src/fused_memory/reconciliation/journal.py::REPAIRABLE_RUN_STATUSES``)
+# exists to prevent.
 #
 # DIVISION OF LABOUR with ``_ERR_CONCURRENT_MODIFICATION``: the compare-and-set
-# owns writers landing BEFORE this call's write; this owns the remaining window,
-# a writer landing AFTER it. Neither subsumes the other, so both stay.
+# owns writers landing BEFORE this call's write; this backstops the remaining
+# window, a writer landing AFTER it that does not preserve repairs. Neither
+# subsumes the other, so both stay.
 _ERR_REPAIR_CLOBBERED: dict[str, str] = {
     'error': 'repair_clobbered',
     'error_type': 'ReconCitationRepairClobbered',
@@ -444,9 +421,9 @@ def _find_finding(
     for stage_name, report in run.stage_reports.items():
         if not isinstance(report, StageReport):
             continue
-        for finding in report.items_flagged:
-            if isinstance(finding, dict) and finding.get('finding_id') == finding_id:
-                return stage_name, report, finding
+        finding = flagged_findings_by_id(report.items_flagged).get(finding_id)
+        if finding is not None:
+            return stage_name, report, finding
     return None
 
 
@@ -460,18 +437,20 @@ def _repair_is_persisted(
     """True when a RE-READ of the run shows this exact repair durably present.
 
     Read-after-write, because the terminal-status allowlist structurally cannot
-    see the two windows in which a terminal-looking run still has a writer (see
-    ``_ERR_REPAIR_CLOBBERED``). Cheap — one point read on a path that already
-    did two Mem0 reads and a write — and it converts "reported repaired, then
-    silently overwritten" into a loud refusal.
+    see a writer landing after this call's write on a run that already reads
+    terminal (see ``_ERR_REPAIR_CLOBBERED``). Cheap — one point read on a path
+    that already did two Mem0 reads and a write — and it converts "reported
+    repaired, then silently overwritten" into a loud refusal.
 
-    A DETECTOR, not a guarantee, and the difference is load-bearing for a caller
-    deciding how wide to make ``live_run_ids``: the sequence is write → re-read
-    → compare, so a clobbering write that lands AFTER the re-read still returns
-    ``repaired`` for a repair that did not survive. It shrinks that exposure to
-    one gap rather than removing it. Refusing BEFORE the write is the only thing
-    that closes it outright, which is why the run-status allowlist stays an
-    allowlist rather than leaning on this check.
+    A BACKSTOP, not the guarantee. The run owner's trailing rewrite carries
+    persisted repairs forward
+    (``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.update_run_stage_reports``),
+    so the harness no longer clobbers a repair; this check catches a writer that
+    bypasses that path. For such a writer it is a detector only: the sequence
+    is write → re-read → compare, so a clobber landing AFTER the re-read still
+    returns ``repaired``. Refusing BEFORE the write is what protects a live
+    run, which is why the run-status allowlist stays an allowlist rather than
+    leaning on this check.
 
     Identity, not shape: ``repair_record`` carries this call's own
     ``repaired_at``, so a look-alike record written by a CONCURRENT repair does
@@ -548,11 +527,11 @@ def _run_still_live_hint(
     message names the one that actually fired.
     """
     parts: list[str] = []
-    if status_value not in _REPAIRABLE_STATUS_VALUES:
+    if status_value not in REPAIRABLE_RUN_STATUS_VALUES:
         parts.append(
             f'run {target_run_id} is in status {status_value!r}, which is not one '
             'of the terminal statuses a repair may touch '
-            f'({sorted(_REPAIRABLE_STATUS_VALUES)}); its stage_reports blob is '
+            f'({sorted(REPAIRABLE_RUN_STATUS_VALUES)}); its stage_reports blob is '
             'rewritten wholesale from a writer\'s own loaded copy at each stage '
             'end, so a journal-side repair would be silently clobbered.'
         )
@@ -760,7 +739,7 @@ async def repair_memory_citation(
     # 'completed' while ReconReportState is still writing its entries through.
     status_value = str(run.status)
     in_process = target_run_id in live_run_ids
-    if status_value not in _REPAIRABLE_STATUS_VALUES or in_process:
+    if status_value not in REPAIRABLE_RUN_STATUS_VALUES or in_process:
         return _ERR_RUN_STILL_LIVE | {
             'target_run_id': target_run_id,
             # ``run_status``, deliberately NOT ``status``: every success branch
@@ -998,12 +977,12 @@ async def repair_memory_citation(
         }
 
     # Read-after-write. The compare-and-set above owns writers landing BEFORE
-    # this call's write; this owns the remaining window — a writer landing
+    # this call's write; this backstops the remaining window — a writer landing
     # AFTER it, which the status allowlist structurally cannot see because the
-    # row already reads terminal: harness completes a run BEFORE its trailing
-    # update_run_stage_reports, so a just-completed run may still have a writer
-    # holding a loaded copy it is about to write back wholesale. That window
-    # ends here as repair_clobbered instead of a ``repaired`` verdict on a
+    # row already reads terminal. The run owner's trailing rewrite carries
+    # persisted repairs forward, so only a writer bypassing
+    # ``ReconciliationJournal.update_run_stage_reports`` can still clobber, and
+    # that ends here as repair_clobbered instead of a ``repaired`` verdict on a
     # repair that quietly evaporated. Neither guard subsumes the other.
     try:
         persisted = await journal.get_run(target_run_id)
@@ -1029,11 +1008,10 @@ async def repair_memory_citation(
                 f'{target_run_id} does not show it, so another writer rewrote '
                 'stage_reports from its own loaded copy AFTER this write landed '
                 '(a writer that landed BEFORE it would have been refused as '
-                'concurrent_modification instead). Known producer: the harness '
-                'completes a run BEFORE its trailing update_run_stage_reports, '
-                'so a just-completed run may still have a writer. Re-run once '
-                'the run is quiescent; nothing is left half-applied, because '
-                "the other writer's blob won wholesale."
+                "concurrent_modification instead). The run owner's own "
+                'rewrite preserves persisted repairs, so the writer bypassed '
+                'that path. Re-run once the run is quiescent; nothing is left '
+                "half-applied, because the other writer's blob won wholesale."
             ),
         }
 
