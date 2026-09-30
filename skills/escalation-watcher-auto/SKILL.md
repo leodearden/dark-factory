@@ -94,6 +94,7 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
 | `Bash(git show ...)` | Read a specific commit's diff |
 | `Bash(git status ...)` | Working-tree state at the project root |
+| `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only) |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
@@ -120,6 +121,8 @@ A hypothesis is a **stable, human-readable string** you will pass as `root_cause
 - Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"neo4j-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
+
+A hypothesis that joins two or more failure events of one task is formed from counted rows, per `$DARK_FACTORY_ROOT/skills/_shared/counting-failure-events.md`.
 
 ## Promote to L2
 
