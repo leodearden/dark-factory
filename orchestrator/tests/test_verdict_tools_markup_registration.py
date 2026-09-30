@@ -1215,6 +1215,42 @@ class TestVerdictToolsResidueChannelIsShared:
         assert str(len(raw)) in errors[0]
 
     @pytest.mark.asyncio
+    async def test_a_lost_burst_alarm_is_reported_in_its_own_terms(
+        self, tmp_path, caplog,
+    ):
+        """A storm record carries no payload and no caller waits to resend one,
+        so its loss line must name the burst rather than a raw value."""
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools._MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '3690',
+            resolve_root=lambda worktree: None,
+            open_channel=lambda root: None,
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            locator = await sink({
+                'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+                'count': 7,
+                'threshold': 5,
+                'window_seconds': 3600,
+                'outcome': 'repaired',
+                'project': None,
+                'callers': [],
+            })
+
+        assert locator is None
+        (error,) = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno == logging.ERROR
+        ]
+        assert 'burst alarm' in error
+        assert '7 repaired' in error
+        assert 'raw value' not in error
+        assert 'resend' not in error
+
+    @pytest.mark.asyncio
     async def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
         self, tmp_path,
     ):

@@ -622,6 +622,27 @@ def file_storm(
     return esc_id
 
 
+def _loss_account(record: dict[str, Any]) -> str:
+    """What a record the queue could not take cost, in its OWN kind's terms.
+
+    A burst alarm carries no payload and no caller is waiting to resend one,
+    so the payload kinds' size-and-resend account would be false for it.
+    """
+    if record.get('error_type') == MARKUP_STORM_ERROR_TYPE:
+        return (
+            f'the burst alarm ({record.get("count")} {record.get("outcome")} '
+            f'outcome(s) in {record.get("window_seconds")}s) was NOT QUEUED; '
+            'the leak is active and the queue does not say so'
+        )
+    return (
+        f'the {record.get("error_type")!r} record for '
+        f'{record.get("tool")}.{record.get("field")} '
+        f'({len(record.get("raw_value") or "")}-char raw value) was preserved '
+        'NOWHERE; the caller is told nothing was preserved and to resend from '
+        'its own copy'
+    )
+
+
 def make_escalation_sink(
     *,
     worktree: Path,
@@ -682,12 +703,8 @@ def make_escalation_sink(
         record: dict[str, Any], why: str, *, exc_info: bool = False,
     ) -> None:
         logger.error(
-            'markup guard: %s, so the %r record for %s.%s (%d-char raw value, '
-            'subject %r) was preserved NOWHERE; the caller is told nothing was '
-            'preserved and to resend from its own copy',
-            why, record.get('error_type'), record.get('tool'), record.get('field'),
-            len(record.get('raw_value') or ''), _subject(),
-            exc_info=exc_info,
+            'markup guard: %s, so %s (subject %r)',
+            why, _loss_account(record), _subject(), exc_info=exc_info,
         )
 
     def file_record(record: dict[str, Any]) -> str | None:
