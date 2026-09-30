@@ -14114,8 +14114,9 @@ class TestRunPostMergeVerify:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
-    def _make_req(self) -> MagicMock:
+    def _make_req(self, project_root: Path) -> MagicMock:
         req = MagicMock()
+        req.config.project_root = project_root
         req.task_id = 'task-verify-test'
         req.task_files = None
         req.module_configs = []
@@ -14123,12 +14124,12 @@ class TestRunPostMergeVerify:
         req.config.merge_verify_workspace = False
         return req
 
-    async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
+    async def test_disk_guard_none_verify_passed_returns_none(self, tmp_path: Path) -> None:
         """(a) disk guard returns None + verify passed → returns None; merge_wt NOT cleaned."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         timeouts: dict[str, int] = {}
         enospc_retries: dict[str, int] = {}
@@ -14145,12 +14146,12 @@ class TestRunPostMergeVerify:
         assert result is None
         git_ops.cleanup_merge_worktree.assert_not_awaited()
 
-    async def test_disk_guard_returns_reason_blocks(self) -> None:
+    async def test_disk_guard_returns_reason_blocks(self, tmp_path: Path) -> None:
         """(b) disk guard returns reason string → MergeOutcome('blocked') with that reason; merge_wt cleaned once."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
 
@@ -14172,12 +14173,12 @@ class TestRunPostMergeVerify:
         git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
         assert verifier.verified == [], 'the disk guard must short-circuit before verify runs'
 
-    async def test_verify_fails_non_enospc_blocks_and_cleans(self) -> None:
+    async def test_verify_fails_non_enospc_blocks_and_cleans(self, tmp_path: Path) -> None:
         """(c) verify fails (non-ENOSPC) → MergeOutcome('blocked') reason starts 'Post-merge verification failed:' and merge_wt cleaned."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         failed_result = _fake_verify_result(passed=False, summary='Test suite exploded', timed_out=False)
         failed_result.failure_report.return_value = ''
@@ -14204,12 +14205,12 @@ class TestRunPostMergeVerify:
         )
         git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
 
-    async def test_verify_timeout_bumps_timeouts_dict(self) -> None:
+    async def test_verify_timeout_bumps_timeouts_dict(self, tmp_path: Path) -> None:
         """(d) verify fails with timed_out=True → timeouts dict bumped to 1 for req.task_id."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         timeouts: dict[str, int] = {}
         timed_out_result = _fake_verify_result(passed=False, summary='verify timed out', timed_out=True)
@@ -14232,12 +14233,12 @@ class TestRunPostMergeVerify:
             f'expected timeouts[task_id]=1, got: {timeouts}'
         )
 
-    async def test_persistent_enospc_prunes_and_escalates(self) -> None:
+    async def test_persistent_enospc_prunes_and_escalates(self, tmp_path: Path) -> None:
         """(e) persistent ENOSPC (both attempts) → prune awaited, enospc_retries bumped, transient infra blocked."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         enospc_retries: dict[str, int] = {}
 
@@ -14262,7 +14263,9 @@ class TestRunPostMergeVerify:
         )
 
     @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
-    async def test_classified_infra_transient_clears_on_retry(self, category) -> None:
+    async def test_classified_infra_transient_clears_on_retry(
+        self, category, tmp_path: Path,
+    ) -> None:
         """(task ν) RETRY-CLEARS: infra-category result then a pass → None (merge
 
         proceeds), run_scoped_verification called twice (one bounded retry
@@ -14275,7 +14278,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         enospc_retries: dict[str, int] = {}
 
@@ -14299,7 +14302,9 @@ class TestRunPostMergeVerify:
         )
 
     @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
-    async def test_classified_infra_transient_persistent_holds_loud_no_attempt(self, category) -> None:
+    async def test_classified_infra_transient_persistent_holds_loud_no_attempt(
+        self, category, tmp_path: Path,
+    ) -> None:
         """(task ν) PERSISTENT-HOLD: infra-category result on every dispatch →
 
         blocked with the TRANSIENT_INFRA_REASON_PREFIX (loud infra_issue hold,
@@ -14314,7 +14319,7 @@ class TestRunPostMergeVerify:
         )
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         timeouts: dict[str, int] = {}
         enospc_retries: dict[str, int] = {}
@@ -14353,7 +14358,9 @@ class TestRunPostMergeVerify:
             f'got: {result.failure_category!r}'
         )
 
-    async def test_env_transient_outer_retry_stacks_with_internal_env_serial_retry(self) -> None:
+    async def test_env_transient_outer_retry_stacks_with_internal_env_serial_retry(
+        self, tmp_path: Path,
+    ) -> None:
         """env_transient double-retry-layer interaction is intentional (task
 
         2591 amendment, reviewer_comprehensive/test_coverage): a
@@ -14370,7 +14377,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         enospc_retries: dict[str, int] = {}
 
@@ -14395,7 +14402,9 @@ class TestRunPostMergeVerify:
             f'run_scoped_verification, got {len(verifier.verified)} calls'
         )
 
-    async def test_classified_infra_transient_zero_retry_after_shared_budget_exhausted(self) -> None:
+    async def test_classified_infra_transient_zero_retry_after_shared_budget_exhausted(
+        self, tmp_path: Path,
+    ) -> None:
         """(task 2591 amendment, reviewer_comprehensive/robustness) The
 
         classified-infra retry (branch A) shares the enospc_retries/
@@ -14414,7 +14423,7 @@ class TestRunPostMergeVerify:
         )
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         timeouts: dict[str, int] = {}
         # Simulate the shared enospc_retries/max_enospc budget already spent,
@@ -14453,7 +14462,9 @@ class TestRunPostMergeVerify:
             'a classified-infra hold must not spawn a dry-run debugger'
         )
 
-    async def test_genuine_test_failure_not_treated_as_infra_transient(self) -> None:
+    async def test_genuine_test_failure_not_treated_as_infra_transient(
+        self, tmp_path: Path,
+    ) -> None:
         """(task ν) NARROWNESS: a genuine test_failure category is NOT retried
 
         or routed to the transient-infra hold — it takes the ordinary
@@ -14462,7 +14473,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         test_failure_result = VerifyResult(
@@ -14494,12 +14505,12 @@ class TestRunPostMergeVerify:
             f'got {len(verifier.verified)} calls'
         )
 
-    async def test_verify_exception_propagates_no_cleanup(self) -> None:
+    async def test_verify_exception_propagates_no_cleanup(self, tmp_path: Path) -> None:
         """(f) run_scoped_verification raises RuntimeError → exception propagates; merge_wt NOT cleaned."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
@@ -14513,7 +14524,9 @@ class TestRunPostMergeVerify:
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
 
-    async def test_blocked_merge_outcome_carries_verify_fingerprint_fields(self) -> None:
+    async def test_blocked_merge_outcome_carries_verify_fingerprint_fields(
+        self, tmp_path: Path,
+    ) -> None:
         """task-1688 step-3: _run_post_merge_verify copies category/cause_hint to MergeOutcome.
 
         Stubs run_scoped_verification to return a failing VerifyResult with
@@ -14524,7 +14537,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         failing_verify = _fake_verify_result(passed=False, summary='tests failed', timed_out=False, category='gui_tsc', cause_hint='StatusBar.tsx:42 error TS2322: Type X not assignable')
@@ -14550,12 +14563,12 @@ class TestRunPostMergeVerify:
             f'unexpected failure_cause_hint: {result.failure_cause_hint!r}'  # type: ignore[attr-defined]
         )
 
-    async def test_keep_worktrees_forwarded_to_disk_guard(self) -> None:
+    async def test_keep_worktrees_forwarded_to_disk_guard(self, tmp_path: Path) -> None:
         """keep_worktrees is forwarded verbatim to _ensure_verify_disk_space."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
         l1 = Path('/fake/_merge-l1')
         l2 = Path('/fake/_merge-l2')
@@ -14574,12 +14587,12 @@ class TestRunPostMergeVerify:
         assert len(verifier.disk_guard_calls) == 1
         assert verifier.disk_guard_calls[0]['keep_worktrees'] == {l1, l2}
 
-    async def test_enospc_retry_prunes_with_keep_set_union(self) -> None:
+    async def test_enospc_retry_prunes_with_keep_set_union(self, tmp_path: Path) -> None:
         """ENOSPC retry passes keep = {merge_wt} | keep_worktrees to prune."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = Path('/fake/_merge-active')
         l1 = Path('/fake/_merge-l1')
         l2 = Path('/fake/_merge-l2')
@@ -14600,12 +14613,12 @@ class TestRunPostMergeVerify:
         call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
         assert call_kwargs['keep'] == {merge_wt, l1, l2}
 
-    async def test_default_enospc_retry_keeps_only_merge_wt(self) -> None:
+    async def test_default_enospc_retry_keeps_only_merge_wt(self, tmp_path: Path) -> None:
         """Default keep_worktrees=None → ENOSPC retry keep == {merge_wt} (regression)."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = Path('/fake/_merge-active')
         enospc_retries: dict[str, int] = {}
 
@@ -14634,9 +14647,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
-        # Use a real Path so we can check the derived archive_root value.
-        req.config.project_root = tmp_path
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         expected_archive_root = tmp_path / 'data' / 'verify-logs'
@@ -14657,7 +14668,7 @@ class TestRunPostMergeVerify:
             f'got {actual_archive_root!r}'
         )
 
-    async def test_failure_reason_contains_infra_timeout_category(self) -> None:
+    async def test_failure_reason_contains_infra_timeout_category(self, tmp_path: Path) -> None:
         """(task 1768 step-9 RED) Timed-out verify → reason contains '[category: infra_timeout]'.
 
         Fails today because the generic failure block (merge_queue.py:890) does not
@@ -14666,7 +14677,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         timed_out_result = _fake_verify_result(passed=False, summary='timed out after 7200s', timed_out=True, category='infra_timeout', cause_hint='')
@@ -14693,7 +14704,7 @@ class TestRunPostMergeVerify:
             f'Expected "[category: infra_timeout]" in reason; got: {result.reason!r}'
         )
 
-    async def test_failure_reason_contains_test_failure_category(self) -> None:
+    async def test_failure_reason_contains_test_failure_category(self, tmp_path: Path) -> None:
         """(task 1768 step-9 RED) Real test failure → reason contains '[category: test_failure]'.
 
         Fails today because the generic failure block does not append the category.
@@ -14701,7 +14712,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         test_fail_result = _fake_verify_result(passed=False, summary='test-fail', timed_out=False, category='test_failure', cause_hint='assert x == y')
@@ -14732,7 +14743,7 @@ class TestRunPostMergeVerify:
             f'Expected "[category: test_failure]" in reason; got: {result.reason!r}'
         )
 
-    async def test_narrowed_infra_budget_allows_multiple_retries(self) -> None:
+    async def test_narrowed_infra_budget_allows_multiple_retries(self, tmp_path: Path) -> None:
         """(task 2835 step-1) RED — a narrowed (failed-only) retry uses a
 
         SEPARATE budget (max_narrowed/narrowed_retries) decoupled from the
@@ -14744,7 +14755,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         req.retry_failed_only = True
         merge_wt = MagicMock()
 
@@ -14784,7 +14795,7 @@ class TestRunPostMergeVerify:
             f'narrowed retries must stay decoupled from the shared ENOSPC budget: {er}'
         )
 
-    async def test_deterministic_red_attempt0_never_narrowed_retried(self) -> None:
+    async def test_deterministic_red_attempt0_never_narrowed_retried(self, tmp_path: Path) -> None:
         """(task 2835 step-3) RED — INV-4 storm-escape headline: a
 
         deterministic-red category (test_failure) must NEVER enter the
@@ -14797,7 +14808,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         req.retry_failed_only = True
         merge_wt = MagicMock()
 
@@ -14843,7 +14854,9 @@ class TestRunPostMergeVerify:
         assert nr == {}, f'no narrowed counter should be touched: {nr}'
         assert er == {}, f'no ENOSPC counter should be touched: {er}'
 
-    async def test_narrowed_retry_stops_on_midflight_deterministic_red(self) -> None:
+    async def test_narrowed_retry_stops_on_midflight_deterministic_red(
+        self, tmp_path: Path,
+    ) -> None:
         """(task 2835 step-5) RED — the narrowed retry loop stops the instant
 
         a retry's fresh category is no longer infra-transient, even though
@@ -14856,7 +14869,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         req.retry_failed_only = True
         merge_wt = MagicMock()
 
@@ -14924,7 +14937,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path / 'project_root')
         req.retry_failed_only = True
         merge_wt = tmp_path
 
@@ -14952,7 +14965,9 @@ class TestRunPostMergeVerify:
             f'expected the persistent transient-infra hold, got: {result.reason!r}'
         )
 
-    async def test_narrowed_infra_budget_exhausted_falls_through_to_persistent_hold(self) -> None:
+    async def test_narrowed_infra_budget_exhausted_falls_through_to_persistent_hold(
+        self, tmp_path: Path,
+    ) -> None:
         """(task 2835 amendment, reviewer_comprehensive/test-coverage) The
 
         narrowed budget is BOUNDED, not unbounded: when every narrowed retry
@@ -14965,7 +14980,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         req.retry_failed_only = True
         merge_wt = MagicMock()
 
@@ -15004,7 +15019,9 @@ class TestRunPostMergeVerify:
         )
         assert er == {}, f'the legacy ENOSPC counter must stay untouched: {er}'
 
-    async def test_narrowed_retry_not_starved_by_exhausted_enospc_budget(self) -> None:
+    async def test_narrowed_retry_not_starved_by_exhausted_enospc_budget(
+        self, tmp_path: Path,
+    ) -> None:
         """(task 2835 amendment, reviewer_comprehensive/test-coverage) The
 
         headline decoupling invariant: an earlier UNRELATED ENOSPC event
@@ -15018,7 +15035,7 @@ class TestRunPostMergeVerify:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         req.retry_failed_only = True
         merge_wt = MagicMock()
 
@@ -22063,8 +22080,9 @@ class TestRunPostMergeVerifyRouting:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
-    def _make_req(self) -> MagicMock:
+    def _make_req(self, project_root: Path) -> MagicMock:
         req = MagicMock()
+        req.config.project_root = project_root
         req.task_id = 'task-routing-test'
         req.task_files = None
         req.module_configs = []
@@ -22086,7 +22104,7 @@ class TestRunPostMergeVerifyRouting:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path / 'project_root')
         merge_wt = MagicMock()
         event_store = self._make_event_store(tmp_path)
 
@@ -22136,7 +22154,7 @@ class TestRunPostMergeVerifyRouting:
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         intercepted: list[dict] = []
@@ -22166,12 +22184,12 @@ class TestRunPostMergeVerifyRouting:
 
         assert intercepted, 'run_scoped_verification was not intercepted by patch'
 
-    async def test_scoped_failure_consults_main_health_probe(self) -> None:
+    async def test_scoped_failure_consults_main_health_probe(self, tmp_path: Path) -> None:
         """Scoped failure: MergeOutcome 'blocked' and _classify_main_health_red consulted."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         failed_result = VerifyResult(
@@ -22197,13 +22215,13 @@ class TestRunPostMergeVerifyRouting:
         mock_mh.assert_called_once()
 
     async def test_unscoped_gate_broken_returns_correct_reason_without_main_health(
-        self,
+        self, tmp_path: Path,
     ) -> None:
         """Unscoped gate broken: correct reason, NO main-health probe consulted."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         passed_scoped = VerifyResult(
@@ -22237,12 +22255,12 @@ class TestRunPostMergeVerifyRouting:
         )
         mock_mh.assert_not_called()
 
-    async def test_unscoped_gate_timeout_increments_counter(self) -> None:
+    async def test_unscoped_gate_timeout_increments_counter(self, tmp_path: Path) -> None:
         """Unscoped gate timeout: correct reason and timeout counter incremented (fail-closed)."""
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
+        req = self._make_req(tmp_path)
         merge_wt = MagicMock()
 
         passed_scoped = VerifyResult(
@@ -22283,7 +22301,7 @@ class TestRunPostMergeVerifyRouting:
 
         git_ops = self._make_git_ops()
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[tmp_path / 'old-wt'])
-        req = self._make_req()
+        req = self._make_req(tmp_path / 'project_root')
         merge_wt = MagicMock()
 
         enospc_result = VerifyResult(
