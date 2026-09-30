@@ -66,6 +66,7 @@ from escalation.models import (
 from escalation.pins import classify_pins
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
+from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -930,7 +931,7 @@ def create_server(
     default).  Pass a fixed datetime in tests to make the prune cutoff
     deterministic and wall-clock-independent.
     """
-    mcp = FastMCP('escalation')
+    mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
 
     # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
     #
