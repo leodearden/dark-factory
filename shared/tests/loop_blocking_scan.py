@@ -134,6 +134,24 @@ def site_key(site: LoopBlockingSite) -> tuple[str, str, str]:
 # The five INV-8 limbs, all present: subprocess, network, filesystem, lock,
 # sleep.
 
+# The directory-walk / metadata families task 5099 added, one reason per
+# family rather than one near-duplicate string per spelling.
+_METADATA_WHY = (
+    'filesystem metadata: one stat syscall -- measured 3-4us against a warm '
+    'dentry cache (task 5099: 20000-call timeit, CPython 3.13.9), unbounded '
+    'against a cold, network or wedged filesystem, and the coroutine cannot '
+    'tell which it got'
+)
+_DIRECTORY_READ_WHY = (
+    'filesystem directory read: cost scales with the entry count -- '
+    'recursively for rglob and ** patterns -- and is unbounded from the '
+    "coroutine's point of view"
+)
+_DIRECTORY_ENTRY_WRITE_WHY = (
+    'filesystem directory-entry write: creates, removes or renames an entry, '
+    'so it waits on the filesystem journal, not merely the page cache'
+)
+
 # Dotted paths, matched after `import X as Y` alias substitution
 # (`subprocess.run(...)`) and after `from X import Y` binding resolution
 # (a bare `run(...)` bound by `from subprocess import run`).
@@ -193,6 +211,19 @@ DOTTED_PRIMITIVES: dict[str, str] = {
         'filesystem: os.listdir applied recursively -- the same cost per level '
         'with no bound on the depth'
     ),
+    'os.scandir': _DIRECTORY_READ_WHY,
+    'glob.glob': _DIRECTORY_READ_WHY,
+    'os.stat': _METADATA_WHY,
+    'os.path.exists': _METADATA_WHY,
+    'os.path.isfile': _METADATA_WHY,
+    'os.path.isdir': _METADATA_WHY,
+    'os.makedirs': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.mkdir': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.rmdir': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.remove': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.unlink': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.rename': _DIRECTORY_ENTRY_WRITE_WHY,
+    'os.replace': _DIRECTORY_ENTRY_WRITE_WHY,
     'shutil.rmtree': (
         'filesystem: a recursive delete, one unlink syscall per file, all of '
         'them on the calling thread; this is the primitive behind '
@@ -247,17 +278,12 @@ BUILTIN_PRIMITIVES: dict[str, str] = {
 # A call that `await`, `async with` or `async for` consumes is skipped: a sync
 # pathlib method never returns an awaitable, so that call is some async API.
 #
-# DELIBERATELY ABSENT, with the counts that decided it: the directory-walk and
-# metadata methods.  Measured over `fused-memory/src` at this commit, adding
-# them would produce mkdir +18, exists +15, unlink +5, stat +4, iterdir +4,
-# glob +2, open (as a method) +7 -- ~55 new rows, every one of which needs a
-# hand-written disposition or the ledger becomes a page of "existing" waivers,
-# which is precisely the silent waiver this gate exists to prevent.  They are
-# also the names most likely to collide on an unrelated receiver, since match
-# is by attribute name alone.  Widening here is a triage exercise of its own,
-# filed as a follow-up rather than smuggled into an amendment pass; the
-# `open` BUILTIN below is included because it is unambiguous and costs zero
-# rows in the current tree.
+# DELIBERATELY ABSENT (counts: plans/inv8-caller-side-census-2026-09-03.md
+# section 4c).  `replace`, `remove` and `walk` stay out of this table for good:
+# by attribute name alone they are str.replace, list.remove and ast.walk, so
+# every string edit would become a merge-blocking row -- their os.* spellings
+# are matched above as receiver-pinned dotted paths.  `resolve` (Path.resolve)
+# and os.path.realpath are the next widening, owned by task 6089 (+13 rows).
 METHOD_PRIMITIVES: dict[str, str] = {
     'read_text': (
         'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
@@ -275,6 +301,22 @@ METHOD_PRIMITIVES: dict[str, str] = {
     'write_bytes': (
         'filesystem: task 4091/4201 vocabulary; identical cost to write_text '
         'without the encode'
+    ),
+    'mkdir': _DIRECTORY_ENTRY_WRITE_WHY,
+    'rmdir': _DIRECTORY_ENTRY_WRITE_WHY,
+    'touch': _DIRECTORY_ENTRY_WRITE_WHY,
+    'unlink': _DIRECTORY_ENTRY_WRITE_WHY,
+    'rename': _DIRECTORY_ENTRY_WRITE_WHY,
+    'exists': _METADATA_WHY,
+    'is_file': _METADATA_WHY,
+    'is_dir': _METADATA_WHY,
+    'stat': _METADATA_WHY,
+    'iterdir': _DIRECTORY_READ_WHY,
+    'glob': _DIRECTORY_READ_WHY,
+    'rglob': _DIRECTORY_READ_WHY,
+    'open': (
+        'filesystem: Path.open, the method spelling of the builtin open() -- a '
+        'blocking file read or write handle on the calling thread'
     ),
 }
 
