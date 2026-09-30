@@ -194,7 +194,8 @@ bumps the heartbeat.
 ```
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
-3. Handle each drained escalation
+3. Handle each drained escalation: standing facts → self-execute tier → briefing disposition
+   (see "Before an item reaches Leo")
 4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
    an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
@@ -403,9 +404,9 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 ### 3. Task progress
 
-**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on.
+**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on. What "act" may cover is the self-execute tier (see "Before an item reaches Leo"), and its always-ask list overrides 3a.
 
-**3b — Unclear decisions that matter: ask the human.** When the best action is ambiguous AND the choice has real consequences:
+**3b — Unclear decisions that matter: ask the human.** Before you ask, give the item its briefing disposition (see "Disposition before briefing (H1–H6)"). When the best action is ambiguous AND the choice has real consequences:
 - Leave the escalation pending on the queue
 - Tell the human about it with full context (they may be away for hours — that's OK)
 - Create a local task/todo to track the need for resolution
@@ -1155,6 +1156,10 @@ A promoted cluster's `root_cause` and `evidence` are the auto-watcher's narrativ
 Before ruling on one that joins two or more failures of a task, or restating it to the human, count
 those failures per [`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
 
+Every handler below ends in an action or a question to Leo. The self-execute tier bounds the
+action, and the question passes through its briefing disposition first (see "Before an item
+reaches Leo").
+
 **Additive-context convention for spawned `/unblock` prompts.** Several categories below spawn an
 interactive `/unblock` session with a prompt of the form `/unblock <task_id> (esc <escalation_id>,
 <category>, <severity>: <summary>)`. Only the leading `/unblock <task_id>` token is load-bearing:
@@ -1444,6 +1449,8 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Every option carries its `ramification`. Every item carries a recommendation with its evidence
   chain, or an explicit `no_lean` with its reason.
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
+- The item's briefing disposition decides whether it is recorded now, after investigation, or as a
+  direct ask (see "Disposition before briefing (H1–H6)").
 
 #### Gate facts are yours to supply
 
@@ -1637,7 +1644,8 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human**, except for the narrow self-close case defined in "Standing rule:
 accept verified info-level design deviations" below — check that subsection first:
-1. Present the concern with full context
+1. Present the concern with full context, after its briefing disposition — H3 and H6 usually fire
+   here (see "Disposition before briefing (H1–H6)")
 2. Leave the escalation pending — the open escalation record IS the durable record that something
    needs doing
 3. Create a local todo **for this session only** — it does not survive session end and is not the
@@ -1945,6 +1953,7 @@ window this is the difference between one durable session and repeated restarts.
 - ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
   top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
+- Choosing between a sub-agent and a `/spawn`ed session: see "Sub-agent or `/spawn`"
 
 **Keep in top-level context:**
 - The watch loop itself (your core job)
@@ -1960,7 +1969,7 @@ Maintain awareness of escalations waiting for human input. When the human return
 status, answer with the sitting preparer (see "Sitting preparer (`prepare-sitting` mode)" above)
 rather than a hand-assembled list: `brief --ledger <session ledger>` is the numbered list, with each
 item's options, recommendation and age, and its standing footer says what is waiting on someone
-else.
+else. The brief lists every item awaiting Leo, with no cap (see "No cap on items awaiting Leo").
 
 Remind about unresolved items roughly every 3-5 escalation handling cycles — enough to keep them visible without being noisy.
 
