@@ -244,6 +244,8 @@ BUILTIN_PRIMITIVES: dict[str, str] = {
 # Bare method names, matched on any receiver: `path.read_text()`.  Receiver
 # types are not inferred, so these match by attribute name alone -- the
 # deliberate trade for finding `self._path.read_text()` without type inference.
+# A call that `await`, `async with` or `async for` consumes is skipped: a sync
+# pathlib method never returns an awaitable, so that call is some async API.
 #
 # DELIBERATELY ABSENT, with the counts that decided it: the directory-walk and
 # metadata methods.  Measured over `fused-memory/src` at this commit, adding
@@ -665,7 +667,9 @@ def _primitive_for_call(call: ast.Call, ctx: _ModuleCtx) -> str | None:
       2. an unbound, unshadowed bare ``Name`` in :data:`BUILTIN_PRIMITIVES`;
       3. a dotted ``Attribute`` chain (after ``import X as Y`` substitution)
          in :data:`DOTTED_PRIMITIVES`;
-      4. a bare method name in :data:`METHOD_PRIMITIVES`, on any receiver.
+      4. a bare method name in :data:`METHOD_PRIMITIVES`, on any receiver,
+         unless an async construct consumes the call
+         (:func:`_is_consumed_asynchronously`).
     """
     func = call.func
 
@@ -697,10 +701,25 @@ def _primitive_for_call(call: ast.Call, ctx: _ModuleCtx) -> str | None:
                 return None
             if resolved in DOTTED_PRIMITIVES:
                 return resolved
-        if func.attr in METHOD_PRIMITIVES:
+        if func.attr in METHOD_PRIMITIVES and not _is_consumed_asynchronously(call, ctx):
             return func.attr
 
     return None
+
+
+def _is_consumed_asynchronously(call: ast.Call, ctx: _ModuleCtx) -> bool:
+    """Is *call* itself the operand of ``await``, ``async with`` or ``async for``?
+
+    Only the call that IS the consumed expression counts: in
+    ``await w.send(p.read_text())`` the inner ``read_text`` is an argument,
+    evaluated on the loop thread before anything is awaited.
+    """
+    parent = ctx.parent_map.get(id(call))
+    if isinstance(parent, ast.Await):
+        return True
+    if isinstance(parent, ast.withitem) and parent.context_expr is call:
+        return isinstance(ctx.parent_map.get(id(parent)), ast.AsyncWith)
+    return isinstance(parent, ast.AsyncFor) and parent.iter is call
 
 
 def _is_non_blocking(dotted: str) -> bool:
