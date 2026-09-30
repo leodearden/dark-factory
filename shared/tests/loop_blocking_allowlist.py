@@ -84,10 +84,16 @@ ROW PER SITE, TRIAGE PER CAUSE.  Where a cluster shares one root cause -- the
 caller of ``ReconciliationHarness._escalate`` -- every row carries the SAME
 justification naming that shared cause and its single follow-up -- held in
 one named constant where a cluster's text has had to change after filing
-(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  The ledger
-stays row-per-site so a 23rd handler cannot be added silently under a blessed
-22; the triage stays cluster-per-defect so the follow-ups are one task per
-defect rather than one per line.
+(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  Every
+multi-row cluster added from task 5099 on, and any cluster whose text
+changes, holds its justification in one such named constant; an untouched
+cluster keeps its inline copies until the task owning its rows deletes them.
+Such a constant states the cause and its cost, never a row count or a site
+list: the rows referencing it are the membership, and a copy in prose would
+go stale unchecked the first time a row joins or leaves.
+The ledger stays row-per-site so a 23rd handler cannot be added silently under
+a blessed 22; the triage stays cluster-per-defect so the follow-ups are one
+task per defect rather than one per line.
 
 Regenerating
 ------------
@@ -103,7 +109,9 @@ Baseline measured at HEAD 6696f1ce0c: 167 files scanned, 60 findings.
 Task 4484's amendment pass re-measured 62 over the same 167 files: one
 row withdrawn as a scanner false positive (see the
 create_mcp_server._claim_commit_presence row) and three added by widening
-the vocabulary to shutil.rmtree.
+the vocabulary to shutil.rmtree.  Task 5099 re-measured at HEAD b4e1349e1c
+after widening it to the directory-walk/metadata calls: 190 files scanned,
+91 findings (55 before; census section 4c).
 """
 
 from __future__ import annotations
@@ -151,8 +159,174 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
+#: The shared justification of every ``reconciliation/backlog_policy.py`` row.
+_BACKLOG_POLICY_RECORD_IO_WHY = (
+    'ROOT CAUSE (one defect): BacklogPolicy scans, reads and '
+    'writes its escalation records on the loop thread. on_judge_unhalt '
+    'is_dirs data/escalations, then globs every judge_halt*.json record '
+    'in the queue root -- an O(N) directory read that grows with the '
+    'pending queue -- read_texts each match and reaches '
+    '_restore_policy_keys; _maybe_write_escalation reaches '
+    '_merge_onto_persisted; both helpers read_text then write_text the '
+    'located record under escalation_id_lock. UNDERSTATED BY THESE '
+    'ROWS, and recorded here because no row can carry it: the dominant '
+    'blocking work on the write path is the '
+    'escalation.dedupe.submit_or_dedupe call one line ABOVE the '
+    '_merge_onto_persisted site -- find_dedupe_parent globs and '
+    'JSON-parses every pending record in the project queue '
+    '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
+    'queue 2026-09-18), then queue.submit writes with a durable fsync. '
+    'The scanner reports only _merge_onto_persisted because those '
+    'primitives live in the escalation package, across a boundary its '
+    'fused-memory/src scope cannot follow -- so another row would be a '
+    'blessing test_no_stale_blessings rejects, and this paragraph is '
+    'the only honest place to state it. Filesystem, the limb task '
+    '3778\'s subprocess-only vocabulary omitted. The record '
+    'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
+    '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
+    '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
+    'added when it widened the vocabulary are TASK 6086, filed to fold '
+    'into the same offload.'
+)
+
+#: The shared justification of every ``server/manifest_stamping.py`` row.
+_MANIFEST_STAMPING_INLINE_IO_WHY = (
+    'ROOT CAUSE (one defect): _stamp_capability_manifests_impl '
+    'does its sidecar I/O INLINE in one coroutine, with no helper '
+    'anywhere for a definition-side census to point at -- the shape '
+    'task 3778\'s methodology is structurally blind to: an is_file() '
+    'existence probe per distinct manifest path, read_text + '
+    'yaml.safe_load of the sidecar, then an atomic write-back '
+    '(write_text of yaml.safe_dump to a temp sibling, os.replace onto '
+    'the sidecar, and the finally-block unlink of the temp). Task 4201 '
+    'measured yaml.safe_load at 8.15 ms for an 11 KB document, so the '
+    'parse alone is the same order as a subprocess spawn and this '
+    'coroutine pays it twice plus every filesystem round trip above. '
+    'One asyncio.to_thread around the whole probe-read-parse-write '
+    'closes every row. The read/parse/write rows are OWNED BY '
+    'TASK 5276 -- do not file again: task 4484 step-9\'s ticket '
+    'tkt_0RT7QYENVS6J9WVWCY3FJAVNFR became task 5073, coalesced into '
+    '5276. The is_file, os.replace and unlink rows task 5099 added '
+    'when it widened the vocabulary are TASK 6087, filed to fold into '
+    'the same offload.'
+)
+
+#: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
+_VERIFIER_LLM_TOOL_IO_WHY = (
+    'ROOT CAUSE (one defect): the async tools '
+    'CodebaseVerifier.verify hands the codebase-verification LLM do '
+    'their filesystem work inline on the loop thread, once per tool '
+    'call the model chooses to make -- an LLM-driven, unbounded call '
+    'count. read_file does full_path.read_text(); glob_search runs '
+    'codebase_root.glob(pattern) with an LLM-CHOSEN pattern and sorts '
+    'every match before keeping 50, so a "**/*" walks the whole '
+    'codebase root. The read_file row is OWNED BY TASK 5270 -- do not '
+    'file again: task 4484 step-9\'s ticket '
+    'tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ became task 5078, coalesced into '
+    '5270. The glob_search row task 5099 added when it widened the '
+    'vocabulary is TASK 6088, filed to fold into the same offload.'
+)
+
+#: Task 5099: an idempotent mkdir of a store's own data dir as it opens.
+_MKDIR_ON_STORE_OPEN_WHY = (
+    'ACCEPTED, measured cheap (one cause): one idempotent '
+    'mkdir(parents=True, exist_ok=True) of the store\'s own data dir as it '
+    'opens its SQLite connection -- measured 6-11us on an existing dir '
+    '(task 5099: 20000-call timeit, CPython 3.13.9). A store opener pays it '
+    'once per store lifetime: at startup, or once per project behind a '
+    'cached connection. A per-MCP-call DB opener pays it immediately before '
+    'an awaited connect_daemon(...) that already hops threads and costs far '
+    'more. Only the directory is created inline; every read and write of '
+    'the store itself is awaited.'
+)
+
+#: Task 5099: a fixed number of existence / type guards per invocation.
+_FIXED_STAT_GUARD_WHY = (
+    'ACCEPTED, measured cheap (one cause): a fixed, data-independent '
+    'number of stat calls per invocation -- an existence or type guard in '
+    'front of the real work, never a scan -- measured 3-4us each against a '
+    'warm dentry cache (task 5099: 20000-call timeit of exists/stat/is_dir, '
+    'CPython 3.13.9). The work each guard fronts is awaited and costs '
+    'orders of magnitude more (a SQLite connect, a subprocess, an LLM '
+    'call). The count is set by the code or an operator-authored config '
+    'list, never by what is on disk.'
+)
+
+#: Task 5099: one exists() per metadata.files entry a task author declared.
+_DECLARED_FILES_STAT_WHY = (
+    'ACCEPTED, bounded by an authored list (one cause): '
+    'middleware/task_interceptor.py::_missing_files does one exists() per '
+    'metadata.files entry the task author declared -- 3-4us each (task '
+    '5099: 20000-call timeit, CPython 3.13.9), so a 20-file task costs '
+    '~0.1 ms. Its callers reach it only on a status transition, never per '
+    'read.'
+)
+
+#: Task 5099: the curator COMBINE audit line.
+_COMBINE_AUDIT_APPEND_WHY = (
+    'ACCEPTED, bounded by an LLM decision (one cause): '
+    'TaskInterceptor._execute_combine reaches _append_combine_audit, an '
+    'idempotent mkdir (6-11us, task 5099 timeit) plus one open(\'a\') '
+    'append of a single JSON line under 2 KB (descriptions truncated to '
+    '500 chars), with no fsync. It runs once per curator COMBINE decision, '
+    'each of which follows an LLM call of seconds, so the append is never '
+    'on a hot or storm-coupled path. The EventQueue dead-letter append is '
+    'the one defect of this shape, because it fires during a drop storm.'
+)
+
+#: Task 5099: EventQueue._write_dead_letter's inline append.
+_DEAD_LETTER_APPEND_WHY = (
+    'ROOT CAUSE (one defect): EventQueue._write_dead_letter runs '
+    'mkdir + exists + stat + the cascade rotation + open(\'a\') + write '
+    'inline on the loop thread, and its async callers reach it without a '
+    'hop. The enqueue overflow_drop branch fires EXACTLY when the loop is '
+    'saturated, so the blocking append is coupled to the storm it '
+    'records, and a rotation renames files on the same thread. '
+    'UNDERSTATED BY THESE ROWS: the scanner resolves only self.enqueue, '
+    'not other receivers\' event_queue.enqueue(...), so the real caller '
+    'population is larger. Filed by task 5099 as TASK 6085.'
+)
+
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
 AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
+
+    # ---- backends/sqlite_task_backend.py ----
+    (
+        'fused-memory/src/fused_memory/backends/sqlite_task_backend.py',
+        'SqliteTaskBackend._get_connection',
+        '14c6bfa75f63',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/backends/sqlite_task_backend.py',
+        'SqliteTaskBackend.get_statuses_fresh',
+        '09007f79712d',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
+
+    # ---- maintenance/seed_autopilot_video_triage_guardrails.py ----
+    (
+        'fused-memory/src/fused_memory/maintenance/seed_autopilot_video_triage_guardrails.py',
+        'SeedManager.seed',
+        '43bbc3406b55',
+        'accepted',
+        'ACCEPTED, no server loop to stall: SeedManager.seed reaches '
+        'load_guardrail_payloads\'s exists() inside a one-shot maintenance '
+        'CLI driven by asyncio.run in its __main__ block. Nothing under '
+        'fused-memory/src imports the module, so the only event loop it '
+        'ever runs on is its own, with no concurrent work to block.',
+    ),
+
+    # ---- mcp_tools/scheduler_state.py ----
+    (
+        'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py',
+        'read_scheduler_events',
+        '09007f79712d',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
 
     # ---- middleware/curator_escalator.py ----
     (
@@ -169,6 +343,29 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
         'never enumerated. Follow-up filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
+    ),
+
+    # ---- middleware/task_interceptor.py ----
+    (
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'TaskInterceptor._apply_status_transition',
+        'c387b27712b9',
+        'accepted',
+        _DECLARED_FILES_STAT_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'TaskInterceptor._execute_combine',
+        '15bda1dd6b34',
+        'accepted',
+        _COMBINE_AUDIT_APPEND_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'TaskInterceptor._execute_combine',
+        'd7b1b643f3fe',
+        'accepted',
+        _COMBINE_AUDIT_APPEND_WHY,
     ),
 
     # ---- middleware/ticket_janitor.py ----
@@ -203,81 +400,96 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
+    # ---- middleware/ticket_store.py ----
+    (
+        'fused-memory/src/fused_memory/middleware/ticket_store.py',
+        'TicketStore.initialize',
+        'f485b909e349',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+
     # ---- reconciliation/backlog_policy.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy.on_judge_unhalt',
         '8f53c74a5d76',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy.on_judge_unhalt',
         '08a103635fd7',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
         '0d761c10e563',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
+        'BacklogPolicy.on_judge_unhalt',
+        'cb226477b1bf',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
+        'BacklogPolicy.on_judge_unhalt',
+        '48269c8edbbd',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
+    ),
+
+    # ---- reconciliation/cli_stage_runner.py ----
+    (
+        'fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py',
+        'run_stage_via_cli',
+        'aa09bf369631',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
+
+    # ---- reconciliation/event_queue.py ----
+    (
+        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
+        'EventQueue.start',
+        'd325858ad5fe',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
+        'EventQueue.recover',
+        '2f9ae36b2bc7',
+        'filed',
+        _DEAD_LETTER_APPEND_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
+        'EventQueue.close',
+        'c8191bbaf10a',
+        'filed',
+        _DEAD_LETTER_APPEND_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
+        'EventQueue._commit_with_retry',
+        '93d589ee10dd',
+        'filed',
+        _DEAD_LETTER_APPEND_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
+        'EventQueue._enqueue_on_loop',
+        'f46e02910e17',
+        'filed',
+        _DEAD_LETTER_APPEND_WHY,
     ),
 
     # ---- reconciliation/harness.py ----
@@ -456,6 +668,24 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
 
+    # ---- reconciliation/journal.py ----
+    (
+        'fused-memory/src/fused_memory/reconciliation/journal.py',
+        'ReconciliationJournal.initialize',
+        '863ff109dbaf',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+
+    # ---- reconciliation/recon_ledger.py ----
+    (
+        'fused-memory/src/fused_memory/reconciliation/recon_ledger.py',
+        'ReconLedgerStore.initialize',
+        'f485b909e349',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+
     # ---- reconciliation/stages/task_knowledge_sync.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
@@ -468,6 +698,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'makes it cold-miss-only. Filed together with that cluster by task '
         '4484 step-9, since one fix closes both.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
+        '_run_briefing_known_gaps_script',
+        'a23d01e12b5a',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
+        '_run_briefing_known_gaps_script',
+        '39a6fb8ac63e',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
     ),
 
     # ---- reconciliation/stale_priority_override_edge_sweep.py ----
@@ -482,6 +726,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'makes it cold-miss-only. Filed together with that cluster by task '
         '4484 step-9, since one fix closes both.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py',
+        'read_live_override_state',
+        '09007f79712d',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
     ),
 
     # ---- reconciliation/targeted.py ----
@@ -498,18 +749,47 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'by task 4484 step-9.'
         ' Ticket: tkt_0RT7RKWJG17W03JRC947R8FZZN.',
     ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/targeted.py',
+        'TargetedReconciler._sweep_cancelled_descendants',
+        'f06e6adb6bbd',
+        'accepted',
+        _DECLARED_FILES_STAT_WHY
+        + ' Task 5270 already owns this coroutine\'s is_orchestrator_live_for '
+        'row (ticket-derived task 5077): if 5270 offloads the whole sweep, '
+        'delete this row with it.',
+    ),
 
     # ---- reconciliation/verify.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify.read_file',
         'c04bd0d302eb',
-        'to_file',
-        'The async read_file tool handed to the codebase-verification LLM '
-        'does full_path.read_text() inline on the loop thread, once per '
-        'tool call the model chooses to make -- an LLM-driven, unbounded '
-        'call count. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ.',
+        'filed',
+        _VERIFIER_LLM_TOOL_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/verify.py',
+        'CodebaseVerifier.verify.glob_search',
+        '29916e02709d',
+        'filed',
+        _VERIFIER_LLM_TOOL_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/verify.py',
+        'CodebaseVerifier.verify',
+        'ab04e5fd6d64',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
+
+    # ---- services/durable_queue.py ----
+    (
+        'fused-memory/src/fused_memory/services/durable_queue.py',
+        'DurableWriteQueue.initialize',
+        'c57d271d306d',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
     # ---- services/live_workflow_detector.py ----
@@ -531,6 +811,24 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'coroutine; its git probes, the real cost, are awaited.',
     ),
 
+    # ---- services/planned_episode_registry.py ----
+    (
+        'fused-memory/src/fused_memory/services/planned_episode_registry.py',
+        'PlannedEpisodeRegistry.initialize',
+        'c57d271d306d',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+
+    # ---- services/write_journal.py ----
+    (
+        'fused-memory/src/fused_memory/services/write_journal.py',
+        'WriteJournal.initialize',
+        '863ff109dbaf',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+
     # ---- server/main.py ----
     (
         'fused-memory/src/fused_memory/server/main.py',
@@ -547,78 +845,108 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'merely that the call exists. If this ever moves onto a request or '
         'reload path, the content_hash changes and the gate re-asks.',
     ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        'e3f8e93f2610',
+        'accepted',
+        'ACCEPTED, startup only: run_server reaches '
+        'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
+        'SQLite open matched by the method name open. It genuinely blocks, '
+        'but like the build_known_projects_map row beside it, it runs once '
+        'during process STARTUP, before the server binds and begins '
+        'serving traffic, so there is no concurrent work to stall. If it '
+        'ever moves onto a request or reload path, the content_hash '
+        'changes and the gate re-asks.',
+    ),
 
     # ---- server/manifest_stamping.py ----
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '3817640cc33d',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         'e19569fdcfa0',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '78912ffb516a',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '93a769609c9b',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/manifest_stamping.py',
+        '_stamp_capability_manifests_impl',
+        'dfdb79e84d56',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/manifest_stamping.py',
+        '_stamp_capability_manifests_impl',
+        '364eac0531d3',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/manifest_stamping.py',
+        '_stamp_capability_manifests_impl',
+        'edbfd36fd257',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
 
     # ---- server/tools.py ----
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        '_open_overrides_db',
+        '14c6bfa75f63',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        '_connect_overrides_db',
+        '14c6bfa75f63',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        '_open_park_eviction_db',
+        '14c6bfa75f63',
+        'accepted',
+        _MKDIR_ON_STORE_OPEN_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        '_checkpoint_overrides_db_if_exists',
+        '051cd59d92be',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        'create_mcp_server.submit_task',
+        '32c0a08cd635',
+        'accepted',
+        _FIXED_STAT_GUARD_WHY,
+    ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server._claim_commit_presence',
