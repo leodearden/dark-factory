@@ -5302,6 +5302,43 @@ class Scheduler:
         if count >= threshold:
             self._complete_parks(task_id, modules, tier, skip_count=count)
 
+    def _settle_fairness_on_dispatch(
+        self, task_id: str, modules: list[str], priority: str
+    ) -> None:
+        """End *task_id*'s fairness episode because it just dispatched (task 5308).
+
+        THE single place a dispatch settles fairness state, called for EVERY
+        dispatch — pin loop and scored loop, top or not: the skip count and
+        blocked-install streak are dropped, and the task's own parks are
+        consumed (``reservation_used``, plus ``reservation_restored`` for each
+        shadow the clear exposes).  A running task's park would otherwise
+        block same-tier installs (INV-3) until release, which is where
+        partial installs came from.  ``Scheduler.release`` keeps its
+        defensive clear only for parks installed AFTER dispatch, e.g. a
+        reserve_now armed on a running task.
+        """
+        self._skip_count.pop(task_id, None)
+        self._streak_park_install_blocked.clear(task_id)
+        if not self.lock_table.has_parks(task_id):
+            return
+        restored_pairs = self.lock_table.clear_parks_for(task_id)
+        if not self.event_store:
+            return
+        self.event_store.emit(
+            EventType.reservation_used,
+            task_id=task_id,
+            data={'modules': modules, 'priority': priority},
+        )
+        for restored_owner, restored_modules in restored_pairs:
+            self.event_store.emit(
+                EventType.reservation_restored,
+                task_id=restored_owner,
+                data={
+                    'restored_owner': restored_owner,
+                    'modules': restored_modules,
+                },
+            )
+
     def _complete_parks(
         self,
         task_id: str,
@@ -7353,7 +7390,9 @@ class Scheduler:
         Pinned candidates bypass scoring entirely but still respect lock
         availability and eligibility checks (status, deps, cooldown). On
         lock conflict, falls through to the next pinned candidate without
-        touching skip counters or arming parks (pins bypass fairness).
+        touching skip counters or arming parks: a pin never ACCRUES fairness
+        state from this loop, but a pin dispatch settles whatever it earned
+        as a scored candidate (``_settle_fairness_on_dispatch``).
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
@@ -7416,6 +7455,7 @@ class Scheduler:
                         pin_tid, coerce_tier(pin_task.get('priority'))
                     )
                     self._dispatched_priority[pin_tid] = pin_pri
+                    self._settle_fairness_on_dispatch(pin_tid, pin_modules, pin_pri)
                     self._emit_lock_event(
                         EventType.lock_acquired,
                         task_id=pin_tid,
@@ -7473,7 +7513,6 @@ class Scheduler:
         # for fairness bookkeeping (skip counter / park installation).
         top_score, top_id, top_task, top_pri = scored[0]
         top_modules = self._get_modules(top_task)
-        top_had_parks = self.lock_table.has_parks(top_id)
 
         # One scan, one memo for admission's read-only inputs (task 3823 /
         # PRD C7).  Park and hold state does not move inside this loop, so
@@ -7537,27 +7576,10 @@ class Scheduler:
                     if ctx.candidate_signals.get(task_id) is not None:
                         self._last_dispatch_at[task_id] = self._time_source()
                     self._dispatched_priority[task_id] = pri
-                    if task_id == top_id:
-                        self._skip_count.pop(task_id, None)
-                        if top_had_parks:
-                            restored_pairs = self.lock_table.clear_parks_for(task_id)
-                            if self.event_store:
-                                self.event_store.emit(
-                                    EventType.reservation_used,
-                                    task_id=task_id,
-                                    data={'modules': modules, 'priority': pri},
-                                )
-                                for restored_owner, restored_modules in restored_pairs:
-                                    self.event_store.emit(
-                                        EventType.reservation_restored,
-                                        task_id=restored_owner,
-                                        data={
-                                            'restored_owner': restored_owner,
-                                            'modules': restored_modules,
-                                        },
-                                    )
-                    else:
-                        # A lower-ranked task won — top was passed over this tick.
+                    # Settle the winner BEFORE bumping a passed-over top: the
+                    # winner's own park would otherwise block the top's install.
+                    self._settle_fairness_on_dispatch(task_id, modules, pri)
+                    if task_id != top_id:
                         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
                     if grant is not None:
                         self._record_backfill_grant(grant)
@@ -8439,7 +8461,9 @@ class Scheduler:
             self._arm_requeue_cooldown(task_id, armed_n)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
-        # Defensive: clear any reservations still owned by this task.
+        # Defensive: dispatch already settled this task's parks, so this only
+        # clears parks installed after dispatch (e.g. a reserve_now armed on
+        # a running task).
         restored_pairs = self.lock_table.clear_parks_for(task_id)
         if modules:
             self._emit_lock_event(
