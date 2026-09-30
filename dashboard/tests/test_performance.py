@@ -1152,7 +1152,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1225,7 +1225,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1299,7 +1299,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             canonical_inner = {
@@ -1380,7 +1380,7 @@ class TestAggregateLoopHistograms:
             'values': [1, 1, 1, 1, 1, 1],
         }
 
-        async def _fake_get_loop_histograms(db, *, days, now):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -2348,6 +2348,9 @@ def test_no_sql_side_clock_reads_in_data_layer():
 
 CARDS_NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 CARDS_DAYS = 7
+# The hour buckets of a1-a3 in _active_and_idle_rows(CARDS_NOW); a4's
+# '2026-09-23T11:00' falls before the cutoff.
+ACTIVE_IN_WINDOW_HOURS = ['2026-09-30T09:00', '2026-09-30T10:00', '2026-09-30T11:00']
 
 
 def _task_row(
@@ -2432,17 +2435,19 @@ class TestCardsShareTheWallClockWindow:
         assert result['idle']['p50'] == 0
 
     @pytest.mark.asyncio
-    async def test_cards_count_the_rows_the_sparkline_counts(
+    async def test_cards_and_sparkline_both_exclude_the_row_before_the_cutoff(
         self, active_idle_conn, empty_escalations_dir,
     ):
+        """a4 sits 30 minutes before the shared cutoff: the cards count only
+        a1-a3, and the sparkline buckets only their three hours."""
         paths = await aggregate_completion_paths(
             [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
         )
         history = await aggregate_performance_history(
             [active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW,
         )
-        hour_buckets = history['active']['time_centiles_history']['labels']
-        assert sum(entry['count'] for entry in paths['active']) == len(hour_buckets)
+        assert sum(entry['count'] for entry in paths['active']) == 3
+        assert history['active']['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
 
     @pytest.mark.asyncio
     async def test_default_now_is_the_wall_clock(self, tmp_path, empty_escalations_dir):
@@ -2520,7 +2525,6 @@ class TestPerformanceCardsDatum:
         assert datum.reason is not None
         assert datum.value is not None
         assert datum.as_of == CARDS_NOW - timedelta(days=20)
-        assert CARDS_NOW - datum.as_of == timedelta(days=20)
         assert '7d' in datum.reason
         assert 'last completion' in datum.reason
         wire = datum.value.to_wire()
@@ -2592,6 +2596,69 @@ class TestPerformanceCardsDatum:
         assert await aggregate_performance_cards([None], [empty_escalations_dir], **window) == {}
 
     @pytest.mark.asyncio
+    async def test_a_family_that_raises_leaves_its_projects_unknown_naming_it(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        async def _raising_histograms(*_args, **_kwargs):
+            raise RuntimeError('histogram read failed')
+
+        with patch('dashboard.data.performance.aggregate_loop_histograms', _raising_histograms):
+            cards = await aggregate_performance_cards(
+                [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert set(cards) == {'active', 'idle'}
+        for datum in cards.values():
+            assert datum.state is DatumState.UNKNOWN
+            assert datum.reason == 'the loop histograms of this project could not be read'
+            validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_family_whose_query_fails_open_leaves_the_project_unknown(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        """A runs.db without ``verify_attempts`` fails only the loop-histogram
+        query; its project is served UNKNOWN naming that family, not dropped."""
+        db_path = tmp_path / 'drifted.db'
+        with sqlite3.connect(str(db_path)) as setup:
+            setup.execute(
+                'CREATE TABLE task_results (run_id TEXT, task_id TEXT, project_id TEXT, '
+                'outcome TEXT, duration_ms INTEGER, review_cycles INTEGER, '
+                'steward_invocations INTEGER, completed_at TEXT)',
+            )
+            setup.execute(
+                "INSERT INTO task_results VALUES ('r', 't1', 'drifted', 'done', 1000, 0, 0, ?)",
+                ((CARDS_NOW - timedelta(hours=1)).isoformat(),),
+            )
+        async with aiosqlite.connect(str(db_path)) as conn:
+            cards = await aggregate_performance_cards(
+                [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        datum = cards['drifted']
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason == 'the loop histograms of this project could not be read'
+
+    @pytest.mark.asyncio
+    async def test_query_count_does_not_grow_with_the_project_count(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        async def statements_for(project_count: int) -> list[str]:
+            db_path = _make_runs_db(tmp_path, f'{project_count}-projects.db', [
+                _task_row(f't{i}', f'p{i}', CARDS_NOW - timedelta(hours=1))
+                for i in range(project_count)
+            ])
+            statements: list[str] = []
+            async with aiosqlite.connect(str(db_path)) as conn:
+                await conn.set_trace_callback(statements.append)
+                await aggregate_performance_cards(
+                    [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+                )
+            return statements
+
+        one_project, six_projects = await statements_for(1), await statements_for(6)
+        assert len(six_projects) == len(one_project)
+        assert sum('MAX(completed_at)' in sql for sql in six_projects) == 1
+
+    @pytest.mark.asyncio
     async def test_shaped_payload_serves_both_states_under_one_now(
         self, active_idle_conn, empty_escalations_dir,
     ):
@@ -2605,11 +2672,12 @@ class TestPerformanceCardsDatum:
         )
         performance_by_label = shaped['PERFORMANCE']
 
+        assert shaped['served_at'] == CARDS_NOW.isoformat()
+
         active = performance_by_label['active']
         assert active['cards']['state'] == 'fresh'
-        assert sum(entry['count'] for entry in active['cards']['value']['paths']) == len(
-            active['time_centiles_history']['labels'],
-        )
+        assert sum(entry['count'] for entry in active['cards']['value']['paths']) == 3
+        assert active['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
 
         idle = performance_by_label['idle']
         assert idle['cards']['state'] == 'stale'

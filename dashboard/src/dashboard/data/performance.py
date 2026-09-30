@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import enum
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 from escalation.queue import iter_all_escalation_paths
@@ -23,7 +26,7 @@ from shared.timestamps import parse_timestamp_or_warn
 from dashboard.data.datum import Datum, DatumState
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import resolve_now
+from dashboard.data.utils import resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,7 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
 
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
-    recorded completion — the card families' project discovery set."""
+    recorded completion — the projects a card family tallies by default."""
     rows = await db.execute_fetchall(
         'SELECT project_id, MAX(completed_at) '
         '  FROM task_results '
@@ -82,6 +85,28 @@ async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
         ' GROUP BY project_id',
     )
     return {row[0]: row[1] for row in rows}
+
+
+async def _window_rows_by_project(
+    db: aiosqlite.Connection,
+    sql: str,
+    since: str,
+    projects: Collection[str] | None,
+) -> dict[str, list[tuple]]:
+    """Each listed project's in-window rows of *sql*, without their leading ``project_id``.
+
+    *sql* selects ``project_id`` first and binds two parameters: the listed
+    projects as a JSON array for ``json_each``, then *since*. One query per
+    call, and ``project_id IN (json_each)`` keeps ``idx_task_results_project``
+    usable. Every listed project gets an entry, so a project with nothing in
+    the window reads ``[]`` — its empty tally, never an absence. *projects*
+    defaults to every project with a recorded completion in *db*.
+    """
+    listed = list(projects if projects is not None else await _latest_completions(db))
+    by_project: dict[str, list[tuple]] = {project_id: [] for project_id in listed}
+    for row in await db.execute_fetchall(sql, (json.dumps(listed), since)):
+        by_project[row[0]].append(tuple(row)[1:])
+    return by_project
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +120,12 @@ async def get_completion_paths(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project completion path breakdown.
 
-    Returns {project_id: [{path: str, count: int, pct: float}, ...]}.
+    Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
+    of *projects* (default: every project with a recorded completion).
     Paths: one-pass, multi-pass, via-steward, via-interactive, blocked.
     """
     escalations = _load_escalations(escalations_dir)
@@ -113,15 +140,16 @@ async def get_completion_paths(
 
     async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {}
-        for project_id in await _latest_completions(db):
-            rows = await db.execute_fetchall(
-                'SELECT task_id, outcome, review_cycles, '
-                '       steward_invocations '
-                '  FROM task_results '
-                ' WHERE project_id = ? AND completed_at >= ? ',
-                (project_id, since),
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, task_id, outcome, review_cycles, '
+            '       steward_invocations '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             counts: dict[str, int] = {
                 'one-pass': 0,
                 'multi-pass': 0,
@@ -171,6 +199,7 @@ async def aggregate_completion_paths(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, list[dict]]:
     """Merge :func:`get_completion_paths` results from multiple databases.
 
@@ -202,7 +231,7 @@ async def aggregate_completion_paths(
     now = resolve_now(now)
     results = await asyncio.gather(
         *(
-            get_completion_paths(db, edir, days=days, now=now)
+            get_completion_paths(db, edir, days=days, now=now, projects=projects)
             for db, edir in zip(dbs, escalations_dirs, strict=True)
         )
     )
@@ -239,6 +268,7 @@ async def aggregate_escalation_rates(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_escalation_rates` results from multiple databases.
 
@@ -253,7 +283,7 @@ async def aggregate_escalation_rates(
     now = resolve_now(now)
     results = await asyncio.gather(
         *(
-            get_escalation_rates(db, edir, days=days, now=now)
+            get_escalation_rates(db, edir, days=days, now=now, projects=projects)
             for db, edir in zip(dbs, escalations_dirs, strict=True)
         )
     )
@@ -288,6 +318,7 @@ async def aggregate_loop_histograms(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_loop_histograms` results from multiple databases.
 
@@ -307,7 +338,7 @@ async def aggregate_loop_histograms(
 
     now = resolve_now(now)
     results = await asyncio.gather(
-        *(get_loop_histograms(db, days=days, now=now) for db in dbs),
+        *(get_loop_histograms(db, days=days, now=now, projects=projects) for db in dbs),
     )
 
     merged: dict[str, dict] = {}
@@ -350,6 +381,7 @@ async def _durations_by_project(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, list[int]]:
     """Return raw ``duration_ms`` lists per project_id (internal helper).
 
@@ -362,13 +394,16 @@ async def _durations_by_project(
 
     async def _query(db: aiosqlite.Connection) -> dict[str, list[int]]:
         result: dict[str, list[int]] = {}
-        for project_id in await _latest_completions(db):
-            rows = await db.execute_fetchall(
-                'SELECT duration_ms FROM task_results '
-                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' "
-                ' ORDER BY duration_ms ',
-                (project_id, since),
-            )
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, duration_ms FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            "   AND outcome = 'done' "
+            ' ORDER BY duration_ms ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             result[project_id] = [row[0] for row in rows if row[0] is not None and row[0] > 0]
 
         return result
@@ -381,6 +416,7 @@ async def aggregate_time_centiles(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Merge time-centile data from multiple databases.
 
@@ -395,7 +431,7 @@ async def aggregate_time_centiles(
 
     now = resolve_now(now)
     results = await asyncio.gather(
-        *(_durations_by_project(db, days=days, now=now) for db in dbs),
+        *(_durations_by_project(db, days=days, now=now, projects=projects) for db in dbs),
     )
 
     # Merge: concatenate raw duration lists per project_id
@@ -434,12 +470,14 @@ async def get_escalation_rates(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Per-project escalation rates and human attention breakdown.
 
     Returns {project_id: {total_tasks, steward_count, interactive_count,
                           steward_rate, interactive_rate,
-                          human_attention: {zero, minimal, significant}}}.
+                          human_attention: {zero, minimal, significant}}}
+    for each of *projects* (default: every project with a recorded completion).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -454,16 +492,15 @@ async def get_escalation_rates(
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         result: dict[str, dict] = {}
-        for project_id in await _latest_completions(db):
-            rows = list(
-                await db.execute_fetchall(
-                    'SELECT task_id, steward_invocations '
-                    '  FROM task_results '
-                    ' WHERE project_id = ? AND completed_at >= ? ',
-                    (project_id, since),
-                )
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, task_id, steward_invocations '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             total = len(rows)
             steward_count = 0
             interactive_count = 0
@@ -519,13 +556,14 @@ async def get_loop_histograms(
     *,
     days: int = 7,
     now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Per-project loop cycle distributions.
 
     Returns {project_id: {
         outer: {labels: [str], values: [int]},
         inner: {labels: [str], values: [int]},
-    }}.
+    }} for each of *projects* (default: every project with a recorded completion).
     Outer = review_cycles (0,1,2,3+). Inner = verify_attempts (0,1,2,3,4,5+).
     Filtered to outcome=done tasks only.
     """
@@ -534,14 +572,16 @@ async def get_loop_histograms(
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         result: dict[str, dict] = {}
-        for project_id in await _latest_completions(db):
-            rows = await db.execute_fetchall(
-                'SELECT review_cycles, verify_attempts '
-                '  FROM task_results '
-                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' ",
-                (project_id, since),
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, review_cycles, verify_attempts '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            "   AND outcome = 'done' ",
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             # Outer loop: review cycles (0, 1, 2, 3+)
             outer_bins = [0, 0, 0, 0]  # indices 0-3
             outer_labels = ['0', '1', '2', '3+']
@@ -952,6 +992,88 @@ async def _latest_completion_instants(
     return latest
 
 
+class _CardFamily(enum.Enum):
+    """The four families a project's card block is built from, by display name."""
+
+    PATHS = 'completion paths'
+    ESCALATION = 'escalation rates'
+    HISTOGRAMS = 'loop histograms'
+    TTC = 'time centiles'
+
+
+async def _read_card_families(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int,
+    now: datetime,
+    projects: frozenset[str],
+) -> dict[_CardFamily, Mapping[str, Any]]:
+    """Each card family's ``{project_id: tally}`` over the listed *projects*.
+
+    Gathered with ``return_exceptions=True``: a family that raises reads as
+    ``{}``, blanking only its own tallies. A listed project a family did not
+    tally is logged here and served UNKNOWN by :func:`_cards_datum`.
+    """
+    reads = {
+        _CardFamily.PATHS: aggregate_completion_paths(
+            dbs, escalations_dirs, days=days, now=now, projects=projects,
+        ),
+        _CardFamily.ESCALATION: aggregate_escalation_rates(
+            dbs, escalations_dirs, days=days, now=now, projects=projects,
+        ),
+        _CardFamily.HISTOGRAMS: aggregate_loop_histograms(
+            dbs, days=days, now=now, projects=projects,
+        ),
+        _CardFamily.TTC: aggregate_time_centiles(dbs, days=days, now=now, projects=projects),
+    }
+    results = await asyncio.gather(*reads.values(), return_exceptions=True)
+    readings: dict[_CardFamily, Mapping[str, Any]] = {}
+    for family, result in zip(reads, results, strict=True):
+        reading: Mapping[str, Any] = safe_gather_result(result, {}, f'perf/cards/{family.value}')
+        untallied = projects - reading.keys()
+        if untallied:
+            logger.warning('performance cards: no %s tally for %s', family.value, sorted(untallied))
+        readings[family] = reading
+    return readings
+
+
+def _cards_datum(
+    project_id: str,
+    readings: Mapping[_CardFamily, Mapping[str, Any]],
+    latest: datetime | None,
+    served_at: datetime,
+    days: int,
+) -> Datum[PerformanceCards]:
+    """*project_id*'s cards Datum: UNKNOWN, naming the families, when any
+    family has no tally for it; otherwise its window tally, aged by *latest*."""
+    bound = _window_bound_seconds(days)
+    unread = [family.value for family, reading in readings.items() if project_id not in reading]
+    if unread:
+        return Datum(
+            value=None,
+            as_of=None,
+            state=DatumState.UNKNOWN,
+            reason=f'the {" and ".join(unread)} of this project could not be read',
+            freshness_bound_seconds=bound,
+        )
+    histograms = readings[_CardFamily.HISTOGRAMS][project_id]
+    as_of, state, reason = _cards_provenance(latest, served_at, days)
+    return Datum(
+        value=PerformanceCards(
+            paths=readings[_CardFamily.PATHS][project_id],
+            escalation=readings[_CardFamily.ESCALATION][project_id],
+            hist_outer=histograms['outer'],
+            hist_inner=histograms['inner'],
+            ttc=readings[_CardFamily.TTC][project_id],
+        ),
+        as_of=as_of,
+        state=state,
+        reason=reason,
+        freshness_bound_seconds=bound,
+    )
+
+
 async def aggregate_performance_cards(
     dbs: list[aiosqlite.Connection | None],
     escalations_dirs: list[Path],
@@ -961,33 +1083,22 @@ async def aggregate_performance_cards(
 ) -> dict[str, Datum[PerformanceCards]]:
     """Each project's card block for the window ``[now - days, now]``, as one Datum.
 
-    The value is the project's window tally; ``as_of`` is its newest
-    contributing event, its latest completion. So "fresh" means the last
-    completion lies inside the window, and an idle project (completions ever,
-    none in the window) is stale by the envelope's own bound.
+    The projects are discovered once per DB: every project with a recorded
+    completion is listed, and each family tallies exactly those. The value is
+    the project's window tally; ``as_of`` is its newest contributing event,
+    its latest completion. So "fresh" means the last completion lies inside
+    the window, and an idle project (completions ever, none in the window) is
+    stale by the envelope's own bound. A project some family could not tally
+    is UNKNOWN rather than dropped.
     """
     served_at = resolve_now(now)
-    paths, escalation, histograms, ttc, latest = await asyncio.gather(
-        aggregate_completion_paths(dbs, escalations_dirs, days=days, now=served_at),
-        aggregate_escalation_rates(dbs, escalations_dirs, days=days, now=served_at),
-        aggregate_loop_histograms(dbs, days=days, now=served_at),
-        aggregate_time_centiles(dbs, days=days, now=served_at),
-        _latest_completion_instants(dbs),
+    latest = await _latest_completion_instants(dbs)
+    if not latest:
+        return {}
+    readings = await _read_card_families(
+        dbs, escalations_dirs, days=days, now=served_at, projects=frozenset(latest),
     )
-    cards: dict[str, Datum[PerformanceCards]] = {}
-    for project_id in sorted(paths.keys() & escalation.keys() & histograms.keys() & ttc.keys()):
-        as_of, state, reason = _cards_provenance(latest.get(project_id), served_at, days)
-        cards[project_id] = Datum(
-            value=PerformanceCards(
-                paths=paths[project_id],
-                escalation=escalation[project_id],
-                hist_outer=histograms[project_id]['outer'],
-                hist_inner=histograms[project_id]['inner'],
-                ttc=ttc[project_id],
-            ),
-            as_of=as_of,
-            state=state,
-            reason=reason,
-            freshness_bound_seconds=_window_bound_seconds(days),
-        )
-    return cards
+    return {
+        project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
+        for project_id in sorted(latest)
+    }
