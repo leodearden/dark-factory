@@ -561,14 +561,22 @@ and are not restated here.
   `shared/src/shared/task_claimant.py`. The classification itself is a single
   table, `_RECOVERY` in
   `orchestrator/src/orchestrator/task_ground_truth.py`, keyed by
-  (status × branch-state × open-escalation × deploy-phase) and defaulting
-  fail-safe to `LEAVE` for any shape it does not recognize — including every
-  shape with a live claimant. `RecoveryAction` today has four members:
+  (status × live-claimant × branch-state × escalation-veto × deploy-phase) and
+  defaulting fail-safe to `LEAVE` for any shape it does not recognize —
+  including every shape with a live claimant. The escalation element is the
+  shared classifier's conservative done-flip answer
+  (`classify_pins(...).vetoes_done_flip`, via
+  `orchestrator/src/orchestrator/task_ground_truth.py::_shape`; see "Pin
+  discrimination" below), not "any open record", so an `info`-severity-only
+  record does not key it. `RecoveryAction` has five members:
   `MARK_DONE_WITH_PROVENANCE` (branch on `main` or carrying a merge
   marker → `found_on_main`, behind the provenance and delivered-checks gates),
-  `REVERT_TO_PENDING` (branch off-main or gone, no open record),
-  `RE_FILE_ESCALATION` (a row that lost its record — re-files a
-  `stranded_blocked` L1 and deliberately changes **no** status), and `LEAVE`.
+  `REVERT_TO_PENDING` (branch off-main or gone, no vetoing record),
+  `CONVERT_TO_BLOCKED` (a stranded, unclaimed `in-progress` row whose open
+  record vetoes a done-flip, in any of the four branch states → `blocked`; see
+  "Converting a pinned strand" below), `RE_FILE_ESCALATION` (a row that lost
+  its record — re-files a `stranded_blocked` L1 and deliberately changes
+  **no** status), and `LEAVE`.
   The matching sweep for stranded `blocked` rows is the scheduler phase
   `_phase_redispatch_stranded_blocked` (`scheduler.py`).
 - **Pin discrimination — what an open record actually vetoes.** The shared
@@ -593,16 +601,31 @@ and are not restated here.
   escalation queue is injected, `_resolve_open_escalations` returns `[]`, which
   is indistinguishable from a genuine "no open escalations" — the
   collapse the `store_unavailable` result exists to prevent. That is task 3535.
-- **Converting a pinned strand (normative — NOT yet landed).** The spec's
-  recovery rule is that a stranded row carrying a genuinely-pinning record must
-  be **converted to `blocked`** and attributed to that record —
-  `CONVERT_TO_BLOCKED` — rather than reverted to `pending` underneath the
-  responder or left stranded: nothing new is filed, in-flight work is
-  preserved, and the row re-couples to the ladder's existing wake edges. Read
-  this as intent, not as current behaviour: `RecoveryAction` has no such member
-  today (the enum is the four above, and `CONVERT_TO_BLOCKED` appears nowhere
-  in code). It lands via `plans/task-escalation-state-graph-prd.md` leaf δ, in
-  log-mode first with enforcement behind the soak gate.
+- **Converting a pinned strand.** `_RECOVERY` maps a stranded, unclaimed
+  `in-progress` row whose open record vetoes a done-flip to
+  `CONVERT_TO_BLOCKED` in all four branch states, landed-but-pinned rows
+  included; the normative rule is spec §7.2. The applier,
+  `Harness._reconcile_one_stranded` (`harness.py`), writes `blocked`, files
+  nothing and writes no `done_provenance`. Conversion is a legibility action,
+  not a recovery: the row keeps its pin and does not self-heal. Its exit is
+  its record's resolution — by a human, or, for a dead-filer L0, by the
+  supervised consumer that takes it once the orphan-L0 reaper has promoted it
+  to L1 ("Orphaned L0 records" below) — where a `resume` re-pends it (§6).
+  Every CONVERT row is keyed `in-progress`, so a converted
+  row can never match one again: conversion is one-shot. A row that the
+  blocked-arm upgrade clauses would move again on the next sweep —
+  `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
+  is False, because it is pinned only by merge-remediable `stranded_blocked`
+  records or only by dead-filer L0s — would not be at rest in `blocked`, so it
+  is held at `LEAVE` instead. The write is observe-before-enforce, gated by
+  `convert_to_blocked_enforce`
+  (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`). With it
+  off, the sweep logs the conversion it would perform and holds the row at
+  `LEAVE`, emitting the same `recovery_vetoed` row (reason
+  `escalation_pinned`); with it on, it writes `blocked`. Which mode is live is
+  that field's default plus any `dark-factory-orchestrator.yaml` override;
+  promoting it is operator gate μ (task 3546,
+  `plans/task-escalation-state-graph-prd.md`).
 - **Orphaned worktrees.** `Harness._reap_orphan_worktrees` (`harness.py`)
   quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
