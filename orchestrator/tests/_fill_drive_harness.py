@@ -81,7 +81,7 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
 
     async def _fake_dispatch_item(item: Any) -> InflightEntry | None:
         drive.dispatched.append(item)
-        lease = await allocator.acquire(lambda: MagicMock())
+        lease = await allocator.acquire(lambda: MagicMock(), policy='prefer_local')
         if lease is None:
             return None
         # Signal only after the lease is confirmed held, not merely

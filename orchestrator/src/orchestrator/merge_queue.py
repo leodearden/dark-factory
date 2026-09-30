@@ -2667,11 +2667,11 @@ async def _run_post_merge_verify(
             production ``SpeculativeMergeWorker._run_inflight_verify`` call
             site passes ``self.operator_halt``; every other (module-level,
             test-local) caller omits it (default ``None`` → no halt), keeping
-            them byte-identical.  Cross-check REMAINS a trailing detector, not
-            a pre-adoption gate (pre-gating every remote-sole verdict would
-            double Lever-C cost); the halt is synchronous purely so it
-            precedes any further adoption — incident 83336a32 halted +3s too
-            late via the async escalation gate.
+            them byte-identical.  With ``verify_cross_check_remote_green`` on
+            (default True) the cross-check is a BLOCKING pre-land local
+            re-verify, NOT a trailing detector; the halt is synchronous purely
+            so it precedes any further adoption — incident 83336a32 halted +3s
+            too late via the async escalation gate, which trails it.
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
@@ -3392,9 +3392,9 @@ async def _run_post_merge_verify(
                 # outcome — so no FURTHER adoption can occur before a human looks.
                 # The async escalation-queue gate is only checked at the NEXT
                 # merger iteration, so it TRAILS adoption: incident 83336a32
-                # diverged +3s AFTER CAS-advance.  Cross-check REMAINS a TRAILING
-                # detector, not a pre-adoption gate (pre-gating every remote-sole
-                # verdict would double Lever-C cost); the halt is synchronous
+                # diverged +3s AFTER CAS-advance.  With verify_cross_check_remote_green
+                # on (default True) the cross-check is a BLOCKING pre-land local
+                # re-verify, NOT a trailing detector; the halt is synchronous
                 # purely so it precedes any further adoption.  None-safe: only the
                 # production worker call site threads self.operator_halt.
                 #
@@ -9839,7 +9839,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # divergence would go undetected — defeating the safety control.
         # Mirrors the _shadow_compare_tasks pattern (see :func:`_maybe_schedule_shadow_compare`).
         self._drift_check_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
-        # β worker-lifetime host allocator (one slot per host, prefer-local).
+        # β worker-lifetime host allocator (one slot per host, config-selected order: verify_host_policy).
         # None until first _ensure_host_allocator(config) call — lazily built
         # because config arrives per-MergeRequest, not at __init__ time.
         self._host_allocator: HostAllocator | None = None
@@ -21261,9 +21261,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # item) and `req`.  It builds a LocalRunner; _run_inflight_verify will
         # override merge_wt via warm-swap on the local path, so the factory's
         # merge_wt is a reasonable initial value.
-        # NOTE: the factory is called ONLY when the local slot is free (prefer-local
-        # policy in HostAllocator.acquire); the remote path uses the remote runner
-        # directly without calling the factory.
+        # NOTE: the factory is called ONLY when the LOCAL host is selected; which
+        # host acquire() tries first is config-driven (verify_host_policy), and the
+        # remote path uses the remote runner directly without calling the factory.
         _item_for_factory = item
         _req_for_factory = req
 
@@ -21287,7 +21287,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 task_id=_req_for_factory.task_id,
             )
 
-        lease = await allocator.acquire(_local_factory)
+        lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)
         if lease is None:
             # Should not happen (free_host_count > 0 was checked above with no
             # intervening await that could yield to a concurrent dispatch — asyncio

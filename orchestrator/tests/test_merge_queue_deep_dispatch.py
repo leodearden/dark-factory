@@ -2300,7 +2300,7 @@ class _StubRemoteAllocator:
     def free_host_count(self) -> int:
         return 0 if self._held else 1
 
-    async def acquire(self, _local_factory):
+    async def acquire(self, _local_factory, *, policy):
         if self._held:
             return None
         self._held = True
