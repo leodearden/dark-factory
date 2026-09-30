@@ -1255,14 +1255,25 @@ Three restart mechanisms act on the orchestrator fleet. They're
 deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
-- **Liveness = brokenness.** `main()`'s port-probe pass over the
-  **`WATCHED` orchestrator units** revives a wedged or port-down unit
-  immediately: per-unit, uncapped, not gated by any fleet-wide clock, and
-  it never stamps that clock. A single wedged-unit revive is not a fleet
-  deploy. Read "uncapped" as scoped to those units: it does **not**
-  describe `fused-memory.service`, which is deliberately kept out of
-  `WATCHED` and has had its own streak-gated, rate-capped liveness pass
-  since task 3764 — see
+- **Liveness = brokenness.** `main()`'s pass over the **`WATCHED`
+  orchestrator units** revives a dead unit immediately on either of two
+  signals — per-unit, uncapped, not gated by any fleet-wide clock, and it
+  never stamps that clock. The port-probe signal (wedged or port-down) is
+  unchanged. Under systemd socket activation each unit's escalation port is
+  held by its own `.socket` unit, so it can keep reading LISTEN across a
+  dead service; `main()` therefore also asks systemd's ActiveState
+  (`_unit_active_state()`) whenever the port IS up, and revives on
+  `inactive`/`failed` (`UNIT_DEAD_ACTIVE_STATES`) exactly as it would a down
+  port — a transitional state (`activating`/`deactivating`/`reloading`) is
+  never treated as dead, since a unit mid-restart can take up to 90s to
+  settle. Reviving no longer calls `systemctl stop`: `restart_unit()` is
+  `reset-failed` (targeting the unit AND its `.socket` sibling) then
+  `restart --no-block`, so a revive never closes a socket-activated unit's
+  listening socket out from under an open MCP connection. A single
+  wedged-unit revive is not a fleet deploy. Read "uncapped" as scoped to
+  those units: it does **not** describe `fused-memory.service`, which is
+  deliberately kept out of `WATCHED` and has had its own streak-gated,
+  rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
   is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
@@ -1393,38 +1404,56 @@ Classification lives in
 `scripts/orchestrator-watchdog.py::_register_transient_unit`; the state probe
 is `scripts/orchestrator-watchdog.py::_unit_is_active`.
 
-### fused-memory socket activation (port 8002 survives restarts)
+### Socket activation (MCP ports survive restarts)
 
-`fused-memory.socket` (committed at `scripts/fused-memory.socket.template`) owns the
-listening socket on `0.0.0.0:8002`; `fused-memory.service` requires it, and
-the server adopts it via
-`shared/src/shared/systemd_listeners.py::take_systemd_listeners`. The port
-therefore stays bound while the service restarts (~50s): clients connecting
+Every MCP port an interactive Claude session talks to is owned by a systemd
+socket unit, so it stays bound while its service restarts: clients connecting
 mid-restart wait in the kernel backlog and are served by the new process.
+
+| Socket unit | Ports | Service |
+|---|---|---|
+| `fused-memory.socket` | `0.0.0.0:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
+| `orchestrator-<project>.socket` | that project's `escalation.port` (8100–8108) | `orchestrator-<project>.service` |
+
+The servers adopt the socket via
+`shared/src/shared/systemd_listeners.py::take_systemd_listeners`; without
+socket activation they bind the port themselves, as before. The units are
+committed as `scripts/<unit>.socket.template` — only because `.socket` is not
+in the lock-charter extension allowlist; they have no placeholders — and
+installed as `<unit>.socket` by `scripts/setup-host.sh` (fused-memory in
+section 4, orchestrators in section 5, both parity-gated).
 
 Why: Claude Code's HTTP MCP client (≥2.1.280) treats refused connections as
 terminal, retries 5 times over ~15s, then withdraws the server's tools until
-a manual `/mcp`. Before this, every fused-memory restart (~9/day) did that to
-every connected interactive session. Measured 2026-09-25 on 2.1.282 with a
-45s restart: without the socket the client gave up at +16s; with it, one
-connection reset and nothing else, and tool calls kept working.
+a manual `/mcp`. A fused-memory restart kept 8002 closed 41–63s (~9/day), an
+orchestrator restart its escalation port 6–97s. Measured 2026-09-25 on
+2.1.282 with a 45s restart: without the socket the client gave up at +16s;
+with it, one connection reset and nothing else, and tool calls kept working.
 
-What changes for an operator:
+**Stopping still stops.** Each service's `ExecStopPost`
+(`scripts/stop-socket-unless-restarting.sh`) stops its socket when the service
+has a `stop` job, so the port closes and no later connection — the
+dashboard polls every escalation port every ~3s — can start a stopped or
+disabled service again. A `restart` job, or a crash awaiting auto-restart,
+keeps the socket bound. `Also=` in each service's `[Install]` makes
+`enable`/`disable` cover its socket.
 
 | Command | Effect |
 |---|---|
-| `systemctl --user restart fused-memory` | Unchanged — restarts the process; the port never closes. |
-| `systemctl --user stop fused-memory` | Stops the process but **the port stays listening**, and the next connection (any orchestrator, the watchdog's `/alive` probe) starts it again. |
-| `systemctl --user stop fused-memory.socket fused-memory` | Actually takes fused-memory down; stopping the socket stops the service too. |
+| `systemctl --user restart <service>` | Restarts the process; the port never closes. |
+| `systemctl --user stop <service>` / `disable --now <service>` | Stops the process **and** its socket; the port closes. |
+| a crash under `Restart=on-failure` | The port stays bound; clients queue until the automatic restart. |
 
-Installing on a host that predates it: `scripts/setup-host.sh` section 4
-installs and enables the socket. By hand: copy `scripts/fused-memory.socket.template`
-to `~/.config/systemd/user/fused-memory.socket`, re-render the service unit (it now carries
-`Requires=`/`After=fused-memory.socket`), `systemctl --user daemon-reload`,
-`systemctl --user enable fused-memory.socket`, then
-`systemctl --user stop fused-memory` **before**
-`systemctl --user start fused-memory.socket fused-memory` — the old process
-binds 8002 itself, so the socket cannot bind until it exits.
+The watchdog revives with `reset-failed` + `restart --no-block` (never
+`stop`, which would close the port), and treats an enabled unit whose port
+listens but whose `ActiveState` is `inactive`/`failed` as dead — under socket
+activation a listening port no longer proves the process is alive.
+
+Migrating a host: run `scripts/setup-host.sh`, or install the units by hand
+and `systemctl --user daemon-reload` + `enable` the sockets. The next
+`systemctl --user restart` of each service completes the switch — systemd
+orders the old process's stop before the socket's start, so the socket binds
+the port the old process just released.
 
 ### fused-memory liveness revive
 
@@ -1438,12 +1467,14 @@ and a revive rate cap — described below.
 
 **The verdict** comes from
 `scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
-classifies fm three ways: `port-down` (the port probe fails — under socket
-activation the probe sees systemd's socket, so this now means
-`fused-memory.socket` itself is down; a dead process behind a live socket
-is restarted by the next connection instead), `healthy` (the zero-I/O `/alive` route
-answers within 15s), or `wedged` (the port is up but `/alive` does not
-answer — the asyncio loop is hung). `/health` is deliberately not
+classifies fm three ways: `port-down` (the port probe fails), `healthy`
+(the zero-I/O `/alive` route answers within 15s), or `wedged` (the port is
+up but `/alive` does not answer — the asyncio loop is hung). Under socket
+activation `port-down` does **not** mean the process is gone: the probe sees
+`fused-memory.socket`, which stays bound through a restart or a crash awaiting
+auto-restart and closes only on a deliberate stop or disable. A dead process
+behind a live socket is restarted by the next connection, and one that does
+not answer in time reads as `wedged`. `/health` is deliberately not
 consulted for the verdict: it awaits two sequential backing-store
 round-trips, which would make a slow FalkorDB/Qdrant read as a wedge and
 get the shared MCP server restarted for nothing. `/health` is still the
@@ -1741,13 +1772,15 @@ cases, the same backing stores. **Check this table before adding a job** —
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
 | 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
+| 05:30 | Cross-project return brief (Fable prepare + render) | `return-brief.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
+for the 03:30 job; the sections below for the 03:00 and 05:00 ones, and
+[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -2129,6 +2162,114 @@ preconditions for flipping it, so "the guard is off" is never misread as
 **3626**'s re-measurement — it emits both slug-conformance partitions that
 gate's recipe asks for. The obligation, the target and the honest baseline
 are owned in `docs/prds/memory-metadata-vocabulary.md` §9.
+
+### Cross-project return brief (05:30)
+
+**What it does.** Writes `data/return-brief.md`, the page Leo pulls on return:
+what needs him across every project, then what the fleet did while he was
+away. It has six sections: decisions needed, rulings made under standing
+policy, landed, stuck and why, spend and cap hits, and autonomous closes. It
+supersedes `data/afk-digest.md`, which was last written 2026-08-19.
+
+| File | Role |
+|---|---|
+| `scripts/return-brief.sh` | Wrapper: prepare, then render |
+| `scripts/return-brief.service` | `Type=oneshot` around the wrapper |
+| `scripts/return-brief.timer` | `OnCalendar=*-*-* 05:30:00` |
+| `scripts/install-return-brief-timer.sh` | Installer |
+| `scripts/sitting/nightly_prepare.py` | Step 1: the prepare-sitting mode, headless on Fable |
+| `scripts/sitting/return_brief.py` | Step 2: the deterministic render |
+
+**Two steps, in order.**
+
+1. **Prepare.** A headless `claude --print` run on Fable follows the
+   prepare-sitting mode's nightly form and records its judgement (options,
+   ramifications, a recommendation or an explicit no-lean) with
+   `prepare_sitting.py record`. It is read-only by construction: it runs
+   under `--permission-mode dontAsk`, with an allowlist and an explicit
+   denylist of every apply verb, both in `nightly_prepare.py`, and its
+   environment sets `SITTING_NIGHTLY_CONFINED`, under which
+   `prepare_sitting.py` refuses anything but `brief` and `record` into
+   `data/sitting/`, including `--apply-closes` and `--ledger`. Its only MCP
+   servers are the `escalation` and `fused-memory` blocks of the checkout's
+   `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
+   on the project config being approved for a headless run, and playwright
+   never starts. Its account comes from the shared pool, as a
+   lease that is read and handed straight back, so the night's Fable spend
+   is invisible to the gate. With nothing leasable, it inherits the unit's
+   environment. It stops itself after 2700s.
+2. **Render.** This step is deterministic and runs whatever prepare
+   returned. Every figure on the page comes from its own fresh measurement
+   and carries a stamp, and a store it cannot read is a stated shortfall in
+   its section. The model states no figure the page prints.
+
+**The artifacts are NOT committed.** `.gitignore` anchors `/data/`, so there
+is no commit seam, unlike the 05:00 census:
+
+| Path | What it carries |
+|---|---|
+| `data/return-brief.md` | The page |
+| `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
+| `data/sitting/preparation.json` | The prepared judgement, per open item |
+
+**The regen commands**, which are the two invocations the wrapper makes, run
+from the repo root:
+
+```bash
+uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
+uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+```
+
+The first spends a Fable budget. For a **no-cost re-render**, skip it:
+`RETURN_BRIEF_SKIP_PREPARE=1 scripts/return-brief.sh`.
+
+**Reading a night.** Every wrapper line is prefixed `return-brief:`, and the
+run ends with one summary line:
+
+```
+return-brief: done (prepare=0 brief=0)
+```
+
+```bash
+journalctl --user -u return-brief.service -n 100
+systemctl --user list-timers return-brief.timer
+```
+
+- `prepare=1` means the Fable run failed, timed out or hit a usage limit;
+  its log line carries both stream tails. That is routine, not an incident:
+  the page is still written, and items the run did not reach show as
+  `awaiting preparation`. The page's header says how fresh the preparation
+  is.
+- `prepare=2` is a configuration error, such as no `claude` on the unit's
+  PATH.
+- `brief=` other than 0 means the page was not written. That is the one
+  worth acting on.
+
+The wrapper always exits 0, for the reason the whole §12 family shares: a
+failing recurring `oneshot` stays in `failed` state and silently ends the job.
+
+**API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
+policy stated in "Legibility trickle accounts (03:00)" above.
+`nightly_prepare.py` also strips the key from the child's env, whether the
+account came from a lease or was inherited.
+
+**First run: arm the timer.** The installer kicks no immediate run, because
+an off-cadence run would spend a Fable budget nobody scheduled.
+
+```bash
+scripts/install-return-brief-timer.sh
+```
+
+**Adding a project.** The brief scans every project root that
+`_task_db_scan.discover_project_roots` returns, plus every queue the decision
+registry has recorded. For a project the registry has never seen (e.g.
+know-live), set `DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the
+unit's environment. It replaces the default root rather than adding to it,
+so list dark-factory too.
+
+**The apply half is agent work, not timer work.** Leo's answers are applied
+by a watcher session, following `skills/escalation-watcher/SKILL.md`,
+"Sitting preparer (`prepare-sitting` mode)".
 
 ---
 

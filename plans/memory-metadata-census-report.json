@@ -22,72 +22,72 @@
   "projects": {
     "dark_factory": {
       "total": {
-        "records": 29676,
+        "records": 29803,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 29676
+              "count": 29803
             },
             {
               "value": "created_at",
-              "count": 29676
+              "count": 29803
             },
             {
               "value": "data",
-              "count": 29676
+              "count": 29803
             },
             {
               "value": "hash",
-              "count": 29676
+              "count": 29803
             },
             {
               "value": "user_id",
-              "count": 29676
+              "count": 29803
             },
             {
               "value": "updated_at",
-              "count": 28416
+              "count": 28543
             },
             {
               "value": "agent_id",
-              "count": 23480
+              "count": 23586
             },
             {
               "value": "role",
-              "count": 20494
+              "count": 20621
             },
             {
               "value": "task_id",
-              "count": 8273
+              "count": 8294
             },
             {
               "value": "source",
-              "count": 6873
+              "count": 6894
             },
             {
               "value": "transition",
-              "count": 6566
+              "count": 6587
             },
             {
               "value": "_causation_id",
-              "count": 3540
+              "count": 3542
             },
             {
               "value": "_deferred",
-              "count": 3514
+              "count": 3516
             },
             {
               "value": "stage2_suppress",
-              "count": 2221
+              "count": 2242
             },
             {
               "value": "echo_used_provenance",
-              "count": 2187
+              "count": 2208
             },
             {
               "value": "run_id",
-              "count": 2137
+              "count": 2179
             },
             {
               "value": "kind",
@@ -95,7 +95,7 @@
             },
             {
               "value": "topic",
-              "count": 1396
+              "count": 1398
             },
             {
               "value": "stage",
@@ -107,7 +107,7 @@
             },
             {
               "value": "parent_id",
-              "count": 321
+              "count": 323
             },
             {
               "value": "task_ref",
@@ -514,6 +514,10 @@
               "count": 15
             },
             {
+              "value": "cluster_role",
+              "count": 14
+            },
+            {
               "value": "corrective_for_run",
               "count": 14
             },
@@ -538,12 +542,12 @@
               "count": 14
             },
             {
-              "value": "tasks_updated",
+              "value": "study",
               "count": 14
             },
             {
-              "value": "cluster_role",
-              "count": 13
+              "value": "tasks_updated",
+              "count": 14
             },
             {
               "value": "entity_summaries_refreshed",
@@ -559,10 +563,6 @@
             },
             {
               "value": "findings_resolved",
-              "count": 13
-            },
-            {
-              "value": "study",
               "count": 13
             },
             {
@@ -623,6 +623,10 @@
             },
             {
               "value": "replaces_deleted",
+              "count": 11
+            },
+            {
+              "value": "report",
               "count": 11
             },
             {
@@ -711,10 +715,6 @@
             },
             {
               "value": "recon_run",
-              "count": 9
-            },
-            {
-              "value": "report",
               "count": 9
             },
             {
@@ -4274,6 +4274,10 @@
               "count": 1
             },
             {
+              "value": "trial",
+              "count": 1
+            },
+            {
               "value": "unblocks",
               "count": 1
             },
@@ -4514,7 +4518,7 @@
               "count": 1
             }
           ],
-          "distinct_total": 1122
+          "distinct_total": 1123
         },
         "kind": {
           "entries": [
@@ -5453,12 +5457,12 @@
           ],
           "distinct_total": 233
         },
-        "kind_missing": 28131,
+        "kind_missing": 28258,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 6468
+              "count": 6489
             },
             {
               "value": "remediation_run",
@@ -5875,7 +5879,7 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 6462
+              "count": 6483
             },
             {
               "value": "remediation_run",
@@ -6264,7 +6268,7 @@
           ],
           "distinct_total": 97
         },
-        "topic_present": 1396,
+        "topic_present": 1398,
         "topic": {
           "entries": [
             {
@@ -6324,6 +6328,10 @@
               "count": 15
             },
             {
+              "value": "resolve-ticket-timeout-discriminator",
+              "count": 15
+            },
+            {
               "value": "silent-fallthrough-gate",
               "count": 15
             },
@@ -6341,10 +6349,6 @@
             },
             {
               "value": "pyright-ruff-test-surface",
-              "count": 14
-            },
-            {
-              "value": "resolve-ticket-timeout-discriminator",
               "count": 14
             },
             {
@@ -6416,6 +6420,10 @@
               "count": 8
             },
             {
+              "value": "dashboard-classic-script-scope-collision",
+              "count": 8
+            },
+            {
               "value": "doc-prose-guard-policy-corrections",
               "count": 8
             },
@@ -6434,10 +6442,6 @@
             {
               "value": "stale-verify-attempt-artifacts",
               "count": 8
-            },
-            {
-              "value": "dashboard-classic-script-scope-collision",
-              "count": 7
             },
             {
               "value": "metadata-mode-replace-key-retirement",
@@ -7758,7 +7762,7 @@
           ],
           "distinct_total": 372
         },
-        "parent_id_present": 321,
+        "parent_id_present": 323,
         "canonical_true": 85,
         "canonical_false": 44,
         "canonical_non_bool": 0,
@@ -8112,7 +8116,7 @@
           "entries": [
             {
               "value": "absent",
-              "count": 29513
+              "count": 29640
             },
             {
               "value": "list",
@@ -8181,9 +8185,9 @@
         }
       },
       "topic_coverage": {
-        "records": 29676,
-        "topic_present": 1396,
-        "topic_coverage_pct": 4.7041,
+        "records": 29803,
+        "topic_present": 1398,
+        "topic_coverage_pct": 4.6908,
         "distinct_topics": 372,
         "topics_with_one_canonical": 85,
         "topics_with_zero_canonical": 287,
@@ -8598,72 +8602,72 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 20930,
+          "records": 21030,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 20930
+                "count": 21030
               },
               {
                 "value": "created_at",
-                "count": 20930
+                "count": 21030
               },
               {
                 "value": "data",
-                "count": 20930
+                "count": 21030
               },
               {
                 "value": "hash",
-                "count": 20930
+                "count": 21030
               },
               {
                 "value": "user_id",
-                "count": 20930
+                "count": 21030
               },
               {
                 "value": "updated_at",
-                "count": 19791
+                "count": 19891
               },
               {
                 "value": "agent_id",
-                "count": 14741
+                "count": 14820
               },
               {
                 "value": "role",
-                "count": 12451
+                "count": 12551
               },
               {
                 "value": "task_id",
-                "count": 7960
+                "count": 7981
               },
               {
                 "value": "source",
-                "count": 6759
+                "count": 6780
               },
               {
                 "value": "transition",
-                "count": 6564
+                "count": 6585
               },
               {
                 "value": "_causation_id",
-                "count": 3519
+                "count": 3521
               },
               {
                 "value": "_deferred",
-                "count": 3514
+                "count": 3516
               },
               {
                 "value": "stage2_suppress",
-                "count": 2216
+                "count": 2237
               },
               {
                 "value": "echo_used_provenance",
-                "count": 2187
+                "count": 2208
               },
               {
                 "value": "run_id",
-                "count": 2069
+                "count": 2105
               },
               {
                 "value": "kind",
@@ -8675,7 +8679,7 @@
               },
               {
                 "value": "topic",
-                "count": 294
+                "count": 295
               },
               {
                 "value": "task_ids",
@@ -9050,6 +9054,10 @@
                 "count": 14
               },
               {
+                "value": "study",
+                "count": 14
+              },
+              {
                 "value": "tasks_updated",
                 "count": 14
               },
@@ -9071,10 +9079,6 @@
               },
               {
                 "value": "findings_resolved",
-                "count": 13
-              },
-              {
-                "value": "study",
                 "count": 13
               },
               {
@@ -9102,7 +9106,15 @@
                 "count": 12
               },
               {
+                "value": "cluster_role",
+                "count": 11
+              },
+              {
                 "value": "flags_emitted_for_stage2",
+                "count": 11
+              },
+              {
+                "value": "report",
                 "count": 11
               },
               {
@@ -9115,10 +9127,6 @@
               },
               {
                 "value": "action_required",
-                "count": 10
-              },
-              {
-                "value": "cluster_role",
                 "count": 10
               },
               {
@@ -9191,10 +9199,6 @@
               },
               {
                 "value": "recon_run",
-                "count": 9
-              },
-              {
-                "value": "report",
                 "count": 9
               },
               {
@@ -12198,6 +12202,10 @@
                 "count": 1
               },
               {
+                "value": "trial",
+                "count": 1
+              },
+              {
                 "value": "unblocks",
                 "count": 1
               },
@@ -12374,7 +12382,7 @@
                 "count": 1
               }
             ],
-            "distinct_total": 943
+            "distinct_total": 944
           },
           "kind": {
             "entries": [
@@ -13193,12 +13201,12 @@
             ],
             "distinct_total": 203
           },
-          "kind_missing": 19707,
+          "kind_missing": 19807,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 6458
+                "count": 6479
               },
               {
                 "value": "remediation_run",
@@ -13503,7 +13511,7 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 6452
+                "count": 6473
               },
               {
                 "value": "reconciliation_stage2",
@@ -13780,7 +13788,7 @@
             ],
             "distinct_total": 69
           },
-          "topic_present": 294,
+          "topic_present": 295,
           "topic": {
             "entries": [
               {
@@ -13797,7 +13805,7 @@
               },
               {
                 "value": "resolve-ticket-timeout-discriminator",
-                "count": 11
+                "count": 12
               },
               {
                 "value": "escalation-store-ambiguity",
@@ -14540,7 +14548,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 20882
+                "count": 20982
               },
               {
                 "value": "scalar",
@@ -14593,40 +14601,40 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2143,
+          "records": 2148,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 2143
+                "count": 2148
               },
               {
                 "value": "created_at",
-                "count": 2143
+                "count": 2148
               },
               {
                 "value": "data",
-                "count": 2143
+                "count": 2148
               },
               {
                 "value": "hash",
-                "count": 2143
+                "count": 2148
               },
               {
                 "value": "user_id",
-                "count": 2143
+                "count": 2148
               },
               {
                 "value": "agent_id",
-                "count": 2139
+                "count": 2144
               },
               {
                 "value": "updated_at",
-                "count": 2045
+                "count": 2050
               },
               {
                 "value": "role",
-                "count": 1729
+                "count": 1734
               },
               {
                 "value": "topic",
@@ -14654,7 +14662,7 @@
               },
               {
                 "value": "run_id",
-                "count": 22
+                "count": 26
               },
               {
                 "value": "task_ref",
@@ -15100,7 +15108,7 @@
             ],
             "distinct_total": 9
           },
-          "kind_missing": 2104,
+          "kind_missing": 2109,
           "source": {
             "entries": [
               {
@@ -15587,7 +15595,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2132
+                "count": 2137
               },
               {
                 "value": "list",
@@ -15628,44 +15636,44 @@
           }
         },
         "procedural_knowledge": {
-          "records": 6579,
+          "records": 6601,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 6579
+                "count": 6601
               },
               {
                 "value": "created_at",
-                "count": 6579
+                "count": 6601
               },
               {
                 "value": "data",
-                "count": 6579
+                "count": 6601
               },
               {
                 "value": "hash",
-                "count": 6579
+                "count": 6601
               },
               {
                 "value": "user_id",
-                "count": 6579
+                "count": 6601
               },
               {
                 "value": "agent_id",
-                "count": 6576
+                "count": 6598
               },
               {
                 "value": "updated_at",
-                "count": 6556
+                "count": 6578
               },
               {
                 "value": "role",
-                "count": 6290
+                "count": 6312
               },
               {
                 "value": "topic",
-                "count": 939
+                "count": 940
               },
               {
                 "value": "kind",
@@ -15677,7 +15685,7 @@
               },
               {
                 "value": "parent_id",
-                "count": 258
+                "count": 260
               },
               {
                 "value": "task_ref",
@@ -15705,7 +15713,7 @@
               },
               {
                 "value": "run_id",
-                "count": 46
+                "count": 48
               },
               {
                 "value": "tasks",
@@ -16807,7 +16815,7 @@
             ],
             "distinct_total": 28
           },
-          "kind_missing": 6296,
+          "kind_missing": 6318,
           "source": {
             "entries": [
               {
@@ -16962,7 +16970,7 @@
             ],
             "distinct_total": 17
           },
-          "topic_present": 939,
+          "topic_present": 940,
           "topic": {
             "entries": [
               {
@@ -17086,6 +17094,10 @@
                 "count": 8
               },
               {
+                "value": "dashboard-classic-script-scope-collision",
+                "count": 7
+              },
+              {
                 "value": "orchestrator-pytest-asyncio-strict-mode",
                 "count": 7
               },
@@ -17112,10 +17124,6 @@
               {
                 "value": "tests-scripts-pyright-ignore-extrapaths-absence",
                 "count": 7
-              },
-              {
-                "value": "dashboard-classic-script-scope-collision",
-                "count": 6
               },
               {
                 "value": "merge-lane-ratchet-private-reads-new-test-rows",
@@ -17716,7 +17724,7 @@
             ],
             "distinct_total": 187
           },
-          "parent_id_present": 258,
+          "parent_id_present": 260,
           "canonical_true": 67,
           "canonical_false": 39,
           "canonical_non_bool": 0,
@@ -17998,7 +18006,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 6475
+                "count": 6497
               },
               {
                 "value": "list",
@@ -18337,52 +18345,52 @@
     },
     "reify": {
       "total": {
-        "records": 36482,
+        "records": 36536,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 36482
+              "count": 36536
             },
             {
               "value": "created_at",
-              "count": 36482
+              "count": 36536
             },
             {
               "value": "data",
-              "count": 36482
+              "count": 36536
             },
             {
               "value": "hash",
-              "count": 36482
+              "count": 36536
             },
             {
               "value": "user_id",
-              "count": 36482
+              "count": 36536
             },
             {
               "value": "updated_at",
-              "count": 34006
+              "count": 34060
             },
             {
               "value": "agent_id",
-              "count": 25953
+              "count": 25989
             },
             {
               "value": "role",
-              "count": 22937
+              "count": 22991
             },
             {
               "value": "task_id",
-              "count": 13449
+              "count": 13468
             },
             {
               "value": "source",
-              "count": 11842
+              "count": 11860
             },
             {
               "value": "transition",
-              "count": 11194
+              "count": 11212
             },
             {
               "value": "_causation_id",
@@ -18394,7 +18402,7 @@
             },
             {
               "value": "run_id",
-              "count": 2463
+              "count": 2464
             },
             {
               "value": "stage",
@@ -18406,15 +18414,15 @@
             },
             {
               "value": "stage2_suppress",
-              "count": 1618
+              "count": 1636
             },
             {
               "value": "echo_used_provenance",
-              "count": 1294
+              "count": 1312
             },
             {
               "value": "topic",
-              "count": 1117
+              "count": 1118
             },
             {
               "value": "task_ids",
@@ -24532,12 +24540,12 @@
           ],
           "distinct_total": 288
         },
-        "kind_missing": 34773,
+        "kind_missing": 34827,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 10927
+              "count": 10945
             },
             {
               "value": "consolidation",
@@ -25086,7 +25094,7 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 10918
+              "count": 10936
             },
             {
               "value": "consolidation",
@@ -25559,7 +25567,7 @@
           ],
           "distinct_total": 118
         },
-        "topic_present": 1117,
+        "topic_present": 1118,
         "topic": {
           "entries": [
             {
@@ -26088,6 +26096,10 @@
             },
             {
               "value": "tmp-purge-safety",
+              "count": 2
+            },
+            {
+              "value": "warm-lane-audit-freshness-staleness",
               "count": 2
             },
             {
@@ -27271,10 +27283,6 @@
               "count": 1
             },
             {
-              "value": "warm-lane-audit-freshness-staleness",
-              "count": 1
-            },
-            {
               "value": "warm-lane-audit-unset-mount-false-zero",
               "count": 1
             },
@@ -27839,7 +27847,7 @@
           "entries": [
             {
               "value": "absent",
-              "count": 36262
+              "count": 36316
             },
             {
               "value": "list",
@@ -27920,9 +27928,9 @@
         }
       },
       "topic_coverage": {
-        "records": 36482,
-        "topic_present": 1117,
-        "topic_coverage_pct": 3.0618,
+        "records": 36536,
+        "topic_present": 1118,
+        "topic_coverage_pct": 3.06,
         "distinct_topics": 444,
         "topics_with_one_canonical": 121,
         "topics_with_zero_canonical": 323,
@@ -28238,52 +28246,52 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 27928,
+          "records": 27969,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 27928
+                "count": 27969
               },
               {
                 "value": "created_at",
-                "count": 27928
+                "count": 27969
               },
               {
                 "value": "data",
-                "count": 27928
+                "count": 27969
               },
               {
                 "value": "hash",
-                "count": 27928
+                "count": 27969
               },
               {
                 "value": "user_id",
-                "count": 27928
+                "count": 27969
               },
               {
                 "value": "updated_at",
-                "count": 25709
+                "count": 25750
               },
               {
                 "value": "agent_id",
-                "count": 17404
+                "count": 17427
               },
               {
                 "value": "role",
-                "count": 15478
+                "count": 15519
               },
               {
                 "value": "task_id",
-                "count": 13089
+                "count": 13107
               },
               {
                 "value": "source",
-                "count": 11579
+                "count": 11597
               },
               {
                 "value": "transition",
-                "count": 11186
+                "count": 11204
               },
               {
                 "value": "_causation_id",
@@ -28295,7 +28303,7 @@
               },
               {
                 "value": "run_id",
-                "count": 2377
+                "count": 2378
               },
               {
                 "value": "stage",
@@ -28303,7 +28311,7 @@
               },
               {
                 "value": "stage2_suppress",
-                "count": 1615
+                "count": 1633
               },
               {
                 "value": "kind",
@@ -28311,7 +28319,7 @@
               },
               {
                 "value": "echo_used_provenance",
-                "count": 1294
+                "count": 1312
               },
               {
                 "value": "topic",
@@ -33393,12 +33401,12 @@
             ],
             "distinct_total": 208
           },
-          "kind_missing": 26394,
+          "kind_missing": 26435,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 10905
+                "count": 10923
               },
               {
                 "value": "consolidation",
@@ -33747,7 +33755,7 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 10896
+                "count": 10914
               },
               {
                 "value": "consolidation",
@@ -35124,7 +35132,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 27850
+                "count": 27891
               },
               {
                 "value": "list",
@@ -35177,40 +35185,40 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2017,
+          "records": 2019,
           "keys": {
             "entries": [
               {
                 "value": "agent_id",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "category",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "created_at",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "data",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "hash",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "user_id",
-                "count": 2017
+                "count": 2019
               },
               {
                 "value": "updated_at",
-                "count": 1895
+                "count": 1897
               },
               {
                 "value": "role",
-                "count": 1487
+                "count": 1489
               },
               {
                 "value": "topic",
@@ -35716,7 +35724,7 @@
             ],
             "distinct_total": 12
           },
-          "kind_missing": 2004,
+          "kind_missing": 2006,
           "source": {
             "entries": [
               {
@@ -36219,7 +36227,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2003
+                "count": 2005
               },
               {
                 "value": "list",
@@ -36264,48 +36272,48 @@
           }
         },
         "procedural_knowledge": {
-          "records": 6457,
+          "records": 6468,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 6457
+                "count": 6468
               },
               {
                 "value": "created_at",
-                "count": 6457
+                "count": 6468
               },
               {
                 "value": "data",
-                "count": 6457
+                "count": 6468
               },
               {
                 "value": "hash",
-                "count": 6457
+                "count": 6468
               },
               {
                 "value": "user_id",
-                "count": 6457
+                "count": 6468
               },
               {
                 "value": "agent_id",
-                "count": 6452
+                "count": 6463
               },
               {
                 "value": "updated_at",
-                "count": 6384
+                "count": 6395
               },
               {
                 "value": "role",
-                "count": 5967
+                "count": 5978
               },
               {
                 "value": "topic",
-                "count": 579
+                "count": 580
               },
               {
                 "value": "task_id",
-                "count": 278
+                "count": 279
               },
               {
                 "value": "kind",
@@ -37747,7 +37755,7 @@
             ],
             "distinct_total": 78
           },
-          "kind_missing": 6296,
+          "kind_missing": 6307,
           "source": {
             "entries": [
               {
@@ -38114,7 +38122,7 @@
             ],
             "distinct_total": 38
           },
-          "topic_present": 579,
+          "topic_present": 580,
           "topic": {
             "entries": [
               {
@@ -38411,6 +38419,10 @@
               },
               {
                 "value": "tmp-purge-safety",
+                "count": 2
+              },
+              {
+                "value": "warm-lane-audit-freshness-staleness",
                 "count": 2
               },
               {
@@ -38922,10 +38934,6 @@
                 "count": 1
               },
               {
-                "value": "warm-lane-audit-freshness-staleness",
-                "count": 1
-              },
-              {
                 "value": "warm-lane-cargo-build-env",
                 "count": 1
               },
@@ -39302,7 +39310,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 6329
+                "count": 6340
               },
               {
                 "value": "list",
@@ -39805,72 +39813,72 @@
     }
   },
   "grand_total": {
-    "records": 66158,
+    "records": 66339,
     "keys": {
       "entries": [
         {
           "value": "category",
-          "count": 66158
+          "count": 66339
         },
         {
           "value": "created_at",
-          "count": 66158
+          "count": 66339
         },
         {
           "value": "data",
-          "count": 66158
+          "count": 66339
         },
         {
           "value": "hash",
-          "count": 66158
+          "count": 66339
         },
         {
           "value": "user_id",
-          "count": 66158
+          "count": 66339
         },
         {
           "value": "updated_at",
-          "count": 62422
+          "count": 62603
         },
         {
           "value": "agent_id",
-          "count": 49433
+          "count": 49575
         },
         {
           "value": "role",
-          "count": 43431
+          "count": 43612
         },
         {
           "value": "task_id",
-          "count": 21722
+          "count": 21762
         },
         {
           "value": "source",
-          "count": 18715
+          "count": 18754
         },
         {
           "value": "transition",
-          "count": 17760
+          "count": 17799
         },
         {
           "value": "_causation_id",
-          "count": 9066
+          "count": 9068
         },
         {
           "value": "_deferred",
-          "count": 9005
+          "count": 9007
         },
         {
           "value": "run_id",
-          "count": 4600
+          "count": 4643
         },
         {
           "value": "stage2_suppress",
-          "count": 3839
+          "count": 3878
         },
         {
           "value": "echo_used_provenance",
-          "count": 3481
+          "count": 3520
         },
         {
           "value": "kind",
@@ -39882,7 +39890,7 @@
         },
         {
           "value": "topic",
-          "count": 2513
+          "count": 2516
         },
         {
           "value": "commit",
@@ -39906,7 +39914,7 @@
         },
         {
           "value": "parent_id",
-          "count": 362
+          "count": 364
         },
         {
           "value": "date",
@@ -40645,6 +40653,10 @@
           "count": 15
         },
         {
+          "value": "cluster_role",
+          "count": 14
+        },
+        {
           "value": "corrective_for_run",
           "count": 14
         },
@@ -40673,6 +40685,10 @@
           "count": 14
         },
         {
+          "value": "study",
+          "count": 14
+        },
+        {
           "value": "supersedes_memory",
           "count": 14
         },
@@ -40693,10 +40709,6 @@
           "count": 13
         },
         {
-          "value": "cluster_role",
-          "count": 13
-        },
-        {
           "value": "follow_up_task",
           "count": 13
         },
@@ -40706,10 +40718,6 @@
         },
         {
           "value": "remediation",
-          "count": 13
-        },
-        {
-          "value": "study",
           "count": 13
         },
         {
@@ -40810,6 +40818,10 @@
         },
         {
           "value": "replaces_deleted",
+          "count": 11
+        },
+        {
+          "value": "report",
           "count": 11
         },
         {
@@ -40958,10 +40970,6 @@
         },
         {
           "value": "related_df_tasks",
-          "count": 9
-        },
-        {
-          "value": "report",
           "count": 9
         },
         {
@@ -47449,6 +47457,10 @@
           "count": 1
         },
         {
+          "value": "trial",
+          "count": 1
+        },
+        {
           "value": "trigger_task",
           "count": 1
         },
@@ -47857,7 +47869,7 @@
           "count": 1
         }
       ],
-      "distinct_total": 2012
+      "distinct_total": 2013
     },
     "kind": {
       "entries": [
@@ -49804,12 +49816,12 @@
       ],
       "distinct_total": 485
     },
-    "kind_missing": 62904,
+    "kind_missing": 63085,
     "source": {
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 17395
+          "count": 17434
         },
         {
           "value": "consolidation",
@@ -50678,7 +50690,7 @@
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 17380
+          "count": 17419
         },
         {
           "value": "consolidation",
@@ -51447,7 +51459,7 @@
       ],
       "distinct_total": 192
     },
-    "topic_present": 2513,
+    "topic_present": 2516,
     "topic": {
       "entries": [
         {
@@ -51547,6 +51559,10 @@
           "count": 15
         },
         {
+          "value": "resolve-ticket-timeout-discriminator",
+          "count": 15
+        },
+        {
           "value": "silent-fallthrough-gate",
           "count": 15
         },
@@ -51568,10 +51584,6 @@
         },
         {
           "value": "pyright-ruff-test-surface",
-          "count": 14
-        },
-        {
-          "value": "resolve-ticket-timeout-discriminator",
           "count": 14
         },
         {
@@ -51707,6 +51719,10 @@
           "count": 8
         },
         {
+          "value": "dashboard-classic-script-scope-collision",
+          "count": 8
+        },
+        {
           "value": "doc-prose-guard-policy-corrections",
           "count": 8
         },
@@ -51745,10 +51761,6 @@
         {
           "value": "structure-ctors-do-not-dimension-check-args",
           "count": 8
-        },
-        {
-          "value": "dashboard-classic-script-scope-collision",
-          "count": 7
         },
         {
           "value": "entity-summary-accumulation-bug-description",
@@ -52388,6 +52400,10 @@
         },
         {
           "value": "update-memory-metadata-patch-authz-gate",
+          "count": 2
+        },
+        {
+          "value": "warm-lane-audit-freshness-staleness",
           "count": 2
         },
         {
@@ -54619,10 +54635,6 @@
           "count": 1
         },
         {
-          "value": "warm-lane-audit-freshness-staleness",
-          "count": 1
-        },
-        {
           "value": "warm-lane-audit-unset-mount-false-zero",
           "count": 1
         },
@@ -54705,7 +54717,7 @@
       ],
       "distinct_total": 813
     },
-    "parent_id_present": 362,
+    "parent_id_present": 364,
     "canonical_true": 206,
     "canonical_false": 50,
     "canonical_non_bool": 1,
@@ -55539,7 +55551,7 @@
       "entries": [
         {
           "value": "absent",
-          "count": 65775
+          "count": 65956
         },
         {
           "value": "list",
@@ -55628,9 +55640,9 @@
     }
   },
   "topic_coverage": {
-    "records": 66158,
-    "topic_present": 2513,
-    "topic_coverage_pct": 3.7985,
+    "records": 66339,
+    "topic_present": 2516,
+    "topic_coverage_pct": 3.7926,
     "distinct_topics": 813,
     "topics_with_one_canonical": 206,
     "topics_with_zero_canonical": 610,
@@ -56592,26 +56604,26 @@
   },
   "registry_error": null,
   "coverage_trend": {
-    "baseline": "2026-09-28T04:01:44+00:00",
-    "baseline_reason": "compared against the most recent prior run (2026-09-28T04:01:44+00:00)",
+    "baseline": "2026-09-29T04:01:54+00:00",
+    "baseline_reason": "compared against the most recent prior run (2026-09-29T04:01:54+00:00)",
     "projects": {
       "dark_factory": {
         "status": "compared",
         "columns": {
           "records": {
-            "before": 29615,
-            "after": 29676,
-            "delta": 61
+            "before": 29676,
+            "after": 29803,
+            "delta": 127
           },
           "topic_present": {
-            "before": 1392,
-            "after": 1396,
-            "delta": 4
+            "before": 1396,
+            "after": 1398,
+            "delta": 2
           },
           "topic_coverage_pct": {
-            "before": 4.7003,
-            "after": 4.7041,
-            "delta": 0.0038
+            "before": 4.7041,
+            "after": 4.6908,
+            "delta": -0.0133
           },
           "distinct_topics": {
             "before": 372,
@@ -56689,29 +56701,29 @@
         "status": "compared",
         "columns": {
           "records": {
-            "before": 36446,
-            "after": 36482,
-            "delta": 36
+            "before": 36482,
+            "after": 36536,
+            "delta": 54
           },
           "topic_present": {
-            "before": 1112,
-            "after": 1117,
-            "delta": 5
+            "before": 1117,
+            "after": 1118,
+            "delta": 1
           },
           "topic_coverage_pct": {
-            "before": 3.0511,
-            "after": 3.0618,
-            "delta": 0.0107
+            "before": 3.0618,
+            "after": 3.06,
+            "delta": -0.0018
           },
           "distinct_topics": {
-            "before": 442,
+            "before": 444,
             "after": 444,
-            "delta": 2
+            "delta": 0
           },
           "topics_with_one_canonical": {
-            "before": 119,
+            "before": 121,
             "after": 121,
-            "delta": 2
+            "delta": 0
           },
           "topics_with_zero_canonical": {
             "before": 323,
@@ -56724,9 +56736,9 @@
             "delta": 0
           },
           "canonical_true": {
-            "before": 119,
+            "before": 121,
             "after": 121,
-            "delta": 2
+            "delta": 0
           },
           "canonical_true_without_topic": {
             "before": 0,
@@ -56734,9 +56746,9 @@
             "delta": 0
           },
           "slug_conforming": {
-            "before": 376,
+            "before": 378,
             "after": 378,
-            "delta": 2
+            "delta": 0
           },
           "slug_non_conforming": {
             "before": 66,
@@ -56744,9 +56756,9 @@
             "delta": 0
           },
           "canonical_slug_conforming": {
-            "before": 117,
+            "before": 119,
             "after": 119,
-            "delta": 2
+            "delta": 0
           },
           "canonical_slug_non_conforming": {
             "before": 2,
@@ -56792,41 +56804,41 @@
     "projects": {
       "dark_factory": {
         "collection": "fused_dark_factory",
-        "collection_points": 29676,
-        "collection_points_before": 29676,
+        "collection_points": 29803,
+        "collection_points_before": 29803,
         "collection_points_interval": [
-          29676,
-          29676
+          29803,
+          29803
         ],
-        "counted": 29676,
-        "counted_recount": 29676,
+        "counted": 29803,
+        "counted_recount": 29803,
         "counted_interval": [
-          29676,
-          29676
+          29803,
+          29803
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 20930,
-            "recount": 20930,
-            "scrolled": 20930,
+            "expected": 21030,
+            "recount": 21030,
+            "scrolled": 21030,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2143,
-            "recount": 2143,
-            "scrolled": 2143,
+            "expected": 2148,
+            "recount": 2148,
+            "scrolled": 2148,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 6579,
-            "recount": 6579,
-            "scrolled": 6579,
+            "expected": 6601,
+            "recount": 6601,
+            "scrolled": 6601,
             "delta": 0,
             "complete": true,
             "churn": false
@@ -56859,41 +56871,41 @@
       },
       "reify": {
         "collection": "fused_reify",
-        "collection_points": 36482,
-        "collection_points_before": 36482,
+        "collection_points": 36536,
+        "collection_points_before": 36536,
         "collection_points_interval": [
-          36482,
-          36482
+          36536,
+          36536
         ],
-        "counted": 36482,
-        "counted_recount": 36482,
+        "counted": 36536,
+        "counted_recount": 36536,
         "counted_interval": [
-          36482,
-          36482
+          36536,
+          36536
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 27928,
-            "recount": 27928,
-            "scrolled": 27928,
+            "expected": 27969,
+            "recount": 27969,
+            "scrolled": 27969,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2017,
-            "recount": 2017,
-            "scrolled": 2017,
+            "expected": 2019,
+            "recount": 2019,
+            "scrolled": 2019,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 6457,
-            "recount": 6457,
-            "scrolled": 6457,
+            "expected": 6468,
+            "recount": 6468,
+            "scrolled": 6468,
             "delta": 0,
             "complete": true,
             "churn": false

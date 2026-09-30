@@ -1,13 +1,17 @@
 [Unit]
 Description=My Solar Challenge Orchestrator (supervised)
 Documentation=file:///home/leo/src/dark-factory/plans/afk-C1-systemd.md
-After=network.target fused-memory.service reify-jobserver.service pytest-jobserver.service
+After=network.target fused-memory.service reify-jobserver.service pytest-jobserver.service orchestrator-my-solar-challenge.socket
 # Wants=, not Requires=: a hard Requires= turns a single fused-memory first-start
 # failure (boot race) into a PERMANENT cancel of our start job — systemd never
 # retries a dependency-failed job. Wants= still orders us after fused-memory but
 # lets us proceed; the ExecStartPre below then waits for port 8002, and
 # Restart=on-failure self-heals if fused-memory is mid-restart.
 Wants=fused-memory.service
+# orchestrator-my-solar-challenge.socket holds the escalation port so it stays bound across
+# restarts (see that unit). Wants=, for the reason above: if the socket
+# cannot start, the orchestrator still starts and binds the port itself.
+Wants=orchestrator-my-solar-challenge.socket
 
 # Restart-rate guard: 10 starts within 600s tolerates cap-rotation churn and
 # recoverable cascades but blocks a true crash loop. Default StartLimitAction
@@ -63,5 +67,10 @@ TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
 
+# A deliberate stop also stops the socket, so no later connection restarts
+# a stopped or disabled orchestrator; a restart or crash keeps it bound.
+ExecStopPost=-/home/leo/src/dark-factory/scripts/stop-socket-unless-restarting.sh %n
+
 [Install]
 WantedBy=default.target
+Also=orchestrator-my-solar-challenge.socket

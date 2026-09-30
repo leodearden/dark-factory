@@ -400,6 +400,11 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     return sr.DecisionRecord(**fields)
 
 
+def _identity_of(record: sr.DecisionRecord) -> dict[str, str]:
+    """close_decision_with_evidence's compare-and-swap expectations for *record*, as it was filed."""
+    return {'expected_project': record.project, 'expected_escalations_dir': record.escalations_dir}
+
+
 def _names_the_destination_token(message: str) -> bool:
     """True when *message* names ``solar_challenge`` as a token in its OWN
     right -- not merely as the tail of ``my_solar_challenge``.
@@ -1476,6 +1481,30 @@ class TestDecisionHelpersAdoptLock:
 
         assert rc == 0
         assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
+
+    def test_close_decision_with_evidence_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The FIFTH writer (task 5376): the sitting preparer's apply step, via close-decision."""
+        rec = _make_decision(id='dec-spy-6', state=sr.DecisionState.OPEN)
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.close_decision_with_evidence(
+            'dec-spy-6', sr.DecisionState.ANSWERED, 'gate evidence', root=tmp_path, **_identity_of(rec)
+        )
+
+        assert 'dec-spy-6' in acquired, f'Expected lock acquisition for dec-spy-6; got {acquired}'
 
     def test_main_write_decision_refusal_takes_no_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6183,6 +6212,8 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         state=sr.DecisionState.DROPPED,
         manual_boost=7,
         escalations_dir=queue,
+        closing_evidence='the operator dropped it: superseded by esc-5914-2',
+        closed_at='2026-08-01T00:00:00+00:00',
     )
     incoming = _make_decision(
         text="the watcher's current view",
@@ -6214,6 +6245,8 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         'filed_at',
         'state',
         'manual_boost',
+        'closing_evidence',
+        'closed_at',
         'escalations_dir',
     }
 
@@ -9900,3 +9933,436 @@ def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
     never raises" -- and that promise cannot hold if the pid check can throw.
     """
     assert sr._pid_alive(_UNREPRESENTABLE_PID) is False
+
+
+# ---------------------------------------------------------------------------
+# DecisionRecord.closing_evidence and the close-decision verb (task 5376)
+# ---------------------------------------------------------------------------
+
+_EVIDENCE = 'gate 1 ruling_is_leos_own: held\nLeo 2026-09-20: esc-400-1 option A'
+
+
+def _assert_utc_instant_within(stamp: str, before: datetime, after: datetime) -> None:
+    instant = datetime.fromisoformat(stamp)
+    assert instant.utcoffset() == timedelta(0)
+    assert before <= instant <= after
+
+
+class TestClosingEvidence:
+    """The deciding evidence, quoted verbatim on the closed record, and the one mutator that writes it."""
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        sr.write_decision(_make_decision(id='dec-close', **{'state': sr.DecisionState.OPEN, **overrides}), root=root)
+        return sr.decision_path_for_id('dec-close', root=root)
+
+    def _close(self, root: Path, state: str = sr.DecisionState.ANSWERED, evidence: str = _EVIDENCE):
+        return sr.close_decision_with_evidence(
+            'dec-close', state, evidence, root=root, **_identity_of(_make_decision())
+        )
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closing_evidence == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, escalations_dir='/p/data/escalations')
+
+        assert d.to_dict()['closing_evidence'] == _EVIDENCE
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closing_evidence': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closing_evidence']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closing_evidence == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closing_evidence == ''
+
+    @pytest.mark.parametrize('state', [sr.DecisionState.ANSWERED, sr.DecisionState.DROPPED])
+    def test_open_to_terminal_sets_state_and_evidence_in_one_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        self._seed(tmp_path)
+        real_write = sr.write_decision
+        written: list[dict[str, Any]] = []
+
+        def recording_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            written.append(record.to_dict())
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', recording_write)
+
+        before = datetime.now(UTC)
+        updated = self._close(tmp_path, state)
+        after = datetime.now(UTC)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (state, _EVIDENCE)
+        [write] = written
+        assert (write['state'], write['closing_evidence'], write['closed_at']) == (state, _EVIDENCE, updated.closed_at)
+        _assert_utc_instant_within(updated.closed_at, before, after)
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread == updated
+
+    def test_evidence_attaches_to_a_record_the_reaper_already_closed(self, tmp_path: Path) -> None:
+        self._seed(tmp_path, state=sr.DecisionState.ANSWERED)
+
+        updated = self._close(tmp_path)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize(('seeded', 'state', 'evidence', 'reason'), [
+        ({}, sr.DecisionState.OPEN, _EVIDENCE, r"not 'open'"),
+        ({}, sr.DecisionState.ANSWERED, '', 'evidence is empty'),
+        ({}, sr.DecisionState.ANSWERED, '  \n\t', 'evidence is empty'),
+        ({'state': sr.DecisionState.ANSWERED}, sr.DecisionState.DROPPED, _EVIDENCE, 'between terminal states'),
+        ({'state': sr.DecisionState.ANSWERED, 'closing_evidence': 'the reaper-era evidence'},
+         sr.DecisionState.ANSWERED, _EVIDENCE, 'overwrite'),
+    ], ids=['to-open', 'empty', 'whitespace', 'terminal-to-terminal', 'overwrite'])
+    def test_refusals_raise_naming_the_refusal_and_write_nothing(
+        self, tmp_path: Path, seeded: dict, state: str, evidence: str, reason: str
+    ) -> None:
+        path = self._seed(tmp_path, **seeded)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match=reason):
+            self._close(tmp_path, state, evidence)
+
+        assert path.read_bytes() == before
+        assert sr.DecisionRecord.from_json(path.read_text()).closed_at == ''
+
+    @pytest.mark.parametrize(('state', 'evidence'), [
+        (sr.DecisionState.OPEN, _EVIDENCE),
+        (sr.DecisionState.ANSWERED, ' '),
+    ])
+    def test_argument_refusals_take_no_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, evidence: str
+    ) -> None:
+        """Mirrors test_main_write_decision_refusal_takes_no_lock: a lock sidecar is never cleaned up."""
+        self._seed(tmp_path)
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        with pytest.raises(sr.DecisionCloseRefused):
+            self._close(tmp_path, state, evidence)
+
+        assert acquired == []
+
+    def test_fail_soft_when_absent(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_a_corrupt_body(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = sr.decision_path_for_id('dec-close', root=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{not valid json')
+
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_an_unwritable_root(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+
+        with caplog.at_level(logging.ERROR):
+            assert sr.close_decision_with_evidence(
+                'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=blocker / 'fleet',
+                **_identity_of(_make_decision()),
+            ) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    @pytest.mark.timeout(30)
+    def test_a_concurrent_boost_loses_neither_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same technique as test_concurrent_state_and_boost_updates_do_not_lose_a_field."""
+        self._seed(tmp_path, manual_boost=0)
+        real_write = sr.write_decision
+
+        def delayed_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            time.sleep(0.3)
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', delayed_write)
+        threads = [
+            threading.Thread(target=self._close, args=(tmp_path,)),
+            threading.Thread(target=sr.set_manual_boost, args=('dec-close', 7, tmp_path)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence, reread.manual_boost) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, 7,
+        )
+
+    def test_same_queue_refile_keeps_the_evidence(self) -> None:
+        closed_at = '2026-09-20T05:31:00+00:00'
+        existing = _make_decision(
+            state=sr.DecisionState.ANSWERED, closing_evidence=_EVIDENCE, closed_at=closed_at, escalations_dir='/q'
+        )
+        incoming = _make_decision(state=sr.DecisionState.OPEN, escalations_dir='/q')
+
+        for merged in (sr.merge_same_queue_refile(existing, incoming), sr.merge_decision_enrichment(existing, incoming)):
+            assert (merged.closing_evidence, merged.closed_at) == (_EVIDENCE, closed_at)
+
+
+class TestClosedAt:
+    """When the evidence-carrying close happened: custody, stamped by close_decision_with_evidence alone."""
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closed_at == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, closed_at='2026-09-20T05:31:00+00:00')
+
+        assert d.to_dict()['closed_at'] == '2026-09-20T05:31:00+00:00'
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closed_at': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closed_at']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closed_at == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closed_at == ''
+
+    def test_attaching_evidence_after_the_reaper_closed_stamps_it(self, tmp_path: Path) -> None:
+        seeded = _make_decision(id='dec-close', state=sr.DecisionState.ANSWERED)
+        sr.write_decision(seeded, root=tmp_path)
+
+        before = datetime.now(UTC)
+        updated = sr.close_decision_with_evidence(
+            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path, **_identity_of(seeded)
+        )
+        after = datetime.now(UTC)
+
+        assert updated is not None
+        _assert_utc_instant_within(updated.closed_at, before, after)
+
+    def test_a_same_queue_write_decision_refile_keeps_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = str(tmp_path / 'data' / 'escalations')
+        filing = {'id': 'dec-close', 'project': 'dark_factory', 'text': 'approve?', 'escalations_dir': queue}
+        _file_decision(**filing)
+        closed = sr.close_decision_with_evidence(
+            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path,
+            expected_project='dark_factory', expected_escalations_dir=queue,
+        )
+        assert closed is not None and closed.closed_at
+
+        _file_decision(**{**filing, 'text': 'approve? (rephrased)'})
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.text == 'approve? (rephrased)'
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, closed.closed_at,
+        )
+
+    def test_the_other_state_and_boost_writers_never_stamp_it(self, tmp_path: Path) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        closed = sr.update_decision_state('dec-close', sr.DecisionState.ANSWERED, root=tmp_path)
+        boosted = sr.set_manual_boost('dec-close', 7, root=tmp_path)
+
+        assert closed is not None and boosted is not None
+        assert (closed.closed_at, boosted.closed_at) == ('', '')
+
+
+class TestCloseDecisionVerb:
+    def _argv(self, root: Path, *, state: str = 'answered', evidence: str = _EVIDENCE) -> list[str]:
+        seeded = _make_decision()
+        return [
+            'close-decision', '--id', 'dec-close', '--state', state, '--evidence', evidence,
+            '--project', seeded.project, '--escalations-dir', seeded.escalations_dir, '--root', str(root),
+        ]
+
+    def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
+        args = sr._build_parser().parse_args(self._argv(tmp_path))
+        seeded = _make_decision()
+
+        assert (args.verb, args.id, args.state, args.evidence, args.root) == (
+            'close-decision', 'dec-close', 'answered', _EVIDENCE, str(tmp_path),
+        )
+        assert (args.project, args.escalations_dir) == (seeded.project, seeded.escalations_dir)
+
+    def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'dec-close'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    def test_a_refusal_exits_nonzero_naming_it(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, evidence=' '))
+
+        assert rc != 0
+        assert 'evidence is empty' in capsys.readouterr().err
+
+    def test_an_absent_record_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc != 0
+        assert 'dec-close' in capsys.readouterr().err
+
+
+class TestCloseDecisionIdentity:
+    """A close lands only on the record the caller names: decision ids are fleet-global, esc numbering is per project."""
+
+    _A_PROJECT = 'know_live'
+    _A_QUEUE = '/a/data/escalations'
+    _B_PROJECT = 'reify'
+    _B_QUEUE = '/b/data/escalations'
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        fields = {'id': 'esc-42-1', 'project': self._A_PROJECT, 'escalations_dir': self._A_QUEUE,
+                  'state': sr.DecisionState.OPEN, 'closing_evidence': '', **overrides}
+        sr.write_decision(_make_decision(**fields), root=root)
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    def _close(self, root: Path, project: str, queue: str) -> sr.DecisionRecord | None:
+        return sr.close_decision_with_evidence(
+            'esc-42-1', sr.DecisionState.ANSWERED, _EVIDENCE, root=root,
+            expected_project=project, expected_escalations_dir=queue,
+        )
+
+    @pytest.mark.parametrize(('project', 'queue'), [
+        (_A_PROJECT, _B_QUEUE),
+        (_B_PROJECT, _A_QUEUE),
+        (_B_PROJECT, _B_QUEUE),
+    ], ids=['queue-only', 'project-only', 'both'])
+    def test_another_projects_record_at_the_same_id_is_refused_and_untouched(
+        self, tmp_path: Path, project: str, queue: str
+    ) -> None:
+        """The reviewer's scenario: project B's close payload names an id project A already holds OPEN."""
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, project, queue)
+
+        message = str(refused.value)
+        for named in ('esc-42-1', self._A_PROJECT, self._A_QUEUE, project, queue):
+            assert named in message
+        assert path.read_bytes() == before
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (sr.DecisionState.OPEN, '', '')
+
+    @pytest.mark.parametrize('queue', ['/q/data/escalations/', '/q/./data/escalations'], ids=['slash', 'dot'])
+    def test_both_sides_are_folded_before_the_compare(self, tmp_path: Path, queue: str) -> None:
+        self._seed(tmp_path, project='df', escalations_dir=sr.normalize_escalations_dir('/q/data/escalations'))
+
+        updated = self._close(tmp_path, 'dark_factory', queue)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize('stamp', ['', sr.UNKNOWN_QUEUE], ids=['legacy', 'unknown'])
+    def test_a_sentinel_stamp_closes_under_the_same_sentinel(self, tmp_path: Path, stamp: str) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+
+        updated = self._close(tmp_path, self._A_PROJECT, stamp)
+
+        assert updated is not None
+        assert updated.closing_evidence == _EVIDENCE
+
+    @pytest.mark.parametrize(('stamp', 'queue'), [
+        ('', '/q/data/escalations'),
+        (sr.UNKNOWN_QUEUE, ''),
+        (sr.UNKNOWN_QUEUE, '/q/data/escalations'),
+    ], ids=['legacy-vs-real', 'unknown-vs-legacy', 'unknown-vs-real'])
+    def test_a_sentinel_stamp_is_refused_under_any_other_expectation(
+        self, tmp_path: Path, stamp: str, queue: str
+    ) -> None:
+        path = self._seed(tmp_path, escalations_dir=stamp)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match='esc-42-1'):
+            self._close(tmp_path, self._A_PROJECT, queue)
+
+        assert path.read_bytes() == before
+
+    def test_the_identity_check_runs_before_the_overwrite_check(self, tmp_path: Path) -> None:
+        path = self._seed(tmp_path, state=sr.DecisionState.ANSWERED, closing_evidence='project A evidence')
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, self._B_PROJECT, self._B_QUEUE)
+
+        assert self._B_PROJECT in str(refused.value)
+        assert 'overwrite' not in str(refused.value)
+        assert path.read_bytes() == before
+
+    def _argv(self, root: Path, *, project: str, queue: str) -> list[str]:
+        return [
+            'close-decision', '--id', 'esc-42-1', '--state', 'answered', '--evidence', _EVIDENCE,
+            '--project', project, '--escalations-dir', queue, '--root', str(root),
+        ]
+
+    @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
+    def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
+        argv = self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE)
+        at = argv.index(dropped)
+        del argv[at:at + 2]
+
+        with pytest.raises(SystemExit) as exited:
+            sr.main(argv)
+
+        assert exited.value.code == 2
+
+    def test_the_verb_exits_nonzero_on_a_mismatch_and_leaves_the_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        rc = sr.main(self._argv(tmp_path, project=self._B_PROJECT, queue=self._B_QUEUE))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'close-decision refused' in err
+        assert self._B_PROJECT in err
+        assert path.read_bytes() == before
+
+    def test_the_verb_closes_the_record_it_names(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed(tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'esc-42-1'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)

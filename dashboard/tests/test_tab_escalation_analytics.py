@@ -597,16 +597,21 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
 
 def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
     """app.jsx must destructure EscalationAnalyticsTab from window.DF_TABS,
-    add an 'esc-analytics' tab entry, handle it in renderTab, and configure
-    toolbarConfig with showWindow: false (the tab owns its own client-side
-    window toggle rather than the global server-side window chip).
+    add an 'esc-analytics' tab entry, handle it in renderTab, and give it a
+    toolbarConfig entry.
 
     Asserts four structural wiring contracts:
     (a) EscalationAnalyticsTab is destructured from window.DF_TABS.
     (b) tabs[] contains an entry with id 'esc-analytics' and label 'Analytics'.
     (c) renderTab switch has a `case 'esc-analytics':` branch returning
         <EscalationAnalyticsTab projectFilter={projects} />.
-    (d) toolbarConfig has an 'esc-analytics' entry with showWindow: false.
+    (d) toolbarConfig has an 'esc-analytics' entry.
+
+    That the tab carries no global window chip (it owns its own client-side
+    7d/28d toggle) is no longer a source grep here: it is executed by
+    dashboard/tests/js/window_chip.test.mjs (b), which asserts esc-analytics
+    has no window_chip.js::TAB_WINDOWS entry and windowForTab leaves the
+    window alone on it.
     """
     # (a) EscalationAnalyticsTab destructured from window.DF_TABS
     assert re.search(
@@ -636,17 +641,11 @@ def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
         "app.jsx renderTab `case 'esc-analytics':` does not return "
         '<EscalationAnalyticsTab projectFilter={projects} /> — add it.'
     )
-    # (d) toolbarConfig esc-analytics entry with showWindow: false
+    # (d) toolbarConfig esc-analytics entry
     parts = app_jsx_body.split('toolbarConfig')
     assert len(parts) > 1 and "'esc-analytics'" in parts[1], (
         "app.jsx toolbarConfig does not have an 'esc-analytics' entry — add "
-        "`'esc-analytics': { showWindow: false, showAgents: false, search: false }` "
-        'to toolbarConfig.'
-    )
-    esc_analytics_entry = parts[1].split("'esc-analytics'", 1)[1][:200]
-    assert re.search(r'showWindow\s*:\s*false', esc_analytics_entry), (
-        "app.jsx toolbarConfig 'esc-analytics' entry does not set `showWindow: false` — "
-        'the tab owns its own client-side window toggle, not the global chip.'
+        "`'esc-analytics': { showAgents: false, search: false }` to toolbarConfig."
     )
 
 

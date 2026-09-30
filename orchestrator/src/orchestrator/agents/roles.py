@@ -265,6 +265,9 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_reuse_item',
     # Revalidation tools (blast-radius requeue)
     'mcp__plan-tools__update_plan_metadata',
+    # Narrowing-pass option (c); see
+    # orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt
+    'mcp__plan-tools__drop_plan_file',
     'mcp__plan-tools__remove_plan_step',
     'mcp__plan-tools__replace_plan_step',
     'mcp__plan-tools__confirm_plan',

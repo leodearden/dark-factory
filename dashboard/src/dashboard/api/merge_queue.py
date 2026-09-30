@@ -22,7 +22,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from dashboard.api.window import _parse_window
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
@@ -47,8 +47,8 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     """MERGE_QUEUE — per-project depth/outcomes/latency/recent/active/speculative."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
-    hours = days * 24
+    window = _parse_window(request.query_params)
+    hours = window.days * 24
     effective_now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     project_dbs = await _project_scoped_dbs_labeled(
@@ -62,7 +62,6 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             project_dbs,
             hours=hours,
             now=effective_now,
-            recent_window_minutes=1440,
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
         fetch_live_merge_queues(http_client, config.escalation_urls),
@@ -90,9 +89,12 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     for pid in pids:
         active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
     return JSONResponse(
-        redux_api.shape_merge_queue(
-            enriched,
-            active_sparks=active_sparks,
-            halt_status=halt_status,
+        with_window(
+            redux_api.shape_merge_queue(
+                enriched,
+                active_sparks=active_sparks,
+                halt_status=halt_status,
+            ),
+            window,
         )
     )

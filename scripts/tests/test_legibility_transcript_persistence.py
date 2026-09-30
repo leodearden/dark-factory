@@ -181,7 +181,14 @@ _USABLE_PROMPT = (
 )
 
 
-def _spawn_record(slug: str, cwd: str, prompt: str, *, start_offset_hours: int = 1):
+def _spawn_record(
+    slug: str,
+    cwd: str,
+    prompt: str,
+    *,
+    start_offset_hours: int = 1,
+    claude_session_id: str | None = None,
+):
     return session_registry.SessionRecord(
         session_slug=slug,
         status=session_registry.Status.EXITED,
@@ -189,6 +196,16 @@ def _spawn_record(slug: str, cwd: str, prompt: str, *, start_offset_hours: int =
         cwd=cwd,
         start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
         exit_code=0,
+        claude_session_id=claude_session_id,
+    )
+
+
+def _slash_expanded(command: str, args: str) -> str:
+    """The real on-disk first user turn of a slash-command session, as observed in ~/.claude/projects transcripts such as 2d479abe-dc83-4b50-8e36-2b13b0c2333c.jsonl."""
+    return (
+        f"<command-message>{command}</command-message>\n"
+        f"<command-name>/{command}</command-name>\n"
+        f"<command-args>{args}</command-args>"
     )
 
 
@@ -457,6 +474,255 @@ def test_find_missing_transcripts_no_false_positive_for_underscore_cwd(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# task 5873: bound claude_session_id is the exact join key
+# ---------------------------------------------------------------------------
+
+_DF_CWD = "/home/leo/src/dark-factory"
+_TEAM_ARGS = (
+    "Read the brief at /home/leo/.claude/spawn-briefs/steward-multiple-runs.md "
+    "and carry out what it specifies."
+)
+_TEAM_PROMPT = "/team " + _TEAM_ARGS
+_SPAWN_TRAILER = (
+    "\n\n---\nBefore you end this session (whether you finish, hand off, or get\n"
+    "blocked), write your outcome to: /x/result.md"
+)
+
+
+def test_find_matching_transcript_bound_session_id_resolves_exact_file(tmp_path):
+    projects = tmp_path / "projects"
+    session_id = "2d479abe-dc83-4b50-8e36-2b13b0c2333c"
+    rec = _spawn_record(
+        "sess-bound", _DF_CWD, _TEAM_PROMPT, claude_session_id=session_id,
+    )
+
+    bound_path = _write_transcript(
+        projects, _DF_CWD, f"{session_id}.jsonl",
+        "An opening turn unrelated to the recorded prompt.",
+    )
+    sibling = _write_transcript(
+        projects, _DF_CWD, "aaa-sibling.jsonl",
+        "You are a TDD implementer. A different first turn.",
+    )
+    _set_mtime(sibling, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == bound_path
+
+
+def test_find_missing_transcripts_no_finding_when_bound_exact_file_exists(tmp_path):
+    projects = tmp_path / "projects"
+    session_id = "2d479abe-dc83-4b50-8e36-2b13b0c2333c"
+    rec = _spawn_record(
+        "sess-bound-team", _DF_CWD, _TEAM_PROMPT, claude_session_id=session_id,
+    )
+    _write_transcript(
+        projects, _DF_CWD, f"{session_id}.jsonl",
+        "An opening turn unrelated to the recorded prompt.",
+    )
+
+    findings = mod.find_missing_transcripts(
+        [rec], projects, [_DF_CWD],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert findings == []
+
+
+def test_find_matching_transcript_bound_session_id_absent_is_missing_even_with_prompt_match(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-bound-lost", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id="f1b732ad-572f-42bd-8720-1a219ff0d424",
+    )
+    respawn = _write_transcript(projects, _DF_CWD, "respawn.jsonl", _USABLE_PROMPT)
+    _set_mtime(respawn, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_find_matching_transcript_rebound_id_without_file_is_missing_despite_launch_transcript(
+    tmp_path,
+):
+    """Pins the accepted re-mint false-positive class: a ``/clear`` re-binds the
+    record to a new id, and a session that exits before writing under it has no
+    ``<new_id>.jsonl`` even though its launch transcript survives."""
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-rebound", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id="64e5c3cd-2457-4f92-8532-574617f54233",
+    )
+    launch = _write_transcript(
+        projects, _DF_CWD, "5029efa9-cb15-43d2-bba8-985e34de0b7a.jsonl",
+        _USABLE_PROMPT + _SPAWN_TRAILER,
+    )
+    _set_mtime(launch, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+@pytest.mark.parametrize(
+    "make_bad_id",
+    [lambda root: "../elsewhere/decoy", lambda root: str(root / "abs" / "decoy")],
+    ids=["relative-escape", "absolute"],
+)
+def test_find_matching_transcript_path_like_bound_id_never_resolves_outside_expected_dir(
+    tmp_path, make_bad_id,
+):
+    projects = tmp_path / "projects"
+    bad_id = make_bad_id(tmp_path)
+    rec = _spawn_record("sess-bad-id", _DF_CWD, _USABLE_PROMPT, claude_session_id=bad_id)
+    expected_dir = projects / mod.inventory.encode_cwd(_DF_CWD)
+    decoy_name = f"{bad_id}.jsonl"
+    (expected_dir / decoy_name).parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(projects, _DF_CWD, decoy_name, "An unrelated session elsewhere.")
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_find_matching_transcript_path_like_bound_id_falls_back_to_prompt_match(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-bad-id", _DF_CWD, _USABLE_PROMPT, claude_session_id="../elsewhere/decoy",
+    )
+    present = _write_transcript(projects, _DF_CWD, "present.jsonl", _USABLE_PROMPT)
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == present
+
+
+# ---------------------------------------------------------------------------
+# task 5873: unbound slash-command spawns (STRONG tier)
+# ---------------------------------------------------------------------------
+
+_SLASH_ARGS = (
+    "4743 (esc esc-4743-9, preexisting_main_break, blocking: bring current main "
+    "into task/4743, re-verify, and land via the merge queue)"
+)
+
+
+def test_find_matching_transcript_unbound_slash_command_matches_expanded_first_turn(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+
+    expanded = _write_transcript(
+        projects, _DF_CWD, "expanded.jsonl",
+        _slash_expanded("unblock", _SLASH_ARGS + _SPAWN_TRAILER),
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == expanded
+
+
+def test_find_matching_transcript_unbound_slash_command_other_command_same_args_returns_none(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+
+    _write_transcript(projects, _DF_CWD, "deb-sibling.jsonl", _slash_expanded("deb", _SLASH_ARGS))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_find_matching_transcript_unbound_slash_command_matches_name_first_expansion(tmp_path):
+    """Claude Code also writes the tags name-first, as observed in ~/.claude/projects transcripts such as 72882c69-5ce8-4c33-a01c-310d6480eba2.jsonl."""
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+    name_first = _write_transcript(
+        projects, _DF_CWD, "name-first.jsonl",
+        "<command-name>/unblock</command-name>\n"
+        "            <command-message>unblock</command-message>\n"
+        f"            <command-args>{_SLASH_ARGS}</command-args>",
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == name_first
+
+
+@pytest.mark.parametrize(
+    "first_turn",
+    [
+        "Read the session digest below and code it.\n\n"
+        + _slash_expanded("unblock", _SLASH_ARGS),
+        "<command-name>/unblock</command-name>\nAn unrelated aside.\n"
+        f"<command-args>{_SLASH_ARGS}</command-args>",
+    ],
+    ids=["expansion-quoted-mid-turn", "name-and-args-not-adjacent"],
+)
+def test_find_matching_transcript_unbound_slash_command_ignores_non_expansion_turn(
+    tmp_path, first_turn,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-unbound-unblock", _DF_CWD, "/unblock " + _SLASH_ARGS)
+    _write_transcript(projects, _DF_CWD, "quoting.jsonl", first_turn)
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+# ---------------------------------------------------------------------------
+# task 5873: a finding names the bound claude_session_id
+# ---------------------------------------------------------------------------
+
+_LOST_SESSION_ID = "fbc45451-7894-4330-961f-ba377c9ce8a3"
+
+
+def test_find_missing_transcripts_finding_carries_bound_claude_session_id(tmp_path):
+    projects = tmp_path / "projects"
+    bound = _spawn_record(
+        "sess-lost-bound", _DF_CWD, _USABLE_PROMPT, claude_session_id=_LOST_SESSION_ID,
+    )
+    unbound = _spawn_record(
+        "sess-lost-unbound", _DF_CWD,
+        "Diagnose the stuck reconciliation on task 2701 and summarise the root cause.",
+    )
+
+    findings = mod.find_missing_transcripts(
+        [bound, unbound], projects, [_DF_CWD],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert len(findings) == 2
+    by_slug = {f.session_slug: f for f in findings}
+    assert by_slug["sess-lost-bound"].claude_session_id == _LOST_SESSION_ID
+    assert by_slug["sess-lost-unbound"].claude_session_id is None
+
+
+def test_build_escalation_arguments_names_bound_claude_session_id(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    finding = _missing_finding(claude_session_id=_LOST_SESSION_ID)
+
+    args = mod._build_escalation_arguments([finding], cfg, force_persistence_ok=None)
+
+    assert _LOST_SESSION_ID in args["detail"]
+
+
+# ---------------------------------------------------------------------------
 # step-9/10: pure preventer guard — payload_exports_force_persistence
 # (fixture strings ONLY — never the real committed spawn-claude.sh)
 # ---------------------------------------------------------------------------
@@ -590,6 +856,8 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
+    *,
+    claude_session_id: str | None = None,
 ) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
@@ -598,6 +866,7 @@ def _missing_finding(
         start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
         exit_code=0,
         expected_dir=Path("/tmp/projects") / mod.inventory.encode_cwd(cwd),
+        claude_session_id=claude_session_id,
     )
 
 

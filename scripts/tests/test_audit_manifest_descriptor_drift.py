@@ -56,7 +56,6 @@ from audit_manifest_descriptor_drift import (
     EXIT_NO_ROOT,
     EXIT_NOTHING_AUDITED,
     EXIT_OK,
-    MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
     ManifestBinding,
     ProjectAudit,
@@ -68,6 +67,7 @@ from audit_manifest_descriptor_drift import (
     format_report,
     load_task_store_scan,
 )
+from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -84,6 +84,7 @@ from shared.task_statuses import TERMINAL, TaskStatus
 _GREP_CHECK = {"kind": "grep", "pattern": "def foo", "paths": ["a.py"], "expect": "present"}
 _SCRIPT_CHECK = {"kind": "script", "script": "scripts/x.sh", "args": ["--v"], "timeout_secs": 30}
 _MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
+_PATH_CHECK = {"kind": "path", "paths": ["scripts/x.sh"], "expect": "present"}
 
 
 def _capability(name: str, check: dict | None) -> dict:
@@ -256,6 +257,42 @@ def test_script_kind_descriptor_fields_are_compared(
     assert [d.differing_fields for d in audit.findings] == [(field,)]
 
 
+def test_identical_path_descriptors_are_compared_and_agree(tmp_path, make_tasks_db):
+    """kind=path is mechanical: the stamper copies it, so the sweep compares it."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", _PATH_CHECK))
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    assert audit.coverage.mechanical_capabilities_compared == 1
+    assert audit.coverage.task_entries_with_no_sidecar_capability == 0
+
+
+def test_a_path_sidecar_against_a_grep_task_entry_is_kind_drift(
+        tmp_path, make_tasks_db):
+    """The half-landed shape of a MODE-3 repair: sidecar rewritten, record not."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    audit = audit_project(str(root))
+
+    assert len(audit.findings) == 1
+    assert "kind" in audit.findings[0].differing_fields
+
+
+def test_differing_paths_on_a_path_check_is_a_finding(tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", {**_PATH_CHECK, "paths": ["scripts/y.sh"]}))
+
+    audit = audit_project(str(root))
+
+    assert [d.differing_fields for d in audit.findings] == [("paths",)]
+
+
 def test_abbreviated_task_entry_omitting_defaults_is_NOT_a_finding(
         tmp_path, make_tasks_db):
     """THE NORMALIZATION PROPERTY — what keeps the live count at 8, not 22.
@@ -287,11 +324,11 @@ def test_abbreviated_task_entry_omitting_defaults_is_NOT_a_finding(
 def test_manual_kind_capability_is_skipped_entirely(tmp_path, make_tasks_db):
     """A manual check is never copied to metadata, so it can never drift.
 
-    manifest_stamping.py step 5 filters ``check.kind not in ('grep', 'script')``,
-    so comparing a manual capability would report a permanent false positive on
-    every manual-checked capability in the corpus.
+    manifest_stamping.py step 5 copies only
+    ``shared.capability_manifest.MECHANICAL_CHECK_KINDS``, of which manual is
+    never one, so comparing a manual capability would report a permanent false
+    positive on every manual-checked capability in the corpus.
     """
-    assert MECHANICAL_CHECK_KINDS == ("grep", "script")
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[_task(100, [])],
@@ -1988,9 +2025,7 @@ def test_live_sidecars_still_declare_none_of_the_adjudicated_labels(relpath):
     _MEASURED_UNBOUND_ROWS and the sidecar's "Unbound task labels (task 4907
     adjudication)" twin section in the SAME commit. Do not relax this pin.
     """
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     # NON-VACUITY FLOOR: a renamed or deleted sidecar must not pass by finding
     # nothing to check, and neither must one emptied of every label.
@@ -2244,17 +2279,6 @@ def test_the_measured_rows_carry_the_two_differing_field_sets(
 # legitimate live assertion where a tasks.db one would not be.
 # ---------------------------------------------------------------------------
 
-def _repo_root():
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed.stdout.strip() if completed.returncode == 0 else None
-
-
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,resynced",
     [(r[0], r[1], r[2], r[3], r[5]) for r in _MEASURED_DRIFT_ROWS],
@@ -2282,9 +2306,7 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     is the assertion this pin is standing in for. Only a sidecar that disagrees
     with its task record is the defect this test was written to catch.
     """
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
     # renamed or deleted manifest cannot make this test pass by finding
@@ -2331,9 +2353,7 @@ def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
     suite, not prose it merely contains — grepped with the argv of
     orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
     the working tree instead of a ref."""
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
     doc = load_capability_manifest(Path(root) / relpath)

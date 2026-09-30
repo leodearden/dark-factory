@@ -112,7 +112,7 @@
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 55, "function_local_imports": 0, "lines": 747, "prose_lines": 428, "reexport_names": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"cognitive": 5, "function_local_imports": 0, "lines": 106, "prose_lines": 45, "reexport_names": 0},
     "orchestrator/tests/_serial_merge_worker.py": {"cognitive": 33, "function_local_imports": 0, "lines": 393, "prose_lines": 134, "reexport_names": 0},
-    "orchestrator/tests/conftest.py": {"cognitive": 50, "function_local_imports": 6, "lines": 1261, "prose_lines": 796, "reexport_names": 5}
+    "orchestrator/tests/conftest.py": {"cognitive": 50, "function_local_imports": 6, "lines": 1246, "prose_lines": 778, "reexport_names": 5}
   },
   "functions": {
     "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,

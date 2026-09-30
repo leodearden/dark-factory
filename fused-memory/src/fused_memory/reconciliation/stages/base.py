@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
-from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
+from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -528,11 +528,7 @@ class BaseStage:
 
         servers: dict = {
             'fused-memory': fm_entry,
-            # Launch contract: shared/jcodemunch_launch.py::JCODEMUNCH_COMMAND / ::JCODEMUNCH_ENV.
-            'jcodemunch': {
-                'command': JCODEMUNCH_COMMAND,
-                'env': dict(JCODEMUNCH_ENV),
-            },
+            'jcodemunch': jcodemunch_server_config(),
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate
             # in-process state (not Graphiti / Mem0 / Taskmaster).

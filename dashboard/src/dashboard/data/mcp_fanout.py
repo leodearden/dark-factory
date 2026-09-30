@@ -40,7 +40,7 @@ import logging
 import os
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -659,6 +659,34 @@ async def first_success(
             note_fanout_success(log_label, url)
             return result
     return offline_result(errors)
+
+
+async def cancel_and_await(tasks: Mapping[asyncio.Task[Any], str], what: str) -> int:
+    """Cancel *tasks* and wait for them to end, within ``_REAP_UNWIND_TIMEOUT_SECONDS``.
+
+    The shutdown reap's one mechanism, keyed by each task's label for the
+    WARNING. Every outcome is consumed, since nobody awaits a reaped task. A task
+    still unwinding at the bound is abandoned, named in one WARNING, and not
+    counted: returns how many actually ended.
+    """
+    for task in tasks:
+        task.cancel()
+    if not tasks:  # asyncio.wait rejects an empty set
+        return 0
+    ended, abandoned = await asyncio.wait(tasks, timeout=_REAP_UNWIND_TIMEOUT_SECONDS)
+    for task in ended:
+        if not task.cancelled():
+            task.exception()
+    if abandoned:
+        logger.warning(
+            '%d %s did not unwind within %.1fs and are abandoned (%s); '
+            'shutdown continues without them',
+            len(abandoned),
+            what,
+            _REAP_UNWIND_TIMEOUT_SECONDS,
+            ', '.join(sorted({tasks[task] for task in abandoned})),
+        )
+    return len(ended)
 
 
 # Every live TTLCache, enrolled from __init__ so reap_detached_refreshes()
@@ -1541,23 +1569,9 @@ class TTLCache(Generic[V, K]):
             for key, entry in self._bypass_tasks.items()
             if _runs_on_another_live_loop(entry[1])
         }
-        for _key, task in reapable:
-            task.cancel()
-        abandoned: set[asyncio.Task[V]] = set()
-        if reapable:  # asyncio.wait rejects an empty set; a clean cache is one
-            _ended, abandoned = await asyncio.wait(
-                [task for _key, task in reapable],
-                timeout=_REAP_UNWIND_TIMEOUT_SECONDS,
-            )
-        if abandoned:
-            logger.warning(
-                '%d detached cache refresh(es) did not unwind within %.1fs and '
-                'are abandoned (keys: %s); shutdown continues without them',
-                len(abandoned),
-                _REAP_UNWIND_TIMEOUT_SECONDS,
-                ', '.join(sorted({repr(k) for k, task in reapable if task in abandoned})),
-            )
-        return len(reapable) - len(abandoned)
+        return await cancel_and_await(
+            {task: repr(key) for key, task in reapable}, 'detached cache refresh(es)',
+        )
 
     def clear(self) -> None:
         """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).

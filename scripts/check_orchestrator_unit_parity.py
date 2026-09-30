@@ -1,6 +1,6 @@
 """Parity checker for the installed orchestrator systemd units.
 
-Verifies that the nine units committed under ``scripts/`` still agree with
+Verifies that the sixteen units committed under ``scripts/`` still agree with
 the copies actually installed in ``~/.config/systemd/user/``:
 
     orchestrator-watchdog.service          orchestrator-watchdog.timer
@@ -8,6 +8,11 @@ the copies actually installed in ``~/.config/systemd/user/``:
     orchestrator-autopilot-video.service   orchestrator-my-solar-challenge.service
     orchestrator-solar-challenge-platform.service
     orchestrator-know-live.service         orchestrator-pump-web-ui.service
+
+and the seven ``orchestrator-<project>.socket`` units (one per project
+orchestrator above; the watchdog pair has none) that hold each project's
+escalation MCP port across a restart. Each socket's committed copy lives at
+``scripts/<unit>.template`` — see the ``UNITS`` registry below for why.
 
 The two know-live / pump-web-ui entries were added 2026-08-06, when this
 branch was rebased onto a main that had, in the interim, wired both units
@@ -36,8 +41,8 @@ per-unit ``(section, key)`` registry, because one of its units is RENDERED
 from a template (``__REPO_ROOT__`` / ``__UV_PATH__`` substitution) and an
 unbounded diff there would be a false-positive machine.
 
-That reasoning does not transfer.  ``setup-host.sh`` installs all nine units
-here by ``cp``-ing them VERBATIM — no substitution at all, not even for the
+That reasoning does not transfer.  ``setup-host.sh`` installs all sixteen
+units here by ``cp``-ing them VERBATIM — no substitution at all, not even for the
 host paths, which are hardcoded in the committed files.  So the two sides are
 supposed to be character-identical by construction, every parsed-directive
 difference is real drift, and the false-positive risk that forced curation
@@ -76,7 +81,7 @@ is worded APART in the report — ``[drift]`` / ``[vanished]`` / ``[override]``
 / ``[unreadable]`` — because they share an exit code but send the operator to
 four different places.  Only ``[drift]`` is a directive diff to propagate.
 
-PRECEDENCE: drift (1) DOMINATES absence (2).  With nine units a single run
+PRECEDENCE: drift (1) DOMINATES absence (2).  With sixteen units a single run
 can hit both at once, and returning 2 there would let an unrelated
 uninstalled unit mask an actionable finding — ``setup-host.sh`` treats 2 as a
 benign "not installed on this host, skipping" and only 1 as something to act
@@ -91,10 +96,11 @@ A consumer that needs to act per UNIT rather than per run wants the
 
 Machine-readable verdicts
 -------------------------
-The exit code above is a WHOLE-RUN verdict: with nine units, one drifted unit
-collapses the entire run to 1 and tells a consumer nothing about the other
-eight.  That is fine for an operator reading the report, and was not fine for
-``setup-host.sh``, which used it to decline the install of ALL nine units when
+The exit code above is a WHOLE-RUN verdict: with sixteen units, one drifted
+unit collapses the entire run to 1 and tells a consumer nothing about the
+other fifteen.  That is fine for an operator reading the report, and was not
+fine for ``setup-host.sh``, which used it to decline the install of ALL sixteen
+units when
 any one of them was unverifiable — so a single deliberate drop-in on
 ``orchestrator-reify.service`` also blocked the watchdog pair from being
 reinstalled and re-enabled, which is a supervision regression dressed as
@@ -494,6 +500,31 @@ UNITS: dict[str, str] = {
     # KNOWN RED section, which retired the REBASE NOTE that stood here.
     "orchestrator-know-live.service": "scripts/orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service": "scripts/orchestrator-pump-web-ui.service",
+    # The seven escalation-port-holding sockets (task: escalation socket
+    # activation). Each pairs with the like-named .service above and is
+    # installed by the SAME verbatim `cp` as every other unit here — `.socket`
+    # is only not itself the committed EXTENSION, because it is not in the
+    # shared lock-charter extension allowlist. The committed source is
+    # `<unit>.template`; comparison still runs on the parsed directives, so
+    # that source's extra leading comment block (required by the charter) is
+    # invisible to it exactly like every other unit's header comment (see
+    # "Why FULL SYMMETRIC EQUALITY" above — comments are dropped before either
+    # side is compared).
+    "orchestrator-dark-factory.socket": "scripts/orchestrator-dark-factory.socket.template",
+    "orchestrator-reify.socket": "scripts/orchestrator-reify.socket.template",
+    "orchestrator-autopilot-video.socket": (
+        "scripts/orchestrator-autopilot-video.socket.template"
+    ),
+    "orchestrator-my-solar-challenge.socket": (
+        "scripts/orchestrator-my-solar-challenge.socket.template"
+    ),
+    "orchestrator-solar-challenge-platform.socket": (
+        "scripts/orchestrator-solar-challenge-platform.socket.template"
+    ),
+    "orchestrator-know-live.socket": "scripts/orchestrator-know-live.socket.template",
+    "orchestrator-pump-web-ui.socket": (
+        "scripts/orchestrator-pump-web-ui.socket.template"
+    ),
 }
 
 

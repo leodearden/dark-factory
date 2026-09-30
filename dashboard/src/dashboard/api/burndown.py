@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.burndown import (
@@ -31,9 +32,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# Deliberately NOT dashboard.api.window's _WINDOW_DAYS: the burndown chart
-# offers 90d where that vocabulary offers `all`, and static/redux/app.jsx
-# pins the two sets as distinct. api_burndown is this one's only consumer.
+# A distinct vocabulary, parsed by the shared dashboard.api.window parser:
+# the burndown chip offers 90d where dashboard.api.window._WINDOW_DAYS offers
+# `all`. api_burndown is this one's only consumer.
 _BURNDOWN_WINDOWS: dict[str, int] = {
     '24h': 1,
     '7d': 7,
@@ -48,18 +49,17 @@ async def api_burndown(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs = await _burndown_dbs(config, pool)
-    window_raw = request.query_params.get('window', '30d')
-    days = _BURNDOWN_WINDOWS.get(window_raw, 30)
+    window = _parse_window(request.query_params, vocabulary=_BURNDOWN_WINDOWS)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     try:
-        projects = await aggregate_burndown_projects(dbs, days=days, now=now)
+        projects = await aggregate_burndown_projects(dbs, days=window.days, now=now)
         per_pid = await asyncio.gather(
-            *(aggregate_burndown_series(dbs, pid, days=days, now=now) for pid in projects)
+            *(aggregate_burndown_series(dbs, pid, days=window.days, now=now) for pid in projects)
         )
         series: dict[str, dict] = dict(zip(projects, per_pid, strict=True))
     except Exception:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
     shaped = redux_api.shape_burndown(series, served_at=now)
-    return JSONResponse({**shaped, 'served_at': now.isoformat()})
+    return JSONResponse(with_window({**shaped, 'served_at': now.isoformat()}, window))

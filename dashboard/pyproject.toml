@@ -32,6 +32,9 @@ dependencies = [
     # moment httpx swapped its backend — the same drift the typing-extensions
     # entry above exists to prevent.
     "httpcore>=1.0",
+    # Direct import (src/dashboard/data/memory.py::_bounded_post), not just an
+    # httpx transitive, for the reason given for httpcore above.
+    "anyio>=4.0",
     "escalation>=0.1",
     "dark-factory-shared",
 ]

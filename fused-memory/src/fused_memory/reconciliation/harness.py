@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -775,8 +776,12 @@ class ReconciliationHarness:
         known_projects: dict[str, str] | None = None,
         recon_report_state=None,
         server_ready_event: asyncio.Event | None = None,
+        escalation_listener: socket.socket | None = None,
     ):
         self.memory = memory_service
+        # systemd-held listening socket for the escalation port, so it stays
+        # bound across fused-memory restarts; None means bind it ourselves.
+        self._escalation_listener = escalation_listener
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
@@ -2772,9 +2777,17 @@ class ReconciliationHarness:
         host = self.config.escalation_host
         port = self.config.escalation_port
 
+        listener = self._escalation_listener
+
         async def _serve():
             try:
-                await mcp_server.run_http_async(host=host, port=port)
+                if listener is None:
+                    await mcp_server.run_http_async(host=host, port=port)
+                else:
+                    import uvicorn
+
+                    config = uvicorn.Config(mcp_server.http_app(), log_level='warning')
+                    await uvicorn.Server(config).serve(sockets=[listener])
             except Exception as e:
                 logger.error(f'Escalation server error: {e}')
 
@@ -3903,12 +3916,17 @@ class ReconciliationHarness:
                     reports.append(report)
                     run.stage_reports[stage_key] = report
 
-                # Update watermark
-                watermark.last_full_run_id = run_id
-                watermark.last_full_run_completed = datetime.now(UTC)
-                watermark.last_episode_timestamp = datetime.now(UTC)
-                watermark.last_memory_timestamp = datetime.now(UTC)
-                watermark.last_task_change_timestamp = datetime.now(UTC)
+                completed_at = datetime.now(UTC)
+                watermark = watermark.model_copy(update={
+                    'last_full_run_id': run_id,
+                    'last_full_run_completed': completed_at,
+                    # Run start, not completion (on resume, the original start): a mid-cycle
+                    # item is shown to the next cycle rather than to neither. Why, and the cost:
+                    # tests/reconciliation/test_recon_window_anchor.py
+                    'last_episode_timestamp': run.started_at,
+                    'last_memory_timestamp': run.started_at,
+                    'last_task_change_timestamp': completed_at,
+                })
                 await self.journal.update_watermark(watermark)
 
                 run.completed_at = datetime.now(UTC)
