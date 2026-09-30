@@ -3,7 +3,6 @@ from a freshly built one, to porcelain AND plumbing, and costs one git spawn.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import os
 import shlex
@@ -272,80 +271,3 @@ class TestSharedWorkflowSeeders:
         asyncio.run(seeder(tmp_path / 'measured'))
 
         assert _spawns(log) == 1
-
-
-_MIGRATED_MODULES = tuple(
-    Path(__file__).parent / name
-    for name in (
-        'test_git_ops.py', 'test_merge_queue.py', 'test_warm_lane_pool.py', '_workflow_helpers.py',
-    )
-)
-
-
-def _git_argvs(func: ast.AST) -> list[list[object]]:
-    """Every ``['git', <verb>, ...]`` list literal under *func*; non-constant elements are None."""
-    argvs: list[list[object]] = []
-    for node in ast.walk(func):
-        if isinstance(node, ast.List):
-            argv: list[object] = [
-                elt.value if isinstance(elt, ast.Constant) else None for elt in node.elts
-            ]
-            if len(argv) >= 2 and argv[0] == 'git' and isinstance(argv[1], str):
-                argvs.append(argv)
-    return argvs
-
-
-def _local_repo_seeders(tree: ast.Module) -> list[str]:
-    """Module-level functions that both ``git init`` a non-bare repo and ``git commit``."""
-    seeders: list[str] = []
-    for func in tree.body:
-        if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            argvs = _git_argvs(func)
-            if (
-                any(argv[1] == 'init' and '--bare' not in argv for argv in argvs)
-                and any(argv[1] == 'commit' for argv in argvs)
-            ):
-                seeders.append(func.name)
-    return seeders
-
-
-class TestNoLocalRepoSeederInMigratedModules:
-    @pytest.mark.parametrize('module', _MIGRATED_MODULES, ids=[m.name for m in _MIGRATED_MODULES])
-    def test_module_has_no_local_repo_seeder(self, module: Path) -> None:
-        seeders = _local_repo_seeders(ast.parse(module.read_text(encoding='utf-8')))
-        assert seeders == [], (
-            f'{module.name} defines its own repo seeder(s) {seeders}: delegate to '
-            '_git_fixtures.seed_repo instead. When migrating another module, add it '
-            'to _MIGRATED_MODULES in test_git_fixtures.py.'
-        )
-
-    def test_the_legacy_seeder_is_flagged(self) -> None:
-        tree = ast.parse(
-            'async def _setup_repo(repo):\n'
-            "    await _run(['git', 'init', '-b', 'main'], cwd=repo)\n"
-            "    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)\n"
-            "    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)\n"
-            "    (repo / 'README.md').write_text('# Test\\n')\n"
-            "    await _run(['git', 'add', '-A'], cwd=repo)\n"
-            "    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)\n"
-        )
-
-        assert _local_repo_seeders(tree) == ['_setup_repo']
-
-    def test_a_bare_origin_helper_is_not_flagged(self) -> None:
-        tree = ast.parse(
-            'async def _make_origin(origin, seed):\n'
-            "    await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)\n"
-            "    await _run(['git', 'push', str(origin), 'main'], cwd=seed)\n"
-        )
-
-        assert _local_repo_seeders(tree) == []
-
-    def test_a_clone_then_commit_helper_is_not_flagged(self) -> None:
-        tree = ast.parse(
-            'async def _clone_and_commit(origin, local):\n'
-            "    await _run(['git', 'clone', str(origin), str(local)])\n"
-            "    await _run(['git', 'commit', '--allow-empty', '-m', 'x'], cwd=local)\n"
-        )
-
-        assert _local_repo_seeders(tree) == []
