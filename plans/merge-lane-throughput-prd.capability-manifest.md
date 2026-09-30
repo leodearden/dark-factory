@@ -90,6 +90,17 @@ Probed 2026-09-03: `~/src/dark-factory` on leo-laptop is at `5f185fdf00` with
 trusting either the PRD's or this manifest's snapshot (INV-3), and must not
 `git clean` those paths without the decision-7 inspection. Carried into B's text.
 
+**(6) § A's `mode=ro` precedent citation named the wrong script.** § A cites
+`scripts/analyze_speculation_depth.py` as the established `mode=ro` convention.
+At the time of the citation that script opened its `runs.db` with a bare
+read-write `sqlite3.connect(args.db_path)` (fixed by task 5125). The convention
+is held by `scripts/merge-deep-canary-predicate.sh` (verified: `mode=ro` URI),
+`scripts/audit_wiped_metadata_files.py`, `scripts/audit_combine_gate_marker_loss.py`,
+`scripts/census_tagger_debris.py` and `scripts/scan_task_toolcall_leaks.py`;
+`scripts/merge_lane_throughput.py` itself should follow those. Consumers of this
+manifest (B, C, D1, E, G, H) cite those scripts, not `analyze_speculation_depth.py`,
+for the read-only open. The § A body is left as written (append-only).
+
 ---
 
 ## A — `scripts/merge_lane_throughput.py` + fixture test
