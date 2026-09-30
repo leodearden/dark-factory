@@ -14,6 +14,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
@@ -51,6 +52,7 @@ from fused_memory.backends.falkor_indices import (
 from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
+from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
@@ -1250,6 +1252,18 @@ _PROVENANCE_RANK_CLAUSE = (
 _PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
 
 
+def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
+    """The project registry's ids, derived exactly as ``server/main.py`` derives its map.
+
+    Same builder, same two inputs (the taskmaster project_root and
+    DASHBOARD_KNOWN_PROJECT_ROOTS), so both snapshots of the registry agree.
+    """
+    primary = config.taskmaster.project_root if config.taskmaster else ''
+    if primary:
+        primary = str(Path(primary).expanduser().resolve())
+    return frozenset(build_known_projects_map(primary, known_project_roots_from_env()))
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -1258,8 +1272,18 @@ class GraphitiBackend:
     so every operation targets the correct graph.
     """
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        registered_graph_ids: Iterable[str] | None = None,
+    ):
         self.config = config
+        self._registered_graph_ids: frozenset[str] = (
+            _derive_registered_graph_ids(config)
+            if registered_graph_ids is None
+            else frozenset(canonicalize_project_id(g) for g in registered_graph_ids)
+        )
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
@@ -1277,6 +1301,11 @@ class GraphitiBackend:
         self._embedder = None
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
+
+    @property
+    def registered_graph_ids(self) -> frozenset[str]:
+        """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
+        return self._registered_graph_ids
 
     # --- Per-request driver routing ---
 

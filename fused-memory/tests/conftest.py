@@ -495,9 +495,14 @@ def standard_mock_config() -> MagicMock:
 
 @pytest.fixture
 def make_backend():
-    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client."""
-    def _factory(config) -> GraphitiBackend:
-        backend = GraphitiBackend(config)
+    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client.
+
+    ``registered_graph_ids`` defaults to EMPTY, not to the derived registry, so
+    no ambient DASHBOARD_KNOWN_PROJECT_ROOTS or CWD-derived project id can turn
+    on index provisioning against a MagicMock driver (task 3708).
+    """
+    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
         backend.client = MagicMock()
         backend._driver = MagicMock()
         return backend
