@@ -3522,6 +3522,17 @@ class TestTripwireCensusSplit:
         assert '8' in tuned[0] and 'content_hash' in tuned[0] and 'mem0' in tuned[0]
         assert 'graphiti' in held_out[0]
 
+    def test_a_query_surface_failure_shows_each_phrasings_rank_and_store(self, tmp_path):
+        """Its canonical is hand-adjudicated, not censused, so the ranks are
+        the only diagnosis the run can offer for it."""
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path)
+        lines = sections[m.SECTION_TRIPWIRE_BY_CENSUS].text.splitlines()
+
+        phrasing = [line for line in lines if f'{BRIEFING_SURFACE} tuned' in line]
+        assert len(phrasing) == 1
+        assert 'mem0' in phrasing[0]
+
     def test_an_unpopulated_failure_shows_its_variant_spelling_count(self, tmp_path):
         m = _mod()
         sections, _ = self._report_sections(tmp_path)

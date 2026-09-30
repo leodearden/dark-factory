@@ -2555,9 +2555,17 @@ def _phrasing_rank_line(rank: PhrasingRank, fetched_depth: int) -> str:
     )
 
 
+_RANKED_PRESENCES = frozenset({
+    CanonicalPresence.CANONICAL_PRESENT, CanonicalPresence.QUERY_SURFACE,
+})
+"""The classes whose canonical is known to exist — counted by the census, or
+hand-adjudicated for a query surface — so a failure's per-phrasing ranks are
+the diagnosis."""
+
+
 def _failing_topic_lines(topic: TopicPresence, fetched_depth: int) -> list[str]:
     row = topic.census_row
-    if topic.presence is CanonicalPresence.CANONICAL_PRESENT:
+    if topic.presence in _RANKED_PRESENCES:
         return [f'    - {topic.topic}'] + [
             f'        {_phrasing_rank_line(rank, fetched_depth)}'
             for rank in topic.phrasing_ranks
@@ -2583,7 +2591,8 @@ def _tripwire_by_census_lines(split: TripwireCensusSplit, fetched_depth: int) ->
         'K. The metadata census counts canonicals deterministically, so each item '
         'is classed here by what the census says exists; the counts behind each '
         'class are the census\'s registry_coverage, read there. For a failing '
-        'topic whose canonical the census counts, each phrasing\'s rank, matcher '
+        'topic whose canonical the census counts, or was hand-adjudicated for a '
+        'briefing query, each phrasing\'s rank, matcher '
         'and serving store tell ranking (a rank below K), routing (served only by '
         'a store the canonical does not live in) and fixture decay (matched by '
         'last_known_id, or by neither key) apart.'
