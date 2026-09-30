@@ -157,12 +157,16 @@ def _make_config(
     verdict here would otherwise spawn a DETACHED project-wide verify of the
     tmp repo that outlives the test (task 5811; conftest's leaked-task drain
     is the net under every scene that does not).
+
+    ``verify_runners`` is pinned empty: these scenes are single-host, and the
+    live operational yaml's runners must not turn them into two-host ones.
     """
     return OrchestratorConfig(
         project_root=repo,
         git=git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
         escalate_preexisting_main_break=False,
+        verify_runners=[],
     )
 
 

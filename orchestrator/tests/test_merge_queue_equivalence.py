@@ -74,7 +74,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return OrchestratorConfig(project_root=git_repo, git=git_config, verify_runners=[])
 
 
 # Stand-in type_check_command that exits 0 on a clean tree and exits 1 with

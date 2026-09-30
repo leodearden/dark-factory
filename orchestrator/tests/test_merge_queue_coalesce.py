@@ -280,6 +280,7 @@ def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
         project_root=git_repo,
         git=git_config,
         merge_train_coalesce_enabled=True,
+        verify_runners=[],
     )
 
 

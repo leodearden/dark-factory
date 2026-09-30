@@ -92,12 +92,16 @@ def lane_scene_config(
     """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
 
     The main-health probe is off (``escalate_preexisting_main_break=False``);
-    ``main_health_probe_spawned`` says why. *overrides* are any further
+    ``main_health_probe_spawned`` says why. The scene is single-host and
+    local-first (``verify_runners=[]``, ``verify_host_policy='prefer_local'``)
+    unless *overrides* say otherwise, so the live operational yaml's runners and
+    host policy cannot reshape it. *overrides* are any further
     ``OrchestratorConfig`` fields the scene needs.
     """
     return OrchestratorConfig(
         project_root=project_root, git=git,
-        escalate_preexisting_main_break=False, **overrides,
+        escalate_preexisting_main_break=False,
+        **{'verify_runners': [], 'verify_host_policy': 'prefer_local', **overrides},
     )
 
 

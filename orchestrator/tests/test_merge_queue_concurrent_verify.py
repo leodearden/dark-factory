@@ -781,6 +781,7 @@ def _make_config_with_runner(
         project_root=git_repo,
         git=git_config,
         verify_runners=[runner_cfg],
+        verify_host_policy='prefer_local',
     )
 
 
