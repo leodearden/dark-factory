@@ -60,7 +60,7 @@ the pytest gate today, with an import-specific remedy in the failure message
 that a generic "unnecessary suppression" diagnostic cannot give. Task 5086
 was that task: it measured every ``[tool.pyright]`` table and kept the ROOT
 table off, because the root table carries import pragmas that are load-bearing
-only in narrower environments; the per-table census and the opt-in set live in
+only in narrower environments; the per-table decision and the opt-in set live in
 ``tests/scripts/test_pyright_unnecessary_ignore_opt_in.py``. When the native
 rule is enabled in the ROOT ``[tool.pyright]`` table, shrink or delete this
 file.

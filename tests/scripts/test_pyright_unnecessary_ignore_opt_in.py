@@ -22,29 +22,25 @@ third-party lazy import. Such a pragma is vestigial in the gate env and
 load-bearing in a narrower one, so with the rule on no spelling of that line is
 right in both.
 
-CENSUS (task 5086, pyright 1.1.408, vestigial sites / files per table). The
-full census was measured 2026-09-28 by adding the rule to all eight tables and
-running all nine declared module gates; the opted-in tables were re-measured
-2026-09-30 before their cleanup. Opted in: cockpit 0; sampler 1; dashboard 9 in
-5 files. Staying OFF:
+WHY EACH OTHER TABLE STAYS OFF. The dated per-table counts are in task 5086's
+record, not here, because they go stale with the next edit to any member.
 
-* root, 15 (scripts 6 + tests/scripts 9) — ``scripts/merge_lane_metrics.py::
-  _import_complexipy`` and the radon import beside it are lazy by design, so
-  env-dependent; and the root table also governs every ad-hoc root-scoped
-  pyright run over member files, which would then surface their sites.
+* root — ``scripts/merge_lane_metrics.py::_import_complexipy`` and the radon
+  import beside it are lazy by design, so env-dependent; and the root table
+  also governs every ad-hoc root-scoped pyright run over member files, which
+  would then surface their sites.
   ``tests/scripts/test_no_vestigial_import_pragmas.py`` guards the import class
   under this table instead.
-* shared, 39 — 3 env-dependent cross-member imports in
+* shared — env-dependent cross-member imports in
   ``shared/tests/test_task_statuses.py::TestCrossPackageDriftGuardPlaceholder``.
-* escalation, 184 — ~115 env-dependent ``orchestrator.*`` imports.
-* fused-memory, 307 in 76 files — count alone; its import sites resolve via its
-  own ``extraPaths``, so it is the natural next candidate.
-* orchestrator, 1547 in 173 files — count alone.
+* escalation — env-dependent ``orchestrator.*`` imports.
+* fused-memory — volume alone; its import sites resolve via its own
+  ``extraPaths``, so it is the natural next candidate.
+* orchestrator — volume alone.
 
 GOTCHA. pyright treats ``# type: ignore`` / ``# pyright: ignore`` appearing
 anywhere after a ``#`` in a COMMENT as a live pragma, so prose mentioning one
-in a comment is reported (5 such sites were measured). Docstring mentions are
-string tokens and are not.
+in a comment is reported. Docstring mentions are string tokens and are not.
 
 TO RE-MEASURE OR EXTEND. In a worktree with its own synced ``.venv``, under
 ``env -u VIRTUAL_ENV``, temporarily add
