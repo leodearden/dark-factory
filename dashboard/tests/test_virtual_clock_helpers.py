@@ -39,7 +39,7 @@ def test_a_deadline_cannot_expire_during_a_host_stall():
     async def scenario() -> object:
         async with asyncio.timeout(0.05):
             time.sleep(0.1)
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
         return finished
 
     assert run_on_virtual_clock(scenario()) is finished
