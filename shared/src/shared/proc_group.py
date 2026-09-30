@@ -180,7 +180,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
-            wchan = (entry / 'wchan').read_text().strip()
+            wchan = (entry / 'wchan').read_bytes().decode('utf-8', 'replace').strip()
         except OSError:
             wchan = '?'
 
@@ -416,6 +416,9 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     Short-circuits cheapest-first: cwd, then open fds, then mmap'd pathnames
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
     permission-denied pid is skipped rather than raising (module invariant).
+    ``maps`` pathnames are decoded with ``os.fsdecode``, the surrogateescape
+    str space ``os.readlink`` returns for the cwd and fd signals, so
+    arbitrary-byte pathnames compare correctly and never raise.
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
@@ -434,7 +437,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
 
     # 3. mmap'd pathnames — an mmap'd .rlib / .so living under the tree.
     try:
-        maps_text = (entry / 'maps').read_text()
+        maps_text = os.fsdecode((entry / 'maps').read_bytes())
     except OSError:
         return False
     for line in maps_text.splitlines():
