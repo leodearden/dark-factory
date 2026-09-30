@@ -2389,7 +2389,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     Records every fused-memory ``tools/call`` write on the owning server's
     shared ``writes`` list and replies with a benign JSON-RPC success envelope
     (mirroring ``_StubMcpSession._envelope``). Any POST path is accepted — the
-    workflow write path targets ``{url}/mcp/`` but ``BaseHTTPRequestHandler``
+    workflow write path targets ``{url}/mcp`` but ``BaseHTTPRequestHandler``
     routes every POST here regardless of path.
     """
 
@@ -2452,7 +2452,7 @@ class RecordingMemorySink:
 
     A real loopback HTTP endpoint (stdlib ``http.server``) that receives the
     raw httpx POSTs the workflow's ``_write_*_to_memory`` methods send to
-    ``{self.mcp.url}/mcp/``, records each fused-memory ``tools/call`` write as
+    ``{self.mcp.url}/mcp``, records each fused-memory ``tools/call`` write as
     ``(tool_name, arguments)`` on :attr:`writes`, and replies with a benign
     JSON-RPC success envelope (mirroring ``_StubMcpSession._envelope`` so any
     caller that parses the reply stays happy).

@@ -17636,12 +17636,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
         """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
 
-        Worker-side mirror of ``TaskWorkflow._post_submit_tasks``
-        (workflow.py:9092, task 2564) — a single shared ``httpx.AsyncClient``
-        for the whole batch so only one TCP connection pool is opened
-        regardless of how many tasks are being submitted.  Per-POST
-        exceptions are caught and logged as warnings so a failure on one
-        submission does not abort the rest.
+        Worker-side mirror of ``orchestrator/workflow.py::TaskWorkflow._post_submit_tasks``
+        (task 2564) — a single shared client from ``shared.mcp_post.open_mcp_client``
+        for the whole batch so only one TCP connection pool is opened regardless
+        of how many tasks are being submitted.  Per-POST exceptions are caught
+        and logged as warnings so a failure on one submission does not abort
+        the rest.
 
         None-safe: no-ops when ``self._mcp`` is ``None`` (every bare-worker
         test constructor and any harness that hasn't wired an MCP client).
@@ -17649,22 +17649,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if self._mcp is None:
             return
         try:
-            import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            from shared.mcp_post import open_mcp_client, post_mcp_tool_call
+            async with open_mcp_client() as client:
                 for arguments in arguments_list:
                     try:
-                        await client.post(
-                            f'{self._mcp.url}/mcp/',
-                            json={
-                                'jsonrpc': '2.0',
-                                'id': 1,
-                                'method': 'tools/call',
-                                'params': {
-                                    'name': 'submit_task',
-                                    'arguments': arguments,
-                                },
-                            },
-                            timeout=10,
+                        await post_mcp_tool_call(
+                            client,
+                            self._mcp.url,
+                            'submit_task',
+                            arguments,
+                            context='main-health fix task submit',
                         )
                     except Exception as exc:
                         logger.warning(

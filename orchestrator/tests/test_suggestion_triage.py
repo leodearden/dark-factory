@@ -1338,3 +1338,135 @@ class TestPreTriageCapHandling:
         assert any(
             'all accounts capped' in t.lower() for t in warning_texts
         ), f'Expected warning with "all accounts capped", got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# _post_submit_tasks — transport regression (task 4023)
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorSubmitTransport:
+    """WHERE the curator submit_task POST lands, not merely that it was made.
+
+    The payload-shape tests above stayed green through ~3 months of silently
+    discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
+    the body, which cannot distinguish a delivered POST from one absorbed by
+    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client through the
+    MockTransport server in ``_mcp_transport_harness`` instead — a
+    ``_``-prefixed sibling rather than the ``test_mcp_post_transport`` module
+    that also uses it, so no test module's collection depends on another's.
+    The older tests are left intact — they were never wrong, only insufficient.
+    """
+
+    def _suggestions(self):
+        return [
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/foo.py:10',
+                'category': 'coverage',
+                'description': 'Missing edge case for branch X',
+                'suggested_fix': 'Add a test covering branch X',
+            },
+        ]
+
+    async def _route_and_drain(self, wf, suggestions):
+        await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+        tasks = list(wf._background_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_submit_task_call_lands_at_the_mcp_path(self):
+        """THE regression: the submit_task tools/call must arrive at /mcp."""
+        from _mcp_transport_harness import (
+            MCP_PATH,
+            RecordingClientFactory,
+            RecordingMcpServer,
+        )
+
+        wf = _make_workflow()
+        server = RecordingMcpServer()
+        factory = RecordingClientFactory(server)
+
+        with patch('httpx.AsyncClient', factory):
+            await self._route_and_drain(wf, self._suggestions())
+
+        calls = server.tool_calls('submit_task')
+        assert len(calls) == 1, (
+            f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
+            f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+        )
+        assert server.redirected == [], 'POSTed to the redirecting /mcp/ path'
+        server.assert_every_request_accepted_json()
+
+    @pytest.mark.asyncio
+    async def test_client_is_constructed_with_follow_redirects(self):
+        """Task's explicit ask (a), first half."""
+        from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
+
+        wf = _make_workflow()
+        factory = RecordingClientFactory(RecordingMcpServer())
+
+        with patch('httpx.AsyncClient', factory):
+            await self._route_and_drain(wf, self._suggestions())
+
+        factory.assert_follows_redirects()
+
+    @pytest.mark.asyncio
+    async def test_post_url_has_no_trailing_slash(self):
+        """Task's explicit ask (a), second half — asserted on the URL argument."""
+        urls = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            urls.append(url)
+            return MagicMock(status_code=200, json=lambda: {'result': {}})
+
+        wf = _make_workflow()
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await self._route_and_drain(wf, self._suggestions())
+
+        assert urls, 'no POST was made at all'
+        for url in urls:
+            assert not url.endswith('/'), (
+                f'{url!r} ends in a slash — the server 307s it and the payload is lost'
+            )
+            assert url.endswith('/mcp'), f'{url!r} is not the canonical MCP endpoint'
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_that_slips_through_warns_instead_of_passing_silently(
+        self, caplog,
+    ):
+        """A 3xx reaching the call site must be LOUD.
+
+        Pins that this site actually hands its response to
+        ``check_mcp_post_response``: simulate a redirect arriving unfollowed
+        (a proxy, or a future edit dropping ``follow_redirects``) and require a
+        WARNING attributed to ``shared.mcp_post``.  Silent success here is the
+        exact failure this task exists to end.
+        """
+        import httpx
+
+        async def redirect_post(url, *, json=None, **kwargs):
+            return httpx.Response(
+                307,
+                headers={'Location': 'http://localhost:8002/mcp'},
+                request=httpx.Request('POST', url),
+            )
+
+        wf = _make_workflow()
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('httpx.AsyncClient.post', side_effect=redirect_post),
+        ):
+            await self._route_and_drain(wf, self._suggestions())
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_post'
+        ]
+        assert warnings, (
+            'a 307 at the curator submit site passed silently; expected a WARNING '
+            f'from shared.mcp_post. records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+        assert 'redirect' in ' '.join(r.getMessage() for r in warnings).lower()

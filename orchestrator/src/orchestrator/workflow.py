@@ -41,6 +41,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
@@ -16712,36 +16713,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.mcp is None:
             return
         try:
-            import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
-                await client.post(
-                    f'{self.mcp.url}/mcp/',
-                    json={
-                        'jsonrpc': '2.0',
-                        'id': 1,
-                        'method': 'tools/call',
-                        'params': {
-                            'name': 'add_memory',
-                            'arguments': {
-                                'content': content,
-                                'category': 'observations_and_summaries',
-                                'project_id': self.config.fused_memory.project_id,
-                                'agent_id': f'orchestrator-task-{self.task_id}',
-                                # Stamp task_id (exact-string form) + source so the
-                                # note is audit-visible via metadata.task_id —
-                                # found by get_memories_by_metadata sweeps and the
-                                # Stage-2 done-task audit's semantic-search step.
-                                # Deliberately NO stage2_suppress: this must stay
-                                # visible to the audit, not silently skip its
-                                # count-gate (see method docstring).
-                                'metadata': {
-                                    'task_id': str(self.task_id),
-                                    'source': 'orchestrator_completion',
-                                },
-                            },
+            async with open_mcp_client() as client:
+                await post_mcp_tool_call(
+                    client,
+                    self.mcp.url,
+                    'add_memory',
+                    {
+                        'content': content,
+                        'category': 'observations_and_summaries',
+                        'project_id': self.config.fused_memory.project_id,
+                        'agent_id': f'orchestrator-task-{self.task_id}',
+                        # Stamp task_id (exact-string form) + source so the
+                        # note is audit-visible via metadata.task_id — found
+                        # by get_memories_by_metadata sweeps and the Stage-2
+                        # done-task audit's semantic-search step.
+                        # Deliberately NO stage2_suppress: this must stay
+                        # visible to the audit, not silently skip its
+                        # count-gate (see method docstring).
+                        'metadata': {
+                            'task_id': str(self.task_id),
+                            'source': 'orchestrator_completion',
                         },
                     },
-                    timeout=10,
+                    context=f'completion memory write for task {self.task_id}',
                 )
         except Exception as e:
             logger.warning(f'Failed to write completion to memory: {e}')
@@ -16754,25 +16748,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.mcp is None:
             return
         try:
-            async with __import__('httpx').AsyncClient() as client:
+            async with open_mcp_client() as client:
                 for decision in decisions:
-                    await client.post(
-                        f'{self.mcp.url}/mcp/',
-                        json={
-                            'jsonrpc': '2.0',
-                            'id': 1,
-                            'method': 'tools/call',
-                            'params': {
-                                'name': 'add_memory',
-                                'arguments': {
-                                    'content': f"Decision: {decision['decision']}\nRationale: {decision['rationale']}",
-                                    'category': 'decisions_and_rationale',
-                                    'project_id': self.config.fused_memory.project_id,
-                                    'agent_id': f'orchestrator-task-{self.task_id}',
-                                },
-                            },
+                    await post_mcp_tool_call(
+                        client,
+                        self.mcp.url,
+                        'add_memory',
+                        {
+                            'content': f"Decision: {decision['decision']}\nRationale: {decision['rationale']}",
+                            'category': 'decisions_and_rationale',
+                            'project_id': self.config.fused_memory.project_id,
+                            'agent_id': f'orchestrator-task-{self.task_id}',
                         },
-                        timeout=10,
+                        context=f'decisions memory write for task {self.task_id}',
                     )
         except Exception as e:
             logger.warning(f'Failed to write decisions to memory: {e}')
@@ -16785,26 +16773,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.mcp is None:
             return
         try:
-            import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            async with open_mcp_client() as client:
                 for suggestion in suggestions[:5]:  # cap at 5 to avoid noise
-                    await client.post(
-                        f'{self.mcp.url}/mcp/',
-                        json={
-                            'jsonrpc': '2.0',
-                            'id': 1,
-                            'method': 'tools/call',
-                            'params': {
-                                'name': 'add_memory',
-                                'arguments': {
-                                    'content': f"[{suggestion.get('category', '')}] {suggestion.get('description', '')}",
-                                    'category': 'preferences_and_norms',
-                                    'project_id': self.config.fused_memory.project_id,
-                                    'agent_id': f'orchestrator-task-{self.task_id}',
-                                },
-                            },
+                    await post_mcp_tool_call(
+                        client,
+                        self.mcp.url,
+                        'add_memory',
+                        {
+                            'content': f"[{suggestion.get('category', '')}] {suggestion.get('description', '')}",
+                            'category': 'preferences_and_norms',
+                            'project_id': self.config.fused_memory.project_id,
+                            'agent_id': f'orchestrator-task-{self.task_id}',
                         },
-                        timeout=10,
+                        context=f'suggestions memory write for task {self.task_id}',
                     )
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
@@ -16812,10 +16793,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
         """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
 
-        Uses a single shared ``httpx.AsyncClient`` for the entire batch so only
-        one TCP connection pool is opened per routing call regardless of how many
-        suggestions are being submitted.  Runs inside ``asyncio.create_task`` so
-        the caller returns immediately.
+        Uses a single shared client — ``shared.mcp_post.open_mcp_client`` —
+        for the entire batch so only one TCP connection pool is opened per
+        routing call regardless of how many suggestions are being submitted.
+        That is why the client is opened here rather than inside
+        ``post_mcp_tool_call``.  Runs inside ``asyncio.create_task`` so the
+        caller returns immediately.
 
         Per-POST exceptions are caught and logged as warnings; a failure on one
         suggestion does not abort the remaining submissions.
@@ -16823,22 +16806,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.mcp is None:
             return
         try:
-            import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            async with open_mcp_client() as client:
                 for arguments in arguments_list:
                     try:
-                        await client.post(
-                            f'{self.mcp.url}/mcp/',
-                            json={
-                                'jsonrpc': '2.0',
-                                'id': 1,
-                                'method': 'tools/call',
-                                'params': {
-                                    'name': 'submit_task',
-                                    'arguments': arguments,
-                                },
-                            },
-                            timeout=10,
+                        await post_mcp_tool_call(
+                            client,
+                            self.mcp.url,
+                            'submit_task',
+                            arguments,
+                            context=f'curator submit_task for task {self.task_id}',
                         )
                     except Exception as exc:
                         logger.warning(
