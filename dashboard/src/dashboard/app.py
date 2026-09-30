@@ -82,11 +82,8 @@ from dashboard.data.metrics import (
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
 from dashboard.data.performance import (
-    aggregate_completion_paths,
-    aggregate_escalation_rates,
-    aggregate_loop_histograms,
+    aggregate_performance_cards,
     aggregate_performance_history,
-    aggregate_time_centiles,
 )
 from dashboard.data.reconciliation import (
     get_buffer_stats,
@@ -1066,27 +1063,23 @@ async def api_costs(request: Request) -> JSONResponse:
 
 @app.get('/api/v2/dashboard/performance')
 async def api_performance(request: Request) -> JSONResponse:
-    """PERFORMANCE — completion paths / escalation / loop histograms / TTC."""
+    """PERFORMANCE + served_at — per-project cards Datum and sparkline histories."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
     window = _parse_window(request.query_params, default='7d')
-    paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
-        aggregate_completion_paths(dbs, esc_dirs),
-        aggregate_escalation_rates(dbs, esc_dirs),
-        aggregate_loop_histograms(dbs),
-        aggregate_time_centiles(dbs),
-        aggregate_performance_history(dbs, days=window.days),
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    cards_r, history_r = await asyncio.gather(
+        aggregate_performance_cards(dbs, esc_dirs, days=window.days, now=now),
+        aggregate_performance_history(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
     shaped = redux_api.shape_performance(
-        paths=safe_gather_result(paths_r, {}, 'perf/paths'),
-        escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
-        histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
-        ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
+        cards=safe_gather_result(cards_r, {}, 'perf/cards'),
         history=safe_gather_result(history_r, {}, 'perf/history'),
+        served_at=now,
     )
-    return JSONResponse(with_window(shaped, window))
+    return JSONResponse(with_window({**shaped, 'served_at': now.isoformat()}, window))
 
 
 # Cap str(exc) inside the 502 `detail` field to bound arbitrary-length

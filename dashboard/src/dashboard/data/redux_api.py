@@ -29,6 +29,7 @@ from dashboard.data.burndown import (
 from dashboard.data.datum import Datum, DatumState, validate_datum
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.outcome_colors import assign_outcome_colors
+from dashboard.data.performance import PerformanceCards
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
 
@@ -834,36 +835,33 @@ def shape_escalations(
 
 def shape_performance(
     *,
-    paths: Mapping[str, Iterable[Mapping[str, Any]]],
-    escalations: Mapping[str, Mapping[str, Any]],
-    histograms: Mapping[str, Mapping[str, Any]],
-    ttc: Mapping[str, Mapping[str, Any]],
+    cards: Mapping[str, Datum[PerformanceCards]],
     history: Mapping[str, Mapping[str, Any]] | None = None,
+    served_at: datetime,
 ) -> dict[str, Any]:
-    """Combine the four performance aggregators into the per-project shape.
+    """Each project's cards Datum beside its hour-bucketed histories.
 
-    Output: ``{PERFORMANCE: {project_label: {paths, escalation, hist_outer,
-    hist_inner, ttc, time_centiles_history, one_pass_history,
-    escalation_history}}}``.
+    Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
+    one_pass_history, escalation_history}}}``, where ``cards`` is the
+    project's wire Datum from
+    :func:`dashboard.data.performance.aggregate_performance_cards`.
 
-    ``history`` (optional) carries per-project hour-bucketed histories from
-    :func:`dashboard.data.performance.aggregate_performance_history`. When
-    absent or sparse, the history blocks render as empty {labels, values}.
+    ``cards`` is the listing authority: a project appears exactly when it has
+    a cards Datum, so every entry carries a measured value. ``history``
+    (optional) is :func:`dashboard.data.performance.aggregate_performance_history`'s
+    output; a project absent from it gets empty history blocks. A Datum that
+    breaks its contract at *served_at* is a shaper bug, and the
+    :class:`~dashboard.data.datum.DatumContractError` propagates.
     """
-    project_ids = set(paths) | set(escalations) | set(histograms) | set(ttc) | set(history or {})
     history = history or {}
     empty_pair = {'labels': [], 'values': []}
     empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
-    for pid in project_ids:
-        hist = histograms.get(pid) or {}
+    for pid, datum in cards.items():
+        validate_datum(datum, served_at)
         h = history.get(pid) or {}
         out[_project_label(pid)] = {
-            'paths': [dict(e) for e in (paths.get(pid) or [])],
-            'escalation': dict(escalations.get(pid) or {}),
-            'hist_outer': dict(hist.get('outer') or {'labels': [], 'values': []}),
-            'hist_inner': dict(hist.get('inner') or {'labels': [], 'values': []}),
-            'ttc': dict(ttc.get(pid) or {}),
+            'cards': datum.to_wire(),
             'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
             'escalation_history': dict(h.get('escalation_history') or empty_pair),
