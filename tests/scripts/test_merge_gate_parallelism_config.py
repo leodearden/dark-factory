@@ -200,13 +200,13 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    ``orchestrator/pyproject.toml`` carries ``--max-worker-restart=0``, and
-    copying it here would look like completing the family. It is deliberately
-    NOT copied: that flag turns a worker killed by pytest-timeout's thread
-    handler into a false-failing per-test "node down" on whatever test happened
-    to be running — a SHIFTING VICTIM rather than the starved test — and
-    whether orchestrator should keep it is its own open question (tasks 5114 /
-    5115), not something this task pre-answers for four more modules.
+    The flag is required exactly where ``timeout_method = "thread"`` runs under
+    xdist — orchestrator and fused-memory — and that invariant, with its
+    executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
+    Copying it here would look like completing the family, but these members
+    run ``timeout_method = "signal"``: a timeout raises inside the test and the
+    worker survives, so the case the flag exists for does not arise from their
+    cap, and task 5408 declined to widen it to them without a measured need.
     """
     offenders = [
         token
@@ -215,12 +215,12 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag was deliberately not carried over from '
-        'orchestrator/pyproject.toml: under it a worker that pytest-timeout '
-        "os._exit()s becomes a per-test 'node down' failure attributed to a "
-        'shifting victim rather than to the starved test, and tasks 5114/5115 '
-        "are still open on whether orchestrator should keep it. Do not widen "
-        'that exposure to four more modules as a side effect of adding workers'
+        'That flag is required only where timeout_method = "thread" runs under '
+        'xdist (orchestrator, fused-memory — see '
+        'test_xdist_worker_restart_policy.py). This member runs '
+        'timeout_method = "signal", where a timeout raises inside the test and '
+        'the worker survives, so the case the flag exists for does not arise '
+        'from its cap. Do not widen it here without a measured need'
     )
 
 
