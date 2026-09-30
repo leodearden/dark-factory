@@ -3921,7 +3921,8 @@ class ReconciliationHarness:
                     'last_full_run_id': run_id,
                     'last_full_run_completed': completed_at,
                     # Run start, not completion (on resume, the original start): a mid-cycle
-                    # item is re-presented, never skipped. Why: tests/reconciliation/test_recon_window_anchor.py
+                    # item is shown to the next cycle rather than to neither. Why, and the cost:
+                    # tests/reconciliation/test_recon_window_anchor.py
                     'last_episode_timestamp': run.started_at,
                     'last_memory_timestamp': run.started_at,
                     'last_task_change_timestamp': completed_at,

@@ -10,9 +10,22 @@ then the three stages run for minutes. An item created after that fetch but
 before completion is shown to neither cycle: this one fetched before the item
 existed, and the next one's window starts after it. That skip is silent loss.
 
-Why an earlier anchor is safe: it re-presents the few items created between the
-anchor and the fetch to the next cycle. Re-presenting an already-absorbed item
-is idempotent; skipping one is not.
+What an earlier anchor costs: the next cycle's window covers everything created
+from this cycle's start to its completion. Besides the external writes the old
+anchor dropped, that includes two classes it hid:
+
+- items created between the anchor and Stage 1's fetch, which this cycle
+  already saw and the next one sees again;
+- every record this cycle wrote itself after its fetch, e.g. memories added by
+  consolidation, completion memories, and the ``cycle_summary`` mirror and
+  ``task_count_snapshot`` records. No cycle was ever shown these before.
+
+Both cost Stage 1 prompt tokens, and the second class may lead Stage 1 to
+re-consolidate its predecessor's output. That cost is recoverable; a skipped
+external item is not. Nothing here tests that re-presentation is harmless. If
+the churn matters, drop reconciliation-sourced records from the "new" list by
+their source metadata. Do not move the anchor back to completion: that reopens
+the hole for external writes.
 
 The anchor is ``run.started_at``. On a fresh run it is stamped before Stage 1.
 On a resumed run (task sigma) it is the ORIGINAL start of the interrupted run,
