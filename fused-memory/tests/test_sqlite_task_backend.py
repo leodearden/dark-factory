@@ -7235,6 +7235,11 @@ async def test_update_task_details_and_metadata_append_true_concatenates_details
             'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         details='REWRITTEN BODY',
@@ -7255,6 +7260,7 @@ async def test_update_task_details_and_metadata_append_true_concatenates_details
         'files': ['src/a.py'],
         'spawned_from': 'task-100',
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
     }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
 
 
@@ -7285,6 +7291,11 @@ async def test_update_task_prompt_and_metadata_append_true_concatenates_details(
             'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         prompt='REWRITTEN BODY',
@@ -7300,6 +7311,7 @@ async def test_update_task_prompt_and_metadata_append_true_concatenates_details(
     assert task['metadata'] == {
         'files': ['src/c.py'],
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
     }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
 
 
@@ -7328,6 +7340,11 @@ async def test_update_task_split_call_details_rewrite_leaves_one_body_and_unions
             'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     # call 1 — metadata only, append=True (the hints attach)
     await backend.update_task(
         '1', project_root=project_root,
@@ -7348,6 +7365,7 @@ async def test_update_task_split_call_details_rewrite_leaves_one_body_and_unions
     assert split['metadata'] == {
         'files': ['src/b.py'],
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
     }, f'the hints attach must still union under the split: {split["metadata"]}'
 
 
