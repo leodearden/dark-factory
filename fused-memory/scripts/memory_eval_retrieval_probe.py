@@ -140,11 +140,17 @@ is "is the canonical in this list", and the list has to have some length.
 DEFAULT_KS: tuple[int, ...] = (5, 10)
 """Default ``--k`` values. A parameterisation, not a limit (see module docstring)."""
 
+QUERY_SURFACE_DERIVATION = 'briefing_query'
+"""The ``derived_from`` of a topic that keys a QUERY a caller fires.
+
+See :attr:`RegistryEntry.is_query_surface`.
+"""
+
 DERIVED_FROM_VALUES: frozenset[str] = frozenset({
     'curator_gate',
     'census_topic',
     'topic_guard_cluster',
-    'briefing_query',
+    QUERY_SURFACE_DERIVATION,
     'hand',
 })
 """The closed provenance vocabulary for a registry entry.
@@ -351,6 +357,17 @@ class RegistryEntry:
     @property
     def held_out_phrasings(self) -> tuple[Phrasing, ...]:
         return tuple(p for p in self.phrasings if p.held_out)
+
+    @property
+    def is_query_surface(self) -> bool:
+        """This topic keys a query a caller fires, not a ``metadata.topic`` value.
+
+        No record is ever stamped with such a slug, so a metadata census must
+        not gauge it: it would read as a permanently unpopulated topic that no
+        stamping sweep can fix. The single definition both the census gauge
+        and the tripwire's census split read.
+        """
+        return self.derived_from == QUERY_SURFACE_DERIVATION
 
     @property
     def item_key(self) -> str:
