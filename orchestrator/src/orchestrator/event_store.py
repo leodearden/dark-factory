@@ -81,6 +81,16 @@ class EventType(StrEnum):
     # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
     # it directly; a json_extract discriminator over every resolution would not.
     stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
+    # One info-severity L0 was dispositioned by the router or the reviewer leg
+    # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
+    # the fact's home; this row is telemetry naming it, keyed on the subject's
+    # REAL task_id.
+    # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
+    #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
+    #   member when the record closed); by: the dispositioning actor;
+    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   curator ticket id, or null; decided_at: ISO-8601 UTC.
+    info_l0_dispositioned = 'info_l0_dispositioned'
 
     # Waste detection
     waste_detected = 'waste_detected'
