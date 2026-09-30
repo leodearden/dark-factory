@@ -626,12 +626,8 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         gates a weak marker ('confirm') in that field, even though the same
         stamp's "bug" no longer arms the code-change suppression.
 
-        Left unfixed deliberately (task 4569 is scoped to the code-change
-        scan; extending the strip into the marker loop would break the
-        monotonicity invariant and needs its own precision matrix). Follow-up
-        ticket tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 is scoped to close it — this
-        test is its regression anchor, so closing it means flipping the first
-        assertion here, not discovering the behaviour from scratch.
+        Closed as won't-fix by task 5106 after a live-corpus census found zero
+        incidence of this shape; this pair stays as its pin.
 
         Asserted as a PAIR so the pin is specific to the artifact noun rather
         than to the whole stamp: swapping the single word 'field' -> 'prose'
@@ -651,7 +647,7 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         )
         assert gated is None, (
             "A stamp's own code-artifact noun still gates the weak marker "
-            f'(the tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 boundary), got: {gated!r}'
+            f"(task 5106 won't-fix), got: {gated!r}"
         )
 
         ungated = operational_suggestion_finding(
