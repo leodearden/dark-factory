@@ -18,6 +18,7 @@ import anyio
 import httpx
 from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
@@ -573,11 +574,6 @@ def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
-MCP_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-}
-
 # Mutating task tools that must carry a client-supplied idempotency key so a
 # transport-level retry (after an ambiguous timeout/reset) dedupes server-side
 # instead of double-applying (task 2712). Reads/initialize are untouched.
@@ -600,7 +596,7 @@ class McpSession:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
-        self.mcp_endpoint = f'{self.base_url}/mcp'
+        self.mcp_endpoint = mcp_endpoint_url(self.base_url)
         self._session_id: str | None = None
         self._initialized = False
         self._request_id = 0
@@ -695,7 +691,7 @@ class McpSession:
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
+            headers = dict(MCP_POST_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
 
@@ -728,7 +724,7 @@ class McpSession:
                     if resp_session_id:
                         self._session_id = resp_session_id
 
-                    return self._parse_response(resp)
+                    return decode_mcp_response_body(resp)
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
@@ -772,7 +768,7 @@ class McpSession:
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
+            headers = dict(MCP_POST_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
 
@@ -809,34 +805,6 @@ class McpSession:
                 f'{type(last_exc).__name__}: {last_exc}'
             ) from last_exc
         raise RuntimeError('_raw_notify exhausted retries')
-
-    @staticmethod
-    def _parse_response(resp: httpx.Response) -> dict:
-        """Parse JSON or SSE response."""
-        content_type = resp.headers.get('content-type', '')
-
-        if 'text/event-stream' in content_type:
-            return _parse_sse_response(resp.text)
-        elif 'application/json' in content_type:
-            return resp.json()
-        else:
-            try:
-                return resp.json()
-            except (json.JSONDecodeError, ValueError):
-                return _parse_sse_response(resp.text)
-
-
-def _parse_sse_response(text: str) -> dict:
-    """Parse SSE text to extract the JSON-RPC result."""
-    last_data = None
-    for line in text.split('\n'):
-        if line.startswith('data: '):
-            last_data = line[6:]
-        elif line.startswith('data:'):
-            last_data = line[5:]
-    if last_data:
-        return json.loads(last_data)
-    raise ValueError(f'No data line found in SSE response: {text[:200]}')
 
 
 # Module-level session singleton (created by McpLifecycle after server starts)

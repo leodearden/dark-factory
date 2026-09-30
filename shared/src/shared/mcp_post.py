@@ -54,20 +54,13 @@ that.  ``post_mcp_tool_call`` warns if handed a client that is not following
 redirects, so splitting them does not reopen the partial-application hole.
 
 The ingredients stay public — :data:`MCP_POST_HEADERS`,
-:func:`mcp_endpoint_url`, :func:`check_mcp_post_response` — for a caller that
-genuinely needs a non-``tools/call`` request or a hand-built envelope.
+:func:`mcp_endpoint_url`, :func:`check_mcp_post_response`,
+:func:`decode_mcp_response_body` — for a caller that genuinely needs a
+non-``tools/call`` request or a hand-built envelope.
 
-KNOWINGLY PARALLEL TO ``orchestrator.mcp_lifecycle``.  Three primitives here
-have long-lived twins there: :data:`MCP_POST_HEADERS` /
-``mcp_lifecycle.MCP_HEADERS``, :func:`decode_mcp_response_body` /
-``McpSession._parse_response``, and :func:`_parse_sse` /
-``mcp_lifecycle._parse_sse_response``.  The dependency direction supports
-consolidating (``orchestrator`` already imports ``shared``), and doing so is
-the right end state — but ``orchestrator/src/orchestrator/mcp_lifecycle.py``
-is outside task 4023's module locks, so the copies are left in place
-DELIBERATELY rather than by oversight, and the consolidation is filed as
-follow-up work.  If you are editing either side, change both or finish the
-consolidation; do not let them drift.
+``orchestrator.mcp_lifecycle.McpSession`` (the session-handshake transport)
+consumes :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
+:func:`decode_mcp_response_body`, so this module is the single copy of each.
 
 Public API::
 
@@ -110,13 +103,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Headers every raw MCP POST must send.  Byte-identical to
-#: ``orchestrator.mcp_lifecycle.MCP_HEADERS`` — the already-correct pattern the
-#: five defect sites never adopted, and a knowingly-parallel copy pending the
-#: consolidation described in the module docstring.  Without the ``Accept``
-#: member the server answers ``406 Not Acceptable`` and the payload is
-#: discarded (see the module docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)`` before
-#: mutating: this is a module-level singleton.
+#: Headers every raw MCP POST must send.  Without the ``Accept`` member the
+#: server answers ``406 Not Acceptable`` and the payload is discarded (see the
+#: module docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)``
+#: before mutating: this is a module-level singleton.
 MCP_POST_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
@@ -131,9 +121,9 @@ def mcp_endpoint_url(base_url: str) -> str:
 
     The ``rstrip('/')`` is load-bearing, not cosmetic — a configured base that
     already ends in ``/`` would otherwise produce ``…//mcp``, which is a
-    different path than the server mounts.  Mirrors the canonicalization
-    ``McpSession.__init__`` (``orchestrator/mcp_lifecycle.py``) has been doing
-    correctly all along; the defect sites simply never used it.
+    different path than the server mounts.  ``McpSession.__init__``
+    (``orchestrator/src/orchestrator/mcp_lifecycle.py``) builds its endpoint
+    with this function.
 
     >>> mcp_endpoint_url('http://127.0.0.1:8002')
     'http://127.0.0.1:8002/mcp'

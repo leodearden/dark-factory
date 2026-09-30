@@ -54,7 +54,7 @@ class _ScriptedSessionServer(RecordingMcpServer):
         )
 
     def delivered_methods(self) -> list[str]:
-        return [body.get('method') for _path, body in self.delivered]
+        return [body['method'] for _path, body in self.delivered]
 
 
 async def _call_tool(server: RecordingMcpServer, base_url: str = BASE_URL) -> dict:
