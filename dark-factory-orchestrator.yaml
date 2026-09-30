@@ -1602,6 +1602,40 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
+# ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop
+# joins this project's merge-verify pool; the restart that activates it is task 5054
+# (D2) — landing this block alone changes nothing at runtime. Measured 2026-09-03:
+# the laptop verifies ~2.5x faster than this workstation (p50 17.4 vs 43.4 min) and
+# sits 78-88% idle while this host's CPU is the lane bottleneck. Fail-safe: an
+# unreachable laptop falls back to local, never stalls. df_checkout_path turns on the
+# INV-2 auto-sync of the laptop's DF checkout (stale tree = stale verify-merge, #5120).
+# Laptop-side knobs live on leo-laptop, not here: its dark-factory-laptop.yaml sets
+# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and a systemd
+# drop-in caps each verify scope at MemoryMax=24G (a memory kill reports RED, not a
+# local fallback, until task 6106).
+# TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
+# anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
+# every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
+# standing fidelity guard: 10 here, not the 20 of the PRD's first draft. A drift check
+# leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
+# verify_cross_check_remote_green is deliberately NOT set (2026-09-30): the code
+# default TRUE applies — every non-trivial remote green gets a blocking local
+# re-verify — for the 3-day parity window that opens at the 5054 restart. Task 5416
+# runs the window and owns the OFF step (reload), so there is nothing to edit here.
+# ROLLBACK: verify_host_policy: prefer_local (green tier, mcp__escalation__reload_config);
+# enabled: false, or dropping this block, needs a restart (verify_runners and
+# verify_drift_check_every_n_lands are restart-only).
+verify_runners:
+  - name: laptop
+    ssh_host: leo-laptop
+    git_remote: leo-laptop
+    config_path: /home/leo/.config/orchestrator/dark-factory-laptop.yaml
+    df_checkout_path: /home/leo/src/dark-factory
+    enabled: true
+verify_host_policy: prefer_remote
+verify_drift_check_every_n_lands: 10
+
 # Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
 # workflow.py's merge phase rebases the task branch onto main and runs a full
 # task-role scoped verify (admission-gated, 3 slots on this box) BEFORE submitting
