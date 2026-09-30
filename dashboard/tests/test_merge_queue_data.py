@@ -2527,7 +2527,7 @@ class _PerPortHandler:
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
 
-    async def __call__(self, request: httpx.Request) -> httpx.Response:  # type: ignore[name-defined]
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
         if port in self.fail_ports:

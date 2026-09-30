@@ -122,7 +122,7 @@ def test_series_keys_spell_the_hyphenated_members_as_their_store_columns():
 def test_vocabulary_constants_reject_mutation(constant):
     """These are imported by beta, the generator and the parity test — SPOT."""
     with pytest.raises(TypeError):
-        constant['whatever'] = 'anything'  # type: ignore[index]
+        constant['whatever'] = 'anything'
 
 
 # ---------------------------------------------------------------------------
