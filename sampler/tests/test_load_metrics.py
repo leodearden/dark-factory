@@ -1202,7 +1202,7 @@ class TestCalibrationScriptArmTableLockstep:
         assert spec is not None, f'Could not build spec from {script}'
         assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
         return module
 
     def test_the_script_exposes_a_public_arm_to_selector_mapping(self):
