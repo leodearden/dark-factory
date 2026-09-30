@@ -89,20 +89,22 @@ _PROBE_SOURCE = (
 _EXPECTED_ERRORS = [(1, RULE), (2, RULE)]
 
 
-def _pyright_config_dir(mc: ModuleConfig) -> pathlib.Path:
-    """The directory whose ``pyproject.toml`` *mc*'s declared type gate resolves.
+def _pyright_config_dir(command: str, *, label: str) -> pathlib.Path:
+    """The directory whose ``pyproject.toml`` the type gate *command* resolves.
 
-    ``uv run --directory <x> pyright ...`` runs pyright from ``<x>``; a gate
-    with no ``--directory`` runs from the repo root (e.g. scripts'
-    ``uv run --project shared pyright scripts/``, where ``--project`` selects
-    only the environment).
+    ``uv run --directory <x> pyright ...`` (or ``--directory=<x>``) runs
+    pyright from ``<x>``; a gate with no ``--directory`` runs from the repo
+    root (e.g. scripts' ``uv run --project shared pyright scripts/``, where
+    ``--project`` selects only the environment). Only the wrapper's tokens are
+    read: after the anchor, the same spelling would be pyright's own argument.
     """
-    label = f"{mc.prefix} type_check_command"
-    assert mc.type_check_command, f"{label} is not declared, so there is no gate to probe"
-    segment = required_segment(mc.type_check_command, PYRIGHT, label=label)
+    segment = required_segment(command, PYRIGHT, label=label)
     pre, _ = anchor_split(segment, PYRIGHT, label=label)
-    if "--directory" in pre:
-        return REPO_ROOT / pre[pre.index("--directory") + 1]
+    for index, token in enumerate(pre):
+        if token == "--directory":
+            return REPO_ROOT / pre[index + 1]
+        if token.startswith("--directory="):
+            return REPO_ROOT / token.removeprefix("--directory=")
     return REPO_ROOT
 
 
@@ -141,6 +143,21 @@ def _error_rules_by_line(payload: dict[str, Any]) -> list[tuple[int, str]]:
     )
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("uv run --directory dashboard pyright src/ tests/", REPO_ROOT / "dashboard"),
+        ("uv run --directory=dashboard pyright src/ tests/", REPO_ROOT / "dashboard"),
+        ("uv run --project shared pyright scripts/", REPO_ROOT),
+    ],
+    ids=["space-separated", "equals-joined", "no-directory"],
+)
+def test_config_dir_follows_either_directory_spelling(
+    command: str, expected: pathlib.Path
+) -> None:
+    assert _pyright_config_dir(command, label="probe") == expected
+
+
 @pytest.mark.parametrize("prefix", OPTED_IN_MODULE_PREFIXES, ids=OPTED_IN_MODULE_PREFIXES)
 def test_opted_in_type_gate_reports_a_vestigial_suppression(
     prefix: str,
@@ -152,7 +169,10 @@ def test_opted_in_type_gate_reports_a_vestigial_suppression(
         f"opted-in module {prefix!r} has no discovered module config, so its "
         f"type gate cannot be probed; discovered: {sorted(discovered)}"
     )
-    config_dir = _pyright_config_dir(discovered[prefix])
+    label = f"{prefix} type_check_command"
+    command = discovered[prefix].type_check_command
+    assert command, f"{label} is not declared, so there is no gate to probe"
+    config_dir = _pyright_config_dir(command, label=label)
     probe = tmp_path / "probe.py"
     probe.write_text(_PROBE_SOURCE, encoding="utf-8")
 
