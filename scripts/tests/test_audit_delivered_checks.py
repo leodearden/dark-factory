@@ -38,6 +38,7 @@ from audit_delivered_checks import (
     DISPOSITION_NO_TASK,
     DISPOSITION_SUPERSEDED,
     DISPOSITION_UNEVALUABLE,
+    DISPOSITION_UNWIRED_LIVE_GATE,
     DISPOSITION_VACUOUS_LIVE_GATE,
     AuditCoverage,
     DescriptorRow,
@@ -47,7 +48,7 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
-    load_metadata_checks,
+    load_task_index,
 )
 from shared.delivered_check_polarity import CheckOutcome
 
@@ -84,13 +85,13 @@ class TestClassifyDescriptor:
         """(a) The mode-2/mode-3 defect class: the producer closed, and the
         capability its check asserts is nowhere on main. Whatever the check was
         supposed to gate was never gated."""
-        assert classify_descriptor(CheckOutcome.FAIL, status='done') == DISPOSITION_BROKEN
+        assert classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True) == DISPOSITION_BROKEN
 
     def test_done_and_expect_absent_still_matching_is_broken(self):
         """(b) The same defect from the other polarity. FAIL already encodes
         the polarity — interpret_grep_rc inverts on `expect` — so the
         classifier never re-derives it and the two cells collapse to one rule."""
-        assert classify_descriptor(CheckOutcome.FAIL, status='done') == DISPOSITION_BROKEN
+        assert classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True) == DISPOSITION_BROKEN
 
     @pytest.mark.parametrize('status', ['pending', 'blocked', 'in-progress', 'deferred'])
     def test_non_terminal_and_already_passing_is_a_vacuous_live_gate(self, status):
@@ -99,7 +100,7 @@ class TestClassifyDescriptor:
         producer cannot change the verdict, so any dependent is either released
         for the wrong reason or held for one that will never clear."""
         assert (
-            classify_descriptor(CheckOutcome.PASS, status=status)
+            classify_descriptor(CheckOutcome.PASS, status=status, stamped=True)
             == DISPOSITION_VACUOUS_LIVE_GATE
         )
 
@@ -107,12 +108,12 @@ class TestClassifyDescriptor:
     def test_non_terminal_and_failing_is_healthy(self, status):
         """(d) The normal majority: a forward-looking check on unbuilt work.
         This cell MUST stay silent or the report is unreadable."""
-        assert classify_descriptor(CheckOutcome.FAIL, status=status) == DISPOSITION_HEALTHY
+        assert classify_descriptor(CheckOutcome.FAIL, status=status, stamped=True) == DISPOSITION_HEALTHY
 
     def test_done_and_passing_is_delivered(self):
         """(e) The success state, and the one a status-blind sweep misreads as
         vacuity for 57% of the corpus."""
-        assert classify_descriptor(CheckOutcome.PASS, status='done') == DISPOSITION_DELIVERED
+        assert classify_descriptor(CheckOutcome.PASS, status='done', stamped=True) == DISPOSITION_DELIVERED
 
     def test_supersession_outranks_broken(self):
         """(f) SUPERSESSION IS NOT A DEFECT. The measured case: task 3618's
@@ -121,7 +122,7 @@ class TestClassifyDescriptor:
         correct, delivered, and then legitimately undone by later work — so it
         must never be counted as an authoring defect."""
         assert (
-            classify_descriptor(CheckOutcome.FAIL, status='done', superseded_by='3578')
+            classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True, superseded_by='3578')
             == DISPOSITION_SUPERSEDED
         )
 
@@ -130,11 +131,11 @@ class TestClassifyDescriptor:
         # Letting it relabel a delivered or healthy row would launder a real
         # disposition into a footnote.
         assert (
-            classify_descriptor(CheckOutcome.PASS, status='done', superseded_by='3578')
+            classify_descriptor(CheckOutcome.PASS, status='done', stamped=True, superseded_by='3578')
             == DISPOSITION_DELIVERED
         )
         assert (
-            classify_descriptor(CheckOutcome.FAIL, status='pending', superseded_by='3578')
+            classify_descriptor(CheckOutcome.FAIL, status='pending', stamped=True, superseded_by='3578')
             == DISPOSITION_HEALTHY
         )
 
@@ -142,8 +143,8 @@ class TestClassifyDescriptor:
         # A cancelled task promised nothing and gates nothing. Reporting its
         # failing check as `broken` would be a false positive on abandoned
         # work; reporting it as a live gate would be false too.
-        assert classify_descriptor(CheckOutcome.FAIL, status='cancelled') == DISPOSITION_INERT
-        assert classify_descriptor(CheckOutcome.PASS, status='cancelled') == DISPOSITION_INERT
+        assert classify_descriptor(CheckOutcome.FAIL, status='cancelled', stamped=True) == DISPOSITION_INERT
+        assert classify_descriptor(CheckOutcome.PASS, status='cancelled', stamped=True) == DISPOSITION_INERT
 
     def test_unevaluable_is_its_own_disposition(self):
         # ERRORED is not FAIL. git being unable to answer must never be
@@ -152,7 +153,7 @@ class TestClassifyDescriptor:
         # runtime gate's own rc>=2 -> ERRORED boundary exists to prevent.
         for status in ('done', 'pending', 'cancelled', None):
             assert (
-                classify_descriptor(CheckOutcome.ERRORED, status=status)
+                classify_descriptor(CheckOutcome.ERRORED, status=status, stamped=True)
                 == DISPOSITION_UNEVALUABLE
             )
 
@@ -160,16 +161,59 @@ class TestClassifyDescriptor:
         """(g) COVERAGE, never silence. A sidecar capability whose task_id
         resolves to no row in tasks.db cannot be classified — but dropping it
         would present a partial sweep as a complete one."""
-        assert classify_descriptor(CheckOutcome.PASS, status=None) == DISPOSITION_NO_TASK
-        assert classify_descriptor(CheckOutcome.FAIL, status=None) == DISPOSITION_NO_TASK
+        assert classify_descriptor(CheckOutcome.PASS, status=None, stamped=True) == DISPOSITION_NO_TASK
+        assert classify_descriptor(CheckOutcome.FAIL, status=None, stamped=True) == DISPOSITION_NO_TASK
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'deferred', 'blocked'])
+    def test_live_failing_check_never_stamped_is_an_unwired_live_gate(self, status):
+        """A sound forward-looking descriptor its live producer never
+        received: the runtime gate cannot see it, so its dependents dispatch
+        ungated. It must not read as the ordinary 'healthy' majority."""
+        assert (
+            classify_descriptor(CheckOutcome.FAIL, status=status, stamped=False)
+            == DISPOSITION_UNWIRED_LIVE_GATE
+        )
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'deferred', 'blocked'])
+    def test_live_failing_check_that_is_stamped_stays_healthy(self, status):
+        assert (
+            classify_descriptor(CheckOutcome.FAIL, status=status, stamped=True)
+            == DISPOSITION_HEALTHY
+        )
+
+    def test_stamped_must_be_stated_by_every_caller(self):
+        # A default of True would let a caller that forgot the argument read
+        # an unwired gate as healthy — the silent under-report this
+        # disposition exists to remove.
+        with pytest.raises(TypeError):
+            classify_descriptor(CheckOutcome.FAIL, status='pending')  # pyright: ignore[reportCallIssue]
+
+    def test_stamping_matters_in_no_other_cell(self):
+        # Every other cell is already decided by polarity or status: an
+        # unstamped vacuous or broken descriptor is still that defect.
+        cases = [
+            (CheckOutcome.PASS, 'pending', DISPOSITION_VACUOUS_LIVE_GATE),
+            (CheckOutcome.PASS, 'done', DISPOSITION_DELIVERED),
+            (CheckOutcome.FAIL, 'done', DISPOSITION_BROKEN),
+            (CheckOutcome.FAIL, 'cancelled', DISPOSITION_INERT),
+            (CheckOutcome.PASS, 'cancelled', DISPOSITION_INERT),
+            (CheckOutcome.FAIL, None, DISPOSITION_NO_TASK),
+            (CheckOutcome.ERRORED, 'pending', DISPOSITION_UNEVALUABLE),
+        ]
+        for outcome, status, expected in cases:
+            for stamped in (True, False):
+                assert (
+                    classify_descriptor(outcome, status=status, stamped=stamped)
+                    == expected
+                )
 
 
 # ---------------------------------------------------------------------------
-# load_metadata_checks — tasks.db -> DescriptorRow, read-only.
+# load_task_index — tasks.db -> statuses and stamped checks, read-only.
 # ---------------------------------------------------------------------------
 
 
-class TestLoadMetadataChecks:
+class TestLoadTaskIndex:
     def test_reads_grep_descriptors_with_the_producer_status(self, make_tasks_db):
         db = make_tasks_db([
             {
@@ -189,7 +233,7 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        rows = load_metadata_checks(str(db))
+        rows = load_task_index(str(db)).metadata_rows
 
         assert len(rows) == 1
         row = rows[0]
@@ -197,10 +241,11 @@ class TestLoadMetadataChecks:
         assert (row.pattern, row.expect, row.paths) == ('SomeSymbol', 'present', ('src/',))
         assert row.source == 'metadata'
 
-    def test_script_and_manual_kinds_are_not_swept(self, make_tasks_db):
+    def test_script_and_manual_kinds_are_stamped_but_not_swept(self, make_tasks_db):
         # The sweep is a statement about grep POLARITY against a tree. A script
         # check has no pattern to evaluate and belongs to the script-target
-        # guard in shared/tests/test_capability_manifest.py instead.
+        # guard in shared/tests/test_capability_manifest.py instead. It is
+        # still STAMPED, so it still dedupes a same-named sidecar capability.
         db = make_tasks_db([
             {
                 'id': 11,
@@ -213,7 +258,10 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        assert load_metadata_checks(str(db)) == []
+        index = load_task_index(str(db))
+
+        assert index.metadata_rows == ()
+        assert index.stamped_names == {(11, 'c')}
 
     def test_malformed_metadata_is_skipped_not_raised(self, make_tasks_db):
         # A single undecodable row must not abort a whole-project sweep.
@@ -231,9 +279,11 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        rows = load_metadata_checks(str(db))
+        index = load_task_index(str(db))
 
-        assert [r.task_id for r in rows] == [14]
+        assert [r.task_id for r in index.metadata_rows] == [14]
+        assert index.stamped_names == {(14, 'ok')}
+        assert set(index.statuses) == {12, 13, 14}
 
     def test_connection_is_read_only(self, make_tasks_db):
         # READ-ONLY/REPORT-ONLY is a structural guarantee, not a convention:
@@ -364,6 +414,64 @@ class TestAuditProject:
         orphans = [f for f in audit.findings if f.disposition == DISPOSITION_NO_TASK]
         assert [f.row.task_id for f in orphans] == [999]
         assert audit.coverage.descriptors_without_task == 1
+
+    def test_sidecar_copy_is_a_phantom_when_metadata_carries_the_name_in_any_kind(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """The metadata copy is the one the runtime gate evaluates, so a
+        sidecar capability whose (task_id, name) is already stamped is a
+        phantom WHATEVER kind the stamped copy has. The measured shape: a
+        producer's metadata carries the check as kind=path while its sidecar
+        still spells it as a grep.
+
+        The unstamped sibling cap-y is the positive control: it proves the
+        sidecar was loaded and swept, so cap-x's absence is the dedupe and
+        not a sidecar that silently failed to load."""
+        root = _init_repo(
+            tmp_path / 'proj',
+            {
+                'src/a.py': 'pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 20\n'
+                    '    capabilities:\n'
+                    '      - name: cap-x\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: NotYetBuilt\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                    '      - name: cap-y\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: AlsoNotYetBuilt\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                ),
+            },
+        )
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [{'id': 20, 'status': 'pending', 'metadata': {'delivered_checks': [
+                {'name': 'cap-x', 'kind': 'path', 'expect': 'present',
+                 'paths': ['src/b.py']}]}}],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+
+        from_sidecar = {
+            f.row.name: f.disposition for f in audit.findings if f.row.source == 'manifest'
+        }
+        assert audit.coverage.sidecars_unloadable == 0
+        assert from_sidecar == {'cap-y': DISPOSITION_UNWIRED_LIVE_GATE}
 
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
@@ -655,6 +763,68 @@ class TestMainExitCodes:
         # 77 is still open behind the defect; 78 already closed and is not.
         assert '77' in result.stdout
         assert 'open_dependents' in result.stdout
+
+    def test_unwired_live_gate_is_actionable_and_names_its_dependents(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A sidecar capability its open producer never received in
+        metadata.delivered_checks is invisible to the runtime gate, so the
+        producer's dependents dispatch ungated. Reported as 'healthy' it
+        would never be printed; it must be a named, actionable section."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={
+                'src/a.py': 'pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 20\n'
+                    '    capabilities:\n'
+                    '      - name: wired\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: WiredYet\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                    '      - name: unwired\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: UnwiredYet\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
+                ),
+            },
+            tasks=[
+                {'id': 20, 'status': 'pending',
+                 'metadata': _checks(_grep('wired', 'WiredYet'))},
+                {'id': 30, 'status': 'pending'},
+            ],
+        )
+        _seed_dependencies(root, [(30, 20)])
+
+        result = _run_cli('--project-root', str(root))
+        payload = json.loads(_run_cli('--project-root', str(root), '--json').stdout)
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'UNWIRED LIVE GATES (1)' in result.stdout
+        # The next header is the first TERMINAL section: live ones come first.
+        section = result.stdout.split('UNWIRED LIVE GATES (1)', 1)[1].split('  BROKEN (', 1)[0]
+        [row_line] = [line for line in section.splitlines() if 'name=' in line]
+        assert 'name=unwired' in row_line
+        assert 'source=manifest' in row_line
+        assert 'manifest=plans/x-prd.capability-manifest.yaml' in row_line
+        assert 'open_dependents=30' in row_line
+        finding = next(
+            f for f in payload['projects'][0]['findings'] if f['name'] == 'unwired'
+        )
+        assert finding['disposition'] == DISPOSITION_UNWIRED_LIVE_GATE
+        assert finding['reason']
 
     def test_superseded_rows_never_drive_the_exit_code(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db

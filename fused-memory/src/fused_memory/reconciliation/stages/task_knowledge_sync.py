@@ -4742,7 +4742,7 @@ class TaskKnowledgeSync(BaseStage):
         hint_conversion_section = ''
         if not self.remediation_mode:
             tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_conversion(t)
+                t for t in visible_active if _needs_hint_attention(t)
             ]
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
@@ -5006,17 +5006,31 @@ class TaskKnowledgeSync(BaseStage):
 
         known_projects_section = self._format_known_projects_section()
 
-        # Step 5 in the Your Task block below ("read-modify-write +
-        # metadata_mode='replace' for hint conversion") is grounded in Mem0
-        # memory 0b0eeb8d (old-wins semantics for list-format hints under
-        # the additive merge).  A bare append=False RMW is no longer sanctioned
-        # — the task-2180 metadata-wipe guard in _resolve_metadata_mode now
-        # rejects it — so the reshape writes the COMPLETE blob back under the
-        # explicit metadata_mode='replace' co-signal instead.  That
-        # 'replace'-alongside-append=True combination stays sanctioned; what is
-        # NOT is metadata_mode='merge' alongside append=True, which
-        # _resolve_metadata_mode also now rejects (task 3581) because honouring
-        # 'merge' shallow-overwrote a task's whole memory_hints key.  The memory
+        # Step 5 in the Your Task block below prescribes a PLAIN ADDITIVE
+        # attach (append=True, metadata_mode OMITTED) for every task in the
+        # hint-attention section, legacy-list rows included.  That is
+        # sufficient because the additive branch of _merge_metadata
+        # (sqlite_task_backend.py) runs apply_migrations over memory_hints on
+        # BOTH sides before merging, normalising a legacy
+        # [{entity, query}, ...] row to the canonical {entities, queries}
+        # shape and unioning it with the incoming hints.
+        #
+        # metadata_mode='replace' is deliberately NOT prescribed here (task
+        # 4216).  Item 5 used to instruct a reshape read-modify-write under
+        # 'replace', on the premise that the additive merge dropped
+        # list-format hints — a premise the migration above falsifies.
+        # 'replace' also writes the incoming blob verbatim and BYPASSES the
+        # corrupt-blob guard that 'merge'/'additive' enforce, so it is the one
+        # mode that can destroy a corrupt-but-recoverable metadata row.
+        # Canonical norm: Mem0 memory
+        # 197893d5-90ad-4c9d-8da9-9706d85d5921, which supersedes the earlier
+        # record that grounded the obsolete instruction.
+        #
+        # Two guards remain, and item 5 / item 4 still carry them: a bare
+        # append=False is rejected by the task-2180 metadata-wipe guard in
+        # _resolve_metadata_mode, and metadata_mode='merge' alongside
+        # append=True is rejected too (task 3581) because honouring 'merge'
+        # shallow-overwrote a task's whole memory_hints key.  The memory
         # id is kept here rather than in the prompt string so the LLM is not
         # burdened with an opaque reference it cannot look up, and the
         # traceability survives prompt rewording.
@@ -5046,13 +5060,14 @@ delete tasks. Update dependent tasks.
 Use entity references + semantic queries, NOT inline content. Request the ADDITIVE merge by \
 passing `append=True` ALONE or the equivalent `metadata_mode='additive'` — never `append=True` \
 together with `metadata_mode='merge'`, which is a contradiction the backend now rejects.
-5. For tasks listed in **Tasks Needing Memory Hint Attention**: reshape legacy list-format \
-memory_hints via read-modify-write — call `get_task` to read the FULL current metadata, convert \
-the hints to the canonical `{{entities, queries}}` dict shape and merge them into that metadata \
-locally, then write the COMPLETE metadata blob back with `metadata_mode='replace'`. Do NOT use a \
-bare `append=False` (the task-2180 metadata-wipe guard now rejects it), and do NOT rely on \
-Stage 2's additive attach merge from step 4 — it silently discards legacy list-format hints \
-under old-wins semantics.
+5. For tasks listed in **Tasks Needing Memory Hint Attention**: attach hints with the plain \
+additive call from step 4 — \
+`update_task(metadata={{'memory_hints': {{'entities': [...], 'queries': [...]}}}}, append=True)` \
+with `metadata_mode` OMITTED. That one call serves every task in the section, whether it has no \
+hints yet or stores them in the LEGACY list format: the backend unions your entries with any \
+hints already on the row, preserves all sibling metadata keys, and auto-converts a legacy \
+list-format row to the canonical `{{entities, queries}}` dict shape. Do NOT use a bare \
+`append=False` (the task-2180 metadata-wipe guard rejects it).
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture. **For each done task, \
@@ -5721,26 +5736,40 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     return heapq.nsmallest(n, tasks, key=sort_key)
 
 
-def _needs_hint_conversion(task: dict) -> bool:
-    """Classify whether *task*'s ``metadata.memory_hints`` needs conversion to the
-    canonical ``{entities: [...], queries: [...]}`` dict shape (task 1275).
+def _needs_hint_attention(task: dict) -> bool:
+    """Classify whether *task*'s ``metadata.memory_hints`` needs ATTENTION — i.e.
+    whether Stage 2 should attach hints in the canonical
+    ``{entities: [...], queries: [...]}`` dict shape (task 1275).
 
     Three branches matching the pseudo-code in the task spec:
 
     1. ``isinstance(task_hints, list)`` → True (legacy list-of-dict format
-       ``[{entity: ..., query: ...}, ...]`` — treat as conversion target).
+       ``[{entity: ..., query: ...}, ...]``).
     2. ``not task_hints`` (missing key or empty dict) → True (existing falsy path).
     3. otherwise (any truthy non-list value, including malformed scalars like strings
        or ints) → False (skip). Any truthy non-list value is treated as
        already-converted — narrowing to dict is a separable robustness change.
 
-    Per Mem0 memory ``0b0eeb8d``: Stage 2's ADDITIVE attach merge (``append=True``
-    alone, or ``metadata_mode='additive'``) silently discards list-format hints under
-    old-wins semantics, so list-format must be re-classified as a conversion target so
-    the LLM uses read-modify-write, writing the complete metadata blob back with
-    ``metadata_mode='replace'`` (a bare ``append=False`` is now rejected by the
-    task-2180 metadata-wipe guard, and ``metadata_mode='merge'`` alongside
-    ``append=True`` by the task-3581 nested-clobber guard).
+    ONE action serves BOTH True branches: a plain additive attach —
+    ``update_task(metadata={'memory_hints': ...}, append=True)`` with
+    ``metadata_mode`` OMITTED. No reshape read-modify-write is required, because
+    the additive branch runs ``apply_migrations`` over ``memory_hints`` on BOTH
+    sides before merging (``sqlite_task_backend.py::_merge_metadata``), so a legacy
+    list-format row is normalised to the canonical dict shape and unioned with the
+    incoming hints automatically, siblings intact. ``metadata_mode='replace'`` is
+    deliberately NOT prescribed here: it returns the incoming blob verbatim and
+    bypasses the corrupt-blob guard that 'merge'/'additive' enforce. (A bare
+    ``append=False`` is rejected by the task-2180 metadata-wipe guard, and
+    ``metadata_mode='merge'`` alongside ``append=True`` by the task-3581
+    nested-clobber guard.) Canonical norm: Mem0 memory
+    ``197893d5-90ad-4c9d-8da9-9706d85d5921``, which supersedes the earlier record
+    whose discard premise this docstring used to carry and which the migration
+    above falsifies.
+
+    Named for "attention" rather than "conversion" (task 4216) because the
+    population is overwhelmingly branch 2 — tasks with no hints at all, i.e.
+    plain ATTACH candidates — matching the rendered section header
+    ``### Tasks Needing Memory Hint Attention``.
     """
     metadata = task.get('metadata')
     task_hints = metadata.get('memory_hints') if isinstance(metadata, dict) else None

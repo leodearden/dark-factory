@@ -121,24 +121,31 @@ INERT_STATUSES = ("cancelled",)
 
 # --- Dispositions ----------------------------------------------------------
 #
-# Seven, and the split is load-bearing. `delivered` vs `vacuous_live_gate`
-# reads the SAME evaluation bit — they are told apart only by status, which is
-# the whole reason this tool exists. `unevaluable` and `no_task` exist so that
-# "we could not tell" is never rendered as "we checked and it is fine".
+# The split is load-bearing. `delivered` vs `vacuous_live_gate` reads the SAME
+# evaluation bit — they are told apart only by status, which is the whole
+# reason this tool exists. `unevaluable` and `no_task` exist so that "we could
+# not tell" is never rendered as "we checked and it is fine".
 
 DISPOSITION_DELIVERED = "delivered"                    # done + passes: success
 DISPOSITION_BROKEN = "broken"                          # done + fails: never delivered
 DISPOSITION_SUPERSEDED = "superseded"                  # done + fails, later task undid it
 DISPOSITION_VACUOUS_LIVE_GATE = "vacuous_live_gate"    # live + already passes: gates nothing
 DISPOSITION_HEALTHY = "healthy"                        # live + fails: normal, forward-looking
+DISPOSITION_UNWIRED_LIVE_GATE = "unwired_live_gate"    # live + fails, never stamped: ungated
 DISPOSITION_INERT = "inert"                            # cancelled producer: promises nothing
 DISPOSITION_UNEVALUABLE = "unevaluable"                # git could not answer
 DISPOSITION_NO_TASK = "no_task"                        # descriptor reached no task row
 
-#: The dispositions an operator must act on. `superseded` is deliberately NOT
-#: here: the descriptor was correct and delivered, and later work legitimately
-#: undid it — filing it beside real defects is what makes a report get ignored.
-DEFECT_DISPOSITIONS = (DISPOSITION_BROKEN, DISPOSITION_VACUOUS_LIVE_GATE)
+#: The dispositions an operator must act on: each leaves a live dependent
+#: released or held for the wrong reason, and each drives exit 1. `superseded`
+#: is deliberately NOT here: the descriptor was correct and delivered, and
+#: later work legitimately undid it — filing it beside real defects is what
+#: makes a report get ignored.
+DEFECT_DISPOSITIONS = (
+    DISPOSITION_BROKEN,
+    DISPOSITION_VACUOUS_LIVE_GATE,
+    DISPOSITION_UNWIRED_LIVE_GATE,
+)
 
 
 class DescriptorRow(NamedTuple):
@@ -253,6 +260,7 @@ def classify_descriptor(
     outcome: CheckOutcome,
     *,
     status: str | None,
+    stamped: bool,
     superseded_by: str | None = None,
 ) -> str:
     """Disposition for one descriptor, from its outcome and its producer's status.
@@ -275,7 +283,13 @@ def classify_descriptor(
     4. Done: ``PASS`` is the success state; ``FAIL`` is the defect, unless a
        later task is known to have reintroduced the pattern.
     5. Live: ``PASS`` is the vacuous gate this sweep exists to surface, and
-       ``FAIL`` is the ordinary forward-looking majority.
+       ``FAIL`` is the ordinary forward-looking majority — unless the
+       descriptor was never *stamped* onto its producer, in which case the
+       runtime gate cannot see it at all. Stamping matters only in this cell,
+       where the descriptor would be a sound gate; every other cell is
+       already decided by polarity and status. *stamped* has no default:
+       a caller that forgot it would silently read an unwired gate as
+       healthy, so every call site must state it.
 
     *superseded_by* only ever explains away a would-be DEFECT. It is ignored
     on every other cell, so a supersession signal can never launder a real
@@ -293,7 +307,7 @@ def classify_descriptor(
         return DISPOSITION_SUPERSEDED if superseded_by else DISPOSITION_BROKEN
     if outcome is CheckOutcome.PASS:
         return DISPOSITION_VACUOUS_LIVE_GATE
-    return DISPOSITION_HEALTHY
+    return DISPOSITION_HEALTHY if stamped else DISPOSITION_UNWIRED_LIVE_GATE
 
 
 def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
@@ -368,8 +382,25 @@ def _grep_rows_from_checks(
     return rows
 
 
-def load_metadata_checks(db_path: str) -> list[DescriptorRow]:
-    """Every grep ``metadata.delivered_checks`` entry in *db_path*, with status.
+class TaskIndex(NamedTuple):
+    """Everything the join needs from tasks.db, read in one pass.
+
+    ``metadata_rows`` and ``stamped_names`` are two views of ONE fact — what
+    is stamped — derived from the same per-task extraction, so they cannot
+    drift apart. ``metadata_rows`` holds only the evaluable grep descriptors;
+    ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
+    delivered_check, whatever its kind — the set a sidecar capability is
+    deduplicated against.
+    """
+
+    statuses: dict[int, tuple[str, str]]
+    stamps: dict[int, str]
+    metadata_rows: tuple[DescriptorRow, ...]
+    stamped_names: frozenset[tuple[int, str]]
+
+
+def load_task_index(db_path: str) -> TaskIndex:
+    """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
     Read-only URI — the guarantee is structural, not a convention. Malformed
     metadata is SKIPPED rather than raised: a single undecodable row must not
@@ -380,22 +411,32 @@ def load_metadata_checks(db_path: str) -> list[DescriptorRow]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
-        rows: list[DescriptorRow] = []
-        for record in cursor:
+        statuses: dict[int, tuple[str, str]] = {}
+        stamps: dict[int, str] = {}
+        metadata_rows: list[DescriptorRow] = []
+        stamped_names: set[tuple[int, str]] = set()
+        for record in conn.execute(
+            "SELECT tag, id, status, updated_at, metadata FROM tasks"
+        ):
+            task_id = int(record["id"])
+            statuses[task_id] = (record["tag"], record["status"])
+            stamps[task_id] = record["updated_at"]
             checks = extract_delivered_checks(record["metadata"])
-            if not checks:
-                continue
-            rows.extend(
+            metadata_rows.extend(
                 _grep_rows_from_checks(
                     checks,
-                    task_id=int(record["id"]),
+                    task_id=task_id,
                     tag=record["tag"],
                     status=record["status"],
                     source="metadata",
                 )
             )
-        return rows
+            stamped_names.update(
+                (task_id, check["name"])
+                for check in checks
+                if isinstance(check.get("name"), str) and check["name"]
+            )
+        return TaskIndex(statuses, stamps, tuple(metadata_rows), frozenset(stamped_names))
     finally:
         conn.close()
 
@@ -619,21 +660,6 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
         conn.close()
 
 
-def _load_statuses(db_path: str) -> tuple[dict[int, tuple[str, str]], dict[int, str]]:
-    """``{task_id: (tag, status)}`` and ``{task_id: updated_at}``, read-only."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        conn.row_factory = sqlite3.Row
-        statuses: dict[int, tuple[str, str]] = {}
-        stamps: dict[int, str] = {}
-        for record in conn.execute("SELECT tag, id, status, updated_at FROM tasks"):
-            statuses[int(record["id"])] = (record["tag"], record["status"])
-            stamps[int(record["id"])] = record["updated_at"]
-        return statuses, stamps
-    finally:
-        conn.close()
-
-
 def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     """Join tasks.db, the sidecars and the tree; classify every descriptor.
 
@@ -642,19 +668,21 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     per root, or a raise. Returning a sentinel to "skip" would silently break
     the exit-3 gate that stops a total-failure sweep reading as clean.
 
-    Deduplication is by ``(task_id, name)`` with the METADATA copy winning:
-    that is the artifact the runtime gate actually evaluates, so when the
-    sidecar and the stamped metadata disagree, the stamped one is the live
-    behaviour and the sidecar row would be a phantom.
+    Deduplication is by ``(task_id, name)`` with the METADATA copy winning,
+    regardless of kind: that is the artifact the runtime gate actually
+    evaluates, so when the sidecar and the stamped metadata disagree — even
+    when the stamped copy is a path check the sweep does not evaluate — the
+    stamped one is the live behaviour and the sidecar row would be a phantom.
     """
     db = str(tasks_db_path(project_root))
-    statuses, stamps = _load_statuses(db)
+    index = load_task_index(db)
     open_dependents = load_open_dependents(db)
-    metadata_rows = load_metadata_checks(db)
-    manifest_rows, unloadable = load_manifest_checks(project_root, statuses)
+    manifest_rows, unloadable = load_manifest_checks(project_root, index.statuses)
 
-    seen = {(r.task_id, r.name) for r in metadata_rows}
-    rows = metadata_rows + [r for r in manifest_rows if (r.task_id, r.name) not in seen]
+    rows = [
+        *index.metadata_rows,
+        *(r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names),
+    ]
 
     findings: list[Finding] = []
     for row in rows:
@@ -662,10 +690,15 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
         superseded_by = None
         if outcome is CheckOutcome.FAIL and row.status in DONE_STATUSES:
             superseded_by = find_superseding_task(
-                row, repo_root=project_root, since=stamps.get(row.task_id)
+                row, repo_root=project_root, since=index.stamps.get(row.task_id)
             )
+        # After the all-kind dedupe above, a manifest row survives only when
+        # its producer carries no stamped check of that name at all.
         disposition = classify_descriptor(
-            outcome, status=row.status, superseded_by=superseded_by
+            outcome,
+            status=row.status,
+            superseded_by=superseded_by,
+            stamped=row.source == "metadata",
         )
         findings.append(
             Finding(
@@ -710,6 +743,7 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
 #: history first is how a report stops being read.
 _LIVE_SECTIONS = (
     ("VACUOUS LIVE GATES", DISPOSITION_VACUOUS_LIVE_GATE),
+    ("UNWIRED LIVE GATES", DISPOSITION_UNWIRED_LIVE_GATE),
 )
 
 #: SUPERSEDED sits below BROKEN and is deliberately in this group rather than
@@ -743,6 +777,13 @@ _REASONS = {
         "nothing, and a dependent is released for a reason unrelated to the "
         "capability"
     ),
+    DISPOSITION_UNWIRED_LIVE_GATE: (
+        "the checked-in sidecar declares a sound, forward-looking check that "
+        "its still-open producer never received in metadata.delivered_checks "
+        "— the runtime gate cannot see it, so its dependents dispatch "
+        "ungated; repair it by linting it as commit_planning would and "
+        "stamping it onto the task"
+    ),
     DISPOSITION_SUPERSEDED: (
         "correctly authored and delivered, then legitimately undone by later "
         "work — REPORTED, NOT ACTIONABLE; repairing it would revert the "
@@ -763,10 +804,13 @@ _COVERAGE_CAVEAT = (
     "COVERAGE — what this sweep could NOT classify. A descriptor whose task is\n"
     "  absent from tasks.db, or whose sidecar would not load, is counted here\n"
     "  rather than dropped: a report that showed only findings would let a\n"
-    "  partial sweep read as a complete one. The orphan class is real and\n"
-    "  measured, not hypothetical — of 543 mechanical sidecar capabilities, 35\n"
-    "  reach no task at all; 34 of those sit on tasks carrying no\n"
-    "  delivered_checks whatsoever, and 10 of THOSE are still open."
+    "  partial sweep read as a complete one. Two classes are counted: a\n"
+    "  sidecar task_id with no row in this store (including a producer filed\n"
+    "  in a FOREIGN registry whose block is not yet rebound through task\n"
+    "  4731's external_task_id), and a sidecar that would not load. A foreign\n"
+    "  id that COLLIDES with a local task is not counted here; it is\n"
+    "  classified against that unrelated task. The reconciliation record is\n"
+    "  docs/sidecar-orphan-reconciliation-2026-09-29/investigation.md."
 )
 
 
@@ -915,8 +959,9 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # test_exit_constants_alias_the_shared_tier_3_codes exists to catch, here and
 # in audit_combine_gate_marker_loss.py.
 EXIT_OK = AUDIT_EXIT_OK                        # audited; no ACTIONABLE defect
-EXIT_DEFECTS = AUDIT_EXIT_FINDINGS             # a broken or vacuous-live-gate
-                                               # descriptor was found
+EXIT_DEFECTS = AUDIT_EXIT_FINDINGS             # a broken, vacuous-live-gate or
+                                               # unwired-live-gate descriptor
+                                               # was found
 EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT              # no project root resolved to a
                                                # readable tasks.db
 EXIT_NOTHING_AUDITED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
@@ -929,19 +974,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "READ-ONLY, STATUS-AWARE audit of checked-in delivered_checks: "
             "reports every kind=grep descriptor whose polarity against main "
             "today disagrees with its producer's status — a closed producer "
-            "whose capability is nowhere on main (broken), or an open one "
+            "whose capability is nowhere on main (broken), an open one "
             "whose check already passes and therefore gates nothing (vacuous "
-            "live gate). Reporting only — never mutates a task or a manifest. "
+            "live gate), or an open one whose sound sidecar check was never "
+            "stamped onto it, so the runtime gate cannot see it (unwired live "
+            "gate). Reporting only — never mutates a task or a manifest. "
             "Remediation is a separate, individually-reviewed follow-up."
         ),
         epilog=(
             "exit codes: 0 = audited, no ACTIONABLE defect; 1 = at least one "
-            "actionable defect (broken, or a vacuous live gate); 2 = no "
-            "project root resolved to a readable tasks.db; 3 = roots resolved "
-            "but every one failed to audit, so NOTHING was swept (never treat "
-            "3 as a clean run). Superseded, unevaluable, delivered, inert and "
-            "forward-looking rows are reported in full but never affect the "
-            "exit code."
+            "actionable defect (broken, a vacuous live gate, or an unwired "
+            "live gate); 2 = no project root resolved to a readable tasks.db; "
+            "3 = roots resolved but every one failed to audit, so NOTHING was "
+            "swept (never treat 3 as a clean run). Superseded, unevaluable, "
+            "delivered, inert and stamped forward-looking rows are reported "
+            "in full but never affect the exit code."
         ),
     )
     parser.add_argument(
@@ -975,7 +1022,7 @@ def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
 
 
 def _is_dirty(audits: list[ProjectAudit]) -> bool:
-    """Exit 1 keys ONLY on the two ACTIONABLE dispositions.
+    """Exit 1 keys ONLY on the ACTIONABLE dispositions, ``DEFECT_DISPOSITIONS``.
 
     Everything else is reported in full and counted in COVERAGE but stays out
     of the exit code, for the reason the exemplar's terminal-row suppression
@@ -987,6 +1034,8 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
     * ``inert`` (a cancelled producer): promised nothing, gates nothing.
     * ``delivered`` / ``healthy``: the success and the ordinary
       forward-looking states, i.e. the overwhelming majority of the corpus.
+      A forward-looking check that was never STAMPED onto its live producer
+      is not ``healthy`` but ``unwired_live_gate``, and does exit 1.
     * ``unevaluable`` / ``no_task``: coverage facts, not verdicts. Letting
       "git could not answer" exit 1 would make an infrastructure failure
       indistinguishable from a real defect.
@@ -999,10 +1048,11 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
-    Exit codes: 0 = audited, no actionable defect; 1 = at least one ``broken``
-    or ``vacuous_live_gate`` descriptor; 2 = no project root resolved to a
-    readable tasks.db; 3 = roots resolved but every one failed to audit, so
-    NOTHING was swept (never treat 3 as a clean run).
+    Exit codes: 0 = audited, no actionable defect; 1 = at least one
+    ``broken``, ``vacuous_live_gate`` or ``unwired_live_gate`` descriptor;
+    2 = no project root resolved to a readable tasks.db; 3 = roots resolved
+    but every one failed to audit, so NOTHING was swept (never treat 3 as a
+    clean run).
 
     A thin delegation to :func:`_task_db_scan.run_audit_cli` (Tier 3), shared
     with audit_combine_gate_marker_loss.py and audit_wiped_metadata_files.py.

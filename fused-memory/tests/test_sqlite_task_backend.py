@@ -7196,6 +7196,180 @@ async def test_update_task_details_only_merge_plus_append_true_ok(backend, proje
 
 
 @pytest.mark.asyncio
+async def test_update_task_details_and_metadata_append_true_concatenates_details(
+    backend, project_root,
+):
+    """CHARACTERIZATION PIN (task 4216): ``append`` is NOT scoped to metadata.
+
+    A single ``update_task`` carrying BOTH a ``details`` rewrite and a
+    ``memory_hints`` metadata attach under ``append=True`` splits in two:
+
+    * the METADATA half behaves exactly as advertised — ``append=True`` with
+      metadata present resolves to 'additive' (``_resolve_metadata_mode``),
+      so hints union and sibling keys survive;
+    * the DETAILS half silently CONCATENATES ``existing + '\\n\\n' + new``
+      (``update_task``'s details branch), because the very same flag also
+      drives the ``details``/``prompt`` TEXT columns.
+
+    The metadata success makes the response read as a clean write while the
+    details body is duplicated — the silent-duplication hazard the Stage-2
+    prompt now warns about. This test pins CURRENT behaviour and is GREEN on
+    first run by design: task 4216 is a prompt/payload text correction and
+    changes no merge semantics. Do NOT "fix" the backend to make it fail.
+
+    Scope: the ``details=`` spelling of the combined call only. Its two
+    siblings pin the rest of the same contract independently, so a
+    regression in one cannot mask the others:
+    ``test_update_task_prompt_and_metadata_append_true_concatenates_details``
+    (the ``prompt=`` spelling of this same hazard) and
+    ``test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints``
+    (the split-call remedy the corrected Stage-2 prompt prescribes).
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='combined-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/a.py'],
+            'spawned_from': 'task-100',
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='REWRITTEN BODY',
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+
+    # (a) append is NOT scoped to metadata — the details TEXT column is
+    #     concatenated, not replaced. The intended rewrite is duplicated.
+    assert task['details'] == 'ORIGINAL BODY\n\nREWRITTEN BODY', (
+        'append=True must concatenate the details column even when the call '
+        f'also carries metadata; got: {task["details"]!r}'
+    )
+
+    # (b) the metadata half behaves exactly as advertised — union + siblings.
+    assert task['metadata'] == {
+        'files': ['src/a.py'],
+        'spawned_from': 'task-100',
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_and_metadata_append_true_concatenates_details(
+    backend, project_root,
+):
+    """The ``prompt=`` spelling of the same hazard (task 4216).
+
+    ``update_task``'s body branch is ``details`` first, ``prompt`` as the
+    fallback — and BOTH write the same ``details`` TEXT column under the
+    same ``append`` flag. A caller that reaches for the legacy ``prompt=``
+    parameter alongside a ``memory_hints`` attach therefore duplicates the
+    body exactly as the ``details=`` sibling above does.
+
+    This exists because the backend comment and the Stage-2 prompt both
+    state the hazard covers ``details`` AND ``prompt``; without this case
+    the ``prompt`` half of that claim would be asserted in two places and
+    pinned in none. GREEN on first run by design — characterization, not a
+    behaviour change.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='prompt-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/c.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    await backend.update_task(
+        '1', project_root=project_root,
+        prompt='REWRITTEN BODY',
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+
+    assert task['details'] == 'ORIGINAL BODY\n\nREWRITTEN BODY', (
+        'append=True must concatenate the details column via the prompt '
+        f'branch too; got: {task["details"]!r}'
+    )
+    assert task['metadata'] == {
+        'files': ['src/c.py'],
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints(
+    backend, project_root,
+):
+    """The SPLIT-CALL REMEDY prescribed by the corrected Stage-2 prompt (task 4216).
+
+    A metadata-only ``append=True`` attach followed by a details-only call
+    with ``append`` OMITTED leaves exactly ONE copy of the details body
+    while the hints still union and sibling keys survive.
+
+    Split out from
+    ``test_update_task_details_and_metadata_append_true_concatenates_details``
+    deliberately: the remedy is the shape Stage 2 is now told to emit, so a
+    regression here must surface on its own rather than be masked behind a
+    failure of the combined-call hazard characterization.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='split-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/b.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    # call 1 — metadata only, append=True (the hints attach)
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    # call 2 — details only, append OMITTED (the clean rewrite)
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='REWRITTEN BODY',
+    )
+    split = await backend.get_task('1', project_root=project_root)
+
+    assert split['details'] == 'REWRITTEN BODY', (
+        'the split-call remedy must leave exactly ONE copy of the details '
+        f'body; got: {split["details"]!r}'
+    )
+    assert split['metadata'] == {
+        'files': ['src/b.py'],
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'the hints attach must still union under the split: {split["metadata"]}'
+
+
+@pytest.mark.asyncio
 async def test_update_task_default_corrupt_blob_refused(backend, project_root, caplog):
     """Default (no-arg) merge refuses a corrupt existing blob — raises TaskmasterError
     and leaves stored bytes unchanged."""
