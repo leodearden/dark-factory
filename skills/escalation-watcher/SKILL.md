@@ -495,16 +495,17 @@ it, and the gate slug where one corresponds:
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
-  of an orchestrator, watchdog enables that restart units. **Except** restarts of fused-memory and
-  the dashboard, which are allowed but reported after the fact with their root cause.
+  of an orchestrator, watchdog enables that restart units (`physical_operator_action`). **Except**
+  restarts of fused-memory and the dashboard, which are allowed but reported after the fact with
+  their root cause.
 - Irreversible or content-losing operations: entity merge or split, memory deletion, branch
   deletion, cancelling a task with dependents (`irreversible_deletion`).
 - Bypasses: no-verify, skipping the merge queue, force lease release, widening an allowlist past a
   guard. **Except** direct-to-main docs-only commits, which are allowed; CLAUDE.md "Working in the
   main checkout" says when one may land.
 - Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
-- Anything with a declared pin (`pin_declared_by`), under a Leo HOLD, or naming Leo's other session
-  or his personal backlog.
+- A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
+  other session or his personal backlog.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
 - Scope changes: acceptance criteria, cancel-and-refile or re-scope.
 
