@@ -73,8 +73,53 @@ import signal
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
+
+
+#: The procfs mount every /proc walk in this module reads: the snapshot, the
+#: at-or-under scan and the group-member walk.
+#:
+#: Module-level solely so the synthetic-/proc tests in ``test_proc_group`` can
+#: point those walks at a fabricated tree by monkeypatching it, the same way
+#: other tests there monkeypatch ``os.readlink`` and ``os.killpg``. It is an
+#: INJECTION SEAM FOR TESTS, not a runtime knob: nothing in production reads a
+#: config value into it, and the whole module already assumes Linux procfs
+#: semantics (os.killpg, /proc/<pid>/stat field order), so pointing it
+#: elsewhere at runtime would not make it portable.
+_PROC_ROOT = Path('/proc')
+
+
+class _StatFields(NamedTuple):
+    comm: str
+    state: str
+    ppid: int
+    pgrp: int
+
+
+def _read_stat_fields(entry: Path) -> _StatFields | None:
+    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
+
+    comm is delimited by the LAST ``)``, so a comm containing spaces or parens
+    parses correctly; its bytes are arbitrary, so undecodable ones are replaced
+    rather than costing the pid its entry.
+    """
+    try:
+        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    rparen = text.rfind(')')
+    if rparen < 0:
+        return None
+    comm = text[text.find('(') + 1 : rparen]
+    fields = text[rparen + 2 :].split()
+    try:
+        return _StatFields(
+            comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
+        )
+    except (IndexError, ValueError):
+        return None
 
 
 def snapshot_process_group(pgid: int) -> str:
@@ -97,7 +142,7 @@ def snapshot_process_group(pgid: int) -> str:
     process belongs to *pgid*, or a benign "no processes found" note otherwise.
 
     Linux-specific: depends on ``/proc/<pid>/stat``, ``/proc/<pid>/wchan``,
-    and ``/proc/<pid>/comm``.  The whole ``proc_group`` module already relies on
+    and ``/proc/<pid>/cmdline``.  The whole ``proc_group`` module already relies on
     Linux semantics (``os.killpg`` / ``os.getpgrp``), so this is acceptable.
     """
     try:
@@ -114,7 +159,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
     if pgid <= 0:
         return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
 
-    proc_dir = Path('/proc')
+    proc_dir = _PROC_ROOT
     if not proc_dir.exists():
         return f'snapshot_process_group({pgid}): /proc not available'
 
@@ -129,35 +174,9 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             continue
         pid = int(entry.name)
 
-        # Read /proc/<pid>/stat to get pgrp (field 5, 1-indexed), ppid (4), state (3).
-        # stat format: "pid (comm) state ppid pgrp ..."
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
+        fields = _read_stat_fields(entry)
+        if fields is None or fields.pgrp != pgid:
             continue
-
-        # Parse: find the closing ')' of the comm field to handle spaces/parens in names.
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            tail = stat_text[rparen + 2 :]  # skip ') '
-            fields = tail.split()
-            # fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session, ...
-            state = fields[0]
-            ppid = int(fields[1])
-            pgrp = int(fields[2])
-        except (IndexError, ValueError):
-            continue
-
-        if pgrp != pgid:
-            continue
-
-        # Read comm (short executable name, capped at 15 chars by the kernel).
-        try:
-            comm = (entry / 'comm').read_text().strip()
-        except OSError:
-            comm = '?'
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
@@ -168,20 +187,21 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         # Read /proc/<pid>/cmdline (NUL-separated argv → spaces) for the full
         # command-line.  Kernel threads have an empty cmdline; fall back to
         # comm so the field is always populated.  Truncate to ~200 chars for
-        # log friendliness.  Mirrors the comm/wchan try/except idiom so
+        # log friendliness.  Mirrors the wchan try/except idiom so
         # snapshot_process_group never raises (module invariant).
         try:
             raw = (entry / 'cmdline').read_bytes()
             cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
             if not cmdline:
-                cmdline = comm  # kernel thread — fall back to short comm
+                cmdline = fields.comm  # kernel thread — fall back to short comm
             if len(cmdline) > 200:
                 cmdline = cmdline[:200] + '…'
         except OSError:
             cmdline = '?'
 
         rows.append(
-            f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm} cmdline={cmdline}'
+            f'  pid={pid} ppid={fields.ppid} state={fields.state} wchan={wchan} '
+            f'comm={fields.comm} cmdline={cmdline}'
         )
 
     if not rows:
@@ -296,16 +316,89 @@ async def terminate_process_group(
 # ---------------------------------------------------------------------------
 
 
-#: The procfs mount the at-or-under scan walks.
-#:
-#: Module-level solely so the synthetic-/proc tests can point the scan at a
-#: fabricated tree (``test_proc_group.TestScanProcessGroupsAgainstASyntheticProc``
-#: monkeypatches it, the same way other tests here monkeypatch ``os.readlink``
-#: and ``os.killpg``). It is an INJECTION SEAM FOR TESTS, not a runtime knob:
-#: nothing in production reads a config value into it, and the whole module
-#: already assumes Linux procfs semantics (os.killpg, /proc/<pid>/stat field
-#: order), so pointing it elsewhere at runtime would not make it portable.
-_PROC_ROOT = Path('/proc')
+class ProcessGroupMember(NamedTuple):
+    pid: int
+    ppid: int
+    state: str
+    comm: str
+
+    @property
+    def terminated(self) -> bool:
+        """Exited; awaits only its (maybe reparented) parent's reap, not the signaller's job."""
+        return self.state in ('Z', 'X')
+
+
+def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupMember]]:
+    """One /proc walk: the members of every positive pgid in *pgids*, keyed by pgid.
+
+    Each list holds zombies too and is sorted by pid; a group with no visible
+    member maps to an empty list.  A pid that vanishes or cannot be read
+    mid-walk is skipped, and no positive pgid means no walk.  Never raises OSError.
+    """
+    members: dict[int, list[ProcessGroupMember]] = {p: [] for p in pgids if p > 0}
+    if not members:
+        return members
+    try:
+        entries = list(_PROC_ROOT.iterdir())
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fields = _read_stat_fields(entry)
+        if fields is None or fields.pgrp not in members:
+            continue
+        members[fields.pgrp].append(
+            ProcessGroupMember(
+                pid=int(entry.name), ppid=fields.ppid, state=fields.state, comm=fields.comm
+            )
+        )
+    for group in members.values():
+        group.sort()
+    return members
+
+
+def process_group_members(pgid: int) -> list[ProcessGroupMember]:
+    """Every process whose pgrp is *pgid*, zombies included, sorted by pid.
+
+    Walks ``/proc``; a pid that vanishes or cannot be read mid-walk is skipped.
+    Never raises OSError.
+    """
+    return _group_members_by_pgid((pgid,)).get(pgid, [])
+
+
+def _terminated_pgids(pgids: Iterable[int]) -> set[int]:
+    """The subset of *pgids* that :func:`process_group_terminated` would pass.
+
+    Probes each group with ``killpg(pgid, 0)``, then walks /proc once for all
+    the groups that probe still sees, however many there are.
+    """
+    gone: set[int] = set()
+    visible: list[int] = []
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            gone.add(pgid)
+        else:
+            visible.append(pgid)
+    walked = _group_members_by_pgid(visible)
+    return gone | {
+        pgid
+        for pgid, members in walked.items()
+        if members and all(m.terminated for m in members)
+    }
+
+
+def process_group_terminated(pgid: int) -> bool:
+    """True iff every member of group *pgid* has terminated, or the group is gone.
+
+    Concluded only on positive evidence: ``killpg(pgid, 0)`` failing (ESRCH:
+    gone; EPERM: the pgid now belongs to another user), or a /proc walk that
+    sees at least one member, all terminated.  An empty walk while killpg
+    still sees the group is inconclusive and yields False.
+    """
+    return pgid in _terminated_pgids((pgid,))
 
 
 def _path_at_or_under(candidate: str, root: str) -> bool:
@@ -376,21 +469,10 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
         if not entry.name.isdigit():
             continue
 
-        # Parse pgrp from /proc/<pid>/stat (field 5, after the parenthesized
-        # comm). Reuses _snapshot_process_group_unsafe's rfind(')') idiom so a
-        # comm containing spaces/parens is handled correctly.
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
+        fields = _read_stat_fields(entry)
+        if fields is None:
             continue
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            fields = stat_text[rparen + 2 :].split()
-            pgrp = int(fields[2])  # fields: state, ppid, pgrp, ...
-        except (IndexError, ValueError):
-            continue
+        pgrp = fields.pgrp
 
         if pgrp in exclude or pgrp in result:
             # Excluded, or already recorded via another pid in the same group —
@@ -431,32 +513,17 @@ def scan_process_groups_under_path(
         return set()
 
 
-def _pgid_alive(pgid: int) -> bool:
-    """True while *pgid* still exists (``killpg(pgid, 0)`` succeeds).
-
-    ProcessLookupError (ESRCH) → gone.  PermissionError (EPERM) → the pgid was
-    recycled to another user's group, so the group we were reaping is gone;
-    treat as gone.  Any other OSError → treat as gone (fail-safe: never report
-    a group as alive on an ambiguous error, which would falsely mark it
-    'survived').
-    """
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-
-
 def _drop_dead_pgids(pgids: list[int], grace_secs: float, poll_step: float) -> list[int]:
-    """Bounded-poll *pgids*, returning those still alive after *grace_secs*.
+    """Bounded-poll *pgids*, returning those not yet terminated after *grace_secs*.
 
-    Checks liveness immediately (so an already-dead group needs no sleep),
-    then polls every *poll_step* until the deadline.
+    Checks immediately (so an already-terminated group needs no sleep), then
+    polls every *poll_step* until the deadline.
     """
     remaining = list(pgids)
     deadline = time.monotonic() + max(0.0, grace_secs)
     while True:
-        remaining = [p for p in remaining if _pgid_alive(p)]
+        terminated = _terminated_pgids(remaining)
+        remaining = [p for p in remaining if p not in terminated]
         if not remaining or time.monotonic() >= deadline:
             return remaining
         time.sleep(poll_step)
@@ -471,9 +538,11 @@ def reap_process_groups(
     """SIGTERM→wait→SIGKILL every pgid in *pgids*; return a per-pgid outcome.
 
     Outcomes:
-    - ``'reaped'``       — the group is gone.
-    - ``'survived'``     — still alive after SIGKILL + *grace_secs* (rare;
-      only same-user-uncooperative or unsignalable groups).
+    - ``'reaped'``       — every member has terminated: the group is gone, or
+      only zombies awaiting their subreaper's reap remain
+      (:func:`process_group_terminated`).
+    - ``'survived'``     — a member was still running after SIGKILL +
+      *grace_secs* (rare; only same-user-uncooperative or unsignalable groups).
     - ``'refused:<reason>'`` — an unsafe pgid (``pgid <= 1`` / self / parent /
       own group per :func:`unsafe_pgid_reason`); never signalled at all.
 
