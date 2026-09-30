@@ -3916,12 +3916,16 @@ class ReconciliationHarness:
                     reports.append(report)
                     run.stage_reports[stage_key] = report
 
-                # Update watermark
-                watermark.last_full_run_id = run_id
-                watermark.last_full_run_completed = datetime.now(UTC)
-                watermark.last_episode_timestamp = datetime.now(UTC)
-                watermark.last_memory_timestamp = datetime.now(UTC)
-                watermark.last_task_change_timestamp = datetime.now(UTC)
+                completed_at = datetime.now(UTC)
+                watermark = watermark.model_copy(update={
+                    'last_full_run_id': run_id,
+                    'last_full_run_completed': completed_at,
+                    # Run start, not completion (on resume, the original start): a mid-cycle
+                    # item is re-presented, never skipped. Why: tests/reconciliation/test_recon_window_anchor.py
+                    'last_episode_timestamp': run.started_at,
+                    'last_memory_timestamp': run.started_at,
+                    'last_task_change_timestamp': completed_at,
+                })
                 await self.journal.update_watermark(watermark)
 
                 run.completed_at = datetime.now(UTC)
