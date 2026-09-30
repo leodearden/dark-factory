@@ -1310,10 +1310,8 @@ async def _init_transcript_repo(repo: Path) -> None:
     the transcript suites the wrong repo contents — a failure that surfaces as
     a confusing assertion error far from its cause, not an ImportError.
 
-    The three names stay separate, and what separates them is DATA: one
-    ``RepoSeed`` each, all built by ``_git_fixtures.py::build_repo``. An earlier
-    rejection of a ``seed=`` parameter was aimed at one branchy factory; seeds
-    as data have no branches, so that objection no longer applies.
+    Each of the three names is backed by its own ``RepoSeed``, built by
+    ``_git_fixtures.py::build_repo``.
     """
     seed_repo(repo, TRANSCRIPT_REPO_SEED)
 
