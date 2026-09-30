@@ -431,6 +431,54 @@ class TestInitialScan:
         assert result is not None
         assert result.id == 'esc-6-1'
 
+    def test_malformed_json_is_warned_not_silent(self, tmp_path, caplog):
+        """A corrupt record is skipped AND logged at WARNING naming the file."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-garbage.json').write_text('{not valid json}}}')
+        with caplog.at_level(logging.WARNING):
+            assert _initial_scan(queue_dir, task_id=None, level=None) is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'watcher._initial_scan' in r.getMessage() and 'esc-garbage.json' in r.getMessage()
+            for r in warnings
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_undecodable_file_is_warned_and_scan_continues(self, tmp_path, caplog):
+        """A non-UTF-8 record must not crash the scan; a valid sibling is still found."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-binary.json').write_bytes(b'\xff\xfe\x00\x80')
+        esc = Escalation(
+            id='esc-6-2', task_id='6', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='valid',
+        )
+        _write_esc(queue_dir, esc)
+        with caplog.at_level(logging.WARNING):
+            result = _initial_scan(queue_dir, task_id=None, level=None)
+        assert result is not None
+        assert result.id == 'esc-6-2'
+        assert any('esc-binary.json' in r.getMessage() for r in caplog.records)
+
+    def test_unreadable_file_is_warned(self, tmp_path, caplog):
+        """A permission-denied record is skipped AND logged at WARNING."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-denied.json').write_text('{}')
+        real_read_text = Path.read_text
+
+        def deny(self, *a, **kw):
+            if self.name == 'esc-denied.json':
+                raise PermissionError(13, 'Permission denied')
+            return real_read_text(self, *a, **kw)
+
+        with patch.object(Path, 'read_text', deny), caplog.at_level(logging.WARNING):
+            assert _initial_scan(queue_dir, task_id=None, level=None) is None
+        assert any(
+            r.levelno == logging.WARNING and 'esc-denied.json' in r.getMessage()
+            for r in caplog.records
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
     def test_exclude_single_pending(self, tmp_path):
         """Sole pending escalation in exclude_ids -> returns None."""
         queue_dir = tmp_path / 'queue'
