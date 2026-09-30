@@ -55,13 +55,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'datumFor',
   'requestOnDemand',
   'onDemandView',
+  'onDemandDatum',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
 // before fetch completes cannot crash any component reading DF_DATA.*.
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
-  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
   'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
@@ -104,7 +105,7 @@ const DATUM_SPEC = { kind: 'datum' };
 // because deriving it from endpointsFor would be deriving the expectation from
 // the thing under test.
 const EXPECTED_ENDPOINT_KEYS = [
-  'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
+  'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
   'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
   'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
@@ -1573,6 +1574,17 @@ test('registry: the reshape drops no key — the union is exactly today\'s set',
   assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
 });
 
+test('registry: ACTIVE_TASKS is retired from the seed and the /tasks row', () => {
+  // EXPECTED_DF_DATA_KEYS is a containment check, so it cannot see a leftover
+  // seed. The rows travel only as TASKS_SNAPSHOT[p].rows now.
+  const { api, window: win } = loadDataJs();
+  assert.ok(!Object.prototype.hasOwnProperty.call(win.DF_DATA, 'ACTIVE_TASKS'), 'DF_DATA still seeds ACTIVE_TASKS');
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(api.endpointsFor('24h')['/api/v2/dashboard/tasks'], 'ACTIVE_TASKS'),
+    'the /tasks registry row still names ACTIVE_TASKS',
+  );
+});
+
 test('registry: every polled key is plain, because beta nests its Datums inside TASKS_SNAPSHOT', () => {
   // Not an aspiration — a description. Beta does serve Datums, but each one
   // sits inside a TASKS_SNAPSHOT entry (census, rows), and TASKS_SNAPSHOT
@@ -2016,13 +2028,14 @@ test('on-demand: a poll of /tasks still runs while a terminal request is in flig
   assert.equal(state.get(TERMINAL_STATE_KEY).inFlight, true, 'the held request should be in flight');
   assert.notEqual(state.get(TASKS_PATH)?.inFlight, true, 'the POLLED tasks endpoint was marked in flight');
 
-  await api.refreshOne(TASKS_PATH, { ACTIVE_TASKS: PLAIN_SPEC }, state, {
-    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ ACTIVE_TASKS: [{ id: '1' }] }) }); },
+  const polledSnapshot = { [TERMINAL_PROJECT]: {} };
+  await api.refreshOne(TASKS_PATH, { TASKS_SNAPSHOT: PLAIN_SPEC }, state, {
+    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ TASKS_SNAPSHOT: polledSnapshot }) }); },
     now: () => 101,
   });
 
   assert.deepEqual(polledUrls, [TASKS_PATH], 'the polled tasks fetch was skipped while the terminal request ran');
-  assert.deepEqual(win.DF_DATA.ACTIVE_TASKS, [{ id: '1' }]);
+  assert.deepEqual(win.DF_DATA.TASKS_SNAPSHOT, polledSnapshot);
 
   releaseTerminal();
   await pending;
@@ -2232,7 +2245,7 @@ test('outcomes: the poll loop ignores them — refreshDFData still resolves to u
 // ---------------------------------------------------------------------------
 // taskProse — the Task Detail pane's description/details, fetched per selection
 //
-// The ACTIVE_TASKS rows no longer carry either field (task 5815); the pane asks
+// The snapshot rows no longer carry either field (task 5815); the pane asks
 // for the ONE selected task through the same on-demand seam the terminal row
 // uses. The row is addressed by the row's own uid (`<project>/T-<id>`), whose
 // segments are encoded one by one so the '/' between them stays a path
@@ -2346,6 +2359,99 @@ test('onDemandView: with no value, a settled request that brought none is unavai
       );
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// onDemandDatum — the Datum a caller that REQUESTED an on-demand row shows
+//
+// datumFor answers 'not yet fetched' for every absent key, which is a promise
+// only a requesting caller can keep. A caller holding its own request's outcome
+// knows more: the request is on its way, or it did not succeed. onDemandView
+// already decides which; this turns its answer into the Datum a surface renders.
+// ---------------------------------------------------------------------------
+
+test('onDemandDatum: nothing stored and a request on its way is an unknown saying so', () => {
+  const { api, window: win } = loadDataJs();
+  const reasons = [null, api.REFRESH_OUTCOMES.skippedInFlight].map(outcome => {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(win.DF_DATUM.isDatum(d), true, `outcome ${outcome}`);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}: the hole must say why`);
+    assert.notEqual(d.reason, 'not yet fetched', "datumFor's reason promises nothing about this request");
+    return d.reason;
+  });
+  assert.equal(reasons[0], reasons[1], 'both mean the same thing to the caller: wait');
+});
+
+test('onDemandDatum: nothing stored and a request that did not succeed says it failed', () => {
+  const { api } = loadDataJs();
+  const waiting = api.onDemandDatum('terminal', TERMINAL_PROJECT, null).reason;
+  for (const outcome of [api.REFRESH_OUTCOMES.failed, api.REFRESH_OUTCOMES.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}`);
+    assert.notEqual(d.reason, waiting, `outcome ${outcome} must not read as still on its way`);
+    assert.notEqual(d.reason, 'not yet fetched', `outcome ${outcome}`);
+  }
+});
+
+test('onDemandDatum: a landed Datum is returned as stored, whatever outcome is passed', async () => {
+  const { api, window: win } = loadDataJs();
+  const O = api.REFRESH_OUTCOMES;
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 55 },
+  });
+  const stored = win.DF_DATA[api.ON_DEMAND_KEYS.terminal.key(TERMINAL_PROJECT)];
+  assert.ok(stored, 'the request should have landed a Datum');
+
+  for (const outcome of [null, O.applied, O.failed, O.skippedInFlight, O.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.deepEqual(d, stored, `outcome ${outcome}`);
+    assert.equal(d._received_at, 55, `outcome ${outcome}: the receipt stamp must survive`);
+  }
+});
+
+test('onDemandDatum: a failed refresh after a good one still shows the earlier Datum', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 300 },
+  });
+  const good = win.DF_DATA[TERMINAL_KEY];
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  let outcome;
+  try {
+    outcome = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 900, ignoreBackoff: true },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
+  assert.deepEqual(api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome), good);
+});
+
+test('onDemandDatum: an undeclared name is refused loudly, as requestOnDemand refuses it', async () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), /termnial/);
+  let requestMessage;
+  await api.requestOnDemand('termnial', TERMINAL_PROJECT, { state: api.createPollState() }).catch(e => {
+    requestMessage = e.message;
+  });
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), { message: requestMessage });
+});
+
+test('onDemandDatum: a PLAIN row is refused — it has no Datum to answer with', () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('taskProse', PROSE_UID, null), /taskProse/);
 });
 
 // ---------------------------------------------------------------------------

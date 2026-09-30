@@ -8715,11 +8715,43 @@ def test_log_swallows_only_os_and_subprocess_errors(
         wdog.log("hello")
 
 
-def test_log_never_raises_when_the_stderr_fallback_itself_fails(
+class _BrokenStderr:
+    """A stderr that is BROKEN: a dead pipe, or a full/failing journal socket.
+
+    Both surface as an OSError out of ``write``.
+    """
+
+    def write(self, _s: str) -> int:
+        raise BrokenPipeError("stderr is gone too")
+
+    def flush(self) -> None:
+        raise BrokenPipeError("stderr is gone too")
+
+
+def _closed_stderr():
+    """A stderr that is CLOSED — a real stream, not a double.
+
+    ``print`` to one raises ``ValueError: I/O operation on closed file``, which
+    is not an OSError. Handing back the genuine article rather than a fake that
+    re-states that message keeps the pin honest: a double can drift from what
+    CPython actually does, and then the test passes while log() would not.
+    """
+    with open(os.devnull, "w") as stream:
+        pass
+    return stream
+
+
+@pytest.mark.parametrize(
+    "make_stderr", [_BrokenStderr, _closed_stderr], ids=["broken", "closed"]
+)
+def test_log_never_raises_when_the_stderr_fallback_is_unusable(
     monkeypatch: pytest.MonkeyPatch,
+    make_stderr,  # noqa: ANN001
 ) -> None:
-    """The fallback print is best-effort too: stderr can be a broken pipe or a
-    full/failing journal socket, and that OSError must not escape log().
+    """The fallback print is best-effort too: an unusable stderr must not raise
+    out of log(). Stderr is unusable in more than one way, and they do not
+    share an exception type — broken raises OSError, closed raises ValueError —
+    so the fallback guard has to cover the class, not a list.
 
     main()'s per-unit handler calls log() from inside its ``except Exception``
     block, so an exception escaping log() there aborts the for-loop and leaves
@@ -8730,15 +8762,8 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(
     def fake_run(cmd, **kwargs):  # noqa: ANN001
         raise FileNotFoundError("systemd-cat not found")
 
-    class _BrokenStderr:
-        def write(self, _s: str) -> int:
-            raise BrokenPipeError("stderr is gone too")
-
-        def flush(self) -> None:
-            raise BrokenPipeError("stderr is gone too")
-
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
+    monkeypatch.setattr(wdog.sys, "stderr", make_stderr())
 
     wdog.log("hello")  # must not raise — both journal routes are gone
 

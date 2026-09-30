@@ -52,7 +52,7 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
-    '/api/v2/dashboard/tasks':                        { 'ACTIVE_TASKS': PLAIN, 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
+    '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -72,9 +72,9 @@ function endpointsFor(win) {
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
-// `terminal`, the mechanism PRD leaf gamma3 fetches `?terminal=<project>`
-// through, and `taskProse`, the Task Detail pane's description/details for the
-// selected task, addressed by the row's own uid (`<project>/T-<id>`).
+// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
+// `taskProse`, the Task Detail pane's description/details for the selected
+// task, addressed by the row's own uid (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -124,15 +124,6 @@ window.DF_DATA = {
   AGENTS: [],
   ORCHESTRATORS: [],
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
-  // ACTIVE_TASKS row shape: {id, project, title, status, agent, started, loops,
-  //   attempts, lane, phase, lane_state, runtime_offline, deps, meta_files,
-  //   train, external_deps, prd, claimant_run_id, heartbeat_at, stranded}.
-  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
-  //   `stranded` (task 3543) is the independent liveness verdict, computed
-  //   server-side from the claim columns via shared.task_claimant.is_stranded.
-  //   Rows carry no description/details: the Task Detail pane fetches those
-  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
-  ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
   // Projects the tasks handler ran out of budget for — state UNKNOWN, not
@@ -152,7 +143,17 @@ window.DF_DATA = {
   // TASKS_SNAPSHOT: {project: {census, rows, in_progress_live,
   //   in_progress_stranded, skew_seconds}}, census and rows each a Datum.
   //   Seeded EMPTY, so a read before the first fetch finds no entry, which
-  //   task_done_count.js answers with the placeholder rather than a zero.
+  //   task_snapshot.js::projectCensus answers as an unknown Datum rather
+  //   than a zero.
+  //   Each rows Datum's value is a list of rows shaped {id, project, title,
+  //   status, agent, started, loops, attempts, lane, phase, lane_state,
+  //   runtime_offline, deps, meta_files, train, external_deps, prd,
+  //   claimant_run_id, heartbeat_at, stranded}.
+  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
+  //   `stranded` (task 3543) is the independent liveness verdict, computed
+  //   server-side from the claim columns via shared.task_claimant.is_stranded.
+  //   Rows carry no description/details: the Task Detail pane fetches those
+  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {
@@ -549,10 +550,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: the gamma3
-// UI that opens a terminal has to tell "here are the rows" from "the server
-// said no" from "we did not even ask", and datumFor(key) reports the same
-// pre-request unknown Datum in all three cases.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
+// which requests a project's terminal window, has to tell "here are the rows"
+// from "the server said no" from "we did not even ask", and datumFor(key)
+// reports the same pre-request unknown Datum in all three cases, so it reads
+// onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
@@ -576,6 +578,25 @@ function onDemandView(value, outcome) {
   if (value !== undefined && value !== null) return ON_DEMAND_VIEWS.ready;
   if (outcome === null || outcome === REFRESH_OUTCOMES.skippedInFlight) return ON_DEMAND_VIEWS.loading;
   return ON_DEMAND_VIEWS.unavailable;
+}
+
+const ON_DEMAND_HOLE_REASONS = Object.freeze({
+  [ON_DEMAND_VIEWS.loading]: 'requested; waiting for the response',
+  [ON_DEMAND_VIEWS.unavailable]: 'the request for it did not succeed',
+});
+
+// onDemandView's answer as the Datum a REQUESTING caller renders: the stored,
+// receipt-stamped Datum once one has landed, else a hole naming what its own
+// request is doing — never datumFor's 'not yet fetched'. A PLAIN row has no
+// Datum to answer with, so asking for one is refused.
+function onDemandDatum(name, param, outcome) {
+  const row = onDemandRow(name);
+  if (row.spec !== DATUM) {
+    throw new Error(`DF_DATA: on-demand key '${name}' is not datum-kinded, so it has no Datum to answer with`);
+  }
+  const value = window.DF_DATA[row.key(param)];
+  const view = onDemandView(value, outcome);
+  return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
 }
 
 // `stateKey` names the flow-control, staleness and receipt entry this request
@@ -765,10 +786,7 @@ async function refreshDFData(win, opts) {
 // abandoned (the Task Detail pane re-selecting a task) would wait forever on a
 // request that failed.
 async function requestOnDemand(name, param, opts) {
-  const row = ON_DEMAND_KEYS[name];
-  if (!row) {
-    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
-  }
+  const row = onDemandRow(name);
   const o = opts || {};
   const state = o.state || DF_POLL_STATE;
   const ledger = onDemandLedger(state, name);
@@ -778,6 +796,14 @@ async function requestOnDemand(name, param, opts) {
   ledger.set(param, request);
   trimOnDemand(name, ledger, row.retain ?? Infinity, state);
   return request;
+}
+
+function onDemandRow(name) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row) {
+    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
+  }
+  return row;
 }
 
 function startOnDemand(name, param, state, depsOverrides, ledger) {
@@ -894,6 +920,7 @@ const DF_DATA_LOADER_API = {
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
+  onDemandDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

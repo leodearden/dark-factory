@@ -477,6 +477,66 @@
       ]
     },
     {
+      "task_id": "5460",
+      "reason": "Net-additive: conftest gains the session autouse pristine_repo_templates fixture that installs _git_fixtures' per-worker template root under basetemp; autouse because the shared _workflow_helpers seeders are awaited as helper(repo) by ~20 modules and cannot request a fixture.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1201,
+          "current": 1220
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 773,
+          "current": 783
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56236,
+          "current": 56255
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31574,
+          "current": 31584
+        }
+      ]
+    },
+    {
+      "task_id": "5460",
+      "reason": "Net-additive: conftest gains the session autouse pristine_repo_templates fixture that installs _git_fixtures' per-worker template root; re-measured on the tree merged with main a1548f5c64 because task 3542's conftest guard moved the baseline under this branch.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1242,
+          "current": 1261
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 786,
+          "current": 796
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56277,
+          "current": 56296
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31587,
+          "current": 31597
+        }
+      ]
+    },
+    {
       "task_id": "4023",
       "reason": "Net-additive regression coverage for a silent-data-loss fix, not a failed refactor. test_mcp_post_transport.py is a NEW file that drives the five raw MCP POSTs (a /mcp/ 307 redirect silently discarded every write) through a real httpx client and asserts where each tools/call actually landed -- the payload-shaped mocks that missed the bug could not. It imports merge_queue/git_ops only to build the merge-worker mirror of _post_submit_tasks, so every private read in the file is counted: 10 are the TaskWorkflow memory writers under test (workflow.py is outside the cluster) and 3 are SpeculativeMergeWorker._post_submit_tasks, none of which has a public seam. Trimmed first: the three worker._mcp reaches now go through the constructor's mcp= argument (16 -> 13).",
       "measures": [

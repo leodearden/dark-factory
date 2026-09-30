@@ -2993,18 +2993,22 @@ def create_server(
             unknown values return ``{'error': ...}`` (mirrors
             ``escalate_blocker`` validation) and mint nothing.
 
-            **An inherited ``'info'`` L2 is deliberately NON_PINNING.**  Before
-            task 3976 no producer could mint an L2 below ``'blocking'``, so
-            every L2 classified ``QUEUE_HANDOFF`` in ``escalation.pins``.  Link
-            1 there short-circuits on ``severity == 'info'`` BEFORE the
-            ``level != 0`` link — "an info record never pins, at any level" —
-            so an inherited-info L2 no longer vetoes its subject task's
-            ``done`` flip.  That is the INTENDED semantics and was considered
-            here, not an oversight: the members it clusters were themselves
-            non-pinning, and a record that does not merit a human's attention
-            must not hold a task open waiting for one.  An L2 that genuinely
-            should pin is one whose members are genuinely non-info, or one the
-            caller filed with an explicit upward *severity*.
+            **An inherited ``'info'`` L2 is deliberately NON_PINNING.**  Task
+            3976's inherited default is the first path that MINTS a fresh L2
+            at ``'info'``: before it, every freshly filed L2 was at least
+            ``'blocking'`` and classified ``QUEUE_HANDOFF`` in
+            ``escalation.pins``, and the only info-severity L2s were ones
+            ``escalation.queue.EscalationQueue.park()`` promoted from an
+            already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
+            on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
+            info record never pins, at any level" — so an inherited-info L2
+            no longer vetoes its subject task's ``done`` flip.  That is the
+            INTENDED semantics and was considered here, not an oversight: the
+            members it clusters were themselves non-pinning, and a record that
+            does not merit a human's attention must not hold a task open
+            waiting for one.  An L2 that genuinely should pin is one whose
+            members are genuinely non-info, or one the caller filed with an
+            explicit upward *severity*.
 
         Response shapes
         ---------------
