@@ -68,17 +68,15 @@ from inotify_simple import INotify, flags
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
-from escalation.queue import _SCAN_PARSE_ERRORS, read_escalation_for_scan
+from escalation.queue import read_escalation_for_scan
 
 logger = logging.getLogger(__name__)
 
-#: Content faults the scan loops absorb per record.  ``UnicodeDecodeError`` is
-#: named explicitly: ``read_text`` raises it for a truncated/binary file, it is
-#: a ``ValueError`` and not an ``OSError``, and the watcher is a long-lived
-#: polling consumer that must survive one undecodable record (it is WARNed by
-#: ``read_escalation_for_scan``, not dropped silently).  ``OSError`` needs no
-#: entry: the helper files it as 'vanished' or 'unreadable'.
-_WATCHER_PARSE_ERRORS: tuple[type[BaseException], ...] = (*_SCAN_PARSE_ERRORS, UnicodeDecodeError)
+#: UnicodeDecodeError: a long-lived watcher must survive one undecodable record
+#: (see ``escalation/queue.py::read_escalation_for_scan``).
+_WATCHER_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError,
+)
 
 
 def _matches(
