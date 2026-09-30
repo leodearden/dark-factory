@@ -2111,19 +2111,50 @@ def test_log_swallows_only_os_and_subprocess_errors(monkeypatch):
         wdog.log("hello")
 
 
-def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
-    """The stderr fallback is best-effort too: it must not raise even when
-    stderr itself is a broken pipe or a full/failing journal socket.
+class _BrokenStderr:
+    """A stderr that is BROKEN: a dead pipe, or a full/failing journal socket.
+
+    Both surface as an OSError out of ``write``.
+    """
+
+    def write(self, _s: str) -> int:
+        raise BrokenPipeError("stderr is gone too")
+
+    def flush(self) -> None:
+        raise BrokenPipeError("stderr is gone too")
+
+
+def _closed_stderr():
+    """A stderr that is CLOSED — a real stream, not a double.
+
+    ``print`` to one raises ``ValueError: I/O operation on closed file``, which
+    is not an OSError. Handing back the genuine article rather than a fake that
+    re-states that message keeps the pin honest: a double can drift from what
+    CPython actually does, and then the test passes while log() would not.
+    """
+    with open(os.devnull, "w") as stream:
+        pass
+    return stream
+
+
+@pytest.mark.parametrize(
+    "make_stderr", [_BrokenStderr, _closed_stderr], ids=["broken", "closed"]
+)
+def test_log_never_raises_when_the_stderr_fallback_is_unusable(monkeypatch, make_stderr):
+    """The stderr fallback is best-effort too: an unusable stderr must not
+    raise out of log(). Stderr is unusable in more than one way, and they do
+    not share an exception type — broken raises OSError, closed raises
+    ValueError — so the fallback guard has to cover the class, not a list.
 
     dashboard-watchdog has no per-unit loop (unlike orchestrator-watchdog,
     whose main() calls log() from inside a per-unit ``except Exception``).
-    The real damage here is that an escaping OSError aborts tick() MID-BRANCH:
-    every log() call site in tick() — the startup-grace streak reset, the
-    healthy-again streak reset, and the ceiling re-trip log that precedes the
-    ceiling_open write — is ordered BEFORE the save_state() it narrates, so a
-    streak reset or the ``ceiling_open`` write would be silently skipped. A
-    skipped streak reset arms a restart of a *healthy* dashboard on the very
-    next missed probe — and this all lands on a 30s timer, twice as tight as
+    The damage here is that an escape aborts tick() MID-BRANCH: every log()
+    call site in tick() — the startup-grace streak reset, the healthy-again
+    streak reset, and the ceiling re-trip log that precedes the ceiling_open
+    write — is ordered BEFORE the save_state() it narrates, so a streak reset
+    or the ``ceiling_open`` write would be silently skipped. A skipped streak
+    reset arms a restart of a *healthy* dashboard on the very next missed
+    probe — and this all lands on a 30s timer, twice as tight as
     orchestrator-watchdog's 60s.
     """
     wdog = _load_watchdog()
@@ -2131,15 +2162,8 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
     def fake_run(argv, *args, **kwargs):
         raise FileNotFoundError("systemd-cat not found")
 
-    class _BrokenStderr:
-        def write(self, _s: str) -> int:
-            raise BrokenPipeError("stderr is gone too")
-
-        def flush(self) -> None:
-            raise BrokenPipeError("stderr is gone too")
-
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
+    monkeypatch.setattr(wdog.sys, "stderr", make_stderr())
 
     wdog.log("hello")  # must not raise — both journal routes are gone
 
@@ -2161,6 +2185,56 @@ def test_log_stderr_fallback_still_emits_when_stderr_is_healthy(monkeypatch, cap
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     wdog.log("hello")
+
+    captured = capsys.readouterr()
+    assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
+
+
+def test_log_bounds_systemd_cat_with_a_five_second_timeout(monkeypatch):
+    """log() must pass an explicit timeout=5 to its systemd-cat subprocess call.
+
+    The bound is load-bearing HERE in particular. ``dashboard-watchdog.timer``
+    is ``OnUnitActiveSec=30`` — twice as tight as orchestrator-watchdog's 60s —
+    and systemd disables ``TimeoutStartSec`` for ``Type=oneshot`` by default,
+    so an unbounded systemd-cat blocked on a stuck journald or a full /run
+    hangs the tick forever. Because the timer measures from this unit's LAST
+    ACTIVATION, it then never re-fires: supervision of the dashboard stops
+    entirely, with no signal, through the LOGGING path.
+    """
+    wdog = _load_watchdog()
+    seen_kwargs = []
+
+    def fake_run(argv, *args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")
+
+    assert len(seen_kwargs) == 1, f"expected exactly one subprocess.run call: {seen_kwargs}"
+    assert seen_kwargs[0].get("timeout") == 5, (
+        f"log() must bound systemd-cat with timeout=5, got {seen_kwargs[0]!r}"
+    )
+
+
+def test_log_falls_through_to_stderr_on_timeout(monkeypatch, capsys):
+    """A systemd-cat call that exceeds its bound must still emit on stderr.
+
+    This is the direct sibling of the ``timeout=5`` pin above: the bound only
+    helps if the ``TimeoutExpired`` it produces is then CAUGHT and the message
+    still reaches the journal by the ``StandardError=journal`` route. Without
+    this half, a wedged systemd-cat would stop hanging the tick only to kill it
+    instead — the tick would die at the logging call rather than continue.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")  # must not raise
 
     captured = capsys.readouterr()
     assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
