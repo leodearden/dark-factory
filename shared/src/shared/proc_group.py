@@ -417,8 +417,9 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
     permission-denied pid is skipped rather than raising (module invariant).
     ``maps`` pathnames are decoded with ``os.fsdecode``, the surrogateescape
-    str space ``os.readlink`` returns for the cwd and fd signals, so
-    arbitrary-byte pathnames compare correctly and never raise.
+    str space ``os.readlink`` returns for the cwd and fd signals, and lines are
+    split only on ``'\\n'``, the one byte the kernel escapes in them, so a
+    pathname holding any other byte compares correctly and never raises.
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
@@ -440,7 +441,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
         maps_text = os.fsdecode((entry / 'maps').read_bytes())
     except OSError:
         return False
-    for line in maps_text.splitlines():
+    for line in maps_text.split('\n'):
         # maps line: "addr perms offset dev inode  pathname" — pathname is the
         # 6th field (may contain spaces; keep it whole with maxsplit=5). Skip
         # anonymous/special regions ([heap], [stack], anon → no leading '/').

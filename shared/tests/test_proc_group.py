@@ -1405,20 +1405,35 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         assert 600 not in found and 700 not in found
         assert 800 not in found and 810 not in found
 
-    def test_a_mapped_path_matches_a_root_whose_own_name_is_undecodable(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        'odd_bytes',
+        [
+            pytest.param(b'\xff', id='undecodable'),
+            pytest.param(b'\r', id='carriage-return'),
+            pytest.param(b'\x0b', id='vertical-tab'),
+            pytest.param(b'\x0c', id='form-feed'),
+            pytest.param(b'\x1c', id='file-separator'),
+            pytest.param(b'\xc2\x85', id='next-line-U+0085'),
+            pytest.param(b'\xe2\x80\xa8', id='line-separator-U+2028'),
+        ],
+    )
+    def test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes(
+        self, tmp_path, monkeypatch, odd_bytes
     ):
-        """maps pathnames decode into the surrogateescape str space of readlink and str(Path).
+        """A maps pathname matches a root whose name holds any byte but a newline.
 
-        The root's own name holds an undecodable byte: a strict decode raises,
-        and a 'replace' decode yields U+FFFD, which can never equal the root's
-        surrogate-escaped form. No cwd and no fd dir, so maps alone decides.
+        Two ways such a byte in root's own name costs the match. An undecodable
+        one raises under a strict decode and becomes U+FFFD under 'replace', and
+        neither equals root's surrogate-escaped form, the str space readlink and
+        str(Path) use. A line break other than '\\n' cuts the pathname under
+        ``str.splitlines``, although the kernel escapes only '\\n' in maps. No
+        cwd and no fd dir, so maps alone decides.
         """
         proc_root = tmp_path / 'proc'
         entry = proc_root / '900'
         entry.mkdir(parents=True)
         (entry / 'stat').write_text(_synthetic_stat_line(900, 900))
-        root_bytes = os.fsencode(tmp_path) + b'/_merge-verify-\xff'
+        root_bytes = os.fsencode(tmp_path) + b'/_merge-verify-' + odd_bytes
         (entry / 'maps').write_bytes(
             b'55d4c7e1a000-55d4c7e3b000 rw-p 00000000 00:00 0          [heap]\n'
             b'7f0a1c000000-7f0a1c021000 r--p 00000000 08:01 1311       /usr/lib/libc.so.6\n'
