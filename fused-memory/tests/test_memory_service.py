@@ -10089,6 +10089,7 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         mock_edge.uuid = 'e-1'
         mock_edge.fact = 'original fact'
         mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_edge.expired_at = datetime(2026, 1, 1, tzinfo=UTC)
         mock_edge.save = AsyncMock()
         mock_edge.generate_embedding = AsyncMock()
         backend.refresh_entity_summary = AsyncMock(return_value={})
@@ -10105,6 +10106,24 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
             await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
             assert mock_edge.invalid_at is None, (
                 'clear_invalid_at=True must set edge.invalid_at to None'
+            )
+            mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_also_clears_expired_at(self, mock_config, make_graph_mock):
+        """clear_invalid_at=True restores the edge to active: BOTH retirement markers go None."""
+        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+            assert mock_edge.invalid_at is None
+            assert mock_edge.expired_at is None, (
+                'graphiti-core sets invalid_at and expired_at together '
+                '(graphiti_core/utils/maintenance/edge_operations.py::resolve_extracted_edge), '
+                'so clearing only invalid_at leaves the edge retired under '
+                '_ACTIVE_EDGE_PREDICATE and invisible to every valid-edge read'
             )
             mock_edge.save.assert_awaited_once()
 
@@ -10166,6 +10185,34 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         assert 'SET' in cypher
         assert 'invalid_at' in cypher
         assert 'NULL' in cypher
+        assert params == {'uuid': 'e-1'}
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_cypher_nulls_both_markers(self, mock_config, make_graph_mock):
+        """The forced direct-Cypher clear must NULL both retirement markers in ONE statement.
+
+        One ``graph.query`` await with unchanged ``{'uuid': ...}`` params: both
+        markers clear atomically via literal ``NULL``, never a bound parameter.
+        """
+        from _fm_helpers import extract_cypher, extract_params
+
+        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+
+        graph.query.assert_awaited_once()
+        cypher = extract_cypher(graph.query.call_args)
+        params = extract_params(graph.query.call_args)
+        assert 'invalid_at' in cypher
+        assert 'expired_at' in cypher, (
+            'graphiti-core sets invalid_at and expired_at together '
+            '(graphiti_core/utils/maintenance/edge_operations.py::resolve_extracted_edge), '
+            'so a forced clear of invalid_at alone leaves the edge retired under '
+            '_ACTIVE_EDGE_PREDICATE and invisible to every valid-edge read'
+        )
         assert params == {'uuid': 'e-1'}
 
     @pytest.mark.asyncio
