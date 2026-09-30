@@ -88,6 +88,9 @@ one named constant where a cluster's text has had to change after filing
 multi-row cluster added from task 5099 on, and any cluster whose text
 changes, holds its justification in one such named constant; an untouched
 cluster keeps its inline copies until the task owning its rows deletes them.
+Such a constant states the cause and its cost, never a row count or a site
+list: the rows referencing it are the membership, and a copy in prose would
+go stale unchecked the first time a row joins or leaves.
 The ledger stays row-per-site so a 23rd handler cannot be added silently under
 a blessed 22; the triage stays cluster-per-defect so the follow-ups are one
 task per defect rather than one per line.
@@ -158,7 +161,7 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
 
 #: The shared justification of every ``reconciliation/backlog_policy.py`` row.
 _BACKLOG_POLICY_RECORD_IO_WHY = (
-    'ROOT CAUSE (one defect, 5 rows): BacklogPolicy scans, reads and '
+    'ROOT CAUSE (one defect): BacklogPolicy scans, reads and '
     'writes its escalation records on the loop thread. on_judge_unhalt '
     'is_dirs data/escalations, then globs every judge_halt*.json record '
     'in the queue root -- an O(N) directory read that grows with the '
@@ -178,7 +181,7 @@ _BACKLOG_POLICY_RECORD_IO_WHY = (
     'fused-memory/src scope cannot follow -- so another row would be a '
     'blessing test_no_stale_blessings rejects, and this paragraph is '
     'the only honest place to state it. Filesystem, the limb task '
-    '3778\'s subprocess-only vocabulary omitted. The three record '
+    '3778\'s subprocess-only vocabulary omitted. The record '
     'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
     '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
     '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
@@ -188,7 +191,7 @@ _BACKLOG_POLICY_RECORD_IO_WHY = (
 
 #: The shared justification of every ``server/manifest_stamping.py`` row.
 _MANIFEST_STAMPING_INLINE_IO_WHY = (
-    'ROOT CAUSE (one defect, 7 rows): _stamp_capability_manifests_impl '
+    'ROOT CAUSE (one defect): _stamp_capability_manifests_impl '
     'does its sidecar I/O INLINE in one coroutine, with no helper '
     'anywhere for a definition-side census to point at -- the shape '
     'task 3778\'s methodology is structurally blind to: an is_file() '
@@ -200,7 +203,7 @@ _MANIFEST_STAMPING_INLINE_IO_WHY = (
     'parse alone is the same order as a subprocess spawn and this '
     'coroutine pays it twice plus every filesystem round trip above. '
     'One asyncio.to_thread around the whole probe-read-parse-write '
-    'closes all seven. The four read/parse/write rows are OWNED BY '
+    'closes every row. The read/parse/write rows are OWNED BY '
     'TASK 5276 -- do not file again: task 4484 step-9\'s ticket '
     'tkt_0RT7QYENVS6J9WVWCY3FJAVNFR became task 5073, coalesced into '
     '5276. The is_file, os.replace and unlink rows task 5099 added '
@@ -210,7 +213,7 @@ _MANIFEST_STAMPING_INLINE_IO_WHY = (
 
 #: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
 _VERIFIER_LLM_TOOL_IO_WHY = (
-    'ROOT CAUSE (one defect, 2 rows): the async tools '
+    'ROOT CAUSE (one defect): the async tools '
     'CodebaseVerifier.verify hands the codebase-verification LLM do '
     'their filesystem work inline on the loop thread, once per tool '
     'call the model chooses to make -- an LLM-driven, unbounded call '
@@ -226,62 +229,42 @@ _VERIFIER_LLM_TOOL_IO_WHY = (
 
 #: Task 5099: an idempotent mkdir of a store's own data dir as it opens.
 _MKDIR_ON_STORE_OPEN_WHY = (
-    'ACCEPTED, measured cheap (one cause, 11 rows): one idempotent '
+    'ACCEPTED, measured cheap (one cause): one idempotent '
     'mkdir(parents=True, exist_ok=True) of the store\'s own data dir as it '
     'opens its SQLite connection -- measured 6-11us on an existing dir '
-    '(task 5099: 20000-call timeit, CPython 3.13.9). The eight store '
-    'openers pay it once per store lifetime: TicketStore, EventQueue.start, '
-    'ReconciliationJournal, ReconLedgerStore and WriteJournal are awaited '
-    'at server startup in server/main.py, DurableWriteQueue and '
-    'PlannedEpisodeRegistry inside memory_service.initialize (the '
-    'registry returns early once open), and '
-    'SqliteTaskBackend._get_connection once per project (it caches in '
-    'self._connections). The three server/tools.py openers '
-    '(_open_overrides_db, _connect_overrides_db, _open_park_eviction_db) '
-    'pay it once per MCP call, immediately before an awaited '
-    'connect_daemon(...) that already hops threads and costs far more. '
-    'Only the directory is created inline; every read and write of the '
-    'store itself is awaited.'
+    '(task 5099: 20000-call timeit, CPython 3.13.9). A store opener pays it '
+    'once per store lifetime: at startup, or once per project behind a '
+    'cached connection. A per-MCP-call DB opener pays it immediately before '
+    'an awaited connect_daemon(...) that already hops threads and costs far '
+    'more. Only the directory is created inline; every read and write of '
+    'the store itself is awaited.'
 )
 
 #: Task 5099: a fixed number of existence / type guards per invocation.
 _FIXED_STAT_GUARD_WHY = (
-    'ACCEPTED, measured cheap (one cause, 9 rows): a fixed, '
-    'data-independent number of stat calls per invocation -- an existence '
-    'or type guard in front of the real work, never a scan -- measured '
-    '3-4us each against a warm dentry cache (task 5099: 20000-call timeit '
-    'of exists/stat/is_dir, CPython 3.13.9). Sites: an exists() on a '
-    'SQLite file before an awaited connect '
-    '(SqliteTaskBackend.get_statuses_fresh, read_scheduler_events, '
-    'read_live_override_state, _checkpoint_overrides_db_if_exists); two '
-    'exists() before an awaited asyncio subprocess '
-    '(_run_briefing_known_gaps_script); _resolve_codebase_root\'s exists(), '
-    'stat-only by design, once per CodebaseVerifier.verify ahead of an LLM '
-    'verification of seconds; deterministic_task_guard\'s exists() of the '
-    'before_done script once per task_kind=deterministic submit_task; and '
-    'sandbox_guard._writable_roots\' os.path.isdir once per configured '
-    'writable extra (an operator-authored list) before a CLI stage '
-    'subprocess that runs for minutes. The count is set by the code, not '
-    'by what is on disk.'
+    'ACCEPTED, measured cheap (one cause): a fixed, data-independent '
+    'number of stat calls per invocation -- an existence or type guard in '
+    'front of the real work, never a scan -- measured 3-4us each against a '
+    'warm dentry cache (task 5099: 20000-call timeit of exists/stat/is_dir, '
+    'CPython 3.13.9). The work each guard fronts is awaited and costs '
+    'orders of magnitude more (a SQLite connect, a subprocess, an LLM '
+    'call). The count is set by the code or an operator-authored config '
+    'list, never by what is on disk.'
 )
 
 #: Task 5099: one exists() per metadata.files entry a task author declared.
 _DECLARED_FILES_STAT_WHY = (
-    'ACCEPTED, bounded by an authored list (one cause, 2 rows): '
+    'ACCEPTED, bounded by an authored list (one cause): '
     'middleware/task_interceptor.py::_missing_files does one exists() per '
     'metadata.files entry the task author declared -- 3-4us each (task '
     '5099: 20000-call timeit, CPython 3.13.9), so a 20-file task costs '
-    '~0.1 ms. _apply_status_transition runs it only on a transition to '
-    'done without verified provenance; _sweep_cancelled_descendants runs '
-    'it per candidate child of a cancelled parent, a rare path. Task 5270 '
-    'already owns the same sweep coroutine\'s is_orchestrator_live_for row '
-    '(ticket-derived task 5077): if 5270 offloads the whole sweep, delete '
-    'the _sweep_cancelled_descendants row with it.'
+    '~0.1 ms. Its callers reach it only on a status transition, never per '
+    'read.'
 )
 
 #: Task 5099: the curator COMBINE audit line.
 _COMBINE_AUDIT_APPEND_WHY = (
-    'ACCEPTED, bounded by an LLM decision (one cause, 2 rows): '
+    'ACCEPTED, bounded by an LLM decision (one cause): '
     'TaskInterceptor._execute_combine reaches _append_combine_audit, an '
     'idempotent mkdir (6-11us, task 5099 timeit) plus one open(\'a\') '
     'append of a single JSON line under 2 KB (descriptions truncated to '
@@ -293,16 +276,15 @@ _COMBINE_AUDIT_APPEND_WHY = (
 
 #: Task 5099: EventQueue._write_dead_letter's inline append.
 _DEAD_LETTER_APPEND_WHY = (
-    'ROOT CAUSE (one defect, 4 rows): EventQueue._write_dead_letter runs '
+    'ROOT CAUSE (one defect): EventQueue._write_dead_letter runs '
     'mkdir + exists + stat + the cascade rotation + open(\'a\') + write '
-    'inline on the loop thread, reached from recover, close, '
-    '_commit_with_retry and _enqueue_on_loop -> enqueue. The enqueue '
-    'overflow_drop branch fires EXACTLY when the loop is saturated, so '
-    'the blocking append is coupled to the storm it records, and a '
-    'rotation renames files on the same thread. UNDERSTATED BY THESE '
-    'ROWS: the scanner resolves only self.enqueue, not other receivers\' '
-    'event_queue.enqueue(...), so the real caller population is larger. '
-    'Filed by task 5099 as TASK 6085.'
+    'inline on the loop thread, and its async callers reach it without a '
+    'hop. The enqueue overflow_drop branch fires EXACTLY when the loop is '
+    'saturated, so the blocking append is coupled to the storm it '
+    'records, and a rotation renames files on the same thread. '
+    'UNDERSTATED BY THESE ROWS: the scanner resolves only self.enqueue, '
+    'not other receivers\' event_queue.enqueue(...), so the real caller '
+    'population is larger. Filed by task 5099 as TASK 6085.'
 )
 
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
@@ -772,7 +754,10 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TargetedReconciler._sweep_cancelled_descendants',
         'f06e6adb6bbd',
         'accepted',
-        _DECLARED_FILES_STAT_WHY,
+        _DECLARED_FILES_STAT_WHY
+        + ' Task 5270 already owns this coroutine\'s is_orchestrator_live_for '
+        'row (ticket-derived task 5077): if 5270 offloads the whole sweep, '
+        'delete this row with it.',
     ),
 
     # ---- reconciliation/verify.py ----

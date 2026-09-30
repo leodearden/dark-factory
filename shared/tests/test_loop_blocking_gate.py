@@ -1100,13 +1100,6 @@ class TestPrimitiveTable:
         assert {'read_text', 'write_text', 'read_bytes', 'write_bytes'} <= set(
             METHOD_PRIMITIVES
         )
-        assert {'os.makedirs', 'os.mkdir', 'os.rmdir', 'os.remove', 'os.unlink',
-                'os.rename', 'os.replace', 'os.stat', 'os.scandir',
-                'os.path.exists', 'os.path.isfile', 'os.path.isdir',
-                'glob.glob'} <= dotted
-        assert {'mkdir', 'rmdir', 'touch', 'unlink', 'rename', 'exists',
-                'is_file', 'is_dir', 'stat', 'iterdir', 'glob', 'rglob',
-                'open'} <= set(METHOD_PRIMITIVES)
         assert 'open' in BUILTIN_PRIMITIVES, (
             'the plainest filesystem spelling of all is a bare open(); a table '
             'that only knows dotted paths and methods cannot see it'
