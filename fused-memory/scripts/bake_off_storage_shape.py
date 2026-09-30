@@ -2330,6 +2330,15 @@ def _repo_relative(path: str | Path) -> str:
     and it leaks the worktree the run happened in.  Falls back to the bare
     filename for a path outside the repo, rather than emitting the absolute
     one.
+
+    Sibling copies `fused-memory/scripts/harvest_production_queries.py::_repo_relative`
+    (main-checkout anchor) and
+    `fused-memory/scripts/census_memory_metadata.py::_repo_relative` both
+    fall back to the resolved ABSOLUTE path.  This one differs because its
+    values are published fixture NAMES and the `path -> sha256` keys
+    :func:`_check_fixture_digests` compares: fixtures are tracked files in
+    every checkout, so the running checkout is the right anchor, and an
+    out-of-repo fixture is a run-specific tmp path that must not leak.
     """
     resolved = Path(path).resolve()
     try:
