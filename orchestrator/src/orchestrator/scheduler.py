@@ -1937,9 +1937,9 @@ class Scheduler:
         'delivered_check_gate',
         'stamp_milestone',
         'override_snapshot_gc',
+        'compute_priorities',
         'reserve_now',
         'override_diff',
-        'compute_priorities',
         'build_candidates',
         'landed_outbox_gate',
         'starvation',
@@ -7056,7 +7056,8 @@ class Scheduler:
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
-        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``.
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
+        ``ctx.effective_priorities`` (parks install at the effective tier).
         Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
         short-circuit below), then mutates ``ctx.overrides`` in place via
         the reserve-now short-circuit: for any task with reserve_now=1,
@@ -7077,13 +7078,14 @@ class Scheduler:
                     continue
                 r_task = ctx.tasks_by_id[rid]
                 r_modules = self._get_modules(r_task)
-                r_tier = coerce_tier(r_task.get('priority'))
-                # Clear the flag BEFORE installing parks.  install_parks is
-                # naturally idempotent (duplicate parks are a no-op), so if the
-                # process crashes between clear and install, the next tick re-runs
-                # install harmlessly.  The opposite order risks a duplicate
-                # reservation_installed event if the clear fails after a
-                # successful install.
+                r_tier = ctx.effective_priorities.get(
+                    rid, coerce_tier(r_task.get('priority'))
+                )
+                # Clear the flag BEFORE installing parks.  The opposite order
+                # risks a duplicate reserve_now_consumed event if the clear
+                # fails after a successful install, whereas a re-run install
+                # is harmless: ModuleLockTable.install_parks is idempotent per
+                # owner.
                 #
                 # In-process exceptions from install_parks are handled separately:
                 # the flag is restored via set_override so the next tick retries.
