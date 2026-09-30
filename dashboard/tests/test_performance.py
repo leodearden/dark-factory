@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
 import sqlite3
@@ -2369,6 +2370,18 @@ def _task_row(
     )
 
 
+def _drop_task_results_column(db_path: Path, column: str) -> Path:
+    """Give *db_path* one column of schema drift: the card families reading
+    *column* fail open, while discovery (project_id, completed_at) still reads."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(f'ALTER TABLE task_results DROP COLUMN {column}')
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
 def _active_and_idle_rows(now: datetime) -> list[tuple]:
     """'active' completes three tasks inside the 7d window ending at *now*,
     plus one done row at now - 7d - 30m: outside the wall-clock window but
@@ -2618,17 +2631,12 @@ class TestPerformanceCardsDatum:
     ):
         """A runs.db without ``verify_attempts`` fails only the loop-histogram
         query; its project is served UNKNOWN naming that family, not dropped."""
-        db_path = tmp_path / 'drifted.db'
-        with sqlite3.connect(str(db_path)) as setup:
-            setup.execute(
-                'CREATE TABLE task_results (run_id TEXT, task_id TEXT, project_id TEXT, '
-                'outcome TEXT, duration_ms INTEGER, review_cycles INTEGER, '
-                'steward_invocations INTEGER, completed_at TEXT)',
-            )
-            setup.execute(
-                "INSERT INTO task_results VALUES ('r', 't1', 'drifted', 'done', 1000, 0, 0, ?)",
-                ((CARDS_NOW - timedelta(hours=1)).isoformat(),),
-            )
+        db_path = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'drifted.db', [
+                _task_row('t1', 'drifted', CARDS_NOW - timedelta(hours=1)),
+            ]),
+            'verify_attempts',
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             cards = await aggregate_performance_cards(
                 [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
@@ -2685,3 +2693,110 @@ class TestPerformanceCardsDatum:
         assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
         assert idle['one_pass_history'] == {'labels': [], 'values': []}
         assert idle['escalation_history'] == {'labels': [], 'values': []}
+
+
+# ---------------------------------------------------------------------------
+# Each runs.db tallies only the projects it holds (task 5594)
+# ---------------------------------------------------------------------------
+
+
+async def _cards_across(db_paths: list[Path], escalations_dir: Path) -> dict:
+    async with contextlib.AsyncExitStack() as stack:
+        conns = [
+            await stack.enter_async_context(aiosqlite.connect(str(db_path)))
+            for db_path in db_paths
+        ]
+        return await aggregate_performance_cards(
+            conns, [escalations_dir] * len(conns), days=CARDS_DAYS, now=CARDS_NOW,
+        )
+
+
+class TestCardsAcrossRunsDbs:
+    """A project is served a value only when every runs.db holding it tallied
+    every family; a healthy runs.db never fills in a project it does not hold."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('dropped', 'unread'), [
+        ('verify_attempts', 'loop histograms'),
+        ('duration_ms', 'time centiles'),
+        ('steward_invocations', 'completion paths and escalation rates'),
+    ])
+    async def test_a_failed_family_on_one_db_leaves_its_projects_unknown(
+        self, tmp_path, empty_escalations_dir, dropped, unread,
+    ):
+        healthy = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'alpha', CARDS_NOW - timedelta(hours=1)),
+        ])
+        drifted = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'b.db', [
+                _task_row('b1', 'beta', CARDS_NOW - timedelta(hours=1)),
+            ]),
+            dropped,
+        )
+
+        cards = await _cards_across([healthy, drifted], empty_escalations_dir)
+
+        beta = cards['beta']
+        assert beta.state is DatumState.UNKNOWN
+        assert beta.value is None
+        assert beta.reason == f'the {unread} of this project could not be read'
+        alpha = cards['alpha']
+        assert alpha.state is DatumState.FRESH
+        assert alpha.value is not None
+        wire = alpha.value.to_wire()
+        ttc, paths = wire['ttc'], wire['paths']
+        assert isinstance(ttc, dict) and isinstance(paths, list)
+        assert ttc['count'] == 1
+        assert sum(entry['count'] for entry in paths) == 1
+        validate_datum(alpha, CARDS_NOW)
+        validate_datum(beta, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_project_one_holder_could_not_tally_is_unknown(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        healthy = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'shared', CARDS_NOW - timedelta(hours=1)),
+        ])
+        drifted = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'b.db', [
+                _task_row('b1', 'shared', CARDS_NOW - timedelta(hours=2)),
+            ]),
+            'verify_attempts',
+        )
+
+        shared = (await _cards_across([healthy, drifted], empty_escalations_dir))['shared']
+
+        assert shared.state is DatumState.UNKNOWN
+        assert shared.reason == 'the loop histograms of this project could not be read'
+        validate_datum(shared, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_healthy_dbs_each_tally_their_own_projects_with_one_discovery_query(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        db_a = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'alpha', CARDS_NOW - timedelta(hours=1)),
+        ])
+        db_b = _make_runs_db(tmp_path, 'b.db', [
+            _task_row('b1', 'beta', CARDS_NOW - timedelta(hours=1)),
+        ])
+        statements_a: list[str] = []
+        statements_b: list[str] = []
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            await a.set_trace_callback(statements_a.append)
+            await b.set_trace_callback(statements_b.append)
+            cards = await aggregate_performance_cards(
+                [a, b], [empty_escalations_dir, empty_escalations_dir],
+                days=CARDS_DAYS, now=CARDS_NOW,
+            )
+
+        for project_id in ('alpha', 'beta'):
+            datum = cards[project_id]
+            assert datum.state is DatumState.FRESH
+            assert datum.value is not None
+            ttc = datum.value.to_wire()['ttc']
+            assert isinstance(ttc, dict)
+            assert ttc['count'] == 1
+        for statements in (statements_a, statements_b):
+            assert sum('MAX(completed_at)' in sql for sql in statements) == 1
