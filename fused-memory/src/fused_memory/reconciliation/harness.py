@@ -1840,12 +1840,17 @@ class ReconciliationHarness:
                 # the eval program's E4 dangling-pointer census
                 # (docs/prds/memory-eval-program.md §γ, which resolves
                 # `supersedes` targets via `get_memory_by_id`): 100% of this
-                # writer's edges are dangling BY DESIGN, so E4 must allowlist
-                # `kind=project_status_correction` rather than report a census
-                # spike.  Making the target resolvable would mean keeping
-                # `latest` alive, which reopens the unbounded-pool bug — i.e.
-                # not a documentation-only change, which is why this leaf
-                # records the invariant instead of "fixing" it.
+                # writer's edges are dangling BY DESIGN.  E4 ATTRIBUTES these
+                # edges by this `kind` rather than allowlisting them, keeping
+                # them in the `dangling-pointers` total but out of the alarmed
+                # population and the successor tripwire — see
+                # fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper
+                # and docs/prds/memory-eval-program.md D11; renaming this kind
+                # requires updating that reader.  Making the target
+                # resolvable would mean keeping `latest` alive, which reopens
+                # the unbounded-pool bug — i.e. not a documentation-only
+                # change, which is why this leaf records the invariant
+                # instead of "fixing" it.
                 'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
