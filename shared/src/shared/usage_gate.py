@@ -195,15 +195,14 @@ def _load_probe_result(stdout_bytes: bytes) -> dict[str, object] | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
-    """Return True iff the probe stdout is a CLI JSON result reporting that
-    the local ``--max-budget-usd`` cap was hit.
+def _probe_hit_local_budget_cap(result: dict[str, object] | None) -> bool:
+    """Return True iff the probe's CLI JSON result reports that the local
+    ``--max-budget-usd`` cap was hit.
 
     This indicates the Anthropic API accepted the request and consumed real
     tokens — the account is NOT capped. Distinct from account-level cap hits
     (which surface as text prefixes in stderr, not JSON subtypes).
     """
-    result = _load_probe_result(stdout_bytes)
     return result is not None and result.get('subtype') == 'error_max_budget_usd'
 
 
@@ -1124,12 +1123,12 @@ class UsageGate:
         Settle the returned lease through :class:`InvokeSlot` so the claim is
         always released.
 
-        *reverse* walks the roster from the END (max-h → max-b rather than
-        max-b → max-h). It is an ordering PREFERENCE, not a different
+        *reverse* walks the roster from the END (last → first rather than
+        first → last). It is an ordering PREFERENCE, not a different
         admission rule: the same skip predicate, the same probe claim, the
         same lease. The trickle's 33 haiku one-shots drain from the end so
-        they do not contend with the orchestrator's first-available b → h
-        order; the two orders meet only when the pool is nearly exhausted,
+        they do not contend with the orchestrator's first-available
+        first → last order; the two orders meet only when the pool is nearly exhausted,
         which is exactly when contention is unavoidable anyway. Opt-in, and
         that matters: ``before_invoke`` never passes it, so every existing
         caller keeps the order it has always had. The knob lives HERE, in the
@@ -2760,13 +2759,13 @@ class UsageGate:
         # request and consumed real tokens — the account has capacity. Cache
         # creation on a fresh session easily pushes total_cost past $0.01, so
         # this is a routine outcome, not a cap hit.
-        if _probe_hit_local_budget_cap(stdout_bytes):
+        probe_result = _load_probe_result(stdout_bytes)
+        if _probe_hit_local_budget_cap(probe_result):
             logger.info(
                 f'Account {acct.name}: probe hit local $0.01 budget '
                 f'cap (API accepted request) — treating as success',
             )
             return True
-        probe_result = _load_probe_result(stdout_bytes)
         if _probe_succeeded(proc.returncode, probe_result):
             logger.info(f'Account {acct.name}: probe succeeded')
             return True

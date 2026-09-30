@@ -531,6 +531,34 @@ class TestBeforeInvokeGuardConsistency:
 
 
 # ---------------------------------------------------------------------------
+# Real _run_probe against a faked subprocess — shared by the probe classes below
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def probing_gate() -> tuple[UsageGate, AccountState]:
+    """A (gate, acct) pair running the real _run_probe with its config dir mocked."""
+    gate = make_gate(['probe-acct'])
+    del gate._run_probe  # drop make_gate's instance mock; use the class method
+    acct = gate._accounts[0]
+    config_dir = MagicMock()
+    config_dir.path = Path('/tmp/probe-test')
+    # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
+    # (task 2139), so both seams point at the same mock.
+    gate._probe_config_dir = config_dir
+    gate._probe_config_dirs = {acct.name: config_dir}
+    return gate, acct
+
+
+def _fake_probe_proc(returncode: int, stdout: bytes, stderr: bytes = b'') -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.pid = 12345
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    return proc
+
+
+# ---------------------------------------------------------------------------
 # UsageGate probe process-group tests (step-23 / step-24)
 # ---------------------------------------------------------------------------
 
@@ -539,38 +567,19 @@ class TestBeforeInvokeGuardConsistency:
 class TestUsageGateProbeProcessGroup:
     """_run_probe must spawn its subprocess in a fresh process group."""
 
-    @pytest.fixture
-    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
-        """Return a (gate, acct) pair with _probe_config_dir mocked."""
-        gate = make_gate(['probe-acct'])
-        # Replace the mock inserted by make_gate with the real method for testing.
-        del gate._run_probe  # remove instance-level mock; fall back to class method
-        acct = gate._accounts[0]
-        # Stub the probe config dir to avoid real filesystem side-effects.
-        gate._probe_config_dir = MagicMock()
-        gate._probe_config_dir.path = Path('/tmp/probe-test')
-        gate._probe_config_dir.write_credentials = MagicMock()
-        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
-        # (task 2139), so the per-account entry must point at the same mock.
-        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
-        return gate, acct
-
     async def test_usage_gate_probe_passes_start_new_session_true(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """create_subprocess_exec is called with start_new_session=True.
 
         Failing test — _run_probe does not pass that kwarg yet.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         captured_kwargs: dict = {}
 
         async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
             captured_kwargs.update(kwargs)
-            proc = MagicMock()
-            proc.returncode = 0
-            proc.communicate = AsyncMock(return_value=(b'{"ok": true}', b''))
-            return proc
+            return _fake_probe_proc(0, b'{"ok": true}')
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    side_effect=fake_exec):
@@ -581,13 +590,13 @@ class TestUsageGateProbeProcessGroup:
         )
 
     async def test_usage_gate_probe_cleanup_uses_terminate_process_group(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """TimeoutError branch must await terminate_process_group, not bare kill.
 
         Failing test — shared.usage_gate does not import terminate_process_group yet.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
 
         proc = MagicMock()
         proc.returncode = None
@@ -617,34 +626,17 @@ class TestUsageGateProbeProcessGroup:
 class TestUsageGateProbeExitCodeClassification:
     """_run_probe must NOT treat local $0.01 budget exhaustion as a cap."""
 
-    @pytest.fixture
-    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
-        """Return a (gate, acct) pair with _probe_config_dir mocked."""
-        gate = make_gate(['probe-acct'])
-        del gate._run_probe  # fall back to class method
-        acct = gate._accounts[0]
-        gate._probe_config_dir = MagicMock()
-        gate._probe_config_dir.path = Path('/tmp/probe-test')
-        gate._probe_config_dir.write_credentials = MagicMock()
-        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
-        # (task 2139), so the per-account entry must point at the same mock.
-        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
-        return gate, acct
-
     async def test_probe_local_budget_exhaustion_returns_true(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """Non-zero exit + subtype=error_max_budget_usd → success (API accepted)."""
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stdout = (
             b'{"subtype":"error_max_budget_usd",'
             b'"total_cost_usd":0.053,'
             b'"errors":["Reached maximum budget ($0.01)"]}'
         )
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, b''))
+        proc = _fake_probe_proc(1, stdout)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
@@ -653,15 +645,12 @@ class TestUsageGateProbeExitCodeClassification:
         assert result is True
 
     async def test_probe_non_budget_error_still_returns_false(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """Non-zero exit + any other subtype → failure (unchanged behavior)."""
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stdout = b'{"subtype":"error_api","errors":["auth failed"]}'
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, b''))
+        proc = _fake_probe_proc(1, stdout)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
@@ -670,24 +659,21 @@ class TestUsageGateProbeExitCodeClassification:
         assert result is False
 
     async def test_probe_cap_prefix_wins_over_budget_json(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """A cap prefix in stderr forces False even if stdout has budget JSON.
 
         Preserves the conservative bias documented at usage_gate._run_probe —
         any whiff of a real cap message keeps the account paused.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stderr = b"You've hit your 5-hour usage limit. Resets at 3pm."
         stdout = (
             b'{"subtype":"error_max_budget_usd",'
             b'"total_cost_usd":0.053,'
             b'"errors":["Reached maximum budget ($0.01)"]}'
         )
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        proc = _fake_probe_proc(1, stdout, stderr)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
@@ -732,43 +718,24 @@ SERVED_SUCCESS_RESULT = json.dumps({
 class TestUsageGateProbeRequiresServedResult:
     """_run_probe returns True only when the CLI result proves it was served."""
 
-    @pytest.fixture
-    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
-        gate = make_gate(['probe-acct'])
-        del gate._run_probe  # fall back to class method
-        acct = gate._accounts[0]
-        gate._probe_config_dir = MagicMock()
-        gate._probe_config_dir.path = Path('/tmp/probe-test')
-        gate._probe_config_dir.write_credentials = MagicMock()
-        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
-        return gate, acct
-
-    @staticmethod
-    def _fake_probe_proc(returncode: int, stdout: bytes) -> MagicMock:
-        proc = MagicMock()
-        proc.returncode = returncode
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, b''))
-        return proc
-
     async def _probe(
         self, gate: UsageGate, acct: AccountState, returncode: int, stdout: bytes,
     ) -> bool:
-        proc = self._fake_probe_proc(returncode, stdout)
+        proc = _fake_probe_proc(returncode, stdout)
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
             return await gate._run_probe(acct)
 
     async def test_exit_0_with_the_measured_403_result_is_not_served(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         assert await self._probe(gate, acct, 0, MEASURED_ORG_DISABLED_403) is False
 
     async def test_exit_0_with_is_error_true_and_no_status_is_not_served(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stdout = json.dumps({
             'type': 'result',
             'subtype': 'success',
@@ -778,35 +745,68 @@ class TestUsageGateProbeRequiresServedResult:
         assert await self._probe(gate, acct, 0, stdout) is False
 
     async def test_exit_0_with_empty_stdout_is_not_served(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         assert await self._probe(gate, acct, 0, b'') is False
 
     async def test_exit_0_with_non_json_stdout_is_not_served(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         assert await self._probe(gate, acct, 0, b'ok') is False
 
     async def test_exit_0_served_success_result_is_accepted(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         assert await self._probe(gate, acct, 0, SERVED_SUCCESS_RESULT) is True
 
-    async def test_exit_1_with_the_measured_403_result_is_not_served(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+    @pytest.mark.parametrize(
+        ('result', 'served'),
+        [
+            (
+                {
+                    'type': 'result',
+                    'subtype': 'error_max_budget_usd',
+                    'total_cost_usd': 0.053,
+                },
+                True,
+            ),
+            (
+                {
+                    'type': 'result',
+                    'subtype': 'success',
+                    'is_error': False,
+                    'api_error_status': 529,
+                    'result': 'Overloaded',
+                },
+                False,
+            ),
+        ],
+        ids=['local-budget-cap-is-served', 'api-error-status-alone-is-not-served'],
+    )
+    async def test_exit_0_verdict_on_edge_results(
+        self,
+        probing_gate: tuple[UsageGate, AccountState],
+        result: dict[str, object],
+        served: bool,
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, json.dumps(result).encode()) is served
+
+    async def test_exit_1_with_the_measured_403_result_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
         assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403) is False
 
     async def test_not_served_warning_names_the_api_error_status(
         self,
-        gate_with_account: tuple[UsageGate, AccountState],
+        probing_gate: tuple[UsageGate, AccountState],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         caplog.set_level(logging.WARNING, logger='shared.usage_gate')
 
         await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403)
@@ -822,12 +822,12 @@ class TestUsageGateProbeRequiresServedResult:
         ), warnings
 
     async def test_auth_failed_account_stays_auth_failed_on_exit_0_403(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         acct.phase = AccountPhase.AUTH_FAILED
         acct.auth_failed_at = datetime.now(UTC)
-        proc = self._fake_probe_proc(0, MEASURED_ORG_DISABLED_403)
+        proc = _fake_probe_proc(0, MEASURED_ORG_DISABLED_403)
 
         with (
             patch('shared.usage_gate.load_dotenv'),
