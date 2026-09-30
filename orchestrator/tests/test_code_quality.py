@@ -8,11 +8,18 @@ parsers below raise on a hole in a numbered list.
 
 from __future__ import annotations
 
+import importlib.resources
+import os
 import re
+from pathlib import Path
 
 import pytest
 
-from orchestrator.agents.code_quality import render, section
+from orchestrator.agents.code_quality import NORMATIVE_DOC, render, section
+
+# Resolved from THIS FILE, never from the process CWD, so it holds from
+# orchestrator/, the repo root and a ``.worktrees/<id>`` checkout alike.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _ANCHOR = '## The fourteen heuristics'
 _TITLE = '## Code quality — judge against this definition'
@@ -322,3 +329,21 @@ class TestRender:
 
     def test_a_brace_in_an_excluded_section_does_not_raise(self):
         render(_with('## Reach', 'A literal { brace in a section that is never rendered.'))
+
+
+class TestNormativeDocLocation:
+    """Where the one copy of the doc lives."""
+
+    def test_the_normative_doc_is_package_data(self):
+        assert NORMATIVE_DOC.is_file()
+
+    def test_docs_path_is_a_symlink_to_the_packaged_doc(self):
+        """The one remaining second site of the doc. The link keeps every
+        existing pointer to ``docs/code-quality.md`` resolving, and is relative
+        so it resolves in every checkout location.
+        """
+        docs = REPO_ROOT / 'docs' / 'code-quality.md'
+        assert docs.is_symlink()
+        assert not os.path.isabs(os.readlink(docs))
+        with importlib.resources.as_file(NORMATIVE_DOC) as packaged:
+            assert docs.resolve() == packaged.resolve()
