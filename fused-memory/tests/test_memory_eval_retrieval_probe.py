@@ -3179,6 +3179,451 @@ class TestRegistrySearchScope:
             assert 'categories' not in kwargs_by_query[query]
 
 
+# ---------------------------------------------------------------------------
+# The tripwire split by census canonical presence
+#
+# Synthetic census payloads only. plans/memory-metadata-census-report.json is
+# a pinned oracle; asserting against it here would make these tests pass
+# against whatever the last census happened to measure.
+# ---------------------------------------------------------------------------
+
+def _census_row(topic, *, records, canonical, variant=_UNSET, project_id='dark_factory'):
+    """One ``registry_coverage.topics`` row; *variant* omitted is the v4 shape."""
+    row = {
+        'project_id': project_id,
+        'topic': topic,
+        'records': records,
+        'canonical_count': canonical,
+    }
+    if variant is not _UNSET:
+        row['variant_spelling_records'] = variant
+    return row
+
+
+def _census_payload(*rows, query_surface=(), project_id='dark_factory') -> dict:
+    return {
+        'schema_version': 5,
+        'registry_error': None,
+        'registry_coverage': {
+            'topics': list(rows),
+            'query_surface_topics_not_gauged': [
+                {'project_id': project_id, 'topic': topic} for topic in query_surface
+            ],
+        },
+    }
+
+
+def _write_census(tmp_path: Path, payload) -> Path:
+    path = tmp_path / 'census.json'
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    path.write_text(text, encoding='utf-8')
+    return path
+
+
+RANKED_LOW = 'ranked-low'
+"""Census canonical present; the probe failed it (ranks 8 and absent)."""
+RANKED_WELL = 'ranked-well'
+"""Census canonical present; the probe passed it."""
+STAMPED_NOWHERE = 'stamped-nowhere'
+"""Records carry the topic, none of them canonical."""
+SPELLED_OTHERWISE = 'spelled-otherwise'
+"""No record under this spelling; eight under a variant one."""
+BRIEFING_SURFACE = 'briefing-surface'
+"""Keys a briefing query, not a metadata.topic."""
+NEVER_CENSUSED = 'never-censused'
+"""A registry topic the census has no row for."""
+ALL_DEGRADED = 'all-degraded'
+"""Every phrasing degraded: no tripwire item, so no class either."""
+
+
+def _split_obs(topic, phrasing, *, k=5, hit=False, rank=None, matched_by=None,
+               stores=('mem0',), held_out=False, degraded=False):
+    return _mod().PhrasingObservation(
+        topic=topic, phrasing=phrasing, held_out=held_out, k=k, hit=hit,
+        rank=rank, matched_by=matched_by, stores_served=stores, degraded=degraded,
+    )
+
+
+def _split_registry():
+    from dataclasses import replace  # noqa: PLC0415
+
+    m = _mod()
+    entries = []
+    for topic in sorted((
+        RANKED_LOW, RANKED_WELL, STAMPED_NOWHERE, SPELLED_OTHERWISE,
+        BRIEFING_SURFACE, NEVER_CENSUSED, ALL_DEGRADED,
+    )):
+        entry = _scoped_entry(topic)
+        if topic == BRIEFING_SURFACE:
+            entry = replace(entry, derived_from=m.QUERY_SURFACE_DERIVATION)
+        entries.append(entry)
+    return m.TopicRegistry(schema_version=1, entries=tuple(entries))
+
+
+def _split_observations():
+    m = _mod()
+    phrasings = [
+        _split_obs(RANKED_LOW, f'{RANKED_LOW} tuned', rank=8, matched_by='content_hash'),
+        _split_obs(RANKED_LOW, f'{RANKED_LOW} held out', held_out=True, stores=('graphiti',)),
+        # Neither of these is a k=5 non-degraded phrasing, so neither may be
+        # recorded as one of the topic's tripwire ranks.
+        _split_obs(RANKED_LOW, f'{RANKED_LOW} degraded', degraded=True),
+        _split_obs(RANKED_LOW, f'{RANKED_LOW} tuned', k=10, hit=True, rank=8,
+                   matched_by='content_hash'),
+        _split_obs(RANKED_WELL, f'{RANKED_WELL} tuned', hit=True, rank=1,
+                   matched_by='content_hash'),
+        _split_obs(STAMPED_NOWHERE, f'{STAMPED_NOWHERE} tuned'),
+        _split_obs(SPELLED_OTHERWISE, f'{SPELLED_OTHERWISE} tuned'),
+        _split_obs(BRIEFING_SURFACE, f'{BRIEFING_SURFACE} tuned'),
+        _split_obs(NEVER_CENSUSED, f'{NEVER_CENSUSED} tuned'),
+        _split_obs(ALL_DEGRADED, f'{ALL_DEGRADED} tuned', degraded=True),
+    ]
+    return m.ProbeObservations(phrasings=phrasings)
+
+
+def _split_census_payload():
+    return _census_payload(
+        _census_row(RANKED_LOW, records=3, canonical=1, variant=0),
+        _census_row(RANKED_WELL, records=2, canonical=1, variant=0),
+        _census_row(STAMPED_NOWHERE, records=4, canonical=0, variant=0),
+        _census_row(SPELLED_OTHERWISE, records=0, canonical=0, variant=8),
+        _census_row(ALL_DEGRADED, records=1, canonical=1, variant=0),
+        query_surface=(BRIEFING_SURFACE,),
+    )
+
+
+def _presence_of_topic_lines(text: str, slugs) -> dict:
+    """``{slug: the CanonicalPresence whose header last preceded its line}``.
+
+    A class header is recognised by carrying the enum member's VALUE — data,
+    not prose — so this reads which class each topic was rendered under
+    without matching any sentence.
+    """
+    m = _mod()
+    current = None
+    found: dict = {}
+    for line in text.splitlines():
+        for presence in m.CanonicalPresence:
+            if presence.value in line:
+                current = presence
+        for slug in slugs:
+            if slug in line and slug not in found:
+                found[slug] = current
+    return found
+
+
+class TestTripwireCensusSplit:
+    """E1's tripwire, split by what the metadata census says exists.
+
+    E1 measures presence-in-top-K through search, which cannot tell "the
+    canonical does not exist" from "it exists but ranks below K". The census's
+    deterministic metadata count can, so joining the two is what makes the
+    ranking hypothesis (esc-3208-1) measurable on every run.
+    """
+
+    # -- load_census_coverage ------------------------------------------------
+
+    def test_rows_load_keyed_by_project_and_topic(self, tmp_path):
+        path = _write_census(tmp_path, _census_payload(
+            _census_row('alpha', records=3, canonical=1, variant=2),
+            _census_row('beta', records=0, canonical=0, variant=0, project_id='reify'),
+        ))
+        coverage = _mod().load_census_coverage(path)
+
+        assert coverage.unavailable_reason is None
+        assert coverage.source == str(path)
+        assert set(coverage.rows) == {('dark_factory', 'alpha'), ('reify', 'beta')}
+        alpha = coverage.rows[('dark_factory', 'alpha')]
+        assert (alpha.records, alpha.canonical_count, alpha.variant_spelling_records) == (
+            3, 1, 2,
+        )
+
+    def test_a_v4_row_without_variant_spelling_records_loads_as_none(self, tmp_path):
+        """The committed census stays v4 until the next nightly regenerates it."""
+        path = _write_census(tmp_path, _census_payload(
+            _census_row('alpha', records=3, canonical=1),
+        ))
+        coverage = _mod().load_census_coverage(path)
+
+        assert coverage.rows[('dark_factory', 'alpha')].variant_spelling_records is None
+
+    def test_the_query_surface_exclusions_pass_through(self, tmp_path):
+        path = _write_census(tmp_path, _census_payload(query_surface=('briefing-x',)))
+        coverage = _mod().load_census_coverage(path)
+
+        assert coverage.query_surface_topics == ('briefing-x',)
+
+    def test_a_missing_file_is_unavailable_and_names_the_path(self, tmp_path):
+        absent = tmp_path / 'no-census-here.json'
+        coverage = _mod().load_census_coverage(absent)
+
+        assert coverage.rows is None
+        assert str(absent) in coverage.unavailable_reason
+
+    def test_undecodable_json_is_unavailable(self, tmp_path):
+        coverage = _mod().load_census_coverage(_write_census(tmp_path, '{not json'))
+
+        assert coverage.rows is None
+        assert coverage.unavailable_reason
+
+    def test_a_null_gauge_carries_the_censuss_own_registry_error(self, tmp_path):
+        payload = {
+            'schema_version': 4,
+            'registry_coverage': None,
+            'registry_error': 'RegistryError: the census could not load it',
+        }
+        coverage = _mod().load_census_coverage(_write_census(tmp_path, payload))
+
+        assert coverage.rows is None
+        assert 'RegistryError: the census could not load it' in coverage.unavailable_reason
+
+    @pytest.mark.parametrize('payload', [
+        pytest.param([], id='top-level-not-an-object'),
+        pytest.param({'registry_coverage': {'topics': 'nope'}}, id='topics-not-a-list'),
+        pytest.param(
+            {'registry_coverage': {'topics': [{'project_id': 'dark_factory', 'topic': 'a'}]}},
+            id='row-missing-counts',
+        ),
+    ])
+    def test_a_misshapen_gauge_is_unavailable_not_a_crash(self, tmp_path, payload):
+        coverage = _mod().load_census_coverage(_write_census(tmp_path, payload))
+
+        assert coverage.rows is None
+        assert coverage.unavailable_reason
+
+    # -- split_tripwire_by_census --------------------------------------------
+
+    def _split(self, tmp_path, payload=None):
+        m = _mod()
+        coverage = m.load_census_coverage(
+            _write_census(tmp_path, payload if payload is not None else _split_census_payload()),
+        )
+        return m.split_tripwire_by_census(_split_observations(), _split_registry(), coverage)
+
+    def test_every_tripwire_item_lands_in_exactly_one_class(self, tmp_path):
+        m = _mod()
+        split = self._split(tmp_path)
+        presence = {t.topic: t.presence for t in split.topics}
+
+        assert len(presence) == len(split.topics)
+        assert presence == {
+            RANKED_LOW: m.CanonicalPresence.CANONICAL_PRESENT,
+            RANKED_WELL: m.CanonicalPresence.CANONICAL_PRESENT,
+            STAMPED_NOWHERE: m.CanonicalPresence.ABSENT_WITH_RECORDS,
+            SPELLED_OTHERWISE: m.CanonicalPresence.ABSENT_UNPOPULATED,
+            BRIEFING_SURFACE: m.CanonicalPresence.QUERY_SURFACE,
+            NEVER_CENSUSED: m.CanonicalPresence.NOT_CENSUSED,
+        }
+
+    def test_the_split_agrees_with_the_emitted_tripwire(self, tmp_path):
+        """Same items, same verdicts: the split qualifies the tripwire, it does
+        not re-derive it."""
+        m = _mod()
+        split = self._split(tmp_path)
+        series = _build(_split_observations(), ks=(5, 10))
+
+        assert {
+            f'{m.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
+        } == {item.item_key: item.passed for item in _tripwire(series).items}
+
+    def test_an_all_degraded_topic_is_in_no_class(self, tmp_path):
+        split = self._split(tmp_path)
+
+        assert ALL_DEGRADED not in {t.topic for t in split.topics}
+
+    def test_by_presence_filters_on_class_and_verdict(self, tmp_path):
+        m = _mod()
+        split = self._split(tmp_path)
+        present = m.CanonicalPresence.CANONICAL_PRESENT
+
+        assert [t.topic for t in split.by_presence(present, passed=False)] == [RANKED_LOW]
+        assert [t.topic for t in split.by_presence(present, passed=True)] == [RANKED_WELL]
+
+    def test_a_failing_topic_carries_its_per_phrasing_ranks(self, tmp_path):
+        """One per non-degraded k=5 phrasing, read off the observation."""
+        split = self._split(tmp_path)
+        ranked_low = {t.topic: t for t in split.topics}[RANKED_LOW]
+
+        assert [
+            (r.phrasing, r.held_out, r.rank, r.matched_by, r.stores_served)
+            for r in ranked_low.phrasing_ranks
+        ] == [
+            (f'{RANKED_LOW} tuned', False, 8, 'content_hash', ('mem0',)),
+            (f'{RANKED_LOW} held out', True, None, None, ('graphiti',)),
+        ]
+
+    def test_an_unpopulated_topic_carries_its_variant_spelling_count(self, tmp_path):
+        split = self._split(tmp_path)
+        unpopulated = {t.topic: t for t in split.topics}[SPELLED_OTHERWISE]
+
+        assert unpopulated.census_row.variant_spelling_records == 8
+
+    def test_an_unavailable_census_classifies_nothing(self, tmp_path):
+        """It does not guess: every topic would otherwise read as NOT_CENSUSED."""
+        m = _mod()
+        coverage = m.load_census_coverage(tmp_path / 'absent.json')
+        split = m.split_tripwire_by_census(_split_observations(), _split_registry(), coverage)
+
+        assert split.unavailable_reason == coverage.unavailable_reason
+        assert split.topics == ()
+
+    # -- the report section --------------------------------------------------
+
+    def _report_sections(self, tmp_path, payload=None):
+        m = _mod()
+        observations = _split_observations()
+        registry = _split_registry()
+        census_path = (
+            _write_census(tmp_path, payload if payload is not None else _split_census_payload())
+        )
+        coverage = m.load_census_coverage(census_path)
+        return _sections(
+            _build(observations, ks=(5, 10)),
+            observations,
+            registry=registry,
+            census_split=m.split_tripwire_by_census(observations, registry, coverage),
+        ), census_path
+
+    def test_the_section_names_each_failing_topic_under_its_class(self, tmp_path):
+        m = _mod()
+        sections, census_path = self._report_sections(tmp_path)
+        text = sections[m.SECTION_TRIPWIRE_BY_CENSUS].text
+
+        assert str(census_path) in text
+        assert _presence_of_topic_lines(text, (
+            RANKED_LOW, STAMPED_NOWHERE, SPELLED_OTHERWISE, BRIEFING_SURFACE, NEVER_CENSUSED,
+        )) == {
+            RANKED_LOW: m.CanonicalPresence.CANONICAL_PRESENT,
+            STAMPED_NOWHERE: m.CanonicalPresence.ABSENT_WITH_RECORDS,
+            SPELLED_OTHERWISE: m.CanonicalPresence.ABSENT_UNPOPULATED,
+            BRIEFING_SURFACE: m.CanonicalPresence.QUERY_SURFACE,
+            NEVER_CENSUSED: m.CanonicalPresence.NOT_CENSUSED,
+        }
+
+    def test_a_canonical_present_failure_shows_each_phrasings_rank_and_store(self, tmp_path):
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path)
+        lines = sections[m.SECTION_TRIPWIRE_BY_CENSUS].text.splitlines()
+
+        tuned = [line for line in lines if f'{RANKED_LOW} tuned' in line]
+        held_out = [line for line in lines if f'{RANKED_LOW} held out' in line]
+        assert len(tuned) == 1 and len(held_out) == 1
+        assert '8' in tuned[0] and 'content_hash' in tuned[0] and 'mem0' in tuned[0]
+        assert 'graphiti' in held_out[0]
+
+    def test_an_unpopulated_failure_shows_its_variant_spelling_count(self, tmp_path):
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path)
+        lines = sections[m.SECTION_TRIPWIRE_BY_CENSUS].text.splitlines()
+
+        unpopulated = [line for line in lines if SPELLED_OTHERWISE in line]
+        assert len(unpopulated) == 1
+        assert '8' in unpopulated[0]
+
+    def test_the_section_qualifies_the_tripwire_directly_under_its_gaps(self, tmp_path):
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path)
+        keys = list(sections)
+
+        assert keys.index(m.SECTION_TRIPWIRE_BY_CENSUS) == (
+            keys.index(m.SECTION_TOPICS_NOT_MEASURED) + 1
+        )
+
+    def test_an_unavailable_census_is_still_a_section_carrying_the_reason(self, tmp_path):
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path, payload={
+            'registry_coverage': None, 'registry_error': 'the gauge never ran',
+        })
+
+        assert 'the gauge never ran' in sections[m.SECTION_TRIPWIRE_BY_CENSUS].text
+
+    def test_no_census_requested_means_no_section(self):
+        m = _mod()
+        observations = _split_observations()
+
+        assert m.SECTION_TRIPWIRE_BY_CENSUS not in _sections(
+            _build(observations, ks=(5, 10)), observations, registry=_split_registry(),
+        )
+
+    # -- the run band and the CLI --------------------------------------------
+
+    def test_run_probe_threads_the_split_into_the_outcome_and_the_report(self, tmp_path):
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        registry = _probe_registry()
+        coverage = m.load_census_coverage(_write_census(tmp_path, _census_payload(
+            _census_row('alpha-topic', records=2, canonical=1, variant=0),
+        )))
+
+        outcome = asyncio.run(m.run_probe(
+            _ServiceDouble(), registry, project_ids=('dark_factory',), ks=(5,),
+            out_root=tmp_path / 'out', stamp='20260930T100000Z', census=coverage,
+        ))
+
+        assert outcome.census_split is not None
+        assert {t.topic for t in outcome.census_split.topics} == {'alpha-topic', 'beta-topic'}
+        assert m.SECTION_TRIPWIRE_BY_CENSUS in {s.key for s in outcome.sections}
+
+    def test_run_probe_without_a_census_carries_no_split(self, tmp_path):
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        outcome = asyncio.run(m.run_probe(
+            _ServiceDouble(), _probe_registry(), project_ids=('dark_factory',), ks=(5,),
+            out_root=tmp_path / 'out', stamp='20260930T100000Z',
+        ))
+
+        assert outcome.census_split is None
+        assert m.SECTION_TRIPWIRE_BY_CENSUS not in {s.key for s in outcome.sections}
+
+    def _main(self, monkeypatch, tmp_path, census_path: Path) -> tuple[int, Path]:
+        m = _mod()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(_probe_registry())), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble())
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260930T101500Z')
+        out_root = tmp_path / 'out'
+        code = m.main([
+            '--registry', str(registry_path),
+            '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+            '--census', str(census_path),
+        ])
+        report = out_root / 'e1-retrieval-health' / 'report-20260930T101500Z.txt'
+        return code, report
+
+    def test_the_cli_joins_the_census_it_is_pointed_at(self, monkeypatch, tmp_path):
+        census_path = _write_census(tmp_path, _census_payload(
+            _census_row('alpha-topic', records=2, canonical=1, variant=0),
+        ))
+
+        code, report = self._main(monkeypatch, tmp_path, census_path)
+
+        assert code == 0
+        assert str(census_path) in report.read_text(encoding='utf-8')
+
+    def test_an_unreadable_census_is_loud_in_the_report_but_not_fatal(
+        self, monkeypatch, tmp_path,
+    ):
+        absent = tmp_path / 'absent-census.json'
+
+        code, report = self._main(monkeypatch, tmp_path, absent)
+
+        assert code == 0
+        assert str(absent) in report.read_text(encoding='utf-8')
+
+    def test_derive_registry_reads_the_same_census_flag(self, tmp_path, capsys):
+        """One flag, both readers of the census (heuristic 11)."""
+        m = _mod()
+        absent = tmp_path / 'absent-census.json'
+
+        code = m.main(['--derive-registry', '--census', str(absent)])
+
+        assert code == m.EXIT_RUN_FAILED
+        assert str(absent) in capsys.readouterr().err
+
+
 class TestCorpusCounting:
     """(b) One count per category, with the category list derived not restated."""
 
@@ -3253,6 +3698,12 @@ class TestArgparseBand:
         assert args.config is None
         assert args.derive_registry is False
 
+    def test_the_default_census_is_the_committed_artifact(self):
+        m = _mod()
+        args = m.build_parser().parse_args([])
+
+        assert args.census == str(m.DEFAULT_CENSUS_PATH)
+
     def test_the_default_registry_is_the_committed_fixture(self):
         args = _mod().build_parser().parse_args([])
 
@@ -3297,7 +3748,7 @@ class TestArgparseBand:
         assert flags == {
             '-h', '--help',
             '--project-id', '--registry', '--out-root', '--k', '--config',
-            '--derive-registry',
+            '--derive-registry', '--census',
         }
 
 
