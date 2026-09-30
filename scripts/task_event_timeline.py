@@ -16,10 +16,44 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from _task_db_scan import connect_ro, decode_metadata
+from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata
 from audit_wiped_metadata_files import runs_db_path
 
 EXIT_OK = 0
+EXIT_NO_EVENTS = 1
+# 3, as in tasks_db_schema.py::EXIT_UNREADABLE: nothing was read. 2 is argparse's usage error.
+EXIT_UNREADABLE = 3
+
+
+class EventLogUnreadable(Exception):
+    """*path* is not a readable orchestrator event log, for the reason in *detail*."""
+
+    def __init__(self, path: Path, detail: str) -> None:
+        self.path = path
+        self.detail = detail
+        super().__init__(
+            f"{path}: not a readable orchestrator event log ({detail}). The log lives "
+            f"in the MAIN checkout of the TASK's project, at "
+            f"<main checkout>/data/orchestrator/runs.db. data/ is gitignored, so it is "
+            f"absent from worktrees; `git worktree list --porcelain` names the main "
+            f"checkout on its first line; the data/runs.db beside the real log is a "
+            f"0-byte decoy; and each project keeps its own runs.db."
+        )
+
+
+def open_event_log(path: Path) -> sqlite3.Connection:
+    """Open *path* read-only, or refuse with :class:`EventLogUnreadable`."""
+    try:
+        conn = connect_ro(path)
+    except TaskDbUnreadable as refusal:
+        raise EventLogUnreadable(refusal.path, refusal.reason.value) from refusal
+    has_events = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+    ).fetchone()
+    if has_events is None:
+        conn.close()
+        raise EventLogUnreadable(Path(path).resolve(), "no events table")
+    return conn
 
 
 class TimelineEvent(NamedTuple):
@@ -137,7 +171,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Strictly READ-ONLY: the log is opened mode=ro and this tool never writes, "
-            "and never creates a missing log."
+            "and never creates a missing log. Exit 0: events listed. Exit 1: this log "
+            "holds no such events for that task, so the id or the project is wrong. "
+            "Exit 3: the path is not a readable event log."
         ),
     )
     parser.add_argument("task_id", help="the task whose events to list")
@@ -162,15 +198,32 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     return runs_db_path(args.project_root)
 
 
+def _no_events_message(db_path: Path, task_id: str, event_types: Sequence[str]) -> str:
+    of_types = f" of type {', '.join(event_types)}" if event_types else ""
+    return (
+        f"{db_path}: no events{of_types} for task {task_id}. Each project keeps its own "
+        f"runs.db, so a task id from another project finds nothing here."
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    """List the task's events; refuse loudly, with nothing on stdout, when there are none."""
     args = _build_parser().parse_args(argv)
     db_path = _resolve_db_path(args).resolve()
-    conn = connect_ro(db_path)
+    event_types = tuple(args.event_type or ())
     try:
-        events = read_timeline(conn, args.task_id, args.event_type or ())
+        conn = open_event_log(db_path)
+    except EventLogUnreadable as refusal:
+        print(refusal, file=sys.stderr)
+        return EXIT_UNREADABLE
+    try:
+        events = read_timeline(conn, args.task_id, event_types)
     finally:
         conn.close()
 
+    if not events:
+        print(_no_events_message(db_path, args.task_id, event_types), file=sys.stderr)
+        return EXIT_NO_EVENTS
     render = render_json if args.json else render_text
     print(render(db_path, args.task_id, events))
     return EXIT_OK
