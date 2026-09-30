@@ -3002,12 +3002,13 @@ def create_server(
             already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
             on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
             info record never pins, at any level" — so an inherited-info L2
-            no longer vetoes its subject task's ``done`` flip.  That is the INTENDED semantics and was considered
-            here, not an oversight: the members it clusters were themselves
-            non-pinning, and a record that does not merit a human's attention
-            must not hold a task open waiting for one.  An L2 that genuinely
-            should pin is one whose members are genuinely non-info, or one the
-            caller filed with an explicit upward *severity*.
+            no longer vetoes its subject task's ``done`` flip.  That is the
+            INTENDED semantics and was considered here, not an oversight: the
+            members it clusters were themselves non-pinning, and a record that
+            does not merit a human's attention must not hold a task open
+            waiting for one.  An L2 that genuinely should pin is one whose
+            members are genuinely non-info, or one the caller filed with an
+            explicit upward *severity*.
 
         Response shapes
         ---------------
