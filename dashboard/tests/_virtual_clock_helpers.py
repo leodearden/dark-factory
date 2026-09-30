@@ -6,7 +6,8 @@ GC pause) therefore cannot expire a deadline, while timers still fire in exact
 loop-time order.
 
 Scope: scenarios whose every wait is in-loop (httpx.MockTransport handlers,
-asyncio primitives). Real sockets or executor threads race the jump.
+asyncio primitives). Real sockets and threads race the jump; executor work
+(run_in_executor, asyncio.to_thread, getaddrinfo) is rejected with RuntimeError.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import selectors
 from collections.abc import Coroutine
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 T = TypeVar('T')
 
@@ -43,6 +44,13 @@ class _VirtualClockLoop(asyncio.SelectorEventLoop):
 
     def time(self) -> float:
         return self._clock.now
+
+    def run_in_executor(self, executor: Any, func: Any, *args: Any) -> NoReturn:
+        raise RuntimeError(
+            'virtual-clock loop: executor work runs on a real thread that the idle '
+            'jump races, so its deadlines would expire spuriously; keep the '
+            'scenario in-loop (e.g. httpx.MockTransport)'
+        )
 
 
 def run_on_virtual_clock(scenario: Coroutine[Any, Any, T]) -> T:

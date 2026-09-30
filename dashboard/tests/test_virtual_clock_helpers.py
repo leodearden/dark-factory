@@ -71,3 +71,19 @@ def test_an_exception_raised_by_the_scenario_propagates_unchanged():
 
     with pytest.raises(ValueError, match='x'):
         run_on_virtual_clock(scenario())
+
+
+def test_executor_work_is_rejected_loudly():
+    async def scenario() -> None:
+        await asyncio.to_thread(time.sleep, 0)
+
+    with pytest.raises(RuntimeError, match='executor'):
+        run_on_virtual_clock(scenario())
+
+
+def test_name_resolution_is_rejected_loudly():
+    async def scenario() -> None:
+        await asyncio.get_running_loop().getaddrinfo('localhost', 80)
+
+    with pytest.raises(RuntimeError, match='executor'):
+        run_on_virtual_clock(scenario())
