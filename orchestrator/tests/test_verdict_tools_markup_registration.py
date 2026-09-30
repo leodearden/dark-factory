@@ -27,19 +27,22 @@ TWO CONSTRAINTS THIS FILE ENCODES, both measured:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _markup_helpers import LT, closer, type_alternatives
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, verdict_tools
+from orchestrator.mcp import markup_journal, markup_sink, verdict_tools
 from orchestrator.mcp.verdict_tools import _SINGLETON_ROLE_TOOLS, create_server
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,11 @@ def journal_lines(root: Path) -> list[dict[str, Any]]:
         return []
     text = path.read_text(encoding='utf-8')
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def queue_under(root: Path) -> EscalationQueue:
+    """The real queue a sink steered at *root* files into."""
+    return EscalationQueue(root / markup_sink.MARKUP_QUEUE_DIRNAME)
 
 
 # ---------------------------------------------------------------------------
@@ -474,8 +482,18 @@ class TestUnrepairableResidueIsPreserved:
         return json.loads(str(excinfo.value))
 
     @staticmethod
-    def _residue_files(artifacts: TaskArtifacts) -> list[Path]:
-        return sorted(artifacts.root.glob('markup_residue-*.json'))
+    def _steer(monkeypatch, tmp_path: Path) -> None:
+        """Point the sink at a real ``EscalationQueue`` under *tmp_path*."""
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
+        )
+
+    @staticmethod
+    def _queued_residue(tmp_path: Path) -> list[Any]:
+        """Every pending residue record the refusal queued under *tmp_path*."""
+        return queue_under(tmp_path).get_by_task(
+            verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
+        )
 
     @pytest.mark.asyncio
     async def test_the_call_is_refused(self, artifacts: TaskArtifacts):
@@ -502,56 +520,89 @@ class TestUnrepairableResidueIsPreserved:
         assert artifacts.read_verdict(REVIEWER_ROLE) is None
 
     @pytest.mark.asyncio
-    async def test_the_residue_survives_in_full(self, artifacts: TaskArtifacts):
+    async def test_the_residue_survives_in_full(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
         """(c) "The entire issues payload destroyed with no surviving copy
         anywhere on disk" — made FALSE.
 
         Verbatim and entire, deliberately unlike ``build_markup_block``'s
         200-char excerpt: this is the only surviving copy.
         """
+        self._steer(monkeypatch, tmp_path)
         value = self._value()
+        assert len(value) == 3525
+
         await self._refuse(artifacts)
 
-        files = self._residue_files(artifacts)
-        assert len(files) == 1, f'expected exactly one residue file, got {files!r}'
-        stored = json.loads(files[0].read_text())
-        assert stored['raw_value'] == value
-        assert len(stored['raw_value']) == len(value) == 3525
+        queued = self._queued_residue(tmp_path)
+        assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
+        assert value in queued[0].detail
 
     @pytest.mark.asyncio
-    async def test_the_refusal_names_the_residue(self, artifacts: TaskArtifacts):
+    async def test_the_refusal_names_the_residue(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
         """(d) A bounced reviewer must be able to point an operator at its own
         preserved data — an id it cannot look up is no better than none."""
+        self._steer(monkeypatch, tmp_path)
+
         payload = await self._refuse(artifacts)
 
-        assert isinstance(payload['escalation_id'], str)
-        assert (artifacts.root / payload['escalation_id']).is_file()
+        filed = queue_under(tmp_path).get(payload['escalation_id'])
+        assert filed is not None
+        assert filed.task_id == 'verdict-tools-markup-residue'
 
     @pytest.mark.asyncio
     async def test_the_residue_carries_its_routing_fields(
-        self, artifacts: TaskArtifacts
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
         the flat fields locating the leak."""
+        self._steer(monkeypatch, tmp_path)
+
         await self._refuse(artifacts)
 
-        stored = json.loads(self._residue_files(artifacts)[0].read_text())
-        assert stored['category'] == 'mcp_markup_residue'
-        assert stored['owner'] == 'l2-escalation-watcher'
-        assert stored['level'] == 2
-        assert stored['tool'] == 'submit_review_verdict'
-        assert stored['field'] == 'summary'
-        assert stored['matched_pattern']
+        (filed,) = self._queued_residue(tmp_path)
+        assert filed.category == 'mcp_markup_residue'
+        assert filed.level == 2
+        assert "owner='l2-escalation-watcher'" in filed.detail
+        assert "tool='submit_review_verdict'" in filed.detail
+        assert "field='summary'" in filed.detail
 
     @pytest.mark.asyncio
     async def test_the_hint_makes_the_preservation_claim(
-        self, artifacts: TaskArtifacts
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
-        """(f) On this server preservation now ACTUALLY happened, so the
+        """(f) On this server preservation ACTUALLY happened, so the
         preserved variant of the hint is the true one."""
+        self._steer(monkeypatch, tmp_path)
+
         payload = await self._refuse(artifacts)
 
         assert 'preserved verbatim' in payload['hint']
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_queue_leaves_nothing_in_the_worktree_and_says_so(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(f, floor) Queue or nothing — no worktree-local copy to strand.
+
+        A file under the lane dies at ``git worktree remove --force`` and
+        nothing reads it, yet its bare filename is a ``str`` id to the
+        middleware and so bought the caller a preservation claim that was
+        false. The caller still holds the payload, and must be told to keep it.
+        """
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: None,
+        )
+
+        payload = await self._refuse(artifacts)
+
+        assert payload['escalation_id'] is None
+        assert 'nothing was preserved' in payload['hint'].lower()
+        assert 'preserved verbatim' not in payload['hint']
+        assert sorted(artifacts.root.glob('markup_residue-*')) == []
 
     @pytest.mark.asyncio
     async def test_the_hint_tells_the_truth_when_nothing_could_be_written(
@@ -560,9 +611,9 @@ class TestUnrepairableResidueIsPreserved:
         """(f, negative) The guarantee is "the prose matches the id", NOT "the
         prose is always optimistic".
 
-        With the artifacts root removed the residue write cannot land, and the
-        caller must be told so rather than sent after a file that never
-        existed.
+        With the worktree removed its project root cannot be resolved, so
+        nothing is queued, and the caller must be told so rather than sent
+        after a record that never existed.
         """
         import shutil
 
@@ -603,9 +654,8 @@ class TestUnrepairableResidueIsPreserved:
         rather than a copy per channel, on the stated grounds that a guard
         whose escalation and whose journal disagree about who leaked is worse
         than either alone; the two assertions at the bottom are what would
-        catch that disagreement. The residue FLOOR (what happens when the queue
-        cannot be opened at all) stays the business of the UNPATCHED rows
-        above.
+        catch that disagreement. What happens when the queue cannot be reached
+        at all is the business of the (f, floor) row above.
         """
         monkeypatch.setattr(
             verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
@@ -930,21 +980,54 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_the_dropped_value_survives_in_the_residue_channel(
-        self, artifacts: TaskArtifacts
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """Nothing is guessed AND nothing is destroyed — the C2 pair."""
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
+        )
+
         await self._submit(artifacts)
 
-        files = sorted(artifacts.root.glob('markup_residue-*.json'))
-        assert len(files) == 1, f'expected one residue file, got {files!r}'
-        stored = json.loads(files[0].read_text())
-        assert stored['field'] == 'metadata'
-        assert stored['raw_value'] == 'swallowed tail'
+        queued = queue_under(tmp_path).get_by_task(
+            verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
+        )
+        assert len(queued) == 1, f'expected one residue record, got {queued!r}'
+        assert "field='metadata'" in queued[0].detail
+        assert 'swallowed tail' in queued[0].detail
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """Queue or nothing on the FORWARD tier too: the call still lands, and
+        the dropped slice is reported as preserved nowhere rather than under a
+        worktree-local filename that dies with the lane."""
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: None,
+        )
+
+        result = await self._submit(artifacts)
+
+        assert result.data['status'] == 'ok'
+        assert result.meta is not None
+        assert result.meta['markup_repair']['unrecovered_residue_id'] is None
+        assert sorted(artifacts.root.glob('markup_residue-*')) == []
 
 
 # ---------------------------------------------------------------------------
 # The residue channel is the SHARED one (task 3690 review follow-up)
 # ---------------------------------------------------------------------------
+
+
+class _RefusingQueue:
+    """A queue that opens, but whose ``submit`` fails as a full disk would."""
+
+    def make_id(self, anchor: str) -> str:
+        return f'esc-{anchor}-1'
+
+    def submit(self, esc: Any) -> str:
+        raise OSError('No space left on device')
 
 
 class TestVerdictToolsResidueChannelIsShared:
@@ -954,9 +1037,9 @@ class TestVerdictToolsResidueChannelIsShared:
     ``TaskArtifacts.write_markup_residue``, which lands under the task
     worktree — a root the orchestrator destroys with
     ``git worktree remove --force`` at teardown, and which no watcher ever
-    reads. These pin the corrected wiring: the queued escalation is the primary
-    channel, and the worktree file is only the floor beneath a queue that
-    cannot be opened.
+    reads. These pin the corrected wiring: the queued escalation is the ONLY
+    channel, and a payload the queue cannot take is reported lost rather than
+    parked where it would die unread.
     """
 
     def test_spec_declares_verdict_tools_own_anchors(self):
@@ -1026,14 +1109,11 @@ class TestVerdictToolsResidueChannelIsShared:
             )
 
     @pytest.mark.asyncio
-    async def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
-        self, tmp_path,
-    ):
-        """The primary channel is the queue, and the fallback is NOT taken."""
+    async def test_residue_is_queued_as_an_escalation(self, tmp_path):
+        """The channel is the queue."""
         from orchestrator.mcp import markup_sink, verdict_tools
 
         submitted: list[Any] = []
-        fell_back: list[dict[str, Any]] = []
 
         class _Queue:
             def make_id(self, anchor: str) -> str:
@@ -1054,7 +1134,6 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
             open_channel=lambda root: (Escalation, _Queue()),
-            last_resort=lambda record: fell_back.append(record) or 'residue.json',
         )
         record = {
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
@@ -1069,10 +1148,6 @@ class TestVerdictToolsResidueChannelIsShared:
         esc_id = await sink(record)
 
         assert esc_id == 'esc-verdict-tools-markup-residue-1'
-        assert not fell_back, (
-            'the worktree-local writer is the LAST RESORT — taking it while '
-            'the queue is healthy is the doomed-storage bug this test pins'
-        )
         assert len(submitted) == 1
         filed = submitted[0]
         assert filed.task_id == 'verdict-tools-markup-residue'
@@ -1088,32 +1163,56 @@ class TestVerdictToolsResidueChannelIsShared:
         assert 'verdict-tools' in filed.detail
 
     @pytest.mark.asyncio
-    async def test_worktree_file_is_the_floor_when_the_queue_cannot_be_opened(
-        self, tmp_path,
+    @pytest.mark.parametrize(
+        ('resolve_root', 'open_channel'),
+        [
+            pytest.param(
+                lambda worktree: None, lambda root: None, id='root-unresolved',
+            ),
+            pytest.param(
+                lambda worktree: worktree, lambda root: None, id='queue-unopened',
+            ),
+            pytest.param(
+                lambda worktree: worktree,
+                lambda root: (Escalation, _RefusingQueue()),
+                id='submit-raised',
+            ),
+        ],
+    )
+    async def test_a_payload_the_queue_cannot_take_is_reported_lost_once(
+        self, tmp_path, caplog, resolve_root, open_channel,
     ):
-        """Strictly better than losing the payload; strictly worse than a queue."""
-        from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.mcp import markup_sink, verdict_tools
+        """Queue or nothing, and the nothing is LOUD.
 
-        artifacts = TaskArtifacts(tmp_path)
-        artifacts.root.mkdir(parents=True, exist_ok=True)
+        Exactly one ERROR line per lost payload whichever step failed, so a
+        loss is countable, and it names the leak and the size of what was lost.
+        """
+        raw = 'THE ONLY SURVIVING COPY'
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
             spec=verdict_tools._MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
-            resolve_root=lambda worktree: tmp_path,
-            open_channel=lambda root: None,
-            last_resort=artifacts.write_markup_residue,
+            resolve_root=resolve_root,
+            open_channel=open_channel,
         )
-        locator = await sink({
-            'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
-            'tool': 'submit_review_verdict',
-            'field': 'issues',
-            'raw_value': 'THE ONLY SURVIVING COPY',
-        })
-        assert locator, 'a queue outage must not silently destroy the payload'
-        # A bare filename, resolved against the artifacts root it was written to.
-        assert 'THE ONLY SURVIVING COPY' in (artifacts.root / locator).read_text()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            locator = await sink({
+                'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+                'tool': 'submit_review_verdict',
+                'field': 'issues',
+                'raw_value': raw,
+            })
+
+        assert locator is None
+        errors = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1, errors
+        assert 'submit_review_verdict.issues' in errors[0]
+        assert str(len(raw)) in errors[0]
 
     @pytest.mark.asyncio
     async def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
@@ -1128,7 +1227,6 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
-            last_resort=None,
         )
         assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None
 
@@ -1221,7 +1319,8 @@ class TestTheVerdictFactReachesADurableJournal:
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
-        assert sorted(artifacts.root.glob('markup_residue-*.json')) == [], (
+        queue_dir = tmp_path / markup_sink.MARKUP_QUEUE_DIRNAME
+        assert sorted(queue_dir.rglob('esc-*.json')) == [], (
             'a repaired call never reaches the residue channel'
         )
         assert len(journal_lines(tmp_path)) == 1
