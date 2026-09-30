@@ -341,7 +341,7 @@ async def _resolve_members(
     )
     if not distinct:
         return {}
-    project_id = resolve_project_id_for_root(project_root)
+    project_id = await asyncio.to_thread(resolve_project_id_for_root, project_root)
     resolved = await asyncio.gather(*(
         resolve_memory_liveness(memory_service, project_id, memory_id)
         for memory_id in distinct
