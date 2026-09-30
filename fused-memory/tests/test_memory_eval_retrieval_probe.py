@@ -3500,6 +3500,17 @@ class TestTripwireCensusSplit:
             NEVER_CENSUSED: m.CanonicalPresence.NOT_CENSUSED,
         }
 
+    def test_the_section_names_each_passing_topic_under_its_class(self, tmp_path):
+        """Every tripwire item is named somewhere in the split, so the section
+        is the whole partition rather than only its failing half."""
+        m = _mod()
+        sections, _ = self._report_sections(tmp_path)
+        text = sections[m.SECTION_TRIPWIRE_BY_CENSUS].text
+
+        assert _presence_of_topic_lines(text, (RANKED_WELL,)) == {
+            RANKED_WELL: m.CanonicalPresence.CANONICAL_PRESENT,
+        }
+
     def test_a_canonical_present_failure_shows_each_phrasings_rank_and_store(self, tmp_path):
         m = _mod()
         sections, _ = self._report_sections(tmp_path)

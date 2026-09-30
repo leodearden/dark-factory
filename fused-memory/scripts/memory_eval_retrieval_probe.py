@@ -2604,6 +2604,10 @@ def _tripwire_by_census_lines(split: TripwireCensusSplit, fetched_depth: int) ->
             )
         for topic in failed:
             lines.extend(_failing_topic_lines(topic, fetched_depth))
+        if passed:
+            chunks = _wrap(', '.join(t.topic for t in passed), width=64)
+            lines.append(f'    passed: {chunks[0]}')
+            lines.extend(f'            {chunk}' for chunk in chunks[1:])
     return lines
 
 

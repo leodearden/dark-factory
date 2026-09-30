@@ -145,7 +145,10 @@ class TestEachBriefingTopicIsAdjudicatedIndividually:
 
         for item_key, passed in _tripwire_items().items():
             if not passed:
-                assert f'    - {item_key.removeprefix(prefix)}' in section
+                bullet = f'    - {item_key.removeprefix(prefix)}'
+                assert any(
+                    line == bullet or line.startswith(f'{bullet} ') for line in section
+                ), f'{item_key} has no line of its own in the census split'
 
 
 class TestTheRunCannotBeMistakenForALiveRun:
