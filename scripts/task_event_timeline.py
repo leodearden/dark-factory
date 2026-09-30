@@ -78,6 +78,44 @@ def invocation_outcomes(events: Sequence[TimelineEvent]) -> tuple[OutcomeCount, 
     return tuple(OutcomeCount(role, subtype, count) for (role, subtype), count in tally.items())
 
 
+def _event_line(event: TimelineEvent) -> str:
+    labelled = (("role", event.role), ("phase", event.phase), ("subtype", event.subtype))
+    extras = "".join(f" {label}={value}" for label, value in labelled if value is not None)
+    cost = f" cost={event.cost_usd:.2f}" if event.cost_usd is not None else ""
+    return f"#{event.id} {event.timestamp} {event.run_id} {event.event_type}{extras}{cost}"
+
+
+def _summary_line(task_id: str, events: Sequence[TimelineEvent]) -> str:
+    runs = run_ids(events)
+    return (
+        f"{len(events)} events for task {task_id} across {len(runs)} orchestrator runs: "
+        f"{', '.join(runs)}"
+    )
+
+
+def _outcome_lines(events: Sequence[TimelineEvent]) -> list[str]:
+    outcomes = invocation_outcomes(events)
+    if not outcomes:
+        return ["invocation_end outcomes: none"]
+    return [
+        "invocation_end outcomes:",
+        *(f"  {o.count} x {o.role or '-'} {o.subtype or '-'}" for o in outcomes),
+    ]
+
+
+def render_text(db_path: Path, task_id: str, events: Sequence[TimelineEvent]) -> str:
+    """The log read, one line per event, then the event/run count and the outcome tally."""
+    return "\n".join(
+        [
+            str(db_path),
+            *(_event_line(event) for event in events),
+            "",
+            _summary_line(task_id, events),
+            *_outcome_lines(events),
+        ]
+    )
+
+
 def render_json(db_path: Path, task_id: str, events: Sequence[TimelineEvent]) -> str:
     return json.dumps(
         {
@@ -129,12 +167,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     db_path = _resolve_db_path(args).resolve()
     conn = connect_ro(db_path)
     try:
-        events = read_timeline(conn, args.task_id)
+        events = read_timeline(conn, args.task_id, args.event_type or ())
     finally:
         conn.close()
 
-    if args.json:
-        print(render_json(db_path, args.task_id, events))
+    render = render_json if args.json else render_text
+    print(render(db_path, args.task_id, events))
     return EXIT_OK
 
 
