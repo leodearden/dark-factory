@@ -108,12 +108,14 @@ import os
 import pathlib
 import textwrap
 from collections.abc import Callable
+from typing import NamedTuple
 
 import pytest
 import yaml
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
+    census_budget_floor,
     min_budget,
     published_pairs,
 )
@@ -214,28 +216,51 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
 #                 instead.
 #
-#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, and its presence does
-#                 not gate a min_budget(worst) floor — see
-#                 RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
+#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, in two ways, both
+#                 deliberate.
+#                 (i) Its presence does not gate a min_budget(worst) floor —
+#                 see RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
 #                 budget is actually justified. What this figure DOES gate is
 #                 the ruled-exception branch's own measurement floor: that
-#                 branch asserts the declared budget clears W (7200 > 5288
+#                 branch asserts the declared budget clears W (7200 > 4626.17
 #                 today), so the number here is load-bearing rather than
-#                 decorative.
-#                 PROVENANCE — esc-4211-6's 2026-09-08 FOLD AMENDMENT (filed
-#                 against task 4792), NOT the 2026-09-07 ruling itself: this
-#                 is a POST-ruling census maximum. That amendment records a
-#                 fleet census of the BYTE-IDENTICAL orchestrator verify
-#                 command across .worktrees/*/.task/verify/*.summary.json —
-#                 n=92 runs, 19 timed out, six GREEN completions above the
-#                 THEN-3600s budget at 5288 / 5269 / 5196 / 5093 / 4991 /
-#                 4708s, three of them on 2026-09-08 alone. W = 5288.0, the
-#                 max green, per this table's worst-RUN rule. RE-MEASURE BY
-#                 REPEATING THAT CENSUS over the same summary.json corpus, so
-#                 the next figure is a repeat rather than a re-derivation.
-#                 The census is LATER than, and larger than, the
-#                 864.83-3310.50s post-cap spread task 4902 recorded in
-#                 tests/scripts/test_fallback_verify_config.py's
+#                 decorative. Since D17 it is no longer the BINDING floor
+#                 there — census_budget_floor(W) = 7000 is, and is asserted
+#                 alongside it; the dict entry below records why refreshing W
+#                 DOWNWARD nonetheless leaves that branch strictly stronger.
+#                 (ii) IT IS REGIME-SCOPED, WHILE THE OTHER SIX ARE ALL-TIME
+#                 WORST-OBSERVED. This table's worst-RUN rule, applied
+#                 literally here, would take the largest run ever observed —
+#                 5288.0, which this table carried until 2026-09-14. That
+#                 figure and the 4991 still readable on disk both belong to
+#                 the retired 3-slot / 3600-ceiling regime, and D17 sizes
+#                 under the PREVAILING config, so W here is the worst GREEN
+#                 full-suite run WITHIN that regime. A DIFFERENT rule from the
+#                 other six, named here so the divergence reads as a decision
+#                 rather than an arithmetic slip.
+#                 ORCHESTRATOR_BUDGET_CENSUS.regime / regime_since carry the
+#                 scope, and its comment block lists all three regimes found.
+#                 THE CORPUS IS EPHEMERAL, which bounds what any re-measure
+#                 can recover: it is `.worktrees/*/.task/verify/*.summary.json`
+#                 and worktrees are reset. MEASURED 2026-09-16 — re-running
+#                 the census command below over the RETIRED regime's own
+#                 window reports max=4991, not the 5288.0 the 09-08 amendment
+#                 read from that same window (n=24 today vs n=26 then; p50
+#                 3090 unchanged). So an all-time worst cannot be recovered by
+#                 re-running the census, and a figure that drops between two
+#                 runs means records aged out, NOT that the suite got faster.
+#                 PROVENANCE — REFRESHED 2026-09-14 from
+#                 ORCHESTRATOR_BUDGET_CENSUS, superseding the 5288.0 this
+#                 table carried from esc-4211-6's 2026-09-08 fold amendment.
+#                 RE-MEASURE BY REPEATING
+#                 ``ORCHESTRATOR_BUDGET_CENSUS.census_command`` and replacing
+#                 that whole record — NOT by repeating the fold amendment's
+#                 hand-run census, which D17 superseded — so the next figure is
+#                 a repeat rather than a re-derivation. That record is the
+#                 single home for the method; nothing of it is restated here.
+#                 Its window is LATER than, and its max LARGER than, the
+#                 864.83-3310.50s post-cap spread (2026-08-22..08-28) task 4902
+#                 recorded in tests/scripts/test_fallback_verify_config.py's
 #                 POST_CAP_ORCHESTRATOR_GREEN_SECS (a different table, kept a
 #                 separate home per that file's own RAISE-TOGETHER rule).
 #                 Kept here rather than omitted so assertions (a)/(d)/(e)/(f)
@@ -263,7 +288,20 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
-    'orchestrator': 5288.0,
+    # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
+    # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
+    # regime's worst GREEN full-suite run.
+    #
+    # REFRESHING THIS DOWNWARD DOES NOT WEAKEN THE GUARD, and a reviewer
+    # diffing plan against code should not read a lowered measurement as a
+    # loosened check. W stops being the only floor in the excepted branch:
+    # census_budget_floor(4626.17) = 7000 now EXCEEDS this figure and is the
+    # BINDING floor, asserted alongside the surviving `budget > worst`. Net
+    # strength strictly increases — before, the excepted branch's only real
+    # floor was a single frozen number that could not detect its own
+    # staleness; now it is a derivation over a dated, regime-scoped,
+    # reproducible census that names the command to repeat.
+    'orchestrator': 4626.166946739017,
 }
 
 # Single, EXPLICIT, documented exception to assertions (b) and (c) below —
@@ -298,21 +336,30 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 # against. Same lesson as commit e9d1055ed8: a guard must not pin an
 # operator-tunable live yaml value.
 #
-# INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08): 7200 is an
-# operator estimate — ~1.6x headroom over the ~4400s loaded extrapolation
-# from task 4176's contended run — not a measured distribution. Task 3353's
-# scope D (p50/p90/max under load, with PSI and runqueue) refines it later;
-# this exception's NUMBER is expected to change with that refinement, not
-# this exception's EXISTENCE, which is why the exception is keyed on the
-# module rather than on today's figure.
+# NOW D-DERIVED (Leo's ruling D17, 2026-09-14, task 3353 scope D'). It was an
+# operator estimate under D16' — ~1.6x headroom over a ~4400s extrapolation
+# from task 4176's contended run, not a distribution. It is now a DERIVATION
+# over a dated, regime-scoped census: see ORCHESTRATOR_BUDGET_CENSUS, whose
+# verbatim command is the way to repeat it. This exception's NUMBER is still
+# expected to change as the census is re-measured, not this exception's
+# EXISTENCE — which is why it stays keyed on the module rather than on today's
+# figure.
 #
 # WHAT THE EXCEPTION DOES NOT BUY. It drops (b)'s ~2x min_budget MULTIPLE,
-# not the measurement floor underneath it. The excepted branch asserts the
-# declared budget is at or above the fleet ceiling AND still clears
-# MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used to
-# park a budget inside the band where green runs have already been observed
-# to land, which is the failure mode the ruling exists to remove and the one
-# an "except (b) and (c) entirely" reading would silently re-open.
+# not the measurement floor underneath it — and since D17 it does not even buy
+# a bare fleet-ceiling check. The excepted branch asserts the declared budget
+# is at or above max(census_budget_floor(census max), fleet ceiling) AND still
+# clears MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used
+# to park a budget inside the band where green runs have already been observed
+# to land, which is the failure mode the ruling exists to remove and the one an
+# "except (b) and (c) entirely" reading would silently re-open.
+#
+# WHY `>=` AND NOT `>` against the fleet ceiling, unchanged from D16': commit
+# 36c4c71eb4 raised that ceiling onto this module's ruled figure as a stopgap
+# and recorded the condition for putting it back. The two are expected to
+# separate again, and the module keeps its ruled figure through that revert
+# rather than falling back with the ceiling — so the comparison must admit
+# equality while they coincide.
 #
 # Do NOT widen this dict for any other module: every other declared budget
 # still narrows below the fleet ceiling and is still held to (b) and (c) in
@@ -320,14 +367,150 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
     'orchestrator': (
         "esc-4211-6 (2026-09-07 option B / 2026-09-11 option C), Leo's ruling "
-        "D16' (2026-09-08): verify_command_timeout_secs=7200 is a deliberate, "
-        'documented INTERIM exception to assertions (b) and (c) — a budget '
-        'that does not narrow below the fleet ceiling, to stop false '
-        'infra_timeouts on a suite whose green runs already exceed the 3600s '
-        "ceiling the ruling was made against — and is NOT yet D-derived. Task "
-        '3353 scope D refines it with a measured distribution.'
+        "D16' (2026-09-08), refined by ruling D17 (2026-09-14, task 3353 "
+        "scope D'): verify_command_timeout_secs=7200 is a deliberate, "
+        'documented exception to assertions (b) and (c) — a budget that does '
+        'not narrow below the fleet ceiling, to stop false infra_timeouts on '
+        'a suite whose green runs already exceed the 3600s ceiling the ruling '
+        'was made against. It is NO LONGER a bare estimate: the floor holding '
+        'it up is max(census_budget_floor(ORCHESTRATOR_BUDGET_CENSUS.'
+        'max_secs), fleet ceiling), derived from a dated, regime-scoped '
+        'census whose repeat command is recorded at that constant.'
     ),
 }
+
+# D17's HARD CONSTRAINT (Leo, 2026-09-14). A census-derived floor above this
+# figure is a FINDING, never a silent raise: commit 36c4c71eb4 raised the fleet
+# ceiling 3600 -> 7200 as a STOPGAP and recorded that "the next raise should be
+# refused". So if the derivation below ever demands more than this, the answer
+# is to escalate and trim the suite (tasks 4600 / 5412 / 5280 own that half of
+# scope D), not to move the number.
+CENSUS_FLOOR_REFUSAL_CEILING = 7200
+
+
+class BudgetCensus(NamedTuple):
+    """One module's verify-duration census, frozen with its own provenance.
+
+    THE POINT OF THE SHAPE. The prose entry in
+    ``RULED_INTERIM_BUDGET_EXCEPTIONS`` could say "7200 is an operator
+    estimate" and nothing could check it. These fields are asserted against, so
+    the excepted branch stops asserting prose and starts asserting a
+    DERIVATION.
+
+    ``census_command`` and ``measured_at`` are not decoration: they are what
+    make the next figure a REPEAT rather than a re-derivation, which is exactly
+    what ``MEASURED_MODULE_SUITE_WORST_SECS``' own provenance block demands.
+    Re-measure by re-running that command, and replace the whole record.
+
+    ``regime``/``regime_since`` exist because a bare trailing window is WRONG
+    here, and provably so. A 14-day window from 2026-09-14 reaches back to
+    08-31 and straddles the retired 3-slot / 3600-ceiling regime, whose max was
+    4991s -> a floor of 7500, which trips the refusal ceiling above on evidence
+    from a configuration that no longer exists. D17's rule says "under the
+    PREVAILING config", so the window is
+    ``intersection(trailing-14d, prevailing regime)`` and the assertion
+    ``window_start >= regime_since`` holds it there. That assertion goes INERT
+    on its own once 14 days of prevailing-regime data exist, which is the point
+    — it narrows the window only while narrowing is needed, and says why.
+    """
+
+    window_start: str
+    window_end: str
+    regime: str
+    regime_since: str
+    n: int
+    p50: float
+    p90: float
+    max_secs: float
+    timed_out: int
+    census_command: str
+    measured_at: str
+
+
+# MEASURED 2026-09-14 by the verbatim command below, over the PREVAILING
+# config regime. RE-MEASURE BY REPEATING THAT COMMAND and replacing this whole
+# record, so the next figure is a repeat rather than a re-derivation.
+#
+# THE THREE REGIMES THE CENSUS FOUND, which is why this one is scoped:
+#   pre-2026-09-03          n=26  p50=1551  p90=2385  max=3225   t/o=1   floor 4900
+#   09-03 .. 09-12T08       n=26  p50=3090  p90=4223  max=4991   t/o=14  floor 7500
+#   since 09-12T08 (THIS)   n=14  p50=3275  p90=3685  max=4626   t/o=0   floor 7000
+# The middle regime corroborates the segmentation on its own evidence: 14
+# timeouts against this regime's 0, which is the distress commit 36c4c71eb4
+# relieved by raising the ceiling 3600 -> 7200.
+#
+# DIVERGENCE FROM D17's STATED FIGURES, recorded rather than smoothed over.
+# The ruling expected max=3753 -> floor 5700. Measured max is 4626 -> floor
+# 7000, because a green run landed at 2026-09-14T09:35 (task 3541) after the
+# ruling was written, making 3753 the second-highest. n/p50/p90 all match the
+# ruling's shape. Consequence filed as esc-3353-15: headroom against the
+# refusal ceiling is 174s of floor (7000 vs 7200), i.e. a single green run
+# above 4800s trips assertion (3) above. That is the ruling's INTENDED
+# behaviour — the finding surfaces instead of the budget silently rising — so
+# when it fires, read it as the escalate branch working.
+#
+# EVERY IN-WINDOW RUN IS UNSTAMPED. Deliverable 1 of this task adds the host
+# load stamp; it had not merged when this was measured, so all 14 records
+# carry no load reading and the census's load bands are all empty. The figures
+# here are therefore durations under UNKNOWN host load — which is precisely the
+# gap D1 closes for the next re-measure.
+ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
+    window_start='2026-09-12T08:00:00+00:00',
+    window_end='2026-09-15T00:00:00+00:00',
+    regime='prevailing config since the 3600 -> 7200 fleet-ceiling raise',
+    regime_since='2026-09-12T08:00:00+00:00',
+    n=14,
+    p50=3274.9211449669992,
+    p90=3684.5928532374005,
+    max_secs=4626.166946739017,
+    timed_out=0,
+    census_command=(
+        'uv run --project shared python scripts/verify_budget_census.py '
+        '--root /home/leo/src/dark-factory --module orchestrator '
+        '--label test --role task '
+        '--window 2026-09-12T08:00:00+00:00..2026-09-15T00:00:00+00:00'
+    ),
+    measured_at='2026-09-14',
+)
+
+# Keyed by prefix, like every other justification dict here, so the
+# parametrized branch below stays total rather than special-casing one name.
+RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
+    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
+}
+
+
+# RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
+# the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
+# MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
+# verify_cold_command_timeout_secs; every module NOT listed keeps assertion
+# (f)'s fall-through contract in full.
+#
+# Do NOT widen this dict to silence a surprising (f) failure. (f) exists to
+# make ONE misreading un-silent — that an unset cold knob "inherits" the warm
+# value — and for the six modules task 3473 closed, the fall-through IS the
+# intended behaviour. Adding a prefix here to make a red go green would retire
+# that guard for a module that never wanted a cold budget.
+RULED_COLD_BUDGET_DECLARATIONS: dict[str, str] = {
+    'orchestrator': (
+        "ruling D17 (2026-09-14, task 3353 scope D'): "
+        'verify_cold_command_timeout_secs=10800 is a ruled, INTERIM per-module '
+        'cold budget. INTERIM because there is no cold distribution to derive '
+        'from — a summary.json carries no is-cold flag and the attempt-number '
+        'inference cannot tell a cold first verify from a warm re-verify of a '
+        'reset worktree, which scripts/verify_budget_census.py reports as an '
+        'explicit cold_separable=false finding rather than guessing. BASIS: '
+        'the census-derived warm figure (7200) plus the cold preprovision cost '
+        'this lane additionally pays, allotted at the fleet\'s own current '
+        'cold allowance. DECLARED RATHER THAN LEFT TO FALL THROUGH because '
+        "commit 36c4c71eb4's stated revert condition would return the cold "
+        'ceiling to 5400 — BELOW this module\'s warm budget, on a strictly '
+        'costlier path, which is the state in which the cold false-timeout '
+        'hazard was live. A module declaration survives that revert; a '
+        'fall-through does not.'
+    ),
+}
+
 
 # One real tracked file under each module prefix, used to drive the production
 # plan->execution bridge in assertion (e). Deliberately a PRODUCTION file rather
@@ -376,12 +559,30 @@ def test_module_carries_its_own_measured_verify_budget(
         through to ``config.verify_cold_command_timeout_secs``, NOT to the
         module's warm budget. This is exactly the misreading the sibling guard
         was written to make un-silent, and it is folded in here so every
-        parametrized module gets it for the cost of one assertion. Note what
-        that means for ``orchestrator`` specifically, whose warm budget is the
-        one sized ABOVE the root ceiling: its cold verify resolves to the ROOT
-        cold ceiling, which is BELOW its own warm budget. That is deliberate
-        and WARM-ONLY BY DESIGN — the full statement, including what it leaves
-        live, is in ``orchestrator/orchestrator.yaml``'s provenance block.
+        parametrized module gets it for the cost of one assertion. ONE module
+        is carved out of that fall-through contract: ``orchestrator`` now
+        DECLARES its own ``verify_cold_command_timeout_secs``, so for it this
+        assertion checks the RULED shape instead — that the RESOLVER returns
+        the declared value rather than the cascade shadowing it, and that the
+        value sits at or above BOTH the module's own warm budget and the fleet
+        cold ceiling, because a cold verify pays the warm cost plus
+        preprovision. Why it is declared rather than left to fall through —
+        commit 36c4c71eb4's revert condition would return the cold ceiling to
+        5400, below this module's warm budget — is stated at the definition
+        site in ``RULED_COLD_BUDGET_DECLARATIONS`` and in
+        ``orchestrator/orchestrator.yaml``'s provenance block. Every other
+        prefix keeps the fall-through contract in full.
+
+    (f) COVERS THE TASK/BACKGROUND COLD LANE ONLY. ``_resolve_verify_timeout``
+        has TWO cold lanes and its cold track tries
+        ``merge_verify_cold_command_timeout_secs`` FIRST, ahead of any module
+        knob. So for ``orchestrator`` the declared 10800 is returned at
+        ``is_merge_verify=False`` and SHADOWED at ``is_merge_verify=True``,
+        which resolves to 7200 — equal to its warm budget, on the strictly
+        costlier path. That carve-out is asserted below rather than merely
+        described, so closing it (or forgetting it) turns a test red. Closing
+        it needs a repo-root ceiling raise, which ruling D17 places outside
+        this task.
 
     SCOPE, STATED HONESTLY — this guard's advertised reach must equal its real
     reach, because a guard that overstates itself is the same defect wearing a
@@ -483,15 +684,58 @@ def test_module_carries_its_own_measured_verify_budget(
         # something. root_warm is operator-tunable and currently sits ON this
         # module's ruled figure; the floor that actually holds the budget up
         # is the measurement assertion below, not this one.
-        assert mc.verify_command_timeout_secs >= root_warm, (
-            f'{prefix} is listed in RULED_INTERIM_BUDGET_EXCEPTIONS '
-            f'({ruled_exception}) as a budget that deliberately does NOT '
-            f'narrow below the repo-root ceiling, but its declared '
-            f'verify_command_timeout_secs={mc.verify_command_timeout_secs} is '
-            f'below verify_command_timeout_secs={root_warm}. Either the ruling '
-            f'no longer applies — remove this prefix from '
-            f'RULED_INTERIM_BUDGET_EXCEPTIONS so (b)/(c) apply in full — or '
-            f'{prefix}/orchestrator.yaml regressed'
+        census = RULED_BUDGET_CENSUS[prefix]
+
+        # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
+        # feeds, because a straddling window makes every figure below describe
+        # a configuration that no longer exists. Goes inert on its own once 14
+        # days of prevailing-regime data exist.
+        assert census.window_start >= census.regime_since, (
+            f'{prefix} budget census window starts {census.window_start}, '
+            f'BEFORE the prevailing config regime began '
+            f'({census.regime_since}, commit 36c4c71eb4). A window that '
+            f'straddles the retired 3-slot / 3600s-ceiling regime derives the '
+            f'floor below from runs made under a configuration that no longer '
+            f'exists — measured, that regime max is 4991s and yields a 7500s '
+            f'floor, which trips CENSUS_FLOOR_REFUSAL_CEILING. Re-run '
+            f'{census.census_command!r} with an explicit '
+            f'--window {census.regime_since}..<now> and replace the record'
+        )
+
+        # (3) D17's HARD CONSTRAINT, asserted before it is used as a floor.
+        derived_floor = census_budget_floor(census.max_secs)
+        assert derived_floor <= CENSUS_FLOOR_REFUSAL_CEILING, (
+            f'{prefix} census-derived floor is {derived_floor}s — ABOVE the '
+            f'{CENSUS_FLOOR_REFUSAL_CEILING}s refusal ceiling. THIS IS A '
+            f'FINDING TO ESCALATE, NOT A NUMBER TO RAISE. Commit 36c4c71eb4 '
+            f'raised the fleet ceiling 3600 -> 7200 as a stopgap and recorded '
+            f'that "the next raise should be refused", so do NOT edit '
+            f'CENSUS_FLOOR_REFUSAL_CEILING, do NOT raise the yaml, and do NOT '
+            f'weaken this assertion. File '
+            f"escalate_blocker(category='design_concern') naming this census "
+            f'(n={census.n}, p50={census.p50}, p90={census.p90}, '
+            f'max={census.max_secs}, window {census.window_start}..'
+            f'{census.window_end}, measured {census.measured_at}) and that '
+            f'refusal condition. The remedy is trimming the suite — tasks '
+            f'4600 / 5412 / 5280 own that half of scope D — not a wider budget'
+        )
+
+        # (1) THE DERIVATION. Replaces a bare `>= root_warm`: that alone would
+        # let the budget sit anywhere at or above an operator-tunable value,
+        # including inside the band where green runs land once the ceiling
+        # reverts. The floor is now the STRONGER of the census derivation and
+        # the fleet ceiling, so it survives commit 36c4c71eb4's revert.
+        census_floor = max(derived_floor, root_warm)
+        assert mc.verify_command_timeout_secs >= census_floor, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is below its census-derived '
+            f'floor of {census_floor}s = max(census_budget_floor('
+            f'{census.max_secs})={derived_floor}, root ceiling={root_warm}). '
+            f'Its RULED_INTERIM_BUDGET_EXCEPTIONS entry ({ruled_exception}) '
+            f'excuses it from (b)/(c), NOT from the derivation that replaced '
+            f'them. Either the ruling no longer applies — remove this prefix '
+            f'so (b)/(c) apply in full — or {prefix}/orchestrator.yaml '
+            f'regressed. Re-measure with {census.census_command!r}'
         )
 
         # ...AND IT STILL CLEARS THIS MODULE'S OWN WORST RECORDED GREEN RUN.
@@ -550,6 +794,97 @@ def test_module_carries_its_own_measured_verify_budget(
 
     # (f) The warm knob deliberately does NOT cover cold. An unset module cold
     # knob falls through to the ROOT cold ceiling, not to this warm value.
+    #
+    # ONE per-module carve-out (RULED_COLD_BUDGET_DECLARATIONS) for a module
+    # that DOES declare its own cold budget. The fall-through contract below is
+    # untouched for every other prefix, so the misreading (f) exists to make
+    # un-silent stays closed for them.
+    cold_declaration = RULED_COLD_BUDGET_DECLARATIONS.get(prefix)
+    # The fleet's EFFECTIVE cold ceiling. An unset root cold knob is not the
+    # absence of a ceiling: the cascade's step 3 falls through to the root WARM
+    # budget (verify._resolve_verify_timeout), so that is the figure a module
+    # declaration must still clear. Reading it as None would both make the
+    # floor below vacuous and raise TypeError on the comparison.
+    root_cold_ceiling = (
+        root_config.verify_cold_command_timeout_secs
+        if root_config.verify_cold_command_timeout_secs is not None
+        else root_config.verify_command_timeout_secs
+    )
+    if cold_declaration is not None:
+        declared_cold = mc.verify_cold_command_timeout_secs
+        assert declared_cold is not None, (
+            f'{prefix} is listed in RULED_COLD_BUDGET_DECLARATIONS '
+            f'({cold_declaration}) but {prefix}/orchestrator.yaml declares no '
+            f'verify_cold_command_timeout_secs. Either the declaration was '
+            f'reverted — drop this prefix from the dict so (f)\'s '
+            f'fall-through contract applies again — or the yaml regressed'
+        )
+
+        # The RESOLVER returns it, not merely the yaml holding it. This is what
+        # proves the cascade's step 1 is actually reached: a number present in
+        # the config but shadowed by the cascade would satisfy a yaml-only
+        # check while the cold lane still ran on the root ceiling.
+        resolved_declared = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=False
+        )
+        assert resolved_declared == declared_cold, (
+            f'_resolve_verify_timeout(is_cold=True) returned '
+            f'{resolved_declared} for {prefix}, not its DECLARED '
+            f'verify_cold_command_timeout_secs={declared_cold}. The value is '
+            f'in the yaml but the cascade is not reaching it, so the cold lane '
+            f'is still running on some other budget'
+        )
+
+        # The OTHER cold lane, pinned as the carve-out it is. The cold track
+        # tries merge_verify_cold_command_timeout_secs BEFORE the module knob,
+        # so on a cold MERGE verify this module's declaration is shadowed. The
+        # yaml block says so; this asserts it, so the prose cannot drift from
+        # the resolver and a future closing of the lane cannot land silently.
+        merge_cold = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=True,
+        )
+        root_merge_cold = root_config.merge_verify_cold_command_timeout_secs
+        assert merge_cold == root_merge_cold, (
+            f'_resolve_verify_timeout(is_cold=True, is_merge_verify=True) '
+            f'returned {merge_cold} for {prefix}, not the repo-root '
+            f'merge_verify_cold_command_timeout_secs={root_merge_cold}. The '
+            f'cold MERGE lane is a documented carve-out (esc-3353-20): the '
+            f'module cold declaration is shadowed there. If this lane was '
+            f'deliberately closed, update this assertion AND the '
+            f'orchestrator.yaml provenance block together — the finding they '
+            f'both record would no longer be true'
+        )
+
+        # A cold verify pays verify_cold_preprovision_command and unwarmed
+        # caches ON TOP of the warm cost, so a cold budget BELOW the warm one
+        # is incoherent by construction — it would make the strictly costlier
+        # path the one that times out first.
+        assert declared_cold >= mc.verify_command_timeout_secs, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, BELOW its warm '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs}. A '
+            f'cold verify pays the cold preprovision command and unwarmed '
+            f'caches on top of everything the warm run pays, so this makes the '
+            f'strictly more expensive path time out first'
+        )
+
+        # ...and never below the fleet cold ceiling, the same rule the warm
+        # exception carries and for the same reason: the ceiling is
+        # operator-tunable and this figure is RULED, so the declaration must
+        # survive commit 36c4c71eb4's revert condition rather than falling back
+        # with it.
+        assert declared_cold >= root_cold_ceiling, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, below the repo-root effective cold ceiling '
+            f'{root_cold_ceiling} (its verify_cold_command_timeout_secs, or '
+            f'the warm budget the cold cascade falls through to when that is '
+            f'unset). The root '
+            f'ceiling is operator-tunable and this module\'s figure is ruled, '
+            f'so the declaration exists precisely to survive a revert of that '
+            f'ceiling — a module figure that falls back with it buys nothing'
+        )
+        return
+
     assert mc.verify_cold_command_timeout_secs is None, (
         f'{prefix}/orchestrator.yaml now declares '
         f'verify_cold_command_timeout_secs='
@@ -1511,3 +1846,83 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
         'guard pins the SET of returned prefixes against '
         'FAMILY_PUBLISHED_PREFIXES instead of iterating whatever it finds'
     )
+
+
+class TestCensusBudgetFloor:
+    """`census_budget_floor` — the family's ONE spelling of D17's derivation.
+
+    ceil-to-100(1.5 * worst). Lives beside `min_budget` in
+    `module_budget_family` so the family has one home for budget expressions,
+    and imported by name here under the same single-import discipline the
+    canonical-expression guard enforces for `min_budget`.
+
+    It is a DIFFERENT trade from `min_budget`, not a weakening of it: ruling
+    D17 rejected the 2x multiple for this module as a moving target against a
+    still-growing unsharded suite, and replaced it with a tighter multiple over
+    a SHORTER, regime-scoped window.
+    """
+
+    @pytest.mark.parametrize(
+        ('worst', 'expected'),
+        [
+            # An already-round product must not round up a further 100.
+            (4800.0, 7200),
+            # The plan's worked example: 1.5 * 3753 = 5629.5 -> 5700.
+            (3753.0, 5700),
+            # The measured prevailing-regime max: 1.5 * 4626.17 = 6939.25 -> 7000.
+            (4626.166946739017, 7000),
+            # The retired-regime max, which is why the window is regime-scoped.
+            (4991.13326132996, 7500),
+            (0.0, 0),
+            # Any positive fraction of a 100s block rounds UP to it.
+            (0.1, 100),
+            (66.66, 100),
+            (66.67, 200),
+        ],
+    )
+    def test_exact_values_across_the_rounding_boundaries(self, worst, expected):
+        assert census_budget_floor(worst) == expected
+
+    def test_the_return_type_is_int(self):
+        """It is compared against a yaml-declared budget, so it must not be a
+        float that prints as one thing and compares as another."""
+        assert isinstance(census_budget_floor(3753.0), int)
+
+    def test_it_rounds_up_where_min_budget_rounds_down(self):
+        """The direction is load-bearing and opposite.
+
+        `min_budget` truncates DOWN and degenerates to zero for cheap suites —
+        acceptable for a "at least 2x" sanity floor. A floor derived from a
+        measured TAIL must not be truncated BELOW that tail, so this one rounds
+        up. A single value where both are non-degenerate shows the split.
+        """
+        assert census_budget_floor(66.67) == 200
+        assert min_budget(66.67) == 100
+
+    def test_it_never_returns_less_than_the_worst_run_it_derives_from(self):
+        """The property that makes it a FLOOR: 1.5x, rounded up, always clears W."""
+        for worst in (0.1, 22.49, 66.67, 233.5, 3753.0, 4626.17, 4991.13, 5288.0):
+            assert census_budget_floor(worst) > worst
+
+    def test_it_is_distinct_from_min_budget_in_multiple_and_direction(self):
+        """A test asserting the two AGREE somewhere would let one silently
+        become the other. This asserts they disagree on a live figure."""
+        worst = 4626.166946739017
+
+        assert census_budget_floor(worst) == 7000
+        assert min_budget(worst) == 9200
+        assert census_budget_floor(worst) != min_budget(worst)
+
+    def test_it_is_not_in_the_canonical_expression_namespace(self):
+        """Deliberately NOT wired into the family's publisher guard.
+
+        That guard evaluates each publisher's floor expression in a namespace
+        holding only `min_budget` and the published worst, without
+        `__builtins__`, so a re-spelled derivation raises NameError. Adding a
+        second callable to it would let a publisher's MIN_MODULE_BUDGET_SECS
+        silently switch derivations and still evaluate green — which is the
+        exact drift that namespace exists to catch.
+        """
+        import module_budget_family as family  # noqa: PLC0415
+
+        assert family.HELPER_NAME == 'min_budget'

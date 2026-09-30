@@ -250,13 +250,6 @@ _ALLOWED_RENAMERS = {
         'disjoint-path discipline, so two writers can never share a temp path '
         'even if they bypass _persist_lock), and the asyncio.to_thread offload '
         'that keeps the blocking I/O off the event loop under burst load.',
-    ('fused-memory/src/fused_memory/reconciliation/backlog_policy.py', 'BacklogPolicy._restore_policy_keys'):
-        'Out of task 3223 enumerated scope; left alone deliberately. Re-merges '
-        'the policy-only keys that closing a halt strips (project_id, '
-        'error_type, backlog, threshold) back onto the persisted record via '
-        'tmp.write_text + tmp.replace. Best-effort by construction — every '
-        'failure is logged and swallowed so a record that IS closed but lost '
-        'its forensic keys is never misreported as un-closed.',
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
         'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
         '-> ... There is no content string, only os.replace(src, dst) per '
@@ -372,7 +365,7 @@ _ALLOWED_RENAMERS = {
     # scope" boilerplate, and none was migrated here — a source migration
     # folded into a merge resolution is an unreviewed change arriving on the
     # one path nobody diffs, which is the opposite of what this guard is for.
-    ('scripts/render_dashboard_unit.py', 'main'):
+    ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
         'save_state and orchestrator-watchdog._atomic_write_json above, and of '
         'session_registry._atomic_write_text before them, but under a HARDER '
@@ -414,10 +407,10 @@ _ALLOWED_RENAMERS = {
         'shell function under test (restart-all-orchestrators.sh::'
         'stamp_fleet_deploy_clock) so the fixture publishes the heartbeat the '
         'way production does. The atomicity is load-bearing to the test rather '
-        'than decorative: _heartbeat_timeline calls this from a '
-        'threading.Timer WHILE the spawned script polls the same file, and '
+        'than decorative: the _rewrites_on_gate_polls watcher thread calls '
+        'this WHILE the spawned script polls the same file, and '
         'drain_check._read_heartbeat turns the ValueError from a partially '
-        'written file into "absent" — a verdict no timeline scheduled, i.e. a '
+        'written file into "absent" — a verdict no rewrite asked for, i.e. a '
         'flake. Stated plainly: there is NO semantic here beyond '
         'atomic_write_text\'s reach, so this is a migration candidate, held '
         'back only because whether the fixture should keep mirroring the shell '

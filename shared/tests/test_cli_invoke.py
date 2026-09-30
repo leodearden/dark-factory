@@ -4851,6 +4851,18 @@ class TestBackendForwarding:
 
 _ESCAPE_NEEDLE = 'Transcript UNREADABLE'
 
+# One transcript read made to outlive the fake child, so the starvation the
+# class's poll-count preconditions depend on is reproduced on any host.
+_STARVATION_STALL_SECS = 0.5
+
+# How long the fake child waits for its poll-count barrier before giving up and
+# exiting anyway. ORDERING INVARIANT, stated here and nowhere else: well under
+# the 30s startup_grace_secs/absolute_cap_secs these tests pass, so a valve trip
+# can never manufacture a spurious escape record or kill, and far under the 300s
+# pytest timeout. 10s is ~7x this harness's measured worst case (~0.25s per poll
+# under 40-way contention x the 6 polls the largest required_reads needs).
+_CHILD_RELEASE_TIMEOUT_SECS = 10.0
+
 
 def _escape_records(caplog):
     """The storm-escape WARNINGs emitted during a driven watchdog run.
@@ -4876,11 +4888,41 @@ class TestUnreadableTranscriptEscapeWiring:
 
     The escape must not change any kill decision — "NEVER kill on None" stays
     exactly as it is. It only makes the degrade observable.
+
+    DETERMINISM.  The fake child exits on a poll-count handshake, not a timer:
+    it blocks until the watchdog has read the transcript `required_reads` times,
+    which each test states at its own call site as the precondition its
+    `call_count` assertion consumes. The wait is valve-bounded, so a watchdog
+    that stops polling fails that assertion instead of hanging the suite. The
+    scope-bound test is the exception: nothing can ever hand its barrier a read,
+    so it asserts ZERO reads over a valve-bounded lifetime, which is what keeps
+    that assertion falsifiable rather than a no-op.
+
+    The child used to live a fixed 0.25s while the watchdog polled at 5ms, which
+    made every poll count a race: measured 33-46 polls standalone, but 4/480
+    failures under 40-way process contention with counts down to 1 and 5. That
+    is the defect, and it is not re-derivable from the code that replaced it.
+    Widening the lifetime was the rejected alternative — it buys a bigger
+    constant on the same race, and this file's sibling wall-clock bound has been
+    widened four times already. The post-fix soak that settled it is recorded on
+    task 5112 rather than restated here, where it would read as a live guarantee
+    long after the harness moved on.
     """
 
     @staticmethod
-    def _proc(run_secs: float = 0.25):
-        """A process whose communicate() stays pending across many watchdog polls."""
+    def _proc(release: asyncio.Event, release_timeout_secs: float):
+        """A process that stays pending until the watchdog has polled enough times.
+
+        The child exits on `release`, which `_drive`'s read wrapper sets once
+        `required_reads` polls have happened — not on a timer, so no amount of
+        host contention can decide how many polls a test observes.
+
+        The wait is bounded, and the TimeoutError SUPPRESSED rather than raised:
+        a barrier that never opens must leave the child exiting NORMALLY, so
+        `_run_subprocess` takes its normal-exit path and the surviving failure is
+        the caller's poll-count assertion rather than a spurious `timed_out=True`
+        routed through the kill block.
+        """
         payload = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -4891,7 +4933,8 @@ class TestUnreadableTranscriptEscapeWiring:
         }).encode()
 
         async def _communicate(input=None):  # noqa: A002
-            await asyncio.sleep(run_secs)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(release.wait(), timeout=release_timeout_secs)
             return (payload, b'')
 
         proc = MagicMock()
@@ -4908,14 +4951,38 @@ class TestUnreadableTranscriptEscapeWiring:
         tmp_path,
         *,
         turns_side_effect,
+        required_reads: int,
         config_dir,
         session_id,
         startup_grace_secs=0.0,
         working_idle_secs=None,
         absolute_cap_secs=None,
+        release_timeout_secs: float = _CHILD_RELEASE_TIMEOUT_SECS,
     ):
-        """Run the watchdog loop at millisecond cadence with a patched transcript read."""
-        proc = self._proc()
+        """Run the watchdog loop at millisecond cadence with a patched transcript read.
+
+        `required_reads` is the caller's stated precondition: the fake child stays
+        pending until the watchdog has polled the transcript that many times, or
+        until the valve fires. A run that can never produce a read is bounded by
+        `release_timeout_secs` alone — pre-setting the barrier instead would end
+        the run before the first poll body ever executes, which silently makes
+        any `call_count` assertion over it unfalsifiable.
+        """
+        assert required_reads >= 1, 'a pre-opened barrier makes call_count unfalsifiable'
+        loop = asyncio.get_running_loop()
+        release = asyncio.Event()
+        proc = self._proc(release, release_timeout_secs)
+
+        reads = itertools.count(1)
+
+        def counted_read(*args, **kwargs):
+            value = turns_side_effect(*args, **kwargs)
+            # The read is dispatched through `asyncio.to_thread`, so this runs on
+            # a worker thread and must not touch the Event directly. Re-releasing
+            # on later reads is idempotent.
+            if next(reads) >= required_reads:
+                loop.call_soon_threadsafe(release.set)
+            return value
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4927,7 +4994,7 @@ class TestUnreadableTranscriptEscapeWiring:
             patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
             patch(
                 'shared.cli_invoke.count_transcript_turns',
-                side_effect=turns_side_effect,
+                side_effect=counted_read,
             ) as mock_turns,
         ):
             result = await _run_subprocess(
@@ -4948,6 +5015,103 @@ class TestUnreadableTranscriptEscapeWiring:
         assert result.timed_out is False, 'the escape must not change the kill decision'
         return mock_turns
 
+    async def test_a_slow_read_cannot_starve_the_poll_count(self, tmp_path, caplog):
+        """One slow transcript read must not decide how many polls a test gets.
+
+        Every behavioural test below states a `call_count >= N` precondition, and
+        those preconditions used to be a RACE: the fake child lived a fixed
+        wall-clock span while `_drive` polls at millisecond cadence, so the count
+        was settled by how many times a contended loop got round the watchdog.
+        Measured in the low tail of 480 runs under 40-way process contention:
+        poll counts of 1, 1, 1 and 5 — `call_count == 1` being exactly the value
+        esc-5216-5 reported from the field.
+
+        The mechanism at that tail is ONE read outliving the whole child, so a
+        sleep inside the side_effect reproduces it deterministically instead of
+        probabilistically: the read is dispatched through `asyncio.to_thread`, so
+        the sleep stalls the loop's await exactly the way executor-queue
+        saturation does, with no host load required. Same principle the
+        stdin-starvation block below already states for its own gap injection —
+        the failure is not "load" per se, it is the gap, so the test injects
+        exactly the gap.
+        """
+        import time as _time
+
+        reads = itertools.count(1)
+
+        def _stalling_read(*a, **k):
+            if next(reads) == 1:
+                _time.sleep(_STARVATION_STALL_SECS)
+            return None
+
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=_stalling_read,
+                required_reads=3,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'a read slower than the child must not decide how many polls this '
+            f'class gets: the child has to stay pending until the watchdog has '
+            f'actually polled, not until a timer expires; got '
+            f'{mock_turns.call_count}'
+        )
+
+    async def test_an_unreachable_read_count_releases_the_child_instead_of_hanging(
+        self, tmp_path, caplog
+    ):
+        """An unreachable `required_reads` must fail the assertion, not hang the suite.
+
+        The handshake is only safe if a watchdog that stops polling still ends
+        the run. shared/pyproject.toml's timeout block records what the
+        alternative costs: a pytest-timeout breach under
+        `timeout_method = "signal"` with `--max-worker-restart=0` degrades into
+        the "shifting victim" false red, failing whatever unrelated test was on
+        the killed xdist worker. A barrier that can hang converts a clean
+        per-test red into that, so the valve is what keeps the failure
+        attributable to the test that actually broke.
+
+        The barrier here provably cannot open: a readable transcript latches
+        `seen_turn` on the first read and the progress extension is off, so the
+        loop never reads again — one read, forever short of the count demanded.
+
+        Both assertions are deliberately loose. The property under test is that
+        the run ENDED with the barrier still shut; the exact poll count and the
+        exact wall clock are scheduling artefacts, and pinning either would put
+        this test back on the race the rest of the class exists to remove.
+        """
+        import time as _time
+
+        unreachable_reads = 5
+
+        started = _time.monotonic()
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                required_reads=unreachable_reads,
+                release_timeout_secs=0.05,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+        elapsed = _time.monotonic() - started
+
+        assert elapsed < 30.0, (
+            f'an unsatisfiable barrier must be released by the valve, not waited '
+            f'out at the 300s pytest timeout; the run took {elapsed:.2f}s'
+        )
+        assert mock_turns.call_count < unreachable_reads, (
+            f'the valve must release the child WITHOUT the barrier being '
+            f'satisfied, so the surviving failure is the caller\'s own poll-count '
+            f'assertion; got {mock_turns.call_count} of the {unreachable_reads} '
+            f'polls demanded'
+        )
+
     async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
         """A transcript still unreadable past grace fires the escape exactly once.
 
@@ -4962,6 +5126,7 @@ class TestUnreadableTranscriptEscapeWiring:
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
@@ -4990,9 +5155,10 @@ class TestUnreadableTranscriptEscapeWiring:
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
-                # The driven run lasts ~0.25s; nothing may fire inside 30s.
+                # The driven run is over in milliseconds; nothing may fire inside 30s.
                 startup_grace_secs=30.0,
             )
 
@@ -5009,14 +5175,19 @@ class TestUnreadableTranscriptEscapeWiring:
     async def test_no_escape_when_transcript_readable(self, tmp_path, caplog):
         """A readable transcript never fires the escape, even with grace at zero."""
         with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
-            await self._drive(
+            mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: 1,
+                required_reads=1,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
             )
 
+        assert mock_turns.call_count >= 1, (
+            f'a run that never read the transcript proves nothing about the escape; '
+            f'got {mock_turns.call_count} polls'
+        )
         records = _escape_records(caplog)
         assert not records, (
             f'a readable transcript must not fire; got {[r.getMessage() for r in records]}'
@@ -5029,13 +5200,14 @@ class TestUnreadableTranscriptEscapeWiring:
         latches on the first readable poll and the loop keeps reading every poll
         via the extension branch (without the extension it would short-circuit
         all further reads and the alternation would be untestable). The idle and
-        absolute bounds are far beyond the ~0.25s run, so no kill is in play.
+        absolute bounds are far beyond this run's length, so no kill is in play.
         """
         alternating = itertools.cycle([None, 1])
         with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: next(alternating),
+                required_reads=6,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
@@ -5059,6 +5231,11 @@ class TestUnreadableTranscriptEscapeWiring:
         The watchdog never reads a transcript for such a role, so its Nones mean
         nothing — counting them would be noise, not signal. This is the scope
         bound from the amendment.
+
+        The child's lifetime here is bounded by the valve rather than by the
+        handshake: a run that can never read has nothing to hand the barrier, so
+        pre-setting it would end the run before the first poll body and take this
+        assertion's power with it.
         """
         for config_dir, session_id in (
             (None, 'sid'),
@@ -5070,6 +5247,8 @@ class TestUnreadableTranscriptEscapeWiring:
                 mock_turns = await self._drive(
                     tmp_path,
                     turns_side_effect=lambda *a, **k: None,
+                    required_reads=1,
+                    release_timeout_secs=0.25,
                     config_dir=config_dir,
                     session_id=session_id,
                     startup_grace_secs=0.0,

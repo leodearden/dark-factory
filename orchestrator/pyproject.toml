@@ -172,14 +172,22 @@ filterwarnings = [
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
-# is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
+# is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
-# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
-# 300 is INTERIM and judgement-picked, not measured).
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
+# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
+# clock under real fleet load x the 8x headroom factor — and no longer
+# judgement-picked; see
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
 # that line used to imply it was. A marker OVERRIDES the budget in BOTH
 # directions rather than raising a floor under it, so any N below the
 # --timeout=300 verify passes silently TIGHTENS the run that gates your merge.
+# NOTE that CLI budget is now TIGHTER than this ini default rather than equal to
+# it: task 5442 raised the ini 300 -> 540 and deliberately left every verify
+# test_command's --timeout=300 alone, that knob being yaml rather than pyproject.
+# The band below is stated against the CLI budget, which is the one that
+# actually governs a merge-gating run.
 # That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
 # DELIBERATE tight bound, for a test asserting something happens FAST) or
 # @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
@@ -190,19 +198,26 @@ filterwarnings = [
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no
 # longer reliable inside the worker — switch to thread mode like fused-memory.
-# UNCHANGED by the 60→300 raise, deliberately: the raise attacks the trigger,
-# not the two safety mechanisms.
+# UNCHANGED by the 60→300 and 300→540 raises, deliberately: a raise attacks the
+# trigger, not the two safety mechanisms.
 # MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
 # this value with tomllib at runtime — edit the two together.
-timeout = 300
+timeout = 540
 timeout_method = "thread"
+# A test still running after this many seconds dumps every thread's stack to
+# the worker's stderr, which the verify log carries, so a hang whose kill comes
+# LATER than this is legible before the os._exit() below erases the worker.
+# Kept under verify's CLI --timeout=300 so an unmarked test dumps before it is
+# killed. Why stderr, and why not pytest-timeout's own banner:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants, which pins it.
+faulthandler_timeout = 240
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
 # ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the 300s timeout above, pytest-timeout's thread method
+# ever exceeds the timeout above, pytest-timeout's thread method
 # os._exit()s the xdist worker. With restarts allowed, xdist spawns a
 # replacement node that
 # re-collects the full suite and re-dies → restart/re-collect/re-die loop that
@@ -240,6 +255,7 @@ markers = [
     "mocks_dry_run_unblock: opt the class into an AsyncMock(return_value=None) patch of orchestrator.workflow.run_dry_run_unblock so BLOCKED-driving e2e tests do not invoke the real fire-and-forget hook. Default in test_workflow_e2e.py: a fail-fast stub that records calls and asserts in teardown.",
     "guard_self_test: marks a test class as a self-test of _dry_run_unblock_e2e_guard; suppresses the fixture's teardown assertion so deliberate stub invocations inside pytest.raises do not produce a false-positive failure.",
     "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_queue.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
+    "exit_contract_violation_expected: opt a test OUT of the autouse `_no_unexpected_exit_contract_violation` guard, for a test that DELIBERATELY drives a run()-exit contract violation (spec docs/task-escalation-state-spec.md §5; the WHY is orchestrator/src/orchestrator/exit_contract.py). Never a fix for an unexpected violation: that is a producer or test-double bug (task 3542).",
     "real_verify_admission: opt a test OUT of the autouse `_neutralize_verify_admission` patch so it exercises the REAL orchestrator.verify admission wiring (nice-prefix wrap + shared.verify_admission.acquire_task_slot) instead of the force-inactive stub. Default: autouse neutralize installed in conftest.py (task 2390).",
     "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). DESELECTED from the default suite in addopts and re-selected post-merge by the `warm-lane-bash` LaneCommand in dark-factory-orchestrator.yaml — PRD §11 q4 re-decided (task 3349, 2026-08-01) to take the escape the PRD itself documented. Two grounds: leaf γ (task 3075) has LANDED with this coverage green on its verify leg, consuming half the original justification; and the surviving cost ground inverted — measured 289.58s at loadavg 128.72 on 32 cores, 6.2x the README's 47s module baseline. Still selectable on demand with `-m warm_lane_bash`, which is exactly how the lane re-selects it (a CLI -m overrides the addopts -m, last wins). PRD leaves δ/δ2/ε, which still change warm-lane behaviour, must run `-m warm_lane_bash` explicitly on their own verify legs. The addopts deselection and the lane entry are COUPLED and never move independently — pinned by test_warm_lane_bash_bucket_placement.py. See orchestrator/tests/warm-lane/README.md.",
     "slow: marks heavyweight tests that shell out to real subprocesses (uv run pytest, plan-tools MCP servers) rather than mocking them, so they run materially slower than the rest of the suite. Call sites: test_verify_plan_integration.py::test_scoped_pytest_producer_and_runner_agree_on_scope (one real `uv run ... pytest` subprocess) and test_plan_tools_startup_load.py::test_concurrent_startup_no_hang (six real subprocesses). Deselect with -m 'not slow and not warm_lane_bash' — NOT a bare -m 'not slow': pytest's -m is single-value, so a CLI -m overrides addopts' `-m 'not warm_lane_bash'` entirely (last wins, per the warm_lane_bash note above), and a bare 'not slow' would silently RE-SELECT that already-deselected 12-item bucket instead of speeding the run up. Unlike warm_lane_bash this marker is NOT deselected by addopts by default — registering it here only stops it being silently accepted as an unknown/typo-able marker name (task 3506).",

@@ -98,7 +98,7 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
 #
-# BUT NEVER ADD A NAME THAT scripts/render_dashboard_unit.py PRESERVES.
+# BUT NEVER ADD A NAME THAT scripts/render_systemd_unit.py PRESERVES.
 # Concretely, today: never add `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=...`.
 # The two mechanisms are incompatible by construction, and the failure is silent
 # in the worst way — it lands on the unit that governs RECONCILIATION.
@@ -128,7 +128,7 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # is why the guard is a cross-module test and this is a comment.
 #
 # PINNED FROM BOTH ENDS, and the second anchor is not redundant. The test above
-# derives its preserved set solely from render_dashboard_unit.UNITS[*].
+# derives its preserved set solely from render_systemd_unit.UNITS[*].
 # host_local_environment, so dropping the name from a UnitSpec while
 # fused_memory/models/scope.py still read it would make that test pass
 # VACUOUSLY — the intersection goes empty for the wrong reason and this hazard
@@ -174,8 +174,10 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
 # [Service] line) but whose full value is host-specific and therefore cannot
 # be exact-matched or synthesized by --fix. ExecStartPre= carries
 # host-specific paths (__REPO_ROOT__, /home/leo/bin) — only its presence can
-# be asserted.
-REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=",)
+# be asserted. ExecStopPost= is the hook that stops fused-memory.socket on a
+# deliberate stop; without it a stopped service is restarted by the next
+# connection to its still-listening port.
+REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecStopPost=")
 
 
 def _log(message: str, *, stream=None) -> None:

@@ -984,52 +984,67 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive UNEXPLAINED session_resume_fallback degradations '
-            'before one L1 escalation is filed (INV-4 storm escape). Only a '
-            'reason OUTSIDE harness.py::_BY_DESIGN_SESSION_RESUME_REASONS '
-            'counts: every by-design outcome — the per-task cap, a lane '
-            'reseed, an out-of-window sidecar, an uncorroborable transcript — '
-            'is excluded by construction, so reaching this threshold means a '
-            'genuinely unexplained failure mode fired repeatedly. A reason '
-            'is genuine BY DEFAULT: a new one feeds this streak unless it is '
-            'added to that constant. The run is chained within '
-            'storm_window_secs (and reset to 0 on any eligible resume) rather '
-            'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic breakage trips it. '
-            'NOT CURRENTLY REACHABLE, by design and only for now: with '
-            "today's reason vocabulary EVERY producible reason is by-design, "
-            'so the streak has no feeder and this threshold cannot fire at '
-            'any value. Tuning it changes nothing until PRD leaf epsilon '
-            '(task 3733) installs the first genuine feeder '
-            '(archive-restore failure); the mechanism is retained unfed so '
-            'that lands on a tested path. Until then, watch the '
-            'session_resume_fallback event rate directly.'
+            'Consecutive ELIGIBLE-BUT-FAILED resumes before one L1 '
+            'escalation is filed (INV-4 storm escape). The feeder (task '
+            '3733) is every armed resume that did not survive: an archive '
+            'restore that faulted, and every CLI rejection of a resume we '
+            'armed. Only outcomes OUTSIDE the two by-design carve-outs count '
+            "— harness.py::_BY_DESIGN_SESSION_RESUME_REASONS for the "
+            'pre-dispatch eligibility predicate and '
+            'harness.py::_BY_DESIGN_RESTORE_OUTCOMES for the archive restore '
+            "('disabled', the kill switch, and 'miss', the archive-coverage "
+            'signal, which belongs on a rate watch rather than a '
+            'consecutive-run detector). A new value in either vocabulary is '
+            'GENUINE BY DEFAULT and feeds this streak unless it is added to '
+            'the constant. The run is chained within storm_window_secs (and '
+            'reset to 0 on any resume that survives) rather than accumulating '
+            'unbounded per boot. Must be >= 1. '
+            'Default 5 STAYS where task 2774 put it, and the re-derivation '
+            'behind the window (see storm_window_secs) is why: the WINDOW, '
+            'not the threshold, was the binding constraint — at the old 3600s '
+            'nothing chained at ANY threshold. 5 sits two above the measured '
+            "null's longest run of 3 inside the shipped 24h window, and "
+            'reset-on-success rather than the clock is what suppresses false '
+            'alarms. '
+            'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(
-        default=3600,
+        default=86400,
         ge=1,
         description=(
-            'Maximum gap, in seconds, between two consecutive unexplained '
-            'session-resume fallbacks for them to count as the same storm '
-            'run; a larger gap decays the streak to 0 before the next '
-            'fallback is counted. Without this the streak is cumulative '
-            'rather than consecutive, so a slow drip of isolated failures '
-            'accumulates into a false storm. Must be >= 1. Default 3600 is '
-            'read off the measured signature: real bursts land ~17 fallbacks '
-            'inside one hour, while quiet gaps between isolated failures run '
-            '~7h and ~39h — so a 1h chain window separates burst from drip '
-            'with a wide margin on both sides. Measured on the monotonic '
-            'clock, deliberately: the stale reason is itself PRODUCED by '
-            'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect. '
-            'Its ESCALATION-driving role is inert for the same reason '
-            'fallback_storm_threshold is (see above) — nothing feeds the '
-            'streak until task 3733 — but the window is still LIVE as the '
-            'expiry clock: it is evaluated on every dispatch carrying a '
-            'recovered session, so shortening it still changes when a run '
-            'is considered over.'
+            'Maximum gap, in seconds, between two consecutive '
+            'eligible-but-FAILED resumes for them to count as the same storm '
+            'run; a larger gap retires the run before the next failure is '
+            'counted. Without this the streak is cumulative rather than '
+            'consecutive, so a slow drip of isolated failures accumulates '
+            'into a false storm. Must be >= 1. Measured on the MONOTONIC '
+            'clock, deliberately: clock skew is one of the failure modes this '
+            'seam must survive, so a wall-clock decay could be corrupted by '
+            'the very thing it detects. '
+            'A DERIVED bound, not a chosen number (task 3733). The previous '
+            '3600s was read off the session_resume_fallback burst signature '
+            '("~17 fallbacks inside one hour") — a population task 3728 '
+            'entirely carved out of the streak, leaving the number a stale '
+            'inheritance describing a feeder that no longer exists, and one '
+            'so narrow the escape could not fire at any threshold. It is '
+            're-derived against the population that actually feeds the streak '
+            '(session_resume_failed), and the bound is TWO-SIDED: the window '
+            'must be at least the smallest observed interval between two such '
+            'failures (below it nothing can ever chain), and small enough '
+            "that the longest run the measured NULL produces stays strictly "
+            'below fallback_storm_threshold. Neither side is a safety factor. '
+            'The derivation, its provenance and the guard that RE-DERIVES it '
+            'against live runs.db on every run live in '
+            'orchestrator/storm_window_bound.py and '
+            'orchestrator/tests/test_storm_window_bound.py — read the numbers '
+            'there rather than trusting this sentence, and re-derive before '
+            'retuning.'
         ),
     )
 
@@ -2664,6 +2679,21 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    streak_escalation_suppress_human_parked: bool = Field(
+        default=True,
+        description=(
+            'Skip the veto-streak L1 when the hold is escalation_pinned and '
+            'every record pinning the task is already an L2 in front of a '
+            'human. Without this the alarm re-fires forever on a queue where '
+            'L2s legitimately stay parked for days, since its trigger is '
+            'exactly "a human-facing escalation is still open" (re-filed twice '
+            'inside one hour on 2026-08-19; 27 of 94 pending records on '
+            '2026-08-31). Set to false to restore the pre-4541 behaviour. It '
+            'suppresses only the queue WRITE: recovery_vetoed rows and the '
+            'per-sweep summary line keep flowing, and a hold that includes '
+            'any unpromoted pin still alarms.'
+        ),
+    )
     landing_git_error_rate_per_hour: int = Field(
         default=10,
         ge=1,
@@ -3549,6 +3579,41 @@ class OrchestratorConfig(BaseSettings):
     # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
     # activated by the τ deterministic-deploy fleet restart.
     merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
+    # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
+    # skips the post-rebase re-verify when the branch's touched files and the
+    # intervening main delta are DISJOINT.  That inference needs two premises,
+    # and the overlap probe checks neither:
+    #
+    #   P1 (compositionality) — the gate's verdict decomposes over disjoint
+    #       file sets, i.e. every check it runs is diff-scoped.  A WHOLE-TREE
+    #       check (one whose whole premise is that an unrelated file can fail
+    #       you) violates P1 by construction.
+    #   P2 (the drift is itself green) — main at ``rebased_onto`` passes the
+    #       gate on its own.  Even a perfectly diff-scoped gate returns red on
+    #       a merge whose BASE is already red.
+    #
+    # When True (default) the fast path additionally requires P2 to be
+    # positively observed: ``rebased_onto`` must be a SHA this orchestrator's
+    # own merge queue landed, which is exactly the set of main tips a green
+    # gate run has been observed on.  Drift from ANY other writer — an
+    # unattended nightly job, a direct human commit, a push — has unknown
+    # health, so the rebase re-verifies.  Set False to restore the pre-fix
+    # behaviour (disjointness alone clears the gate) if the extra re-verifies
+    # ever have to be traded away under load; the P1 arm keyed on
+    # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
+    # because a project that has declared a whole-tree gate has declared the
+    # skip unsound outright.
+    #
+    # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
+    # section "Config reload vs restart").  Unlike its restart-only
+    # ``merge_verify_breadth`` neighbour this knob cannot split an in-flight
+    # merge's BREADTH — it only ever decides whether ONE more verify is run
+    # before an advance, is read fresh off ``req.config`` at each gate
+    # evaluation, and is a safety kill switch: a switch you can only pull by
+    # restarting the fleet is not a kill switch (the argument already written
+    # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
+    merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -3898,6 +3963,32 @@ class OrchestratorConfig(BaseSettings):
             'force_fire_after_secs + this. 0 disables. 10-min default.'
         ),
     )
+    # Max age of the in-flight fleet-redeploy lease (task 4755) before the
+    # orchestrator's own coordinator stops believing it. While
+    # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
+    # the coordinator stands down; the bound is what keeps a lease stranded by
+    # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
+    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
+    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
+    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
+    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
+    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
+    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # red-tier / restart-only, matching its siblings
+    # orchestrator_restart_merge_phase_grace_secs /
+    # orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_lease_max_age_secs: float = Field(
+        default=7200.0,
+        description=(
+            'Max age of the in-flight fleet-redeploy lease before the '
+            'orchestrator coordinator stops honouring it and redeploys anyway. '
+            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
+            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
+            'sweep delays at most one window. 2h default.'
+        ),
+    )
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
@@ -4187,6 +4278,28 @@ class OrchestratorConfig(BaseSettings):
             'over 10.5h on task 3717).  Conversion is NOT completion: the '
             'converted row keeps its pin, and its exit is a human or task '
             '3541 — never an automatic self-heal.'
+        ),
+    )
+
+    # Task 3542 — observe-before-enforce gate for the run()-exit contract, flat
+    # like its neighbour above: no `defaults.yaml` stanza and no
+    # `RELOADABLE_FIELDS` entry.  The canonical WHY is
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    #
+    # THE PROMOTION PATH:
+    #   1. OBSERVE.  With the default False, count the `would-violate` rows
+    #      (`workflow_exit_contract` events, verdict='violation', mode='log').
+    #   2. ENFORCE.  Task mu flips this default to True after the soak.
+    #   3. KEEP.  Unlike convert_to_blocked_enforce, never delete this field:
+    #      enforce is the steady state, and the log mode is its escape hatch.
+    workflow_exit_contract_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the run()-exit contract (task 3542; spec §5).  False — the '
+            'shipped default — is LOG MODE: a violating exit logs a '
+            '`would-violate` WARNING and emits a `workflow_exit_contract` event. '
+            'True also files one deduped L1 (category workflow_exit_contract). '
+            'In neither mode does the check write the task status or raise.'
         ),
     )
 
@@ -5754,6 +5867,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
         # it mid-process cannot split an in-flight merge's breadth.
         'verify_cross_check_remote_green',
+        # Disjoint-delta fast-path soundness gate (2026-09-22 whole-tree-drift
+        # incident) — green-tier for the same reason as its
+        # verify_cross_check_remote_green neighbour directly above: it only
+        # ever ADDS a re-verify before an advance, never changes an in-flight
+        # merge's breadth, and is read fresh off req.config at each gate
+        # evaluation.  A safety kill switch behind a restart is not one.
+        'merge_disjoint_skip_requires_verified_drift',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

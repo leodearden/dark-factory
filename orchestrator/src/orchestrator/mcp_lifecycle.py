@@ -15,6 +15,7 @@ from typing import Any
 
 import anyio
 import httpx
+from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.proc_group import terminate_process_group
 
@@ -453,59 +454,6 @@ async def verify_plan_tools_startup(
 
 
 # ---------------------------------------------------------------------------
-# jcodemunch-mcp launch contract (single source of truth for all projects)
-# ---------------------------------------------------------------------------
-
-# Prebuilt, version-pinned launcher on PATH (installed via
-# `uv tool install --python 3.13 jcodemunch-mcp==<pin>`; see
-# reify scripts/setup-dev.sh).  Named constants centralise the launch contract
-# so every project's mcp_config_json() injection references one definition and
-# a regression test can lock this against reverting to the unpinned uvx form.
-#
-# JCODEMUNCH_GIT_ROOT_IDENTITY=0: jcodemunch ships `git_root_identity: True`
-# as a DEFAULT, so any checkout with a `.git` and a parseable `origin`
-# resolves to the repo's single `<owner>/<repo>` index identity. A linked
-# worktree's `.git` FILE is treated like a directory and reads the SHARED
-# config, so every DF agent worktree of a repo collapses onto ONE identity —
-# the first writer claims that index and the upstream collision guard then
-# refuses all others, leaving them unindexed while the shared index reflects
-# whichever branch the first worktree happened to be on. '0' selects
-# per-worktree `local/<basename>-<sha1[:8]>` identity instead. The shared
-# jcodemunch-watcher systemd unit adopted this same lever on 2026-06-11 for
-# the same reason; this is the per-agent stdio path catching up.
-# Deprecated upstream ("will be removed in v2.0. Use config.jsonc instead."),
-# verified working at the installed 1.108.55 — a pin bump past v2.0 must
-# re-establish this lever via `"git_root_identity": false` in config.jsonc.
-# Note `"identity_mode": "local"` is NOT a substitute at 1.108.55: that key is
-# absent from the package's CONFIG_TYPES and is discarded silently despite
-# the shipped config template advertising it.
-# Shadowing risk: the env fallback is skipped for any key explicitly set in
-# ~/.code-index/config.jsonc. That host file does not currently set
-# git_root_identity, so this env var wins today — but a future host-config
-# edit could silently shadow this fix without any test going red.
-# Adoption precondition: this only stops NEW git-root indexes — jcodemunch's
-# resolve_index_identity (git_root.py) still returns a PRE-EXISTING legacy
-# "<owner>/<repo>" index if one is already on disk (e.g. reify's
-# ~/.code-index/leodearden-reify.db), making this env var INERT there until
-# `jcodemunch-mcp delete-index <owner>/<repo>` is run — see
-# scripts/jcodemunch-watcher.service.template's identical caveat. Dark
-# Factory has no such legacy index today, so the fix is effective here now.
-# Known gap: two sibling launch sites skip this lever and re-spell
-# command/args instead of importing these constants —
-# fused_memory/reconciliation/stages/base.py's recon-stage launch and
-# scripts/setup-host.sh's user-scope `claude mcp add` registration. Either
-# creating a legacy git-root index would silently re-collapse that repo's
-# worktrees per the precondition above, undermining this fix. Out of this
-# task's two-file scope; tracked at tkt_0RSRDYZ75MPVYJP76093P7PYWQ
-# (fused-memory site) and tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ (setup-host.sh site
-# + this compounding risk).
-JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
-JCODEMUNCH_ENV: dict[str, str] = {
-    'JCODEMUNCH_NO_VERSION_HINT': '1',
-    'JCODEMUNCH_GIT_ROOT_IDENTITY': '0',
-}
-
-# ---------------------------------------------------------------------------
 # Retry settings for transient MCP failures (e.g. server restarting).
 #
 # The attempt count and backoff schedule come from the shared
@@ -559,6 +507,41 @@ _RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
     httpx.NetworkError,
     OSError,
 )
+
+_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (TimeoutError, httpx.TimeoutException)
+_CAUSE_CHAIN_LIMIT = 20
+
+
+def is_timeout_failure(exc: BaseException) -> bool:
+    """Was *exc* caused, at any depth, by something timing out?
+
+    Inverts the wrap performed a few hundred lines below: ``_raw_call``
+    retries ``httpx.TimeoutException`` along with the rest of
+    ``_RETRYABLE_EXCEPTIONS`` and, on exhaustion, re-raises a plain
+    ``RuntimeError(...) from last_exc``. That erases the timeout from the
+    exception's TYPE while preserving it as ``__cause__`` — so a caller
+    holding the raised error cannot tell a service that is alive and slow
+    from one that is unreachable by an ``isinstance`` check, only by
+    unwrapping. This is that unwrap, and it lives here, beside the wrap it
+    inverts, so the pairing has one home (SPOT) and callers such as
+    ``agents/briefing.py`` need know nothing of httpx's exception taxonomy.
+
+    ``asyncio.TimeoutError`` is an alias of the builtin from 3.11 on, so
+    naming ``TimeoutError`` covers both. The walk is bounded and
+    cycle-guarded: ``__cause__`` is writable, so a chain can be circular,
+    and a diagnostic predicate must never be the thing that hangs a caller.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(_CAUSE_CHAIN_LIMIT):
+        if current is None or id(current) in seen:
+            return False
+        if isinstance(current, _TIMEOUT_EXCEPTIONS):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
 
 MCP_HEADERS = {
     'Content-Type': 'application/json',
@@ -1074,21 +1057,7 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                # jcodemunch: launch the PREBUILT, version-pinned tool installed
-                # via `uv tool install --python 3.13 jcodemunch-mcp==<pin>` (see
-                # reify scripts/setup-dev.sh). Invoking the installed launcher on
-                # PATH (~/.local/bin, same dir as the `uv`/`uvx` resolved above)
-                # avoids `uvx`'s per-launch re-resolve + from-source build of
-                # tree-sitter C-extension sdists, which under host load stalled
-                # agent startup past the 1200s wall — the 0-turn MCP-startup wedge
-                # (reify esc-4415-232). Missing prebuild now fails fast instead of
-                # hanging. JCODEMUNCH_NO_VERSION_HINT silences the stderr drift note.
-                # Launch contract is centralised in JCODEMUNCH_COMMAND/JCODEMUNCH_ENV
-                # (module constants above) so all projects share one source of truth.
-                'jcodemunch': {
-                    'command': JCODEMUNCH_COMMAND,
-                    'env': dict(JCODEMUNCH_ENV),
-                },
+                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:

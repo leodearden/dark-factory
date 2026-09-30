@@ -131,16 +131,38 @@ def test_the_tab_body_is_never_replaced_by_a_staleness_notice(app_jsx_body: str)
 def test_no_new_timer_is_introduced(app_jsx_body: str) -> None:
     """Re-rendering rides the EXISTING refresh signals.
 
-    `App` already re-renders on the `df-data-refresh` event the loader
-    dispatches every cycle, and on the 1s `now` tick while unpaused. A second
-    listener or a third timer would add load to a page whose connection budget
-    is already the subject of this task's `STALE_TIMEOUT_MS` change.
+    `App` re-renders on the `df-data-refresh` event the loader dispatches every
+    cycle, and that alone is the cadence the notices need: ages render at
+    second granularity and a banner only appears after STALE_FAILURE_THRESHOLD
+    consecutive failures. A second listener or a timer would add load to a page
+    whose connection budget is already the subject of this task's
+    `STALE_TIMEOUT_MS` change.
+
+    `App` must own NO timer at all. The single interval in this file belongs to
+    `LiveClock`, the leaf that renders the wall clock, and keeping it there is
+    what stops a once-a-second tick re-rendering the whole tree — no tab is
+    wrapped in `React.memo`, so an interval in `App()` re-renders the active
+    tab 60x a minute against a data rate of 20. Measured 2026-09-20: with
+    polling frozen entirely, that tick still accounted for two thirds of the
+    main thread's blocked time. A `setInterval` reappearing inside `App()` is
+    that regression, whoever adds it and for whatever reason.
     """
     body = _app_body(app_jsx_body)
 
-    assert body.count('setInterval') == 1, (
-        'App() must keep exactly ONE setInterval (the 1s `now` tick); the '
-        f'staleness indicator must not add another. Found {body.count("setInterval")}.'
+    assert body.count('setInterval') == 0, (
+        'App() must own NO setInterval: the staleness indicator rides the '
+        'df-data-refresh re-render, and the 1s wall clock belongs to LiveClock '
+        f'so it re-renders only the timestamp. Found {body.count("setInterval")} in App().'
+    )
+    whole = strip_js_comments(app_jsx_body)
+    assert whole.count('setInterval') == 1, (
+        "app.jsx must contain exactly ONE setInterval (LiveClock's 1s tick); "
+        f'found {whole.count("setInterval")}.'
+    )
+    clock = strip_js_comments(extract_function_body(app_jsx_body, 'LiveClock'))
+    assert clock and clock.count('setInterval') == 1, (
+        'the 1s tick must live in LiveClock() — that placement is the whole '
+        'point of the split, and a rename without moving the timer defeats it.'
     )
     # Counted on addEventListener alone: the existing effect both adds and
     # removes the listener, so the bare event name legitimately appears twice.

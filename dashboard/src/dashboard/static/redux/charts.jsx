@@ -2,6 +2,11 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name, which is safe here — see the CANONICAL note in datum.js's header;
+// the spark_path.js destructure below follows the same rule.
+const { datumView } = window.DF_DATUM;
+
 // The scale+path math for every chart primitive here lives in the plain-JS
 // sibling /static/redux/spark_path.js, where it is behaviourally testable under
 // `node --test` (dashboard/tests/js/spark_path.test.mjs) — this file is JSX
@@ -35,11 +40,9 @@ const PALETTE = {
   ok:      'oklch(0.74 0.14 155)',
   warn:    'oklch(0.80 0.14 80)',
   bad:     'oklch(0.68 0.18 25)',
-  // In-progress work with no live claimant. Named rather than inlined so the
-  // burndown stack and its legend cannot drift apart. Magenta because the
-  // band sits between `accent` (live, 230) and `bad` (blocked, 25) in the
-  // status-mix stack: reusing either would make the split unreadable, and a
-  // strand is a different failure from a block, not a worse one.
+  // census.py::TONES' infra-hold tone. Magenta so it reads apart from both
+  // `accent` (in-progress, 230) and `bad` (blocked, 25): work parked on an
+  // infrastructure hold is a different condition from a block, not a worse one.
   stranded: 'oklch(0.66 0.19 330)',
   info:    'oklch(0.62 0.20 305)',
   fg2:     'oklch(0.66 0.012 250)',
@@ -478,16 +481,61 @@ function Donut({ data, size = 120, thickness = 18, centerLabel, centerValue }) {
   );
 }
 
-function StatTile({ label, value, unit, delta, deltaDir, spark, sparkColor, hint }) {
+// How an age badge renders, in one place. An INLINE style rather than a new
+// `.datum-age` CSS rule: styles.css belongs to no leaf of this PRD, and the
+// repo already styles one-off annotations inline throughout these files. It
+// borrows the delta's own typography (mono, 10px, dim tertiary) because the two
+// sit side by side in the same row and are both secondary annotations on the
+// value above them — an age that shouted would read as the measurement.
+//
+// Exported on DF_CHARTS so shell.jsx::Pip states an age in the SAME shape
+// rather than hand-copying three literals, the drift MUTED_COLOR was extracted
+// to end in task_row_cells.js.
+const DATUM_AGE_STYLE = Object.freeze({ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--fg-3)' });
+
+// ── One KPI tile ──
+// `datum` is REQUIRED and must be a Datum: datumView asserts it, so a call site
+// that was missed during the migration throws by name in dev instead of
+// rendering an unprovenanced number that looks exactly like a measured one.
+// Wrap a value the server does not yet serve as a Datum with
+// plainDatum(value, endpointKey).
+//
+// THE TILE MAKES NO HOLE DECISION AND NO AGE DECISION. Both come back from the
+// one datumView call: `text` is the value cell with `format` and the lower-bound
+// prefix already applied, `title` is the producer's reason as a tooltip, and
+// `age` is the humanised displayed age — non-null only when there is something
+// to say about freshness. Before this, 43 call sites hand-rolled 14 different
+// `x == null ? '—' : f(x)` guards and the tile rendered whatever it was handed.
+//
+// `format` REPLACES those guards rather than joining them: datumView never
+// invokes it on a hole, which is what lets a call site delete its sentinel
+// instead of keeping two hole decisions per tile. charts.jsx::HBarChart records
+// why that, and not the placeholder, is the load-bearing half — its live call
+// sites pass formatters that throw on a missing value.
+//
+// `history` IS THE OLD `spark`, renamed. The series feeding the sparkline is a
+// history of measurements, not the datum-backed value beside it, and one prop
+// named `spark` next to a `sparkColor` read as though they were a pair. Its
+// falsy gate, and the `unit &&` / `delta &&` / `hint &&` gates, are unchanged —
+// a call site passing `unit=""` deliberately still suppresses the span.
+//
+// The age badge sits beside the delta, in the same row: both are secondary
+// annotations on the value above them, and putting the age there costs the
+// value cell no width when there is nothing to badge.
+function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint }) {
+  const view = datumView(datum, { now: Date.now(), format });
   return (
     <div className="kpi">
       <div className="lbl">{label}{hint && <span style={{ color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0, fontSize: 10 }}> · {hint}</span>}</div>
-      <div className="val">{value}{unit && <span className="unit">{unit}</span>}</div>
+      <div className="val" title={view.title || undefined}>{view.text}{unit && <span className="unit">{unit}</span>}</div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 6 }}>
         <div className="spark" style={{ height: 22 }}>
-          {spark && <Sparkline values={spark} color={sparkColor || PALETTE.accent} />}
+          {history && <Sparkline values={history} color={sparkColor || PALETTE.accent} />}
         </div>
-        {delta && <span className={`delta ${deltaDir || 'flat'}`}>{deltaDir === 'up' ? '▲' : deltaDir === 'down' ? '▼' : '·'} {delta}</span>}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {view.age && <span style={DATUM_AGE_STYLE} title={view.title || undefined}>{view.age}</span>}
+          {delta && <span className={`delta ${deltaDir || 'flat'}`}>{deltaDir === 'up' ? '▲' : deltaDir === 'down' ? '▼' : '·'} {delta}</span>}
+        </span>
       </div>
     </div>
   );
@@ -559,10 +607,11 @@ function defaultSmoothingForWindow(windowKey) {
 // the window's left boundary is non-decreasing as i advances, so `left` only
 // ever moves forward.
 //
-// Cf. dailyDeltas() in shell.jsx — related but distinct: dailyDeltas buckets by
-// calendar day, clamps rates to >=0, and returns N-1 entries (day-to-day diff).
-// deriveVelocitySeries uses a configurable trailing time window, allows negative
-// rates (backlog can shrink), and returns N entries aligned to each sample.
+// Cf. burndown.py::compute_window_completion's `completed_per_day` — related
+// but distinct: the server buckets by calendar day, clamps each day's gain at 0
+// and serves one entry per ISO day. deriveVelocitySeries uses a configurable
+// trailing time window, allows negative rates (backlog can shrink), and returns
+// N entries aligned to each sample.
 function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
   const t = labels.map(l => {
@@ -584,4 +633,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };

@@ -51,7 +51,14 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, hangs_until, passes
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import (  # noqa: F401
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -773,7 +780,7 @@ async def _spec_lane_git_ops(
     # see the storage is really there (git_ops.py::GitOps.acquire_spec_lane).
     git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     git_ops.mark_pool_storage_present()
-    return git_ops, OrchestratorConfig(project_root=repo, git=git_config)
+    return git_ops, lane_scene_config(repo, git_config)
 
 
 class _AdvanceFailingGitOps(GitOps):
@@ -1520,7 +1527,7 @@ class TestLateArrivalAttaches:
         )
 
         # ── Build branches ─────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late1-a', 'late1_a.py', 'a = 1\n',
         )
@@ -1725,7 +1732,7 @@ class TestLateArrivalCleanCAS:
         )
 
         # ── Build branches (disjoint files) ──────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late3-a', 'late3_a.py', 'a = 1\n',
         )
@@ -1925,7 +1932,7 @@ class TestLateArrivalFailCascade:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
         )
@@ -2006,6 +2013,7 @@ class TestLateArrivalFailCascade:
         assert outcome_a.status != 'done', (
             f'A must NOT land (verify failed); got outcome_a={outcome_a!r}'
         )
+        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
 
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).
@@ -2129,7 +2137,7 @@ class TestLateArrivalGuards:
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='fallback7-laptop')
 
         # ── Build branches ────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/guard7-a', 'guard7_a.py', 'a = 1\n',
         )
@@ -2218,7 +2226,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='depth7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/dk7-a', 'dk7_a.py', 'a = 1\n',
         )
@@ -2310,7 +2318,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='sv7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/sv7-a', 'sv7_a.py', 'a = 1\n',
         )
@@ -2399,7 +2407,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='k1-7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/k1-7-a', 'k1_7_a.py', 'a = 1\n',
         )
@@ -2526,7 +2534,7 @@ class TestLateArrivalGuards:
             gate_b_prerelease, passed=True, name='shutdown-guard-laptop',
         )
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/shutdown-guard-a', 'shutdown_guard_a.py', 'a = 1\n',
         )
@@ -2697,7 +2705,7 @@ class TestLateArrivalSubmissionOrderCAS:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/cas8-a', 'cas8_a.py', 'a = 1\n',
         )
@@ -3052,8 +3060,8 @@ class TestTimeoutMarkCoverage:
 # lone `MagicMock(passed=True)` — recorded and pinned in
 # fused-memory/tests/test_check_bare_magicmock_config.py::
 # TestRuleBCoversMergeSpeculation, which also holds the two-sided proof that the
-# rule reaches this module. This module is deliberately absent from the rule's
-# _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
+# rule reaches this module. Rule B has no debt baseline at all (task 4354), so a
+# regression here fails the gate.
 #
 # The single deliberate bare double below keeps a per-site
 # `bare-dataclass-double` noqa pragma, which is now its SOLE suppression.
@@ -3153,15 +3161,15 @@ class TestDispositionDoubleFidelity:
         (fused-memory/scripts/check_bare_magicmock_config.py, task 4016).  The
         file-local scope exemption that used to pair with it was deleted in task
         4246 along with the duplicate guard it belonged to.  That single pragma
-        is not a licence to add another bare double here: every other one in this
-        module is still covered, because the module is deliberately OFF the
-        rule's _DATACLASS_DOUBLE_DEBT baseline.
+        is not a licence to add another bare double here: a pragma suppresses the
+        one site it sits above, and Rule B has no per-file baseline that could
+        cover the rest (task 4354).
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # This module is deliberately OFF _DATACLASS_DOUBLE_DEBT, so the pragma
-        # below is a per-SITE suppression and every other double here stays covered.
+        # The pragma below is a per-SITE suppression — Rule B has no per-file
+        # baseline — so every other double in this module stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',

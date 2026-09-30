@@ -1,5 +1,7 @@
 """Tests for reconciliation journal (SQLite persistence)."""
 
+import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -18,7 +20,10 @@ from fused_memory.models.reconciliation import (
     VerdictSeverity,
     Watermark,
 )
-from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.journal import (
+    REPAIRABLE_RUN_STATUSES,
+    ReconciliationJournal,
+)
 from fused_memory.services.memory_service import MemoryService
 
 
@@ -327,7 +332,7 @@ async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
 @pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
-    db = journal._require_db()
+    db = journal._require_access().connection
     async with db.execute('PRAGMA table_info(runs)') as cursor:
         rows = await cursor.fetchall()
     colnames = {row['name'] for row in rows}
@@ -931,6 +936,528 @@ class TestExtractTarget:
         assert _extract_target({'result_summary': 'not json'}) == '?'
 
 
+class TestGetRunWithStageReportsText:
+    """The CAS read primitive: one row read yields BOTH the parsed run and the
+    exact stored ``runs.stage_reports`` text used as a compare-and-set token.
+
+    The token must be the bytes actually in the column — not a re-serialization
+    of the parsed run — so the CAS in ``compare_and_set_run_stage_reports``
+    cannot fail spuriously the day the DB-text → parsed → model_dump → json.dumps
+    round-trip stops being byte-identical.
+    """
+
+    @staticmethod
+    async def _seed(journal, *, stage_reports=None) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        if stage_reports is not None:
+            await journal.update_run_stage_reports(run_id, stage_reports)
+        return run_id
+
+    @staticmethod
+    async def _raw_stage_reports(journal, run_id: str):
+        """Read the column directly, bypassing every parsing layer."""
+        row = await journal._require_access().read_one(
+            'SELECT stage_reports FROM runs WHERE id = ?', (run_id,)
+        )
+        return None if row is None else row['stage_reports']
+
+    @pytest.mark.asyncio
+    async def test_returns_the_parsed_run_and_the_exact_stored_text(self, journal):
+        now = datetime.now(UTC)
+        report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=now,
+            completed_at=now,
+            stats={'created': 1, 'deleted': 2},
+            llm_calls=3,
+            tokens_used=500,
+        )
+        run_id = await self._seed(journal, stage_reports={'memory_consolidator': report})
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        # The parsed half matches what get_run() would have handed back.
+        via_get_run = await journal.get_run(run_id)
+        assert run.id == via_get_run.id
+        assert run.project_id == via_get_run.project_id
+        assert run.status == via_get_run.status
+        assert set(run.stage_reports) == set(via_get_run.stage_reports)
+        assert (
+            run.stage_reports['memory_consolidator'].model_dump(mode='json')
+            == via_get_run.stage_reports['memory_consolidator'].model_dump(mode='json')
+        )
+
+        # The token half is the column value byte-for-byte. Compared against a
+        # raw SELECT, NOT against a re-serialized round-trip — the whole point
+        # of the primitive is that it does not depend on round-trip stability.
+        assert text == await self._raw_stage_reports(journal, run_id)
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_returns_none(self, journal):
+        assert await journal.get_run_with_stage_reports_text('nonexistent-id') is None
+
+    @pytest.mark.asyncio
+    async def test_never_written_stage_reports_is_carried_through_as_is(self, journal):
+        """The token is passed through untouched so it can be fed straight back
+        into the CAS — no normalising, no defaulting."""
+        run_id = await self._seed(journal)
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        assert text == await self._raw_stage_reports(journal, run_id)
+        assert run.stage_reports == {}
+
+
+class TestCompareAndSetRunStageReports:
+    """The serialised half of a read-modify-write of the WHOLE stage_reports
+    blob: the write applies only if the column still holds the exact text the
+    caller read, so a competing wholesale rewrite is refused rather than
+    silently clobbered.
+    """
+
+    @staticmethod
+    async def _seed(journal) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(run_id, {'seed': {'findings': []}})
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_fresh_token_applies(self, journal):
+        run_id = await self._seed(journal)
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        run.stage_reports['seed']['findings'].append({'id': 'f-1'})
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, run.stage_reports, expected_text=token
+            )
+            is True
+        )
+
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+    @pytest.mark.asyncio
+    async def test_stale_token_refuses_and_writes_nothing(self, journal):
+        """Lost-update prevention proper: assert BOTH the refusal and that no
+        partial write landed."""
+        run_id = await self._seed(journal)
+
+        mine, token = await journal.get_run_with_stage_reports_text(run_id)
+        mine.stage_reports['seed']['findings'].append({'id': 'mine'})
+
+        # A competing writer lands, from its own separately-read copy.
+        theirs = await journal.get_run(run_id)
+        theirs.stage_reports['seed']['findings'].append({'id': 'theirs'})
+        await journal.update_run_stage_reports(run_id, theirs.stage_reports)
+        competitors_blob = await journal.get_run(run_id)
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, mine.stage_reports, expected_text=token
+            )
+            is False
+        )
+
+        after = await journal.get_run(run_id)
+        assert after.stage_reports == competitors_blob.stage_reports
+        assert after.stage_reports['seed']['findings'] == [{'id': 'theirs'}]
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                'nonexistent-id', {'seed': {}}, expected_text='{}'
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_null_token_round_trips(self, journal):
+        """A NULL stage_reports column is CASable with expected_text=None,
+        proving the comparison is NULL-safe (``IS``) rather than silently
+        never matching."""
+        run_id = await self._seed(journal)
+        async with journal._require_access().write() as db:
+            await db.execute('UPDATE runs SET stage_reports = NULL WHERE id = ?', (run_id,))
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        assert token is None
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, {'seed': {'findings': [{'id': 'f-1'}]}}, expected_text=token
+            )
+            is True
+        )
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+
+class TestCompleteRunIfStatus:
+    """One-statement terminalisation for a caller acting on a row image it read
+    earlier: the write applies only if the row still holds the status that read
+    observed, so a run whose own coroutine terminalised it in between is left
+    exactly as its owner wrote it.
+    """
+
+    @staticmethod
+    async def _seed(journal, status: RunStatus = RunStatus.running) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                    stats={'created': 1},
+                )
+            },
+        )
+        if status != RunStatus.running:
+            await journal.complete_run(run_id, status)
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_matching_status_terminalises_reports_status_and_completed_at_together(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+        reports = dict(stale.stage_reports)
+        reports['_error'] = {'error_type': 'stale_run', 'message': 'reaped'}
+
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status=RunStatus.failed,
+            stage_reports=reports,
+        )
+
+        assert applied is True
+        after = await journal.get_run(run_id)
+        assert after.status == RunStatus.failed
+        assert after.completed_at is not None
+        assert after.stage_reports == reports
+
+    @pytest.mark.asyncio
+    async def test_mismatched_status_refuses_and_leaves_the_row_byte_identical(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+
+        # The run's own coroutine terminalises it.
+        owners = dict(stale.stage_reports)
+        owners['owner_marker'] = {'written_by': 'owner'}
+        await journal.update_run_stage_reports(run_id, owners)
+        await journal.complete_run(run_id, 'completed')
+        _, owners_text = await journal.get_run_with_stage_reports_text(run_id)
+        owners_row = await journal.get_run(run_id)
+
+        reaper_reports = dict(stale.stage_reports)
+        reaper_reports['_error'] = {'error_type': 'stale_run'}
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status='failed',
+            stage_reports=reaper_reports,
+        )
+
+        assert applied is False
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == owners_text
+        assert after.status == owners_row.status == RunStatus.completed
+        assert after.completed_at == owners_row.completed_at
+
+    @pytest.mark.asyncio
+    async def test_interrupted_expected_status_is_honoured(self, journal):
+        refused_id = await self._seed(journal, RunStatus.interrupted)
+        applied_id = await self._seed(journal, RunStatus.interrupted)
+
+        refused = await journal.complete_run_if_status(
+            refused_id,
+            expected_status=RunStatus.running,
+            status=RunStatus.failed,
+            stage_reports={},
+        )
+        applied = await journal.complete_run_if_status(
+            applied_id,
+            expected_status=RunStatus.interrupted,
+            status=RunStatus.failed,
+            stage_reports={},
+        )
+
+        assert refused is False
+        assert (await journal.get_run(refused_id)).status == RunStatus.interrupted
+        assert applied is True
+        assert (await journal.get_run(applied_id)).status == RunStatus.failed
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.complete_run_if_status(
+                'nonexistent-id',
+                expected_status=RunStatus.running,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'expected_status',
+        [
+            *sorted(REPAIRABLE_RUN_STATUSES),
+            pytest.param(RunStatus.completed.value, id='bare-str-completed'),
+        ],
+    )
+    async def test_a_status_citation_repair_writes_under_raises_before_writing(
+        self, journal, expected_status
+    ):
+        """This write does not carry citation repairs forward, so gating it on a
+        status a repair may already have written under would let it erase one."""
+        run_id = await self._seed(journal, RunStatus(expected_status))
+        before, before_text = await journal.get_run_with_stage_reports_text(run_id)
+
+        with pytest.raises(ValueError, match='expected_status'):
+            await journal.complete_run_if_status(
+                run_id,
+                expected_status=expected_status,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == before_text
+        assert after.status == before.status
+        assert after.completed_at == before.completed_at
+
+
+class TestUpdateRunStageReportsPreservesCitationRepairs:
+    """The run owner's wholesale rewrite never erases a citation repair a
+    compare-and-set writer persisted: the owner's copy predates the repair, so
+    writing it back verbatim would silently undo an audit write that was
+    already reported ``repaired``.
+    """
+
+    @staticmethod
+    def _citation(memory_id: str) -> dict:
+        return {'memory_id': memory_id, 'store': 'mem0'}
+
+    @staticmethod
+    def _repair_record(memory_id: str, replacement: str) -> dict:
+        return {
+            'memory_id': memory_id,
+            'replacement_memory_id': replacement,
+            'store': 'mem0',
+            'reason': 'memory_not_found',
+            'justification': None,
+            'repaired_by': 'run:test',
+            'repaired_at': datetime.now(UTC).isoformat(),
+        }
+
+    async def _seed_completed(self, journal) -> tuple[str, StageReport]:
+        """A completed run whose integrity_check report flags f-1 (citing A)
+        and f-2 (citing B). Returns the run id and the owner's own copy of
+        that report, as the owner held it before any repair."""
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=now,
+            completed_at=now,
+            items_flagged=[
+                {'finding_id': 'f-1', 'cited_memories': [self._citation('A')]},
+                {'finding_id': 'f-2', 'cited_memories': [self._citation('B')]},
+            ],
+            stats={'flagged': 2},
+        )
+        await journal.update_run_stage_reports(run_id, {'integrity_check': report})
+        await journal.complete_run(run_id, 'completed')
+        return run_id, report.model_copy(deep=True)
+
+    async def _repaired_copy(self, journal, run_id: str) -> tuple[dict, str | None, dict]:
+        """Read (run, token) and re-point f-1 from A to C with one provenance
+        record, as citation_repair does. Returns the repaired stage_reports,
+        the token they were read under, and the record."""
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        record = self._repair_record('A', 'C')
+        f1 = run.stage_reports['integrity_check'].items_flagged[0]
+        f1['cited_memories'] = [self._citation('C')]
+        f1['citation_repairs'] = [record]
+        return run.stage_reports, token, record
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_carries_a_persisted_repair_forward(self, journal):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'written after the repair'
+
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1, f2 = after.items_flagged
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert f2 == owner_copy.items_flagged[1]
+        assert after.stats['owner_marker'] == 'written after the repair'
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_without_persisted_repairs_is_a_plain_wholesale_write(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'plain rewrite'
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert stored_text == json.dumps(
+            {'integrity_check': owner_copy.model_dump(mode='json')}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_repair_landing_between_the_owner_read_and_write_survives(
+        self, journal
+    ):
+        """With the owner first in ``gather``, the owner's read takes the
+        AtomicConnection lock without suspending and then suspends on the
+        aiosqlite hop. The competitor queues on the lock and wins it FIFO
+        before the owner's compare-and-set, so the owner's first CAS is refused
+        and its retry must carry the repair forward. Whatever the interleaving,
+        the asserted end state is the property.
+        """
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'raced the repair'
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+
+        _, competitor_applied = await asyncio.gather(
+            journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy}),
+            journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            ),
+        )
+
+        assert competitor_applied is True
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1 = after.items_flagged[0]
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert after.stats['owner_marker'] == 'raced the repair'
+
+    @pytest.mark.asyncio
+    async def test_a_finding_the_owner_copy_no_longer_carries_is_left_alone(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        repaired, token, _ = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+        owner_copy.items_flagged = [owner_copy.items_flagged[1]]
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        assert after.items_flagged == owner_copy.items_flagged
+
+    @pytest.mark.asyncio
+    async def test_a_row_changing_under_every_attempt_raises_having_written_nothing(
+        self, journal, monkeypatch
+    ):
+        """A competitor commits between each of the owner's reads and its
+        compare-and-set, so every attempt is genuinely refused. The owner gives
+        up loudly, and its copy never lands — not even as a last-resort
+        unconditional write."""
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'must never land'
+        real_compare_and_set = journal._compare_and_set_stage_reports_text
+        competitor_texts: list[str] = []
+
+        async def a_competitor_commits_first(run_id_, text, *, expected_text):
+            _, current = await journal.get_run_with_stage_reports_text(run_id_)
+            competitor = json.loads(current)
+            competitor['competitor'] = {'write': len(competitor_texts)}
+            competitor_texts.append(json.dumps(competitor))
+            assert await real_compare_and_set(
+                run_id_, competitor_texts[-1], expected_text=current
+            )
+            return await real_compare_and_set(run_id_, text, expected_text=expected_text)
+
+        monkeypatch.setattr(
+            journal, '_compare_and_set_stage_reports_text', a_competitor_commits_first
+        )
+
+        with pytest.raises(RuntimeError, match=run_id):
+            await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert competitor_texts
+        assert stored_text == competitor_texts[-1]
+        assert 'must never land' not in stored_text
+
+
 class TestGetRunStageExecution:
     """The narrow runs-table read behind typed cycle-summary absence (task 3731).
 
@@ -1167,11 +1694,11 @@ class TestGetRunStageExecution:
         confident answer the indeterminate ``stage_ran`` exists to withhold."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
-        db = journal._require_db()
-        await db.execute(
-            'UPDATE runs SET stage_reports = ? WHERE id = ?', ('["not", "a", "dict"]', run_id),
-        )
-        await db.commit()
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?',
+                ('["not", "a", "dict"]', run_id),
+            )
 
         execution = await journal.get_run_stage_execution(
             'test-project', run_id, 'task_knowledge_sync'
@@ -1215,10 +1742,10 @@ class TestGetRunStageExecution:
         data-loss finding — so it reports ``None`` and logs a WARNING."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
-        await journal._db.execute(
-            'UPDATE runs SET stage_reports = ? WHERE id = ?', ('not json', run_id)
-        )
-        await journal._db.commit()
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?', ('not json', run_id)
+            )
 
         with caplog.at_level('WARNING'):
             execution = await journal.get_run_stage_execution(

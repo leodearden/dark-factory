@@ -616,11 +616,11 @@ class TestRetentionCliff:
         # completion timestamp is stamped directly here instead. Otherwise the
         # run would age from real-now while the reader is handed an injected
         # `now` in the past, and the retention comparison would be meaningless.
-        await journal._db.execute(
-            "UPDATE runs SET status = 'completed', completed_at = ? WHERE id = ?",
-            ((completed_at or started).isoformat(), run_id),
-        )
-        await journal._db.commit()
+        async with journal._require_access().write() as db:
+            await db.execute(
+                "UPDATE runs SET status = 'completed', completed_at = ? WHERE id = ?",
+                ((completed_at or started).isoformat(), run_id),
+            )
 
     @pytest.mark.asyncio
     async def test_reaped_row_is_expired_not_missing(self, mock_config, tmp_path):
@@ -742,12 +742,11 @@ class TestRetentionCliff:
         try:
             run_id = 'run-with-a-naive-timestamp'
             await self._record_run(journal, run_id, stage_ran=True)
-            db = journal._require_db()
-            await db.execute(
-                'UPDATE runs SET started_at = ?, completed_at = NULL WHERE id = ?',
-                (self._T0.replace(tzinfo=None).isoformat(), run_id),
-            )
-            await db.commit()
+            async with journal._require_access().write() as db:
+                await db.execute(
+                    'UPDATE runs SET started_at = ?, completed_at = NULL WHERE id = ?',
+                    (self._T0.replace(tzinfo=None).isoformat(), run_id),
+                )
 
             inside = await service.get_cycle_summary_presence(
                 project_id=_PROJECT_ID,

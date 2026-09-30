@@ -7,41 +7,20 @@ test_audit_found_on_main_provenance.py / test_audit_duplicate_tasks.py.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load correct_found_on_main_backlog.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'correct_found_on_main_backlog'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='correct_found_on_main_backlog')
 Correction = _mod.Correction
 REOPEN_DISPOSITIONS = _mod.REOPEN_DISPOSITIONS
 BENIGN_DISPOSITIONS = _mod.BENIGN_DISPOSITIONS

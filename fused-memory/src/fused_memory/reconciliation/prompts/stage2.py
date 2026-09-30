@@ -3,6 +3,9 @@
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    render_graphiti_degradation_probe_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -16,9 +19,12 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
+    render_entity_standing_decision_write_section,
     render_escalation_boundary_note,
     render_finding_provenance_section,
 )
@@ -216,6 +222,8 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
+{CITATION_REPAIR_TOOL_BLOCK}
+
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## Provenance rules for "shipped via X" edges
@@ -324,6 +332,8 @@ conclusion as a novel finding to capture. The decision was made first, then impl
 re-capturing the outcome inverts the record and fabricates a "finding" that was never \
 new information.
 
+{REFERENT_DECLARATION_GUIDANCE}
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
@@ -342,7 +352,11 @@ report ambiguous or missing data):
   that marker un-acknowledged (see `_acknowledge_resolved_stage1_markers`).
 - `stage1_mem0_flags_processed`: count of Mem0 `flag_for_stage2=true` markers that \
   you processed and deleted via FIX C during this cycle. Must equal \
-  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle.
+  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle. \
+  Like `stage1_analytical_findings_processed` below, this value is purely \
+  self-reported — the framework applies no cross-check or correction to it, and \
+  `flag_deleted_records` feeds only the Stage 1 marker acknowledgment described \
+  above, never a repair of this counter — so its accuracy is on you.
 - `stage1_analytical_findings_processed`: count of Stage 1's structured \
   `flagged_items` (analytical findings) that you reviewed this cycle. This equals \
   the number of items from the "Stage 1 Flagged Items" section that you acted on \
@@ -352,13 +366,18 @@ report ambiguous or missing data):
 - `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
   "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
   one per confirmed task creation (see `## Task-Creation Accounting` below). The \
-  framework treats this list as the ground-truth source for `tasks_created` and \
-  repairs the counter upward when the two disagree.
+  framework CORROBORATES each record before using it: it looks the `task_id` up \
+  via `get_task` against the root of the record's own `project_id`, and repairs \
+  `tasks_created` upward only to the number of records whose task is confirmed to \
+  exist. A record naming a task that cannot be confirmed will NOT raise the \
+  counter, so record only creations you actually made.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
 (`stage1_analytical_findings_processed`) or both — count it in each dimension where \
 it was actually processed.
+
+{render_graphiti_degradation_probe_section(runs_probes=True)}
 
 {render_cycle_summary_section()}
 
@@ -507,6 +526,21 @@ current metadata, convert and merge the reshaped hints into it locally, then wri
 COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
 key while replacing only the legacy hint shape.
 
+`append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
+to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
+any of them with `append=True` is now REJECTED by the backend with a \
+`TASKMASTER_TOOL_ERROR` (`error_type` `AppendUnsupportedFieldError`) naming the offending \
+field. Before that guard the pair was accepted silently and OVERWROTE the column: a \
+caller who passed `description='\\n\\n--- addendum ---'` with `append=True` believing they \
+were extending the field destroyed the entire original description instead, with no error \
+and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
+as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
+project_root=<project_root>)` to read the FULL current text, concatenate your addition \
+locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
+genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
+it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
+`update_task` call.
+
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
@@ -599,6 +633,8 @@ not apply and you should treat the finding as a normal finding and act on it.
 {render_entity_standing_decision_schema_section()}
 
 {render_investigation_outcome_section()}
+
+{render_entity_standing_decision_write_section()}
 
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
@@ -782,10 +818,12 @@ lifecycle.
    `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
    cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
    "## Source-Completion" section is the authority for that canonical key and its \
-   read-side aliases). AMEND HAZARD: `update_task`'s `append=True` governs only \
-   `details` / `prompt` and does NOT append `description`, which always overwrites — \
-   so to extend a description, READ the current text first, write the full merged \
-   text, and verify the echoed `updated_task` reflects it. Re-filing is not an escape \
+   read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
+   amending one is a read-modify-write — READ the current text first, then write the \
+   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
+   reflects it. Pairing `description` with `append=True` is REJECTED; the \
+   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
+   and is the authority for it. Re-filing is not an escape \
    from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
    whose carrier is still non-terminal.
 

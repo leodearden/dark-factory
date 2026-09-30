@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _escalation_seed import seed_escalation
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
@@ -261,18 +262,13 @@ class TestGetPendingLevelFilter:
     """get_pending_escalations(level=N) filters by escalation level."""
 
     def _seed_esc(self, queue: EscalationQueue, task_id: str, level: int) -> Escalation:
-        """Seed a pending escalation at the given level directly via queue.submit()."""
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='implementer',
-            severity='blocking',
-            category='scope_violation',
+        """Delegates to ``seed_escalation`` with this class's default summary,
+        kept as a method with this positional shape so existing call sites stay
+        unchanged."""
+        return seed_escalation(
+            queue, level=level, task_id=task_id,
             summary=f'level={level} test escalation',
-            level=level,
         )
-        queue.submit(esc)
-        return esc
 
     @pytest.mark.asyncio
     async def test_filter_level2_returns_only_l2(self, tmp_path: Path):
@@ -3474,6 +3470,254 @@ class TestPromoteToL2Cascade:
         assert m2 is not None
         assert m1.status == 'dismissed', f'Expected m1 dismissed, got {m1.status!r}'
         assert m2.status == 'dismissed', f'Expected m2 dismissed, got {m2.status!r}'
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2SentinelIdentity — task 4541 RC#3
+# ---------------------------------------------------------------------------
+
+_STREAK_SENTINEL_5469 = '__recovery_veto_streak__5469'
+_STREAK_SENTINEL_7000 = '__recovery_veto_streak__7000'
+
+
+def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
+    """Seed a pending recovery-veto-streak alarm L1, filed the way the orchestrator files it."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=sentinel,
+        agent_role='orchestrator-recovery-veto-streak',
+        severity='blocking',
+        category='risk_identified',
+        summary='recovery veto streak alarm',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+class TestPromoteToL2SentinelIdentity:
+    """A cluster of sentinel-bound records is minted under a member's own sentinel id.
+
+    esc-5469-11: the auto-watcher wrapped a streak alarm filed under
+    ``__recovery_veto_streak__5469`` in an L2 minted under the REAL id
+    ``'5469'``.  Every veto predicate reads that id, so the alarm about the hold
+    became part of the hold.  The server refuses such a create
+    (``code: 'sentinel_task_id_required'``), judged over RESOLVED members' agent
+    roles only, and never constrains the fold path, where nothing is minted
+    under the caller's task_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sentinel_only_cluster_under_real_id_mints_nothing(self, tmp_path: Path):
+        """(a) ACCEPTANCE — the esc-5469-11 shape is refused and leaves no trace."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        member_before = queue.get('esc-streak-5469-1')
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert 'error' in result
+        assert _STREAK_SENTINEL_5469 in result['error']
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469]
+        assert queue.get_by_task('5469', status='pending') == []
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+        assert queue.get('esc-streak-5469-1') == member_before
+
+    @pytest.mark.asyncio
+    async def test_sentinel_only_cluster_under_its_sentinel_id_is_created(self, tmp_path: Path):
+        """(b) The SKILL.md template's exact call mints the L2 under the sentinel."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _STREAK_SENTINEL_5469,
+                'member_ids': ['esc-streak-5469-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == _STREAK_SENTINEL_5469
+        assert minted.level == 2
+
+    @pytest.mark.asyncio
+    async def test_cross_task_cluster_under_real_id_names_every_sentinel(self, tmp_path: Path):
+        """(c) Members from two sentinels: the refusal names both, sorted."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-7000-1', 'esc-streak-5469-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469, _STREAK_SENTINEL_7000]
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('chosen', [_STREAK_SENTINEL_5469, _STREAK_SENTINEL_7000])
+    async def test_cross_task_cluster_accepts_either_sentinel(
+        self, tmp_path: Path, chosen: str,
+    ):
+        """(c cont.) Any member's own sentinel id is an acceptable mint target."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': chosen,
+                'member_ids': ['esc-streak-5469-1', 'esc-streak-7000-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == chosen
+
+    @pytest.mark.asyncio
+    async def test_mixed_cluster_under_real_id_is_created(self, tmp_path: Path):
+        """(d) An ordinary member justifies a real-task filing, so the guard stands aside."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_l1(queue, 'esc-5469-3', '5469')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-5469-3'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == '5469'
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_members_are_unconstrained(self, tmp_path: Path):
+        """(e) FAIL-OPEN — an unreadable id proves nothing and never blocks a promote."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-ghost-1']},
+        )
+
+        assert result.get('status') == 'created', result
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_sibling_does_not_unbind_a_sentinel_member(
+        self, tmp_path: Path,
+    ):
+        """(e cont.) The judgement ranges over RESOLVED members only."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-ghost-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_STREAK_SENTINEL_5469]
+
+    @pytest.mark.asyncio
+    async def test_fold_into_existing_l2_ignores_the_callers_task_id(self, tmp_path: Path):
+        """(f) FOLD UNTOUCHED — nothing is minted under the caller's task_id on a fold."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_streak_alarm(queue, 'esc-streak-5469-2', _STREAK_SENTINEL_5469)
+        root_cause = 'recovery-veto-streak-noise-from-pending-l2-pin:esc-5469-9'
+        first = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _STREAK_SENTINEL_5469,
+                'member_ids': ['esc-streak-5469-1'],
+                'root_cause': root_cause,
+            },
+        )
+        assert first.get('status') == 'created', first
+
+        second = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-2'],
+                'root_cause': root_cause,
+            },
+        )
+
+        assert second.get('status') == 'updated', second
+        assert second['id'] == first['id']
+        assert queue.get_by_task('5469', status='pending') == []
+
+    @pytest.mark.asyncio
+    async def test_identity_gate_still_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(g) GATE ORDER — a disallowed identity is denied before this guard runs."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        monkeypatch.setattr(
+            escalation_server,
+            'get_http_headers',
+            lambda: {'x-escalation-identity': 'not-a-promote-identity'},
+        )
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
+        )
+
+        assert result.get('code') == 'level_forbidden', result
+
+    @pytest.mark.asyncio
+    async def test_empty_member_ids_error_still_wins(self, tmp_path: Path):
+        """(g cont.) Cheap validation is still reported before this guard."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': []},
+        )
+
+        assert 'error' in result, result
+        assert result.get('code') != 'sentinel_task_id_required', result
 
 
 # ---------------------------------------------------------------------------
@@ -7081,8 +7325,8 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
     escalate_blocker's docstring says "``level`` echoes the level actually
     persisted, so a caller that passed ``level=1`` can confirm it landed".  A
     caller written to that contract (``result['level'] == 1``) must not hit a
-    KeyError on any branch — least of all the degraded fail-open branch, which
-    exists precisely to survive the race where a re-read is unavailable.
+    KeyError on any branch — least of all the degraded unpersisted branch,
+    which is reached in exactly the race where a re-read is unavailable.
     """
 
     @pytest.mark.asyncio
@@ -7096,12 +7340,13 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
 
     @pytest.mark.asyncio
-    async def test_fail_open_branch_still_echoes_level(self, tmp_path: Path):
+    async def test_unpersisted_branch_still_echoes_level(self, tmp_path: Path):
         """A post-write re-read that RAISES still yields a response carrying level.
 
-        This is the degraded path the fail-open exists for: the filing must be
-        reported as queued rather than lost, and the contract-following caller
-        must still be able to read ``level``.
+        The degraded path reports ``accepted_unpersisted`` rather than laundering
+        an unconfirmed write into a 'queued' confirmation (task 5368) — but the
+        contract-following caller must still be able to read ``level``, which is
+        the invariant this test has always been about.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -7117,9 +7362,11 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         finally:
             queue.get = real_get  # type: ignore[method-assign]
 
-        assert result.get('status') == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result.get('status') == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert result.get('level') == 1, (
-            f'The fail-open branch must still echo the level written, got: {result}'
+            f'The unpersisted branch must still echo the level written, got: {result}'
         )
 
     @pytest.mark.asyncio
@@ -7895,6 +8142,185 @@ class TestFilingClaimantIdentityStamp:
         assert esc is not None
         assert esc.level == 1
         assert esc.filing_claimant_run_id == self._ID
+
+
+class TestResolveIssueSurfacesLateResolution:
+    """The MCP caller must not be told "success" when its text was captured LATE.
+
+    `resolve_issue` returns `esc.to_dict()` — a perfectly healthy-looking
+    resolved/dismissed record — on both the applied and the already-terminal
+    path.  In the esc-3902-1 race the second is the one that happened, and the
+    resolving agent was told nothing (task 4495).
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+
+    def _auto_dismissed(self, queue: EscalationQueue, esc_id: str = 'esc-3902-1') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='3902',
+            agent_role='implementer',
+            severity='blocking',
+            category='task_failure',
+            summary='the L0 the steward was interrupted on',
+        )
+        queue.submit(esc)
+        queue.resolve(
+            esc_id, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_late_capture_is_reported_to_the_caller(self, tmp_path: Path):
+        """(a) The return dict carries the flag AND a reason naming the dismisser."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the caller must learn its text did not apply: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'auto-dismissed' in reason, (
+            f'the reason must name the automated dismisser that won: {reason!r}'
+        )
+        assert 'late_resolutions' in reason, (
+            f'the reason must say WHERE the text went: {reason!r}'
+        )
+        # The record dict is still the stored record — its terminal state was
+        # NOT changed, which is exactly what the flag is warning about.
+        assert result.get('status') == 'dismissed', f'{result}'
+        assert result.get('resolution') == (
+            'Auto-dismissed: steward interrupted (attempt cap)'
+        ), f'the stored resolution must not be overwritten: {result}'
+        assert result.get('late_resolutions'), (
+            f'the captured text must be visible on the returned record: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_resolve_reports_the_flag_as_false(self, tmp_path: Path):
+        """(b) The contract is EXPLICIT: the key is always present, not absent-on-success.
+
+        An always-present key is what lets a caller write
+        `if result['late_resolution_captured']` without a `.get` default that
+        silently reads a typo'd key as "fine".
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = Escalation(
+            id='esc-3902-2', task_id='3902', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='an ordinary L0',
+        )
+        queue.submit(esc)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-2', resolution='really fixed it',
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('status') == 'resolved', f'{result}'
+        assert result['late_resolution_captured'] is False, (
+            f'the key must be present and False on the applied path: {result}'
+        )
+        assert 'late_resolution_reason' not in result, (
+            f'no reason belongs on a resolve that actually applied: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_terminal_path_does_not_resurrect_the_archived_record(
+        self, tmp_path: Path,
+    ):
+        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+
+        `queue._rewrite` targets the queue ROOT, so running it on an archived
+        record would leave a second copy there — the orphan state
+        `TestResolveIdempotent` exists to prevent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert not (queue.queue_dir / 'esc-3902-1.json').exists(), (
+            'the already-terminal path resurrected a queue-root copy'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy: {archived}'
+
+    @pytest.mark.asyncio
+    async def test_invalid_resolution_class_still_rejects_with_nothing_persisted(
+        self, tmp_path: Path,
+    ):
+        """(d) INV-1 is unaffected: a rejected call persists nothing and captures nothing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='not-a-class',
+        )
+
+        assert result.get('code') == 'invalid_resolution_class', f'{result}'
+        assert 'late_resolution_captured' not in result, (
+            f'a rejection is not a capture report: {result}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'a rejected call must persist NOTHING: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'a rejected call must not correct the stamp either: '
+            f'{record.resolution_class!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_correction_is_not_announced_as_a_correction(
+        self, tmp_path: Path,
+    ):
+        """(e) The reason explains the CAPTURE, and claims a correction only when one happened.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' re-derives the same value — nothing was corrected, so the
+        human-readable reason must not say it was, while still reporting the
+        capture that DID happen.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='benign',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the text is still a genuine late finding: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'late_resolutions' in reason, f'the capture is still explained: {reason!r}'
+        assert 'resolution_class was corrected' not in reason, (
+            f'no correction happened, so none may be announced: {reason!r}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

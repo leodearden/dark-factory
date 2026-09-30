@@ -47,6 +47,13 @@ def _client():
     """
     from dashboard.app import app
 
+    # This is the ONE module-local client fixture dashboard/tests keeps. The
+    # module-scoped TestClient lifespan is the SUBJECT UNDER TEST here (task
+    # 3503) — it is the scope a function-scoped isolation fixture provably
+    # cannot protect — so it is not a copy of conftest's shared fixture.
+    # The pragma must sit on the line immediately above the construction:
+    # any intervening non-blank line breaks it.
+    # noqa: module-local-testclient — module-scoped lifespan is the subject under test (3503)
     with TestClient(app) as c:
         yield c
 
@@ -198,3 +205,175 @@ class TestApplyIsolatedEnvNeutralizesAmbientKnownRoots:
                 f'{cfg.known_project_roots} — every entry gets a '
                 f"DbPool.get(root / 'data/orchestrator/runs.db')"
             )
+
+
+class TestHermeticFusedMemoryUrls:
+    """The endpoint the suite fans out at must be MEASURED dead, not assumed dead.
+
+    ``DASHBOARD_FUSED_MEMORY_URLS`` is the network axis of the same isolation
+    contract the classes above pin on the filesystem axis.  Left unset it falls
+    back to ``DEFAULT_FUSED_MEMORY_URLS = ('http://localhost:8002',)`` — the
+    operator's live shared fused-memory instance — so every app lifespan in
+    this suite fans ``_burndown_loop`` and ``_metrics_loop`` out at production.
+
+    Measurement, not a comment, because this suite has already been burned by
+    exactly that substitution: ``test_api_curator_cancel.py`` documented 8002
+    as "the same unreachable URL" while 8002 answered a 404 in 1.4ms, and
+    believing that comment is most likely why this gap survived as long as it
+    did.  A comment asserting a port is dead is the one form of evidence
+    already disproven here.
+
+    So the deadness is re-measured on every run.  If a port here becomes live,
+    the suite is NOT hermetic and every fan-out test is quietly talking to a
+    real service — going red is the correct outcome, and the fix is to pick
+    another dead port, never to relax the check.  Same stance as
+    ``_dashboard_helpers.build_dual_escalation_tree``'s containment assertion.
+    """
+
+    @staticmethod
+    def _endpoints():
+        """Return ``[(url, host, port), ...]`` for the hermetic constant."""
+        from urllib.parse import urlsplit
+
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        return [
+            (url, urlsplit(url).hostname, urlsplit(url).port)
+            for url in HERMETIC_FUSED_MEMORY_URLS
+        ]
+
+    def test_is_an_immutable_tuple_of_loopback_urls(self):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        assert isinstance(HERMETIC_FUSED_MEMORY_URLS, tuple), (
+            'a tuple, like DEFAULT_FUSED_MEMORY_URLS it stands in for — a '
+            'mutable default is one test away from being edited for everyone'
+        )
+        assert len(HERMETIC_FUSED_MEMORY_URLS) > 0, (
+            'the tuple must not be empty: every check below is a loop over '
+            'it, so an empty one asserts nothing at all'
+        )
+        for url, host, port in self._endpoints():
+            assert host in ('127.0.0.1', '::1'), (
+                f'{url} must name a loopback literal: a hostname can resolve '
+                f'off-box, and one that resolves to ::1 first costs a second '
+                f'connect attempt before refusing — latency back in the very '
+                f'path this constant exists to make instant. Got host {host!r}'
+            )
+            assert port is not None, f'{url} must name an explicit port'
+
+    def test_shares_nothing_with_the_production_default(self):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
+        assert not set(HERMETIC_FUSED_MEMORY_URLS) & set(DEFAULT_FUSED_MEMORY_URLS), (
+            'the hermetic endpoint must not BE the production default — that '
+            'is the traffic it exists to stop'
+        )
+        for url, _host, _port in self._endpoints():
+            assert '8002' not in url, (
+                f'{url} names the operator\'s live fused-memory port; the '
+                f'whole point is to dial somewhere that answers nothing'
+            )
+
+    def test_every_port_genuinely_refuses_a_connection(self):
+        """The load-bearing one: re-measured every run, never assumed."""
+        import socket
+
+        for url, host, port in self._endpoints():
+            assert port is not None, f'{url} names no port to probe'
+            try:
+                with socket.create_connection((host, port), timeout=1.0):
+                    pass
+            except ConnectionRefusedError:
+                continue
+            except OSError as exc:
+                raise AssertionError(
+                    f'{url} neither answered nor refused ({exc!r}). The suite '
+                    f'needs an INSTANT refusal; anything else puts a stall back '
+                    f'into every app lifespan. Pick another dead port in '
+                    f'_dashboard_helpers.HERMETIC_FUSED_MEMORY_URLS rather than '
+                    f'relaxing this check.'
+                ) from exc
+            raise AssertionError(
+                f'{url} ACCEPTED a connection. Something is listening on port '
+                f'{port}, so this suite is not hermetic: every TestClient '
+                f'lifespan is fanning _burndown_loop and _metrics_loop out at '
+                f'a real service. Pick another dead port in '
+                f'_dashboard_helpers.HERMETIC_FUSED_MEMORY_URLS rather than '
+                f'relaxing this check.'
+            )
+
+
+class TestApplyIsolatedEnvNeutralizesAmbientFusedMemoryUrls:
+    """The network axis of the same contract, pinned in two halves.
+
+    ``from_env()`` reads ``DASHBOARD_FUSED_MEMORY_URLS``; unset, it falls back
+    to the operator's live fused-memory instance, which every lifespan then
+    dials through ``_burndown_loop`` -> ``collect_snapshot`` -> ``fetch_tasks``
+    and through ``_metrics_loop``.
+
+    TWO halves, because either alone passes while the suite is still
+    un-hermetic.  The helper contract alone would pass if nothing ever called
+    the helper; the end-to-end alone would pass vacuously on a box where the
+    var happened to be set correctly by hand.
+
+    The DELETED case in the first half is the one that matters most, and is
+    why this var is SET rather than deleted like its three siblings: unset is
+    exactly the state the whole suite runs in today, and for this variable
+    unset means production.  The decoy case follows the precedent of
+    ``TestApplyIsolatedEnvNeutralizesAmbientKnownRoots`` above — an operator
+    shell or systemd unit may well have it set to something live.
+    """
+
+    def test_neither_a_decoy_nor_an_absent_value_survives(self, tmp_path):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+
+        isolated_root = tmp_path / 'isolated'
+        ambient_states = {
+            'decoy': lambda mp: mp.setenv(
+                'DASHBOARD_FUSED_MEMORY_URLS', 'http://localhost:8002'
+            ),
+            'absent': lambda mp: mp.delenv(
+                'DASHBOARD_FUSED_MEMORY_URLS', raising=False
+            ),
+        }
+
+        for label, make_ambient in ambient_states.items():
+            with pytest.MonkeyPatch.context() as mp:
+                make_ambient(mp)
+
+                apply_isolated_env(mp, isolated_root)
+                cfg = DashboardConfig.from_env()
+
+                assert cfg.fused_memory_urls == list(HERMETIC_FUSED_MEMORY_URLS), (
+                    f'[{label}] apply_isolated_env must SET '
+                    f'DASHBOARD_FUSED_MEMORY_URLS at the hermetic endpoint, not '
+                    f'leave from_env() to resolve {cfg.fused_memory_urls}'
+                )
+                assert cfg.fused_memory_urls != list(DEFAULT_FUSED_MEMORY_URLS), (
+                    f'[{label}] the resolved list is the production default — '
+                    f'every app lifespan in this suite would fan out at the '
+                    f"operator's live fused-memory instance"
+                )
+
+    def test_the_real_client_fixture_resolves_the_hermetic_endpoint(self, client):
+        """Non-vacuous end-to-end: no MonkeyPatch context, the real session fixture.
+
+        Pins the whole chain — session-autouse fixture -> env -> ``from_env()``
+        -> ``lifespan`` -> ``app.state.config`` — so an edit that drops the
+        ``setenv`` reds HERE rather than silently re-aiming the suite at
+        production.
+        """
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        assert client.app.state.config.fused_memory_urls == list(
+            HERMETIC_FUSED_MEMORY_URLS
+        ), (
+            f'the live lifespan resolved '
+            f'{client.app.state.config.fused_memory_urls} — the suite is fanning '
+            f'out somewhere other than the measured-dead endpoint'
+        )

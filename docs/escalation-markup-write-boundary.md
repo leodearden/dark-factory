@@ -92,51 +92,80 @@ middleware wrapping `ToolManager.call_tool`), retiring 3141's four in-line
 gates in favour of coverage of every tool. The fifth-boundary gap that produced
 these records is closed on both servers.
 
-## 4. THE FINDING — recovery does not occur for this specimen class
+## 4. THE FINDING — a recovered payload class, recovered as of task 4502
+
+> **Verdict updated 2026-08-28 (task 4502).** Between 2026-08 and that task
+> this section recorded the OPPOSITE result: both records returned `None` and
+> routed to `_refuse_unrepairable`. That measurement was correct when taken,
+> and the diagnosis below is what routed the defect to 4502 and got it fixed.
+> The finding is rewritten rather than deleted, because the payload CLASS it
+> identified is real and recurring — what changed is that the repairer now
+> recovers it.
 
 Task 3643's own description anticipated that under `FORWARD_REPAIR` "a
 corrupted `escalate_info` LANDS with its `suggested_action` recovered instead
-of being lost." **Measured against the real records, that is false for this
-shape.**
+of being lost." **As of task 4502 that is true for this shape.** It was false
+for roughly three weeks, and why is the interesting part.
 
 Replayed through `shared.toolcall_markup::repair` with `escalate_info`'s real
-parameter set, both records return `None`. `None` routes to
-`shared.mcp_markup_middleware::MarkupGuardMiddleware._refuse_unrepairable`,
-which raises `ToolError` and writes nothing through the tool — the escalation
-**does not file under its own task id at all**. The payload survives only as a
-separate record on the synthetic `mcp-markup-residue` anchor, filed at
-`severity='critical'`, `level=2`, owned by `l2-escalation-watcher`. Preserved,
-but not where anyone looking for task 3514's escalations would find it.
+parameter set, both records now return a `Repair` recovering **both** swallowed
+siblings: the real `suggested_action` (261 chars) and the `evidence` array
+(1,010 chars for `esc-3514-1`, 1,071 for `esc-3514-3`), leaving a `clean_value`
+of 1,453 chars that the detector does not fire on. Under `FORWARD_REPAIR` that
+routes to `MarkupGuardMiddleware._forward`, so a filing of this shape today
+**lands under its own task id with both arguments recovered** — not
+`_refuse_unrepairable`, and not a separate `mcp-markup-residue` record at
+`severity='critical'`, `level=2`.
 
-### Why: the controlled experiment
+The recovered `evidence` still contains the quoted `content` closing tag,
+because that is the caller's own text. The middleware names it in
+`quoted_markup_params`, on the `markup_detected` fact and on both policy
+payloads, so the quoting is countable rather than silent. Concretely, measured
+against the real server: a filing of this shape reports
+`recovered_params=['evidence','suggested_action']` with
+`quoted_markup_params=['evidence']`, while the stored `evidence` still lands
+with its declared `list` type.
 
-`repair()` rejects any candidate whose parsed tail contains a second mis-close.
-Inside the swallowed `evidence` value, the report **quotes the very
-`matched_pattern` the memory tripwire handed back to it** — a `content` closing
-tag, reproduced faithfully in prose because the escalation was *reporting a
-markup leak*. That quotation is the second mis-close.
+The census is taken from the **verbatim** recovered map, before the middleware
+types each value against the invoked tool's schema. That is not an
+implementation detail here: `evidence` is decoded to a `list` on its way to the
+tool, so a census read off the delivered map would name nothing at all for
+exactly this shape.
+
+### Why it USED to fail: the controlled experiment
+
+`repair()` used to reject any candidate whose parsed tail contained a closing
+tag **anywhere** in a recovered value. Inside the swallowed `evidence` value,
+the report **quotes the very `matched_pattern` the memory tripwire handed back
+to it** — a `content` closing tag, reproduced faithfully in prose because the
+escalation was *reporting a markup leak*. The guard read that quotation as a
+second mis-close.
 
 Replacing only that one quoted literal with an inert placeholder — every other
-byte of `detail` untouched, verified by round-trip — flips the outcome:
-`repair()` returns a `Repair` recovering **both** swallowed siblings, the real
-`suggested_action` text and the three `{observation, measured_at, ref}`
-evidence entries, with a `clean_value` the detector no longer fires on. The
-recovered lengths and the exact strings are tabulated in the fixture README;
-`test_the_quoted_pattern_is_the_sole_blocker` asserts them against the bytes.
+byte of `detail` untouched, verified by round-trip — flipped the outcome. That
+isolated the quote as the sole blocker and routed the defect to task 4502.
+`test_the_quoted_pattern_is_the_sole_blocker` is retained as the regression
+control: it now asserts that scrubbing changes **nothing**.
 
-**The quote is the sole blocker.** Generalised, and this is the part worth
-carrying forward:
+**Generalised, and this is the part worth carrying forward** — rewritten, not
+deleted, because the class is real:
 
-> An escalation that REPORTS a markup leak is the one payload class the
-> repairer structurally cannot recover, because a faithful report quotes the
-> pattern, and the quote defeats the tail parser's no-second-mis-close
-> condition.
+> An escalation that REPORTS a markup leak is a distinct payload class: a
+> faithful report quotes the pattern that tripped the tripwire, so the quote
+> lands inside a swallowed argument. A guard that refuses on the mere PRESENCE
+> of a closing tag in a recovered value cannot tell that quotation apart from a
+> genuine second mis-close, and so destroys exactly the reports that document
+> its own failures. Boundary row B5's stated rule was always narrower than its
+> implementation — it refuses a value whose *boundary is a guess* — and task
+> 4502 restored the implementation to that rule: an inner closer blocks
+> recovery only when it mis-closes the item itself, spans a tool-call boundary,
+> or yields an equally valid alternative parse.
 
-This independently confirms, on a second and unrelated pair of records, the
-"doubly corrupted" PRD boundary row B5 shape that
-`escalation/tests/test_markup_middleware_registration.py` describes for
-`esc-3184-2` and says could never demonstrate a successful recovery. It is a
-recurring shape, not a one-off property of one record.
+`escalation/tests/test_markup_middleware_registration.py` describes the same
+"doubly corrupted" B5 shape for `esc-3184-2` and says it could never
+demonstrate a successful recovery. It is a recurring shape, not a one-off
+property of one record — and this pair is now the demonstration that the
+recoverable half of it recovers.
 
 ### A measurement correction
 
@@ -189,8 +218,11 @@ Stated explicitly so nothing here is quietly dropped.
   records is what was found by hand, not a count. The predicate that sweep
   should use is committed and tested against a clean control (see the caveat
   above); what is missing is the sweep that runs it.
-- **The repair gap is filed as a follow-up**, to be coordinated with the
-  3688 / 3689 / 3690 owners rather than patched independently.
+- **The repair gap was filed as a follow-up** (`agent-followup-3643`), to be
+  coordinated with the 3688 / 3689 / 3690 owners rather than patched
+  independently. **RESOLVED by task 4502**, which narrowed boundary row B5 in
+  `shared/toolcall_markup.py` and added `quoted_markup_params` to
+  `shared/mcp_markup_middleware.py`. See part 4 for the post-fix verdict.
 
 ## Division of labour
 
@@ -206,9 +238,23 @@ Stated explicitly so nothing here is quietly dropped.
 | 3691 | The escalation-corpus sweep — the intended consumer of these fixtures. |
 | **3643** | **This page, the two preserved specimens plus their clean control, and the regression test that pins the verdict.** |
 
-## If the unrepairable pin ever fails
+## If the repairable pin ever fails
 
-`test_the_specimen_is_unrepairable_as_stored` asserts `repair()` returns
-`None`. A failure there is **the intended signal**, not a broken test: a
-repairer has improved past this shape. Revisit and update part 4 of this page
-rather than deleting the assertion.
+`test_the_specimen_is_repairable_as_stored` asserts that `repair()` recovers
+exactly `{evidence, suggested_action}`, with a 1,453-char `clean_value`, a
+261-char `suggested_action`, and evidence of 1,010 / 1,071 chars still
+containing the quoted `content` closer.
+
+**It points the other way now.** Until task 4502 this section described
+`test_the_specimen_is_unrepairable_as_stored`, which asserted `repair()`
+returned `None` and said a failure there was the intended signal of a repairer
+improving past this shape. That is exactly what happened: the pin fired, and
+4502 inverted it rather than deleting it. The discipline is unchanged — a
+failure here is a report that the landed behaviour moved, so revisit and update
+part 4 of this page rather than deleting the assertion. Either direction of
+failure is informative:
+
+- back to `None` — the narrowing regressed, and the two payloads are being
+  dropped again;
+- to different lengths or names — the repairer changed what it recovers, and
+  part 4's figures are stale.

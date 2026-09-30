@@ -15,7 +15,7 @@ After=docker.service
 [Service]
 Type=exec
 WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project shared python scripts/local-model-serving/lms_serve.py %i
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/local-model-serving/lms_serve.py %i
 
 # The launcher execs `docker run` in the FOREGROUND, so this is the container.
 # `docker stop` is still required: killing the client does not stop the

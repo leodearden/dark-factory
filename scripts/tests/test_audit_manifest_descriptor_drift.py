@@ -10,6 +10,11 @@ spelling over the repair. This module tests the detector for that regeneration
 hazard. Neither the detector nor these tests ever mutate a task record or a
 manifest file.
 
+Task 4907 added the second direction, task -> sidecar. A manifest-bearing task
+whose ``prd_task_label`` its tracked sidecar does not declare is an UNBOUND
+LABEL: the stamper binds nothing for it and copies it no delivered_checks. Those
+rows are reported as their own list, never mixed into the drift findings.
+
 Mirrors test_audit_combine_gate_marker_loss.py: pure functions get direct pytest
 coverage; ``main()`` gets subprocess coverage.
 
@@ -20,9 +25,10 @@ would be a guessed threshold going red on unrelated branches. Every
 tasks.db-dependent assertion below runs against synthetic temp databases built
 by the helpers here, whose contents the test controls exactly.
 
-The ONE live-corpus test in this file
-(:func:`test_live_sidecars_carry_the_resynced_descriptors`) reads only TRACKED
-GIT FILES and opens no database at all — the same legitimacy as
+The live-corpus tests in this file
+(:func:`test_live_sidecars_carry_the_resynced_descriptors` and
+:func:`test_live_sidecars_still_declare_none_of_the_adjudicated_labels`) read
+only TRACKED GIT FILES and open no database at all — the same legitimacy as
 shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
 scripts/tests/test_lms_marker_contract.py.
 """
@@ -45,19 +51,25 @@ from _task_db_scan import (
 from audit_manifest_descriptor_drift import (
     _COVERAGE_CAVEAT,
     _DISCOVERY_FAILED_NOTICE,
+    _UNBOUND_CAVEAT,
     EXIT_DRIFT,
     EXIT_NO_ROOT,
     EXIT_NOTHING_AUDITED,
     EXIT_OK,
-    MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
+    ManifestBinding,
     ProjectAudit,
+    TaskStoreScan,
+    UnboundLabel,
     _is_dirty,
     audit_project,
     format_json,
     format_report,
+    load_task_store_scan,
 )
+from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
+from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
 # Fixtures. The tasks-table schema and the tasks.db builder live in
@@ -72,6 +84,7 @@ from shared.capability_manifest import load_capability_manifest
 _GREP_CHECK = {"kind": "grep", "pattern": "def foo", "paths": ["a.py"], "expect": "present"}
 _SCRIPT_CHECK = {"kind": "script", "script": "scripts/x.sh", "args": ["--v"], "timeout_secs": 30}
 _MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
+_PATH_CHECK = {"kind": "path", "paths": ["scripts/x.sh"], "expect": "present"}
 
 
 def _capability(name: str, check: dict | None) -> dict:
@@ -244,6 +257,42 @@ def test_script_kind_descriptor_fields_are_compared(
     assert [d.differing_fields for d in audit.findings] == [(field,)]
 
 
+def test_identical_path_descriptors_are_compared_and_agree(tmp_path, make_tasks_db):
+    """kind=path is mechanical: the stamper copies it, so the sweep compares it."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", _PATH_CHECK))
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    assert audit.coverage.mechanical_capabilities_compared == 1
+    assert audit.coverage.task_entries_with_no_sidecar_capability == 0
+
+
+def test_a_path_sidecar_against_a_grep_task_entry_is_kind_drift(
+        tmp_path, make_tasks_db):
+    """The half-landed shape of a MODE-3 repair: sidecar rewritten, record not."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    audit = audit_project(str(root))
+
+    assert len(audit.findings) == 1
+    assert "kind" in audit.findings[0].differing_fields
+
+
+def test_differing_paths_on_a_path_check_is_a_finding(tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_PATH_CHECK,
+                        task_entry=_entry("gate", {**_PATH_CHECK, "paths": ["scripts/y.sh"]}))
+
+    audit = audit_project(str(root))
+
+    assert [d.differing_fields for d in audit.findings] == [("paths",)]
+
+
 def test_abbreviated_task_entry_omitting_defaults_is_NOT_a_finding(
         tmp_path, make_tasks_db):
     """THE NORMALIZATION PROPERTY — what keeps the live count at 8, not 22.
@@ -275,11 +324,11 @@ def test_abbreviated_task_entry_omitting_defaults_is_NOT_a_finding(
 def test_manual_kind_capability_is_skipped_entirely(tmp_path, make_tasks_db):
     """A manual check is never copied to metadata, so it can never drift.
 
-    manifest_stamping.py step 5 filters ``check.kind not in ('grep', 'script')``,
-    so comparing a manual capability would report a permanent false positive on
-    every manual-checked capability in the corpus.
+    manifest_stamping.py step 5 copies only
+    ``shared.capability_manifest.MECHANICAL_CHECK_KINDS``, of which manual is
+    never one, so comparing a manual capability would report a permanent false
+    positive on every manual-checked capability in the corpus.
     """
-    assert MECHANICAL_CHECK_KINDS == ("grep", "script")
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[_task(100, [])],
@@ -660,6 +709,570 @@ def test_manifests_swept_and_compared_are_counted(tmp_path, make_tasks_db):
 
 
 # ---------------------------------------------------------------------------
+# load_task_store_scan — ONE read of tasks.db feeds BOTH directions.
+#
+# The drift direction needs every row id and each task's delivered_checks; the
+# label-binding direction needs each manifest-bearing task's status, label and
+# derived sidecar. All three come back from one scan in one TaskStoreScan
+# record, so the two halves of a report can never straddle a write the
+# orchestrator makes to the live store in between.
+# ---------------------------------------------------------------------------
+
+def _labelled(task_id, *, status="pending", prd_path="plans/x-prd.md", label="α", **extra):
+    """A task row whose metadata carries prd_path + prd_task_label (plus *extra*)."""
+    return {"id": task_id, "status": status,
+            "metadata": {"prd_path": prd_path, "prd_task_label": label, **extra}}
+
+
+def test_scan_binds_a_manifest_bearing_task_to_its_derived_sidecar(make_tasks_db):
+    """The binding carries what the label-binding direction reports: the task,
+    its status, its label verbatim, and the sidecar the stamper would open."""
+    db = make_tasks_db([_labelled(7, status="pending", label="γ1")])
+
+    scan = load_task_store_scan(str(db))
+
+    assert isinstance(scan, TaskStoreScan)
+    assert scan.manifest_bindings == (
+        ManifestBinding(task_id=7, status="pending", label="γ1",
+                        manifest="plans/x-prd.capability-manifest.yaml"),
+    )
+
+
+@pytest.mark.parametrize("prd_path,derived", [
+    ("plans/x-prd.md", "plans/x-prd.capability-manifest.yaml"),
+    # No `.md` suffix: the stamper's re.sub strips nothing and just appends.
+    ("plans/x-prd", "plans/x-prd.capability-manifest.yaml"),
+], ids=["md-suffix", "no-md-suffix"])
+def test_scan_derives_the_sidecar_by_the_stampers_rule(make_tasks_db, prd_path, derived):
+    """``re.sub(r'\\.md$', '', prd_path) + '.capability-manifest.yaml'`` —
+    manifest_stamping.py::_stamp_capability_manifests_impl step 1, exactly. The
+    scan stops there: resolving that path against the project root is step 2,
+    which the sweep applies (see
+    test_the_derived_sidecar_is_resolved_against_the_root_as_the_stamper_does)."""
+    db = make_tasks_db([_labelled(7, prd_path=prd_path)])
+
+    (binding,) = load_task_store_scan(str(db)).manifest_bindings
+
+    assert binding.manifest == derived
+
+
+@pytest.mark.parametrize("metadata", [
+    {"prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md"},
+    {"prd_path": "", "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": ""},
+    {"prd_path": None, "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": None},
+], ids=["no-path", "no-label", "empty-path", "empty-label", "null-path", "null-label"])
+def test_scan_mirrors_the_stampers_falsy_admission_gate(make_tasks_db, metadata):
+    """``if not prd_path or not prd_task_label: continue`` — the stamper's step 1.
+
+    A task the stamper never admits is promised nothing, so it can never be an
+    unbound label. Mirroring the gate exactly is what makes the sweep's
+    population the stamper's population.
+    """
+    db = make_tasks_db([{"id": 7, "status": "pending", "metadata": metadata}])
+
+    assert load_task_store_scan(str(db)).manifest_bindings == ()
+
+
+@pytest.mark.parametrize("metadata", [
+    {"prd_path": 5, "prd_task_label": "α"},
+    {"prd_path": ["plans/x-prd.md"], "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": 1},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": ["α"]},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": True},
+], ids=["int-path", "list-path", "int-label", "list-label", "bool-label"])
+def test_scan_admits_no_truthy_non_string_key(make_tasks_db, metadata):
+    """THE ONE DELIBERATE DIVERGENCE from the stamper, which would admit these.
+
+    It would then fail to derive a sidecar path from a non-string prd_path, or
+    never match a non-string label against the sidecar's string labels — so
+    such a row can neither be bound nor usefully reported. No live row has this
+    shape.
+    """
+    db = make_tasks_db([{"id": 7, "status": "pending", "metadata": metadata}])
+
+    assert load_task_store_scan(str(db)).manifest_bindings == ()
+
+
+@pytest.mark.parametrize("raw", [
+    "{not json",
+    None,
+    '["plans/x-prd.md", "α"]',
+    '"plans/x-prd.md"',
+], ids=["malformed-json", "null", "json-list", "json-string"])
+def test_undecodable_metadata_yields_no_binding_and_the_scan_continues(
+        make_tasks_db, raw):
+    """A corrupt metadata blob is a row to skip, never a reason to abort a
+    sweep over thousands of tasks — and the rows after it are still bound."""
+    db = make_tasks_db([
+        {"id": 1, "status": "pending", "metadata": raw},
+        _labelled(2),
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert [b.task_id for b in scan.manifest_bindings] == [2]
+    assert scan.row_ids == {1, 2}
+
+
+def test_bindings_come_back_in_numeric_task_id_order(make_tasks_db):
+    """Numeric, not insertion or lexicographic order ("200" < "30" < "4"): the
+    report built from these rows must diff cleanly between runs."""
+    db = make_tasks_db([_labelled(30), _labelled(200), _labelled(4)])
+
+    bindings = load_task_store_scan(str(db)).manifest_bindings
+
+    assert [b.task_id for b in bindings] == [4, 30, 200]
+
+
+def test_widening_the_loader_changed_neither_existing_output(make_tasks_db):
+    """The row-id set and the delivered_checks mapping the drift direction reads
+    are exactly what they were before the loader also collected bindings.
+
+    A task with no metadata at all is still a ROW (so a sidecar binding it is
+    not "without a db row"), and still has no delivered_checks. A task that
+    carries both a binding and delivered_checks feeds both outputs from its one
+    decoded metadata. A row under another tag reaches none of the three: the
+    ``tag = 'master'`` pin covers the bindings too.
+    """
+    gate = _entry("gate", _GREP_CHECK)
+    cap = _entry("cap", _SCRIPT_CHECK)
+    db = make_tasks_db([
+        {"id": 1, "status": "pending", "metadata": None},
+        {"id": 2, "status": "done", "metadata": {"delivered_checks": [gate]}},
+        _labelled(3, status="done", delivered_checks=[cap, "not-a-dict", {"name": 5}]),
+        {**_labelled(4, delivered_checks=[gate]), "tag": "other-tag"},
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert scan.row_ids == {1, 2, 3}
+    assert scan.delivered_checks == {2: {"gate": gate}, 3: {"cap": cap}}
+    assert [b.task_id for b in scan.manifest_bindings] == [3]
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-BINDING DIRECTION — task -> sidecar (task 4907).
+#
+# The drift walk is keyed on each sidecar's STAMPED task_id, so it cannot see a
+# task whose prd_task_label matches no sidecar entry at all. This direction
+# walks the other way, from every task the stamper would admit to the sidecar
+# it would open, and lists each label that sidecar does not declare in
+# `unbound_labels`, never in `findings`.
+# ---------------------------------------------------------------------------
+
+def _declaring(*labels, prd="plans/x-prd.md"):
+    """A sidecar declaring exactly *labels*, in that order, every entry unstamped.
+
+    No block carries a capability: the label-binding direction reads labels
+    only.
+    """
+    return {"prd": prd, "schema_version": 1,
+            "tasks": [{"label": label, "task_id": None, "capabilities": []}
+                      for label in labels]}
+
+
+def _unbound_pairs(audit) -> list[tuple[int, str]]:
+    return [(row.task_id, row.label) for row in audit.unbound_labels]
+
+
+def test_a_label_its_tracked_sidecar_does_not_declare_is_one_unbound_row(
+        tmp_path, make_tasks_db):
+    """THE ROW SHAPE. It carries the labels the sidecar DOES declare, in the
+    sidecar's own order, so a reader can act without opening the file."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("η0", "α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.unbound_labels == [UnboundLabel(
+        task_id=7, label="ω", status="pending",
+        manifest="plans/x-prd.capability-manifest.yaml",
+        declared_labels=("η0", "α"),
+    )]
+    assert audit.findings == []
+
+
+def test_a_declared_label_is_bound_whatever_its_entry_task_id_says(
+        tmp_path, make_tasks_db):
+    """The stamper matches on LABEL, not task_id (manifest_stamping step 4).
+
+    So a declared label is bound while its entry is still unstamped
+    (``task_id: null``), and even while the entry carries another task's id.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="α"), _labelled(8, label="β")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", {
+            "prd": "plans/x-prd.md", "schema_version": 1,
+            "tasks": [{"label": "α", "task_id": None, "capabilities": []},
+                      {"label": "β", "task_id": 5, "capabilities": []}],
+        })],
+    )
+
+    assert audit_project(str(root)).unbound_labels == []
+
+
+def test_a_task_whose_derived_sidecar_is_not_tracked_is_no_row(
+        tmp_path, make_tasks_db):
+    """No sidecar, no promise. The stamper's step 2 opens only a sidecar that
+    exists, so a task whose derived sidecar is absent is a complete no-op. An
+    UNTRACKED file is not part of the corpus this sweep reads (see
+    _tracked_manifest_paths). Neither case is an unbound label."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path="plans/absent-prd.md", label="α"),
+               _labelled(8, prd_path="plans/untracked-prd.md", label="α")],
+    )
+    _write_manifest(root, "plans/untracked-prd.capability-manifest.yaml",
+                    _declaring("β", prd="plans/untracked-prd.md"))
+
+    assert audit_project(str(root)).unbound_labels == []
+
+
+@pytest.mark.parametrize("spell_prd_path", [
+    pytest.param(lambda root: "./plans/x-prd.md", id="dot-slash"),
+    pytest.param(lambda root: str(root / "plans" / "x-prd.md"), id="absolute-in-root"),
+    pytest.param(lambda root: f"../{root.name}/plans/x-prd.md", id="re-entering-dotdot"),
+])
+def test_the_derived_sidecar_is_resolved_against_the_root_as_the_stamper_does(
+        tmp_path, make_tasks_db, spell_prd_path):
+    """The stamper's step 2 resolves the derived path against the project root
+    before it opens anything, so every in-root spelling reaches the one tracked
+    sidecar. Matching the raw string instead would count these tasks as having
+    no tracked sidecar: a miss that nothing reports."""
+    root = tmp_path / "proj"
+    prd_path = spell_prd_path(root)
+    _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path=prd_path, label="ω"),
+               _labelled(8, prd_path=prd_path, label="α")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert [(row.manifest, row.task_id) for row in audit.unbound_labels] == [
+        ("plans/x-prd.capability-manifest.yaml", 7)]
+    assert audit.coverage.tasks_bound_to_a_declared_label == 1
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 0
+
+
+def test_a_derived_sidecar_outside_the_root_is_no_row(tmp_path, make_tasks_db):
+    """The stamper refuses to read a sidecar that resolves outside its project
+    root, so such a task is promised nothing: the same no-op as an absent
+    sidecar, even when a sidecar really exists out there."""
+    elsewhere = tmp_path / "elsewhere"
+    _write_manifest(elsewhere, "plans/x-prd.capability-manifest.yaml", _declaring("α"))
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path=str(elsewhere / "plans" / "x-prd.md"), label="ω"),
+               _labelled(8, prd_path="../elsewhere/plans/x-prd.md", label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.unbound_labels == []
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 2
+
+
+def test_an_unresolvable_sidecar_path_is_no_row_and_the_sweep_continues(
+        tmp_path, make_tasks_db):
+    """An embedded NUL makes the derived path unresolvable, so the stamper can
+    open nothing for it. One such row must never abort a sweep over thousands."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path="plans/x\x00-prd.md", label="ω"),
+               _labelled(8, label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert _unbound_pairs(audit) == [(8, "ω")]
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 1
+
+
+def test_label_matching_is_exact_so_a_transliteration_is_a_row(
+        tmp_path, make_tasks_db):
+    """'gamma-1' is not 'γ1'. This is task 4590's defect shape, and the reason
+    this direction exists: the stamper compares the two strings exactly, so a
+    transliterated label binds nothing, and after its one planning-time
+    ``missing_labels`` entry nothing says so again."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="gamma-1")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("γ1"))],
+    )
+
+    assert _unbound_pairs(audit_project(str(root))) == [(7, "gamma-1")]
+
+
+def test_two_undeclared_labels_on_one_sidecar_are_two_rows(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="ω"), _labelled(8, label="ψ")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    assert _unbound_pairs(audit_project(str(root))) == [(7, "ω"), (8, "ψ")]
+
+
+def test_unbound_rows_sort_by_manifest_then_numeric_task_id(tmp_path, make_tasks_db):
+    """Manifest relpath first, then NUMERIC task id ("30" < "4" as strings), so
+    a report built from these rows diffs cleanly between runs."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(30, prd_path="plans/b-prd.md", label="ω"),
+               _labelled(4, prd_path="plans/b-prd.md", label="ψ"),
+               _labelled(200, prd_path="plans/a-prd.md", label="ω")],
+        manifests=[
+            ("plans/b-prd.capability-manifest.yaml", _declaring("α", prd="plans/b-prd.md")),
+            ("plans/a-prd.capability-manifest.yaml", _declaring("α", prd="plans/a-prd.md")),
+        ],
+    )
+
+    rows = audit_project(str(root)).unbound_labels
+
+    assert [(row.manifest, row.task_id) for row in rows] == [
+        ("plans/a-prd.capability-manifest.yaml", 200),
+        ("plans/b-prd.capability-manifest.yaml", 4),
+        ("plans/b-prd.capability-manifest.yaml", 30),
+    ]
+
+
+# The drift dimension's coverage fields: the whole of AuditCoverage as it stood
+# before the label-binding direction was added.
+_DRIFT_COVERAGE_FIELDS = (
+    "manifests_swept",
+    "mechanical_capabilities_seen",
+    "mechanical_capabilities_compared",
+    "capabilities_without_task_entry",
+    "task_entries_with_no_sidecar_capability",
+    "manifest_tasks_without_db_row",
+    "malformed_task_entries",
+    "unconvertible_sidecar_descriptors",
+    "manifest_parse_failures",
+    "manifest_parse_failure_details",
+    "uncomparable_details",
+    "git_discovery_failed",
+)
+
+
+def test_unbound_rows_leave_the_drift_findings_and_coverage_untouched(
+        tmp_path, make_tasks_db):
+    """Two dimensions, reported separately. Adding tasks whose labels bind
+    nothing changes neither the drift findings nor any drift counter."""
+    drifted = [_entry("gate", {**_GREP_CHECK, "pattern": "def bar"})]
+    manifests = [("plans/a-prd.capability-manifest.yaml",
+                  _manifest_doc(100, prd="plans/a-prd.md"))]
+    baseline = audit_project(str(_make_project(
+        tmp_path, make_tasks_db, name="baseline",
+        tasks=[_task(100, drifted)], manifests=manifests)))
+    with_unbound = audit_project(str(_make_project(
+        tmp_path, make_tasks_db, name="with-unbound",
+        tasks=[_task(100, drifted),
+               _labelled(200, prd_path="plans/a-prd.md", label="ω"),
+               _labelled(201, prd_path="plans/a-prd.md", label="ψ")],
+        manifests=manifests)))
+
+    assert _unbound_pairs(with_unbound) == [(200, "ω"), (201, "ψ")]
+    assert baseline.findings != []
+    assert with_unbound.findings == baseline.findings
+    for field in _DRIFT_COVERAGE_FIELDS:
+        assert getattr(with_unbound.coverage, field) == getattr(baseline.coverage, field), field
+
+
+# The label-binding direction's coverage counters. With len(unbound_labels) they
+# partition every task the stamper would admit.
+_LABEL_BINDING_COUNTERS = (
+    "manifest_bearing_tasks",
+    "tasks_bound_to_a_declared_label",
+    "tasks_without_a_tracked_sidecar",
+    "tasks_on_an_unparseable_sidecar",
+)
+
+
+def _label_binding_counters(coverage) -> dict[str, int]:
+    return {name: getattr(coverage, name) for name in _LABEL_BINDING_COUNTERS}
+
+
+def test_manifest_bearing_tasks_equal_bound_plus_unbound_plus_every_skip_class(
+        tmp_path, make_tasks_db):
+    """THE ARITHMETIC CLOSES, as it does for the drift direction (see
+    test_seen_equals_compared_plus_every_skip_class), so the unbound list can
+    never be mistaken for the whole population it came from.
+
+    One project exercising every outcome. The absent and the untracked sidecar
+    share one term, because neither is part of the tracked corpus. The
+    unparseable sidecar gets its own term: it IS tracked, so calling it
+    "without a tracked sidecar" would be false.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[
+            _labelled(1, label="α"),
+            _labelled(2, label="ω"),
+            _labelled(3, prd_path="plans/absent-prd.md"),
+            _labelled(4, prd_path="plans/untracked-prd.md"),
+            _labelled(5, prd_path="plans/broken-prd.md"),
+            _labelled(6, prd_path="plans/broken-prd.md", label="β"),
+            # Excluded by the stamper's falsy gate, so in NO term at all.
+            {"id": 7, "status": "pending", "metadata": {"prd_path": "plans/x-prd.md"}},
+        ],
+        manifests=[
+            ("plans/x-prd.capability-manifest.yaml", _declaring("α")),
+            ("plans/broken-prd.capability-manifest.yaml", "prd: [unclosed\n  nope: {"),
+        ],
+    )
+    _write_manifest(root, "plans/untracked-prd.capability-manifest.yaml",
+                    _declaring("α", prd="plans/untracked-prd.md"))
+
+    audit = audit_project(str(root))
+    c = audit.coverage
+
+    assert _label_binding_counters(c) == {
+        "manifest_bearing_tasks": 6,
+        "tasks_bound_to_a_declared_label": 1,
+        "tasks_without_a_tracked_sidecar": 2,
+        "tasks_on_an_unparseable_sidecar": 2,
+    }
+    assert _unbound_pairs(audit) == [(2, "ω")]
+    assert c.manifest_bearing_tasks == (
+        c.tasks_bound_to_a_declared_label
+        + len(audit.unbound_labels)
+        + c.tasks_without_a_tracked_sidecar
+        + c.tasks_on_an_unparseable_sidecar
+    )
+    # Two failure modes, never conflated: the existing count stays one per
+    # SIDECAR, and still names it, however many tasks point at it.
+    assert c.manifest_parse_failures == 1
+    assert c.manifest_parse_failure_details[0].startswith(
+        "plans/broken-prd.capability-manifest.yaml: ")
+
+
+def test_label_binding_counters_are_zero_without_manifest_bearing_tasks(
+        tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    counters = _label_binding_counters(audit_project(str(root)).coverage)
+
+    assert counters == dict.fromkeys(_LABEL_BINDING_COUNTERS, 0)
+
+
+def test_label_binding_counters_are_zero_when_git_discovery_failed(
+        tmp_path, make_tasks_db):
+    """Nothing was enumerated, so nothing was classified. That matches the
+    drift counters, which are zero there too; the discovery failure itself is
+    what the report's notice and exit 1 carry."""
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_labelled(7)])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    audit = audit_project(str(root), str(not_a_checkout))
+
+    assert audit.coverage.git_discovery_failed is True
+    assert audit.unbound_labels == []
+    assert _label_binding_counters(audit.coverage) == dict.fromkeys(
+        _LABEL_BINDING_COUNTERS, 0)
+
+
+def test_coverage_block_counts_the_label_binding_classes_as_aligned_rows(
+        tmp_path, make_tasks_db):
+    """Four labelled rows, asserted as WHOLE LINES with their alignment (see
+    test_report_coverage_rows_render_with_their_column_alignment).
+
+    The no-tracked-sidecar class is COUNTED and never LISTED. Live, it is 407
+    tasks for which the stamper does nothing at all, and listing them would bury
+    the few rows the report exists to show. capabilities_without_task_entry is
+    treated the same way.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(1, label="α"), _labelled(2, label="ω"),
+               _labelled(918273, prd_path="plans/absent-prd.md")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    report = format_report([audit_project(str(root))])
+    lines = report.splitlines()
+
+    assert "    manifest-bearing tasks:             3" in lines
+    assert "    tasks bound to a declared label:    1" in lines
+    assert "    tasks with no tracked sidecar:      1" in lines
+    assert "    tasks on an unparseable sidecar:    0" in lines
+    assert "918273" not in report
+
+
+# LIVE or HISTORICAL — the mechanical form of task 4907's adjudication. The
+# hazard an unbound label carries is that a future commit_planning touching its
+# task stamps and copies nothing, and that can only happen to a task that is not
+# yet terminal.
+
+def _row_with_status(status: str) -> UnboundLabel:
+    return UnboundLabel(task_id=7, label="ω", status=status,
+                        manifest="plans/x-prd.capability-manifest.yaml",
+                        declared_labels=("α",))
+
+
+@pytest.mark.parametrize("status", ["done", "cancelled"])
+def test_a_done_or_cancelled_row_is_historical(status):
+    """No future commit_planning can touch a terminal task, so its label can no
+    longer cost anything. It is still REPORTED; it just is not live."""
+    assert _row_with_status(status).is_live is False
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "deferred", "blocked", "in-progress", "merge-deferred"])
+def test_a_non_terminal_row_is_live(status):
+    """A deferred or blocked task can still be pulled back into a planning
+    batch, and while it is live its label is still cheap to fix."""
+    assert _row_with_status(status).is_live is True
+
+
+@pytest.mark.parametrize("status", ["", "archived", "DONE"],
+                         ids=["empty", "unknown", "case-variant"])
+def test_an_unrecognised_status_is_live(status):
+    """Fails toward REPORTING. A status the shared vocabulary does not know is
+    never read as a confident 'nothing to fix'."""
+    assert _row_with_status(status).is_live is True
+
+
+def test_liveness_is_the_shared_terminal_set_not_a_local_copy():
+    """Across the whole vocabulary, a row is live exactly when its status is
+    outside shared.task_statuses.TERMINAL. Statuses are passed as the raw
+    strings tasks.db holds, so a local re-spelling of the terminal set that
+    drifts from the shared one fails here."""
+    for status in TaskStatus:
+        assert _row_with_status(status.value).is_live is (status not in TERMINAL), status
+
+
+def test_live_and_historical_rows_share_one_list(tmp_path, make_tasks_db):
+    """ONE list, both kinds, every row named. The live subset is derived from
+    it rather than reported in place of it."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="ω"),
+               _labelled(8, status="pending", label="ψ"),
+               _labelled(9, status="cancelled", label="χ")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    rows = audit_project(str(root)).unbound_labels
+
+    assert [(row.task_id, row.label) for row in rows] == [(7, "ω"), (8, "ψ"), (9, "χ")]
+    assert [row.task_id for row in rows if row.is_live] == [8]
+
+
+# ---------------------------------------------------------------------------
 # Non-vacuity / loudness. A silently-empty corpus must NEVER render as a clean
 # zero: an empty corpus and a clean corpus are indistinguishable in the finding
 # count, and only one of them is good news.
@@ -713,9 +1326,21 @@ def _drifted_audit(tmp_path, make_tasks_db):
     return audit_project(str(root))
 
 
+def _unbound_audit(tmp_path, make_tasks_db):
+    """Nothing drifted; one historical and one LIVE unbound label on one sidecar."""
+    root = _make_project(
+        tmp_path, make_tasks_db, name="unbound",
+        tasks=[_labelled(7, status="done", label="ω"),
+               _labelled(8, status="pending", label="ψ")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("η0", "α"))],
+    )
+    return audit_project(str(root))
+
+
 def test_formatters_are_pure_and_print_nothing(tmp_path, make_tasks_db, capsys):
     """Both return str and neither prints — main() does the single print."""
-    audits = [_drifted_audit(tmp_path, make_tasks_db)]
+    audits = [_drifted_audit(tmp_path, make_tasks_db),
+              _unbound_audit(tmp_path, make_tasks_db)]
     capsys.readouterr()
 
     assert isinstance(format_report(audits), str)
@@ -1026,13 +1651,15 @@ def test_main_manifest_root_that_is_not_a_checkout_is_loudly_non_zero(
 
 def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
     """THE READ-ONLY CLAIM, CHECKED. The tasks.db AND every manifest YAML have
-    their (mtime, sha256) captured before and after a full run, and the whole
-    mapping must be unchanged."""
+    their (mtime, sha256) captured before and after a full run that reports
+    BOTH a drifted descriptor and an unbound label, and the whole mapping must
+    be unchanged."""
     import hashlib
 
     root = _make_project(
         tmp_path, make_tasks_db,
-        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})])],
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})]),
+               _labelled(200, prd_path="plans/a-prd.md", label="omega")],
         manifests=[
             ("plans/a-prd.capability-manifest.yaml", _manifest_doc(100)),
             ("docs/prds/b-prd.capability-manifest.yaml",
@@ -1052,9 +1679,105 @@ def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
         }
 
     before = fingerprint()
-    assert _run_cli("--project-root", str(root)).returncode == 1
+    result = _run_cli("--project-root", str(root))
+    assert result.returncode == 1
+    # The run genuinely exercised the label-binding direction too.
+    assert "label=omega" in result.stdout
 
     assert fingerprint() == before
+
+
+# The label-binding direction's exit contract. A LIVE unbound label is dirty; a
+# historical one is reported but not dirty (see UnboundLabel.is_live). Labels
+# here are ASCII so no assertion depends on the child's stdout encoding.
+
+def test_main_exit_1_when_a_live_unbound_label_is_the_only_issue(
+        tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="kappa-followup")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("kappa"))],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert _unbound_line(7, "kappa-followup", "pending", "LIVE") in result.stdout.splitlines()
+
+
+def test_main_exit_0_when_every_unbound_label_is_historical_but_names_them_all(
+        tmp_path, make_tasks_db):
+    """Clean, but never silent: a done or cancelled row cannot be touched by a
+    future planning batch, so it does not make the run dirty, and it is still
+    in the report."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="omega"),
+               _labelled(8, status="cancelled", label="psi")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 0, result.stdout
+    lines = result.stdout.splitlines()
+    assert _unbound_line(7, "omega", "done", "historical") in lines
+    assert _unbound_line(8, "psi", "cancelled", "historical") in lines
+
+
+def test_main_drift_plus_a_historical_unbound_label_still_exits_1(
+        tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "def bar"})]),
+               _labelled(7, status="done", prd_path="plans/a-prd.md", label="omega")],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(100, prd="plans/a-prd.md"))],
+    )
+
+    assert _run_cli("--project-root", str(root)).returncode == 1
+
+
+def test_main_exit_0_with_neither_drift_nor_an_unbound_label(tmp_path, make_tasks_db):
+    """A live task whose label its sidecar declares is BOUND, so nothing is
+    wrong."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="alpha")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    assert _run_cli("--project-root", str(root)).returncode == 0
+
+
+def test_main_discovery_failure_exits_1_whatever_the_unbound_list_holds(
+        tmp_path, make_tasks_db):
+    """Only historical labels here, which alone would be clean, but the corpus
+    was never enumerated, so no label was classified at all."""
+    root = _make_project(tmp_path, make_tasks_db,
+                         tasks=[_labelled(7, status="done", label="omega")])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    result = _run_cli("--project-root", str(root), "--manifest-root", str(not_a_checkout))
+
+    assert result.returncode == 1
+
+
+def test_main_json_carries_unbound_labels_with_their_liveness(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="omega"),
+               _labelled(8, status="pending", label="psi")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    result = _run_cli("--project-root", str(root), "--json")
+
+    assert result.returncode == 1
+    (project,) = json.loads(result.stdout)["projects"]
+    assert [(row["task_id"], row["label"], row["is_live"])
+            for row in project["unbound_labels"]] == [(7, "omega", False), (8, "psi", True)]
 
 
 def test_exit_constants_alias_the_shared_tier_3_codes():
@@ -1065,6 +1788,260 @@ def test_exit_constants_alias_the_shared_tier_3_codes():
     """
     assert (EXIT_OK, EXIT_DRIFT, EXIT_NO_ROOT, EXIT_NOTHING_AUDITED) == (
         AUDIT_EXIT_OK, AUDIT_EXIT_FINDINGS, AUDIT_EXIT_NO_ROOT, AUDIT_EXIT_NOTHING_AUDITED)
+
+
+# ---------------------------------------------------------------------------
+# REPORTING THE LABEL-BINDING DIRECTION (task 4907).
+#
+# Every unbound row is NAMED, historical and live alike, and the section prints
+# even when it is empty: a reader must be able to tell "looked and found none"
+# from "never looked".
+# ---------------------------------------------------------------------------
+
+def _unbound_line(task_id, label, status, hazard):
+    return format_kv_line([
+        ("manifest", "plans/x-prd.capability-manifest.yaml"),
+        ("task_id", task_id),
+        ("label", label),
+        ("status", status),
+        ("hazard", hazard),
+    ])
+
+
+def test_report_names_every_unbound_row_and_marks_the_live_one(
+        tmp_path, make_tasks_db):
+    """Each row line carries (manifest, task_id, label, status) and a hazard that
+    tells LIVE from historical at a glance. The sidecar's declared labels ride
+    on the continuation line, in the sidecar's own order."""
+    lines = format_report([_unbound_audit(tmp_path, make_tasks_db)]).splitlines()
+
+    for row_line in (_unbound_line(7, "ω", "done", "historical"),
+                     _unbound_line(8, "ψ", "pending", "LIVE")):
+        assert row_line in lines
+        assert lines[lines.index(row_line) + 1] == "      declared labels: η0, α"
+
+
+def test_the_unbound_section_and_its_caveat_print_even_when_empty(
+        tmp_path, make_tasks_db):
+    """Never silent, for the reason the coverage block always prints. The caveat
+    is asserted by its CONSTANT, as the coverage caveat's test does."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    report = format_report([audit_project(str(root))])
+
+    assert "  -- unbound task labels (0, 0 live) --" in report.splitlines()
+    assert _UNBOUND_CAVEAT in report
+
+
+def test_the_total_line_counts_both_dimensions_and_the_live_rows(
+        tmp_path, make_tasks_db):
+    """A report carrying two kinds of row must not close on a drift-only total."""
+    audits = [_drifted_audit(tmp_path, make_tasks_db),
+              _unbound_audit(tmp_path, make_tasks_db)]
+
+    last = format_report(audits).splitlines()[-1]
+
+    assert last == (
+        "1 drifted descriptor(s), 2 unbound task label(s) (1 live) across 2 project(s)")
+
+
+def test_discovery_failed_notice_sits_above_the_unbound_section_too(
+        tmp_path, make_tasks_db):
+    """An empty unbound list from an unenumerable corpus is as meaningless as an
+    empty finding list, so the notice precedes both."""
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_labelled(7)])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    lines = format_report([audit_project(str(root), str(not_a_checkout))]).splitlines()
+
+    assert lines.index(_DISCOVERY_FAILED_NOTICE) < next(
+        i for i, ln in enumerate(lines) if "unbound task labels" in ln)
+
+
+def test_format_json_carries_unbound_rows_with_an_explicit_liveness_flag(
+        tmp_path, make_tasks_db):
+    """``is_live`` is a property, so ``_asdict()`` alone would drop it; the JSON
+    writer carries it explicitly. The new caveat travels under its own key,
+    leaving the drift caveat as it was."""
+    payload = json.loads(format_json([_unbound_audit(tmp_path, make_tasks_db)]))
+
+    (project,) = payload["projects"]
+    assert project["unbound_labels"] == [
+        {"task_id": 7, "label": "ω", "status": "done",
+         "manifest": "plans/x-prd.capability-manifest.yaml",
+         "declared_labels": ["η0", "α"], "is_live": False},
+        {"task_id": 8, "label": "ψ", "status": "pending",
+         "manifest": "plans/x-prd.capability-manifest.yaml",
+         "declared_labels": ["η0", "α"], "is_live": True},
+    ]
+    assert payload["unbound_labels_caveat"] == _UNBOUND_CAVEAT
+    assert payload["caveat"] == _COVERAGE_CAVEAT
+
+
+# ---------------------------------------------------------------------------
+# THE 21 MEASURED UNBOUND LABELS (task 4907).
+#
+# Measured 2026-09-23 at main fbf0b5c683, read-only against the live tasks.db:
+# every manifest-bearing task whose tracked sidecar does not declare its
+# prd_task_label. A DATED RECORD, never re-measured. Each row is
+# (sidecar relpath, task_id, label, status, class). Each class is adjudicated in
+# its sidecar's .md twin, under "Unbound task labels (task 4907 adjudication)".
+# ---------------------------------------------------------------------------
+
+_EVAL_REVIVAL = "plans/eval-framework-revival-prd.capability-manifest.yaml"
+_FOUND_ON_MAIN = "plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml"
+_DASHBOARD = "plans/dashboard-availability-prd.capability-manifest.yaml"
+_STATE_GRAPH = "plans/task-escalation-state-graph-prd.capability-manifest.yaml"
+
+_MEASURED_UNBOUND_ROWS = (
+    # A1 — the wave before the sidecar. Twin section in
+    # plans/eval-framework-revival-prd.capability-manifest.md.
+    (_EVAL_REVIVAL, 2464, "α", "done", "A1"),
+    (_EVAL_REVIVAL, 2466, "β", "done", "A1"),
+    (_EVAL_REVIVAL, 2469, "γ", "done", "A1"),
+    (_EVAL_REVIVAL, 2470, "δ", "done", "A1"),
+    (_EVAL_REVIVAL, 2471, "ε", "done", "A1"),
+    (_EVAL_REVIVAL, 2472, "ι", "done", "A1"),
+    (_EVAL_REVIVAL, 2473, "ζ", "done", "A1"),
+    (_EVAL_REVIVAL, 2474, "η", "done", "A1"),
+    (_EVAL_REVIVAL, 2475, "θ", "done", "A1"),
+    (_EVAL_REVIVAL, 2476, "κ", "done", "A1"),
+    (_EVAL_REVIVAL, 2477, "λ", "done", "A1"),
+    (_EVAL_REVIVAL, 2478, "μ", "done", "A1"),
+    (_EVAL_REVIVAL, 2479, "ν", "done", "A1"),
+    (_EVAL_REVIVAL, 2480, "ξ", "done", "A1"),
+    (_EVAL_REVIVAL, 2825, "ο", "done", "A1"),
+    # A2 — the PRD's intermediates, left out of a leaf-only sidecar. Twin
+    # section in plans/found-on-main-provenance-integrity-prd.capability-manifest.md.
+    (_FOUND_ON_MAIN, 2674, "α", "done", "A2"),
+    (_FOUND_ON_MAIN, 2675, "δ", "done", "A2"),
+    (_FOUND_ON_MAIN, 2676, "ι", "done", "A2"),
+    (_FOUND_ON_MAIN, 2677, "β", "done", "A2"),
+    # B — an out-of-plan task with a hand-written label. Twin section in
+    # plans/dashboard-availability-prd.capability-manifest.md.
+    (_DASHBOARD, 3289, "restore-gate", "done", "B"),
+    # C — an agent follow-up with a synthesized label; the only live row. Twin
+    # section in plans/task-escalation-state-graph-prd.capability-manifest.md.
+    (_STATE_GRAPH, 4172, "kappa-followup", "pending", "C"),
+)
+
+# What each of those sidecars declared at the same measurement.
+_MEASURED_DECLARED_LABELS = {
+    _EVAL_REVIVAL: ("π", "ρ", "σ", "υ", "φ"),
+    _FOUND_ON_MAIN: ("γ", "ε", "ζ", "η", "κ", "θ"),
+    _DASHBOARD: ("α", "β", "γ", "δ", "ε", "ζ", "η", "θ"),
+    _STATE_GRAPH: ("α", "η0", "β", "γ1", "γ2", "γ3", "δ", "ζ", "η", "θ", "ι", "κ", "λ", "μ"),
+}
+
+
+def _prd_of(relpath: str) -> str:
+    return relpath.replace(".capability-manifest.yaml", ".md")
+
+
+def _unbound_rows_as_project(tmp_path, make_tasks_db):
+    """Rebuild the 21 measured rows as ONE synthetic project, with decoys.
+
+    Each sidecar declares its measured label set, and each task carries its
+    measured label and status. The decoys make the assertion a genuine SET
+    equality over a mixed corpus rather than "every task present is unbound":
+    a task whose label its sidecar declares, a manifest-bearing task on an
+    untracked sidecar, a task the stamper's falsy gate excludes, and one
+    descriptor-drift row.
+    """
+    tasks = [
+        _labelled(task_id, status=status, prd_path=_prd_of(relpath), label=label)
+        for relpath, task_id, label, status, _class in _MEASURED_UNBOUND_ROWS
+    ]
+    manifests = [
+        (relpath, _declaring(*labels, prd=_prd_of(relpath)))
+        for relpath, labels in _MEASURED_DECLARED_LABELS.items()
+    ]
+
+    tasks += [
+        _labelled(9001, status="pending", prd_path=_prd_of(_STATE_GRAPH), label="κ"),
+        _labelled(9002, status="pending", prd_path="plans/untracked-prd.md", label="α"),
+        {"id": 9003, "status": "pending",
+         "metadata": {"prd_path": _prd_of(_DASHBOARD), "prd_task_label": ""}},
+        _task(9004, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})]),
+    ]
+    manifests.append(("plans/decoy-prd.capability-manifest.yaml",
+                      _manifest_doc(9004, prd="plans/decoy-prd.md")))
+
+    root = _make_project(tmp_path, make_tasks_db, name="unbound-corpus",
+                         tasks=tasks, manifests=manifests)
+    _write_manifest(root, "plans/untracked-prd.capability-manifest.yaml",
+                    _declaring("β", prd="plans/untracked-prd.md"))
+    return root
+
+
+def test_the_21_measured_unbound_rows_are_reported_exactly(tmp_path, make_tasks_db):
+    """SET EQUALITY on the 21 NAMED rows, exactly one of them live.
+
+    The durable stand-in for the live measurement, and synthetic for the reason
+    this module's docstring gives: tasks.db is gitignored, so an assertion on it
+    would go red on unrelated branches. A bare count could stay green while the
+    sweep reported the WRONG rows; set equality cannot.
+    """
+    audit = audit_project(str(_unbound_rows_as_project(tmp_path, make_tasks_db)))
+
+    assert len(audit.unbound_labels) == 21
+    assert {(row.manifest, row.task_id, row.label) for row in audit.unbound_labels} == {
+        (relpath, task_id, label)
+        for relpath, task_id, label, _status, _class in _MEASURED_UNBOUND_ROWS
+    }
+    assert [(row.task_id, row.label) for row in audit.unbound_labels if row.is_live] == [
+        (4172, "kappa-followup")]
+    # The decoys land where they belong, and the drift direction still reports
+    # exactly its own row.
+    assert audit.coverage.tasks_bound_to_a_declared_label == 1
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 1
+    assert audit.coverage.manifest_bearing_tasks == 23
+    assert _triples(audit) == {("plans/decoy-prd.capability-manifest.yaml", 9004, "gate")}
+
+
+_ADJUDICATED_LABELS_BY_SIDECAR = {
+    sidecar: {label for relpath, _task_id, label, _status, _class in _MEASURED_UNBOUND_ROWS
+              if relpath == sidecar}
+    for sidecar in _MEASURED_DECLARED_LABELS
+}
+
+
+@pytest.mark.parametrize("relpath", sorted(_ADJUDICATED_LABELS_BY_SIDECAR))
+def test_live_sidecars_still_declare_none_of_the_adjudicated_labels(relpath):
+    """The adjudication's premise, checked against the TRACKED sidecars.
+
+    Parametrized so a failure names its own sidecar. This is the only part of
+    the 21-row record CI can run: tasks.db is gitignored, so the sweep itself
+    never runs there. It pins only the premise, that none of the adjudicated
+    labels is declared, and not each sidecar's full label set, which a
+    legitimate PRD amendment may grow.
+
+    MAINTENANCE CONTRACT — READ THIS BEFORE "FIXING" A FAILURE HERE. If a
+    sidecar legitimately gains one of these labels (the fix for a class-A row
+    would be to complete the sidecar), that row is no longer unbound. Update
+    _MEASURED_UNBOUND_ROWS and the sidecar's "Unbound task labels (task 4907
+    adjudication)" twin section in the SAME commit. Do not relax this pin.
+    """
+    root = checkout_root_or_skip()
+
+    # NON-VACUITY FLOOR: a renamed or deleted sidecar must not pass by finding
+    # nothing to check, and neither must one emptied of every label.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--", relpath],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
+    declared = {task.label for task in load_capability_manifest(Path(root) / relpath).tasks}
+    assert declared, f"{relpath} declares no labels at all"
+
+    adjudicated = _ADJUDICATED_LABELS_BY_SIDECAR[relpath]
+    assert declared.isdisjoint(adjudicated), (
+        f"{relpath} now declares {sorted(declared & adjudicated)}, which task 4907 "
+        f"adjudicated as unbound. See this test's maintenance contract."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1118,10 +2095,13 @@ _MEASURED_DRIFT_ROWS = (
     (
         "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml", 2906, "α4",
         "enforcement-matrix-suite-exists",
-        # BENIGN — both spellings deliver. Resynced anyway so the sweep can
-        # assert zero drift rather than carrying an allowlist.
+        # RE-REPAIRED ON BOTH SIDES (task 4783): the docstring-prose anchor
+        # broke silently if anyone reworded the docstring, so this row now
+        # anchors on the suite's own class identifier instead — same rule as
+        # the γ1/3536 row below. See
+        # test_alpha4_anchor_is_an_identifier_inside_the_certified_suite.
         _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
-        _grep("Landlock enforcement-matrix suite", ["orchestrator/tests/"]),
+        _grep("TestSandboxEnforcementMatrix", ["orchestrator/tests/"]),
     ),
     (
         "plans/task-escalation-state-graph-prd.capability-manifest.yaml", 3534, "η0",
@@ -1299,17 +2279,6 @@ def test_the_measured_rows_carry_the_two_differing_field_sets(
 # legitimate live assertion where a tasks.db one would not be.
 # ---------------------------------------------------------------------------
 
-def _repo_root():
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed.stdout.strip() if completed.returncode == 0 else None
-
-
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,resynced",
     [(r[0], r[1], r[2], r[3], r[5]) for r in _MEASURED_DRIFT_ROWS],
@@ -1337,9 +2306,7 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     is the assertion this pin is standing in for. Only a sidecar that disagrees
     with its task record is the defect this test was written to catch.
     """
-    root = _repo_root()
-    if root is None:
-        pytest.skip("not a git checkout")
+    root = checkout_root_or_skip()
 
     # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
     # renamed or deleted manifest cannot make this test pass by finding
@@ -1378,4 +2345,57 @@ def test_live_sidecars_carry_the_resynced_descriptors(
         f"would re-stamp the stale spelling over the repair), OR this check was "
         f"legitimately re-repaired on BOTH sides since — in which case update "
         f"this row's `resynced` element and see this test's maintenance contract."
+    )
+
+
+def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
+    """The α4 (task 2906) anchor must name a class/def inside the certified
+    suite, not prose it merely contains — grepped with the argv of
+    orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
+    the working tree instead of a ref."""
+    root = checkout_root_or_skip()
+
+    relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == "α4"
+        for cap in task.capabilities if cap.name == "enforcement-matrix-suite-exists"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one enforcement-matrix-suite-exists capability "
+        f"under label α4 in {relpath}, found {len(matches)}"
+    )
+    check = matches[0].delivered_check
+    assert check is not None
+    pattern = check.pattern
+    assert pattern is not None, (
+        f"expected a grep check with a pattern, got kind={check.kind!r}"
+    )
+
+    completed = subprocess.run(
+        ["git", "-C", root, "grep", "-E", "-n", "-e", pattern, "--",
+         *check.paths],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode in (0, 1), (
+        f"git grep errored (rc={completed.returncode}, stderr: "
+        f"{completed.stderr!r}) on pattern {pattern!r} under {check.paths!r} — "
+        f"_run_grep_check would report ERRORED"
+    )
+    assert completed.returncode == 0, (
+        f"pattern {pattern!r} matched nothing under {check.paths!r} — "
+        f"_run_grep_check would report FAILED on main"
+    )
+    parsed = [line.split(":", 2) for line in completed.stdout.splitlines() if line]
+    assert parsed, "grep reported rc=0 but produced no output lines"
+
+    paths_matched = {fields[0] for fields in parsed}
+    assert paths_matched == {"orchestrator/tests/test_sandbox_enforcement_matrix.py"}, (
+        f"anchor {pattern!r} leaked outside the certified suite: "
+        f"{sorted(paths_matched)}"
+    )
+
+    assert any(fields[2].lstrip().startswith(("class ", "def ")) for fields in parsed), (
+        f"anchor {pattern!r} does not name a definition the suite "
+        f"owns — no matched line starts with 'class '/'def ' after lstrip()"
     )

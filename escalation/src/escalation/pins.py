@@ -42,10 +42,12 @@ with its rationale lives above :func:`_classify_record`):
                                               (``DEAD_L0`` only when the filer
                                               is PROVABLY dead)
 
-This task delivers the types + classifier + tests ONLY.  Rewiring the veto
-sites (``task_ground_truth._shape``, the harness reconcile sweeps, the
-scheduler's stranded-blocked sweep) is task eta (3541); the structured
-``escalation_store_unavailable`` emission is task beta (3535).
+Task 3533 delivered the types + classifier + tests; task 3541 (eta) rewired
+every veto site onto them — ``task_ground_truth._shape`` and its report-shaped
+adapters, the harness reconcile sweeps, the scheduler's stranded-blocked
+redispatch, the deterministic-recon dedup and the orphan-L0 reaper, the
+orchestrator half composed in ``orchestrator/recovery_pins.py``.  The
+structured ``escalation_store_unavailable`` emission is task beta (3535).
 """
 
 from __future__ import annotations
@@ -59,7 +61,18 @@ from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ['PinClass', 'PinRecord', 'PinReport', 'classify_pins']
+__all__ = [
+    'HUMAN_PARKED_MIN_LEVEL',
+    'PinClass',
+    'PinRecord',
+    'PinReport',
+    'classify_pins',
+    'pinned_only_by_human_parked',
+]
+
+#: The escalation level at which a record is in front of a HUMAN (L2) — see
+#: :func:`pinned_only_by_human_parked`.
+HUMAN_PARKED_MIN_LEVEL: int = 2
 
 
 class PinClass(enum.StrEnum):
@@ -204,9 +217,12 @@ def _norm_id(value: str | None) -> str | None:
       ``None`` (unknown) otherwise, and its in-memory source yields ``None``.
       Its plan.lock leg reads the ``.task-meta`` root the lock's writer
       targets (task 4028), so a real orchestrator run CAN reach it and emit a
-      composed identity from that source — though no production caller passes
-      a live identity into this module yet at all (task 3541).
-      This guard nonetheless stays load-bearing DEFENCE IN DEPTH — legacy
+      composed identity from that source.  Since task 3541 a production
+      caller DOES pass a live identity: the orphan-L0 reaper compares a
+      record's filing identity against the live task row's DB
+      ``claimant_run_id`` stamp, so this guard is on a hot path rather than
+      latent.
+      It stays load-bearing DEFENCE IN DEPTH beyond that — legacy
       plan.lock files already on disk, harness-less workflows (whose DB stamp
       is itself partial), and any future producer can still hand this module a
       non-composed identity.  A format mismatch is not PROOF that the filer is
@@ -412,4 +428,48 @@ def classify_pins(
         tuple(buckets[PinClass.QUEUE_HANDOFF]),
         tuple(buckets[PinClass.NON_PINNING]),
         task_id=task_id,
+    )
+
+
+def pinned_only_by_human_parked(
+    report: PinReport,
+    records: Sequence[PinRecord] | None,
+) -> bool:
+    """Is everything that PINS this task already in front of a human?
+
+    **This docstring is the canonical statement of the predicate; other sites
+    point here.**  True iff the read succeeded, something pins the task, and
+    every record in the ``queue_handoff`` bucket — the bucket
+    :attr:`PinReport.pins` reads — sits at ``level >= HUMAN_PARKED_MIN_LEVEL``.
+    *report* is what :func:`classify_pins` returned for these same *records*,
+    taken rather than recomputed so a caller that already classified them does
+    not classify twice; the info, unknown-severity, dead-L0 and
+    store-unavailable rules are therefore the chain's own.  Records that do not
+    pin (see :attr:`PinReport.pins`) cannot spoil the answer, and a store that
+    could not be read never counts as parked.
+
+    Every uncertain input answers False — no records, an unreadable store, an
+    L1 nobody has promoted, a level that is missing or not an int (never
+    coerced: ``'3'``, ``2.9`` and ``True`` are not levels), a handoff id the
+    records do not carry — because a false True silences an alarm for a
+    genuinely stranded task, while a false False costs one quick triage.
+
+    The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
+    records the promotion to a human, whereas a critical/urgent record still at
+    level 0 is the contradictory state link 3b fails safe to pinning, not proof
+    that anyone human holds the task.
+
+    Pure: no I/O, and neither argument is mutated.
+    """
+    if report.store_unavailable or records is None or not report.queue_handoff:
+        return False
+    levels = {record.id: record.level for record in records}
+    return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+
+
+def _is_human_level(level: object) -> bool:
+    return (
+        isinstance(level, int)
+        and not isinstance(level, bool)
+        and level >= HUMAN_PARKED_MIN_LEVEL
     )

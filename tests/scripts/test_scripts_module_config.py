@@ -223,6 +223,25 @@ _PYRIGHT = vci.PYRIGHT
 # test directly.
 _PYTEST = vci.PYTEST
 
+# The pytest flags in the commands THIS FILE parses that consume the following
+# token, so `positional_targets` drops the value instead of admitting it as a
+# phantom target. Required since task 5408 put `-n auto --dist loadgroup` on
+# scripts/orchestrator.yaml's test_command: without this set, `auto` and
+# `loadgroup` arrive as scripts suites and
+# test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites — which
+# compares by SET EQUALITY, not membership — fails naming two flag values as
+# missing directories.
+#
+# The worked precedent is test_skills_module_config_decision.py::
+# _PYTEST_VALUE_FLAGS, which already contains both and is why that guard's
+# target-EXISTS check never went red on the same change. Deliberately NOT
+# widened to that guard's full table: a flag listed here that no command this
+# file parses actually uses would read as coverage of a command shape this file
+# never sees, which is the same objection the _NARROWING_FLAGS comment below
+# records against copying ruff's spellings to pyright. This file's ruff and
+# pyright keywords keep the naive `-`-prefix filter, unchanged.
+_PYTEST_VALUE_FLAGS = frozenset({'-n', '--dist'})
+
 # Flag PREFIXES that narrow what a directory-wide target actually gets checked,
 # per checker. Prefix-matched, so each entry covers both the `--flag value` and
 # the `--flag=value` spelling.
@@ -348,7 +367,7 @@ def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
     return _anchor_split(cmd, keyword)[1]
 
 
-def _targets(cmd: str, keyword: str) -> list[str]:
+def _targets(cmd: str, keyword: str, *, value_flags: frozenset[str] = frozenset()) -> list[str]:
     """The positional path arguments *keyword*'s segment of *cmd* checks.
 
     Substring checks alone cannot carry the anti-copy-paste assertions:
@@ -358,16 +377,34 @@ def _targets(cmd: str, keyword: str) -> list[str]:
     LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
     what makes those assertions real.
 
-    NO ``value_flags`` are passed: this file keeps the naive ``-``-prefix filter
-    it has always had for all three keywords. The shared extractor with an empty
-    set is byte-for-byte that filter (task 3745, pinned by
-    ``test_verify_command_invariants.py``), so a space-separated flag VALUE is
-    still admitted as a phantom target here — harmless, because every assertion
-    below reads this list for what it CONTAINS. The skills and CONTRIBUTING
-    guards, which report a target as a path that must EXIST, supply their own
-    sets instead.
+    *value_flags* DEFAULTS TO EMPTY, which is byte-for-byte the naive
+    ``-``-prefix filter this file had for all three keywords before task 5408
+    (task 3745, pinned by ``test_verify_command_invariants.py``): a
+    space-separated flag VALUE is admitted as a phantom target, harmless wherever
+    the caller reads the list only for what it CONTAINS. The ruff and pyright
+    call sites keep that default and are unchanged by 5408.
+
+    THE PYTEST CALL SITE NO LONGER CAN, and the reason is the ONE assertion in
+    this file that compares two target lists by SET EQUALITY rather than
+    membership —
+    ``test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites``.
+    A phantom on one side alone fails an equality. When task 5408 put
+    ``-n auto --dist loadgroup`` on ``scripts/orchestrator.yaml``'s
+    test_command, ``auto`` and ``loadgroup`` arrived as targets on the module
+    side only and that guard went red reporting two flag values as scripts
+    suites. Supplying the set is the repair ``vci.positional_targets``' own
+    docstring names ("Widening the set is the caller's call"), and the precedent
+    is already in this directory as ``test_skills_module_config_decision.py::
+    _PYTEST_VALUE_FLAGS``.
+
+    THE TWO ALTERNATIVES WERE REJECTED. Loosening that assertion to membership
+    would discard the BIDIRECTIONAL claim it exists to hold — widening either
+    side alone is precisely what must fail. Appending the flags to the root
+    fleet chain's trailing segment so the phantoms matched on both sides would
+    parallelise the fleet fallback as a side effect of a parsing workaround,
+    against a chain whose members do not all declare pytest-xdist.
     """
-    return vci.positional_targets(_segment(cmd, keyword), keyword)
+    return vci.positional_targets(_segment(cmd, keyword), keyword, value_flags=value_flags)
 
 
 def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
@@ -460,8 +497,16 @@ def _pytest_targets(cmd: str) -> list[str]:
     substring appears to prove. Splitting out the positional targets is what
     makes "the directory is collected" a claim about what pytest will actually
     do rather than about which characters occur in the string.
+
+    THE SINGLE HOME for this file's pytest target extraction, and since task 5408
+    that is load-bearing rather than tidy: it is where ``_PYTEST_VALUE_FLAGS`` is
+    applied, so every pytest target read in this file — module command and root
+    fleet chain segment alike — drops ``-n``/``--dist`` values instead of
+    admitting them as phantom suites. A caller that reached for
+    ``_targets(cmd, _PYTEST)`` directly would silently skip that policy, which is
+    exactly the drift ``verify_command_invariants``' own docstring is about.
     """
-    return _targets(cmd, _PYTEST)
+    return _targets(cmd, _PYTEST, value_flags=_PYTEST_VALUE_FLAGS)
 
 
 def _dir_key(target: str) -> str:
@@ -1704,7 +1749,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
     )
     wanted = {_dir_key(OWN_TESTS_DIR), _dir_key(SIBLING_TESTS_DIR)}
     segments = [s for s in verify_cmd.split_top_level_and(root_cmd) if _PYTEST in s]
-    matching = [s for s in segments if wanted & set(_dir_keys(_targets(s, _PYTEST)))]
+    matching = [s for s in segments if wanted & set(_dir_keys(_pytest_targets(s)))]
     assert len(matching) == 1, (
         f'expected exactly one pytest segment naming {sorted(wanted)!r} in the '
         f'repo-root fleet chain, got {matching!r} out of {segments!r}. Zero '
@@ -1712,7 +1757,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
         'than one means the two trees were split across segments, which this '
         'guard cannot compare as a single unit'
     )
-    return _targets(matching[0], _PYTEST)
+    return _pytest_targets(matching[0])
 
 
 def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(

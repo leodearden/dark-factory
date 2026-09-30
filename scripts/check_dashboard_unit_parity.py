@@ -116,7 +116,7 @@ are split by CLASS, because one rule cannot fit all of them:
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
 ``scripts/dashboard.service.template`` (``__REPO_ROOT__`` / ``__UV_PATH__``
-substitution, performed by ``scripts/render_dashboard_unit.py`` since task
+substitution, performed by ``scripts/render_systemd_unit.py`` since task
 4793 — no longer an inline ``sed``), and only ``cp``s the two watchdog units
 verbatim — so the committed ``dashboard/dark-factory-dashboard.service`` this
 checker treats as truth is not the source of the copy it compares against.
@@ -197,13 +197,13 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "therefore report drift on every run of a correctly-configured host, "
         "and a gate that is always red gets switched off — taking the "
         "accidental drift it exists to catch with it. "
-        "SECOND CONSUMER (task 4793): scripts/render_dashboard_unit.py now "
+        "SECOND CONSUMER (task 4793): scripts/render_systemd_unit.py now "
         "PRESERVES this variable's installed value when setup-host.sh "
         "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
         "SUBSET of this allowlist, not the allowlist itself — the two entries "
         "here are on it for opposite reasons, and preserving the other one "
         "would pin the data root at the previous checkout. Held by "
-        "tests/scripts/test_render_dashboard_unit.py::"
+        "tests/scripts/test_render_systemd_unit.py::"
         "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
         "and ::test_host_local_environment_excludes_project_root. So editing "
         "THIS dict has a second blast radius: adding a name here does not make "
@@ -470,7 +470,7 @@ def _compare_exec_start_flags(
 # _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
 # here under its existing PRIVATE name, on the same terms as the parser and
 # find_dropins above.  The THIRD lift, and the first whose second consumer is
-# not another checker: scripts/render_dashboard_unit.py must read the INSTALLED
+# not another checker: scripts/render_systemd_unit.py must read the INSTALLED
 # unit's Environment= map to preserve this host's host-local
 # DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
 # value this checker can SEE has to be exactly a value the installer can

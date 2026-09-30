@@ -582,11 +582,11 @@ def _tc_block(reason: str = 'failed'):
     )
 
 
-def _tc_config(*, enabled: bool = True, tmp_path: Path | None = None) -> MagicMock:
+def _tc_config(*, tmp_path: Path, enabled: bool = True) -> MagicMock:
     from orchestrator.config import DeliveredChecksConfig
 
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = tmp_path or Path('/tmp/proj')
+    config.project_root = tmp_path
     config.delivered_checks = DeliveredChecksConfig(
         enabled=enabled, check_timeout_secs=7.5,
     )

@@ -1310,6 +1310,21 @@ BASELINE_MEASURED_AT = _datetime.datetime(
     2026, 8, 6, 9, 30, tzinfo=_datetime.UTC,
 )
 
+#: When the fixture's PROBE reading was taken: one minute after
+#: BASELINE_MEASURED_AT, because a healthcheck reads the card AFTER the arm
+#: started.  DERIVED from the baseline's moment rather than hand-copied from
+#: it, so editing that one cannot silently falsify this sentence.  Pinned for
+#: the same reason the baseline's stamp is -- and for one more, specific to
+#: this one: `render_table` prints it in the header line, so a stamp read off
+#: the live clock puts six microsecond digits into every rendering this module
+#: asserts over.
+FIXTURE_MEASURED_AT = BASELINE_MEASURED_AT + _datetime.timedelta(minutes=1)
+
+#: The same moment as the ARTIFACT carries it.  `run_healthcheck` takes a
+#: `datetime` and renders it, so the constant above is what a test injects and
+#: this one is what a test asserts against.
+FIXTURE_MEASURED_AT_ISO = FIXTURE_MEASURED_AT.isoformat()
+
 
 def _baseline(
     used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
@@ -1360,6 +1375,10 @@ def _failing_probe(arm, *, warmup: bool = False):
 
 
 def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None, **kwargs):
+    # `setdefault`, so the pin is a DEFAULT and not a wall: a caller wanting a
+    # different or live stamp can pass `now=` exactly as callers already pass
+    # `repeat=`.
+    kwargs.setdefault('now', lambda: FIXTURE_MEASURED_AT)
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
@@ -1582,16 +1601,94 @@ def test_the_report_carries_a_schema_version():
     assert isinstance(report.schema_version, int)
 
 
-def test_the_report_is_stamped_with_an_aware_utc_timestamp():
-    """A naive timestamp would make a stale artifact indistinguishable from a
-    fresh one across a timezone change -- and this artifact's whole job is to
-    prove a live run happened."""
-    report = _report()
+def test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock():
+    """Both halves of the clock seam, on the function that owns it.
 
-    stamped = _datetime.datetime.fromisoformat(report.measured_at)
+    A test may pin the stamp, and a real run may not: a naive or stale
+    timestamp would make a dead artifact indistinguishable from a live one,
+    and proving a live run happened is this artifact's whole job.  Called
+    directly rather than through `_report()`, which exists to hide the very
+    argument under test.
+    """
+    injected = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+        now=lambda: FIXTURE_MEASURED_AT,
+    )
 
+    # The ROW too, not just the report: `run_healthcheck` stamps every ArmRow
+    # from the same local, so the seam has to reach that far to be worth
+    # anything to a test asserting over a rendering.  Asserted in ISO because
+    # the seam hands over a `datetime` and the rendering is the function's.
+    assert injected.measured_at == FIXTURE_MEASURED_AT_ISO
+    assert injected.arms[0].measured_at == FIXTURE_MEASURED_AT_ISO
+
+    default = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+    )
+
+    stamped = _datetime.datetime.fromisoformat(default.measured_at)
+
+    assert default.measured_at != FIXTURE_MEASURED_AT_ISO
     assert stamped.tzinfo is not None
     assert stamped.utcoffset() == _datetime.timedelta(0)
+    # DELIBERATELY loose.  This only has to tell a live reading from a stamp
+    # pinned ~40 days in the past, and a tight bound would re-introduce the
+    # very wall-clock coupling this seam exists to remove -- a slow runner or
+    # a container clock step would then fail a test about injection.
+    freshness = _datetime.datetime.now(_datetime.UTC) - stamped
+    assert abs(freshness) < _datetime.timedelta(seconds=300)
+
+
+@pytest.mark.parametrize(
+    'unanchorable',
+    [
+        _datetime.datetime(2026, 8, 6, 9, 31),
+        _datetime.datetime(
+            2026, 8, 6, 10, 31,
+            tzinfo=_datetime.timezone(_datetime.timedelta(hours=1)),
+        ),
+    ],
+    ids=['naive', 'aware-but-not-utc'],
+)
+def test_a_clock_that_cannot_be_anchored_is_refused_rather_than_stamped(unanchorable):
+    """Injection must not be able to weaken the stamp's invariant.
+
+    `measured_at` is a plain `str` in the artifact with no validator behind
+    it, so nothing downstream would notice a naive or local-time stamp -- and
+    `merge_reports` picks a slate's stamp with `max()` over those strings,
+    which orders by instant only while every stamp shares one offset.  Both
+    unanchorable shapes are refused as CALLER errors, never recorded as an arm
+    failure.
+    """
+    with pytest.raises(lms_healthcheck.HealthcheckError, match='UTC'):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(),
+            now=lambda: unanchorable,
+        )
+
+
+def test_a_fixture_report_describes_one_fixed_moment():
+    """A fixture is a fixed moment, so its rendering is a fixed string.
+
+    Under the live clock two renderings of "the same" fixture differ in their
+    microsecond digits, which is what made `table.count(...)` a coin flip:
+    `render_table` prints `measured_at` in the header line, and the counts run
+    over the whole rendering.
+    """
+    assert _report().measured_at == FIXTURE_MEASURED_AT_ISO
+    assert (
+        lms_healthcheck.render_table(_report())
+        == lms_healthcheck.render_table(_report())
+    )
 
 
 def test_the_report_carries_a_gpu_identity_block():
@@ -1911,6 +2008,17 @@ def test_the_table_lists_who_else_held_the_card_at_each_reading():
         baseline=_baseline(consumers=[WHISPER_CONSUMER]),
         snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
     ))
+    # The counts below read the WHOLE rendering, so they say "appears in the
+    # inventory" only while no OTHER rendered element carries the same digit
+    # run.  The header's `measured_at` is the one that actually bit -- off the
+    # live clock its microsecond digits made this a coin flip -- but every MiB
+    # figure, the headroom and the latencies are equally capable of it.  The
+    # SAME report with the inventories empty settles that from the renderer
+    # itself, so no future fixture number can quietly re-create the collision
+    # and nothing here has to parse rendered prose to rule it out.
+    without_consumers = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[]), snapshot=_snapshot(consumers=[]),
+    ))
 
     # Two SECTIONS, not one merged list: whisper-writer held the card at both
     # readings and so appears twice, the arm only at the probe.  A structural
@@ -1920,6 +2028,7 @@ def test_the_table_lists_who_else_held_the_card_at_each_reading():
     assert table.count(str(WHISPER_CONSUMER.pid)) == 2
     assert table.count(str(ARM_CONSUMER.pid)) == 1
     for consumer in (WHISPER_CONSUMER, ARM_CONSUMER):
+        assert str(consumer.pid) not in without_consumers
         assert consumer.process_name in table
         assert str(consumer.pid) in table
         assert str(consumer.used_mib) in table
@@ -2479,7 +2588,13 @@ def test_every_row_carries_its_own_measurement_time_and_footprint():
     other seven arms' measurements would leave the artifact entirely."""
     row = _report().arms[0]
 
-    assert _datetime.datetime.fromisoformat(row.measured_at).tzinfo is not None
+    # The RUN's stamp, not merely a well-formed one.  This asserted tz-
+    # awareness until the fixture pinned `now=`, at which point it only
+    # re-checked that a constant three hundred lines above was written aware --
+    # a tautology.  Awareness is production's invariant and is pinned where it
+    # is load-bearing, on the un-injected clock, by
+    # `test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock`.
+    assert row.measured_at == FIXTURE_MEASURED_AT_ISO
     assert row.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
 
 
@@ -3083,6 +3198,278 @@ def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path
 
     assert code == lms_healthcheck.EXIT_MERGE_ERROR
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# A TBD placeholder arm, through a REPORT-PRODUCING path (task 4992)
+#
+# `_placeholder_refusal` had coverage only through `probe_llm_arm` (see
+# `test_a_placeholder_arm_is_refused_before_any_request` above), which made the
+# refusal look handled.  It was not reachable from any caller that WRITES a
+# report: `run_healthcheck` reads a baseline for every arm BEFORE it probes any
+# of them, and a placeholder can never have one -- `lms_ctl.preflight` refuses
+# it as its first check, before the card is touched, and `lms_ctl.start` is the
+# only writer of a per-arm baseline.  So the run raised `StaleBaselineError`,
+# the CLI exited 8 having written nothing, and the row that COVERS this arm for
+# `merge_reports` was never produced at all (esc-4301-2).
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_ARM_ID = 'tbd-arm'
+
+
+def _placeholder_arm(**overrides) -> lms_manifest.ArmEntry:
+    return _moe_arm(**{
+        'arm_id': PLACEHOLDER_ARM_ID,
+        'served_model_name': PLACEHOLDER_ARM_ID,
+        'model_ref': 'TBD-Q3-pick-a-gguf',
+        'image': 'TBD-Q3',
+        'quant': 'TBD-Q3',
+        'port': 8416,
+        **overrides,
+    })
+
+
+@pytest.fixture
+def placeholder_manifest_env(monkeypatch, tmp_path):
+    """A manifest carrying one TBD placeholder beside two real arms.
+
+    The baseline store is a real directory populated for the NON-placeholder
+    arms ONLY, which is exactly the on-disk state `lms_ctl.start` leaves.  The
+    placeholder's absence from it is not a fixture shortcut: it is the state
+    the tools guarantee, and the one the defect turns on.
+    """
+    manifest = lms_manifest.ArmManifest(
+        port_block=(8410, 8417),
+        arms=[
+            _arm(),
+            _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+            _placeholder_arm(),
+        ],
+    )
+    monkeypatch.setattr(lms_healthcheck, 'load_arms', lambda *a, **k: manifest)
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
+    for arm in manifest.arms:
+        if arm.is_placeholder:
+            continue
+        record = _baseline()
+        lms_vram.record_baseline(arm.arm_id, record.reading, consumers=record.consumers)
+    monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
+    return manifest
+
+
+def test_the_cli_reports_on_a_placeholder_arm_instead_of_refusing_to_write(
+    placeholder_manifest_env, tmp_path, capsys,
+):
+    """The headline: `lms_healthcheck --arm <tbd>` produces the refusal ROW.
+
+    `probe_arm` is deliberately NOT patched, so the real dispatch runs and
+    `_placeholder_refusal` is what produces the row -- if the arm were probed
+    for real it would 404 on a literal `TBD-Q3` model id, which is the burial
+    that refusal exists to prevent.  Before this change the run never reached
+    the prober at all: it exited 8 (EXIT_STALE_BASELINE) with no file on disk.
+    """
+    part = tmp_path / 'tbd-arm.json'
+
+    code = lms_healthcheck.main(['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)])
+
+    assert code == lms_healthcheck.EXIT_ARM_FAILED
+    assert part.exists()
+    report = lms_healthcheck.HealthReport.model_validate_json(part.read_text())
+    assert [row.arm_id for row in report.arms] == [PLACEHOLDER_ARM_ID]
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.overall == 'FAIL'
+
+
+def test_a_placeholder_part_covers_its_arm_in_the_merged_slate(
+    placeholder_manifest_env, tmp_path,
+):
+    """The coverage claim the whole task turns on.
+
+    `merge_reports` refuses a set that does not COVER the manifest, so with no
+    part for the placeholder the slate could not be assembled AT ALL -- one
+    unresolved PRD Open Question made every other arm's measurement
+    unpublishable.  With the row present the slate assembles RED BUT COMPLETE.
+    """
+    part = tmp_path / 'tbd-arm.json'
+    assert lms_healthcheck.main(
+        ['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)]
+    ) == lms_healthcheck.EXIT_ARM_FAILED
+    placeholder_part = lms_healthcheck.HealthReport.model_validate_json(
+        part.read_text()
+    )
+    real_parts = [
+        _single(arm) for arm in placeholder_manifest_env.arms
+        if not arm.is_placeholder
+    ]
+
+    merged = lms_healthcheck.merge_reports(
+        [*real_parts, placeholder_part],
+        expected_arm_ids=placeholder_manifest_env.arm_ids(),
+    )
+
+    assert set(placeholder_manifest_env.arm_ids()) == {
+        row.arm_id for row in merged.arms
+    }
+    assert merged.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+def test_a_placeholder_only_run_reports_on_a_card_a_stranger_is_holding(
+    tmp_path, monkeypatch,
+):
+    """The refusal row must not be held hostage to whoever holds the card.
+
+    Measured on this worktree: `lms_vram.unexpected_baseline_consumers([whisper
+    4050 MiB, ollama 10314 MiB])` returns the ollama entry, so feeding the LIVE
+    probe inventory to the BASELINE guard raises `PollutedBaselineError` and the
+    CLI exits 7 having written nothing.  That refusal is spurious here.  Both
+    the baseline guard and `classify_pollution` exist to protect the
+    attribution of `used - baseline` to an arm; nothing was started, so there is
+    no such attribution and no footprint for a dirty baseline to corrupt.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(
+            consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]
+        ),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.vram.pollution == lms_vram.PollutionState.CLEAN
+    assert report.vram.arm_footprint_mib == 0
+
+
+def test_a_placeholder_only_run_does_not_consult_a_supplied_baseline(
+    tmp_path, monkeypatch,
+):
+    """A parameter honoured on one branch and ignored on the other needs a pin.
+
+    `run_healthcheck`'s docstring says no baseline is consulted when nothing is
+    measurable, "not even one supplied through *baseline*" -- but nothing held
+    that.  A refactor hoisting the `baseline is not None` fallback above the
+    `if not measurable` check would keep every other test green (the
+    StaleBaselineError path stays closed either way) while reintroducing a
+    pre-start reading for a run that started nothing, so the block would report
+    a footprint no row can explain.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=lms_healthcheck.probe_arm,
+        baseline=_baseline(),
+    )
+
+    # The snapshot IS the pre-start card; the supplied 3312 MiB never lands.
+    assert report.vram.baseline_mib == MEASURED_USED_MIB
+    assert report.vram.baseline_mib != BASELINE_USED_MIB
+    assert report.vram.arm_footprint_mib == 0
+
+
+def test_a_placeholder_only_run_never_emits_the_unmeasured_sentinel(
+    tmp_path, monkeypatch,
+):
+    """CLEAN here means "there is nothing to pollute", and it has to be CLEAN.
+
+    UNMEASURED is the more literal reading of a branch that skipped the
+    classifier, but it is precisely the value `merge_reports` REFUSES to
+    combine -- so emitting it would restore the unassemblable slate by another
+    route, which is the whole thing this change removes.  Mirrors
+    `test_this_producer_never_emits_the_unmeasured_sentinel`.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.vram.pollution != lms_vram.PollutionState.UNMEASURED
+    assert lms_healthcheck.merge_reports([report]).arms[0].arm_id == (
+        PLACEHOLDER_ARM_ID
+    )
+
+
+def _mixed_probe(arm, *, warmup: bool = False):
+    """The real dispatch for a placeholder, a canned PASS for anything else.
+
+    A mixed run has to reach `_placeholder_refusal` for one arm without issuing
+    a request for the other, and patching `probe_arm` wholesale would take the
+    refusal out of the path under test.
+    """
+    return lms_healthcheck.probe_arm(arm) if arm.is_placeholder else _passing_probe(arm)
+
+
+def test_a_placeholder_row_is_charged_no_footprint_beside_a_real_arm():
+    """A placeholder loaded nothing, so its row's footprint is 0, not the block's.
+
+    `run_healthcheck` used to write `budget.arm_footprint_mib` into EVERY row
+    uniformly, which in a mixed `--all` run puts "this TBD arm took 4050 MiB"
+    into the artifact -- a number that only became WRONG once the row became
+    reachable, and one a downstream reader has no way to discount, because the
+    merged slate keeps just ONE vram block and the per-row figure is the only
+    place an arm's own footprint survives.
+    """
+    report = lms_healthcheck.run_healthcheck(
+        [_arm(), _placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_mixed_probe,
+        baseline=_baseline(),
+    )
+
+    rows = {row.arm_id: row for row in report.arms}
+    assert set(rows) == {'qwen3.5-9b', PLACEHOLDER_ARM_ID}
+    assert rows['qwen3.5-9b'].arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+    assert rows[PLACEHOLDER_ARM_ID].arm_footprint_mib == 0
+    assert rows[PLACEHOLDER_ARM_ID].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    # The BLOCK still reports what the card actually did, which the real arm
+    # explains; only the placeholder's own row declines to claim any of it.
+    assert report.vram.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+
+
+def test_a_real_arm_without_a_baseline_still_refuses_beside_a_placeholder(
+    tmp_path, monkeypatch,
+):
+    """The partition narrows WHICH ids are looked up; it never weakens the guard.
+
+    Without this pin a placeholder sibling could launder a real arm's missing
+    baseline: the run would find nothing to look up for the placeholder, and an
+    over-eager branch would take the unstarted path for a run that genuinely
+    started something and report its footprint as 0.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    with pytest.raises(lms_vram.StaleBaselineError, match='qwen3.5-9b'):
+        lms_healthcheck.run_healthcheck(
+            [_arm(), _placeholder_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_mixed_probe,
+        )
+
+
+def test_a_run_over_zero_arms_is_refused_rather_than_reported_green():
+    """The partition displaced a refusal; it must not have deleted it.
+
+    `lms_vram.read_baseline_records` caught the empty case ("a budget verdict
+    over zero arms would describe nothing") back when every arm id reached it.
+    With placeholders partitioned out, an empty run reaches the unstarted branch
+    instead, which has no reason to object to anything -- and would answer with
+    a rowless report reading PASS/PASS/EXIT_OK, a green "the slate was checked"
+    assembled from nothing.  The CLI cannot produce this today
+    (`ArmManifest.arms` has `min_length=1`, and `--active` over an empty
+    selection exits EXIT_NO_ACTIVE_ARMS), which is exactly why the library-level
+    contract needs its own guard.
+    """
+    with pytest.raises(lms_vram.VramProbeError, match='zero arms'):
+        lms_healthcheck.run_healthcheck(
+            [], gpu_probe=lambda: _snapshot(), probe=_passing_probe,
+        )
 
 
 # ---------------------------------------------------------------------------

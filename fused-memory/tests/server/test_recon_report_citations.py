@@ -16,6 +16,7 @@ import logging
 from unittest.mock import patch
 
 import pytest
+from _mem0_record_shapes import mem0_record
 from mcp.server.fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
@@ -2562,6 +2563,91 @@ class TestCiteMemory:
 # ---------------------------------------------------------------------------
 
 
+class TestCiteMemoryOverRealMemoryService:
+    """cite_memory over the REAL MemoryService — the end-to-end pin on the measured harm.
+
+    Every other cite_memory test in this file drives ``_FakeMemoryService``,
+    which returns a CANNED fingerprint and so never exercises the real read.
+    That is precisely why the defect survived: ``MemoryService.get_memory``
+    inverted the nesting of two of the fingerprint's three fields, and nothing
+    between it and a human ever looked at a real one.
+
+    THE CHAIN THIS GUARDS.  5/5 real ``cite_memory`` calls recorded
+    ``{category: null, agent_id: null, created_at: <real>}`` against records
+    whose raw payloads carried values for both.  A citation's ``agent_id`` is
+    what says WHO wrote the memory; with it null, authorship was INFERRED
+    rather than read, and that false uniform-authorship claim reached a
+    human-gated task's description.
+
+    Asserted off ``get_assembled_report``, not off the return value: what a
+    downstream reader consumes is the citation PERSISTED into the finding.
+    """
+
+    _UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+
+    #: One stored Qdrant payload.  The record the backend hands back is
+    #: DERIVED from it by mem0's own promotion rule
+    #: (``tests/_mem0_record_shapes.py``) rather than transcribed, so this
+    #: module cannot keep asserting a retired contract after a mem0 upgrade
+    #: while a sibling module goes red.
+    _PAYLOAD = {
+        'data': 'some text',
+        'hash': 'h',
+        'created_at': '2026-09-09T12:00:00+00:00',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'claude-review-df-3200',
+        'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'category': 'observations_and_summaries',
+        'topic': 't',
+    }
+
+    @classmethod
+    def _real_service(cls, mock_config):
+        """A real MemoryService whose mem0 backend hands back a mem0-shaped record.
+
+        Only the BACKEND is mocked. ``get_memory`` — the function that held the
+        defect — runs for real.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        service.mem0.get = AsyncMock(
+            return_value=mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
+        )
+        return service
+
+    @pytest.mark.asyncio
+    async def test_persisted_fingerprint_carries_real_category_and_agent_id(
+        self, mock_config
+    ):
+        service = self._real_service(mock_config)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=service)
+
+        await state.cite_memory(run_id, finding_id, self._UUID, 'mem0')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        memories = report['flagged_items'][0]['cited_memories']
+        assert len(memories) == 1, f'expected one citation, got {memories!r}'
+        fingerprint = memories[0]['metadata_fingerprint']
+
+        assert fingerprint['agent_id'] == 'claude-review-df-3200', (
+            'a null agent_id is what let authorship be INFERRED rather than read; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['category'] == 'observations_and_summaries', (
+            f'category lives inside mem0 metadata and must be read there; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['created_at'] == '2026-09-09T12:00:00+00:00', (
+            'created_at was the one field always correct — it must stay correct'
+        )
+
+
 class TestCiteMemoryExceptionNarrowing:
     """Verifies that unexpected exceptions propagate rather than being misclassified as memory_not_found.
 
@@ -2630,6 +2716,33 @@ class TestCiteMemoryExceptionNarrowing:
 
         with pytest.raises(ValueError):
             await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_propagates_not_reported_as_memory_not_found(self):
+        """A mem0 read TimeoutError must propagate — never render as memory_not_found.
+
+        The narrowness of cite_memory's `except (EdgeNotFoundError,
+        MemoryNotFoundError)` is LOAD-BEARING here, not incidental: this is the
+        boundary at which a timeout would otherwise become a FALSE ABSENCE
+        written into a durable report.  The chain that follows from that, and
+        the corroboration gate that bounds it, are stated once at
+        `backends/mem0_client.py::Mem0Backend.get`.
+
+        Since task 5265 `Mem0Backend.get` propagates its read timeout instead
+        of swallowing it into `None` (which `get_memory` then turned into
+        `MemoryNotFoundError`), so this is the first exception shape that can
+        actually reach here from a timed-out read.
+        """
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=TimeoutError('Mem0 get timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError):
+            await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
 
         report = state.get_assembled_report(run_id, 'reconciler')
         assert report is not None

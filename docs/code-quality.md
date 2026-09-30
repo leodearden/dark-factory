@@ -79,18 +79,42 @@ interpretation confirmed on 2026-09-03; apply both by name.
 14. **No file too large.** The composition hierarchy contains and partitions
     complexity, so no file has to be big. Big is context-dependent; in this
     repo treat ~1,500 lines as a soft ceiling and 2,000 (one default `Read`
-    call) as an alarm. **No cheating**: a split is legitimate only when every
-    resulting file passes heuristic 13. Size is necessary, not sufficient —
-    small satellites that are function-bags over a parent's private state
-    fail 13 while passing 14.
+    call) as an alarm. Both count raw lines, prose included, because they
+    measure what one reader must load, not how much code there is. An alarm
+    is a trigger to measure, not a number to get under. Measuring means:
+    first, whether the prose is in its right home (the Comments stance);
+    then a named partition of the file's top-level symbols and, for each
+    candidate, the heuristic-13 symptom it hits — an upward import, a cycle,
+    a reach-back into the parent — or none. Naming a symptom means naming the
+    two modules and the specific import that would close the cycle or reach
+    back; a sentence that merely asserts one exists is not a measurement. A
+    file that stays whole records that measurement where the reviewer will
+    read it — the commit message, or the task record — with at most a
+    one-line pointer in the module docstring: it is reviewer-answering prose
+    under the Comments stance, not rationale the next agent must be able to
+    find. **No cheating**: a split is legitimate only when
+    every resulting file passes heuristic 13. Size is necessary, not
+    sufficient — small satellites that are function-bags over a parent's
+    private state fail 13 while passing 14. Layering is a downward import of
+    names a lower file defines and never takes back; a satellite that imports
+    from the file that imports it is stitching, regardless of what the import
+    brings across.
 
 ## Two stances
 
 - **Comments.** Aim for code that is clear with no or low comments. Needing
   abundant and escalating amounts of commenting is a symptom of poor clarity,
-  and comments drift. Rationale that must persist belongs in memory or the
-  incident record with a pointer from the code, not inline (INV-9). This does
-  not license deleting existing rationale during unrelated work — see
+  and comments drift. Rationale that must persist belongs in a tracked file
+  the next agent can `Read` — the PRD, `docs/`, or a test — with a pointer
+  from the code, not inline (INV-9). A pointer into memory or an escalation
+  record does not count: no dispatched role but the steward can read an
+  escalation, and a memory record is reached by search, not by a path the
+  code can name. Prose written to answer a reviewer — a measurement, a
+  rejected alternative, a defence of a decision — belongs in the commit
+  message, or in the task record where the agent holds a task write: it is
+  the prose most likely to be wrong on the day it is written and the first
+  to drift. This
+  does not license deleting existing rationale during unrelated work — see
   `CONTRIBUTING.md` §2 on tolerated drift.
 - **Tests.** Test access to a module's internals is an interface design smell.
   Tests drive public seams and, where the behaviour is git or the filesystem,
@@ -119,7 +143,11 @@ means complexity was added, not moved.
 Do not steer by any of these:
 
 - **Raw line count.** Prose can be most of a file (the merge lane's main
-  module was 55% comments and docstrings when measured).
+  module was 55% comments and docstrings when measured), so the count says
+  little about how much code is there, and driving it down rewards deleting
+  prose instead of rehoming it, or a cheating split. This is a caution about the metric, not a
+  tolerance for prose: that 55% is the Comments stance's smell, and heuristic
+  14's thresholds are alarms, not targets.
 - **Average complexity.** A file can average B while eight functions score F.
 - **Line coverage under autouse stubs.** A suite that stubs the thing under
   test to "passed" reports coverage of paths it cannot fail.
@@ -148,6 +176,8 @@ Interactive sessions get this document through `CLAUDE.md` and
 `~/.claude/CLAUDE.md`. `/review`'s integration reviewer gets it through
 `review/briefing.yaml`; `/prd` through its project overlay. Orchestrator-
 dispatched task and reviewer agents receive only their role system prompt,
-which cannot follow a cross-reference, so for them the substance must be
-carried inline in the reviewer prompts — that wiring is tracked as a task
-rather than assumed.
+which cannot follow a cross-reference, so for them the substance is carried
+inline in `orchestrator/src/orchestrator/agents/roles.py::CODE_QUALITY_GUIDANCE`
+(task 5225); `orchestrator/tests/test_code_quality_guidance_parity.py` guards
+the headline and label tokens on both sides, and the bullet bodies are
+mirrored by hand.

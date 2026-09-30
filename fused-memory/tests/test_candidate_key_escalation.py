@@ -2,14 +2,14 @@
 
 This is the injectable escalation seam invoked by the sqlite backend's
 v3->v4 self-gating migration when residual non-cancelled duplicate
-candidate_key groups are found at connection-open. Mirrors the defensive
-HAS_ESCALATION / EscalationQueue never-raise pattern established by
-``middleware.scope_violation_escalator``.
+candidate_key groups are found at connection-open.
 """
 
 from __future__ import annotations
 
 import json
+
+import pytest
 
 from fused_memory.middleware import candidate_key_escalation as cke_mod
 from fused_memory.middleware.candidate_key_escalation import (
@@ -17,10 +17,10 @@ from fused_memory.middleware.candidate_key_escalation import (
 )
 
 
-def test_emit_residual_candidate_key_escalation_never_raises_and_returns_id_or_none(tmp_path):
-    """Never raises; returns an escalation id str (escalation package
-    importable -- a file lands under {project_root}/data/escalations) or
-    None (HAS_ESCALATION is False)."""
+def test_emit_residual_candidate_key_escalation_files_into_the_projects_queue(tmp_path):
+    """Returns the escalation id, and a file lands under
+    {project_root}/data/escalations."""
+    pytest.importorskip('escalation')
     residual_groups = [
         {'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'], 'count': 2},
     ]
@@ -28,15 +28,12 @@ def test_emit_residual_candidate_key_escalation_never_raises_and_returns_id_or_n
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if cke_mod.HAS_ESCALATION:
-        assert isinstance(result, str)
-        queue_dir = tmp_path / 'data' / 'escalations'
-        files = list(queue_dir.glob('esc-*.json'))
-        assert len(files) == 1, f'expected one escalation file, found: {files}'
-        payload = json.loads(files[0].read_text())
-        assert payload['id'] == result
-    else:
-        assert result is None
+    assert isinstance(result, str)
+    queue_dir = tmp_path / 'data' / 'escalations'
+    files = list(queue_dir.glob('esc-*.json'))
+    assert len(files) == 1, f'expected one escalation file, found: {files}'
+    payload = json.loads(files[0].read_text())
+    assert payload['id'] == result
 
 
 def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending(tmp_path):
@@ -47,6 +44,7 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
     flood the operator queue with near-identical escalations. Once the
     original is resolved, a later call is free to file a fresh one.
     """
+    pytest.importorskip('escalation')
     residual_groups = [
         {'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'], 'count': 2},
     ]
@@ -56,11 +54,6 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
     second_id = emit_residual_candidate_key_escalation(
         project_root=str(tmp_path), residual_groups=residual_groups,
     )
-
-    if not cke_mod.HAS_ESCALATION:
-        assert first_id is None
-        assert second_id is None
-        return
 
     assert first_id is not None
     assert second_id == first_id, (
@@ -99,6 +92,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
     understands why THESE groups still need a human without
     cross-referencing the migration source.
     """
+    pytest.importorskip('escalation')
     residual_groups = [
         {
             'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'],
@@ -113,9 +107,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if not cke_mod.HAS_ESCALATION:
-        assert result is None
-        return
+    assert result is not None
 
     queue_dir = tmp_path / 'data' / 'escalations'
     files = list(queue_dir.glob('esc-*.json'))
@@ -125,3 +117,55 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
     assert 'mixed_status' in detail, detail
     assert 'title_divergent' in detail, detail
     assert 'auto-heal' in detail.lower(), detail
+
+
+class TestDelegatesToTheSharedHelper:
+    """What this filer forwards to `file_folded_escalation`."""
+
+    def test_forwards_this_modules_own_anchor_role_and_category(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-candidate-key-migration-1'
+
+        monkeypatch.setattr(cke_mod, 'file_folded_escalation', _spy)
+
+        result = emit_residual_candidate_key_escalation(
+            str(tmp_path),
+            [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1', '2'],
+              'count': 2, 'reason': 'mixed_status'}],
+        )
+
+        assert result == 'esc-candidate-key-migration-1'
+        assert seen['anchor_task_id'] == 'candidate-key-migration'
+        assert seen['agent_role'] == 'fused-memory/candidate-key-migration'
+        assert seen['category'] == 'candidate_key_residual_duplicates'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_forwards_the_group_detail_it_builds(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-candidate-key-migration-1'
+
+        monkeypatch.setattr(cke_mod, 'file_folded_escalation', _spy)
+
+        emit_residual_candidate_key_escalation(
+            str(tmp_path),
+            [{'tag': 'bug', 'candidate_key': 'ck-9', 'task_ids': ['7'],
+              'count': 1, 'reason': 'title_divergent'}],
+        )
+
+        assert "reason='title_divergent'" in seen['detail']
+        assert 'ux_tasks_candidate_key' in seen['detail']
+        assert 'residual duplicate candidate_key' in seen['summary']
+

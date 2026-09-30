@@ -26,8 +26,12 @@ reasons:
    differently, but to keep the shipped number visible and reviewable at
    the call site.
 
-This is a GUARD on worst-case pool growth, not a leak fix. It does NOT fix
-CLOSE-WAIT accumulation (owned by the task-3857 re-spec).
+This is a GUARD on worst-case pool growth, not a leak fix. The CLOSE-WAIT
+accumulation is fixed elsewhere, in ``dashboard/src/dashboard/http_pool.py``,
+which reclaims connections a cancelled request leaves in a state httpcore's
+own sweep cannot reach. That extends task 3857's refutation rather than
+reopening it — 3857 measured IDLE connections — and the mechanism is written
+down once, there.
 
 ``_build_http_limits`` is a PURE helper so the sizing is directly testable:
 ``httpx.AsyncClient`` exposes no public accessor for its limits, so the only
@@ -326,9 +330,9 @@ class TestLifespanWiresTheLimits:
                 'dashboard.app.DashboardConfig.from_env',
                 return_value=fleet_config,
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
         ):
@@ -368,7 +372,7 @@ class TestEndpointBudgetsReachTheMcpLegs:
     def test_api_memory_hands_each_mcp_leg_the_endpoint_budget(self, client):
         from unittest.mock import AsyncMock, patch
 
-        from dashboard.app import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
+        from dashboard.api.memory import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
 
         status = AsyncMock(return_value={'offline': True, 'error': 'down'})
         queue = AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None})

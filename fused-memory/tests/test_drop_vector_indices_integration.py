@@ -32,14 +32,22 @@ catalog read taken before that build finishes can still see the pre-drop row,
 including the just-dropped VECTOR property.  Every post-drop
 ``list_indices()`` / ``drop_vector_indices()`` call in THIS MODULE is
 therefore barriered by ``await_index_operational`` — these are TEST-only
-barriers, load-bearing rather than defensive, and they do NOT mean production
-is exposed to the same race:
+barriers, load-bearing rather than defensive.
+
+The window itself is UNCHANGED, and ``TestDropRebuildWindow`` below still pins
+it; what task 4777 changed is that production no longer walks into it.
 ``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``
-issues its own ``list_indices()`` read exactly ONCE, BEFORE any drop, so a
-single production call can never observe its own rebuild window.  Only a
-rapid second call — what
-``test_is_idempotent_and_reports_zero_on_a_second_run`` below exercises — or
-a caller that re-reads the catalog after a drop, can land in it.
+now reads the catalog through ``GraphitiBackend._await_index_catalog_settled``,
+the production-side barrier, so even a back-to-back second call settles before
+it reads — ``test_a_back_to_back_second_run_settles_without_a_test_side_barrier``
+is the live proof.
+
+The barriers in THIS module stay regardless, because the TESTS are still
+exposed: they read the catalog DIRECTLY — ``backend.list_indices``, raw
+``graph.query('CALL db.indexes()')`` — outside any production settle, and a raw
+read is exactly what the window catches.  Do not remove one on the grounds that
+production now settles; production settling says nothing about a read that
+never goes through it.
 """
 
 from __future__ import annotations
@@ -254,23 +262,71 @@ class TestDropVectorIndicesLive:
             first = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert len(first) == 2
 
-            # MANDATORY (task 4748) — see the drop-side HAZARD in the module
-            # docstring; do NOT delete as redundant with the fixture's
-            # barrier. drop_vector_indices() opens with its own
-            # list_indices(), so without this barrier pass 2's internal read
-            # can land in the rebuild window, see the stale
-            # Entity{name_embedding: ['VECTOR']} row, and re-issue
-            # `DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)` — which
-            # FalkorDB then answers with:
+            # RETAINED DELIBERATELY (task 4748, re-read task 4777) — see the
+            # drop-side HAZARD in the module docstring; do NOT delete as
+            # redundant with the fixture's barrier.
+            #
+            # It is no longer the ONLY thing standing between pass 2 and
             #   redis.exceptions.ResponseError: Unable to drop index on
             #   :Entity(name_embedding): no such index.
-            # drop_vector_indices() deliberately does not absorb per-statement
-            # failures, so that ERRORS the test rather than failing an
-            # assertion.
+            # As of task 4777, drop_vector_indices() opens with
+            # _await_index_catalog_settled() rather than a bare list_indices(),
+            # so pass 2 settles the catalog for itself before reading it and
+            # cannot see the stale Entity{name_embedding: ['VECTOR']} row.
+            # test_a_back_to_back_second_run_settles_without_a_test_side_barrier
+            # below is the test that exercises THAT path, with no test-side
+            # barrier at all.
+            #
+            # This one keeps the belt-and-braces test-side barrier itself under
+            # test, and stays load-bearing on its own terms: if the production
+            # settle is ever removed, this barrier is what keeps the failure
+            # confined to the sibling test below instead of making this one a
+            # second flake. drop_vector_indices() deliberately does not absorb
+            # per-statement failures, so a regression ERRORS rather than
+            # failing an assertion.
             await await_index_operational(live_vector_graph)
 
             second = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert second == []
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_a_back_to_back_second_run_settles_without_a_test_side_barrier(
+        self, mock_config, live_vector_graph,
+    ):
+        """The sibling above with the test-side barrier REMOVED: production settles.
+
+        EXPECTED TO PASS ON INTRODUCTION (task 4777) -- not a RED test.  The live
+        window is a race, so a test built to fail without the fix would itself be
+        a flake; the deterministic red coverage is the mocked
+        ``test_drop_vector_indices.py::TestDropVectorIndicesInsideTheRebuildWindow``,
+        whose module docstring says why.
+
+        Its job is to prove the production settle composes with the REAL catalog
+        -- the real ``status`` column and its real not-ready spelling -- rather
+        than only with a mock of it, and to fail loudly if the settle is ever
+        removed or disarmed.  Not a replacement for
+        ``test_is_idempotent_and_reports_zero_on_a_second_run``, which keeps the
+        test-side barrier itself under test.
+        """
+        backend = GraphitiBackend(mock_config)
+        # HAZARD (esc-3375-1): inject the driver, never call initialize().
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            first = await backend.drop_vector_indices(group_id=TEST_GRAPH)
+            assert len(first) == 2, (
+                f'fixture did not seed the two expected vector indices: {first!r}'
+            )
+
+            # NO await_index_operational here -- that omission IS the test: pass
+            # 2's own settle is all that stands between it and the stale
+            # Entity{name_embedding: ['VECTOR']} row, and a regression ERRORS
+            # with FalkorDB's `no such index` rather than failing an assertion.
+            second = await backend.drop_vector_indices(group_id=TEST_GRAPH)
+            assert second == [], (
+                f'a back-to-back second run found vector indices to drop: {second!r}'
+            )
         finally:
             await backend.close()
 

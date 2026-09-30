@@ -55,13 +55,21 @@ import contextlib
 import logging
 import math
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, passes
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    fails,
+    lane_scene_config,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
@@ -77,6 +85,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
+    PRODUCTION_CLOCK,
     MergeRequest,
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
@@ -1225,9 +1234,8 @@ def host_config(host_repo: Path, host_git_config: GitConfig) -> OrchestratorConf
     internals.  The reprobe CADENCE is the injected clock's job -- see
     ``_ShortSleepClock`` for why config alone cannot set it.
     """
-    return OrchestratorConfig(
-        project_root=host_repo,
-        git=host_git_config,
+    return lane_scene_config(
+        host_repo, host_git_config,
         verify_host_unreachable_escalate_after_n=1,
         verify_host_unreachable_escalate_after_secs=0.0,  # streak-only
     )
@@ -1349,6 +1357,14 @@ class _ShortSleepClock:
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(min(secs, self._CAP_SECS))
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        # UNCAPPED, unlike the sleep above: capping it would re-check the
+        # lane's halt and abandonment branches ~500x more often and reorder
+        # the halt-vs-verify interleaving this file's capstone measures. So
+        # this one method wants production semantics exactly, and delegates
+        # rather than restating them.
+        return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
 
 
 class _HostEscalationQueue:
@@ -1888,9 +1904,10 @@ class TestUnreachableHostCapstone:
 # ===========================================================================
 
 
-def _xcheck_config(*, cross_check: bool = True) -> OrchestratorConfig:
-    """OrchestratorConfig with the fix-(b) knob explicit + a project_root the
-    cross-check LocalRunner's archive_root is derived from.
+def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> OrchestratorConfig:
+    """OrchestratorConfig with the fix-(b) knob explicit, rooted at the caller's
+    sandboxed *project_root* — the cross-check LocalRunner's archive_root and
+    the runs.db path both derive from it.
 
     ``escalate_preexisting_main_break=False`` is the FIRST guard both
     ``_classify_main_health_red`` and ``_spawn_main_health_probe`` apply
@@ -1902,7 +1919,7 @@ def _xcheck_config(*, cross_check: bool = True) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         git=GitConfig(main_branch='main'),
-        project_root=Path('/tmp/xcheck-fake'),
+        project_root=project_root,
         verify_cross_check_remote_green=cross_check,
         escalate_preexisting_main_break=False,
     )
@@ -1973,7 +1990,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2039,7 +2056,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2095,7 +2112,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2140,7 +2157,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2174,7 +2191,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2207,7 +2224,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=False)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=False)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2241,7 +2258,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2273,7 +2290,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2311,7 +2328,7 @@ class TestPerLandCrossCheck:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 
@@ -2529,6 +2546,7 @@ class TestTwoHostFalseGreenCapstone:
             # (b1) the false-green does NOT land.
             outcome_b = await wait_responsive(req_b.result, label='false-green must not land')
             assert outcome_b.status != 'done', outcome_b
+            assert not main_health_probe_spawned(outcome_b), outcome_b.reason
 
         _, main_files, _ = await _run(
             ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=host_git_ops.project_root,
@@ -2598,7 +2616,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
-        config = _xcheck_config(cross_check=True)
+        config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
         git_ops = _xcheck_git_ops()
 

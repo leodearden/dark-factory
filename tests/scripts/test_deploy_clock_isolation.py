@@ -49,6 +49,8 @@ import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
+    FLEET_LEASE_RELPATH,
+    PROTECTED_DEPLOY_CLOCK_ENV_VARS,
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
     PYTEST_SESSION_TOKEN_ENV,
     ClockVerdict,
@@ -101,6 +103,51 @@ class TestProtectedRelpaths:
         environment) that produced the fleet-clock bug.
         """
         assert _FM_RELPATH in PROTECTED_DEPLOY_CLOCK_RELPATHS
+
+    def test_it_covers_the_in_flight_lease_for_the_REDIRECT_ONLY(self) -> None:
+        """The lease gets the redirect half of the guard and NOT the other half.
+
+        REDIRECT: yes. A test that spawns restart-all-orchestrators.sh without
+        setting $ORCH_FLEET_LEASE would create, rewrite and remove the LIVE
+        lease, which is exposed in both directions a clock is exposed in one --
+        one left behind suppresses real redeploys until the max-age bound
+        expires, and a lease_release against the live path deletes a genuine
+        in-flight sweep's lease. The redirect removes that at the source.
+
+        CHANGE DETECTION: no, and this is not an omission. deploy_clock_guard_
+        roots deliberately watches the MAIN checkout as well as the worktree,
+        and a real sweep creates, per-unit rewrites and removes the live lease
+        for its WHOLE duration (~15min today) against documented 26-41min
+        verify runs. A real sweep IS a benign external write -- which is the
+        only reason the guard watches the main checkout at all -- so watching
+        the lease for changes fails innocent branches at roughly (sweep + run)
+        / 8h, re-opening exactly the false-positive class task 4823 closed.
+        """
+        assert FLEET_LEASE_RELPATH in PROTECTED_DEPLOY_CLOCK_ENV_VARS, (
+            f'{FLEET_LEASE_RELPATH!r} must stay in the env-var table: that is '
+            'what drives the suite-wide redirect away from the live lease path.'
+        )
+        assert FLEET_LEASE_RELPATH not in PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+            f'{FLEET_LEASE_RELPATH!r} is CHANGE-DETECTED again. A real fleet '
+            'sweep writes, rewrites and removes the live lease for its whole '
+            'duration, so any verify run straddling either end of one fails an '
+            'innocent branch (REWRITTEN / DELETED / CREATED) -- the false-'
+            'positive class task 4823 closed, with a far wider window than a '
+            'clock, which moves once and instantaneously. Unlike a clock, no '
+            'provenance in the body could rescue it: the DELETED case has '
+            'after=None and leaves nothing to attribute.'
+        )
+
+    def test_the_snapshot_does_not_record_the_lease(self, tmp_path: Path) -> None:
+        """The exclusion has to reach the SNAPSHOT, not just the tuple.
+
+        deploy_clock_snapshot keys off PROTECTED_DEPLOY_CLOCK_RELPATHS, so a
+        lease key appearing here would mean the guard is still watching it by
+        another name.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, b'{"pid": 1, "started_ts": 0}')
+
+        assert FLEET_LEASE_RELPATH not in deploy_clock_snapshot(tmp_path)
 
     def test_the_relpaths_are_relative(self) -> None:
         """They are joined onto a root by the snapshot; an absolute entry would
@@ -1544,3 +1591,79 @@ def test_fixture_marker_is_the_shared_one_not_a_local_copy() -> None:
         f'only resolves because tests/scripts/conftest.py puts this directory '
         f'on sys.path. Import df_pytest_isolation.fixture_marker there instead.'
     )
+
+
+class TestALeaseOnlyChangeIsNeverReported:
+    """The behavioural half of the redirect-only split (task 4755 review fix).
+
+    ``scripts/restart-all-orchestrators.sh`` creates the lease at sweep start,
+    rewrites it per unit (``lease_set_current_unit``) and removes it on every
+    catchable exit path, in the MAIN checkout ``deploy_clock_guard_roots``
+    deliberately also watches. So a verify run whose session snapshot straddles
+    either end of a real sweep sees one of exactly three shapes -- REWRITTEN,
+    DELETED or CREATED -- and the lease carries no ``source``/``pytest_session``
+    provenance pair by design (a lease has no benign-external-write case at the
+    PRODUCER, which is a different question from whether a READER can attribute
+    one), so every shape would classify FALSIFIED and fail an innocent branch.
+
+    The non-masking property is pinned in the same class, mirroring
+    ``TestAFalsificationIsNeverMaskedByABenignChange``: an exclusion that could
+    hide a real falsification would be a worse defect than the one it fixes.
+    """
+
+    _LEASE_BODY = b'{"pid": 4242, "started_ts": 1787849070, "current_unit": "u"}'
+    _LEASE_BODY_AFTER = b'{"pid": 4242, "started_ts": 1787849070, "current_unit": "v"}'
+
+    def _report(
+        self, tmp_path: Path, before: dict[str, tuple[bytes, int] | None],
+    ) -> tuple[ClockVerdict, str] | None:
+        return deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+    def test_a_sweep_starting_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """CREATED: the run began before the sweep did."""
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+
+        assert self._report(tmp_path, before) is None
+
+    def test_a_sweep_advancing_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """REWRITTEN: lease_set_current_unit fires once per unit, ~7 times."""
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY_AFTER)
+
+        assert self._report(tmp_path, before) is None
+
+    def test_a_sweep_finishing_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """DELETED: the EXIT trap's lease_release ran while the run was going.
+
+        The shape no provenance scheme could ever rescue: ``after`` is None, so
+        there is no body left to attribute.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        (tmp_path / FLEET_LEASE_RELPATH).unlink()
+
+        assert self._report(tmp_path, before) is None
+
+    def test_the_exclusion_cannot_mask_a_falsified_clock(self, tmp_path: Path) -> None:
+        """A lease change in the SAME run must not swallow a real falsification.
+
+        The same non-masking property ``TestAFalsificationIsNeverMasked
+        ByABenignChange`` pins cross-clock: an exemption for one file is no
+        evidence at all about a different one.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        (tmp_path / FLEET_LEASE_RELPATH).unlink()
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=_THIS_SESSION))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None, 'the lease exclusion masked a falsified clock'
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert str(tmp_path / _FLEET_RELPATH) in message, message

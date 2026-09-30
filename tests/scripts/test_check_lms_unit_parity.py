@@ -864,7 +864,7 @@ def test_lms_reuses_the_shared_drift_and_absent():
     the tooling built to report silent duplication is the failure this family
     exists to catch, one level up.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     mod = _load_checker()
 

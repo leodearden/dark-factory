@@ -13,27 +13,29 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _briefing_helpers import (
+    _mcp_search_envelope,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
+from shared.capability_manifest import DeliveredCheckMeta
+from test_roles_ancestry_check import _tool_is_granted
 
-from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
+from orchestrator.agents.briefing import (
+    DELIVERED_CHECK_BULLET_LIMIT,
+    MEMORY_CONTEXT_CAVEAT,
+    BriefingAssembler,
+    _format_delivered_checks,
+)
+from orchestrator.agents.roles import ARCHITECT
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 
 
 @pytest.fixture
@@ -76,6 +78,75 @@ def task_with_proposal() -> dict:
             ],
         },
     }
+
+@pytest.fixture
+def task_with_delivered_checks() -> dict:
+    """Task fixture carrying a two-entry ``metadata.delivered_checks`` list.
+
+    Shared by the unit and integration layers of
+    ``TestDeliveredChecksReachDispatchedRoles`` so the sample descriptor list
+    lives in one place. The grep entry copies the key set the gate's own suites
+    already exercise (``test_delivered_check_gate_e2e.py``,
+    ``test_delivered_check_gate.py``) so the renderer and the runner cannot
+    drift into describing different dicts.
+    """
+    return {
+        'id': '5359',
+        'title': 'Task declaring a capability',
+        'description': 'Deliver the capability its gate names.',
+        'metadata': {
+            'files': ['orchestrator'],
+            'delivered_checks': [
+                {
+                    'name': 'gate-renders-in-briefing',
+                    'kind': 'grep',
+                    'pattern': '_format_delivered_checks',
+                    'expect': 'present',
+                    'paths': ['orchestrator'],
+                },
+                {
+                    'name': 'gate-predicate-runs',
+                    'kind': 'script',
+                    'script': 'scripts/check_gate.py',
+                    'args': ['--strict'],
+                    'timeout_secs': 60,
+                },
+            ],
+        },
+    }
+
+
+def _bullet_lines(rendered: str) -> list[str]:
+    """The descriptor bullets of a capability-gate block, boilerplate excluded.
+
+    Every assertion about what the RENDERER produced must run against these
+    lines alone. The block's static prose necessarily repeats descriptor
+    vocabulary — it names a ``grep`` check, a ``script`` check, "Satisfying a
+    pattern with a comment", "each capability names" — so a substring test over
+    the whole block silently passes on ``pattern``, ``script``, ``name`` and
+    ``grep`` no matter what the bullets contain. Shared by both
+    ``_format_delivered_checks`` test classes so the filter is stated once.
+    """
+    return [ln for ln in rendered.splitlines() if ln.startswith('- name:')]
+
+
+def _unwrapped(rendered: str) -> str:
+    """``rendered`` with its line wrapping collapsed to single spaces.
+
+    The block's prose is hard-wrapped in the f-string, so a pinned phrase
+    longer than the remaining line budget is split by a newline and a plain
+    ``in`` test fails for a reason that has nothing to do with the claim being
+    pinned. Use this for any phrase long enough to straddle the wrap.
+
+    This normalizes LAYOUT, which is not part of any claim these tests make; it
+    does not weaken the assertion — the pinned phrase stays whole, never
+    shortened to a fragment or loosened into a regex. Re-flowing the prompt so
+    each phrase lands on one line works too, and is what the prior fix in this
+    file did, but it leaves the next editor of that paragraph a trap that fails
+    red for the wrong reason. Precedent for normalizing before matching:
+    ``fused-memory/tests/test_stage3_cross_project_routing_actionable.py``.
+    """
+    return ' '.join(rendered.split())
 
 
 class TestFormatTaskMetadataInvariant:
@@ -148,6 +219,364 @@ class TestFormatTaskIncludeFiles:
         assert '**Files:** orchestrator, shared' in out
 
 
+class TestFormatDeliveredChecks:
+    """Unit tests for the module-level ``_format_delivered_checks`` renderer.
+
+    Covers the happy path: the two descriptor kinds
+    (``shared.capability_manifest.DeliveredCheckMeta``), bullet ordering, the
+    empty-input contract the caller relies on to omit the section entirely,
+    and the anti-gaming reading directive.
+
+    Directive assertions use positive-directive form per
+    ``feedback_test_assert_negative_directives.md`` and the convention
+    ``TestBuildPlanTighteningPrompt`` already records: the directive prose
+    necessarily contains the words it warns about ("comment", "docstring",
+    "pattern"), so a bare ``not in`` would self-conflict.
+    """
+
+    GREP_CHECK = {
+        'name': 'cap-one',
+        'kind': 'grep',
+        'pattern': 'FooBar',
+        'expect': 'present',
+        'paths': ['orchestrator'],
+    }
+    SCRIPT_CHECK = {
+        'name': 'cap-two',
+        'kind': 'script',
+        'script': 'scripts/check.py',
+        'args': ['--strict'],
+        'timeout_secs': 30,
+    }
+
+    def test_grep_entry_renders_its_descriptor(self):
+        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.GREP_CHECK])))
+        assert 'cap-one' in bullet
+        assert 'grep' in bullet
+        assert 'FooBar' in bullet
+        assert 'present' in bullet
+        assert 'orchestrator' in bullet
+
+    def test_script_entry_renders_its_descriptor(self):
+        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK])))
+        assert 'cap-two' in bullet
+        assert 'script' in bullet
+        assert 'scripts/check.py' in bullet
+        assert '--strict' in bullet
+        assert '30' in bullet
+
+    def test_two_entries_render_two_bullets_in_order(self):
+        out = _format_delivered_checks([self.GREP_CHECK, self.SCRIPT_CHECK])
+        bullets = _bullet_lines(out)
+        assert len(bullets) == 2
+        assert out.index('cap-one') < out.index('cap-two')
+
+    def test_none_renders_nothing(self):
+        """The caller uses falsiness to omit the whole section."""
+        assert _format_delivered_checks(None) == ''
+
+    def test_empty_list_renders_nothing(self):
+        assert _format_delivered_checks([]) == ''
+
+    def test_block_labels_itself_as_the_capability_gate_against_main(self):
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert '## Declared Capability Gate' in out
+        assert 'delivered_checks' in out
+        assert 'main' in out
+
+    def test_block_states_the_gate_claim_conditionally(self):
+        """``delivered_checks.enabled`` short-circuits the gate to inert
+        (``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``)
+        and is green-tier hot-reloadable, so an unconditional "your mark-done IS
+        gated" would be a false mechanical claim on a disarmed fleet.
+        """
+        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        assert 'When the capability gate is enabled' in out
+        assert 'delivered_checks.enabled' in out
+
+    def test_block_binds_the_directive_regardless_of_the_gate(self):
+        """The anti-gaming directive must not be read as conditional too."""
+        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        assert 'whether or not the gate is armed on this fleet' in out
+
+    def test_block_carries_the_anti_gaming_directive(self):
+        """Positive-directive assertions — the prose names what to DO."""
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'Deliver the BEHAVIOUR' in out
+        assert 'is a defect, not a pass' in out
+
+    def test_block_tells_the_agent_to_escalate_an_unsatisfiable_descriptor(self):
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'escalate_blocker' in out
+        assert 'design_concern' in out
+
+    def test_block_points_at_the_descriptor_contract_rather_than_restating_it(self):
+        """INV-9: point at §3.3, do not restate the descriptor shape."""
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'docs/task-authoring.md' in out
+
+    def test_render_mentions_every_live_descriptor_field(self):
+        """INV-5 drift pin against the live schema.
+
+        A field added to ``_CheckFieldsBase`` would otherwise vanish silently
+        from every briefing. The grep and script field sets are mutually
+        exclusive by ``kind``, so the union of the two renders is what must
+        cover ``DeliveredCheckMeta.model_fields``.
+
+        Scoped to the BULLETS via ``_bullet_lines``: the block's static prose
+        contains the substrings ``pattern``, ``script`` and ``name`` on its
+        own, so a union taken over the whole block would keep passing after
+        those three fields were deleted from the renderer — pinning prose
+        instead of the thing that drifts.
+        """
+        union = '\n'.join(
+            _bullet_lines(_format_delivered_checks([self.GREP_CHECK]))
+            + _bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK]))
+        )
+        missing = [f for f in DeliveredCheckMeta.model_fields if f not in union]
+        assert not missing, f'renderer omits live DeliveredCheckMeta fields: {missing}'
+
+class TestFormatDeliveredChecksDegradesSafely:
+    """``_format_delivered_checks`` runs on the hot path of every dispatch over
+    persisted, untyped ``metadata`` — a stray shape must never crash a prompt
+    build, and a descriptor it cannot fully describe must stay VISIBLE rather
+    than be dropped (an invisible check still gates mark-done).
+    """
+
+    VALID = {
+        'name': 'cap-ok',
+        'kind': 'grep',
+        'pattern': 'FooBar',
+        'expect': 'present',
+        'paths': [],
+    }
+
+    def test_bare_dict_is_accepted_as_a_one_element_list(self):
+        """A dict supplied where a list belongs validates quietly through
+        ``parse_metadata`` (shared/tests/test_capability_manifest.py), so a real
+        task can carry one — render it as the single bullet the author meant.
+        """
+        out = _format_delivered_checks(
+            {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+        )
+        assert isinstance(out, str)
+        assert len(_bullet_lines(out)) == 1
+        assert 'cap' in out
+
+    def test_string_value_renders_nothing(self):
+        """Never render a string per-character."""
+        assert _format_delivered_checks('cap-one') == ''
+
+    def test_int_value_renders_nothing(self):
+        assert _format_delivered_checks(7) == ''
+
+    def test_non_dict_element_does_not_lose_the_valid_entry(self):
+        out = _format_delivered_checks(['nope', self.VALID])
+        assert isinstance(out, str)
+        assert 'cap-ok' in out
+        assert len(_bullet_lines(out)) == 1
+
+    def test_non_dict_element_is_counted_visibly(self):
+        """A dropped element must leave a trace, not vanish."""
+        out = _format_delivered_checks(['nope', self.VALID])
+        assert '1 malformed entry' in out
+
+    def test_all_elements_malformed_still_renders_the_section(self):
+        """The failure this section exists to cure, one level down.
+
+        ``parse_metadata`` preserves a wrong-shaped ``delivered_checks`` slice
+        with only a ``SchemaWarning`` (shared/tests/test_capability_manifest.py),
+        and ``run_delivered_check`` maps such an entry to ERRORED — which
+        ``gate_mark_done_on_delivered_checks`` turns into a withheld mark-done.
+        Rendering '' would block the task from ever stamping done while showing
+        its agent no gate at all.
+        """
+        out = _format_delivered_checks(['cap-one'])
+        assert GATE_HEADING in out
+        assert '1 malformed entry' in out
+        assert 'metadata.delivered_checks' in out
+
+    def test_malformed_count_is_plural_for_several(self):
+        out = _format_delivered_checks(['a', 'b', 7])
+        assert '3 malformed entries' in out
+
+    def test_malformed_line_is_not_counted_as_a_descriptor_bullet(self):
+        assert _bullet_lines(_format_delivered_checks(['nope'])) == []
+
+    def test_entry_missing_name_and_kind_still_renders_what_is_known(self):
+        out = _format_delivered_checks([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
+        assert len(_bullet_lines(out)) == 1
+        assert 'OnlyAPattern' in out
+        assert 'present' in out
+
+    def test_unrecognised_kind_renders_a_visible_partial_bullet(self):
+        out = _format_delivered_checks(
+            [{'name': 'cap-weird', 'kind': 'telepathy', 'pattern': 'Z'}],
+        )
+        assert len(_bullet_lines(out)) == 1
+        assert 'cap-weird' in out
+        assert 'telepathy' in out
+        assert 'Z' in out
+        assert 'UNRECOGNISED' in out
+
+    def test_unrecognised_kind_does_not_suppress_a_sibling_entry(self):
+        out = _format_delivered_checks([{'kind': 'telepathy'}, self.VALID])
+        assert len(_bullet_lines(out)) == 2
+        assert 'cap-ok' in out
+
+    def test_non_string_paths_element_is_coerced(self):
+        out = _format_delivered_checks(
+            [{'name': 'c', 'kind': 'grep', 'pattern': 'X', 'expect': 'present',
+              'paths': ['orchestrator', 7]}],
+        )
+        assert 'orchestrator' in out
+        assert '7' in out
+
+    def test_non_string_args_element_is_coerced(self):
+        out = _format_delivered_checks(
+            [{'name': 'c', 'kind': 'script', 'script': 's.py', 'args': ['--a', 3],
+              'timeout_secs': 5}],
+        )
+        assert '--a' in out
+        assert '3' in out
+
+    def test_over_the_limit_truncates_visibly(self):
+        checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT + 3)]
+        out = _format_delivered_checks(checks)
+        assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert '…and 3 more' in out
+
+    def test_exactly_at_the_limit_renders_no_truncation_line(self):
+        checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT)]
+        out = _format_delivered_checks(checks)
+        assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert '…and' not in out
+
+GATE_HEADING = '## Declared Capability Gate'
+
+
+class TestDeliveredChecksReachDispatchedRoles:
+    """The defect this task exists to fix: ``metadata.delivered_checks`` gates
+    the task's OWN mark-done
+    (``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``)
+    yet reached no dispatched role, so the agent was measured against a contract
+    it could not see.
+
+    Two layers, mirroring ``TestFormatTaskIncludeFiles`` (unit) and
+    ``TestAntiAnchorFirstDerivation`` (integration). The integration layer
+    passes ``context=''`` exactly as that class does, so no fused-memory call
+    is attempted. ``pytest.mark.asyncio`` is applied per-method rather than to
+    the class: the plugin's strict mode errors on a sync test carrying the mark,
+    and both layers belong in one class.
+    """
+
+    @staticmethod
+    def _assert_gate_delivered(text: str) -> None:
+        assert GATE_HEADING in text
+        assert 'gate-renders-in-briefing' in text
+        assert 'gate-predicate-runs' in text
+        # Positive-directive form: the anti-gaming prose necessarily contains
+        # the words it warns about, so assert what it tells the agent to DO.
+        assert 'Deliver the BEHAVIOUR' in text
+        assert 'is a defect, not a pass' in text
+
+    def test_format_task_renders_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        self._assert_gate_delivered(briefing._format_task(task_with_delivered_checks))
+
+    def test_task_without_delivered_checks_renders_no_gate(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """The common path is unchanged — no section, no header."""
+        assert GATE_HEADING not in briefing._format_task(anti_anchor_task)
+
+    def test_metadata_explicitly_none_does_not_raise(
+        self, briefing: BriefingAssembler,
+    ):
+        """``metadata: None`` reaches ``_format_task`` from callers that never
+        went through ``Scheduler._normalize_task_metadata`` (the eval runner
+        and the CLI pass a raw ``task_definition``).
+        """
+        out = briefing._format_task({'id': '7', 'title': 'None metadata', 'metadata': None})
+        assert '**ID:** 7' in out
+        assert GATE_HEADING not in out
+
+    def test_include_files_false_keeps_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        """C-A1 suppresses the queue-time ``metadata.files`` GUESS only — never
+        the authored acceptance contract the architect is measured against.
+
+        The fixture makes the overlap literal: ``metadata.files`` and the grep
+        descriptor's ``paths`` are the same list. ``paths`` is the scope
+        ``git grep -E`` searches at mark-done, so hiding it would show the
+        architect a check it cannot evaluate while still blocking the task on
+        it — the deliberate exemption ``_format_task``'s docstring records.
+        Asserted on the BULLETS: ``orchestrator`` also appears in the block's
+        prose (it names a file under ``orchestrator/src/``).
+        """
+        out = briefing._format_task(task_with_delivered_checks, include_files=False)
+        assert '**Files:**' not in out
+        self._assert_gate_delivered(out)
+        assert 'paths: orchestrator' in '\n'.join(_bullet_lines(out))
+
+    def test_gate_survives_the_json_fallback(self, briefing: BriefingAssembler):
+        """A task with no recognised top-level field falls through to
+        ``json.dumps``; the gate section must not be lost on that path.
+        """
+        out = briefing._format_task(
+            {'metadata': {'delivered_checks': [
+                {'name': 'lonely-cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+            ]}},
+        )
+        assert GATE_HEADING in out
+        assert 'lonely-cap' in out
+
+    @pytest.mark.asyncio
+    async def test_architect_prompt_carries_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_delivered_checks, worktree=None, context='',
+        )
+        self._assert_gate_delivered(prompt)
+
+    @pytest.mark.asyncio
+    async def test_simple_task_prompt_carries_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        """The role with no architect between it and the gate."""
+        prompt = await briefing.build_simple_task_prompt(
+            task_with_delivered_checks, worktree=None, context='',
+        )
+        self._assert_gate_delivered(prompt)
+
+
+_FORBIDDEN_SECTION_HEADING = '## Forbidden for this pass'
+
+
+async def _build_tightening_prompt(
+    briefing: BriefingAssembler,
+    files: list[str] | None = None,
+    not_touched: list[str] | None = None,
+) -> str:
+    """Render the architect narrowing prompt with a stock flagged-file set."""
+    task = {
+        'id': '2656',
+        'title': 'Test task',
+        'description': 'Demo',
+    }
+    plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
+    return await briefing.build_plan_tightening_prompt(
+        task,
+        plan,
+        not_touched if not_touched is not None else ['a.py', 'b.py'],
+        worktree=None,
+        context='',
+    )
+
+
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:
     """Architect narrowing pass after the plan-files-not-touched gate.
@@ -156,35 +585,19 @@ class TestBuildPlanTighteningPrompt:
     feedback_test_assert_negative_directives.md — the prompt itself
     contains the token names it forbids, so a bare ``not in`` would
     self-conflict.
+
+    New assertions should name tools and structure rather than wording, so
+    that a reworded but still-correct prompt cannot turn this suite red.
     """
 
-    async def _build(
-        self,
-        briefing: BriefingAssembler,
-        files: list[str] | None = None,
-        not_touched: list[str] | None = None,
-    ) -> str:
-        task = {
-            'id': '2656',
-            'title': 'Test task',
-            'description': 'Demo',
-        }
-        plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
-        return await briefing.build_plan_tightening_prompt(
-            task,
-            plan,
-            not_touched if not_touched is not None else ['a.py', 'b.py'],
-            worktree=None,
-            context='',
-        )
-
-    async def test_mentions_both_valid_actions(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+    async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
+        prompt = await _build_tightening_prompt(briefing)
         assert 'update_plan_metadata' in prompt
         assert 'confirm_plan' in prompt
+        assert 'drop_plan_file' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
-        prompt = await self._build(
+        prompt = await _build_tightening_prompt(
             briefing,
             files=['x.py', 'y.py', 'z.py'],
             not_touched=['x.py', 'y.py'],
@@ -197,7 +610,7 @@ class TestBuildPlanTighteningPrompt:
     async def test_forbids_creation_and_step_edits(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         # Positive-directive assertions covering the forbidden tools.
         # The prompt mentions create_plan/add_plan_step/replace_plan_step
         # while listing them as off-limits — assert by section header
@@ -210,12 +623,60 @@ class TestBuildPlanTighteningPrompt:
     async def test_states_new_file_addition_will_be_rejected(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'must NOT add new files' in prompt
 
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestPlanTighteningPromptToolGrants:
+    """Every plan tool the narrowing prompt prescribes must be granted to ARCHITECT.
+
+    ``test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names``
+    scans only ``role.system_prompt``, so it cannot see this dispatch-time prompt.
+    """
+
+    async def test_every_registered_tool_the_prompt_prescribes_is_granted_to_architect(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        artifacts = TaskArtifacts(tmp_path / 'wt')
+        artifacts.init('4807', 'T', 'd')
+        server = plan_tools.create_server(artifacts)
+        registry = {tool.name for tool in await server.list_tools()}
+
+        prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, _forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading, (
+            f'The narrowing prompt has no {_FORBIDDEN_SECTION_HEADING!r} section, '
+            'so this test can no longer tell prescribed tools from forbidden ones.'
+        )
+
+        named = {n for n in registry if re.search(rf'\b{re.escape(n)}\b', prescribed)}
+        assert named, (
+            'The narrowing prompt prescribes no registered plan tool at all, '
+            'which makes this assertion vacuous — either the prompt stopped '
+            'prescribing tools or create_server stopped registering them.'
+        )
+
+        granted = set(ARCHITECT.allowed_tools)
+        missing = sorted(
+            qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
+            if not _tool_is_granted(qualified, granted)
+        )
+        assert not missing, (
+            f'build_plan_tightening_prompt prescribes plan tools absent from '
+            f"ARCHITECT.allowed_tools: {missing}. allowed_tools is passed to the "
+            'SDK as an allowlist (workflow.py::_try_narrow_plan -> '
+            '_invoke(ARCHITECT, ...)), and for the `pi` backend '
+            'agents/invoke.py builds `--tools <csv>` straight from it — so an '
+            'ungranted tool is not in the session registry at all and the '
+            'architect hits a denial following its own instructions. Either '
+            'grant the tool (directly or via a `mcp__<family>__*` wildcard) or '
+            'stop prescribing it.'
+        )
 
 
 @pytest.mark.asyncio
@@ -612,3 +1073,159 @@ class TestReviewerPromptAmendmentScope:
         )
         assert '# Amendment Re-Review Scope' not in omitted
         assert omitted == explicit_none
+
+
+def _memory_reply(content: str = 'A recalled fact.') -> dict:
+    """A one-result, fully-tagged ``search`` reply, in the real wire shape."""
+    entry = _result('1', content, source_store='mem0')
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return _mcp_search_envelope([entry])
+
+
+@pytest.mark.asyncio
+class TestPerRoleMemoryTable:
+    """Which roles get a memory block, and which deliberately do not (D7).
+
+    Task 3659. The merger is a mechanical role — read both sides of a
+    conflict, resolve, test — measured at 7 dispatches in 14 days, and had
+    only the generic block nobody could show helped it. The reviewer is the
+    single highest-volume role and had the same generic block, despite the
+    workflow holding the task id at every dispatch site.
+    """
+
+    async def test_the_merger_asks_memory_nothing(self, briefing: BriefingAssembler):
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_merger_prompt('CONFLICT TEXT', 'THE INTENT')
+
+        assert mcp.await_args_list == [], 'the merger fires no memory query at all'
+        assert '# Context' not in prompt
+        assert '## Conventions & Gotchas' not in prompt
+        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) not in prompt
+        assert 'CONFLICT TEXT' in prompt and 'THE INTENT' in prompt
+
+    async def test_the_reviewer_gets_the_task_scoped_sections(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_memory_reply())
+        task = {
+            'id': '4242',
+            'title': 'Tighten the merge-lane park grace',
+            'metadata': {'files': ['orchestrator/src/orchestrator/merge_worker.py']},
+        }
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt(
+                'reviewer_comprehensive', 'DIFF', task=task,
+            )
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' in prompt
+        assert 'A recalled fact.' in prompt
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-4242-reviewer'
+            assert args['caller_task_id'] == '4242'
+
+    async def test_the_reviewer_still_builds_without_a_task(
+        self, briefing: BriefingAssembler,
+    ):
+        """Existing callers pass no task; they must keep working, with the
+        generic conventions query and no task-scoped section.
+
+        Also the task-less half of D8: a dispatch with no task declares the
+        role alone and must not invent a ``caller_task_id`` for the journal
+        to record it under.
+        """
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' not in prompt
+        arguments = _search_arguments(mcp)
+        assert len(arguments) == 1
+        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+        assert 'caller_task_id' not in arguments[0]
+
+    async def test_the_steward_continuation_asks_memory_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        """Unchanged by this task: the steward session already holds the full
+        context from its initial briefing."""
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_steward_continuation_prompt(
+                {'id': '4242', 'title': 'A task'},
+                {'id': 'esc-4242-1', 'summary': 'Something blocked'},
+            )
+
+        assert mcp.await_args_list == []
+        assert 'esc-4242-1' in prompt
+
+
+class TestFormatTaskFieldSurface:
+    """Pins which task fields ``_format_task`` renders into the prompt.
+
+    Each populated field must reach the prompt on its own line and each
+    absent one must render nothing, so a rewrite that quietly stopped
+    rendering a field an agent is briefed from would not land undetected.
+
+    This does NOT guard ``memory_hints`` delivery: ``briefing.py`` delivers no
+    hints today, and task 3254, which owns that decision, has no protection
+    here.
+
+    Pinned FIELD BY FIELD, not as one byte-for-byte equality: a whole-string
+    equality would additionally freeze field ORDER and every label's exact
+    spelling, so a harmless relabelling would break a guard that has nothing
+    to do with it.
+    """
+
+    def _task(self) -> dict:
+        return {
+            'id': '3254',
+            'title': 'Deliver memory hints to dispatched agents',
+            'description': 'Wire metadata.memory_hints through to the briefing.',
+            'details': 'The channel is reconciliation-internal today.',
+            'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
+            'dependencies': [{'id': '3659'}, '3212'],
+        }
+
+    def test_every_populated_field_renders_on_its_own_line(
+        self, briefing: BriefingAssembler,
+    ):
+        rendered = briefing._format_task(self._task()).splitlines()
+
+        assert '**ID:** 3254' in rendered
+        assert '**Title:** Deliver memory hints to dispatched agents' in rendered
+        assert '**Description:** Wire metadata.memory_hints through to the briefing.' in rendered
+        assert '**Details:** The channel is reconciliation-internal today.' in rendered
+        assert '**Files:** orchestrator/src/orchestrator/agents/briefing.py' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered, (
+            'a dependency reads the same whether it arrives as a dict or a bare id'
+        )
+
+    def test_an_absent_field_renders_nothing_at_all(
+        self, briefing: BriefingAssembler,
+    ):
+        """No empty labels and no ``None`` — the guard against a field that
+        stops being populated turning into a line of noise."""
+        rendered = briefing._format_task({'id': '3254', 'title': 'A task'})
+
+        assert rendered == '**ID:** 3254\n**Title:** A task'
+
+    def test_the_files_line_is_the_only_opt_out(
+        self, briefing: BriefingAssembler,
+    ):
+        """``include_files=False`` is the architect's anti-anchor path (C-A1);
+        it must drop that one line and leave every other field standing."""
+        rendered = briefing._format_task(self._task(), include_files=False).splitlines()
+
+        assert not [line for line in rendered if line.startswith('**Files:**')]
+        assert '**ID:** 3254' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered

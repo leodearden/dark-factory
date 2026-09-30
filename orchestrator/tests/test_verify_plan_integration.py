@@ -60,6 +60,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -895,7 +896,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
 
         verdict = check_proposal(
             entry, worktree=str(req.worktree), category='task_failure',
-            run_git=_fake_run_git,
+            run_git=_fake_run_git, now=datetime.now(UTC),
         )
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
@@ -1016,6 +1017,7 @@ class TestB3GateProposalRouting:
         }
         verdict = check_proposal(
             entry, worktree='/tmp', category=None, run_git=_fake_git_fresh,
+            now=datetime.fromisoformat(self._INVESTIGATED_AT),
         )
         assert verdict['verdict'] == FRESH, (
             f'status-key presence must not abort the typed path, got {verdict!r}'

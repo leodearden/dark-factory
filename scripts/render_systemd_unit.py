@@ -7,15 +7,22 @@ below: dark-factory-dashboard.service (task 4793) and fused-memory.service
 operator-facing log tag and the preserve set were dashboard-specific — so the
 second unit is a registry entry rather than a forked near-copy.
 
-The file keeps its dashboard-era NAME on purpose. ``render_dashboard_unit`` is
-referenced at ~35 sites across 8 tracked files, two of which (in
-tests/scripts/test_check_dashboard_unit_parity.py) WRITE and UNLINK
-``scripts/render_dashboard_unit.py`` by literal path to build setup-host.sh's
-section-8 tmp repo; a rename is filed as separate follow-up work rather than
-smuggled into the task that fixes the defect. The half of that naming problem
-that actually costs anything at 3am is OPERATOR-facing — one shared tag would
-print ``[dashboard_unit_render]`` lines describing the fused-memory unit in a
-long bring-up log — and that half IS fixed here: the tag is per-unit.
+THE FILE WAS RENAMED OFF ITS DASHBOARD-ERA NAME (task 4990), once it also
+rendered fused-memory.service (task 4796) — a module named
+``render_dashboard_unit`` invoked from setup-host.sh to render the unit that
+governs RECONCILIATION was a misnomer at the most safety-critical install site
+in the repo. The rename was deliberately deferred out of task 4796: at that
+point the old name was referenced at ~35 sites across 8 tracked files, two of
+which (in tests/scripts/test_check_dashboard_unit_parity.py) WRITE and UNLINK
+the script BY LITERAL PATH to build setup-host.sh's section-8 tmp repo, making
+the rename its own mechanical pass rather than something to smuggle into the
+task that fixed the defect. The half of that naming problem that actually cost
+anything at 3am was already OPERATOR-facing before this rename: a shared tag
+would have printed ``[dashboard_unit_render]`` lines describing the
+fused-memory unit in a long bring-up log, and task 4796 fixed that half by
+making the tag per-unit (``LOG_TAG`` below is unchanged by this rename — it is
+a distinct string from the module name, and stays the dashboard call site's
+value).
 
 WHAT THIS EXISTS TO PREVENT, measured rather than hypothetical. setup-host.sh
 used to install the dashboard unit with a plain truncating redirect::
@@ -159,7 +166,7 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
 # hypothetical and neither is visible in this file alone.
 #
 # THE SUBSET RELATION AND THE EXCLUSION ARE HELD BY TESTS, NOT BY AN IMPORT:
-# tests/scripts/test_render_dashboard_unit.py::
+# tests/scripts/test_render_systemd_unit.py::
 # test_host_local_environment_is_a_subset_of_the_divergence_allowlist and
 # ::test_host_local_environment_excludes_project_root, plus a staleness guard
 # asserting every name here is really declared in the committed template.
@@ -239,7 +246,7 @@ class UnitRenderSpec:
     # what makes the registry self-describing rather than a bare tag/preserve-set
     # pair, and it is what the staleness guard reads to pair a preserve set with
     # the template that must actually declare it
-    # (tests/scripts/test_render_dashboard_unit.py::
+    # (tests/scripts/test_render_systemd_unit.py::
     # test_every_preserved_name_is_declared_exactly_once_in_its_units_template).
     # A preserve set checked against the WRONG unit's template would pass while
     # preserving nothing on the host, since the two templates declare overlapping
@@ -268,7 +275,7 @@ class UnitRenderSpec:
 # public surface rather than a rename of it: task 4793's suite asserts on
 # LOG_TAG and HOST_LOCAL_ENVIRONMENT directly, and setup-host.sh section 8
 # passes no --unit at all. Identity is pinned by
-# tests/scripts/test_render_dashboard_unit.py::
+# tests/scripts/test_render_systemd_unit.py::
 # test_dashboard_spec_is_the_modules_existing_public_surface.
 #
 # THE TAGS MUST STAY DISTINCT. Both units are rendered by this same script in

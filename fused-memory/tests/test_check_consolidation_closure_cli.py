@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -28,6 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -50,18 +50,7 @@ def _load_module() -> types.ModuleType:
     scripts_dir = str(_ROOT / 'scripts')
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
-    mod_name = 'check_consolidation_closure'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='check_consolidation_closure')
 
 
 mod = _load_module()

@@ -33,11 +33,14 @@ except ImportError:
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    LeakedEnvelopeMarkupError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1051,6 +1054,20 @@ class TaskInterceptor:
         if ',' in task_id:
             ids = [t.strip() for t in task_id.split(',') if t.strip()]
             results: list[dict] = []
+            # One `metadata.pending_since` clock for the whole batch (task
+            # 3816, PRD §C1 invariants / rule 5). A CSV flip -- what
+            # `commit_planning` issues -- is ONE atomic release, so it must
+            # read as one instant: per-id clock reads drift by tens of ms
+            # across a batch of gated transactions, and under the scheduler's
+            # age term that spread is a real score delta, enough to order the
+            # batch by commit sequence when intra-batch order is required to
+            # fall through to CPM and then numeric id. `task_timestamp_now` is
+            # the store's PUBLIC clock and its docstring carries the format
+            # contract; this module's own `datetime.now(UTC).isoformat()`
+            # helper is deliberately NOT interchangeable with it.
+            batch_pending_since = (
+                task_timestamp_now() if status == TaskStatus.PENDING else None
+            )
             for tid in ids:
                 per_result = await self._apply_status_transition(
                     task_id=tid,
@@ -1062,6 +1079,7 @@ class TaskInterceptor:
                     claimant_run_id=claimant_run_id,
                     heartbeat_at=heartbeat_at,
                     agent_id=agent_id,
+                    pending_since_now=batch_pending_since,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1098,12 +1116,19 @@ class TaskInterceptor:
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
+        pending_since_now: str | None = None,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
         Extracted so the public ``set_task_status`` can loop over CSV ids
         and apply the gates per-id. Holds the write lock across
         read→check→write, emits the event outside the lock.
+
+        ``pending_since_now`` is a pure pass-through to the backend's wait-
+        anchor stamp (task 3816): the CSV branch above supplies one value for
+        a whole batch, and the single-id branch leaves it ``None`` so the
+        backend computes its own clock, exactly as before. No gate logic,
+        event payload, or reconciliation behaviour keys on it.
         """
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
@@ -1142,18 +1167,28 @@ class TaskInterceptor:
             # (stale-snapshot) is reachable only via update_task in
             # practice, even though check()'s gate 3 itself is op-agnostic.
             #
-            # check() is dispatched via asyncio.to_thread because gate 2
-            # (live workflow) calls is_workflow_live_for_task, which shells
-            # out to git synchronously (up to _GIT_TIMEOUT seconds per git
-            # call). This whole branch runs under _write_lock, so an inline
-            # call would both block the event loop and hold this project's
-            # write lock for however long git takes — stalling every other
-            # write to the project. to_thread keeps the lock's ordering
-            # guarantee (the awaiting coroutine still holds it across the
-            # call) while freeing the event loop to service other work
-            # meanwhile — the same pattern curator_escalator.py's
-            # _persist_state uses to offload a blocking write while holding
-            # _persist_lock.
+            # check() is a coroutine function and is awaited DIRECTLY (task
+            # 3778). It used to be dispatched via asyncio.to_thread, because
+            # gate 2 (live workflow) called is_workflow_live_for_task, which
+            # shelled out to git synchronously (up to _GIT_TIMEOUT seconds per
+            # git call); this whole branch runs under _write_lock, so an inline
+            # call would have both blocked the event loop and held this
+            # project's write lock for however long git took — stalling every
+            # other write to the project. That offload is now INTRINSIC rather
+            # than bolted on here: the detector's git probes await
+            # shared.git_async.run_git, and check() offloads its one remaining
+            # blocking call (the corroboration verdict's two on-disk reads) via
+            # its own asyncio.to_thread. The lock's ordering guarantee is
+            # unchanged — this coroutine still holds it across the await — and
+            # the event loop is free to service other work meanwhile.
+            #
+            # Wrapping a coroutine function in asyncio.to_thread would now be a
+            # BUG, not merely redundant: the worker thread would return an
+            # un-awaited coroutine object, `verdict.is_rejection` would raise
+            # AttributeError, and every gate would stop rejecting. The sibling
+            # call site in update_task (further down this module) was already
+            # inline and is likewise a plain await now, so the two are
+            # symmetric for the first time.
             #
             # task_metadata (task 3751) comes off the SAME `before` snapshot
             # as old_status, so the metadata and live_status the gate sees can
@@ -1184,10 +1219,9 @@ class TaskInterceptor:
             # fields live at the task's top level, not inside `metadata` — see
             # check()'s Gate 2 docstring. The corroboration assembly performs
             # two more blocking on-disk reads (scheduler_state.json and
-            # orchestrator.lock); they ride the asyncio.to_thread hop that
-            # already exists for gate 2's blocking git I/O rather than needing
-            # a second hop or re-blocking the event loop, which is why the
-            # verdict is computed inside check() rather than here. What it
+            # orchestrator.lock); check() owns their asyncio.to_thread offload
+            # (task 3778) rather than re-blocking the event loop, which is why
+            # the verdict is computed inside check() rather than here. What it
             # unlocks is the detector's in-progress corroboration gate (task
             # 2963): an in-progress task killed by a fleet redeploy, whose
             # lingering worktree registration and freshly re-acquired
@@ -1208,8 +1242,7 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
-                verdict = await asyncio.to_thread(
-                    recon_write_policy.check,
+                verdict = await recon_write_policy.check(
                     'set_task_status',
                     task_id=task_id,
                     project_root=project_root,
@@ -1468,6 +1501,12 @@ class TaskInterceptor:
             # the default call stays byte-identical to every existing caller.
             claimant_kwargs: dict[str, Any] = _maybe_kwargs(
                 _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            )
+            # Same tri-state forwarding shape, one more kwarg: omitted unless
+            # a batch clock was supplied, so the single-id call stays
+            # byte-identical to a pre-3816 one (task 3816).
+            claimant_kwargs.update(
+                _maybe_kwargs(None, pending_since_now=pending_since_now),
             )
 
             async def _do_set_task_status_write() -> Any:
@@ -3003,6 +3042,19 @@ class TaskInterceptor:
                     priority=rt.priority,
                 )
             )
+        except LeakedEnvelopeMarkupError as exc:
+            logger.warning(
+                'task_curator: combine refused for target=%s: the rewrite carries '
+                'leaked tool-call markup in %r',
+                decision.target_id,
+                exc.column,
+                extra={
+                    'column': exc.column,
+                    'fragment': exc.fragment,
+                    'recovered': exc.recovered,
+                },
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 'task_curator: combine update failed for target=%s: %s',
@@ -5139,7 +5191,16 @@ class TaskInterceptor:
                 # signature below.
                 assert isinstance(agent_id, str)
                 before = await tm.get_task(task_id, project_root)
-                verdict = recon_write_policy.check(
+                # Awaited, not inline (task 3778): check() is a coroutine
+                # function now, so an un-awaited call would evaluate
+                # `.is_rejection` on a coroutine object — never a rejection —
+                # and silently disable Gates 1 and 3 on this path. This was
+                # also the latent sibling of _apply_status_transition's
+                # to_thread hop: gate 2 fires only for op == 'set_task_status',
+                # so this call site never paid for the blocking git I/O, but
+                # any widening of that scope would have put it on the event
+                # loop under _write_lock. Both call sites are plain awaits now.
+                verdict = await recon_write_policy.check(
                     'update_task',
                     task_id=task_id,
                     project_root=project_root,

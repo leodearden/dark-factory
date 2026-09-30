@@ -21,11 +21,11 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
@@ -303,49 +303,12 @@ def test_format_json_empty_list_is_empty_array():
 # ---------------------------------------------------------------------------
 # CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
 #
-# test_recon_busy_check.py now carries the same defensive-timeout pattern
-# under its own RECON_BUSY_CHECK_TEST_TIMEOUT env var (task 4515), so the two
-# harnesses no longer diverge on this point.
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_recon_busy_check.py and test_drain_check.py.
 # ---------------------------------------------------------------------------
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
-
-
-def _cli_timeout_from_env(default: float = 60.0) -> float:
-    """Resolve the default wall-clock budget (seconds) for a CLI subprocess.
-
-    10s was tight enough to flake under machine load (task 4217): concurrent
-    orchestrator agents can push interpreter startup + imports past 10s even
-    though the CLI under test behaves correctly (returncode/stderr already
-    correct at the moment the old budget expired). 60s gives real headroom
-    without materially slowing an idle-machine run.
-
-    SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT overrides the default for further
-    tuning without a code change. An unset or blank value (e.g. a CI template
-    that always exports the var) is treated as "not overridden" rather than
-    an error — otherwise this escape hatch would itself fail the *entire*
-    module's collection, including the pure-unit tests here that never spawn
-    a subprocess. A present-but-malformed value (non-numeric or non-positive)
-    still fails loudly, naming the offending value, rather than silently
-    falling back and masking a typo'd override.
-    """
-    raw = os.environ.get("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT", "").strip()
-    if not raw:
-        return default
-    error = ValueError(
-        "SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT must be a positive number of "
-        f"seconds; got {raw!r}"
-    )
-    try:
-        value = float(raw)
-    except ValueError:
-        raise error from None
-    if value <= 0:
-        raise error
-    return value
-
-
-_CLI_TIMEOUT = _cli_timeout_from_env()
+_CLI_TIMEOUT = cli_timeout_from_env("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT")
 
 
 def _run_cli(*args, timeout=_CLI_TIMEOUT):
@@ -355,6 +318,29 @@ def _run_cli(*args, timeout=_CLI_TIMEOUT):
         text=True,
         timeout=timeout,
     )
+
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+    captured_args = []
+
+    def spy(*args, **kwargs):
+        captured_args.append(args[0])
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--db", "/nonexistent.db")
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+    # The script imports `shared` (and its third-party deps), so it needs the
+    # project interpreter, unlike its stdlib-only siblings run as python3.
+    assert captured_args[0][0] == sys.executable
+
+    _run_cli("--db", "/nonexistent.db", timeout=3)
+    assert captured["timeout"] == 3
 
 
 def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
@@ -448,6 +434,12 @@ class TestDetectorIsTheSharedDefinition:
         from fused_memory.utils import toolcall_xml_leak
 
         assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
+
+    def test_scanned_columns_is_the_shared_tuple_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.SCANNED_COLUMNS is toolcall_xml_leak.SCANNED_COLUMNS
 
     def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
         """Delegation is real, not a same-valued copy captured at import."""

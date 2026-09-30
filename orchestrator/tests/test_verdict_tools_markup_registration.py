@@ -32,9 +32,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _markup_helpers import LT, assert_no_raw_sentinels, closer, type_alternatives
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, verdict_tools
@@ -75,6 +77,13 @@ def specimen(tool_use_id: str) -> dict[str, Any]:
         if record.get('tool_use_id') == tool_use_id:
             return record
     raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
+
+
+# The corpus escapes every literal as ``\u003c``, which is why this file can
+# carry specimens without ever spelling one. A hand-authored specimen earns the
+# same property through ``_markup_helpers``, which owns the builders and the
+# import-time self-scan for every markup suite in this package.
+assert_no_raw_sentinels(__file__)
 
 
 #: Recovers the REQUIRED list-typed ``issues`` — PRD boundary row B14's shape.
@@ -632,6 +641,312 @@ class TestUnrepairableResidueIsPreserved:
             f'{record["summary"]!r} — one shared attribution ladder is the '
             f'whole reason those cannot disagree'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the hatch is DECLARED in the schema, on every role's one tool.
+# ---------------------------------------------------------------------------
+
+
+#: The single tool each ``--verdict-role`` server registers. Spelled here so a
+#: role that silently stopped registering anything cannot pass these rows by
+#: having nothing left to check.
+_ROLE_TOOL = {
+    'judge': 'submit_completion_verdict',
+    'triage': 'submit_triage',
+    'merger': 'submit_merge_disposition',
+    REVIEWER_ROLE: 'submit_review_verdict',
+}
+
+
+class TestEveryRoleToolDeclaresTheOverrideParameter:
+    """FORWARD_REPAIR still bounces a caller, so the hatch must exist here too.
+
+    This server repairs and forwards rather than rejecting, but the guard can
+    still refuse — an unrepairable value is reported and the caller is pointed
+    at the deliberate-quoting override. That remediation was reachable only
+    because ``claude`` CLI 2.1.250 transmits an undeclared ``metadata``
+    argument anyway (measured 2026-08-28, task 4817 / esc-4817-1; memory
+    records 4012ec18-55c0-4a7c-9806-04d2d397f868 and
+    decb3e1b-05af-4761-9e08-486fa08044c0), which is a property of one client
+    build and not a contract. Each role registers exactly one tool, so the
+    declaration is checked on all four branches.
+    """
+
+    @staticmethod
+    async def _schema(artifacts: TaskArtifacts, role: str) -> dict[str, Any]:
+        """This role's one tool's ``inputSchema``, off a real ``tools/list``."""
+        server = create_server(artifacts, role)
+        async with Client(server) as client:
+            tools = await client.list_tools()
+        assert [tool.name for tool in tools] == [_ROLE_TOOL[role]], (
+            f'role {role!r} no longer registers exactly its one expected tool'
+        )
+        return tools[0].inputSchema
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_the_role_tool_declares_metadata(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        schema = await self._schema(artifacts, role)
+
+        assert 'metadata' in schema.get('properties', {}), (
+            f'{_ROLE_TOOL[role]} does not declare metadata — the documented '
+            'override is unavailable to any client honouring '
+            'additionalProperties: false'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_is_never_required(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """These tools already declare required parameters; this is not one."""
+        schema = await self._schema(artifacts, role)
+
+        assert 'metadata' not in schema.get('required', [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_accepts_an_object_or_null(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        schema = await self._schema(artifacts, role)
+        declared = schema.get('properties', {}).get('metadata')
+
+        assert isinstance(declared, dict)
+        assert type_alternatives(declared) == {'object', 'null'}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_SAYS_WHAT_IT_IS_FOR(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """An undescribed ``metadata`` on a verdict tool invites the wrong call.
+
+        This half of the declaration matters MORE here than on plan-tools: a
+        verdict tool already persists a metadata-shaped envelope, so a bare
+        ``object|null`` named ``metadata`` beside it reads as the place to add
+        to it. It is not — ``_consume_override`` drops the map — and the
+        description is where a caller is told so, on the one channel it reads.
+        """
+        schema = await self._schema(artifacts, role)
+        description = schema['properties']['metadata'].get('description', '')
+
+        assert MARKUP_OVERRIDE_KEY in description, (
+            f'{_ROLE_TOOL[role]} advertises metadata with no mention of the '
+            f'flag it exists for: {description!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_the_schema_stays_CLOSED(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """One declared parameter, not an open door for every typo."""
+        schema = await self._schema(artifacts, role)
+
+        assert schema.get('additionalProperties') is False
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the hatch WORKS on this server, on the branch declaring it selects
+# ---------------------------------------------------------------------------
+
+
+#: A ``summary`` that QUOTES the literals deliberately — a reviewer whose
+#: finding IS about this leak. Unrepairable by construction: the tail after the
+#: first closer is ordinary prose, so no candidate parses.
+QUOTED_SUMMARY = (
+    'The reviewed diff emits ' + closer('summary') + ' mid-value and then '
+    + closer('invoke') + ', which is what the guard matches on.'
+)
+
+#: The same field with nothing to quote. The byte-comparison row needs two runs
+#: differing ONLY in the flag.
+CLEAN_SUMMARY = 'The reviewed diff registers the guard once, on the shared path.'
+
+
+class TestTheDeliberateQuotingOverrideOnThisServer:
+    """A reviewer whose finding is ABOUT this markup has to be able to say so.
+
+    FORWARD_REPAIR still refuses an unrepairable value, so this server bounces
+    such a reviewer with the same ``_OVERRIDE_SENTENCE`` remediation — which
+    was not part of ``submit_review_verdict``'s advertised contract until the
+    parameter was declared. These rows drive the branch that declaration
+    selects: ``_apply_override`` now FORWARDS the map, and the decorator, not
+    the middleware, is what keeps it out of the artifact.
+    """
+
+    @staticmethod
+    async def _submit(
+        artifacts: TaskArtifacts, summary: str, metadata: dict[str, Any] | None
+    ):
+        arguments: dict[str, Any] = {
+            'reviewer': REVIEWER_ROLE,
+            'verdict': 'ISSUES_FOUND',
+            'issues': [],
+            'summary': summary,
+        }
+        if metadata is not None:
+            arguments['metadata'] = metadata
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            return await client.call_tool('submit_review_verdict', arguments)
+
+    @staticmethod
+    def _envelope_path(artifacts: TaskArtifacts) -> Path:
+        return artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json'
+
+    @pytest.mark.asyncio
+    async def test_the_quoted_summary_lands_verbatim(self, artifacts: TaskArtifacts):
+        """(a) The finding survives, tags and all."""
+        await self._submit(artifacts, QUOTED_SUMMARY, {MARKUP_OVERRIDE_KEY: True})
+
+        envelope = artifacts.read_verdict(REVIEWER_ROLE)
+        assert envelope is not None
+        assert envelope['verdict']['summary'] == QUOTED_SUMMARY
+
+    @pytest.mark.asyncio
+    async def test_the_same_call_without_the_flag_is_still_refused(
+        self, artifacts: TaskArtifacts
+    ):
+        """(b) Otherwise the row above would prove nothing about the flag."""
+        with pytest.raises(ToolError) as excinfo:
+            await self._submit(artifacts, QUOTED_SUMMARY, None)
+
+        payload = json.loads(str(excinfo.value))
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'summary'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is None
+
+    @pytest.mark.asyncio
+    async def test_the_flag_is_never_written_to_the_envelope(
+        self, artifacts: TaskArtifacts
+    ):
+        """(d) Write-time-only CONTROL: it reaches no tool body, so no artifact.
+
+        Checked over the whole document rather than one key, because the
+        envelope nests the payload and an absent top-level key would say
+        nothing about what is under ``verdict``.
+        """
+        await self._submit(
+            artifacts, CLEAN_SUMMARY, {MARKUP_OVERRIDE_KEY: True, 'note': 'x'}
+        )
+
+        text = self._envelope_path(artifacts).read_text(encoding='utf-8')
+        assert MARKUP_OVERRIDE_KEY not in text
+        assert 'metadata' not in text
+
+    @pytest.mark.asyncio
+    async def test_the_flag_changes_nothing_else_in_the_envelope(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(c) Stronger than a missing key: the two documents are the same.
+
+        ``emitted_at`` is the one field that legitimately differs between two
+        runs, so it is dropped from both sides — everything else, including
+        the schema version and the whole nested payload, must match.
+        """
+        await self._submit(artifacts, CLEAN_SUMMARY, {MARKUP_OVERRIDE_KEY: True})
+        with_flag = json.loads(self._envelope_path(artifacts).read_text('utf-8'))
+
+        other = TaskArtifacts(tmp_path / 'baseline')
+        other.init('test-1', 'Test task', 'A test')
+        await self._submit(other, CLEAN_SUMMARY, None)
+        without = json.loads(self._envelope_path(other).read_text('utf-8'))
+
+        assert with_flag.pop('emitted_at')
+        assert without.pop('emitted_at')
+        assert with_flag == without
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the RIPPLE of declaring it, on the FORWARD tier.
+# ---------------------------------------------------------------------------
+
+
+#: A leak whose swallowed tail declares ``metadata``. The middleware resolves
+#: the repair vocabulary from the LIVE tool schema, so declaring the parameter
+#: made ``metadata`` a recovery TARGET here — which nothing about "make the
+#: hatch schema-legal" would lead a reader to expect.
+METADATA_TAIL_SUMMARY = (
+    'The reviewed diff leaks its own envelope.' + closer('summary') + '\n'
+    + LT + 'parameter name="metadata">swallowed tail'
+)
+
+
+class TestTheWidenedRepairVocabularyStaysContained:
+    """FORWARD_REPAIR lets the call through, so containment is not structural.
+
+    On the reject tier nothing is written no matter what is recovered. Here
+    the call LANDS, so the question is real: a recovered ``metadata`` is a
+    verbatim ``str`` slice and the declared parameter is object-or-null, so
+    ``_coerce_recovered`` cannot type it. The tier's own rule then applies —
+    an untypable name is DROPPED rather than forwarded into a doomed call,
+    preserved verbatim in the residue channel, and reported to the caller
+    under ``unrecovered_params``.
+
+    Two independent floors, which is why both are asserted: the coercion
+    drops it, and the decorator would swallow it even if it arrived.
+    """
+
+    @staticmethod
+    async def _submit(artifacts: TaskArtifacts):
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            return await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'PASS',
+                'issues': [],
+                'summary': METADATA_TAIL_SUMMARY,
+            })
+
+    @pytest.mark.asyncio
+    async def test_the_call_still_lands(self, artifacts: TaskArtifacts):
+        """INV-6 first: the review gate must not be stranded by the ripple."""
+        result = await self._submit(artifacts)
+
+        assert result.data['status'] == 'ok'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is not None
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_reaches_the_persisted_envelope(
+        self, artifacts: TaskArtifacts
+    ):
+        """Over the whole document: the envelope nests the payload."""
+        await self._submit(artifacts)
+
+        text = (artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json').read_text('utf-8')
+        assert 'metadata' not in text
+        assert 'swallowed tail' not in text
+
+    @pytest.mark.asyncio
+    async def test_the_caller_is_TOLD_rather_than_silently_losing_it(
+        self, artifacts: TaskArtifacts
+    ):
+        """Dropped is acceptable; dropped and unreported is not."""
+        result = await self._submit(artifacts)
+
+        assert result.meta is not None
+        warning = result.meta['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['recovered_params'] == []
+        assert warning['unrecovered_params'] == ['metadata']
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_value_survives_in_the_residue_channel(
+        self, artifacts: TaskArtifacts
+    ):
+        """Nothing is guessed AND nothing is destroyed — the C2 pair."""
+        await self._submit(artifacts)
+
+        files = sorted(artifacts.root.glob('markup_residue-*.json'))
+        assert len(files) == 1, f'expected one residue file, got {files!r}'
+        stored = json.loads(files[0].read_text())
+        assert stored['field'] == 'metadata'
+        assert stored['raw_value'] == 'swallowed tail'
 
 
 # ---------------------------------------------------------------------------

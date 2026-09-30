@@ -8,6 +8,7 @@ live source/test re-verification (verify_premise_refuted).
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import types
 from pathlib import Path
 
@@ -625,8 +626,12 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its four seed entries against the REAL fused-memory source
-    root — not a tmp_path fixture.
+    and re-verifies its entries against the REAL fused-memory source root — not
+    a tmp_path fixture.
+
+    The COUNT is deliberately not stated here: it lives in exactly one place,
+    `test_shipped_registry_has_five_entries`, which reds when the registry grows
+    rather than going quietly stale the way a prose count does.
 
     Confirmed base-branch facts (see task-1972 analysis):
     - src/fused_memory/services/memory_service.py contains "invalid_at".
@@ -648,6 +653,15 @@ class TestSeedRegistryRealSource:
       wired into the stage that files remediation tasks. It rides along with
       the shared escalation-store boundary note (rendered as a subsection of
       it), so that render call is the wiring token, not the constant name.
+
+    Confirmed facts for the expired_at entry (task 4984):
+    - src/fused_memory/backends/graphiti_client.py contains
+      "_ALL_VALID_EDGES_MATCH", "def get_valid_edges_for_node" and
+      "WHERE e.invalid_at IS NULL", and does NOT contain "e.expired_at IS NULL"
+      — the absence being what makes the premise refuted AND self-correcting.
+    - src/fused_memory/services/memory_service.py contains
+      "_restore_falsely_superseded_sibling_edges" and "clear_invalid_at=True" —
+      the restore hooks an expired_at filter would re-hide the edges of.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
@@ -658,13 +672,18 @@ class TestSeedRegistryRealSource:
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
         return load_premise_registry(self.REGISTRY_PATH)
 
-    def test_shipped_registry_has_four_entries(self):
-        """The seed registry ships exactly the four confirmed incidents."""
+    def test_shipped_registry_has_five_entries(self):
+        """The registry ships exactly the five confirmed incidents.
+
+        RENAMED as well as retargeted: the old name asserted "four" in prose,
+        which a later reader trusts as readily as the assertion itself.
+        """
         entries = self._load_entries()
         names = {e.name for e in entries}
-        assert len(entries) == 4
+        assert len(entries) == 5
         assert names == {
             "entity_summary_rebuild_invalid_at_filter_already_present",
+            "valid_edge_query_expired_at_filter_refuted",
             "stage2_flag_query_stage1_flag_marker_forbidden_regression",
             "add_finding_suggested_action_no_max_length_field",
             "deterministic_gate_escalation_record_archived_not_missing",
@@ -866,10 +885,203 @@ class TestSeedRegistryRealSource:
         )
         assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
 
-    def test_all_four_incidents_via_premise_refuted_entry(self):
-        """premise_refuted_entry composes match + verify for all four incidents
-        at once against the real source root — the end-to-end shape the curator
-        actually calls.
+    #: The name of the entry the four tests below are about, spelled once.
+    _EXPIRED_AT_ENTRY = "valid_edge_query_expired_at_filter_refuted"
+
+    def test_expired_at_validity_filter_claim_matches_and_is_refuted(self):
+        """task 4984 / task 3673's 2026-08-29 retraction: a recurring claim asks
+        the valid-edge queries to also filter `AND e.expired_at IS NULL`.
+
+        REFUTED because `invalid_at` is the field the restore hooks CLEAR
+        (`_restore_superseded_dependency_edges` and
+        `_restore_falsely_superseded_sibling_edges` both pass
+        `clear_invalid_at=True`), so an expired_at condition would re-hide
+        exactly the edges those hooks restore.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Add missing expired_at validity filter to the valid-edge queries",
+            description=(
+                "get_valid_edges_for_node returns edges graphiti_core has already "
+                "expired; the query should read AND e.expired_at IS NULL alongside "
+                "the invalid_at check."
+            ),
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == self._EXPIRED_AT_ENTRY
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+        result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
+        assert result is not None
+        assert result.name == self._EXPIRED_AT_ENTRY
+
+    def test_the_same_claim_phrased_against_the_shared_match_clause_also_matches(self):
+        """REGARDLESS OF PHRASING — the task's own wording. The entry covers
+        BOTH surfaces the claim is filed against, so it is not pinned to the one
+        function name the first phrasing happened to use."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="_ALL_VALID_EDGES_MATCH is missing an expired_at condition",
+            description=(
+                "The shared valid-edge MATCH clause filters only invalid_at. "
+                "Every query built on _ALL_VALID_EDGES_MATCH should also exclude "
+                "expired edges."
+            ),
+        )
+
+        result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
+        assert result is not None
+        assert result.name == self._EXPIRED_AT_ENTRY
+
+    def test_a_proposal_about_the_same_queries_without_the_filter_is_not_dropped(self):
+        """Over-broad-anchoring guard, TITLE half: the entry refutes ONE claim
+        about these queries, not every proposal that names them.
+
+        Rejected at the TITLE gate — `expired_at` is the single title anchor and
+        this candidate carries none — which is exactly why the DESCRIPTION half
+        below exists as a separate test rather than being folded in here.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Add paging to get_valid_edges_for_node",
+            description=(
+                "get_valid_edges_for_node materialises every valid edge of a "
+                "high-degree node in one result set; add a LIMIT/OFFSET so the "
+                "caller can page through them."
+            ),
+        )
+
+        assert match_candidate(candidate, entries) is None
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
+    def test_an_unrelated_expired_at_proposal_is_not_dropped(self):
+        """Over-broad-anchoring guard, DESCRIPTION half, mirroring
+        `test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped`.
+
+        The title carries the single anchor BY CONSTRUCTION, so the rejection is
+        localised to the description anchors and cannot pass vacuously on the
+        title gate.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Document the expired_at column in the graph schema reference",
+            description=(
+                "The schema reference lists invalid_at but never mentions the "
+                "expired_at column graphiti_core writes; add a row for it."
+            ),
+        )
+
+        assert match_candidate(candidate, entries) is None
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
+        # MUTATION CONTROL — widen ONLY the description anchors in memory and
+        # prove the candidate then DOES match, which proves the TITLE gate
+        # passes for it and the description anchors are the only thing
+        # protecting it.
+        entry = next(e for e in entries if e.name == self._EXPIRED_AT_ENTRY)
+        widened = dataclasses.replace(entry, description_substrings=["expired_at"])
+        assert match_candidate(candidate, [widened]) is not None, (
+            "The candidate must pass the TITLE gate — otherwise this test "
+            "rejects on the title and the description anchors it claims to "
+            "guard are untested."
+        )
+
+    def test_the_same_filter_proposed_for_a_different_query_is_not_dropped(self):
+        """Over-broad-anchoring guard, the case a generic description anchor
+        would have failed: the SAME claim — add `AND e.expired_at IS NULL` —
+        against a query this premise was never refuted against.
+
+        The architect refuted the filter for the VALID-EDGE queries, on evidence
+        specific to them (the restore hooks clear `invalid_at`, so an expired_at
+        condition would re-hide exactly the edges they restore). That evidence
+        says nothing about any other query, so a proposal naming another one has
+        to reach a human. An anchor like "expired_at IS NULL" would have dropped
+        it — it appears verbatim in this candidate's description.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Add expired_at IS NULL to the episode-fetch query",
+            description=(
+                "get_episodes returns episodes graphiti_core has expired; the "
+                "query should read AND e.expired_at IS NULL. This is the same "
+                "expired_at filter, on a different query."
+            ),
+        )
+
+        assert match_candidate(candidate, entries) is None
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
+    def test_the_entry_self_corrects_once_the_filter_genuinely_lands(self, tmp_path):
+        """The registry header's own promise, made executable: a premise stops
+        being refuted the moment its evidence changes, with no operator action.
+
+        Mirrors `test_reads_file_fresh_not_cached`'s tmp_path-source technique,
+        but over the REAL cited files, so the `must_contain` tokens exercised
+        are the shipped ones rather than a fixture's.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        entry = next(e for e in entries if e.name == self._EXPIRED_AT_ENTRY)
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+
+        for assertion in entry.source_assertions:
+            target = tmp_path / assertion.file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.SOURCE_ROOT / assertion.file, target)
+        assert verify_premise_refuted(entry, tmp_path) is True, (
+            "the copied tree must reproduce the live verdict before it is edited"
+        )
+
+        client = tmp_path / "src/fused_memory/backends/graphiti_client.py"
+        client.write_text(
+            client.read_text(encoding="utf-8")
+            + "\n_FUTURE = 'WHERE e.invalid_at IS NULL AND e.expired_at IS NULL'\n",
+            encoding="utf-8",
+        )
+
+        assert verify_premise_refuted(entry, tmp_path) is False, (
+            "once the expired_at filter genuinely lands the claim must stop "
+            "being dropped and reach a human again"
+        )
+
+    def test_all_five_incidents_via_premise_refuted_entry(self):
+        """premise_refuted_entry composes match + verify for every shipped
+        incident at once against the real source root — the end-to-end shape
+        the curator actually calls.
+
+        The coverage assertion below is derived from the registry rather than
+        counted by hand, so a SIXTH entry reds this test until someone writes
+        the candidate that proves it drops what it claims to. A count in a test
+        name is trusted exactly as readily as the assertion under it.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
 
@@ -921,12 +1133,30 @@ class TestSeedRegistryRealSource:
                 ),
                 "deterministic_gate_escalation_record_archived_not_missing",
             ),
+            (
+                CandidateTask(
+                    title=(
+                        "Add missing expired_at validity filter to the "
+                        "valid-edge queries"
+                    ),
+                    description=(
+                        "get_valid_edges_for_node returns edges graphiti_core has "
+                        "already expired; the query should also exclude them."
+                    ),
+                ),
+                self._EXPIRED_AT_ENTRY,
+            ),
         ]
 
         for candidate, expected_name in cases:
             result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
             assert result is not None, f"expected a premise-refuted drop for {expected_name!r}"
             assert result.name == expected_name
+
+        assert {name for _, name in cases} == {e.name for e in entries}, (
+            "every shipped registry entry needs a case here — add the candidate "
+            "phrasing that entry is meant to drop rather than relaxing this"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

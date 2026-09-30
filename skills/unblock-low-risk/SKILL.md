@@ -71,7 +71,7 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
      --worktree <worktree> \
      --project-root <project_root> \
      --category <category> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    `<category>` is the escalation category already asserted in precondition 4. The gate reads
@@ -123,13 +123,18 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
 3. **Apply the fix — scoped.** Edit/Write **only** files in `latest['files_referenced']` (and their
    direct test files). The moment the correct fix demands touching a file outside that set — or any
-   of `main`-only paths, CI config, infra, or `orchestrator/config.yaml`/`.mcp.json`/systemd units —
+   of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
+   run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then
    **ABORT** (a conflict means the change is no longer self-contained).
 
-5. **Verify.** Run the project's full verify suite from `orchestrator/config.yaml` in the worktree —
+   The cleanup is not optional politeness. Aborting the skill while the worktree is still
+   mid-rebase leaves precondition 5 refusing the *next* run for that exact reason, so the task
+   deadlocks: nothing can retry it and nothing cleans it up.
+
+5. **Verify.** Run the project's full verify suite from `<project_root>/dark-factory-orchestrator.yaml` in the worktree —
    `test_command`, then `lint_command`, then `type_check_command` (read them from the file; do not
    hardcode). Any non-zero exit → **ABORT**. (Pipe to a file + check exit status; never trust a
    tail.)
@@ -143,7 +148,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    .venv/bin/python -m orchestrator.b3_gate charge \
      --task-id <task_id> \
      --project-root <project_root> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
@@ -296,6 +301,54 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
+   - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
+     submit-terminal and is not a live state, so it reaches this step either straight from step 8's
+     submission or on the first poll tick that returns it — step 8's loop exits immediately
+     because `superseded ∉ {queued, verifying, gate, finalizing}`. It means your request was
+     replaced by a successor that may still be in flight and whose landing will carry this
+     branch's work. Reporting it as a failure would report a **false failure** and leave the
+     escalation pending on a branch that is about to land.
+     - **Do not call `merge_cancel(request_id)`.** On an absorbed id that call is a no-op which
+       resolves to `unknown` (`escalation/src/escalation/server.py` — "callers holding a coalesced
+       id will resolve to 'unknown' here"), so it buys nothing and muddies the record. There is no
+       cancel path for an in-flight train at all.
+     - **Read `superseded_by`'s shape.** It names one of two mechanisms, and only one of them is a
+       request id:
+       - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
+         coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
+         `orchestrator/src/orchestrator/merge_queue.py`). Do **not** poll it by `request_id` —
+         that returns an honest `unknown` which never resolves to anything else.
+       - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
+         (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).
+         Nothing was absorbed, and that id *is* pollable by `request_id`.
+     - **Resolve it by ancestry, not by re-polling the id you already hold.** Run the ancestry
+       disposition in [Deriving the landed sha](#deriving-the-landed-sha) — it already carries the
+       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. It has three
+       dispositions here, and **two of them are success**:
+       - **A stampable sha** — proceed with sub-steps **a–d** above.
+       - **Resolved, landed and already credited** — the `coalesce-*` arm's `done`-status
+         outcome: signal (a) shows the tip landed, and this task's scheduler status, re-read
+         fresh, already reads `done`. There is **nothing to stamp**, and that is **success, not
+         an abort**: skip sub-step (a), then run sub-steps **(c)** cleanup and **(d)**
+         `resolve_issue`, recording the tip merge sha in the resolution text. Without this
+         disposition a landed, correctly-credited task falls through to the polling exit below
+         and gets abandoned as in-flight — see [Deriving the landed
+         sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
+       - **Not resolved yet** — the two exits in the next bullet.
+
+       On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
+       not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
+       which exit applies, never whether a write is permitted.
+     - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
+       the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
+       clamped cadence) for whatever remains of step 8's 20-minute deadline, re-running the
+       ancestry disposition on each tick; or, once that deadline is spent, **ABORT with an
+       explicitly non-failure disposition** — report the branch as *in flight on a successor*,
+       naming the `superseded_by` value, and leave the escalation pending for a human. In neither
+       case call `merge_cancel`, and in neither case claim a failure: this is **not** the plain
+       abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
+       resubmit and never direct-merge while the successor is unresolved.
+
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
      [Deriving the landed sha](#deriving-the-landed-sha) below) to check whether this task's
@@ -315,6 +368,43 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, so it is
        **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
        calling `merge_cancel` — this section scopes that call to genuine not-landed outcomes.
+
+### Rebase recovery preflight
+
+`git rebase --abort` is the way out of a conflicted rebase, and it has two measured failure modes
+that leave the worktree wedged with no obvious way forward. Run the preflight first — from the
+**primary dark-factory checkout** (where `.venv/` and `orchestrator/` live — NOT the worktree,
+which has no `.venv`), exactly as precondition 6 invokes `b3_gate`:
+
+```
+.venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree>
+```
+
+Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
+
+- `clean` or `repaired` → run the abort itself, **with the guard**:
+  `git -C <worktree> -c rerere.enabled=false rebase --abort`. Use that spelling every time, not
+  the bare `git rebase --abort`: with rerere disabled git never opens `MERGE_RR`, which is what
+  makes the abort survive both failure modes.
+- `blocked` → **ABORT** the skill without running the abort, copying the payload's `unrepaired`
+  entries verbatim into your `reason`. `blocked` means either something the preflight declined to
+  touch — typically a lock file a live process still holds open, and deciding what that process
+  is, is a human's call, not this skill's — or a worktree it could not resolve at all
+  (`resolved: false`), where it inspected nothing, so the empty `dangling`/`locks_*` lists report
+  an absence of looking rather than an absence of damage. Check the path you passed.
+
+Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
+and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
+
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to a
+`MERGE_RR.quarantined-<timestamp>` sibling — **moved, never deleted**, because a *successful*
+abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
+It also removes `*.lock` files that are both older than an hour **and** held open by no running
+process; a lock with a live holder is retained at any age.
+
+The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
+those directories come to be missing is **not established** — do not repeat any explanation of the
+cause, including in a report; describe only what was observed.
 
 ### Deriving the landed sha
 
@@ -349,12 +439,24 @@ eyeballed listing.
 - **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
-  `merge-queue/SKILL.md`: rules 2–3 govern rc=1 (take its **landed-but-not-credited** exit),
-  rule 2a governs rc=128-with-empty-marker (check the tip's merge marker and this task's
-  scheduler status; on either landing signal it is landed). In **neither** case
-  `merge_cancel`, and in neither case report not-landed. This is the one carve-out that most
-  matters here: this skill is fully autonomous, so a wrong not-landed reading cancels and
-  abandons work that actually landed.
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
+  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  argument rather than restating it; the disposition here is the **same on both arms**, and it
+  turns on re-reading this task's scheduler status **fresh**:
+  - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
+    **and already credited**. There is nothing to write: **skip sub-step (a) entirely** and
+    proceed to sub-steps **(c)** and **(d)**. This is a **success** path — not an abort, and not
+    a landed-but-not-credited report. (Sub-step (c)'s `git branch -d` will refuse on this arm:
+    the member ref is stale-by-rebase and not an ancestor of main. `git branch -D
+    task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+    starts with `-`; leaving the ref in place is also fine.)
+  - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
+    cannot read — **never write**. Keep polling to step 8's 20-minute ceiling, then take the
+    **landed-but-not-credited** report, citing the tip merge sha and the current status.
+
+  In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  the one carve-out that most matters here: this skill is fully autonomous, so a wrong
+  not-landed reading cancels and abandons work that actually landed.
 - **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
   it as either outcome.
 
@@ -428,6 +530,9 @@ On any ABORT:
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
+  That includes any `MERGE_RR.quarantined-*` file the rebase-recovery preflight left behind: it is
+  preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
+  your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.
 
 ## Return value (your final message IS the data)

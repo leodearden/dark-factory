@@ -120,10 +120,13 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     _client_arg, url_arg, tool_arg, args_arg = cancel_calls[0].args
     assert tool_arg == 'cancel_ticket'
     assert args_arg == {'ticket_id': 'tkt_abc'}
-    # The URL must be exactly the first entry in the default config
-    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
-
-    assert url_arg == DEFAULT_FUSED_MEMORY_URLS[0]
+    # The URL must be exactly the first entry of the config THIS app resolved,
+    # read from app.state rather than from DEFAULT_FUSED_MEMORY_URLS.  The
+    # contract under test is "the handler dials the configured URL", not "the
+    # configured URL is the packaged default" — test_scaffold.py owns the
+    # latter.  Deriving also keeps this green while the suite points
+    # DASHBOARD_FUSED_MEMORY_URLS at a dead port (task 5185).
+    assert url_arg == client.app.state.config.fused_memory_urls[0]
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +210,7 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     ensuring the module-boundary contract introduced in task-1285/step-4.
     """
     _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
-    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+    configured_url = client.app.state.config.fused_memory_urls[0]
 
     async def _only_cancel_ticket_fails(*args, **kwargs):
         """Fail the tool under test; let every other tool succeed.
@@ -238,7 +241,7 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
 
     assert resp.status_code == 502
     # invalidate_session must have been called exactly once with the failing URL
-    assert mock_invalidate.call_args_list == [call(DEFAULT_FUSED_MEMORY_URLS[0])]
+    assert mock_invalidate.call_args_list == [call(configured_url)]
 
 
 # ---------------------------------------------------------------------------
@@ -528,14 +531,19 @@ def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
     Both assertions filter to *cancel_ticket* records rather than counting the
     whole caplog stream: the client fixture runs the full app lifespan, whose
     _metrics_loop fans out list_tickets/get_status/get_queue_stats/
-    get_curator_state/fetch_statuses against the same unreachable URL in the
+    get_curator_state/fetch_statuses against the same configured URL in the
     background, each emitting its own dashboard.data.mcp_fanout WARNING (and a
     'dashboard.app' one on the outer except).  Whether those land before this
     request returns is a timing accident, so an unfiltered count would be
     flaky on a loaded box — the same reason test_invalid_ticket_id_returns_400
     filters handler calls from background ones.
     """
+    # Fabricated exception TEXT — the '8002' here is part of the message the
+    # mock raises and is deliberately unrelated to whatever URL the app
+    # resolved.  Leave it as-is; the URL in the expected log line below is the
+    # one that must be derived.
     exc_msg = 'connection refused: port 8002'
+    configured_url = client.app.state.config.fused_memory_urls[0]
     with (
         patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError(exc_msg))),
         caplog.at_level(logging.DEBUG),
@@ -556,7 +564,7 @@ def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
     assert len(app_warnings) == 1, (
         f'exactly one report per failing URL, from the call site, got {app_warnings}'
     )
-    assert f'cancel_ticket failed for http://localhost:8002: {exc_msg}' == app_warnings[0], (
+    assert f'cancel_ticket failed for {configured_url}: {exc_msg}' == app_warnings[0], (
         f'the call site still logs the RAW exc, untruncated and unprefixed, '
         f'got {app_warnings[0]!r}'
     )

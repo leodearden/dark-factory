@@ -785,7 +785,8 @@ class TestCostByAccount:
 
         The dashboard surfaces only what the gate persisted; reason-text
         regex parsing was removed in favour of a single source of truth in
-        ``shared.usage_gate._parse_resets_at`` (called at the write site).
+        ``shared.invocation_outcome._parse_resets_at`` (called at the write
+        site).
         Older rows pre-dating the persistence convention render as a blank
         cell — accepted in exchange for not duplicating parser logic.
         """

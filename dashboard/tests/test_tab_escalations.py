@@ -858,35 +858,45 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
 
 def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx_body: str) -> None:
     """The strip must feed trend sparklines for the three series-backed tiles
-    (benign-rate, esc-per-done, churn) via StatTile's spark prop, and
+    (benign-rate, esc-per-done, churn) via StatTile's history prop, and
     churn-24h must be RETAINED — not the first tile dropped — per the
     open-question-4 decision (all four tiles kept; responsive grid instead).
 
+    The prop was named `spark` until task 5588 renamed it `history`: the series
+    is the tile's PAST, and `spark` named the drawing rather than the data,
+    which reads badly beside the `datum` carrying the tile's present value.
+
     Asserts:
-    (1) at least three `spark=` props are passed to <C.StatTile within the
+    (1) at least three `history=` props are passed to <C.StatTile within the
         EscalationStatStrip body (one each for the series-backed tiles).
-    (2) churn-24h is retained: a `spark=` occurs within ~200 chars of a churn
+    (2) churn-24h is retained: a `history=` occurs within ~200 chars of a churn
         tile label / churn_daily reference (co-occurrence, not bare
-        presence — a stray spark= elsewhere wouldn't prove churn has one).
+        presence — a stray history= elsewhere wouldn't prove churn has one).
     """
     strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
 
-    # (1) at least three spark= props within <C.StatTile tiles
-    spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
+    # (1) at least three history= props within <C.StatTile tiles.
+    #
+    # Split at each tile and read only as far as that tile's `/>`, rather than
+    # the `<C\.StatTile[^>]*` this used to be: every tile now carries a `format`
+    # callback, and an arrow function puts a `>` inside the tag, which truncated
+    # the old class mid-prop and read every tile as series-less.
+    tiles = re.split(r'(?=<C\.StatTile\b)', strip_fn)[1:]
+    spark_count = sum(1 for tile in tiles if 'history=' in tile.split('/>')[0])
     assert spark_count >= 3, (
-        f'EscalationStatStrip passes spark= to only {spark_count} <C.StatTile tiles, '
-        'expected >= 3 (benign rate, esc/done, and churn are series-backed).'
+        f'EscalationStatStrip passes history= to only {spark_count} <C.StatTile '
+        'tiles, expected >= 3 (benign rate, esc/done, and churn are series-backed).'
     )
 
-    # (2) churn-24h retained: spark= co-occurs near a churn reference
+    # (2) churn-24h retained: history= co-occurs near a churn reference
     found_churn_spark = False
     for m in re.finditer(r'churn', strip_fn, re.IGNORECASE):
         window = strip_fn[max(0, m.start() - 200): m.end() + 200]
-        if 'spark=' in window:
+        if 'history=' in window:
             found_churn_spark = True
             break
     assert found_churn_spark, (
-        'No `spark=` prop found within ~200 chars of a churn tile label / '
+        'No `history=` prop found within ~200 chars of a churn tile label / '
         'churn_daily reference — churn-24h must be RETAINED with its own '
         'sparkline per the open-question-4 decision (keep all four tiles).'
     )
