@@ -28,7 +28,7 @@ from typing import Literal, get_args
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shared.task_metadata import register_metadata_submodel
+from shared.task_metadata import ExternalDep, register_metadata_submodel
 
 __all__ = [
     'CHECK_SUBJECT_FIELD',
@@ -294,9 +294,29 @@ class ManifestCapability(BaseModel):
 class ManifestTask(BaseModel):
     """A single manifest task block — one per PRD Greek-label task (PRD §Contract).
 
-    ``task_id`` is ``int | None``: ``None`` at authoring time, stamped by
-    ``commit_planning`` — never author-supplied for a real batch. ``title``
-    is a human aid, not load-bearing.
+    A block declares exactly one of THREE binding states, naming which
+    registry (if any) holds the task that produces its capabilities:
+
+    - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
+      by ``commit_planning``; never author-supplied for a real batch. This
+      is the ordinary case, and the only one whose ``delivered_check``\\ s
+      this project's dispatch gate evaluates.
+    - ``external_task_id`` set — the producer lives in ANOTHER project's
+      registry, named in the repo's canonical qualified
+      ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
+      same spelling as ``metadata.external_deps``), e.g. ``"reify:5613"``.
+      NORMALISED ON VALIDATE to ``ExternalDep.render()``'s canonical
+      spelling, so the stored value is always JOIN-SAFE against an
+      ``external_deps`` entry (see the validator below).
+      ``commit_planning`` never stamps such a block: its step-4 write-back
+      only touches labels present in the batch being committed, and a
+      foreign producer is by construction not in a dark-factory batch.
+    - both ``None`` — authoring time; the block binds nothing yet.
+
+    The two id fields are MUTUALLY EXCLUSIVE (enforced below): a block that
+    named both would claim two different producers in two different
+    registries, which is exactly the misattribution this field exists to
+    prevent. ``title`` is a human aid, not load-bearing.
 
     ``note`` is durable task-level provenance — why a label was split,
     renamed or re-homed. It is a DECLARED field rather than a YAML comment
@@ -317,9 +337,48 @@ class ManifestTask(BaseModel):
 
     label: str = Field(min_length=1)
     task_id: int | None = None
+    external_task_id: str | None = None
     title: str | None = None
     note: str | None = None
     capabilities: list[ManifestCapability]
+
+    @model_validator(mode='after')
+    def _check_producer_binding(self) -> ManifestTask:
+        if self.external_task_id is None:
+            return self
+        if self.task_id is not None:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: binds BOTH a local task_id '
+                f'({self.task_id}) and external_task_id '
+                f'{self.external_task_id!r} — a block names exactly one producer.'
+            )
+        # ExternalDep.parse is the single authority for this wire form
+        # (shared/src/shared/task_metadata.py::ExternalDep) — the same one
+        # backing metadata.external_deps. Do not re-implement the
+        # split/strip check here. Re-raised so the message names the
+        # offending label, which ExternalDep cannot know.
+        try:
+            dep = ExternalDep.parse(self.external_task_id)
+        except ValueError as exc:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: malformed external_task_id '
+                f'{self.external_task_id!r}; expected the qualified '
+                f'"project_id:task_id" form (e.g. "reify:5613"). {exc}'
+            ) from exc
+        # NORMALISE rather than store verbatim. ExternalDep.parse STRIPS
+        # before splitting, so ' reify:5613 ' is well-formed but is NOT
+        # equal to the 'reify:5613' a task's metadata.external_deps
+        # carries. Every consumer treats this field as an OPAQUE KEY --
+        # the live-corpus test compares it with ==, and the field is
+        # documented as the same spelling as external_deps -- so a
+        # non-canonical stored value would make any future join between a
+        # manifest block and its producer's external_deps silently MISS.
+        # Normalising here (rather than rejecting the padded form) keeps
+        # the parser's own tolerance intact while making the stored string
+        # the one thing callers may rely on. parse(s).render() == s holds
+        # for the canonical form, so this is idempotent.
+        self.external_task_id = dep.render()
+        return self
 
 
 class CapabilityManifestDoc(BaseModel):
