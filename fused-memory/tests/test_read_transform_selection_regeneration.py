@@ -7,6 +7,15 @@ here.  ``test_read_transform_selection.py`` pins the same artifact AS DATA;
 this file pins that the data is still what the generator produces, and that
 every commit the report stamps is on this history.
 
+The two guards split by cause: the comparison ignores commit stamps, so it
+fails only when content moved; the ancestry guard fails only when a stamp is
+off HEAD's history.  Masking does not make a rebase harmless.  A branch that
+commits a change to a stamped fixture (the fetch cache, say) and then
+regenerates stamps its own commit; a rebase rewrites that commit, and the
+ancestry guard fails.  The merge lane rebases
+(``orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main``), so such
+a regeneration holds only once the branch sits on current main.
+
 Merge lane, offline: no network, Qdrant or OPENAI_API_KEY.  Git is needed
 only to resolve the stamps.
 
@@ -26,9 +35,10 @@ import types
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import _init_git_repo, load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'read_transform_selection.py'
+THIS_CHECKOUT = Path(__file__).resolve().parent
 
 REGENERATE_COMMAND = (
     'uv run --project fused-memory python '
@@ -52,10 +62,14 @@ def _committed_markdown() -> str:
 
 
 def _without_commit_stamps(report: dict) -> dict:
-    """A copy minus ``fixture_provenance[*].commit``, which a pre-merge rebase rewrites.
+    """A copy minus ``fixture_provenance[*].commit``, so a comparison sees content only.
 
-    Each is the fixture's LAST-TOUCHING commit, per
-    ``fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance``.
+    Each stamp is the fixture's last-touching commit when the report was
+    generated (``fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance``).
+    Masking tolerates a stamp that is still on this history but is no longer
+    the fixture's latest commit, because a later commit touched the fixture
+    without moving a metric.  A stamp that a rebase rewrote also passes here,
+    and ``TestEveryCommittedFixtureStampIsOnThisHistory`` fails it.
     """
     masked = copy.deepcopy(report)
     for entry in masked.get('fixture_provenance') or []:
@@ -68,31 +82,52 @@ _UNTRACKED_REASON = (
     'generated, so the stamp cannot be verified'
 )
 
+_OFF_HISTORY_REASON = (
+    'git has this commit but HEAD does not descend from it; usually a commit '
+    "a rebase rewrote (task 4004's report named two), so regenerate"
+)
 
-def _stamps_not_on_head(provenance: list[dict]) -> list[dict]:
-    """The stamps HEAD's history cannot vouch for, each with its reason."""
+
+def _unresolvable_reason(returncode: int, stderr: str) -> str:
+    return (
+        f'git cannot resolve this commit here (rc={returncode}: '
+        f'{stderr.strip() or "no stderr"}); a shallow clone lacks it (deepen '
+        'and re-run), otherwise it is a rewritten commit this clone never '
+        'had, so regenerate'
+    )
+
+
+def _stamps_not_on_head(
+    provenance: list[dict], *, repo: Path = THIS_CHECKOUT,
+) -> list[dict]:
+    """The stamps ``repo``'s HEAD history cannot vouch for, each with a kind and reason.
+
+    ``git merge-base --is-ancestor`` exits 1 only for a commit git has but HEAD
+    does not descend from (``off_history``); any other nonzero exit means git
+    could not resolve the commit at all (``unresolvable``).
+    """
     off_head = []
     for entry in provenance:
         commit = entry.get('commit')
         if not commit:
-            off_head.append(
-                {'path': entry['path'], 'commit': None, 'reason': _UNTRACKED_REASON}
-            )
+            off_head.append({
+                'path': entry['path'], 'commit': None,
+                'kind': 'untracked', 'reason': _UNTRACKED_REASON,
+            })
             continue
         result = subprocess.run(
             ['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, check=False,
+            cwd=repo, capture_output=True, text=True, check=False,
         )
-        if result.returncode != 0:
-            detail = result.stderr.strip()
+        if result.returncode == 1:
             off_head.append({
-                'path': entry['path'],
-                'commit': commit,
-                'reason': (
-                    f'not an ancestor of HEAD (git rc={result.returncode}'
-                    f'{": " + detail if detail else ""})'
-                ),
+                'path': entry['path'], 'commit': commit,
+                'kind': 'off_history', 'reason': _OFF_HISTORY_REASON,
+            })
+        elif result.returncode != 0:
+            off_head.append({
+                'path': entry['path'], 'commit': commit, 'kind': 'unresolvable',
+                'reason': _unresolvable_reason(result.returncode, result.stderr),
             })
     return off_head
 
@@ -181,7 +216,7 @@ class TestAStampOffThisHistoryIsReported:
     def test_an_unresolvable_or_missing_commit_is_reported_and_head_is_not(self):
         head = subprocess.run(
             ['git', 'rev-parse', 'HEAD'],
-            cwd=Path(__file__).resolve().parent,
+            cwd=THIS_CHECKOUT,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         entries = [
@@ -192,7 +227,7 @@ class TestAStampOffThisHistoryIsReported:
 
         assert [p['path'] for p in _stamps_not_on_head(entries)] == ['a', 'b']
 
-    def test_each_report_names_its_commit_and_a_reason(self):
+    def test_each_report_names_its_commit_a_kind_and_a_reason(self):
         entries = [
             {'path': 'a', 'commit': '0' * 40},
             {'path': 'b', 'commit': None},
@@ -203,9 +238,40 @@ class TestAStampOffThisHistoryIsReported:
         assert len(reported) == 2
         for item in reported:
             assert isinstance(item, dict)
-            assert {'path', 'commit', 'reason'} <= item.keys()
+            assert {'path', 'commit', 'kind', 'reason'} <= item.keys()
             assert item['reason']
         assert [item['commit'] for item in reported] == ['0' * 40, None]
+        assert [item['kind'] for item in reported] == ['unresolvable', 'untracked']
+
+    def test_a_commit_off_this_history_is_told_apart_from_an_unresolvable_one(
+        self, tmp_path,
+    ):
+        root = _init_git_repo(tmp_path)
+        subprocess.run(
+            ['git', '-C', str(tmp_path), 'commit', '-q', '--allow-empty', '-m', 'child'],
+            check=True,
+        )
+        child = subprocess.run(
+            ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ['git', '-C', str(tmp_path), 'checkout', '-q', '--detach', root],
+            check=True,
+        )
+        entries = [
+            {'path': 'child', 'commit': child},
+            {'path': 'missing', 'commit': '0' * 40},
+            {'path': 'root', 'commit': root},
+        ]
+
+        reported = _stamps_not_on_head(entries, repo=tmp_path)
+
+        assert [(item['path'], item['kind']) for item in reported] == [
+            ('child', 'off_history'),
+            ('missing', 'unresolvable'),
+        ]
+        assert reported[0]['reason'] != reported[1]['reason']
 
 
 @pytest.mark.xdist_group('read_transform_regeneration')
@@ -244,8 +310,6 @@ class TestEveryCommittedFixtureStampIsOnThisHistory:
 
         assert off == [], '\n'.join([
             *(f'{item["path"]}: {item["commit"]} — {item["reason"]}' for item in off),
-            "a stamp off HEAD's history is usually a commit a pre-merge rebase "
-            "rewrote (task 4004's report named two); regenerate with "
-            f'`{REGENERATE_COMMAND}` on the CURRENT history and commit both '
-            'files — do not hand-edit the sha',
+            f'to regenerate, run `{REGENERATE_COMMAND}` on the CURRENT history '
+            'and commit both files — do not hand-edit the sha',
         ])
