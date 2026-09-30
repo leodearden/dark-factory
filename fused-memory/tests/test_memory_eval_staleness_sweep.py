@@ -906,16 +906,20 @@ class TestBuildSeries:
         assert series.run_stamp == STAMP
         assert series.corpus.project_id == 'dark_factory'
 
-    def test_it_emits_exactly_the_four_metrics_this_leaf_owns(self):
+    def test_it_emits_exactly_the_five_metrics_this_leaf_owns(self):
+        """``_full_inputs`` has only plain records, so it carries unattributed
+        exposure and every family is present."""
         m = _mod()
         series = m.build_series(**_full_inputs())
         assert _ids(series) == set(m.pinned_metric_ids())
         assert _ids(series) == {
             'superseded-still-surfacing',
             'dangling-pointers',
+            'dangling-pointers-unattributed',
             'successor-pointer-present',
             'task-terminal-staleness',
         }
+        assert [x.metric_id for x in series.metrics] == list(m.pinned_metric_ids())
 
     def test_it_never_emits_beta_metrics(self):
         series = _mod().build_series(**_full_inputs())
@@ -928,13 +932,19 @@ class TestBuildSeries:
         m = _mod()
         series = m.build_series(**_full_inputs())
         for metric_id in (
-            'superseded-still-surfacing', 'dangling-pointers', 'task-terminal-staleness',
+            'superseded-still-surfacing', 'dangling-pointers-unattributed',
+            'task-terminal-staleness',
         ):
             metric = _metric(series, metric_id)
             assert metric.kind == 'count'
             assert metric.direction == 'higher_is_worse'
             assert metric.denominator is None
             assert metric.items is None
+        total = _metric(series, 'dangling-pointers')
+        assert total.kind == 'scalar'
+        assert total.direction is None
+        assert total.denominator is None
+        assert total.items is None
         tripwire = _metric(series, 'successor-pointer-present')
         assert tripwire.kind == 'tripwire'
         assert tripwire.direction is None
@@ -954,6 +964,12 @@ class TestBuildSeries:
         dangling = _metric(series, 'dangling-pointers')
         assert dangling.value == inputs['census'].unresolved
         assert dangling.n == inputs['census'].examined
+        # Every edge in the fixture is plain, so the alarmed count carries the
+        # same population as the total here.
+        unattributed = _metric(series, 'dangling-pointers-unattributed')
+        assert unattributed.value == inputs['census'].by_reaper[m.UNATTRIBUTED]['unresolved']
+        assert unattributed.n == inputs['census'].by_reaper[m.UNATTRIBUTED]['examined']
+        assert unattributed.n == inputs['census'].examined
         surfacing = _metric(series, 'superseded-still-surfacing')
         assert surfacing.value == inputs['surfacing'].still_surfacing
         assert surfacing.n == inputs['surfacing'].pairs_comparable
@@ -2368,10 +2384,13 @@ class TestArtifactEmission:
         series = load_metric_series(metrics_path)
         assert series.eval_id == 'e4-staleness-sweep'
         assert series.run_stamp == STAMP
-        # Every family measurable from this seeded corpus is measured.
+        # Every family measurable from this seeded corpus is measured. The
+        # seeded records carry no reaper signature, so the unattributed count
+        # has exposure too.
         assert _ids(series) == {
             'superseded-still-surfacing',
             'dangling-pointers',
+            'dangling-pointers-unattributed',
             'successor-pointer-present',
             'task-terminal-staleness',
         }

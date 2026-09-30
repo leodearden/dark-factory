@@ -9,28 +9,26 @@ still resolve, whether a superseded entry still outranks the entry that
 replaced it, and whether entries assert live task state for tasks that have
 since gone terminal.
 
-**What it measures** (four metrics across three families, all owned by this
+**What it measures** (five metrics across three families, all owned by this
 leaf):
 
 ======================================  ==========  ==================
 metric_id                               kind        direction
 ======================================  ==========  ==================
 ``superseded-still-surfacing``          count       higher_is_worse
-``dangling-pointers``                   count       higher_is_worse
+``dangling-pointers``                   scalar      (never alarmed)
+``dangling-pointers-unattributed``      count       higher_is_worse
 ``successor-pointer-present``           tripwire    (rule (a) is already
                                                     directional)
 ``task-terminal-staleness``             count       higher_is_worse
 ======================================  ==========  ==================
 
 ``dangling-pointers`` and ``successor-pointer-present`` are the two spellings
-leaf β's docstring and leaf α's committed exemplars reserve for THIS leaf, and
-they are not redundant with each other: the count feeds α's Poisson
-count-shift trend (is the corpus accumulating dangling pointers?), the
-tripwire feeds α's grandfathered structural rule with the ratchet (did THIS
-supersession edge newly break, or did a previously-broken one get fixed?). One
-aggregate count cannot express per-edge grandfathering; one tripwire cannot
-express a trend over ``parent_id``/``corrects`` targets that have no stable
-per-item identity.
+leaf β's docstring and leaf α's committed exemplars reserve for THIS leaf. The
+scalar is the total an operator needs, by-design reaping included; the
+unattributed count is the population α may alarm on, the edges no reaper's
+contract deletes; the tripwire is per-edge, over unattributed ``supersedes``
+edges, for α's grandfathered ratchet. See PRD D11.
 
 β's ``superseded-above-successor`` is NOT reused here. That metric is
 registry-declared-pair shaped and lives under β's ``e1-retrieval-health``;
@@ -124,7 +122,13 @@ METRIC_SUPERSEDED_STILL_SURFACING = 'superseded-still-surfacing'
 """Count of superseded entries that outranked their successor. n = comparable pairs."""
 
 METRIC_DANGLING_POINTERS = 'dangling-pointers'
-"""Count of pointer targets that do not resolve. n = pointers examined."""
+"""Total of pointer targets that do not resolve, over ALL pointers; n = pointers
+examined. ``kind='scalar'``: recorded and trended, never alarmed, because at
+corpus scale it tracks reaping activity rather than corpus health (PRD D11)."""
+
+METRIC_DANGLING_POINTERS_UNATTRIBUTED = 'dangling-pointers-unattributed'
+"""E4's dangling-pointer ALARM: unresolved targets over the edges no reaper's
+contract deletes. n = those edges."""
 
 METRIC_SUCCESSOR_POINTER_PRESENT = 'successor-pointer-present'
 """Tripwire (M2 rule a). One item per ``supersedes`` edge, keyed by content."""
@@ -978,6 +982,7 @@ def pinned_metric_ids() -> tuple[str, ...]:
     return (
         METRIC_SUPERSEDED_STILL_SURFACING,
         METRIC_DANGLING_POINTERS,
+        METRIC_DANGLING_POINTERS_UNATTRIBUTED,
         METRIC_SUCCESSOR_POINTER_PRESENT,
         METRIC_TASK_TERMINAL_STALENESS,
     )
@@ -1007,6 +1012,26 @@ def _count(metric_id: str, value: int, exposure: int, *, details_path: str | Non
         value=float(value),
         n=exposure,
         direction='higher_is_worse',
+        details_path=details_path,
+    )
+
+
+def _scalar(metric_id: str, value: int, exposure: int, *, details_path: str | None = None):
+    """A scalar Metric — recorded and trended, never alarmed — or ``None``.
+
+    :func:`_count`'s absent-when-zero-exposure rule, for the same reason. No
+    ``direction``: the shared validator rejects one on a scalar, which has no
+    alarm rule for a direction to steer.
+    """
+    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+
+    if exposure <= 0:
+        return None
+    return Metric(
+        metric_id=metric_id,
+        kind='scalar',
+        value=float(value),
+        n=exposure,
         details_path=details_path,
     )
 
@@ -1119,7 +1144,8 @@ def build_series(
 ):
     """Assemble the M1 metric series for one sweep run.
 
-    Emits at most the four metrics this leaf owns, in the pinned vocabulary.
+    Emits at most the five metrics this leaf owns, in the pinned vocabulary
+    and in :func:`pinned_metric_ids` order.
     β's ``superseded-above-successor`` and its topic metrics are that leaf's
     and never appear here.
 
@@ -1154,6 +1180,8 @@ def build_series(
     # absolute path from this machine would be a dangling pointer there.
     details_path = report_artifact_path('.', eval_id, stamp).name
 
+    # A missing row is zero unattributed exposure, which `_count` omits.
+    unattributed = census.by_reaper.get(UNATTRIBUTED, {'examined': 0, 'unresolved': 0})
     metrics: list[Any] = []
     for metric in (
         _count(
@@ -1161,9 +1189,14 @@ def build_series(
             surfacing.still_surfacing, surfacing.pairs_comparable,
             details_path=details_path,
         ),
-        _count(
+        _scalar(
             METRIC_DANGLING_POINTERS,
             census.unresolved, census.examined,
+            details_path=details_path,
+        ),
+        _count(
+            METRIC_DANGLING_POINTERS_UNATTRIBUTED,
+            unattributed['unresolved'], unattributed['examined'],
             details_path=details_path,
         ),
     ):
