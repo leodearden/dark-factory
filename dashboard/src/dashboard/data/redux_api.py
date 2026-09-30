@@ -839,16 +839,18 @@ def shape_performance(
     history: Mapping[str, Mapping[str, Any]] | None = None,
     served_at: datetime,
 ) -> dict[str, Any]:
-    """Each project's cards Datum beside its hour-bucketed histories.
+    """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
     Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
-    one_pass_history, escalation_history}}}``, where ``cards`` is the
-    project's wire Datum from
-    :func:`dashboard.data.performance.aggregate_performance_cards`.
+    one_pass_history, escalation_history}}, served_at}``, where ``cards`` is
+    the project's wire Datum from
+    :func:`dashboard.data.performance.aggregate_performance_cards` and
+    ``served_at`` is the instant every Datum was validated against — the one
+    the client ages each ``as_of`` from.
 
     ``cards`` is the listing authority: a project appears exactly when it has
-    a cards Datum, so every entry carries a measured value. ``history``
-    (optional) is :func:`dashboard.data.performance.aggregate_performance_history`'s
+    a cards Datum, measured or UNKNOWN. ``history`` (optional) is
+    :func:`dashboard.data.performance.aggregate_performance_history`'s
     output; a project absent from it gets empty history blocks. A Datum that
     breaks its contract at *served_at* is a shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
@@ -866,7 +868,7 @@ def shape_performance(
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
             'escalation_history': dict(h.get('escalation_history') or empty_pair),
         }
-    return {'PERFORMANCE': out}
+    return {'PERFORMANCE': out, 'served_at': served_at.isoformat()}
 
 
 # ---------------------------------------------------------------------------

@@ -891,6 +891,27 @@ def test_shape_performance_lists_exactly_the_projects_with_cards():
         assert entry['cards']['value'] is not None
 
 
+def test_shape_performance_serves_the_instant_it_validated_against():
+    body = redux_api.shape_performance(
+        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        served_at=_PERF_SERVED_AT,
+    )
+    assert body['served_at'] == '2026-09-30T12:00:00+00:00'
+
+
+def test_shape_performance_serves_an_unread_project_as_an_unknown_cards_datum():
+    reason = 'the loop histograms of this project could not be read'
+    unread = Datum(
+        value=None, as_of=None, state=DatumState.UNKNOWN, reason=reason,
+        freshness_bound_seconds=_PERF_WINDOW_SECONDS,
+    )
+    body = redux_api.shape_performance(cards={'p1': unread}, served_at=_PERF_SERVED_AT)
+    assert body['PERFORMANCE']['p1']['cards'] == {
+        'value': None, 'as_of': None, 'state': 'unknown', 'reason': reason,
+        'freshness_bound_seconds': _PERF_WINDOW_SECONDS,
+    }
+
+
 def test_shape_performance_propagates_a_broken_cards_datum():
     """A FRESH Datum older than its own bound is a shaper bug, not a state."""
     overdue = _perf_cards(_PERF_SERVED_AT - timedelta(days=8))

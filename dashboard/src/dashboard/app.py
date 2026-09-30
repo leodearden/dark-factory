@@ -1079,7 +1079,7 @@ async def api_performance(request: Request) -> JSONResponse:
         history=safe_gather_result(history_r, {}, 'perf/history'),
         served_at=now,
     )
-    return JSONResponse(with_window({**shaped, 'served_at': now.isoformat()}, window))
+    return JSONResponse(with_window(shaped, window))
 
 
 # Cap str(exc) inside the 502 `detail` field to bound arbitrary-length
