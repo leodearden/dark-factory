@@ -350,7 +350,74 @@ class TestDanglingCensus:
         assert census.resolved == 0
         assert census.unresolved == 0
         assert census.by_key == {}
+        assert census.by_reaper == {}
         assert census.unresolved_refs == []
+
+    @staticmethod
+    def _three_writer_refs():
+        """One status correction, one canonical, one plain record.
+
+        Each carries one resolved (UUID_A) and one unresolved supersedes
+        target; the canonical also carries an unresolved ``corrects`` edge.
+        """
+        m = _mod()
+        return [
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=[UUID_A, UUID_B],
+                kind='project_status_correction',
+            )),
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                corrects=UUID_C, canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-plain', 'plain words', supersedes=[UUID_A, UUID_C],
+            )),
+        ]
+
+    def test_the_reaper_cut_is_a_partition_of_the_same_edges(self):
+        m = _mod()
+        census = m.dangling_census(self._three_writer_refs(), {UUID_A: True})
+        for field_name, total in (
+            ('examined', census.examined),
+            ('resolved', census.resolved),
+            ('unresolved', census.unresolved),
+        ):
+            assert sum(row[field_name] for row in census.by_reaper.values()) == total
+        for row in census.by_reaper.values():
+            assert set(row) == {'examined', 'resolved', 'unresolved'}
+
+    def test_attribution_is_per_edge_so_a_canonicals_corrects_edge_is_unattributed(self):
+        m = _mod()
+        census = m.dangling_census(self._three_writer_refs(), {UUID_A: True})
+        assert census.by_reaper == {
+            m.REAPER_STATUS_CORRECTION: {'examined': 2, 'resolved': 1, 'unresolved': 1},
+            m.REAPER_CONSOLIDATION: {'examined': 2, 'resolved': 1, 'unresolved': 1},
+            # The plain record's two supersedes edges PLUS the canonical's
+            # corrects edge: a reaper deletes only what it names in supersedes.
+            m.UNATTRIBUTED: {'examined': 3, 'resolved': 1, 'unresolved': 2},
+        }
+
+    def test_an_absent_reaper_gets_no_fabricated_zero_row(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-canonical', supersedes=UUID_A, canonical=True, topic='t',
+        ))
+        census = m.dangling_census(refs, {UUID_A: True})
+        assert set(census.by_reaper) == {m.REAPER_CONSOLIDATION}
+        assert m.REAPER_STATUS_CORRECTION not in census.by_reaper
+        assert m.UNATTRIBUTED not in census.by_reaper
+
+    def test_a_by_design_target_missing_from_the_map_is_unresolved_in_its_row(self):
+        """Never a silent 'assume fine' per slice either."""
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-status', supersedes=UUID_A, kind='project_status_correction',
+        ))
+        census = m.dangling_census(refs, {})
+        assert census.by_reaper == {
+            m.REAPER_STATUS_CORRECTION: {'examined': 1, 'resolved': 0, 'unresolved': 1},
+        }
 
 
 class TestSuccessorPointerItems:
