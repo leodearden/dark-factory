@@ -131,7 +131,8 @@ METRIC_DANGLING_POINTERS_UNATTRIBUTED = 'dangling-pointers-unattributed'
 contract deletes. n = those edges."""
 
 METRIC_SUCCESSOR_POINTER_PRESENT = 'successor-pointer-present'
-"""Tripwire (M2 rule a). One item per ``supersedes`` edge, keyed by content."""
+"""Tripwire (M2 rule a). One item per UNATTRIBUTED ``supersedes`` edge, keyed
+by content."""
 
 METRIC_TASK_TERMINAL_STALENESS = 'task-terminal-staleness'
 """Count of entries asserting live state for a terminal task. n = entries
@@ -540,12 +541,34 @@ def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     return [ref for ref in refs if _is_unkeyable_successor(ref)]
 
 
+def _is_by_design_successor(ref: PointerRef) -> bool:
+    """Is *ref* a ``supersedes`` edge whose target a reaper deletes by design?
+
+    The ONE site that decides, shared by :func:`by_design_successor_refs`
+    (which reports them) and :func:`successor_pointer_items` (which skips
+    them). A predicate, never set membership, for the unhashable-ref reason
+    :func:`_is_unkeyable_successor` documents.
+    """
+    return ref.key == 'supersedes' and ref.reaped_by is not None
+
+
+def by_design_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
+    """The ``supersedes`` refs the tripwire excludes as reaped by design, in ref order.
+
+    A DISCLOSED narrowing, not a suppression. These edges stay counted in the
+    ``dangling-pointers`` scalar and in the per-reaper rows; they stop being
+    graded by a rule (a) they can never meaningfully pass or fail, since a
+    by-design edge can never newly break or be fixed (PRD D11).
+    """
+    return [ref for ref in refs if _is_by_design_successor(ref)]
+
+
 def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool]) -> list:
     """One :class:`shared.memory_eval_metrics.TripwireItem` per ``supersedes`` edge.
 
     ``parent_id``/``corrects`` refs are deliberately excluded: they are
-    measured by the ``dangling-pointers`` COUNT, whose Poisson trend needs no
-    per-item identity. A tripwire over them could not be grandfathered, since
+    measured by the ``dangling-pointers-unattributed`` COUNT, whose Poisson
+    trend needs no per-item identity. A tripwire over them could not be grandfathered, since
     those targets have no stable item key to ratchet on.
 
     Returns the shared model directly so the tripwire's ``n == len(items)``
@@ -567,15 +590,24 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
     ratchet for every future run. The skipped count is disclosed in
     ``corpus.counts`` and named in the report; ``dangling-pointers`` still
     counts those edges, so nothing measured becomes unmeasured.
+
+    Edges named by :func:`by_design_successor_refs` are skipped too, whether
+    or not their target resolves: otherwise every new canonical and every
+    diverged status-correction record would mint a new failing item, and so a
+    new alarm, on every run a reaper acted (PRD D11).
     """
     from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
 
     by_key: dict[str, bool] = {}
     for ref in refs:
-        # `_is_unkeyable_successor`, not membership in a set of skipped refs: a
-        # ref whose target is a dict or a list is unhashable, and hashing one
-        # would abort the whole sweep. See that predicate's docstring.
-        if ref.key != 'supersedes' or _is_unkeyable_successor(ref):
+        # Predicates, not membership in a set of skipped refs: a ref whose
+        # target is a dict or a list is unhashable, and hashing one would
+        # abort the whole sweep. See `_is_unkeyable_successor`'s docstring.
+        if (
+            ref.key != 'supersedes'
+            or _is_unkeyable_successor(ref)
+            or _is_by_design_successor(ref)
+        ):
             continue
         target = ref.target if isinstance(ref.target, str) else None
         passed = bool(target is not None and resolution.get(target, False))
