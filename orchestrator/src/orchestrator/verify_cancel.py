@@ -71,6 +71,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from enum import StrEnum
@@ -1192,7 +1193,8 @@ def fire_watchdog_kill(
     * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and
-      letting sshd reap it) even if some descendant could not be killed.
+      letting sshd reap it) even if some descendant could not be killed, and
+      even if the kill phase itself failed.
 
     *trigger* names the :func:`run_stdin_watchdog` branch that judged the
     channel dead.  It is REPORTED, never acted on -- the kill sequence is
@@ -1203,37 +1205,54 @@ def fire_watchdog_kill(
     no structured return path left, and on a remote verify this stderr is the
     only thing the dispatcher still sees.
 
-    Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
-    (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
-    a permission race is fine, this is a best-effort escalation), sleep
-    *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), report the trigger on stderr, then
-    ``exit_fn(exit_code)`` as the final action.
+    Sequence: the kill phase (:func:`_signal_descendants`), then report the
+    trigger on stderr, then ``exit_fn(exit_code)`` as the final action.  A
+    failure anywhere in the kill phase (e.g. a raising ``/proc`` snapshot)
+    has its traceback written to stderr and still ends in the trigger line
+    and ``exit_fn``.
     """
-    ppid_map = ppid_map_provider()
-    descendants = collect_descendants(pgid, ppid_map)
-    for pid in descendants:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGTERM)
-
-    sleep(grace_secs)
-
-    ppid_map = ppid_map_provider()
-    survivors = collect_descendants(pgid, ppid_map)
-    for pid in survivors:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGKILL)
+    stream = stderr if stderr is not None else sys.stderr
+    try:
+        _signal_descendants(
+            pgid,
+            grace_secs=grace_secs,
+            ppid_map_provider=ppid_map_provider,
+            kill=kill,
+            sleep=sleep,
+        )
+    except Exception:
+        # Report here: os._exit would discard a propagating exception
+        # unprinted, and the thread excepthook would never run.
+        with contextlib.suppress(Exception):
+            traceback.print_exc(file=stream)
 
     # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
     # buffered line would be dropped.  Suppress everything: a failed
     # diagnostic (broken pipe on a dead ssh channel) must never prevent the
     # self-exit that frees the flock and lets sshd reap the leader.
-    stream = stderr if stderr is not None else sys.stderr
     with contextlib.suppress(Exception):
         stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
         stream.flush()
 
     exit_fn(exit_code)
+
+
+def _signal_descendants(pgid: int, *, grace_secs, ppid_map_provider, kill, sleep) -> None:
+    """SIGTERM every descendant of *pgid*, sleep *grace_secs*, SIGKILL the survivors.
+
+    Each pass takes a fresh ``/proc`` PPID snapshot.  ``ProcessLookupError``
+    and ``PermissionError`` are suppressed per signal: an already-dead target
+    or a permission race is fine, since this is a best-effort escalation.
+    """
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGTERM)
+
+    sleep(grace_secs)
+
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
 
 
 def start_stdin_watchdog(
