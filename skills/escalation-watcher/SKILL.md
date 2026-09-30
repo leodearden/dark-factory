@@ -422,9 +422,10 @@ Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill parks a d
 human — Priority 3b, an AFK-mode deferral, a B3 gate abort/drift-pending outcome, or an
 `infra_issue`/`recon_*` "tell the human" — also file it to the cockpit decision registry, **IN
 ADDITION to** (not instead of) the in-session note and the `afk-digest.md` line. The registry is
-what makes the cockpit decision queue (C5b) the primary return-triage surface; `afk-digest.md` is
-**retained** (demoted to a generated history view, not removed in this batch), so nothing that
-already reads it breaks.
+what makes the cockpit decision queue (C5b) a return-triage surface, and the 05:30 return brief,
+`data/return-brief.md`, reads it too: that brief is the primary pull-on-return surface and
+supersedes `afk-digest.md`. The digest is **retained** (demoted to a generated history view, not
+removed in this batch), so nothing that already reads it breaks.
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
@@ -751,7 +752,11 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
    (overwrite each cycle) listing every pending item: id, task_id, category, severity, age, and a
-   one-line "why it's waiting / what decision is needed." On return the human reads one file. If
+   one-line "why it's waiting / what decision is needed." On return the human reads one file, and
+   the primary one is now `data/return-brief.md`: the 05:30 cross-project return brief supersedes
+   this digest as the pull-on-return surface (see "Sitting preparer (`prepare-sitting` mode)").
+   Keep maintaining the digest, which is retained for the reasons given under "Filing Parked
+   Decisions to the Cockpit Registry (C8)" below. If
    phone push is configured (`--ntfy-url` on the watcher command), a born-at-L2 `critical`/`urgent`
    still pushes immediately — those are the only items worth interrupting an AFK human for.
 
@@ -923,9 +928,10 @@ mode; AFK shift 3 manages it):
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
 
 `afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
-demoted to a generated history view: the cockpit decision queue (C5b), fed by `write-decision`
-(see "Filing Parked Decisions to the Cockpit Registry" above), is now the primary return-triage
-surface for any of the above that left a decision open (i.e. every outcome except "Merged").
+demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
+primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
+fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
+the above that left a decision open (i.e. every outcome except "Merged").
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
@@ -1227,6 +1233,137 @@ done by hand): before designating any survivor, run this check on the shared mem
 an already-answered record open as the survivor — close it against the recovered ruling, recording
 where the ruling lives. The 08-19 pass did the opposite on three clusters and manufactured three
 of the five instances above.
+
+### Sitting preparer (`prepare-sitting` mode)
+
+The sitting preparer (`scripts/sitting/`) turns every question awaiting Leo, across every project's
+queue and the cockpit decision registry, into one brief he answers by number. It reads the stores
+of record and never writes them; its only files are under `data/sitting/`, plus
+`data/return-brief.md`. Every mutation below is an agent action from a pre-built payload, taken
+only for an item Leo has answered or one that clears the carve-out in "Ruled-elsewhere check
+(answered-but-unrecorded)" above, whose gates it evaluates and does not restate. Run it from the
+project root as `uv run --frozen --project shared python scripts/sitting/prepare_sitting.py
+<subcommand>`.
+
+#### When it runs
+
+- **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
+  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
+  autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
+  undated, not dropped.
+- **On demand**, whenever Leo asks for it.
+- **Unprompted**, at three points: on watcher launch; on every return, meaning a human turn after 2h
+  or more of silence, or any status or "what do you need" question; and after each applied ruling
+  batch.
+
+#### The sitting and its numbers
+
+- At launch: `new-sitting --ledger data/sitting/ledger-<lease-slug>.json --seed
+  data/sitting/ledger-nightly.json`. The seed carries forward the numbers Leo read in the return
+  brief.
+- Each 05:30 render seeds its numbering from the night before. An item keeps its number from night
+  to night, so a session launched on an earlier night still agrees with a newer page on every item
+  a render had numbered before that launch. An item your session numbered itself after launch can
+  carry a different number on a later page. The `resolve-answers` echo table names each record id,
+  so check it there.
+- For every brief or re-brief: `brief --ledger <that ledger>`.
+- A number belongs to its item for the whole session and is never reused. An applied item keeps its
+  number under **Done**. An item under a HOLD, a pin or another owner renders in the **Standing / no
+  action** footer instead of the numbered list.
+
+#### Investigate before you `record`
+
+`record --from <file|->` validates and merges preparations: JSON, one object or a list, in the shape
+of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` of the item's
+`brief --json` row. A refused payload writes nothing. Before recording an item:
+
+- Do the work the script cannot: `git show task/<id>:<file>` for work on an unmerged branch, and a
+  grep for `spawned_from` follow-ups.
+- Read every ownership `mentions`; the handover file is prose, so it is evidence, never routing.
+  Anything the handover or Leo places under a HOLD, as Leo-owned, or as owned elsewhere is recorded
+  as a `standing` with its release predicate (`task_status_is`, `escalation_closed` or `manual`).
+- A "nothing owns this" claim cites the probes that came back empty. An `unavailable` probe is not
+  an empty one.
+- Every option carries its `ramification`. Every item carries a recommendation with its evidence
+  chain, or an explicit `no_lean` with its reason.
+- Put every escalation and task id you mention in `cites`, so the brief glosses it.
+
+#### Gate facts are yours to supply
+
+The script measures only what the stores state outright: the pin markers, the DO-NOT-CLOSE
+companions, and the member chain. Carve-out gates 1-4 (`ruling`, `names_this_record`, `executed`,
+`session_terminated`) and `pins_recovery` arrive as the preparation's `gate_facts`. Take
+`pins_recovery` from the `get_pending_escalations` compact row, where the server annotates it at read
+time; it is not on disk. Each fact is `{held, evidence, source_kind}`, and `ruling` holds only from a
+documented source kind (`scripts/sitting/gates.py::DOCUMENTED_RULING_SOURCES`).
+
+Every fact defaults to unknown, and unknown fails closed. That is why `--apply-closes` alone closes
+nothing: an item becomes closeable only when all six gates hold on recorded evidence. Without the
+flag, would-be closes are listed under "Recommended closes (recommend-only)".
+
+#### Docket page or numbered list
+
+When the brief reports a docket threshold (6 or more decisions, 3 or more heavy ones, or
+`--multi-sitting`), publish the `brief --docket-json` rows as a page with the `db` capability. Read
+Leo's rulings back from it and echo each one VERBATIM into the transcript (item, option, note,
+timestamp) before resolving. Below the threshold, the numbered terminal list is the surface. Both
+enter through `resolve-answers`, with `--source docket` or `--source terminal`.
+
+#### Applying Leo's answers, in order
+
+1. Run `resolve-answers --ledger <ledger> --answer 'N=OPTION[:note]' ...` and paste its echo table.
+   It exits 3 when a token does not resolve: ask back on each such token and apply nothing for it.
+2. `stamp_triage` with `payloads.append_markers(existing_note, <x_prepared>, <x_agreed>)`, while the
+   record is still pending (see "Sitting markers" below; the REPLACES caution applies).
+3. `resolve_issue(..., resolution_turns=<the value resolve-answers printed>)`.
+4. The `update_task` `x_ruling` payload. Say so when it discloses a value it supersedes.
+5. The pre-built `close-decision` payload, quoting the deciding evidence. `close-decision` requires
+   `--project` and `--escalations-dir` naming the record you READ, and refuses any other record, so
+   run the payload rather than hand-typing the verb. A non-zero exit stops that item's apply; report
+   it to Leo.
+6. One `add_memory` as `decisions_and_rationale`, plus a second write carrying the rationale to a
+   Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
+
+The order is deliberate. The markers go on while the record is still pending, and `resolve_issue`
+runs before `close-decision`, so a server refusal such as `declared_pin_refused` stops the apply
+before the registry records an answer.
+
+An L2 with no DecisionRecord is filed, then closed, under
+`scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
+id>` for the recon queue, never the bare escalation id. Decision ids are fleet-global while
+escalation numbering restarts per project; see "Across *projects*, a shared id is a collision" in
+"Filing Parked Decisions to the Cockpit Registry (C8)".
+
+#### Findings for another task's owner
+
+A finding is appended to its owner task only while that task is `pending`. Otherwise it is put to
+Leo, or filed through the pre-built `submit_task` follow-up; `payloads.route_finding_to_owner` builds
+whichever applies.
+
+#### Trial and kill criteria
+
+- Stay recommend-only for the first two sittings.
+- Leave the trial only at 90% or more agreement AND a 60% or greater fall in sitting time, read from
+  `summary --ledger <ledger>` and the return brief's trial line.
+- One wrong autonomous close in 50 reverts to recommend-only: stop passing `--apply-closes`.
+
+### Sitting markers: `x_prepared` and `x_agreed`
+
+The sitting preparer (`scripts/sitting/`) records its trial instruments on the escalation itself,
+as marker lines in `triage_note`, stamped only when an item Leo has answered is applied — never
+before he answers:
+
+- `x_prepared` — what the sitting recommended: an option label, or an explicit no-lean with its
+  reason.
+- `x_agreed` — Leo's answer, whether it matched that recommendation, and how many turns it took.
+
+Each is one line of sorted JSON built by `scripts/sitting/payloads.py`
+(`render_prepared_marker` / `render_agreed_marker`); a reader takes the last line of each kind.
+`stamp_triage` replaces the whole note (see "CAUTION: `stamp_triage` REPLACES `triage_note`"
+below), so send `payloads.append_markers(existing_note, ...)`, which keeps the existing note —
+including any world-facing predicate line — verbatim. These are distinct from `x_shadow_ruling:`,
+which records what the adjudicator *would* have ruled, never what Leo did.
 
 ### `review_suggestions` (info)
 
@@ -1662,11 +1799,11 @@ When delegating, give the sub-agent complete context — paste the escalation JS
 
 ## Tracking Pending Human Decisions
 
-Maintain awareness of escalations waiting for human input. When the human returns or asks for status:
-
-1. List all pending items with brief context
-2. Note how long each has been waiting
-3. Prioritize: infra issues first, then blocking issues, then info-level items
+Maintain awareness of escalations waiting for human input. When the human returns or asks for
+status, answer with the sitting preparer (see "Sitting preparer (`prepare-sitting` mode)" above)
+rather than a hand-assembled list: `brief --ledger <session ledger>` is the numbered list, with each
+item's options, recommendation and age, and its standing footer says what is waiting on someone
+else.
 
 Remind about unresolved items roughly every 3-5 escalation handling cycles — enough to keep them visible without being noisy.
 

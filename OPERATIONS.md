@@ -1772,13 +1772,15 @@ cases, the same backing stores. **Check this table before adding a job** —
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
 | 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
+| 05:30 | Cross-project return brief (Fable prepare + render) | `return-brief.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
+for the 03:30 job; the sections below for the 03:00 and 05:00 ones, and
+[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -2160,6 +2162,114 @@ preconditions for flipping it, so "the guard is off" is never misread as
 **3626**'s re-measurement — it emits both slug-conformance partitions that
 gate's recipe asks for. The obligation, the target and the honest baseline
 are owned in `docs/prds/memory-metadata-vocabulary.md` §9.
+
+### Cross-project return brief (05:30)
+
+**What it does.** Writes `data/return-brief.md`, the page Leo pulls on return:
+what needs him across every project, then what the fleet did while he was
+away. It has six sections: decisions needed, rulings made under standing
+policy, landed, stuck and why, spend and cap hits, and autonomous closes. It
+supersedes `data/afk-digest.md`, which was last written 2026-08-19.
+
+| File | Role |
+|---|---|
+| `scripts/return-brief.sh` | Wrapper: prepare, then render |
+| `scripts/return-brief.service` | `Type=oneshot` around the wrapper |
+| `scripts/return-brief.timer` | `OnCalendar=*-*-* 05:30:00` |
+| `scripts/install-return-brief-timer.sh` | Installer |
+| `scripts/sitting/nightly_prepare.py` | Step 1: the prepare-sitting mode, headless on Fable |
+| `scripts/sitting/return_brief.py` | Step 2: the deterministic render |
+
+**Two steps, in order.**
+
+1. **Prepare.** A headless `claude --print` run on Fable follows the
+   prepare-sitting mode's nightly form and records its judgement (options,
+   ramifications, a recommendation or an explicit no-lean) with
+   `prepare_sitting.py record`. It is read-only by construction: it runs
+   under `--permission-mode dontAsk`, with an allowlist and an explicit
+   denylist of every apply verb, both in `nightly_prepare.py`, and its
+   environment sets `SITTING_NIGHTLY_CONFINED`, under which
+   `prepare_sitting.py` refuses anything but `brief` and `record` into
+   `data/sitting/`, including `--apply-closes` and `--ledger`. Its only MCP
+   servers are the `escalation` and `fused-memory` blocks of the checkout's
+   `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
+   on the project config being approved for a headless run, and playwright
+   never starts. Its account comes from the shared pool, as a
+   lease that is read and handed straight back, so the night's Fable spend
+   is invisible to the gate. With nothing leasable, it inherits the unit's
+   environment. It stops itself after 2700s.
+2. **Render.** This step is deterministic and runs whatever prepare
+   returned. Every figure on the page comes from its own fresh measurement
+   and carries a stamp, and a store it cannot read is a stated shortfall in
+   its section. The model states no figure the page prints.
+
+**The artifacts are NOT committed.** `.gitignore` anchors `/data/`, so there
+is no commit seam, unlike the 05:00 census:
+
+| Path | What it carries |
+|---|---|
+| `data/return-brief.md` | The page |
+| `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
+| `data/sitting/preparation.json` | The prepared judgement, per open item |
+
+**The regen commands**, which are the two invocations the wrapper makes, run
+from the repo root:
+
+```bash
+uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
+uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+```
+
+The first spends a Fable budget. For a **no-cost re-render**, skip it:
+`RETURN_BRIEF_SKIP_PREPARE=1 scripts/return-brief.sh`.
+
+**Reading a night.** Every wrapper line is prefixed `return-brief:`, and the
+run ends with one summary line:
+
+```
+return-brief: done (prepare=0 brief=0)
+```
+
+```bash
+journalctl --user -u return-brief.service -n 100
+systemctl --user list-timers return-brief.timer
+```
+
+- `prepare=1` means the Fable run failed, timed out or hit a usage limit;
+  its log line carries both stream tails. That is routine, not an incident:
+  the page is still written, and items the run did not reach show as
+  `awaiting preparation`. The page's header says how fresh the preparation
+  is.
+- `prepare=2` is a configuration error, such as no `claude` on the unit's
+  PATH.
+- `brief=` other than 0 means the page was not written. That is the one
+  worth acting on.
+
+The wrapper always exits 0, for the reason the whole §12 family shares: a
+failing recurring `oneshot` stays in `failed` state and silently ends the job.
+
+**API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
+policy stated in "Legibility trickle accounts (03:00)" above.
+`nightly_prepare.py` also strips the key from the child's env, whether the
+account came from a lease or was inherited.
+
+**First run: arm the timer.** The installer kicks no immediate run, because
+an off-cadence run would spend a Fable budget nobody scheduled.
+
+```bash
+scripts/install-return-brief-timer.sh
+```
+
+**Adding a project.** The brief scans every project root that
+`_task_db_scan.discover_project_roots` returns, plus every queue the decision
+registry has recorded. For a project the registry has never seen (e.g.
+know-live), set `DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the
+unit's environment. It replaces the default root rather than adding to it,
+so list dark-factory too.
+
+**The apply half is agent work, not timer work.** Leo's answers are applied
+by a watcher session, following `skills/escalation-watcher/SKILL.md`,
+"Sitting preparer (`prepare-sitting` mode)".
 
 ---
 
