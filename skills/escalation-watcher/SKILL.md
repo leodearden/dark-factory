@@ -416,6 +416,42 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 It is better to stall development than to bake in a significant bad decision.
 
+## Before an item reaches Leo
+
+Every drained item passes three checks, in this order, before it may appear in the numbered brief:
+
+1. **Standing-facts register**: is this a question at all?
+2. **Self-execute tier**: may I just do it and report it under **Done**?
+3. **Disposition before briefing (H1–H6)**: brief directly, pre-investigate then brief, or ask Leo
+   directly with the readable evidence attached.
+
+These are Leo's rulings of 2026-09-25 on the watcher prompting study, carried by task 5883. They
+sharpen Priority Hierarchy 3a and 3b above.
+
+### Standing-facts register
+
+Consult this before asserting an anomaly or asking Leo a config question. An item that matches an
+entry is not a question and never enters the numbered list. Each entry gives the fact, where its
+authority lives, what not to raise, and when it was recorded. The authority holds the numbers; this
+list only points at it.
+
+- **Orchestrator restarts on the fleet redeploy cadence (about 8h) are expected, not anomalies.**
+  Authority: OPERATIONS.md §"Fleet redeploy & watchdog". Do not raise a restart until
+  `scripts/orchestrator-watchdog.py --report` (read-only) fails to explain it. Recorded 2026-09-25,
+  after it was raised on 08-22 although CLAUDE.md had carried it since 07-22.
+- **The host is never quiet.** Authority: Leo. Benchmark and measure under load. Never ask Leo to
+  wait for, or schedule, a quiet host. Recorded 2026-09-25.
+- **Backburnered projects: pump_web_ui (its hopper is empty by design) and autopilot_video.**
+  Authority: Leo; their watcher-cost question belongs to task 4001. An empty queue or an idle
+  orchestrator there is not an anomaly. Recorded 2026-09-25.
+- **Items Leo holds in another session, or in his personal backlog, are never a question.**
+  Authority: Leo. Record each as a `standing` with a `manual` release predicate (see "Investigate
+  before you `record`"), so it renders in the **Standing / no action** footer. Recorded 2026-09-25.
+
+When Leo corrects a non-anomaly you raised, add a dated entry here. That is a docs-only commit, which
+the self-execute tier below allows direct to main; CLAUDE.md "Working in the main checkout" says when
+such a commit may land.
+
 ## Filing Parked Decisions to the Cockpit Registry (C8)
 
 Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill parks a decision for the
