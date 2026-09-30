@@ -127,6 +127,13 @@ try:
 except ImportError:
     HAS_ESCALATION = False
 
+PROJECT_STATUS_CORRECTION_KIND = 'project_status_correction'
+"""The ``kind`` of the per-project Mem0 record that
+:meth:`ReconciliationHarness._reconcile_status_correction` reads back and
+supersedes. A STORED spelling, also read by E4 to attribute this writer's
+reaped ``supersedes`` edges
+(``fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper``)."""
+
 # Recon-wide dedup config: covers all four recon escalation categories.
 # Wider than DedupeConfig.for_recon() (which only covers recon_integrity_issue)
 # because A7b also folds non-finding categories so each DISTINCT recurring message
@@ -1746,7 +1753,7 @@ class ReconciliationHarness:
             try:
                 memories = await self.memory.get_memories_by_metadata(
                     project_id=project_id,
-                    filters={'kind': 'project_status_correction'},
+                    filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
                 )
             except Exception as exc:
                 # A project whose Qdrant collection was never provisioned has no
@@ -1817,7 +1824,7 @@ class ReconciliationHarness:
 
             live = diff['live']
             corrected_metadata = {
-                'kind': 'project_status_correction',
+                'kind': PROJECT_STATUS_CORRECTION_KIND,
                 # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs.  The
                 # shape contract, the read tolerance for the legacy scalar, and
                 # the writer/reader map all live in ONE place —
@@ -1841,12 +1848,12 @@ class ReconciliationHarness:
                 # (docs/prds/memory-eval-program.md §γ, which resolves
                 # `supersedes` targets via `get_memory_by_id`): 100% of this
                 # writer's edges are dangling BY DESIGN.  E4 ATTRIBUTES these
-                # edges by this `kind` rather than allowlisting them, keeping
-                # them in the `dangling-pointers` total but out of the alarmed
-                # population and the successor tripwire — see
+                # edges by PROJECT_STATUS_CORRECTION_KIND rather than
+                # allowlisting them, keeping them in the `dangling-pointers`
+                # total but out of the alarmed population and the successor
+                # tripwire — see
                 # fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper
-                # and docs/prds/memory-eval-program.md D11; renaming this kind
-                # requires updating that reader.  Making the target
+                # and docs/prds/memory-eval-program.md D11.  Making the target
                 # resolvable would mean keeping `latest` alive, which reopens
                 # the unbounded-pool bug — i.e. not a documentation-only
                 # change, which is why this leaf records the invariant

@@ -157,7 +157,8 @@ the confirmed-gone set — plus legacy hand-rolled Stage-1 folds signed with
 REAPER_STATUS_CORRECTION = 'status_correction'
 """The status-correction reaper:
 ``fused_memory/reconciliation/harness.py::ReconciliationHarness._reconcile_status_correction``
-writes :data:`STATUS_CORRECTION_KIND` plus ``supersedes``, then deletes that set."""
+writes ``harness.py::PROJECT_STATUS_CORRECTION_KIND`` plus ``supersedes``, then
+deletes that set."""
 
 BY_DESIGN_REAPERS: tuple[str, ...] = (REAPER_CONSOLIDATION, REAPER_STATUS_CORRECTION)
 """Every writer whose contract deletes the targets it names in ``supersedes``.
@@ -167,14 +168,12 @@ UNATTRIBUTED = 'unattributed'
 """The partition-row key for edges no reaper's contract deletes — deliberately
 not a member of :data:`BY_DESIGN_REAPERS`."""
 
-STATUS_CORRECTION_KIND = 'project_status_correction'
-"""The ``kind`` the status-correction writer stamps on its record."""
-
 CONSOLIDATOR_AGENT_ID = 'recon-stage-memory_consolidator'
 """Stage 1's agent_id, composed in
 ``fused_memory/reconciliation/stages/base.py`` as ``recon-stage-<stage id>``.
 The EXACT spelling, never the prefix: other stages write memories and reap
-nothing."""
+nothing. A literal rather than derived from ``StageId``: it matches folds
+already stored, which renaming the stage would not rewrite."""
 
 
 def by_design_reaper(metadata: Any) -> str | None:
@@ -190,9 +189,13 @@ def by_design_reaper(metadata: Any) -> str | None:
     unrelated reason is indistinguishable from a reaped one, and is treated as
     by-design because that target was going to be deleted anyway.
     """
+    from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+        PROJECT_STATUS_CORRECTION_KIND,
+    )
+
     if not isinstance(metadata, dict):
         return None
-    if metadata.get('kind') == STATUS_CORRECTION_KIND:
+    if metadata.get('kind') == PROJECT_STATUS_CORRECTION_KIND:
         return REAPER_STATUS_CORRECTION
     if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
         return REAPER_CONSOLIDATION
@@ -1775,7 +1778,7 @@ async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
 # a second home for it would drift from the first without anyone noticing.
 # ---------------------------------------------------------------------------
 
-_MAX_NAMED = 20
+MAX_NAMED_PER_SECTION = 20
 """Detail rows printed per section before the remainder is counted instead.
 
 The count of what was elided is always printed, so a long tail is visible as a
@@ -1907,7 +1910,7 @@ def sweep_report_sections(
             [
                 f'    {record.superseded_id} (rank {record.superseded_rank}) '
                 f'above {record.successor_id} (rank {record.successor_rank})'
-                for record in surfacing.inversions[:_MAX_NAMED]
+                for record in surfacing.inversions[:MAX_NAMED_PER_SECTION]
             ],
             len(surfacing.inversions),
         ),
@@ -1915,13 +1918,14 @@ def sweep_report_sections(
 
     # Unattributed edges first (a stable sort keeps scan order within each
     # half): at corpus scale nearly every unresolved pointer is a deliberate
-    # deletion, and naming in scan order would spend the whole _MAX_NAMED
-    # budget on those and elide the edge an operator actually has to fix.
+    # deletion, and naming in scan order would spend the whole
+    # MAX_NAMED_PER_SECTION budget on those and elide the edge an operator
+    # actually has to fix.
     actionable_first = sorted(census.unresolved_refs, key=lambda ref: ref.reaped_by is not None)
     unresolved_rows = [
         f'    {ref.key}: {ref.source_id} -> {ref.target!r} '
         f'[{ref.reaped_by or UNATTRIBUTED}]'
-        for ref in actionable_first[:_MAX_NAMED]
+        for ref in actionable_first[:MAX_NAMED_PER_SECTION]
     ]
     sections.append(ReportSection('dangling_pointers', (
         '',
@@ -1947,7 +1951,9 @@ def sweep_report_sections(
         # Outside the tripwire, not lost: still in the census above.
         f'  edges excluded, target reaped by design: {len(by_design_successor_refs(list(refs)))}',
         f'  edges whose predecessor is gone: {len(failing)}',
-        *_elided([f'    {item.item_key}' for item in failing[:_MAX_NAMED]], len(failing)),
+        *_elided(
+            [f'    {item.item_key}' for item in failing[:MAX_NAMED_PER_SECTION]], len(failing),
+        ),
     )))
 
     sections.append(ReportSection('task_terminal_staleness', (
@@ -1964,7 +1970,7 @@ def sweep_report_sections(
                 # something this run did not measure. See terminal_staleness.
                 f'    {record.record_id} frames live task state and references '
                 f'task {record.task_id} ({record.status})'
-                for record in staleness.records[:_MAX_NAMED]
+                for record in staleness.records[:MAX_NAMED_PER_SECTION]
             ],
             len(staleness.records),
         ),
@@ -1990,7 +1996,7 @@ def sweep_report_sections(
                 [
                     f'  {query.source_id} -> {query.target} '
                     f'(failed stores: {", ".join(query.failed_stores) or "unnamed"})'
-                    for query in surfacing.degraded[:_MAX_NAMED]
+                    for query in surfacing.degraded[:MAX_NAMED_PER_SECTION]
                 ],
                 len(surfacing.degraded),
             ),
@@ -2025,7 +2031,7 @@ def sweep_report_sections(
             *_elided(
                 [
                     f'  {ref.source_id} -> {ref.target!r} (source has no content)'
-                    for ref in unkeyable[:_MAX_NAMED]
+                    for ref in unkeyable[:MAX_NAMED_PER_SECTION]
                 ],
                 len(unkeyable),
             ),
@@ -2042,7 +2048,7 @@ def sweep_report_sections(
             *_elided(
                 [
                     f'  {ref.key}: {ref.source_id} -> {ref.target!r}'
-                    for ref in malformed[:_MAX_NAMED]
+                    for ref in malformed[:MAX_NAMED_PER_SECTION]
                 ],
                 len(malformed),
             ),

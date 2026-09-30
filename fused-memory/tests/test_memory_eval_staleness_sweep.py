@@ -21,6 +21,7 @@ named item_keys and exact counts on seeded fixtures.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import types
 from pathlib import Path
@@ -72,6 +73,10 @@ UUID_C = 'c3d4e5f6-2222-4b3c-9d4e-5f6071829304'
 def _record(record_id: str = 'rec-1', content: str = 'a memory', **metadata) -> dict:
     """The ``{'id', 'content', 'metadata'}`` shape the fetch band normalises to."""
     return {'id': record_id, 'content': content, 'metadata': dict(metadata)}
+
+
+def _item_keys(items) -> list[str]:
+    return [item.item_key for item in items]
 
 
 class TestPointerTargets:
@@ -208,8 +213,13 @@ class TestByDesignAttribution:
         assert m.UNATTRIBUTED not in m.BY_DESIGN_REAPERS
 
     def test_the_status_correction_writer_is_recognised_by_its_kind(self):
+        """Through the WRITER's constant, so a rename cannot split the two."""
+        from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+            PROJECT_STATUS_CORRECTION_KIND,
+        )
+
         m = _mod()
-        assert m.by_design_reaper({'kind': 'project_status_correction'}) == (
+        assert m.by_design_reaper({'kind': PROJECT_STATUS_CORRECTION_KIND}) == (
             m.REAPER_STATUS_CORRECTION
         )
 
@@ -277,17 +287,19 @@ class TestByDesignAttribution:
         assert refs == reordered
 
     def test_attribution_never_moves_the_stored_tripwire_key(self):
-        """The item_key is persisted in alpha's grandfather set."""
+        """The item_key is persisted in alpha's grandfather set, so an edge
+        that loses its reaper signature re-enters the tripwire under the key
+        the same unsigned edge always had."""
         m = _mod()
         (attributed,) = m.pointer_targets(_record(
             'rec-1', 'canonical words', supersedes=UUID_A, canonical=True,
         ))
-        plain = m.PointerRef(
-            source_id='rec-1', key='supersedes', target=UUID_A,
-            source_content='canonical words',
-        )
+        (plain,) = m.pointer_targets(_record('rec-1', 'canonical words', supersedes=UUID_A))
         assert attributed.reaped_by == m.REAPER_CONSOLIDATION
-        assert m._tripwire_item_key(attributed) == m._tripwire_item_key(plain)
+        unsigned = dataclasses.replace(attributed, reaped_by=None)
+        assert _item_keys(m.successor_pointer_items([unsigned], {})) == (
+            _item_keys(m.successor_pointer_items([plain], {}))
+        )
 
 
 class TestDanglingCensus:
@@ -629,7 +641,7 @@ class TestSuccessorPointerItems:
         refs = self._mixed_attribution_refs()
         items = m.successor_pointer_items(refs, {UUID_B: True})
         plain = [ref for ref in refs if ref.source_id == 'rec-plain']
-        assert [item.item_key for item in items] == [m._tripwire_item_key(plain[0])]
+        assert _item_keys(items) == _item_keys(m.successor_pointer_items(plain, {}))
         assert [item.passed for item in items] == [False]
 
     def test_the_exclusion_is_by_attribution_not_by_resolution(self):
@@ -664,7 +676,7 @@ class TestSuccessorPointerItems:
         ]
         assert [ref.source_id for ref in m.by_design_successor_refs(refs)] == ['rec-canonical']
         items = m.successor_pointer_items(refs, {})
-        assert [item.item_key for item in items] == [m._tripwire_item_key(refs[1])]
+        assert _item_keys(items) == _item_keys(m.successor_pointer_items(refs[1:], {}))
 
     def test_a_fully_reaped_corpus_omits_the_tripwire_and_names_the_gap(self):
         """Never read as a clean structural check: the schema rejects an empty
@@ -685,13 +697,13 @@ class TestSuccessorPointerItems:
         assert m.METRIC_SUCCESSOR_POINTER_PRESENT in m.metric_families_not_measured(series)
 
     def test_the_surviving_item_keys_do_not_move(self):
-        """The keys are persisted in alpha's grandfather set."""
+        """The keys are persisted in alpha's grandfather set, so by-design
+        edges beside an unattributed one must not move its key."""
         m = _mod()
         refs = self._mixed_attribution_refs()
-        unattributed = [ref for ref in refs if ref.key == 'supersedes' and ref.reaped_by is None]
-        items = m.successor_pointer_items(refs, {})
-        assert [item.item_key for item in items] == sorted(
-            m._tripwire_item_key(ref) for ref in unattributed
+        unattributed = [ref for ref in refs if ref.reaped_by is None]
+        assert _item_keys(m.successor_pointer_items(refs, {})) == (
+            _item_keys(m.successor_pointer_items(unattributed, {}))
         )
 
 
@@ -1657,6 +1669,41 @@ class TestFetchPointerRecords:
                 source_content='the successor text',
             ),
         ]
+
+    async def test_reaper_signatures_survive_the_fetch_from_the_raw_payload(self):
+        """The RAW scroll payload keeps ``agent_id`` at top level; mem0's
+        processed ``get`` shape promotes it out of ``metadata``
+        (``fused_memory/backends/mem0_client.py``, ``promoted_payload_keys``).
+        A fetch switched to that shape would silently turn every legacy
+        fold's edges into alarms."""
+        m = _mod()
+        raw = [
+            _raw_point('m-legacy-fold', {
+                'data': 'legacy fold', 'agent_id': 'recon-stage-memory_consolidator',
+                'supersedes': [UUID_A],
+            }),
+            _raw_point('m-canonical', {
+                'data': 'canonical', 'canonical': True, 'topic': 't', 'supersedes': [UUID_B],
+            }),
+            _raw_point('m-status', {
+                'data': 'status', 'kind': 'project_status_correction', 'supersedes': UUID_C,
+            }),
+        ]
+        memory = _mock_memory(scroll_return=raw)
+
+        records, _stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=10,
+        )
+
+        attribution = {
+            ref.source_id: ref.reaped_by
+            for record in records for ref in m.pointer_targets(record)
+        }
+        assert attribution == {
+            'm-legacy-fold': m.REAPER_CONSOLIDATION,
+            'm-canonical': m.REAPER_CONSOLIDATION,
+            'm-status': m.REAPER_STATUS_CORRECTION,
+        }
 
     async def test_a_firing_cap_is_disclosed_per_category(self):
         m = _mod()
@@ -3136,15 +3183,15 @@ class TestAttributionInReport:
 
     At corpus scale nearly every unresolved pointer is a reaped supersedes
     target, so a report that named unresolved edges in scan order would spend
-    its whole ``_MAX_NAMED`` budget on deliberate deletions and elide the one
-    edge an operator actually has to fix. Keyed on section keys, ids and
-    constants, never on English wording.
+    its whole ``MAX_NAMED_PER_SECTION`` budget on deliberate deletions and
+    elide the one edge an operator actually has to fix. Keyed on section keys,
+    ids and constants, never on English wording.
     """
 
     def test_an_unattributed_edge_is_named_ahead_of_by_design_ones(self):
         m = _mod()
         refs = [
-            *_canonical_refs(m._MAX_NAMED + 5),
+            *_canonical_refs(m.MAX_NAMED_PER_SECTION + 5),
             *m.pointer_targets(_record('rec-real-damage', 'plain words', supersedes=UUID_C)),
         ]
         _, sections = _report_over(refs, {})
