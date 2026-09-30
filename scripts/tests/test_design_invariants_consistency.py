@@ -25,8 +25,10 @@ THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
     invariant, never a restatement of the family.
-  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
-    pair-wise against the normative doc, never for completeness.
+  * ``orchestrator/src/orchestrator/agents/code_quality.md``
+    (``docs/code-quality.md`` is a symlink to it) — a PARTIAL
+    `INV-N`-to-heuristic mapping, pinned pair-wise against the normative doc,
+    never for completeness.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -86,7 +88,9 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
-CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
+CODE_QUALITY_DOC = (
+    REPO_ROOT / "orchestrator" / "src" / "orchestrator" / "agents" / "code_quality.md"
+)
 
 # A family this small would mean the normative doc stopped parsing, not that
 # dark-factory shrank its invariant list: eight are landed and none has ever been
@@ -427,7 +431,7 @@ PINNED_SITES = {
     "CONTRIBUTING.md": (
         "pinned as an ABSENCE: at most one by-name citation, never a restatement"
     ),
-    "docs/code-quality.md": (
+    "orchestrator/src/orchestrator/agents/code_quality.md": (
         "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
         "normative doc — never for completeness"
     ),
@@ -1716,8 +1720,8 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 
 
 # ---------------------------------------------------------------------------
-# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
-# normative doc
+# orchestrator/src/orchestrator/agents/code_quality.md — pinned as a PARTIAL
+# mapping, pair-wise against the normative doc
 #
 # The "Relationship to the design invariants" section maps a subset of the
 # family to Leo's fourteen numbered quality heuristics — four of eleven
