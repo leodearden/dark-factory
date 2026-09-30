@@ -541,7 +541,9 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     reservation_installed = 'reservation_installed'
+    reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'

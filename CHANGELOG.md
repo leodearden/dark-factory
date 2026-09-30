@@ -515,6 +515,44 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Fairness parks: `reservation_installed` never empty; new `reservation_install_blocked`; parks settled on every dispatch (task 5308)
+
+**Old behaviour.** An install attempt that parked zero modules — every requested module
+blocked by a same-or-higher-tier foreign park (INV-3) — still emitted
+`reservation_installed` with `data.modules == []`. Those no-ops were **62% (DF) and 82%
+(reify)** of all `reservation_installed` rows
+(`plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md` §0 item 4). A
+partial install was never completed: once an owner held any park, the `has_parks` guard
+stopped every further attempt, so the modules it missed stayed unparked for the rest of
+the episode.
+
+**New behaviour.**
+
+- `reservation_installed` fires only when an attempt NEWLY parked at least one module,
+  and `data.modules` is that increment. A passed-over top past its skip threshold now
+  re-attempts its remainder — every module it has not parked yet — on each qualifying
+  skip, so one park episode can emit several rows: the initial install, then completions.
+- New `reservation_install_blocked` event, payload `{requested, installed, blocked,
+  attempts, skip_count, priority}`, emitted whenever an attempt parked fewer modules than
+  it requested. Empty and partial installs are one signal. It is rate-limited to
+  `attempts` in {1, 10, 100, 1000, 10000} on the owner's consecutive blocked-attempt
+  streak; the attempt itself is not rate-limited.
+- `reservation_used` is now also emitted for pin-loop and non-top scored dispatches.
+  Those tasks' parks were previously kept while running and cleared silently at release,
+  so `reservation_used` counts rise.
+- reserve_now installs at the effective (boosted or inherited) tier, and `install_parks`
+  never duplicates an owner's existing entry. An owner's lower-tier entry is re-ranked in
+  place (and reported in `reserve_now_consumed`'s `data.modules`) unless a same-or-higher
+  tier top blocks it; an entry is never downgraded. The skip-driven completion rule
+  fills only unparked modules and does not re-rank.
+
+**Migration for historical series.** Count pre-change real installs with
+`json_array_length(json_extract(data, '$.modules')) > 0`; measure the install live-lock
+after the change from `reservation_install_blocked`. The change boundary is this task's
+merge commit. Audit: zero in-repo consumers filter `reservation_installed` — the only
+references are the `event_store.py` enum, the scheduler producer, tests and `plans/`
+docs.
+
 #### The referent write path is finished: registry wiring, `.ambiguous` on the wire, and a pure verification layer (task 5262)
 
 **The wire blob gained a third key, `'ambiguous'`, and `_decode_referents` now returns

@@ -80,11 +80,12 @@ if TYPE_CHECKING:
     # scheduler<->escalation module-load coupling.
     from escalation.queue import EscalationQueue
 
-# task_skipped events for "effectively infinite" skip thresholds (>= this
-# value) are rate-limited to a geometric schedule so the event store is not
-# flooded with diagnostics for tasks that will perpetually lose the race.
+# Geometric emission schedule for per-task diagnostics that can repeat every
+# tick: task_skipped under an "effectively infinite" skip threshold (>= the
+# value below) and reservation_install_blocked.  Emitting only at these counts
+# keeps the event store from flooding for tasks that perpetually lose a race.
 _INF_SKIP_THRESHOLD: int = 1000
-_GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
+_GEOMETRIC_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
 
 # set_task_status transient-failure retry attempt count and backoff schedule
 # come from the shared orchestrator.fm_retry.fm_retry_backoffs() (task 2706)
@@ -1276,18 +1277,41 @@ class ModuleLockTable:
             module, task_id, ignore_owners=ignore_owners
         ) is not None
 
+    def _owned_ranks(self, task_id: str) -> dict[str, int]:
+        """``{key: rank}`` for every stack holding *task_id* at ANY level, top or buried.
+
+        THE single definition of "the owner already parks this key": the
+        install idempotency skip, the completion remainder and ``has_parks``
+        all read it, so they cannot disagree about a buried entry.  The rank
+        is the owner's best (lowest) one on that key.
+        """
+        owned: dict[str, int] = {}
+        for module, stack in self._parked.items():
+            ranks = [rank for owner, rank in stack if owner == task_id]
+            if ranks:
+                owned[module] = min(ranks)
+        return owned
+
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
 
-        Returns True for both active-top AND buried (shadowed) reservations so
-        that ``_bump_skip_and_maybe_park`` does not re-arm a duplicate park for a
-        shadowed owner.
+        A pure query over :meth:`_owned_ranks`, so an owner buried beneath a
+        higher-priority shadow still counts as parked.
         """
-        for stack in self._parked.values():
-            for owner, _ in stack:
-                if owner == task_id:
-                    return True
-        return False
+        return bool(self._owned_ranks(task_id))
+
+    def unparked_modules(self, task_id: str, modules: list[str]) -> list[str]:
+        """The completion rule's remainder (task 5308): keys *task_id* has not parked.
+
+        Normalizes *modules* exactly as :meth:`install_parks` does, drops empty
+        keys, de-duplicates, and subtracts every key the owner already parks
+        at ANY stack level and ANY rank — a buried entry counts as owned,
+        because completion fills coverage gaps and never re-ranks.  Sorted.
+        """
+        depth = self._config.lock_depth
+        owned = self._owned_ranks(task_id)
+        requested = {normalize_lock(m, depth) for m in modules}
+        return sorted(m for m in requested if m and m not in owned)
 
     def install_parks(
         self, task_id: str, modules: list[str], priority: str
@@ -1295,9 +1319,20 @@ class ModuleLockTable:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
         Returns ``(installed, shadowed)`` where *installed* is the list of
-        normalized modules actually parked (as the active top) and *shadowed* is
-        a list of ``(owner_id, modules_shadowed)`` for any lower-priority parks
-        that were PUSHED beneath the new reservation (retained, not destroyed).
+        normalized modules NEWLY parked, or re-ranked upward, as the active
+        top by this call and *shadowed* is a list of
+        ``(owner_id, modules_shadowed)`` for any lower-priority parks that
+        were PUSHED beneath the new reservation (retained, not destroyed).
+
+        Idempotent per owner (task 5308): a key *task_id* already parks at
+        *priority* or better, at any stack level (:meth:`_owned_ranks`), is
+        skipped, and so is a second input normalizing to a key this call
+        already handled.  A key it parks at a LOWER priority is a rank
+        upgrade: it runs the same conflict scan at the new rank and, unless
+        blocked, the owner's old entry is replaced by one on top at the new
+        rank and the key is reported in *installed*; a blocked upgrade keeps
+        the old entry.  Either way the owner holds at most one entry per
+        stack, so it can never shadow itself, and it is never downgraded.
 
         Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
         has ``existing_rank > new_rank`` (strictly lower priority), the new entry
@@ -1318,9 +1353,11 @@ class ModuleLockTable:
         shadow_acc: dict[str, list[str]] = {}
         # Track insertion order of shadowed owners for stable output.
         shadow_order: list[str] = []
+        owned = self._owned_ranks(task_id)
         for m in modules:
             normalized = normalize_lock(m, depth)
-            if not normalized:
+            held_rank = owned.get(normalized)
+            if not normalized or (held_rank is not None and held_rank <= rank):
                 continue
             # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
             to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
@@ -1356,10 +1393,14 @@ class ModuleLockTable:
                     shadow_order.append(victim_owner)
                 shadow_acc[victim_owner].append(parked_m)
 
-            # Push task_id onto the top of the (possibly freshly created) stack.
-            if normalized not in self._parked:
-                self._parked[normalized] = []
-            self._parked[normalized].append((task_id, rank))
+            # Push task_id onto the top of the (possibly freshly created)
+            # stack, dropping the lower-rank entry a rank upgrade replaces.
+            stack = [
+                entry for entry in self._parked.get(normalized, []) if entry[0] != task_id
+            ]
+            stack.append((task_id, rank))
+            self._parked[normalized] = stack
+            owned[normalized] = rank
             installed.append(normalized)
 
         # Build shadowed list in first-seen victim order, original module keys sorted.
@@ -1906,9 +1947,9 @@ class Scheduler:
         'delivered_check_gate',
         'stamp_milestone',
         'override_snapshot_gc',
+        'compute_priorities',
         'reserve_now',
         'override_diff',
-        'compute_priorities',
         'build_candidates',
         'landed_outbox_gate',
         'starvation',
@@ -2334,6 +2375,12 @@ class Scheduler:
         # per-tick _streak_registry sweep like every other streak counter.
         self._streak_milestone_malformed = StreakCounter()
         self._streak_registry.register('milestone_malformed', self._streak_milestone_malformed)
+        # Consecutive park-install attempts that left a module blocked
+        # (task 5308); rate-limits reservation_install_blocked.
+        self._streak_park_install_blocked = StreakCounter()
+        self._streak_registry.register(
+            'park_install_blocked', self._streak_park_install_blocked
+        )
 
         # Per-(task_id, dep_string) count of consecutive ticks where the dep
         # resolved to a sentinel (unknown_project/unknown_task/malformed).
@@ -5230,8 +5277,9 @@ class Scheduler:
         modules: list[str],
         tier: str = DEFAULT_TIER,
     ) -> None:
-        """Increment *task_id*'s skip counter; install a reservation if it
-        has just crossed ``skip_threshold`` and does not already hold parks.
+        """Increment *task_id*'s skip counter; once it is at or past
+        ``skip_threshold``, complete its reservation (:meth:`_complete_parks`)
+        over every module it has not parked yet.
 
         *tier* is the task's effective priority — it selects a per-tier
         threshold and lease multiplier.  When the per-tier threshold is
@@ -5248,7 +5296,7 @@ class Scheduler:
         # at {1, 10, 100, 1000, 10000, ...} so the event store is not flooded.
         should_emit = (
             threshold < _INF_SKIP_THRESHOLD
-            or count in _GEOMETRIC_SKIP_EMIT_COUNTS
+            or count in _GEOMETRIC_EMIT_COUNTS
         )
         if self.event_store and should_emit:
             self.event_store.emit(
@@ -5261,14 +5309,86 @@ class Scheduler:
                     'threshold': threshold,
                 },
             )
-        if (
-            count >= threshold
-            and not self.lock_table.has_parks(task_id)
-        ):
-            installed, shadowed_pairs = self.lock_table.install_parks(task_id, modules, tier)
+        if count >= threshold:
+            self._complete_parks(task_id, modules, tier, skip_count=count)
+
+    def _settle_fairness_on_dispatch(
+        self, task_id: str, modules: list[str], priority: str
+    ) -> None:
+        """End *task_id*'s fairness episode because it just dispatched (task 5308).
+
+        THE single place a dispatch settles fairness state, called for EVERY
+        dispatch — pin loop and scored loop, top or not: the skip count and
+        blocked-install streak are dropped, and the task's own parks are
+        consumed (``reservation_used``, plus ``reservation_restored`` for each
+        shadow the clear exposes).  A running task's park would otherwise
+        block same-tier installs (INV-3) until release, which is where
+        partial installs came from.  ``Scheduler.release`` keeps its
+        defensive clear only for parks installed AFTER dispatch, e.g. a
+        reserve_now armed on a running task.
+        """
+        self._skip_count.pop(task_id, None)
+        self._streak_park_install_blocked.clear(task_id)
+        if not self.lock_table.has_parks(task_id):
+            return
+        restored_pairs = self.lock_table.clear_parks_for(task_id)
+        if not self.event_store:
+            return
+        self.event_store.emit(
+            EventType.reservation_used,
+            task_id=task_id,
+            data={'modules': modules, 'priority': priority},
+        )
+        for restored_owner, restored_modules in restored_pairs:
+            self.event_store.emit(
+                EventType.reservation_restored,
+                task_id=restored_owner,
+                data={
+                    'restored_owner': restored_owner,
+                    'modules': restored_modules,
+                },
+            )
+
+    def _complete_parks(
+        self,
+        task_id: str,
+        modules: list[str],
+        tier: str,
+        *,
+        skip_count: int,
+    ) -> None:
+        """The park completion rule (task 5308): park whatever is still unparked.
+
+        The remainder is every key of *modules* that *task_id* does not
+        already park at any stack level.  An empty remainder is a fully
+        parked owner: no attempt, no event.  Otherwise the remainder is
+        installed and exactly one emission decision follows:
+
+        - ``reservation_installed`` only when something was NEWLY parked,
+          carrying just that increment (plus ``reservation_shadowed`` per
+          lower-priority owner pushed beneath it);
+        - ``reservation_install_blocked`` whenever fewer modules were parked
+          than requested — empty and partial installs are one signal.
+
+        The ATTEMPT runs on every qualifying skip, deliberately unthrottled:
+        a module whose foreign park clears must be parked on the very next
+        skip, or a lower-tier task takes it in between.  Only the blocked
+        EVENT is rate-limited, geometrically on the owner's consecutive
+        blocked-attempt streak, which any attempt that leaves nothing
+        blocked resets, as does the owner's dispatch
+        (:meth:`_settle_fairness_on_dispatch`).
+        """
+        streak = self._streak_park_install_blocked
+        remainder = self.lock_table.unparked_modules(task_id, modules)
+        if not remainder:
+            streak.clear(task_id)
+            return
+        installed, shadowed_pairs = self.lock_table.install_parks(task_id, remainder, tier)
+        blocked = [m for m in remainder if m not in installed]
+        if installed:
             logger.info(
                 'Task %s reserved modules %s (skip_count=%d, tier=%s)',
-                task_id, installed, count, tier,
+                task_id, installed, skip_count, tier,
             )
             if self.event_store:
                 self.event_store.emit(
@@ -5276,7 +5396,7 @@ class Scheduler:
                     task_id=task_id,
                     data={
                         'modules': installed,
-                        'skip_count': count,
+                        'skip_count': skip_count,
                         'priority': tier,
                     },
                 )
@@ -5295,6 +5415,30 @@ class Scheduler:
                             'victim': victim,
                         },
                     )
+        if not blocked:
+            streak.clear(task_id)
+            return
+        attempts = streak.bump(task_id)
+        if attempts not in _GEOMETRIC_EMIT_COUNTS:
+            return
+        logger.info(
+            'Task %s could not reserve modules %s: a same-or-higher-priority '
+            'park holds them (attempt %d, skip_count=%d, tier=%s)',
+            task_id, blocked, attempts, skip_count, tier,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.reservation_install_blocked,
+                task_id=task_id,
+                data={
+                    'requested': remainder,
+                    'installed': installed,
+                    'blocked': blocked,
+                    'attempts': attempts,
+                    'skip_count': skip_count,
+                    'priority': tier,
+                },
+            )
 
     # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
@@ -6923,7 +7067,9 @@ class Scheduler:
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
-        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``.
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
+        ``ctx.effective_priorities`` (parks install at, or an owner's
+        lower-tier park is raised to, the effective tier).
         Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
         short-circuit below), then mutates ``ctx.overrides`` in place via
         the reserve-now short-circuit: for any task with reserve_now=1,
@@ -6944,13 +7090,14 @@ class Scheduler:
                     continue
                 r_task = ctx.tasks_by_id[rid]
                 r_modules = self._get_modules(r_task)
-                r_tier = coerce_tier(r_task.get('priority'))
-                # Clear the flag BEFORE installing parks.  install_parks is
-                # naturally idempotent (duplicate parks are a no-op), so if the
-                # process crashes between clear and install, the next tick re-runs
-                # install harmlessly.  The opposite order risks a duplicate
-                # reservation_installed event if the clear fails after a
-                # successful install.
+                r_tier = ctx.effective_priorities.get(
+                    rid, coerce_tier(r_task.get('priority'))
+                )
+                # Clear the flag BEFORE installing parks.  The opposite order
+                # risks a duplicate reserve_now_consumed event if the clear
+                # fails after a successful install, whereas a re-run install
+                # is harmless: ModuleLockTable.install_parks is idempotent per
+                # owner.
                 #
                 # In-process exceptions from install_parks are handled separately:
                 # the flag is restored via set_override so the next tick retries.
@@ -7257,7 +7404,9 @@ class Scheduler:
         Pinned candidates bypass scoring entirely but still respect lock
         availability and eligibility checks (status, deps, cooldown). On
         lock conflict, falls through to the next pinned candidate without
-        touching skip counters or arming parks (pins bypass fairness).
+        touching skip counters or arming parks: a pin never ACCRUES fairness
+        state from this loop, but a pin dispatch settles whatever it earned
+        as a scored candidate (``_settle_fairness_on_dispatch``).
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
@@ -7320,6 +7469,7 @@ class Scheduler:
                         pin_tid, coerce_tier(pin_task.get('priority'))
                     )
                     self._dispatched_priority[pin_tid] = pin_pri
+                    self._settle_fairness_on_dispatch(pin_tid, pin_modules, pin_pri)
                     self._emit_lock_event(
                         EventType.lock_acquired,
                         task_id=pin_tid,
@@ -7377,7 +7527,6 @@ class Scheduler:
         # for fairness bookkeeping (skip counter / park installation).
         top_score, top_id, top_task, top_pri = scored[0]
         top_modules = self._get_modules(top_task)
-        top_had_parks = self.lock_table.has_parks(top_id)
 
         # One scan, one memo for admission's read-only inputs (task 3823 /
         # PRD C7).  Park and hold state does not move inside this loop, so
@@ -7441,27 +7590,10 @@ class Scheduler:
                     if ctx.candidate_signals.get(task_id) is not None:
                         self._last_dispatch_at[task_id] = self._time_source()
                     self._dispatched_priority[task_id] = pri
-                    if task_id == top_id:
-                        self._skip_count.pop(task_id, None)
-                        if top_had_parks:
-                            restored_pairs = self.lock_table.clear_parks_for(task_id)
-                            if self.event_store:
-                                self.event_store.emit(
-                                    EventType.reservation_used,
-                                    task_id=task_id,
-                                    data={'modules': modules, 'priority': pri},
-                                )
-                                for restored_owner, restored_modules in restored_pairs:
-                                    self.event_store.emit(
-                                        EventType.reservation_restored,
-                                        task_id=restored_owner,
-                                        data={
-                                            'restored_owner': restored_owner,
-                                            'modules': restored_modules,
-                                        },
-                                    )
-                    else:
-                        # A lower-ranked task won — top was passed over this tick.
+                    # Settle the winner BEFORE bumping a passed-over top: the
+                    # winner's own park would otherwise block the top's install.
+                    self._settle_fairness_on_dispatch(task_id, modules, pri)
+                    if task_id != top_id:
                         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
                     if grant is not None:
                         self._record_backfill_grant(grant)
@@ -8343,7 +8475,9 @@ class Scheduler:
             self._arm_requeue_cooldown(task_id, armed_n)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
-        # Defensive: clear any reservations still owned by this task.
+        # Defensive: dispatch already settled this task's parks, so this only
+        # clears parks installed after dispatch (e.g. a reserve_now armed on
+        # a running task).
         restored_pairs = self.lock_table.clear_parks_for(task_id)
         if modules:
             self._emit_lock_event(
