@@ -7,7 +7,7 @@ import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -27,6 +27,7 @@ from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
+    RunStatus,
     StageId,
     StageReport,
     Watermark,
@@ -36,6 +37,48 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# The provenance key a citation repair appends to a finding. Deliberate sibling
+# of the ``citation_failures`` key ``verify_cited_memories`` writes: a reader of
+# any finding sees both "this claim lost its backing" and "this claim's backing
+# was re-pointed", in the same shape. It lives in this storage layer because the
+# run owner's wholesale write must recognise a persisted repair
+# (``_carry_forward_citation_repairs``); ``citation_repair`` imports it from here.
+CITATION_REPAIRS_KEY = 'citation_repairs'
+
+# The run statuses a citation repair may touch — an ALLOWLIST, deliberately
+# inverted from the "refuse status == 'running'" check it replaced, because the
+# two failure directions are asymmetric: wrongly PERMITTING yields a write that
+# reports ``status: repaired`` and is then silently overwritten, while wrongly
+# REFUSING yields a loud, recoverable error. So a status absent from the
+# enum-of-today must land on the refusing side by default.
+#
+# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
+# excluded precisely because something does — ``get_interrupted_runs()`` feeds
+# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
+# stage_reports blob from its own loaded copy.
+#
+# It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
+# invariant: a write that does not carry repairs forward must never land on a
+# row holding one of these statuses (``complete_run_if_status`` refuses to).
+REPAIRABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.completed,
+        RunStatus.failed,
+        RunStatus.rolled_back,
+        RunStatus.circuit_breaker,
+    }
+)
+
+# Compared on raw ``.value`` strings so a gate holds whether a status arrives as
+# a coerced ``RunStatus`` or as a bare ``str`` off the journal row. Every
+# member's name happens to equal its value today, so StrEnum hashing would
+# coincide — the gates deliberately do not rest on that coincidence.
+REPAIRABLE_RUN_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
+
+# Each refusal of the owner's compare-and-set is a distinct concurrent commit to
+# the same row, so exhausting this takes a sustained stream of repairs.
+_OWNER_WRITE_MAX_ATTEMPTS = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -389,14 +432,84 @@ class ReconciliationJournal:
                 (status, datetime.now(UTC).isoformat(), run_id),
             )
 
+    async def complete_run_if_status(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        status: str,
+        stage_reports: dict[str, StageReport | dict],
+    ) -> bool:
+        """Terminalise a run in ONE statement, only if it still holds
+        ``expected_status`` — for a caller acting on a row image it read earlier.
+
+        ``False`` means the row's status moved on since that read (or the row is
+        gone), and nothing was written.
+
+        ``stage_reports`` is written wholesale WITHOUT carrying citation repairs
+        forward, so an ``expected_status`` in ``REPAIRABLE_RUN_STATUSES`` — a row
+        a repair may already have written — raises ``ValueError`` before
+        anything is written.
+        """
+        if str(expected_status) in REPAIRABLE_RUN_STATUS_VALUES:
+            raise ValueError(
+                f'complete_run_if_status: expected_status {str(expected_status)!r} '
+                'is a status citation repair writes under, and this wholesale '
+                'write would erase its repairs'
+            )
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                'UPDATE runs SET stage_reports = ?, status = ?, completed_at = ? '
+                'WHERE id = ? AND status = ?',
+                (
+                    _serialize_stage_reports(stage_reports),
+                    status,
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                    expected_status,
+                ),
+            )
+            applied = cursor.rowcount == 1
+        return applied
+
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
-        async with self._require_access().write() as db:
-            await db.execute(
-                'UPDATE runs SET stage_reports = ? WHERE id = ?',
-                (_serialize_stage_reports(stage_reports), run_id),
+        """The run OWNER's wholesale write of ``stage_reports``.
+
+        Never refused for a stale copy, but it can never erase a citation repair
+        a compare-and-set writer persisted
+        (``fused-memory/src/fused_memory/reconciliation/citation_repair.py::repair_memory_citation``):
+        each attempt re-reads the column, carries persisted repairs forward onto
+        a fresh copy of ``stage_reports`` and compare-and-sets on what it read.
+        That closes the window after a repair's own write, which
+        citation_repair's read-after-write could only detect.
+
+        An unknown ``run_id`` writes nothing. Raises ``RuntimeError``, having
+        written nothing, after ``_OWNER_WRITE_MAX_ATTEMPTS`` refusals.
+        """
+        incoming_text = _serialize_stage_reports(stage_reports)
+        for attempt in range(1, _OWNER_WRITE_MAX_ATTEMPTS + 1):
+            row = await self._require_access().read_one(
+                'SELECT stage_reports FROM runs WHERE id = ?', (run_id,)
             )
+            if row is None:
+                return
+            persisted_text = row['stage_reports']
+            merged = json.loads(incoming_text)
+            _carry_forward_citation_repairs(merged, json.loads(persisted_text or '{}'))
+            if await self._compare_and_set_stage_reports_text(
+                run_id, json.dumps(merged), expected_text=persisted_text
+            ):
+                return
+            logger.info(
+                'reconciliation.stage_reports_owner_write_retried',
+                extra={'run_id': run_id, 'attempt': attempt},
+            )
+        raise RuntimeError(
+            f'update_run_stage_reports: run {run_id} changed under each of '
+            f'{_OWNER_WRITE_MAX_ATTEMPTS} compare-and-set attempts; nothing was written'
+        )
 
     async def compare_and_set_run_stage_reports(
         self,
@@ -420,18 +533,27 @@ class ReconciliationJournal:
         Both mean the same thing to the caller: its loaded copy is no longer a
         safe basis for a wholesale rewrite.
 
-        ``update_run_stage_reports`` deliberately stays unconditional. Its
-        harness call sites (``reconciliation/harness.py``) own the blob wholesale
-        at stage boundaries by design, and making a normal end-of-stage persist
-        refusable would convert routine work into a failure mode.
+        ``update_run_stage_reports`` is the run owner's write, and is never
+        refused for a stale copy: the harness owns the blob wholesale at stage
+        boundaries, and making a normal end-of-stage persist refusable would
+        convert routine work into a failure mode. It retries this same
+        compare-and-set instead, carrying persisted citation repairs forward, so
+        it cannot erase what a writer of this method persisted.
         """
+        return await self._compare_and_set_stage_reports_text(
+            run_id, _serialize_stage_reports(stage_reports), expected_text=expected_text
+        )
+
+    async def _compare_and_set_stage_reports_text(
+        self, run_id: str, text: str, *, expected_text: str | None
+    ) -> bool:
         # ``IS``, not ``=``: SQLite's NULL-safe comparison, so a run whose
         # stage_reports column is NULL is CASable with an ``expected_text=None``
         # token instead of never matching.
         async with self._require_access().write() as db:
             cursor = await db.execute(
                 'UPDATE runs SET stage_reports = ? WHERE id = ? AND stage_reports IS ?',
-                (_serialize_stage_reports(stage_reports), run_id, expected_text),
+                (text, run_id, expected_text),
             )
             # Read rowcount inside the write unit, before it commits.
             applied = cursor.rowcount == 1
@@ -488,6 +610,147 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
+    #: Run statuses at which ``runs.stage_reports`` is known to have been
+    #: PERSISTED, i.e. every status :meth:`complete_run` can write.
+    #:
+    #: ``reconciliation/harness.py`` mutates ``run.stage_reports`` in memory as
+    #: each stage returns and persists the whole blob after the stage loop —
+    #: from the success path, the error handlers, or the terminal ``finally``
+    #: backstop, each of which completes the run in the same breath. A run on
+    #: its first attempt therefore leaves the column reading ``'{}'`` however
+    #: many stages have finished.
+    #:
+    #: Stated as the statuses that DO persist, not the one that does not, so a
+    #: future non-terminal status reads as unsettled — an inconclusive answer —
+    #: rather than as a confident wrong one.
+    _STAGE_REPORTS_PERSISTED_STATUSES = frozenset(
+        {
+            RunStatus.completed.value,
+            RunStatus.failed.value,
+            RunStatus.rolled_back.value,
+            RunStatus.circuit_breaker.value,
+            RunStatus.interrupted.value,
+        }
+    )
+
+    @staticmethod
+    def _stage_reports_are_settled(
+        run_status: str | None, resumed: bool | None
+    ) -> bool:
+        """Is ``stage_reports`` a FINISHED account of the run, safe to read as
+        evidence that a stage did or did not execute?
+
+        A persisted status is necessary but not sufficient, because
+        ``'interrupted'`` is the one terminal status a run can leave: the
+        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
+        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
+        running only on the in-memory object — :meth:`complete_run` is the sole
+        writer of the column, so a run re-executing this very stage still reads
+        back ``'interrupted'`` on disk. Pairing that terminal-looking status
+        with the stale blob its interrupted attempt flushed is worse than the
+        empty first-attempt case: the stage key is absent precisely BECAUSE
+        this attempt has not re-filed it yet, which is the shape most likely to
+        be a genuine lost write.
+
+        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        is the durable signal. A resumed run that has since reached any other
+        terminal status has been flushed by that run's own ``finally`` and is
+        settled again, which is why this narrows ``'interrupted'`` alone rather
+        than distrusting every run that was ever resumed.
+        """
+        if run_status not in ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES:
+            return False
+        if run_status == RunStatus.interrupted.value:
+            return resumed is False
+        return True
+
+    async def get_run_stage_execution(
+        self, project_id: str, run_id: str, stage: str
+    ) -> dict | None:
+        """Did ``stage`` execute during ``run_id``? Narrow, read-only projection.
+
+        Answers the one question the recon ledger cannot: a gc()-reaped
+        ``cycle_summary`` row is hard-DELETEd, so an absent row is byte-for-byte
+        indistinguishable from one that was never written. The ``runs`` table
+        carries no TTL and therefore outlives the ledger, which is what makes
+        the distinction recoverable at all. Sole caller today is
+        ``services/memory_service.py::MemoryService.get_cycle_summary_presence``.
+
+        ``stage_ran`` is deliberately three-valued:
+
+        - ``True``  — positive evidence the stage executed (it filed a report).
+        - ``False`` — positive evidence it did not, and it stays true regardless
+          of TTL, which is why the presence reader ranks it above "expired".
+        - ``None``  — INDETERMINATE: the stored ``stage_reports`` blob did not
+          parse as a JSON object. That is a fault, not a state, so it is logged
+          at WARNING and must never be collapsed into ``False`` — doing so would
+          silently suppress a real data-loss finding.
+
+        The membership test is keyed on ``stage``, never "is there any report at
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
+        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
+        and a run holding only those did not run the stage.
+
+        ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
+        should consume: ``stage_ran=False`` means "the stage never ran" ONLY
+        when the blob is a finished account of the run. Deciding that needs
+        harness lifecycle knowledge — which statuses flush the blob, and that
+        an adopted run is executing again behind a terminal-looking disk status
+        — so it is answered here, next to the read, rather than re-derived by
+        every consumer (see :meth:`_stage_reports_are_settled`).
+
+        ``resumed`` is the raw evidence behind that verdict: whether the
+        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
+        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
+        this run over at least once. It is three-valued for the same reason
+        ``stage_ran`` is — an unparseable blob answers neither question, and
+        collapsing it to ``False`` would read as positive evidence the run was
+        never adopted.
+
+        Scoped by ``project_id`` — tighter than ``get_run``, which is keyed on
+        ``id`` alone — to match the project-scoped identity of the ledger row it
+        explains. A projection rather than a reuse of ``get_run`` because that
+        is ``SELECT *`` piped through ``_row_to_run``, materialising every
+        ``StageReport`` including the multi-KB ``items_flagged`` blobs, when four
+        columns answer the question.
+
+        Returns ``None`` when no such run row exists for that project.
+        """
+        row = await self._require_access().read_one(
+            """SELECT status, stage_reports, started_at, completed_at
+               FROM runs WHERE id = ? AND project_id = ?""",
+            (run_id, project_id),
+        )
+        if row is None:
+            return None
+
+        try:
+            reports = json.loads(row['stage_reports'] or '{}')
+            if not isinstance(reports, dict):
+                raise ValueError('stage_reports is not a JSON object')
+            stage_ran = stage in reports
+            resumed = '_resume' in reports
+        except (TypeError, ValueError):
+            logger.warning(
+                'reconciliation.get_run_stage_execution: '
+                'unparseable stage_reports for project_id=%s run_id=%s; '
+                'cannot tell whether stage=%s ran, reporting indeterminate',
+                project_id,
+                run_id,
+                stage,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            stage_ran = None
+            resumed = None
+
+        return {
+            'status': row['status'],
+            'stage_ran': stage_ran,
+            'resumed': resumed,
+            'settled': self._stage_reports_are_settled(row['status'], resumed),
+            'started_at': row['started_at'],
+            'completed_at': row['completed_at'],
+        }
     async def get_run_with_stage_reports_text(
         self, run_id: str
     ) -> tuple[ReconciliationRun, str | None] | None:
@@ -1069,9 +1332,10 @@ def _fmt_dt(val: datetime | None) -> str | None:
 def _serialize_stage_reports(stage_reports: dict[str, StageReport | dict]) -> str:
     """The single definition of the ``runs.stage_reports`` column text.
 
-    Shared by ``update_run_stage_reports`` and
-    ``compare_and_set_run_stage_reports`` so the column's serialization has one
-    definition rather than two that must be kept byte-identical by hand (SPOT).
+    Shared by ``update_run_stage_reports``,
+    ``compare_and_set_run_stage_reports`` and ``complete_run_if_status`` so the
+    column's serialization has one definition rather than several that must be
+    kept byte-identical by hand (SPOT).
 
     Serializer determinism is NOT a CAS invariant: the token the CAS compares
     against is always the raw column text ``get_run_with_stage_reports_text``
@@ -1083,6 +1347,57 @@ def _serialize_stage_reports(stage_reports: dict[str, StageReport | dict]) -> st
     for k, v in stage_reports.items():
         serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
     return json.dumps(serialized)
+
+
+def _carry_forward_citation_repairs(
+    incoming: dict[str, Any], persisted: dict[str, Any]
+) -> None:
+    """Copy every persisted citation repair onto the same finding in ``incoming``.
+
+    Both arguments are plain ``stage_reports`` JSON. Findings match by stage key
+    and ``finding_id``. Where the persisted finding carries a non-empty
+    ``CITATION_REPAIRS_KEY`` list, its ``cited_memories`` and repairs win;
+    everything else in ``incoming`` stands. That is sound because repair records
+    are append-only provenance that only a compare-and-set writer creates, and
+    only on a terminal row, while an owner never edits a finding's citations
+    after its stage completes. A finding ``incoming`` no longer carries is left
+    out.
+
+    Mutates only ``incoming``, which the caller builds fresh.
+    """
+    for stage_key, persisted_report in persisted.items():
+        incoming_report = incoming.get(stage_key)
+        if not isinstance(persisted_report, dict) or not isinstance(incoming_report, dict):
+            continue
+        incoming_by_id = flagged_findings_by_id(incoming_report.get('items_flagged'))
+        persisted_by_id = flagged_findings_by_id(persisted_report.get('items_flagged'))
+        for finding_id, persisted_finding in persisted_by_id.items():
+            repairs = persisted_finding.get(CITATION_REPAIRS_KEY)
+            target = incoming_by_id.get(finding_id)
+            if target is None or not (isinstance(repairs, list) and repairs):
+                continue
+            target['cited_memories'] = persisted_finding.get('cited_memories')
+            target[CITATION_REPAIRS_KEY] = repairs
+
+
+def flagged_findings_by_id(items_flagged: Any) -> dict[str, dict[str, Any]]:
+    """Index one stage report's ``items_flagged`` by ``finding_id``.
+
+    The one definition of how a finding is located, shared by the owner's
+    carry-forward and ``citation_repair``, so both always resolve an id to the
+    same finding. An entry that is not a dict, or has no non-empty string
+    ``finding_id``, is not indexed; on a repeated id the first entry wins.
+    """
+    if not isinstance(items_flagged, list):
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in items_flagged:
+        if not isinstance(item, dict):
+            continue
+        finding_id = item.get('finding_id')
+        if isinstance(finding_id, str) and finding_id:
+            indexed.setdefault(finding_id, item)
+    return indexed
 
 
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:

@@ -105,3 +105,9 @@ dev = [
     "ruff>=0.7.1",
     "escalation",
 ]
+# Eval-only (plans/write-triage-flip-readiness-prd.md ρ1); nothing under src/ imports it.
+reranker = [
+    "torch>=2.4",
+    "sentence-transformers>=6.0",
+    "huggingface-hub<1.16",  # >=1.16 requires click>=8.4, which would move the workspace's click pin
+]

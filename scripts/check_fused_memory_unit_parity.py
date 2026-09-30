@@ -174,8 +174,10 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
 # [Service] line) but whose full value is host-specific and therefore cannot
 # be exact-matched or synthesized by --fix. ExecStartPre= carries
 # host-specific paths (__REPO_ROOT__, /home/leo/bin) — only its presence can
-# be asserted.
-REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=",)
+# be asserted. ExecStopPost= is the hook that stops fused-memory.socket on a
+# deliberate stop; without it a stopped service is restarted by the next
+# connection to its still-listening port.
+REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecStopPost=")
 
 
 def _log(message: str, *, stream=None) -> None:

@@ -10,6 +10,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `consolidate_memories` teaches the write-time topic guard its topic (task 3135)
+
+Removes the manual human hop that was supposed to teach `add_memory`'s topic guard a
+recurring topic. Until now a consolidated topic kept growing paraphrased restatements
+until someone hand-wrote a `ProceduralTopicCluster` into
+`_default_topic_guard_clusters()`. `consolidate_memories` already holds every input
+that derivation needs, so it now seeds the guard itself
+(`docs/prds/memory-write-path-convergence.md` §9, leaf ζ).
+
+- **Runtime store.** Once the fold has closed (a new step 7c), the op derives a
+  `ProceduralTopicCluster` from three sources: the canonical's text, the superseded
+  records' texts (taken from the pre-delete reads it already does), and the topic's
+  other members (taken from the closure scroll it already does). Seeding costs zero
+  extra reads. The cluster is persisted in
+  `server/topic_cluster_store.py::TopicClusterStore` at
+  `<reconciliation.data_dir>/topic_clusters.db`, keyed `(project_id, topic_id)`.
+  `open()` re-validates every row through the real model. A corrupt row fails
+  startup loudly, and the error names every bad row.
+- **Merged at the one read, and scoped to one project.**
+  `near_duplicate_guard.resolve_topic_guard_clusters` returns the config seeds first,
+  then the WRITING project's derived clusters. A derived cluster whose `topic_id`
+  collides with a config seed's is dropped: config wins. The config half matches across
+  projects, a measured residual that was accepted. Derived clusters are served only to
+  their own project, because their hint names that project's canonical.
+- **`topic_id == canonical.metadata.topic` by construction.** The derived `topic_id` is
+  the op's validated `topic` argument, verbatim. The seam invariant that task 3198's
+  shared slug namespace exists for therefore holds with no minting step.
+- **Conservative derivation that abstains.** The derivation uses deterministic n-grams.
+  The rules are motivated by the retired `eval-worktree-plan-tools-missing` cluster, which
+  fired 13 off-topic blocks out of 14 because its phrases were ordinary subsystem vocabulary:
+  - a phrase must occur in at least two distinct texts;
+  - a phrase is at least two words and never begins or ends with a closed-class word, so
+    a lone identifier the whole project uses (`add_memory`, `project_id`, `plan.json`)
+    can never qualify, whatever its shape;
+  - it must contain a distinctive token: identifier punctuation, a digit, or a long
+    word, but never a bare number or a run of punctuation;
+  - no single occurrence may hold two phrases: neither nests in the other, and neither's
+    end overlaps the other's start on a whole word, so `git merge-base --is-ancestor`
+    cannot score `git merge-base` and `merge-base --is-ancestor` at once;
+  - a cluster has at most six phrases, `min_phrase_hits=2` and never any
+    `sufficient_phrases`;
+  - fewer than two phrases produces no cluster.
+
+  One residual remains: a multi-word construction common across the whole project can
+  still qualify, because rejecting it needs a document-frequency check against the
+  project's other memories, a read this zero-I/O derivation deliberately does not make.
+  A replay over dark_factory's 81 consolidated topics measures it. The overlap rule cut
+  non-member matches from 649 to 267. About half of those that remain are off-topic,
+  roughly 1.2% of gated memories. The table is in PRD
+  `docs/prds/memory-write-path-convergence.md` §10.
+
+  A per-cluster hint shadows the guard's default hint, so the derived hint carries
+  everything the writer needs: the canonical UUID, the `allow_near_duplicate` escape,
+  and `update_memory`, offered only to the `recon-stage-`/`curator-` agent_ids that may
+  amend content.
+- **Kill switches.** New green-tier leaf
+  `reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled` (default
+  `true`), read live at both the seed and the merge. `false` seeds nothing and ignores
+  the stored rows at read time without deleting them. Its per-topic companion,
+  `reconciliation.procedural_knowledge_topic_cluster_autoseed_retired`
+  (`{project_id: [topic_id, ...]}`, default empty, also green-tier and read at both),
+  retires one misfiring derived cluster with a config edit, the way a config cluster
+  is retired. The stored row is kept, so deleting the entry restores it. A retired
+  topic's seed reports `disabled`, and a non-slug entry fails config load, because it
+  could never match.
+- **Disclosed, never fatal.** The envelope gains `topic_cluster_seed`, with outcome
+  `seeded`, `skipped`, `failed` or `disabled`. The key is present only when a store is
+  wired. It sits OUTSIDE the status rule, for the same reason as the tombstone counts:
+  `'partial'` invites a retry, and a retry writes a second canonical.
+- **Not yet covered.** The auto-consolidation executor (task 5240) bypasses this tool.
+  Wiring it to `seed_topic_cluster` is follow-up task 5881. The declined-merge trigger
+  is sibling task 4493.
+
 #### `_markup_rejections` — plan.json says how many of its own calls were refused (task 4597)
 
 A plan-tools call carrying leaked tool-call envelope markup is REFUSED before the

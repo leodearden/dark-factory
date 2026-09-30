@@ -13,32 +13,29 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _briefing_helpers import (
+    _mcp_search_envelope,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 from shared.capability_manifest import DeliveredCheckMeta
+from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
+    MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
     _format_delivered_checks,
 )
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
+from orchestrator.agents.roles import ARCHITECT
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 
 
 @pytest.fixture
@@ -555,6 +552,31 @@ class TestDeliveredChecksReachDispatchedRoles:
         )
         self._assert_gate_delivered(prompt)
 
+
+_FORBIDDEN_SECTION_HEADING = '## Forbidden for this pass'
+
+
+async def _build_tightening_prompt(
+    briefing: BriefingAssembler,
+    files: list[str] | None = None,
+    not_touched: list[str] | None = None,
+) -> str:
+    """Render the architect narrowing prompt with a stock flagged-file set."""
+    task = {
+        'id': '2656',
+        'title': 'Test task',
+        'description': 'Demo',
+    }
+    plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
+    return await briefing.build_plan_tightening_prompt(
+        task,
+        plan,
+        not_touched if not_touched is not None else ['a.py', 'b.py'],
+        worktree=None,
+        context='',
+    )
+
+
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:
     """Architect narrowing pass after the plan-files-not-touched gate.
@@ -563,35 +585,19 @@ class TestBuildPlanTighteningPrompt:
     feedback_test_assert_negative_directives.md — the prompt itself
     contains the token names it forbids, so a bare ``not in`` would
     self-conflict.
+
+    New assertions should name tools and structure rather than wording, so
+    that a reworded but still-correct prompt cannot turn this suite red.
     """
 
-    async def _build(
-        self,
-        briefing: BriefingAssembler,
-        files: list[str] | None = None,
-        not_touched: list[str] | None = None,
-    ) -> str:
-        task = {
-            'id': '2656',
-            'title': 'Test task',
-            'description': 'Demo',
-        }
-        plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
-        return await briefing.build_plan_tightening_prompt(
-            task,
-            plan,
-            not_touched if not_touched is not None else ['a.py', 'b.py'],
-            worktree=None,
-            context='',
-        )
-
-    async def test_mentions_both_valid_actions(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+    async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
+        prompt = await _build_tightening_prompt(briefing)
         assert 'update_plan_metadata' in prompt
         assert 'confirm_plan' in prompt
+        assert 'drop_plan_file' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
-        prompt = await self._build(
+        prompt = await _build_tightening_prompt(
             briefing,
             files=['x.py', 'y.py', 'z.py'],
             not_touched=['x.py', 'y.py'],
@@ -604,7 +610,7 @@ class TestBuildPlanTighteningPrompt:
     async def test_forbids_creation_and_step_edits(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         # Positive-directive assertions covering the forbidden tools.
         # The prompt mentions create_plan/add_plan_step/replace_plan_step
         # while listing them as off-limits — assert by section header
@@ -617,12 +623,60 @@ class TestBuildPlanTighteningPrompt:
     async def test_states_new_file_addition_will_be_rejected(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'must NOT add new files' in prompt
 
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestPlanTighteningPromptToolGrants:
+    """Every plan tool the narrowing prompt prescribes must be granted to ARCHITECT.
+
+    ``test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names``
+    scans only ``role.system_prompt``, so it cannot see this dispatch-time prompt.
+    """
+
+    async def test_every_registered_tool_the_prompt_prescribes_is_granted_to_architect(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        artifacts = TaskArtifacts(tmp_path / 'wt')
+        artifacts.init('4807', 'T', 'd')
+        server = plan_tools.create_server(artifacts)
+        registry = {tool.name for tool in await server.list_tools()}
+
+        prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, _forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading, (
+            f'The narrowing prompt has no {_FORBIDDEN_SECTION_HEADING!r} section, '
+            'so this test can no longer tell prescribed tools from forbidden ones.'
+        )
+
+        named = {n for n in registry if re.search(rf'\b{re.escape(n)}\b', prescribed)}
+        assert named, (
+            'The narrowing prompt prescribes no registered plan tool at all, '
+            'which makes this assertion vacuous — either the prompt stopped '
+            'prescribing tools or create_server stopped registering them.'
+        )
+
+        granted = set(ARCHITECT.allowed_tools)
+        missing = sorted(
+            qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
+            if not _tool_is_granted(qualified, granted)
+        )
+        assert not missing, (
+            f'build_plan_tightening_prompt prescribes plan tools absent from '
+            f"ARCHITECT.allowed_tools: {missing}. allowed_tools is passed to the "
+            'SDK as an allowlist (workflow.py::_try_narrow_plan -> '
+            '_invoke(ARCHITECT, ...)), and for the `pi` backend '
+            'agents/invoke.py builds `--tools <csv>` straight from it — so an '
+            'ungranted tool is not in the session registry at all and the '
+            'architect hits a denial following its own instructions. Either '
+            'grant the tool (directly or via a `mcp__<family>__*` wildcard) or '
+            'stop prescribing it.'
+        )
 
 
 @pytest.mark.asyncio
@@ -1019,3 +1073,159 @@ class TestReviewerPromptAmendmentScope:
         )
         assert '# Amendment Re-Review Scope' not in omitted
         assert omitted == explicit_none
+
+
+def _memory_reply(content: str = 'A recalled fact.') -> dict:
+    """A one-result, fully-tagged ``search`` reply, in the real wire shape."""
+    entry = _result('1', content, source_store='mem0')
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return _mcp_search_envelope([entry])
+
+
+@pytest.mark.asyncio
+class TestPerRoleMemoryTable:
+    """Which roles get a memory block, and which deliberately do not (D7).
+
+    Task 3659. The merger is a mechanical role — read both sides of a
+    conflict, resolve, test — measured at 7 dispatches in 14 days, and had
+    only the generic block nobody could show helped it. The reviewer is the
+    single highest-volume role and had the same generic block, despite the
+    workflow holding the task id at every dispatch site.
+    """
+
+    async def test_the_merger_asks_memory_nothing(self, briefing: BriefingAssembler):
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_merger_prompt('CONFLICT TEXT', 'THE INTENT')
+
+        assert mcp.await_args_list == [], 'the merger fires no memory query at all'
+        assert '# Context' not in prompt
+        assert '## Conventions & Gotchas' not in prompt
+        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) not in prompt
+        assert 'CONFLICT TEXT' in prompt and 'THE INTENT' in prompt
+
+    async def test_the_reviewer_gets_the_task_scoped_sections(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_memory_reply())
+        task = {
+            'id': '4242',
+            'title': 'Tighten the merge-lane park grace',
+            'metadata': {'files': ['orchestrator/src/orchestrator/merge_worker.py']},
+        }
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt(
+                'reviewer_comprehensive', 'DIFF', task=task,
+            )
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' in prompt
+        assert 'A recalled fact.' in prompt
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-4242-reviewer'
+            assert args['caller_task_id'] == '4242'
+
+    async def test_the_reviewer_still_builds_without_a_task(
+        self, briefing: BriefingAssembler,
+    ):
+        """Existing callers pass no task; they must keep working, with the
+        generic conventions query and no task-scoped section.
+
+        Also the task-less half of D8: a dispatch with no task declares the
+        role alone and must not invent a ``caller_task_id`` for the journal
+        to record it under.
+        """
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' not in prompt
+        arguments = _search_arguments(mcp)
+        assert len(arguments) == 1
+        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+        assert 'caller_task_id' not in arguments[0]
+
+    async def test_the_steward_continuation_asks_memory_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        """Unchanged by this task: the steward session already holds the full
+        context from its initial briefing."""
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_steward_continuation_prompt(
+                {'id': '4242', 'title': 'A task'},
+                {'id': 'esc-4242-1', 'summary': 'Something blocked'},
+            )
+
+        assert mcp.await_args_list == []
+        assert 'esc-4242-1' in prompt
+
+
+class TestFormatTaskFieldSurface:
+    """Pins which task fields ``_format_task`` renders into the prompt.
+
+    Each populated field must reach the prompt on its own line and each
+    absent one must render nothing, so a rewrite that quietly stopped
+    rendering a field an agent is briefed from would not land undetected.
+
+    This does NOT guard ``memory_hints`` delivery: ``briefing.py`` delivers no
+    hints today, and task 3254, which owns that decision, has no protection
+    here.
+
+    Pinned FIELD BY FIELD, not as one byte-for-byte equality: a whole-string
+    equality would additionally freeze field ORDER and every label's exact
+    spelling, so a harmless relabelling would break a guard that has nothing
+    to do with it.
+    """
+
+    def _task(self) -> dict:
+        return {
+            'id': '3254',
+            'title': 'Deliver memory hints to dispatched agents',
+            'description': 'Wire metadata.memory_hints through to the briefing.',
+            'details': 'The channel is reconciliation-internal today.',
+            'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
+            'dependencies': [{'id': '3659'}, '3212'],
+        }
+
+    def test_every_populated_field_renders_on_its_own_line(
+        self, briefing: BriefingAssembler,
+    ):
+        rendered = briefing._format_task(self._task()).splitlines()
+
+        assert '**ID:** 3254' in rendered
+        assert '**Title:** Deliver memory hints to dispatched agents' in rendered
+        assert '**Description:** Wire metadata.memory_hints through to the briefing.' in rendered
+        assert '**Details:** The channel is reconciliation-internal today.' in rendered
+        assert '**Files:** orchestrator/src/orchestrator/agents/briefing.py' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered, (
+            'a dependency reads the same whether it arrives as a dict or a bare id'
+        )
+
+    def test_an_absent_field_renders_nothing_at_all(
+        self, briefing: BriefingAssembler,
+    ):
+        """No empty labels and no ``None`` — the guard against a field that
+        stops being populated turning into a line of noise."""
+        rendered = briefing._format_task({'id': '3254', 'title': 'A task'})
+
+        assert rendered == '**ID:** 3254\n**Title:** A task'
+
+    def test_the_files_line_is_the_only_opt_out(
+        self, briefing: BriefingAssembler,
+    ):
+        """``include_files=False`` is the architect's anti-anchor path (C-A1);
+        it must drop that one line and leave every other field standing."""
+        rendered = briefing._format_task(self._task(), include_files=False).splitlines()
+
+        assert not [line for line in rendered if line.startswith('**Files:**')]
+        assert '**ID:** 3254' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered

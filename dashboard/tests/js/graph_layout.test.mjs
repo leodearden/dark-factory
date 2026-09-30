@@ -758,9 +758,8 @@ test('focusGroupView: a group the status filter already emptied is NOT attribute
 });
 
 test('focusGroupView: null/undefined tasks do not throw and yield an empty view', () => {
-  // Mirrors projectStatusCounts' null tolerance: the per-project header
-  // renders before task data has necessarily arrived, and a throw there would
-  // blank the whole Tasks tab.
+  // The per-project header renders before task data has necessarily
+  // arrived, and a throw there would blank the whole Tasks tab.
   for (const empty of [null, undefined]) {
     assert.doesNotThrow(() => focusGroupView(empty, { focusMode: true, selectedId: 'B', focusAnchorId: 'B' }));
     const result = focusGroupView(empty, { focusMode: true, selectedId: 'B', focusAnchorId: 'B' });

@@ -8,9 +8,11 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
+import logging
 import os
 import shutil
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -56,14 +58,17 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
+    ExitContractViolationCollector,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
+    track_async_mock_coroutines,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -91,6 +96,8 @@ from orchestrator.config import (  # noqa: E402
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
 merge_queue._DEBUG_ASSERTS = True
+
+track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -259,6 +266,23 @@ def repo_root() -> Path | None:
         if (parent / '.git').exists():
             return parent
     return None
+
+
+@pytest.fixture(scope='session', autouse=True)
+def pristine_repo_templates(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[RepoTemplates]:
+    """Install the process-wide ``_git_fixtures`` templates that ``seed_repo`` copies from.
+
+    AUTOUSE because the shared ``_workflow_helpers`` seeders are awaited as
+    ``helper(repo)`` by ~20 modules and cannot request a fixture.  SESSION scope
+    under basetemp, so pytest owns the templates' lifetime and each xdist worker
+    gets its own, mirroring the set-and-restore shape of
+    ``df_pytest_isolation.py::_df_git_ceiling_at_basetemp``.  Templates build
+    lazily: an unused worker pays one mkdir.
+    """
+    with session_templates(tmp_path_factory.mktemp('git-templates')) as templates:
+        yield templates
 
 
 @pytest.fixture
@@ -455,6 +479,45 @@ def _no_mock_derived_stray_dirs(request):
         "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
         "attribute to auto-spec into a child mock. The stray tree has been "
         "removed so following tests are unaffected."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_unexpected_exit_contract_violation(request):
+    """Fail any test whose ``TaskWorkflow.run()`` exit breaks the spec §5 exit
+    contract (docs/task-escalation-state-spec.md).
+
+    Until task 3542, SM-2 raised ``AssertionError`` out of ``run()`` on an
+    inconsistent exit, which failed whichever test drove it. ``run()`` now
+    RECORDS the verdict instead (a WARNING in the shipped log mode), so this
+    guard restores that oracle: it collects the real recorder's VIOLATION
+    records and fails at teardown.
+
+    **Opt-out via ``exit_contract_violation_expected`` marker**, in the style
+    of ``real_verify_admission`` above: only for a test that DELIBERATELY
+    drives a violation.
+    """
+    collector = ExitContractViolationCollector()
+    contract_logger = logging.getLogger('orchestrator.exit_contract')
+    contract_logger.addHandler(collector)
+    try:
+        yield
+    finally:
+        contract_logger.removeHandler(collector)
+    if not collector.violations:
+        return
+    if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
+        return
+    records = '\n'.join(f'  - {r.getMessage()}' for r in collector.violations)
+    pytest.fail(
+        f"{request.node.nodeid}: a TaskWorkflow.run() exit left a status the "
+        "spec §5 exit contract forbids "
+        "(shared/src/shared/task_transitions.py::outcome_allows_status):\n"
+        f"{records}\n"
+        "Fix the producer that wrote (or skipped) the row, or the test double "
+        "that does not write it the way the real collaborator does. The "
+        "`exit_contract_violation_expected` marker is only for a test that "
+        "DELIBERATELY drives a violation, never a fix for this failure."
     )
 
 
@@ -814,33 +877,15 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Drain orphaned AsyncMock._execute_mock_call coroutines after every test.
+    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
 
-    Task 1714 / esc-1702-13: prevents order-dependent orchestrator test failures
-    caused by un-awaited AsyncMock coroutines surviving GC cycles into sibling
-    tests.  CPython emits RuntimeWarning("coroutine '...' was never awaited")
-    when GC finalizes such an orphan; orchestrator/pyproject.toml promotes this
-    (and pytest's PytestUnraisableExceptionWarning wrapper) to hard errors via
-    filterwarnings — failing whichever test the GC ran during.
+    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
+    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
+    mocks called during collection are covered too.
 
-    By closing every CORO_CREATED ``_execute_mock_call`` coroutine at each test's
-    own teardown boundary, orphans are reclaimed before they can be promoted into
-    a sibling.  Product coroutines (co_name != _execute_mock_call) are untouched,
-    preserving the real-leak safety net.
-
-    KNOWN LIMITATION — module/session-scoped fixture teardowns: pytest finalises
-    fixtures in reverse setup order.  An orphaned AsyncMock coroutine created in
-    the *teardown* of a fixture set up BEFORE this one (e.g. a module- or
-    session-scoped fixture) will be finalised AFTER drain's teardown runs, so it
-    is reclaimed at the *next* test's drain boundary rather than the current one.
-    This is an edge case: function-scoped fixtures (the majority) tear down in
-    definition order before this fixture's teardown, so they are covered.  If a
-    module/session fixture teardown is found to create AsyncMock orphans, either
-    add an explicit ``await`` there or register an additional
-    ``pytest_runtest_teardown`` hook that fires after all finalizers.
-
-    See drain_async_mock_coroutines() in _orch_helpers.py for full rationale and
-    performance notes.
+    KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
+    BEFORE this one (module- or session-scoped) is created after this drain has
+    run, so it is closed at the next test's boundary rather than this one's.
     """
     yield
     drain_async_mock_coroutines()

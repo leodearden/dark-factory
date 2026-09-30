@@ -2679,6 +2679,21 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    streak_escalation_suppress_human_parked: bool = Field(
+        default=True,
+        description=(
+            'Skip the veto-streak L1 when the hold is escalation_pinned and '
+            'every record pinning the task is already an L2 in front of a '
+            'human. Without this the alarm re-fires forever on a queue where '
+            'L2s legitimately stay parked for days, since its trigger is '
+            'exactly "a human-facing escalation is still open" (re-filed twice '
+            'inside one hour on 2026-08-19; 27 of 94 pending records on '
+            '2026-08-31). Set to false to restore the pre-4541 behaviour. It '
+            'suppresses only the queue WRITE: recovery_vetoed rows and the '
+            'per-sweep summary line keep flowing, and a hold that includes '
+            'any unpromoted pin still alarms.'
+        ),
+    )
     landing_git_error_rate_per_hour: int = Field(
         default=10,
         ge=1,
@@ -4263,6 +4278,28 @@ class OrchestratorConfig(BaseSettings):
             'over 10.5h on task 3717).  Conversion is NOT completion: the '
             'converted row keeps its pin, and its exit is a human or task '
             '3541 — never an automatic self-heal.'
+        ),
+    )
+
+    # Task 3542 — observe-before-enforce gate for the run()-exit contract, flat
+    # like its neighbour above: no `defaults.yaml` stanza and no
+    # `RELOADABLE_FIELDS` entry.  The canonical WHY is
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    #
+    # THE PROMOTION PATH:
+    #   1. OBSERVE.  With the default False, count the `would-violate` rows
+    #      (`workflow_exit_contract` events, verdict='violation', mode='log').
+    #   2. ENFORCE.  Task mu flips this default to True after the soak.
+    #   3. KEEP.  Unlike convert_to_blocked_enforce, never delete this field:
+    #      enforce is the steady state, and the log mode is its escape hatch.
+    workflow_exit_contract_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the run()-exit contract (task 3542; spec §5).  False — the '
+            'shipped default — is LOG MODE: a violating exit logs a '
+            '`would-violate` WARNING and emits a `workflow_exit_contract` event. '
+            'True also files one deduped L1 (category workflow_exit_contract). '
+            'In neither mode does the check write the task status or raise.'
         ),
     )
 

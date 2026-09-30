@@ -1309,13 +1309,13 @@ class TestTriageWriteFailsOpen:
     async def test_an_attach_verdict_carries_the_bands_winner_and_score(
         self, verdict,
     ) -> None:
-        """The judge names the RELATIONSHIP; the band already named the target.
+        """A BARE-WORD verdict names no candidate, so it files against the band's winner.
 
-        A judge that returns only a word would otherwise have to be trusted to
-        also identify a canonical, which is exactly the detect-don't-adjudicate
-        split D3 draws. The similarity travels with it because the ack quotes
-        the number that produced the routing — dropping it leaves an attach
-        outcome no reader can second-guess.
+        A bare outcome word is the contract `_stub_judge` and direct callers
+        speak; a verdict that names its candidate is pinned in
+        `test_write_triage_judged_attach.py`. The similarity travels with it
+        because the ack quotes the number that produced the routing —
+        dropping it leaves an attach outcome no reader can second-guess.
         """
         counter = TriageFailOpenCounter(time_provider=_Clock())
         service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))

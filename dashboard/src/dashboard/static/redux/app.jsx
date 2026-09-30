@@ -1,6 +1,6 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
@@ -8,8 +8,8 @@ const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
-// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
-const { orchSummary } = window.DF_ORCH_SUMMARY;
+const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
+const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -54,7 +54,7 @@ function App() {
   const [tw, setTw] = useTweaks ? useTweaks(TWEAK_DEFAULTS) : [TWEAK_DEFAULTS, () => {}];
 
   // Filter state — per tab
-  const [win, setWin] = uS('24h');
+  const [win, setWin] = uS(CHIP_DEFAULT_WINDOW);
   const [projects, setProjects] = uS([]);     // [] = all
   const [agents, setAgents] = uS([]);
   const [search, setSearch] = uS('');
@@ -83,6 +83,12 @@ function App() {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
 
+  // Re-validate the window on every tab switch, whichever path switched it: a
+  // chip tab that does not offer the current window resets it.
+  uE(() => {
+    setWin(w => windowForTab(tab, w));
+  }, [tab]);
+
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints
   // ignore ?window= silently, so passing it from chip-less tabs is harmless.
   uE(() => {
@@ -106,23 +112,24 @@ function App() {
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
+  // ONE census binding feeds both the topbar pill and the rail badge, so the
+  // two cannot show different in-flight numbers.
+  const tasksCensus = censusOver(DD, null);
+
   // Topbar status summary — all derived from real data.  `spend24h` is the
   // current-day total from COSTS.summary.today (server-computed from the
   // cost trend tail).  Falls back to 0 if cost data hasn't loaded yet.
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
-    tasksActive: DD.ORCHESTRATORS.reduce((n, o) => {
-      const s = orchSummary(o);
-      return n + s.in_progress + s.blocked;
-    }, 0),
+    tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
     queue: DD.MEMORY_STATUS.queue.counts.pending,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
   const railCounts = {
     orch: summary.orchRunning,
-    tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
+    tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
     // visible from the rail and not only from the tab. 'interrupted' is
@@ -170,31 +177,26 @@ function App() {
     }
   }
 
-  // Per-tab toolbar config.
-  //
-  // showWindow / windows are scoped per Option-A "honest scoping": the chip
-  // appears only on tabs whose endpoints actually consume ?window=, and the
-  // chip set is restricted to values the server maps. Specifically:
-  //   - Costs / Performance / Merge / Overview-cost-spark obey app.py's
-  //     _WINDOW_DAYS = {24h, 7d, 30d, all} — no 1h, no 90d.
-  //   - Burndown obeys _BURNDOWN_WINDOWS = {24h, 7d, 30d, 90d} — no all.
-  const WIN_DEFAULT  = ['24h', '7d', '30d', 'all'];
-  const WIN_BURNDOWN = ['24h', '7d', '30d', '90d'];
+  // Per-tab toolbar config. Which tabs carry the window chip, and which
+  // windows each offers, is window_chip.js's TAB_WINDOWS.
   const toolbarConfig = {
-    overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
-    tasks:     { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
-    scheduler: { showWindow: false, showProjects: false,    showAgents: false, search: false },
-    curator:  { showWindow: false,                        showAgents: false, search: false },
-    perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    memory:   { showWindow: false,                        showAgents: true,  search: false },
-    recon:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
-    merge:    { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
-    esc:      { showWindow: false,                        showAgents: false, search: false },
-    'esc-analytics': { showWindow: false,                 showAgents: false, search: false },
+    overview:  { showAgents: false, search: false },
+    orch:      { showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
+    tasks:     { showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
+    scheduler: { showProjects: false, showAgents: false, search: false },
+    curator:   { showAgents: false, search: false },
+    perf:      { showAgents: false, search: false },
+    memory:    { showAgents: true,  search: false },
+    recon:     { showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
+    merge:     { showAgents: false, search: false },
+    cost:      { showAgents: false, search: false },
+    burn:      { showAgents: false, search: false },
+    esc:       { showAgents: false, search: false },
+    'esc-analytics': { showAgents: false, search: false },
   }[tab] || {};
+  const chip = CHIP_TAB_WINDOWS[tab];
+  const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;
+  const pending = chip ? pendingWindow(win, chipEcho, chip.windows) : null;
 
   return (
     <div className="app" data-density={tw.density}>
@@ -209,9 +211,10 @@ function App() {
       </div>
       <div className="main">
         <Toolbar
-          window={win} onWindow={setWin}
-          showWindow={toolbarConfig.showWindow !== false}
-          windows={toolbarConfig.windows}
+          showWindow={!!chip}
+          windows={chip?.windows}
+          window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
+          onWindow={setWin}
           showProjects={toolbarConfig.showProjects !== false}
           projects={projects} onProjects={setProjects}
           agents={agents} onAgents={setAgents}
@@ -220,10 +223,17 @@ function App() {
           onSearch={toolbarConfig.search ? setSearch : undefined}
           searchPlaceholder={toolbarConfig.searchPlaceholder}
           extra={
-            <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
-              className="multi" style={{ cursor: 'pointer' }}>
-              {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
-            </button>
+            <>
+              {pending && (
+                <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                  {pending} pending
+                </span>
+              )}
+              <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
+                className="multi" style={{ cursor: 'pointer' }}>
+                {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
+              </button>
+            </>
           }
         />
         <div className="body" key={tab}>

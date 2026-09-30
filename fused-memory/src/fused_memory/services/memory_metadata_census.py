@@ -178,11 +178,10 @@ class UnknownKeyStormDetector:
 
         The latch clears once the window drains back below the threshold, so
         a writer that drifts, is fixed, and later drifts again is heard both
-        times.  That whole policy lives in
-        :class:`shared.storm_counter.StormCounter` under
-        ``fire_mode='latched'`` (task 4519) — this method only keys the
-        counters per writer and aggregates one CALL's worth of per-key events
-        into one answer.
+        times.  A call carrying N keys decides exactly as N single-key calls
+        at the same instant would, returning ``True`` iff one of its keys
+        crossed, so the re-arm rule has one home:
+        :class:`shared.storm_counter.StormCounter`'s ``fire_mode='latched'``.
 
         The call's instant is resolved ONCE from ``time_fn`` and threaded
         through every per-key
@@ -204,22 +203,6 @@ class UnknownKeyStormDetector:
             counter = StormCounter(time_provider=self._time_fn, fire_mode='latched')
             self._warns[writer] = counter
 
-        # The counter decides per EVENT; this class's contract is one decision
-        # per CALL, and a call may carry several keys (``memory_service.py``
-        # passes every ``unknown_key`` violation from one write).  Capturing the
-        # latch state BEFORE the loop is what keeps those two granularities
-        # equivalent: within a call the count only rises, so a writer already
-        # latched on entry must stay suppressed even if the first key of the
-        # call happens to land below the threshold and re-arm the counter
-        # mid-loop.  Without this guard a latched writer whose window had
-        # drained into ``[threshold - len(keys), threshold - 2]`` would be
-        # reported again — a real change of behaviour on the live memory-write
-        # path, not a refactor.  See task 4519 / esc-4519-2: the pre-existing
-        # semantics are preserved deliberately here, and whether the latch
-        # SHOULD survive a fully drained window is a separate question filed
-        # as its own follow-up.
-        was_latched = counter.latched
-
         # An explicit loop, never ``any(counter.record(...) for ...)``: a
         # generator short-circuits on the first fire and would skip the
         # remaining keys, silently under-counting a multi-key burst.
@@ -237,7 +220,7 @@ class UnknownKeyStormDetector:
             self._records_since_sweep = 0
             self._evict_silent_writers(now)
 
-        return crossed and not was_latched
+        return crossed
 
     def _evict_silent_writers(self, now: float) -> None:
         """Drop every writer whose entire window has aged out, as of *now*.

@@ -37,10 +37,18 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
+from shared.delivered_check_polarity import (
+    GATE_REF,
+    CheckOutcome,
+    build_grep_argv,
+    build_path_argv,
+    interpret_grep_rc,
+    interpret_path_listing,
+)
 
 from orchestrator import git_ops
 
@@ -81,6 +89,21 @@ class DeliveredCheckResult(Enum):
     ERRORED = 'errored'
 
 
+#: ``shared.delivered_check_polarity.CheckOutcome`` → :class:`DeliveredCheckResult`
+#: (task 3500). The two enums are deliberately distinct vocabularies — one says
+#: whether a PREDICATE held against some tree, the other whether a CAPABILITY is
+#: delivered — and this table is the single place they are joined. Exhaustive
+#: over ``CheckOutcome`` by construction: a new member would raise ``KeyError``
+#: at the delegation site (caught by :func:`run_delivered_check` and reported as
+#: ERRORED) rather than silently returning the wrong verdict for a whole class
+#: of checks.
+_OUTCOME_TO_RESULT: dict[CheckOutcome, DeliveredCheckResult] = {
+    CheckOutcome.PASS: DeliveredCheckResult.DELIVERED,
+    CheckOutcome.FAIL: DeliveredCheckResult.FAILED,
+    CheckOutcome.ERRORED: DeliveredCheckResult.ERRORED,
+}
+
+
 @dataclass(frozen=True)
 class DeliveredChecksVerdict:
     """Aggregate outcome of running a whole ``metadata.delivered_checks``
@@ -104,7 +127,7 @@ async def run_delivered_check(
     check: dict[str, Any],
     *,
     project_root: str | Path,
-    ref: str = 'main',
+    ref: str = GATE_REF,
     runner: _Runner = git_ops._run,
 ) -> DeliveredCheckResult:
     """Evaluate a single delivered-check descriptor. Never raises.
@@ -154,22 +177,30 @@ async def _run_grep_check(
     ``meta.expect``: ``'present'`` wants a match, ``'absent'`` wants no
     match.
 
-    The explicit ``-e`` separator (reviewer_comprehensive amendment) keeps
-    a pattern beginning with ``'-'`` from being parsed as a ``git grep``
-    option instead of the search pattern — without it, such a pattern
-    would fail with a git error (rc>=2, ERRORED) rather than being used
-    literally.
+    Both halves of that — the argv and the rc mapping, including the
+    ``-e``-separator rationale that used to be spelled out here — now live
+    in ``shared.delivered_check_polarity``; see the delegation comment
+    below and that module's PARITY CONTRACT.
     """
-    argv = ['git', '-C', str(project_root), 'grep', '-E', '-e', meta.pattern, ref]
-    if meta.paths:
-        argv.append('--')
-        argv.extend(meta.paths)
+    # Task 3500: AUTHORING-TIME validation evaluates these same grep checks
+    # (in shared.delivered_check_polarity) before they are ever committed to
+    # a task's metadata, and it MUST reach the identical verdict this runner
+    # will later reach. Rather than trust two implementations to agree on
+    # POSIX-ERE-via-`git grep -E`, the `-e` separator, `--` pathspec
+    # placement and the rc>=2 boundary, both call the same builder and the
+    # same interpreter — so divergence is structurally impossible rather
+    # than merely absent today. A drift here would make the authoring gate a
+    # new source of the wedge it exists to prevent: a check the lint judges
+    # healthy that this runner then fails still blocks its dependent forever.
+    #
+    # `cast` (a runtime no-op): DeliveredCheckMeta's validator guarantees a
+    # non-empty `pattern` whenever kind == 'grep', which is the only way
+    # into this function — pyright just cannot see the cross-field rule.
+    argv = build_grep_argv(
+        cast(str, meta.pattern), meta.paths, project_root=project_root, ref=ref
+    )
     rc, _out, _err = await runner(argv)
-    if rc >= 2:
-        return DeliveredCheckResult.ERRORED
-    matched = rc == 0
-    delivered = matched if meta.expect == 'present' else not matched
-    return DeliveredCheckResult.DELIVERED if delivered else DeliveredCheckResult.FAILED
+    return _OUTCOME_TO_RESULT[interpret_grep_rc(rc, meta.expect)]
 
 
 async def _run_path_check(
@@ -179,64 +210,29 @@ async def _run_path_check(
     ref: str,
     runner: _Runner,
 ) -> DeliveredCheckResult:
-    """``git -C <project_root> ls-tree -r --full-tree --name-only <ref> -- <path>``,
-    once per entry in ``meta.paths``.
+    """One ``git ls-tree`` probe per entry in ``meta.paths``.
 
-    EXISTENCE IS READ FROM STDOUT, NOT FROM THE RETURN CODE — the opposite
-    of :func:`_run_grep_check`, and the one thing that must not be carried
-    across by analogy. ``git grep`` answers through rc (0=match, 1=no
-    match), but ``ls-tree`` exits 0 either way: a MISSING path prints
-    nothing, an existing path prints its name. Reading ``rc == 0`` here
-    would make every path check report DELIVERED — a universal false green
-    on a dispatch gate.
-
-    A non-zero rc is reserved for genuine git errors (a bad ref and a
-    pathspec outside the repository both exit 128) and returns ERRORED
-    immediately, before stdout is interpreted and without probing any
-    further path. That ordering matters: git prints nothing on an error and
-    nothing on an absent path, so reading stdout first would report a
-    definitive FAILED for a check that could not be evaluated at all.
-
-    ``--full-tree`` makes the pathspec repo-root-relative regardless of the
-    subprocess cwd, matching the repo-relative ``paths`` invariant the
-    schema validator enforces.
+    The probe's argv and its reading — existence from STDOUT, with a
+    non-zero rc checked FIRST as ERRORED — live in
+    ``shared.delivered_check_polarity`` (``build_path_argv`` /
+    ``interpret_path_listing``), whose docstrings say why. The authoring-time
+    lint evaluates path checks through the same two functions (task 3500),
+    so the two gates cannot disagree about what a path check means.
 
     Multi-path semantics are CONJUNCTIVE and short-circuiting:
     ``expect='present'`` requires EVERY listed path to exist and
     ``expect='absent'`` requires every one to be gone, returning on the
-    first path that settles the verdict. A delivered_check is a dispatch
-    GATE, so it must be biased toward withholding: disjunctive semantics
-    would let it go green while part of the asserted capability was still
-    missing. One invocation per path rather than one multi-pathspec call,
-    because ``ls-tree`` returns a flat filename list that cannot be
-    attributed back to the requesting pathspec without an ad-hoc parser
-    over git output.
+    first path that settles the verdict — an ERRORED probe included, so no
+    further path is probed after a git error. A delivered_check is a
+    dispatch GATE, so it must be biased toward withholding: disjunctive
+    semantics would let it go green while part of the asserted capability
+    was still missing.
     """
     for path in meta.paths:
-        argv = [
-            'git',
-            '-C',
-            str(project_root),
-            'ls-tree',
-            '-r',
-            '--full-tree',
-            '--name-only',
-            ref,
-            '--',
-            path,
-        ]
-        rc, out, _err = await runner(argv)
-        if rc != 0:
-            # A genuine git error (bad ref / pathspec outside the repository
-            # both exit 128), NOT an answer about existence. Checked BEFORE
-            # stdout is interpreted, because an error prints nothing and an
-            # absent path prints nothing too — collapsing the two would turn
-            # an unevaluable check into a definitive "not delivered".
-            return DeliveredCheckResult.ERRORED
-        exists = bool(out.strip())
-        delivered = exists if meta.expect == 'present' else not exists
-        if not delivered:
-            return DeliveredCheckResult.FAILED
+        rc, out, _err = await runner(build_path_argv(path, project_root=project_root, ref=ref))
+        outcome = interpret_path_listing(rc, out, meta.expect)
+        if outcome is not CheckOutcome.PASS:
+            return _OUTCOME_TO_RESULT[outcome]
     return DeliveredCheckResult.DELIVERED
 
 

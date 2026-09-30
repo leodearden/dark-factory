@@ -10,10 +10,12 @@ why fuller tests are absent:
     behaviour and break on harmless refactors (rename, arrow-function
     conversion, local-var extraction).
 
-  * The {d.recent.length} matching presentation span (tabs.jsx step-4) is
-    verified by manual / e2e testing; the JS project has no test harness
-    (no package.json / jest / vitest / babel) so a jsdom rendering test is
-    out of scope.
+  * The Recent-merges caption ("showing N of M in <window>") is formatted by
+    window_chip.js::recentMergesCaption, whose behaviour is covered by
+    dashboard/tests/js/window_chip.test.mjs; tabs.jsx only passes it the row
+    count, the payload's recent_total and the /merge-queue WINDOW echo. There
+    is no JSX render harness, so the wiring itself is verified by manual / e2e
+    testing.
 
 The single test below is kept rather than deleted so that the file, and its
 explanatory docstring, remain discoverable by future maintainers.  If a JS

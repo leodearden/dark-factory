@@ -936,11 +936,12 @@ class TestSingleSourceOfTruth:
 # ``test_this_module_spells_no_raw_envelope_literal`` (self-file).
 #
 # Coverage is per-file opt-in, not repo-wide: this guard covers only
-# markup_tripwire.py and this test module. Sibling files carrying the same
-# defect with no guard of their own — markup_guard.py,
-# test_markup_tripwire_gate.py, test_markup_guard_fused_memory.py — are
-# deliberately left unguarded here; task 4228's plan records them as
-# follow-up scope, not silently covered by this block.
+# markup_tripwire.py and this test module. The sibling files carry guards of
+# their own (task 4948): test_markup_tripwire_gate.py guards itself, and
+# tests/test_markup_guard_fused_memory.py guards both itself and
+# markup_guard.py. Repo-wide enforcement (a ratchet, a hooks/project-checks
+# leg, or a CI leg) is deliberately not built here; task 5209 owns that
+# design call.
 # ---------------------------------------------------------------------------
 
 #: Needle set shared by both guards below: every ENVELOPE_LITERALS member plus

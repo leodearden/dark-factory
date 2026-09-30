@@ -72,12 +72,19 @@ def make_escalation(
     level: int = 1,
     detail: str | None = None,
     project_id: str = 'dark_factory',
+    field_project_id: str | None = None,
 ) -> Escalation:
     """Build a real ``Escalation`` (never a mock) in the shape Stage 1 files.
 
     Real dataclass instances are used throughout this file so that a field
     rename or default change in ``escalation.models.Escalation`` breaks these
     tests instead of silently passing against a mock's ``__getattr__``.
+
+    ``project_id`` feeds the DETAIL PROSE; ``field_project_id`` sets the
+    structured ``Escalation.project_id``.  They are separate kwargs precisely
+    so a test can set them to DISAGREEING values — a helper with one kwarg
+    driving both could not express the case that proves the field wins.
+    ``field_project_id=None`` is the legacy record: prose only, no stamp.
     """
     if detail is None:
         detail = '\n'.join([
@@ -98,6 +105,7 @@ def make_escalation(
         detail=detail,
         status=status,
         level=level,
+        project_id=field_project_id,
     )
 
 
@@ -137,11 +145,15 @@ class TestSingleOwnerConstants:
 
 
 class TestEscalationProjectId:
-    """``escalation_project_id`` owns the ``project_id:`` detail-line parse.
+    """``escalation_project_id`` owns the project-id derivation, field-first.
 
-    ``Escalation`` carries NO ``project_id`` field, so there is no structured
-    fact to read — the value must be recovered from the detail block both
-    producers write.  This is the one place in the tree that does it.
+    ``Escalation`` carries a structured ``project_id`` (task 4951) and this
+    function prefers it.  The ``project_id:`` detail-line parse is retained as
+    the fallback for records that carry no usable stamp, which is not a
+    shrinking-by-itself population: a gate-backlog refiling normally FOLDS
+    into an existing pending parent, and folding writes no child record and
+    backfills no parent field.  This is the one place in the tree that resolves
+    either source.
     """
 
     def test_parses_the_current_gate_backlog_filing_format(self):
@@ -222,9 +234,66 @@ class TestEscalationProjectId:
         assert escalation_project_id(esc) is None
 
     def test_object_without_a_detail_attribute_returns_none(self):
-        """A non-``Escalation`` element never raises AttributeError."""
+        """A non-``Escalation`` element never raises AttributeError.
+
+        This is also what forces the field read to be ``getattr(esc,
+        'project_id', None)`` rather than attribute access: ``object()`` has
+        neither attribute, and an AttributeError here would abort the sweep
+        for every other record in the batch.
+        """
         assert escalation_project_id(object()) is None
         assert escalation_project_id(None) is None
+
+    # --- field-first (task 4951) ---
+
+    def test_prefers_the_structured_field_over_the_detail_prose(self):
+        """The emitter's structured fact wins over its own rendered prose.
+
+        The two sources DISAGREE here deliberately: a fallback-only
+        implementation returns the prose value and fails.  This is the
+        assertion that actually closes the INV-2 gap.
+        """
+        esc = make_escalation(field_project_id='reify', project_id='dark_factory')
+
+        assert escalation_project_id(esc) == 'reify'
+
+    def test_falls_back_to_the_detail_parse_when_the_field_is_absent(self):
+        """An unstamped legacy record still resolves through the prose."""
+        esc = make_escalation(field_project_id=None, project_id='solar_challenge')
+
+        assert escalation_project_id(esc) == 'solar_challenge'
+
+    def test_an_empty_field_falls_back_to_the_detail_parse(self):
+        """A blank stamp is UNSTAMPED, not a parse failure.
+
+        ``None`` on the field means "no producer set this", and ``''`` is no
+        more usable an identity than ``None`` — both must degrade to the prose
+        rather than resolve to an empty project name.
+        """
+        esc = make_escalation(field_project_id='', project_id='know_live')
+
+        assert escalation_project_id(esc) == 'know_live'
+
+    def test_a_non_str_field_falls_back_to_the_detail_parse(self):
+        """A non-str field degrades to the prose and never raises.
+
+        Same reasoning as the non-str ``detail`` case above: the record is
+        deserialised from JSON on disk, so a malformed value must not abort
+        the sweep for every other record.
+        """
+        esc = make_escalation(project_id='pump_web_ui')
+        esc.project_id = 12345  # type: ignore[assignment]
+
+        assert escalation_project_id(esc) == 'pump_web_ui'
+
+    def test_field_is_returned_when_detail_carries_no_project_id_line(self):
+        """A stamped record needs no prose at all — that is the point."""
+        esc = make_escalation(
+            field_project_id='pump_web_ui',
+            detail='run_id: abc\ntask_id: 7\ntitle: t',
+        )
+
+        assert escalation_project_id(esc) == 'pump_web_ui'
 
 
 class TestSelectReapableEscalations:
@@ -750,7 +819,7 @@ class TestSweepOrphanedReconEscalations:
         )
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert len(stats['flags']) == 2
@@ -775,7 +844,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'blocked'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['flags'] == []
@@ -791,7 +860,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'999': 'blocked'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['missing'] == 1
@@ -819,7 +888,7 @@ class TestSweepOrphanedReconEscalations:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['live'] == 1, 'the non-default-tag subject must be live'
@@ -854,7 +923,7 @@ class TestSweepOrphanedReconEscalations:
         )
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['terminal'] == 1
@@ -878,7 +947,7 @@ class TestSweepOrphanedReconEscalations:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='reify',
         )
 
         assert stats['terminal'] == 1
@@ -888,7 +957,7 @@ class TestSweepOrphanedReconEscalations:
             DARK_ROOT, REIFY_ROOT,
         }
         flagged = {f['task_id'] for f in stats['flags']}
-        assert flagged == {'650', '5944'}
+        assert flagged == {'5944'}
         assert '5943' not in flagged, (
             "task 650 being done in dark_factory says nothing about reify's 5943"
         )
@@ -907,7 +976,7 @@ class TestSweepOrphanedReconEscalations:
         )
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['scanned'] == 20
@@ -925,7 +994,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['unresolvable'] == 1
@@ -940,7 +1009,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['unresolvable'] == 1
@@ -954,7 +1023,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats == {
@@ -979,7 +1048,7 @@ class TestSweepOrphanedReconEscalations:
         )
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1000,7 +1069,7 @@ class TestSweepOrphanedReconEscalations:
         )
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1017,7 +1086,9 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({})
 
         with pytest.raises(exc):
-            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+            await sweep_orphaned_recon_escalations(
+                queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
+            )
 
     @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
     @pytest.mark.asyncio
@@ -1027,7 +1098,9 @@ class TestSweepOrphanedReconEscalations:
         taskmaster.list_tags = AsyncMock(side_effect=exc())
 
         with pytest.raises(exc):
-            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+            await sweep_orphaned_recon_escalations(
+                queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
+            )
 
     @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
     @pytest.mark.asyncio
@@ -1037,7 +1110,9 @@ class TestSweepOrphanedReconEscalations:
         taskmaster.get_statuses_fresh = AsyncMock(side_effect=exc())
 
         with pytest.raises(exc):
-            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+            await sweep_orphaned_recon_escalations(
+                queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
+            )
 
     @pytest.mark.asyncio
     async def test_human_operator_record_is_swept_and_names_its_own_category(self):
@@ -1053,7 +1128,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['terminal'] == 1
@@ -1066,7 +1141,7 @@ class TestSweepOrphanedReconEscalations:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'9': 'done'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats == {
@@ -1082,9 +1157,108 @@ class TestSweepOrphanedReconEscalations:
         queue = make_queue([make_escalation(task_id='650')])
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
 
-        await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+        await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
+        )
 
         queue.resolve.assert_not_called()
+
+
+def make_two_project_orphans():
+    """One terminal orphan per project: dark_factory's 650 and reify's 5944."""
+    queue = make_queue([
+        make_escalation(task_id='650', esc_id='esc-650-1', project_id='dark_factory'),
+        make_escalation(task_id='5944', esc_id='esc-5944-1', project_id='reify'),
+    ])
+    taskmaster = make_taskmaster({
+        DARK_ROOT: {'master': {'650': 'done'}},
+        REIFY_ROOT: {'master': {'5944': 'cancelled'}},
+    })
+    return queue, taskmaster
+
+
+class TestFlagsAreScopedToTheRunningProject:
+    """A cycle flags only the orphans whose subject belongs to ITS OWN project.
+
+    The recon queue is shared fleet-wide, so an unscoped sweep re-flagged every
+    orphan in every project's cycle, under bare numeric task ids that name
+    unrelated local tasks there.  Scoping filters the FLAGS only: the whole
+    queue is still classified, each record against its own project's store, so
+    the counts stay fleet-wide.
+    """
+
+    @pytest.mark.parametrize(
+        ('running_project_id', 'expected_flag_ids'),
+        [('dark_factory', ['650']), ('reify', ['5944'])],
+    )
+    @pytest.mark.asyncio
+    async def test_each_cycle_flags_only_its_own_projects_orphans(
+        self, running_project_id, expected_flag_ids,
+    ):
+        queue, taskmaster = make_two_project_orphans()
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id=running_project_id,
+        )
+
+        assert [f['task_id'] for f in stats['flags']] == expected_flag_ids
+        assert stats['scanned'] == 2, 'counts cover the whole shared queue'
+        assert stats['terminal'] == 2, "the other project's orphan is still counted"
+        assert stats['missing'] == 0
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_project_with_no_orphans_of_its_own_emits_no_flags(self):
+        queue, taskmaster = make_two_project_orphans()
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='know_live',
+        )
+
+        assert stats['flags'] == []
+        assert stats['terminal'] == 2, 'the classification still ran for the fleet'
+
+    @pytest.mark.asyncio
+    async def test_foreign_records_are_still_classified_against_their_own_store(self):
+        """Scoping filters the flags, not the classification."""
+        queue, taskmaster = make_two_project_orphans()
+
+        await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
+        )
+
+        assert {c.args[0] for c in taskmaster.list_tags.await_args_list} == {
+            DARK_ROOT, REIFY_ROOT,
+        }
+
+    @pytest.mark.parametrize(
+        ('running_project_id', 'expected_flag_ids'),
+        [('dark_factory', []), ('reify', ['5944'])],
+    )
+    @pytest.mark.asyncio
+    async def test_scoping_reads_the_subject_project_from_the_stamped_field(
+        self, running_project_id, expected_flag_ids,
+    ):
+        """Scoping and classification share ``escalation_project_id`` (field first).
+
+        The detail prose and the stamped field DISAGREE here: a scoping filter
+        that re-derived the project from the prose would flag this reify
+        record in dark_factory's cycle.
+        """
+        queue = make_queue([
+            make_escalation(
+                task_id='5944', esc_id='esc-5944-1',
+                project_id='dark_factory', field_project_id='reify',
+            ),
+        ])
+        taskmaster = make_taskmaster({REIFY_ROOT: {'master': {'5944': 'cancelled'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id=running_project_id,
+        )
+
+        assert [f['task_id'] for f in stats['flags']] == expected_flag_ids
+        assert stats['terminal'] == 1
 
 
 class TestFailOpenCensusIsTreatedAsFailure:
@@ -1117,7 +1291,7 @@ class TestFailOpenCensusIsTreatedAsFailure:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1141,7 +1315,7 @@ class TestFailOpenCensusIsTreatedAsFailure:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1166,7 +1340,7 @@ class TestFailOpenCensusIsTreatedAsFailure:
         taskmaster = make_taskmaster({DARK_ROOT: {}}, tags_by_root={DARK_ROOT: []})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1189,7 +1363,7 @@ class TestFailOpenCensusIsTreatedAsFailure:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 0
@@ -1214,7 +1388,7 @@ class TestFailOpenCensusIsTreatedAsFailure:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['errors'] == 1
@@ -1252,7 +1426,7 @@ class TestCrossTagIdCollision:
         taskmaster = make_taskmaster({DARK_ROOT: {t: per_tag[t] for t in tag_order}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['ambiguous'] == 1
@@ -1275,7 +1449,7 @@ class TestCrossTagIdCollision:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['terminal'] == 1
@@ -1293,7 +1467,7 @@ class TestCrossTagIdCollision:
         })
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['live'] == 1
@@ -1307,7 +1481,7 @@ class TestCrossTagIdCollision:
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
 
         stats = await sweep_orphaned_recon_escalations(
-            queue, taskmaster, KNOWN_PROJECTS,
+            queue, taskmaster, KNOWN_PROJECTS, running_project_id='dark_factory',
         )
 
         assert stats['ambiguous'] == 0
@@ -1405,6 +1579,23 @@ class TestMemoryConsolidatorOrphanedEscalationWiring:
         assert report.stats['orphaned_recon_escalations_ambiguous'] == 0
         assert report.stats['orphaned_recon_escalations_unresolvable'] == 0
         assert report.stats['orphaned_recon_escalations_errors'] == 0
+        assert report.stats['orphaned_recon_escalations_flags_emitted'] == 1
+
+    @pytest.mark.asyncio
+    async def test_only_the_running_projects_orphans_reach_the_report(self):
+        """The dark_factory cycle flags 650 alone, yet still counts reify's 5944."""
+        queue, taskmaster = make_two_project_orphans()
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
+
+        report, _ = await _run_stage(stage)
+
+        flags = [
+            f for f in report.items_flagged
+            if f.get('flag_type') == ORPHANED_ESCALATION_FLAG_TYPE
+        ]
+        assert [f['task_id'] for f in flags] == ['650']
+        assert report.stats['orphaned_recon_escalations_scanned'] == 2
+        assert report.stats['orphaned_recon_escalations_terminal'] == 2
         assert report.stats['orphaned_recon_escalations_flags_emitted'] == 1
 
     @pytest.mark.asyncio

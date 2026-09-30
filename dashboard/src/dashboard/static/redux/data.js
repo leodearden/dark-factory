@@ -52,7 +52,7 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
-    '/api/v2/dashboard/tasks':                        { 'ACTIVE_TASKS': PLAIN, 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
+    '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -72,9 +72,9 @@ function endpointsFor(win) {
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
-// `terminal`, the mechanism PRD leaf gamma3 fetches `?terminal=<project>`
-// through, and `taskProse`, the Task Detail pane's description/details for the
-// selected task, addressed by the row's own uid (`<project>/T-<id>`).
+// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
+// `taskProse`, the Task Detail pane's description/details for the selected
+// task, addressed by the row's own uid (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -124,15 +124,6 @@ window.DF_DATA = {
   AGENTS: [],
   ORCHESTRATORS: [],
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
-  // ACTIVE_TASKS row shape: {id, project, title, status, agent, started, loops,
-  //   attempts, lane, phase, lane_state, runtime_offline, deps, meta_files,
-  //   train, external_deps, prd, claimant_run_id, heartbeat_at, stranded}.
-  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
-  //   `stranded` (task 3543) is the independent liveness verdict, computed
-  //   server-side from the claim columns via shared.task_claimant.is_stranded.
-  //   Rows carry no description/details: the Task Detail pane fetches those
-  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
-  ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
   // Projects the tasks handler ran out of budget for — state UNKNOWN, not
@@ -152,7 +143,17 @@ window.DF_DATA = {
   // TASKS_SNAPSHOT: {project: {census, rows, in_progress_live,
   //   in_progress_stranded, skew_seconds}}, census and rows each a Datum.
   //   Seeded EMPTY, so a read before the first fetch finds no entry, which
-  //   task_done_count.js answers with the placeholder rather than a zero.
+  //   task_snapshot.js::projectCensus answers as an unknown Datum rather
+  //   than a zero.
+  //   Each rows Datum's value is a list of rows shaped {id, project, title,
+  //   status, agent, started, loops, attempts, lane, phase, lane_state,
+  //   runtime_offline, deps, meta_files, train, external_deps, prd,
+  //   claimant_run_id, heartbeat_at, stranded}.
+  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
+  //   `stranded` (task 3543) is the independent liveness verdict, computed
+  //   server-side from the claim columns via shared.task_claimant.is_stranded.
+  //   Rows carry no description/details: the Task Detail pane fetches those
+  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {
@@ -172,9 +173,10 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency, recent, speculative,
-  //   active, active_spark, halt, train_events: [{event_type, task_id, run_id,
-  //   timestamp, data: {train_id, member_task_ids, ...event-specific keys}}]}}
+  // MERGE_QUEUE: {project_label: {depth, outcomes, latency, recent, recent_total,
+  //   speculative, active, active_spark, halt, train_events: [{event_type,
+  //   task_id, run_id, timestamp, data: {train_id, member_task_ids,
+  //   ...event-specific keys}}]}}
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -190,7 +192,7 @@ window.DF_DATA = {
   // in_progress_live + in_progress_stranded band the in_progress census; the
   // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
   // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], forecast_low: null, forecast_high: null, parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -299,9 +301,17 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt}`, published by refreshOne on the
-  // SUCCESS path only. datum.js::plainDatum reads this to give a value that
-  // is not yet served as a Datum the provenance it does have.
+  // each entry is `{servedAt, receivedAt, window}`, published by refreshOne
+  // on the SUCCESS path only. datum.js::plainDatum reads this to give a value
+  // that is not yet served as a Datum the provenance it does have.
+  //
+  // `window` is the served-window echo (`WINDOW: {requested, served, days}`)
+  // the four windowed endpoints carry, or null. It lives here, not in the key
+  // registry, because it describes the values currently in DF_DATA and must
+  // share their success-only lifetime: a failed refresh must not relabel data
+  // it did not replace. (It also could not be a registry key: four endpoints
+  // share the body key, and a registry key is both the body key and the
+  // DF_DATA key.) window_chip.js::windowEcho validates it at read.
   //
   // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
   // The two answer different questions and have different lifetimes. __stale
@@ -426,6 +436,33 @@ function recordFailure(st, deps) {
   st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
 }
 
+// Slowness pacing: one viewer's poll loop keeps an endpoint busy at most
+// MAX_POLL_DUTY_CYCLE of the wall clock, so the next request may not start
+// sooner than serviceMs / MAX_POLL_DUTY_CYCLE after the last one started. It
+// engages only above MAX_POLL_DUTY_CYCLE times the caller's poll interval:
+// below that, the tick alone already holds the endpoint under the cap. Pacing
+// lives in nextAllowedAt, so the chip-change bypass covers it too. Pinned by
+// data_poll.test.mjs's "Slowness pacing" section.
+const MAX_POLL_DUTY_CYCLE = 0.5;
+
+// Unlike recordFailure, a forced attempt still paces: pacing is a pure
+// function of the latest measurement, so clicks cannot inflate it.
+// Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
+// The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
+// slow body read, an injected deps.timeoutMs or a wall-clock jump
+// (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
+// with failures at 0 and no staleness banner.
+function recordSuccess(st, deps, startedAt, receivedAt) {
+  const serviceMs = receivedAt - startedAt;
+  const paced = deps.pollIntervalMs !== undefined
+    && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
+  st.failures = 0;
+  st.lastSuccessAt = receivedAt;
+  st.nextAllowedAt = paced
+    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
+    : 0;
+}
+
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
 // instead of every tick firing all 13 at once (task 185's lesson — 13
 // simultaneous requests hammering a single aiosqlite worker thread). Capped
@@ -513,10 +550,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: the gamma3
-// UI that opens a terminal has to tell "here are the rows" from "the server
-// said no" from "we did not even ask", and datumFor(key) reports the same
-// pre-request unknown Datum in all three cases.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
+// which requests a project's terminal window, has to tell "here are the rows"
+// from "the server said no" from "we did not even ask", and datumFor(key)
+// reports the same pre-request unknown Datum in all three cases, so it reads
+// onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
@@ -542,6 +580,25 @@ function onDemandView(value, outcome) {
   return ON_DEMAND_VIEWS.unavailable;
 }
 
+const ON_DEMAND_HOLE_REASONS = Object.freeze({
+  [ON_DEMAND_VIEWS.loading]: 'requested; waiting for the response',
+  [ON_DEMAND_VIEWS.unavailable]: 'the request for it did not succeed',
+});
+
+// onDemandView's answer as the Datum a REQUESTING caller renders: the stored,
+// receipt-stamped Datum once one has landed, else a hole naming what its own
+// request is doing — never datumFor's 'not yet fetched'. A PLAIN row has no
+// Datum to answer with, so asking for one is refused.
+function onDemandDatum(name, param, outcome) {
+  const row = onDemandRow(name);
+  if (row.spec !== DATUM) {
+    throw new Error(`DF_DATA: on-demand key '${name}' is not datum-kinded, so it has no Datum to answer with`);
+  }
+  const value = window.DF_DATA[row.key(param)];
+  const view = onDemandView(value, outcome);
+  return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
+}
+
 // `stateKey` names the flow-control, staleness and receipt entry this request
 // owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
 // and every existing direct caller keeps working. An on-demand request passes
@@ -552,6 +609,9 @@ function onDemandView(value, outcome) {
 // a datum-kinded key applyKey then REFUSED is reported by its own console.warn
 // above, because that is a server schema break rather than an outcome this
 // request can act on.
+//
+// `deps.pollIntervalMs` is the cadence the caller re-polls at, set by
+// refreshDFData; when it is absent the request is one-shot and never paced.
 async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
   // already in flight for this endpoint — skip this tick, do not queue
@@ -589,6 +649,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
         reject(new Error(`DF_DATA fetch timed out after ${timeoutMs}ms: ${url}`));
       }, timeoutMs);
     });
+    const startedAt = deps.now();
     const resp = await Promise.race([
       deps.fetchImpl(url, { credentials: 'same-origin', signal: controller ? controller.signal : undefined }),
       timedOut,
@@ -601,11 +662,9 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // ONE clock reading for the whole response, so every key it carries shares
     // a single arrival instant — and so `lastSuccessAt` below cannot drift
     // from `receivedAt` by however long the applies took.
-    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now() };
+    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now(), window: body.WINDOW ?? null };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
-    st.failures = 0;
-    st.nextAllowedAt = 0;
-    st.lastSuccessAt = receipt.receivedAt;
+    recordSuccess(st, deps, startedAt, receipt.receivedAt);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {
@@ -663,12 +722,13 @@ const DEFAULT_POLL_DEPS = {
 // — the other 9 endpoints have no bearing on the chip and must keep
 // respecting whatever backoff the TIMER path already accumulated for them,
 // otherwise a chip click during an outage would re-hammer every endpoint,
-// recreating exactly the load this task removes. A forced attempt that
-// still fails does not touch failures/nextAllowedAt (see recordFailure), so
-// repeated chip clicks cannot escalate the timer path's own backoff
-// schedule. The in-flight check in refreshOne is unconditional regardless
-// of ignoreBackoff, so a chip change still cannot stack a second concurrent
-// request for an endpoint that's already running.
+// recreating exactly the load this task removes. The same bypass skips
+// slowness pacing, which shares nextAllowedAt (see recordSuccess). A forced
+// attempt that still fails does not touch failures/nextAllowedAt (see
+// recordFailure), so repeated chip clicks cannot escalate the timer path's
+// own backoff schedule. The in-flight check in refreshOne is unconditional
+// regardless of ignoreBackoff, so a chip change still cannot stack a second
+// concurrent request for an endpoint that's already running.
 async function refreshDFData(win, opts) {
   const o = opts || {};
   const isChipChange = typeof win === 'string' && win;
@@ -678,6 +738,7 @@ async function refreshDFData(win, opts) {
     ...DEFAULT_POLL_DEPS,
     ...o.deps,
     jitterMaxMs: o.jitterMaxMs ?? JITTER_MAX_MS,
+    pollIntervalMs: POLL_INTERVAL_MS,
   };
   await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keySpecs]) => {
     const ignoreBackoff = !!(isChipChange && url.includes('?window='));
@@ -708,6 +769,11 @@ async function refreshDFData(win, opts) {
 // single user-triggered request has nothing to spread against, and delaying it
 // would only be latency the user sees.
 //
+// NO PACING. startOnDemand clears deps.pollIntervalMs after the overrides, so a
+// poll deps object spread in cannot switch pacing on: a duty-cycle cap is a
+// property of a repeating loop, and pacing a user action would turn a
+// re-request of a slow listing into skippedBackoff.
+//
 // RETURNS the refreshOne outcome of the request serving this call. A user
 // action is the one caller that cannot just wait for the next tick: without
 // it, an awaited request resolves identically whether the Datum landed, the
@@ -720,10 +786,7 @@ async function refreshDFData(win, opts) {
 // abandoned (the Task Detail pane re-selecting a task) would wait forever on a
 // request that failed.
 async function requestOnDemand(name, param, opts) {
-  const row = ON_DEMAND_KEYS[name];
-  if (!row) {
-    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
-  }
+  const row = onDemandRow(name);
   const o = opts || {};
   const state = o.state || DF_POLL_STATE;
   const ledger = onDemandLedger(state, name);
@@ -735,9 +798,17 @@ async function requestOnDemand(name, param, opts) {
   return request;
 }
 
+function onDemandRow(name) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row) {
+    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
+  }
+  return row;
+}
+
 function startOnDemand(name, param, state, depsOverrides, ledger) {
   const row = ON_DEMAND_KEYS[name];
-  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0 };
+  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0, pollIntervalMs: undefined };
   const request = refreshOne(
     row.url(param),
     { [row.key(param)]: row.spec },
@@ -849,6 +920,7 @@ const DF_DATA_LOADER_API = {
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
+  onDemandDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

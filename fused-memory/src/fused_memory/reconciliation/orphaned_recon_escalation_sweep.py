@@ -51,7 +51,8 @@ Design decisions (captured in plan.json):
 
 - The classifier is compared against EACH RECORD'S OWN project's task store,
   resolved through ``BaseStage.known_projects``.  A record whose
-  ``project_id`` cannot be parsed, or that names a project absent from that
+  ``project_id`` cannot be resolved — from the stamped field or, failing that,
+  from the detail-block prose — or that names a project absent from that
   map, is counted ``unresolvable`` and is NEVER called an orphan — classifying
   a foreign record against the querying project's census would tell the sole
   closer to resolve a record whose subject may still be legitimately
@@ -69,6 +70,9 @@ Design decisions (captured in plan.json):
 - Best-effort, and fail-SAFE in ONE direction: an errored read is never
   evidence of terminality.  A false ``terminal`` hands the sole closer a live
   record; a missed detection merely waits for the next cycle.
+- The in-cycle FLAGS are scoped to the running project, while the counts and
+  the operator reap stay fleet-wide; the rationale and trade-off live at
+  ``::sweep_orphaned_recon_escalations``.
 """
 
 from __future__ import annotations
@@ -81,7 +85,8 @@ logger = logging.getLogger(__name__)
 
 # The two recon stale families this reaper covers.  Both are pending L1
 # records filed per-subject-task by Stage 1 whose premise a terminal subject
-# genuinely moots, both write ``project_id:`` as their first detail line, and
+# genuinely moots, both stamp ``Escalation.project_id`` and also write
+# ``project_id:`` as their first detail line (the source legacy records have), and
 # ``skills/recon-escalation-watcher/SKILL.md`` already treats their playbook
 # rows identically ("Same aging/park shape as reconciliation_stale_gate_backlog
 # above").  ``reconciliation_stale_human_operator`` has ZERO pending records
@@ -115,48 +120,67 @@ ORPHANED_ESCALATION_FLAG_TYPE = 'orphaned_recon_escalation'
 # category.
 ORPHANED_ESCALATION_FLAG_CATEGORY = 'cross_store_inconsistency'
 
-# The detail-block key both producers write.  Compared case-sensitively and
-# anchored to the start of a stripped line so a ``project_id`` mention inside
-# a free-text ``description:`` line cannot be mistaken for the field.
+# The detail-block key both producers write, read only as the FALLBACK source
+# for records carrying no stamped ``Escalation.project_id``.  Compared
+# case-sensitively and anchored to the start of a stripped line so a
+# ``project_id`` mention inside a free-text ``description:`` line cannot be
+# mistaken for the key.
 _PROJECT_ID_DETAIL_KEY = 'project_id:'
 
 
 def escalation_project_id(esc):
-    """Return the subject ``project_id`` parsed out of *esc*'s detail block.
+    """Return *esc*'s subject ``project_id``, preferring the structured field.
 
-    DELIBERATE INV-2 EXCEPTION.  ``escalation.models.Escalation`` has no
-    ``project_id`` field (verified: zero occurrences in
-    ``escalation/src/escalation/models.py``), so there is no structured fact
-    to read and the value must be recovered from prose.  Adding the field
-    would help only FUTURE records; the entire population this reaper exists
-    to clear is the records already on disk, which would still need parsing.
-    This function is therefore the SINGLE owner of that parse — the in-cycle
-    sweep and ``scripts/derive_orphaned_recon_escalations.py`` both call it,
-    so the rule cannot drift into two copies that disagree.
-
-    The line is written by both producers as the FIRST entry of their
-    ``detail_parts`` list —
+    FIELD FIRST.  ``escalation.models.Escalation`` carries a ``project_id``
+    field (task 4951), stamped by both producers —
     ``stage1_stall_detector.py::maybe_escalate_stalled_gate_backlog`` and
-    ``stage1_stall_detector.py::maybe_escalate_stalled_tasks`` — but position
-    is not relied upon here: the first line whose stripped form starts with
-    ``project_id:`` wins.  Empirical basis for treating the parse as total: 0
-    of 124 live pending records fail it, across both observed detail vintages
-    (``age_hours_at_filing:`` and the older ``age_hours:`` shape still carried
-    by ``esc-5943-1``).
+    ``::maybe_escalate_stalled_tasks`` — from the same value they render into
+    ``detail``.  Reading the structured fact rather than re-deriving it from a
+    rendered string is the INV-2 shape.  This function is the SINGLE owner of
+    the derivation: the in-cycle sweep and
+    ``scripts/derive_orphaned_recon_escalations.py`` both call it, so the two
+    channels cannot drift into disagreeing about which project a record names.
 
-    Splits on the FIRST colon only, so a value that itself contains a colon is
-    returned whole rather than silently truncated (a truncated id would miss
-    ``known_projects`` and be counted ``unresolvable`` — fail-safe, but an
-    avoidable recall loss).
+    The field is read with ``getattr``, not attribute access, and only a
+    non-empty ``str`` is accepted; anything else falls through to the prose
+    parse below.  ``None`` on the field means UNSTAMPED, never "no project".
 
-    Returns ``None`` when *esc* has no readable ``detail``, or its detail
-    carries no ``project_id:`` line, or the parsed value is empty.  NEVER
-    raises: detail is deserialised from JSON on disk, so a malformed record
-    must degrade to ``unresolvable`` rather than abort the sweep for every
-    other record.
+    WHY THE PROSE FALLBACK IS RETAINED, and why it is not transitional.  A
+    ``reconciliation_stale_gate_backlog`` refiling normally FOLDS into an
+    existing pending parent: on ``escalation/dedupe.py``'s ``dedup_skipped``
+    branch the child ``Escalation`` is never written to disk at all, and
+    ``attach_dedupe_child`` bumps only ``dedupe_count`` / ``dedupe_children``
+    / ``severity`` / ``updated_at`` — it backfills no parent field.  So the
+    records already pending will NEVER gain the field no matter how many
+    cycles run; the field populates only for records minted fresh.  This
+    fallback's population therefore shrinks only as individual legacy parents
+    are resolved, not on its own, and deleting it would also blind every
+    folded child.  Re-anchoring live parents in place is deliberately left to
+    a separately reviewable operator action, matching the precedent
+    ``dedupe.py::gate_backlog_fingerprint_key`` already set.
+
+    The parse: both producers write ``project_id:`` as the FIRST entry of
+    their ``detail_parts`` list, but position is not relied upon — the first
+    line whose stripped form starts with the key wins.  Measured 2026-09-02:
+    0 of 124 live pending records failed it, across both observed detail
+    vintages (``age_hours_at_filing:`` and the older ``age_hours:`` shape
+    still carried by ``esc-5943-1``).  Splits on the FIRST colon only, so a
+    value that itself contains a colon is returned whole rather than silently
+    truncated (a truncated id would miss ``known_projects`` and be counted
+    ``unresolvable`` — fail-safe, but an avoidable recall loss).
+
+    Returns ``None`` when neither source yields a value: no usable field, and
+    no readable ``detail``, or a detail with no ``project_id:`` line, or an
+    empty parsed value.  NEVER raises — both the field and detail are
+    deserialised from JSON on disk, so a malformed record must degrade to
+    ``unresolvable`` rather than abort the sweep for every other record.
 
     Pure: no I/O, no side effects.
     """
+    field_value = getattr(esc, 'project_id', None)
+    if isinstance(field_value, str) and field_value:
+        return field_value
+
     detail = getattr(esc, 'detail', None)
     if not isinstance(detail, str):
         return None
@@ -365,35 +389,16 @@ def build_orphaned_escalation_flag(
     escalation id instead would make every re-file of the same subject look
     like a brand-new finding.
 
-    RESIDUAL, UNFIXED HERE: that key is NOT project-qualified, and the subject
-    frequently belongs to a project OTHER than the one running Stage 1 (live
-    subjects span seven projects — dark_factory 56, reify 48, autopilot_video
-    7, ...).  ``flag_dedup.dedup_flags`` keys the ledger row on
-    ``(project_id=the RUNNING project, task_id, flag_type)``, and task ids are
-    per-project counters that all start near 1, so two orphan records with the
-    same numeric subject id in DIFFERENT projects share one row: their
-    recurrence counts conflate, and a cross-project fix-task suppression
-    decision computed for one can suppress the other's flag.  Nothing in the
-    marker payload distinguishes them either — ``dedup_flags`` persists only
-    ``task_id``/``flag_type``/``run_id`` (task 4712 retired the ``cited_tasks``
-    payload write), so the conflation is not even auditable after the fact.
-
-    Two fixes were considered and BOTH rejected as worse than the residual.
-    (a) Adding ``cited_tasks=[{'project_id': subject, 'task_id': tid}]``: it
-    buys no auditability for the reason just given, and it is actively harmful
-    — ``_resolve_live_cross_project_fix_task`` is FOREIGN-ONLY and
-    ``_cited_fix_task_live`` counts a ``done`` task as live, so citing a
-    ``done`` subject in another project would make a carried-forward orphan
-    flag suppress ITSELF for up to ``_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES``
-    (8) cycles, silencing the largest class of true findings.  (b) A composite
-    ``'dark_factory:650'`` ``task_id``: ``_is_valid_marker_task_id`` rejects
-    it, which would make the flag bypass dedup entirely and re-emit unmarked
-    every cycle — the exact failure the placement-above-``dedup_flags``
-    comment in ``stages/memory_consolidator.py`` exists to avoid.  A real fix
-    means teaching ``flag_dedup`` a project-qualified marker shape, which is
-    that module's change to make, not this one's.  Until then the flag's
-    DESCRIPTION always names the subject's project, so a closer reading the
-    finding is never misled even when the recurrence row is shared.
+    That key carries no project: ``flag_dedup.dedup_flags`` keys the ledger
+    row on ``(project_id=the RUNNING project, task_id, flag_type)``.  For this
+    flag_type it is project-correct by construction, because
+    ``sweep_orphaned_recon_escalations`` emits a flag only when the subject's
+    project IS the running project.  A generic project-qualified marker
+    (task 5614, which also records why ``cited_tasks`` and a composite
+    ``task_id`` were rejected) remains ``flag_dedup``'s change to make, for
+    other producers.  The flag's DESCRIPTION always names the subject's
+    project regardless, so a closer reading the finding never has to infer
+    which store to check.
 
     Args:
         esc: The pending ``Escalation`` being reported.
@@ -678,7 +683,7 @@ async def classify_pending_escalations(
     THE SINGLE OWNER OF THE WHOLE DERIVATION, composition included — not just
     of the leaf predicates.  Both channels call exactly this coroutine: the
     in-cycle Stage-1 sweep (``sweep_orphaned_recon_escalations``, which then
-    only builds flags) and the operator reap
+    builds flags for the running project's records only) and the operator reap
     (``fused-memory/scripts/derive_orphaned_recon_escalations.py``, which then
     only adds the ``queue.resolve`` step).  Sharing only the leaf predicates
     was not enough: the two copies of this loop had already drifted in how
@@ -811,9 +816,10 @@ async def sweep_orphaned_recon_escalations(
     taskmaster,
     known_projects,
     *,
+    running_project_id: str,
     log = logger,
 ):
-    """Flag every pending recon stale record whose subject went terminal or vanished.
+    """Flag this project's pending recon stale records whose subject went terminal or vanished.
 
     DETECTION ONLY.  This function never calls ``escalation_queue.resolve()``:
     the A7b contract above
@@ -827,6 +833,17 @@ async def sweep_orphaned_recon_escalations(
     the derivation itself and the operator script consumes the very same pass,
     so the two channels cannot disagree about which records are safe to close.
 
+    FLAGS ARE SCOPED TO THE RUNNING PROJECT; COUNTS ARE NOT (task 5813).  The
+    recon queue is shared fleet-wide, so unscoped, every project's cycle
+    re-flagged every orphan under a bare numeric task id that names an
+    unrelated local task there (measured 2026-09-23: the same 17 orphans
+    flagged in 5 projects).  The whole queue is still classified, so the
+    counts stay fleet-wide; only the flags are filtered, on the subject
+    project ``escalation_project_id`` derived.  The trade-off: an orphan whose
+    subject project never runs a recon cycle is never FLAGGED.  It is still
+    CLOSED, because ``derive_orphaned_recon_escalations.py --apply`` stays
+    fleet-wide and the recon-escalation-watcher skill runs it every loop cycle.
+
     Args:
         escalation_queue: An ``EscalationQueue`` over the RECON queue dir.
             Only ``get_pending()`` (sync) is called — the queue root, which
@@ -836,12 +853,16 @@ async def sweep_orphaned_recon_escalations(
         known_projects: ``{project_id: project_root}``, i.e.
             ``BaseStage.known_projects``.  A record naming a project absent
             from this map is ``unresolvable``, never an orphan.
+        running_project_id: The project whose Stage-1 cycle is calling, i.e.
+            ``BaseStage.project_id``.  Required, with no "every project"
+            default, so no caller can silently restore the fleet-wide fan-out.
         log: Logger to use (default: this module's logger).
 
     Returns:
         dict with ``flags`` (Stage-1 flag dicts to append to
-        ``report.items_flagged``) and the always-present int counts
-        :data:`_CLASSIFICATION_COUNT_KEYS`, so a caller never needs a
+        ``report.items_flagged``, for *running_project_id*'s orphans only) and
+        the always-present int counts :data:`_CLASSIFICATION_COUNT_KEYS`,
+        which cover the WHOLE queue, so a caller never needs a
         ``.get(..., 0)`` fallback and can read the degraded-cycle signature
         (``errors > 0``) apart from the clean-but-empty one directly.
 
@@ -877,6 +898,7 @@ async def sweep_orphaned_recon_escalations(
                 subject_status=orphan.subject_status,
             )
             for orphan in orphans
+            if orphan.project_id == running_project_id
         ],
         **counts,
     }

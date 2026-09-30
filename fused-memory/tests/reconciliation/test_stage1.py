@@ -5718,3 +5718,36 @@ class TestGateOwnedActionPhrasingWiring:
             'exactly one of the two flags citing gate 645 is normalized; got '
             f'stats={report.stats!r}'
         )
+
+
+class TestStage1LiveStateFreshnessSection:
+    """The Stage-1 live-state freshness section (task 5271) renders its benign
+    deleter list from recon_self_model.MEM0_TOMBSTONE_DELETERS, the tuple the
+    code-side sweep_deletion_guard reads, so the two cannot drift apart."""
+
+    def _section(self) -> str:
+        from fused_memory.reconciliation.prompts.stage1 import (
+            LIVE_STATE_FRESHNESS_HEADING,
+            STAGE1_SYSTEM_PROMPT,
+        )
+
+        start = STAGE1_SYSTEM_PROMPT.index(LIVE_STATE_FRESHNESS_HEADING)
+        end = STAGE1_SYSTEM_PROMPT.find('\n## ', start + len(LIVE_STATE_FRESHNESS_HEADING))
+        return STAGE1_SYSTEM_PROMPT[start:] if end == -1 else STAGE1_SYSTEM_PROMPT[start:end]
+
+    def test_heading_occurs_exactly_once(self):
+        from fused_memory.reconciliation.prompts.stage1 import (
+            LIVE_STATE_FRESHNESS_HEADING,
+            STAGE1_SYSTEM_PROMPT,
+        )
+
+        assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
+
+    def test_every_documented_deleter_is_rendered_in_the_section(self):
+        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
+
+        section = self._section()
+        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
+        assert not missing, (
+            f'the section must name every documented sweep deleter; missing {missing!r}'
+        )

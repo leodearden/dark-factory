@@ -1,0 +1,233 @@
+"""Wiring of the Tasks tab's on-demand terminal window and its PRD-box count.
+
+PRD decisions 5 and 8 (plans/dashboard-one-datum-one-path-prd.md) and task
+4416's option (a): terminal rows are never on the default render; the Tasks tab
+requests a project's ``?terminal=<project>`` window when the terminal view is
+selected or that project is grouped by PRD, and a PRD box reads '≥n/m terminal'
+from a lower_bound Datum over the snapshot rows and that window.
+
+This file pins only the WIRING, on comment-stripped served source. The rules
+themselves execute under node: which projects request the window in
+task_snapshot.test.mjs (terminalWindowProjects), what a requesting caller shows
+in data_poll.test.mjs (onDemandDatum), and the PRD count in
+prd_grouping.test.mjs (prdProgress, prdProgressReading).
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+from _dashboard_helpers import (
+    extract_function_body,
+    find_function_params,
+    strip_js_comments,
+    walk_balanced,
+)
+
+
+@pytest.fixture(scope='module')
+def tab_tasks_code(tab_tasks_jsx_body):
+    return strip_js_comments(tab_tasks_jsx_body)
+
+
+@pytest.fixture(scope='module')
+def tasks_tab_code(tab_tasks_code):
+    return extract_function_body(tab_tasks_code, 'TasksTab')
+
+
+@pytest.fixture(scope='module')
+def wanted(tasks_tab_code):
+    """The name TasksTab binds the requesting projects to; the probes follow it."""
+    calls = re.findall(r'\bconst\s+(\w+)\s*=\s*terminalWindowProjects\(', tasks_tab_code)
+    assert len(calls) == 1, f'TasksTab binds terminalWindowProjects(...) {len(calls)} times; expected one'
+    return calls[0]
+
+
+def _binding(code: str, name: str) -> str:
+    """The right-hand side of ``const <name> = ...;`` in *code*."""
+    match = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*([^;]*);', code)
+    assert match, f'`{name}` is not bound by a `const` in TasksTab'
+    return match.group(1)
+
+
+def _view_rows_args(tasks_tab_code: str) -> list[list[str]]:
+    calls = []
+    for match in re.finditer(r'\bviewRows\(', tasks_tab_code):
+        call = walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
+        calls.append([arg.strip() for arg in call[1:-1].split(',')])
+    return calls
+
+
+def test_the_wanted_set_is_terminal_window_projects_over_the_visible_projects(tasks_tab_code, wanted):
+    args = re.search(rf'\bconst\s+{wanted}\s*=\s*terminalWindowProjects\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)', tasks_tab_code)
+    assert args, f'{wanted} is not terminalWindowProjects(<project ids>, <filter>, <grouped ids>)'
+    ids, view_filter, grouped = args.groups()
+    assert re.fullmatch(r'projects\.map\(\s*(\w+)\s*=>\s*\1\.id\s*\)', _binding(tasks_tab_code, ids).strip()), (
+        f'`{ids}` is not the visible projects\' ids'
+    )
+    assert re.fullmatch(
+        rf"{ids}\.filter\(\s*(\w+)\s*=>\s*groupByPrdMap\[\s*\1\s*\]\s*===\s*'prd'\s*\)",
+        _binding(tasks_tab_code, grouped).strip(),
+    ), f'`{grouped}` is not the ids whose groupByPrdMap entry is \'prd\''
+    assert any(call[2] == view_filter for call in _view_rows_args(tasks_tab_code)), (
+        f'`{view_filter}` is not the view filter the listed rows are selected by'
+    )
+
+
+def test_the_window_is_requested_once_per_entry_into_the_wanted_set(tasks_tab_code, wanted):
+    effects = [
+        walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
+        for match in re.finditer(r'\buE_T\s*\(', tasks_tab_code)
+    ]
+    requesting = [e for e in effects if re.search(r"DF_LOADER_T\.requestOnDemand\(\s*'terminal'\s*,", e)]
+    assert len(requesting) == 1, f'{len(requesting)} effects request the terminal window; expected one'
+    [effect] = requesting
+    deps = re.search(r',\s*\[\s*(\w+)\s*\]\s*\)\Z', effect)
+    assert deps, (
+        'the terminal request must run in an effect keyed on ONE derived key of the wanted '
+        f'set: once per entry into it, never on the 3 s poll and never only on mount. Found: {effect}'
+    )
+    assert re.fullmatch(rf'{wanted}\.join\([^)]*\)', _binding(tasks_tab_code, deps.group(1)).strip()), (
+        f'the effect key `{deps.group(1)}` is not derived from `{wanted}`'
+    )
+    assert re.search(r'\.then\(\s*\(?\s*(\w+)\s*\)?\s*=>[^;]*\bset\w+\([^;]*\b\1\b', effect), (
+        'the effect does not record the request outcome into state'
+    )
+
+
+def test_a_project_already_in_the_wanted_set_is_not_requested_again(tasks_tab_code, wanted):
+    """Only the entrants are requested; which ids those are executes in task_snapshot.test.mjs."""
+    [effect] = [
+        e for e in (
+            walk_balanced(tasks_tab_code, match.end() - 1, '(', ')')
+            for match in re.finditer(r'\buE_T\s*\(', tasks_tab_code)
+        )
+        if "requestOnDemand('terminal'" in e
+    ]
+    entrants = re.search(rf'\bconst\s+(\w+)\s*=\s*terminalWindowEntrants\(\s*(\w+)\.current\s*,\s*{wanted}\s*\)', effect)
+    assert entrants, (
+        f'the effect does not compute terminalWindowEntrants(<ref>.current, {wanted}): every key change '
+        're-requests the window of each project already wanted'
+    )
+    arrived, before = entrants.groups()
+    assert re.search(rf'\bconst\s+{before}\s*=\s*uR_T\(', tasks_tab_code), f'`{before}` is not a ref TasksTab holds'
+    assert re.search(rf'\b{before}\.current\s*=\s*{wanted}\s*;', effect), (
+        f'the effect never records {wanted} as `{before}.current`, so the next run cannot tell who entered'
+    )
+    loop = re.search(r'\bfor\s*\(\s*const\s+(\w+)\s+of\s+(\w+)\s*\)', effect)
+    assert loop and loop.group(2) == arrived, f'the request loop does not iterate `{arrived}`: {effect}'
+    assert re.search(rf"\b{arrived}\.map\(\s*(\w+)\s*=>\s*\[\s*\1\s*,\s*null\s*\]", effect), (
+        f'only the entrants\' outcomes are reset to null; resetting `{wanted}` blanks settled ones'
+    )
+    assert not re.search(r'\breturn\s*\(\s*\)\s*=>', effect), (
+        'a cleanup that drops pending outcomes loses a still-wanted project\'s: the next run '
+        'does not request it again'
+    )
+
+
+def test_a_requesting_project_reads_its_own_outcome_and_the_rest_read_the_unrequested_window(
+    tasks_tab_code, tab_tasks_code, wanted,
+):
+    assert re.search(
+        rf"{wanted}\.includes\(\s*(\w+)\s*\)\s*\?\s*DF_LOADER_T\.onDemandDatum\(\s*'terminal'\s*,\s*\1\s*,[^:]*"
+        r':\s*unrequestedTerminalRows\(\s*DF_T\[\s*DF_LOADER_T\.ON_DEMAND_KEYS\.terminal\.key\(\s*\1\s*\)\s*\]\s*\)',
+        tasks_tab_code,
+    ), (
+        'a wanted project must read DF_LOADER_T.onDemandDatum(\'terminal\', id, <outcome>), and every '
+        'other project unrequestedTerminalRows(DF_T[DF_LOADER_T.ON_DEMAND_KEYS.terminal.key(id)])'
+    )
+    assert 'TASKS_TERMINAL:' not in tab_tasks_code, (
+        'the TASKS_TERMINAL: key is built in data.js only; a literal here can drift from it'
+    )
+
+
+def test_the_flat_view_the_grouped_view_and_the_prd_count_read_one_terminal_datum(tasks_tab_code):
+    calls = _view_rows_args(tasks_tab_code)
+    assert len(calls) == 2, f'TasksTab calls viewRows {len(calls)} times; expected the listed and the held rows'
+    rows, terminal = {call[0] for call in calls}, {call[1] for call in calls}
+    assert len(rows) == 1 and len(terminal) == 1, f'the two viewRows calls read different Datums: {calls}'
+    [rows], [terminal] = rows, terminal
+    grouped = re.search(r'<ProjectPrdGroups\b(.*?)/>', tasks_tab_code, re.DOTALL)
+    assert grouped, 'TasksTab renders no <ProjectPrdGroups ... />'
+    for prop, datum in (('rows', rows), ('terminal', terminal)):
+        assert re.search(rf'\b{prop}=\{{\s*{datum}\s*\}}', grouped.group(1)), (
+            f'<ProjectPrdGroups> is not handed {prop}={{{datum}}}, the Datum the rows are listed from'
+        )
+    source = re.search(rf'\bconst\s+{terminal}\s*=\s*(\w+)\(\s*p\.id\s*\)', tasks_tab_code)
+    assert source, f'`{terminal}` is not read per project through one helper'
+    assert 'onDemandDatum(' in _binding(tasks_tab_code, source.group(1)), (
+        f'`{source.group(1)}` does not route a wanted project to onDemandDatum'
+    )
+
+
+class TestThePrdCountIsMemoised:
+    """The count is rebuilt when a poll lands, not on the app's 1 s clock tick.
+
+    projectRows and the terminal readers stamp a fresh copy on every call, so a
+    memo cannot key on their identity; useHeldDatum keeps the copy it already
+    holds while task_snapshot.js::sameDatum says the new one is the same Datum.
+    Which copies are the same executes in task_snapshot.test.mjs.
+    """
+
+    @pytest.fixture(scope='class')
+    def project_prd_groups_code(self, tab_tasks_code):
+        return extract_function_body(tab_tasks_code, 'ProjectPrdGroups')
+
+    def test_tasks_tab_does_not_rebuild_the_count_per_render(self, tasks_tab_code):
+        assert 'prdProgress(' not in tasks_tab_code, (
+            'TasksTab calls prdProgress inline, so every render regroups the whole project'
+        )
+
+    def test_the_count_is_a_memo_over_the_held_rows_and_terminal_datums(self, project_prd_groups_code):
+        held = {}
+        for prop in ('rows', 'terminal'):
+            match = re.search(rf'\bconst\s+(\w+)\s*=\s*useHeldDatum\(\s*{prop}\s*\)', project_prd_groups_code)
+            assert match, f'ProjectPrdGroups does not hold its `{prop}` prop through useHeldDatum'
+            held[prop] = match.group(1)
+        rows, terminal = held['rows'], held['terminal']
+        assert re.search(
+            rf'\buM_T\(\s*\(\)\s*=>\s*prdProgress\(\s*{rows}\s*,\s*{terminal}\s*\)\s*,\s*\[\s*{rows}\s*,\s*{terminal}\s*\]\s*\)',
+            project_prd_groups_code,
+        ), f'the PRD count is not uM_T(() => prdProgress({rows}, {terminal}), [{rows}, {terminal}])'
+
+    def test_a_held_datum_is_replaced_only_when_it_is_not_the_same_datum(self, tab_tasks_code):
+        hook = extract_function_body(tab_tasks_code, 'useHeldDatum')
+        ref = re.search(r'\bconst\s+(\w+)\s*=\s*uR_T\(', hook)
+        assert ref, 'useHeldDatum keeps no ref'
+        assert re.search(rf'\bif\s*\(\s*!\s*sameDatum\(\s*{ref.group(1)}\.current\s*,', hook), (
+            'useHeldDatum does not compare the held Datum with task_snapshot.js::sameDatum'
+        )
+
+
+class TestThePrdBoxCount:
+    @pytest.fixture(scope='class')
+    def prd_box_code(self, tab_tasks_code):
+        return extract_function_body(tab_tasks_code, 'PrdBox')
+
+    def test_the_count_is_the_progress_datum_read_as_terminal_of_total(self, prd_box_code):
+        count = re.search(r'<span\s+className="prd-box-count"[^>]*>(.*?)</span>\s*</div>', prd_box_code, re.DOTALL)
+        assert count, 'PrdBox renders no .prd-box-count span'
+        assert re.fullmatch(
+            r'\s*<DatumReading\s+datum=\{\s*\w+\s*\}\s+format=\{\s*prdProgressReading\([^)]*\)\s*\}\s*/>\s*terminal\s*',
+            count.group(1),
+        ), f'the PRD count is not <DatumReading datum={{…}} format={{prdProgressReading(…)}} /> terminal: {count.group(1)!r}'
+        assert not re.search(r'\.views\.terminal\s*\}\s*/\s*\{', prd_box_code), (
+            'the interim n/m tally over the client-held members is still rendered'
+        )
+
+    @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])
+    def test_the_box_takes_no_focus_state(self, tab_tasks_jsx_body, focus_prop):
+        masked, start, end = find_function_params(tab_tasks_jsx_body, 'PrdBox')
+        params = tab_tasks_jsx_body[start:end]
+        assert params.strip(), 'PrdBox declares no parameters; the absence below would be vacuous'
+        assert not re.search(rf'\b{focus_prop}\b', params), f'PrdBox takes {focus_prop}: {params.strip()!r}'
+
+
+def test_a_selected_terminal_task_opens_in_the_detail_pane(tasks_tab_code, wanted):
+    found = re.search(r'\bconst\s+selectedTask\s*=\s*selectedId\s*\?\s*(\w+)\.find\(', tasks_tab_code)
+    assert found, 'selectedTask is not looked up with `.find(` over one binding'
+    assert re.search(rf'\[\s*\.\.\.allTasks\s*,\s*\.\.\.{wanted}\.flatMap\(', _binding(tasks_tab_code, found.group(1))), (
+        f'`{found.group(1)}` does not add the wanted projects\' landed terminal rows to allTasks, so a '
+        'selected done or cancelled node could never open in TaskDetail'
+    )

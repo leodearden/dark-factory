@@ -21,34 +21,28 @@
 // over dashboard/tests/js/ — no pytest wrapper change is needed (same as
 // esc_flow_layout.test.mjs and runtime_format.test.mjs before it).
 //
-// SCOPE — the CLASSIC `.js` scripts are covered, and they are exactly the
-// files at risk. The 15 `type="text/babel"` `.jsx` tags in index.html do NOT
-// share this hazard: Babel-standalone transforms them at runtime and
-// downlevels their top-level bindings, so those bindings never join the
-// classic-script global lexical scope. That is an observed fact, not an
-// assumption — `tab_escalations.jsx`, `tab_escalation_analytics.jsx` and
-// `esc_flow_diagram.jsx` each declare a top-level `const C`;
-// `tab_curator.jsx`, `tab_overview.jsx` and `tab_scheduler.jsx` each declare
-// `const D`; `tabs.jsx`, `tab_escalations.jsx` and
-// `tab_escalation_analytics.jsx` each declare `const DF`, `usePersistedState`
-// and `useOpenSet` — and every one of those tabs renders fine in the browser.
-// Under a shared lexical scope those triples would kill each other on load.
-// So there is no uncovered `.jsx` gap to chase here, and the duplicated
-// `.jsx` names above are correct as written rather than latent collisions.
+// SCOPE — the `type="text/babel"` `.jsx` tags join this scope too, one way
+// round. Babel-standalone compiles every top-level binding of a .jsx file,
+// destructures included, into a global `var`, and injects the result as a
+// classic script after all the `.js` tags. A `var` never collides with another
+// `var` or with a classic `function`, so .jsx files may repeat each other's
+// names; it DOES collide with any classic top-level `const`/`let`/`class`, and
+// then none of that .jsx file runs. The text/babel tests below compile each
+// tag with the Babel build index.html pins and probe it against this scope.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 // Mirrors the relative-path idiom in esc_flow_layout.test.mjs /
 // runtime_format.test.mjs: resolve the served asset directory from this test
 // file's own location rather than from process.cwd().
-const REDUX_DIR = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '../../src/dashboard/static/redux',
-);
+const TESTS_JS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REDUX_DIR = path.resolve(TESTS_JS_DIR, '../../src/dashboard/static/redux');
 
 const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
 
@@ -60,12 +54,9 @@ const EXPECTED_WINDOW_GLOBALS = {
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
   'prd_grouping.js': 'DF_PRD_GROUPING',
-  'task_status_counts.js': 'DF_TASK_STATUS_COUNTS',
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
   'orch_filter.js': 'DF_ORCH_FILTER',
-  'orch_summary.js': 'DF_ORCH_SUMMARY',
-  'task_done_count.js': 'DF_TASK_DONE_COUNT',
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
   'spark_path.js': 'DF_SPARK_PATH',
   'memory_evals_fmt.js': 'DF_MEMORY_EVALS_FMT',
@@ -75,7 +66,9 @@ const EXPECTED_WINDOW_GLOBALS = {
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
+  'task_snapshot.js': 'DF_TASK_SNAPSHOT',
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
+  'window_chip.js': 'DF_WINDOW_CHIP',
 };
 
 function readIndexHtml() {
@@ -143,6 +136,12 @@ test('index.html exposes the classic /static/redux/*.js scripts in document orde
     `extracted no classic /static/redux/*.js <script> tags from ${INDEX_HTML} — ` +
       'the extraction regex has gone stale, which would make the shared-scope ' +
       'load test below silently cover nothing',
+  );
+  assert.equal(
+    srcs.length,
+    readIndexHtml().match(/src="\/static\/redux\/[^"?]+\.js[?"]/g).length,
+    'CLASSIC_SCRIPT_RE missed some /static/redux/*.js <script> tag, which would silently ' +
+      `drop it from the shared-scope load below. Extracted: ${srcs.join(', ')}`,
   );
 
   // Inverse containment: every module this harness CLAIMS to cover must
@@ -268,5 +267,178 @@ test('the harness actually detects a duplicate top-level const (negative control
     'redeclaring graph_layout.js\'s top-level export const in the same context ' +
       'did not throw — the shared-scope harness is not actually sharing scope, ' +
       'so the load test above proves nothing',
+  );
+});
+
+// ── The text/babel .jsx tags ──────────────────────────────────────────────
+
+// A vendored copy of the exact Babel build index.html loads, so this suite
+// needs no npm install. Versionless on purpose: index.html's tag is the one
+// pin, and loadVendoredBabel holds this copy to it.
+const VENDORED_BABEL = path.join(TESTS_JS_DIR, 'vendor', 'babel.min.js');
+
+const BABEL_TAG_RE =
+  /<script\s+src="(https:\/\/unpkg\.com\/@babel\/standalone@[^"]+\/babel\.min\.js)"\s+integrity="(sha384-[^"]+)"/;
+
+function pinnedBabelTag() {
+  const match = readIndexHtml().match(BABEL_TAG_RE);
+  assert.ok(match, `found no @babel/standalone <script> tag with an integrity attribute in ${INDEX_HTML}`);
+  return { url: match[1], integrity: match[2] };
+}
+
+function vendoredBabelDigest() {
+  if (!fs.existsSync(VENDORED_BABEL)) return 'missing';
+  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
+}
+
+// Loads the vendored Babel only once its sha384 matches index.html's pin, so a
+// stale, truncated or missing copy fails with the refresh command rather than
+// a parse error. require's own cache makes repeat calls cheap.
+function loadVendoredBabel() {
+  const { url, integrity } = pinnedBabelTag();
+  assert.equal(
+    vendoredBabelDigest(),
+    integrity,
+    `${VENDORED_BABEL} is not the build index.html loads (${url}), so the text/babel ` +
+      'scope test would compile the .jsx files with a different Babel than the browser. ' +
+      `Refresh it: curl -sSfL -o ${VENDORED_BABEL} ${url}`,
+  );
+  return createRequire(import.meta.url)(VENDORED_BABEL);
+}
+
+// The options Babel-standalone builds for a text/babel tag with no
+// `type="module"`, no data-presets/data-plugins and no data-targets. The
+// bundle's script-tag loader keeps these literals through minification; the
+// test below pins them to it.
+const SCRIPT_TAG_BABEL_OPTIONS = {
+  presets: ['react', 'env'],
+  plugins: ['transform-class-properties', 'transform-object-rest-spread', 'transform-flow-strip-types'],
+  targets: { browsers: undefined },
+};
+
+// Matches `<script type="text/babel" src="/static/redux/<name>.jsx?v=NN"></script>`,
+// and the `text/jsx` spelling, which Babel-standalone executes too.
+const BABEL_SCRIPT_RE =
+  /<script\s+type="text\/(?:babel|jsx)"\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.jsx)(?:\?[^"]*)?"\s*><\/script>/g;
+
+function babelScriptSrcs(html) {
+  return [...html.matchAll(BABEL_SCRIPT_RE)].map(m => m[1]);
+}
+
+function compileAsScriptTag(source, filename) {
+  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
+}
+
+const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
+
+// Runs the compiled JSX in `ctx` behind a leading `throw` of the sentinel.
+// V8's GlobalDeclarationInstantiation still checks every top-level binding
+// against the context's lexical scope, but no statement of the body executes.
+// The "use strict" prologue stays first so the probe keeps the code's mode.
+// Returns the collision message, or null when the file is clean.
+function probeJsxAgainstSharedScope(ctx, source, filename) {
+  const [, prologue = '', body] = compileAsScriptTag(source, filename).match(/^("use strict";)?([\s\S]*)$/);
+  try {
+    new vm.Script(`${prologue}throw ${JSON.stringify(PROBE_SENTINEL)};${body}`, { filename }).runInContext(ctx);
+  } catch (err) {
+    if (err === PROBE_SENTINEL) return null;
+    if (err?.name === 'SyntaxError' && /has already been declared/.test(err.message)) return err.message;
+    throw new Error(`the scope probe of ${filename} failed for a reason other than a collision: ${err}`);
+  }
+  throw new Error(`the scope probe of ${filename} completed without reaching its sentinel`);
+}
+
+test('the vendored Babel is the exact build index.html pins', () => {
+  assert.equal(typeof loadVendoredBabel().transform, 'function');
+});
+
+test("the harness compiles with the vendored bundle's own script-tag defaults", () => {
+  loadVendoredBabel();
+  const bundle = fs.readFileSync(VENDORED_BABEL, 'utf8');
+  for (const literal of [SCRIPT_TAG_BABEL_OPTIONS.presets, SCRIPT_TAG_BABEL_OPTIONS.plugins]) {
+    assert.ok(
+      bundle.includes(JSON.stringify(literal)),
+      `the vendored Babel's script-tag loader no longer carries ${JSON.stringify(literal)} — ` +
+        're-read its option builder (grep babel.min.js for "transform-flow-strip-types") ' +
+        'and update SCRIPT_TAG_BABEL_OPTIONS to match',
+    );
+  }
+});
+
+test('index.html exposes the text/babel .jsx tags in document order', () => {
+  const html = readIndexHtml();
+  const srcs = babelScriptSrcs(html);
+  assert.ok(srcs.length > 0, `extracted no text/babel .jsx <script> tags from ${INDEX_HTML} — BABEL_SCRIPT_RE has gone stale`);
+  assert.equal(
+    srcs.length,
+    html.match(/type="text\/(?:babel|jsx)"/g).length,
+    'BABEL_SCRIPT_RE missed some type="text/babel" or "text/jsx" tag, which would silently drop it ' +
+      `from the scope test below. Extracted: ${srcs.join(', ')}`,
+  );
+});
+
+test('no text/babel .jsx file binds a name a classic script declares with top-level const/let/class', () => {
+  const { ctx } = loadAllClassicScripts();
+  const collisions = [];
+  for (const src of babelScriptSrcs(readIndexHtml())) {
+    const message = probeJsxAgainstSharedScope(ctx, fs.readFileSync(path.join(REDUX_DIR, src), 'utf8'), src);
+    if (message !== null) collisions.push(`  ${src} -> ${message}`);
+  }
+
+  assert.deepEqual(
+    collisions,
+    [],
+    'text/babel file(s) collide with the classic scripts\' shared lexical scope ' +
+      '(V8 names only the first colliding binding per file):\n' +
+      `${collisions.join('\n')}\n` +
+      'Babel compiles every top-level binding of a .jsx file, destructures included, ' +
+      'into a global `var`, and a `var` named like a classic top-level const/let/class ' +
+      'throws on load: none of the .jsx file runs and its window.DF_* export stays ' +
+      'undefined. Fix on the .jsx side by renaming in the destructure: ' +
+      '`const { CENSUS_VIEWS: TASK_CENSUS_VIEWS } = window.DF_TASK_SNAPSHOT;`.',
+  );
+});
+
+test('the text/babel probe reports a collision with a classic top-level const (negative control)', () => {
+  const { ctx } = loadAllClassicScripts();
+  const message = probeJsxAgainstSharedScope(
+    ctx,
+    'const { layout: GRAPH_LAYOUT_API } = window.DF_GRAPH_LAYOUT;\nconst Probe = () => <div />;',
+    'synthetic-collider.jsx',
+  );
+  assert.match(
+    message ?? 'reported clean',
+    /GRAPH_LAYOUT_API/,
+    "a .jsx destructure rebinding graph_layout.js's top-level const was not reported " +
+      'as a collision — the probe no longer sees the shared scope, so the scope test proves nothing',
+  );
+});
+
+test('the text/babel probe passes the two harmless shapes (positive controls)', () => {
+  const { ctx } = loadAllClassicScripts();
+
+  const jsxDuplicate = 'const { useState } = React;\nconst Shared = () => <div />;';
+  assert.equal(probeJsxAgainstSharedScope(ctx, jsxDuplicate, 'first.jsx'), null);
+  assert.equal(
+    probeJsxAgainstSharedScope(ctx, jsxDuplicate, 'second.jsx'),
+    null,
+    'two .jsx files binding the same top-level names were reported as colliding — ' +
+      'var-vs-var is legal, so the probe is over-reporting',
+  );
+
+  // formatAge must stay a classic top-level `function`, which a global `var`
+  // may share a name with; a function declaration is an own property of the
+  // global object, a const is not.
+  assert.equal(
+    vm.runInContext("typeof Object.getOwnPropertyDescriptor(globalThis, 'formatAge')?.value", ctx),
+    'function',
+    'endpoint_staleness.js no longer declares a top-level `function formatAge`; ' +
+      'point this control at another classic function declaration',
+  );
+  assert.equal(
+    probeJsxAgainstSharedScope(ctx, 'const { formatAge } = window.DF_ENDPOINT_STALENESS;', 'function-namesake.jsx'),
+    null,
+    'a .jsx binding named like a classic `function` was reported as colliding — ' +
+      'var-vs-function is legal, so the probe is over-reporting',
   );
 });

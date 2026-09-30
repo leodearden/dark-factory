@@ -505,6 +505,116 @@ listed entry must exist for `expect: "present"`, every one must be gone for
 be expressed as either, at the cost of running against the working checkout
 rather than a materialized `main` tree.
 
+**Non-vacuity: a delivered_check must FAIL when you write it**
+
+A sound `delivered_check` **fails at the authoring tree and passes once its
+producer lands** — 0→N or N→0 across the task. That is the whole content of
+the check: it is a claim about a *change*, and a check that cannot observe a
+change observes nothing. Because `commit_planning` runs *before* the task
+lands, `main` at that moment **is** the pre-task tree, so the property is
+decidable at authoring time with nothing but the manifest and git. The lint
+reads `main` — the ref the runtime gate reads
+(`shared/src/shared/delivered_check_polarity.py::GATE_REF`) — never the
+checkout's `HEAD`, which may sit on another branch; where `main` does not
+resolve, every check is reported `unevaluable` rather than judged:
+
+| | `expect: present` | `expect: absent` |
+|---|---|---|
+| **matches at authoring** | rejected `vacuous_present` | healthy |
+| **no match at authoring** | healthy | rejected `vacuous_absent` |
+
+The table covers every kind that carries an `expect`. For `kind: "grep"`,
+"matches" means the pattern matches; for `kind: "path"` it means every listed
+path already exists — the gate's own conjunctive reading. `script` has no
+`expect`, so it has no cell and is not linted.
+
+A check in a rejected cell is already green the day it is written: landing the
+producer cannot change its verdict, so the dependent is dispatched as if
+unguarded. The opposite failure is worse — a check that can *never* go green
+blocks its dependent forever, and at runtime that is indistinguishable from a
+genuinely undelivered capability.
+
+**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+entries are diagnostic refinements of `vacuous_present` for grep, not separate
+gates):
+
+| Code | What fired | Measured specimen |
+|---|---|---|
+| `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
+| `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
+| `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
+| `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
+| `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+
+**Warn code** (reported, never blocking):
+
+| Code | What fired | Why it is not a reject |
+|---|---|---|
+| `absent_overbroad` | an `expect: absent` pattern also matches files outside the task's declared `metadata.files` | genuinely undecidable at authoring time — task **3534**'s pattern legitimately matched inside the very file it owned. On a hard gate a false reject costs more than a missed catch |
+
+**The standing authoring preference.** Assert the **new** symbol positively
+rather than banning the old one: `kind: grep`, `expect: present`, `pattern` = a
+class, function or constant that does not exist yet, scoped with `paths` to the
+files this task actually writes. That is the shape all three measured repairs
+took, and it is the only shape the gate can observe going green. When the
+capability IS a file's existence, use `kind: "path"` naming the file the task
+creates (or, with `expect: absent`, deletes).
+
+**Two enforcement points, deliberately different contracts:**
+
+- **`commit_planning`** — a synchronous gate whose caller is a live agent that
+  can fix the metadata and re-commit. A reject-tier finding on any task in the
+  batch returns `error_type: "DeliveredCheckPolarityViolation"` and **flips
+  nothing** — all-or-nothing, before `set_task_status`, exactly like the
+  existing lock-charter rejection (which keeps precedence). Scoped to
+  `target_status == 'pending'`: that is the only status that releases a task
+  for scheduling, so gating a `cancelled`/`deferred` commit would only block
+  cleanup.
+- **The capability-manifest stamper** — contractually never-raising and never
+  blocking, so it cannot reject. It **refuses to copy** the offending check
+  into `metadata.delivered_checks` and names it in
+  `manifest_stamping.errors`. Dropping degrades toward the safe direction
+  (a dependent dispatched ungated, the pre-gate status quo) rather than the
+  wedge (a dependent blocked forever).
+
+**Fail closed on a verdict, fail open on infrastructure.** The validation is
+applied unconditionally, but "git could not answer" is never a verdict: an
+unevaluable check (no repo, unresolvable ref, `git grep` rc ≥ 2, `git ls-tree`
+rc ≠ 0) is reported as
+`unevaluable` and **never** rejects. An availability failure must not be able
+to halt planning — but it must not read as a clean bill of health either, which
+is why it is reported rather than silently passed.
+
+**Response keys**, both attached **only when non-empty** so a clean call's
+response stays byte-identical to what it was before the gate existed:
+
+| Key | On | Carries |
+|---|---|---|
+| `delivered_check_warnings` | `commit_planning`'s result | every `warn`- and `errored`-severity finding — the latter coded `unevaluable` — as `{task_id, name, code, severity, message}` |
+| `polarity_warnings` | the `manifest_stamping` report | warn-tier findings for checks that were still copied |
+
+**Auditing the existing population.** `scripts/audit_delivered_checks.py` is a
+read-only, status-aware sweep over the descriptors already committed, which the
+authoring gate by construction cannot see. It is status-aware because
+evaluating a descriptor against main yields a *bit*, not a verdict —
+"`expect: present` and it matches" is the success state of a landed producer
+*and* a never-fires gate on a live one, and a status-blind rule flags 313 of
+548 descriptors (57%), overwhelmingly correctly delivered work. Exit 1 keys
+only on `broken` (a done producer whose capability is nowhere on main) and
+`vacuous_live_gate` (an open producer whose check already passes);
+`superseded` — a correct descriptor that later work legitimately undid — is
+reported and never actionable. A separate report-only section lists sidecar
+descriptors carrying a structural code (`vacuous_present_self_referential`,
+`vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
+against today's tree, and a reworded comment or a later file flips them, so
+they never affect the exit code and no gating test sweeps them.
+
+**At runtime**, a `DEP_CAPABILITY_NOT_DELIVERED` escalation whose check is
+mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
+naming the code and a remedy. Without it a malformed check and a genuinely
+undelivered capability produce identical records, and they need opposite
+responses.
+
 **Dispatch-time policy**
 
 | Check outcome | Scheduler action |
@@ -538,7 +648,8 @@ canonical specimen, measured: task 3536 asserted `kind: "grep"`,
 mention its own filename, so the check could never go green — and it blocked
 four dependents (3537, 3544, 3545, 3837). `kind: "path"` with
 `paths: ["orchestrator/tests/test_workflow_merge_gating_strand.py"]` says
-what was meant.
+what was meant. The grep form is now refused at `commit_planning` as
+`filename_shaped`, whose message names this `kind: "path"` fix.
 
 When the capability IS behavioural, prefer `kind: "script"` pointing at a
 COMMITTED predicate. If the same invariant is already gated elsewhere (a

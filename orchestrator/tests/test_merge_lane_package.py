@@ -17,7 +17,13 @@ import time
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, fails
+from _merge_lane_fakes import (
+    FakeClock,
+    FakeVerifier,
+    fails,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 import orchestrator.merge_lane as merge_lane
@@ -164,7 +170,7 @@ def git_ops(git_config: GitConfig, tmp_path: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_ops: GitOps, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+    return lane_scene_config(git_ops.project_root, git_config)
 
 
 async def _branch_with_file(git_ops: GitOps, branch: str, filename: str) -> Path:
@@ -214,6 +220,7 @@ async def test_the_injected_verifier_decides_whether_a_branch_lands(
         await queue.put(red)
         red_outcome = await wait_responsive(red.result, label='red merge outcome')
         assert red_outcome.status == 'blocked', red_outcome
+        assert not main_health_probe_spawned(red_outcome), red_outcome.reason
         assert 'fake red: 1 test failed' in red_outcome.reason
         assert await _main_tip(git_ops) == before
 

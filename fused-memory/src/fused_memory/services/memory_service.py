@@ -14,7 +14,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
@@ -44,6 +44,12 @@ from fused_memory.memory_metadata import (
 from fused_memory.middleware.dead_letter_escalator import (
     emit_dead_letter_escalation,
 )
+from fused_memory.middleware.dependency_direction_check import (
+    DependencyDirectionFinding,
+    build_dependency_index,
+    check_dependency_direction,
+    extract_dependency_facts,
+)
 from fused_memory.middleware.entity_mint_storm_escalator import (
     emit_entity_mint_storm_escalation,
 )
@@ -72,6 +78,9 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_MERGE,
@@ -132,6 +141,7 @@ from fused_memory.utils.validation import _safe_repr, require_full_uuid
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
@@ -1631,12 +1641,31 @@ def _store_failure_diagnostics(
     """Build a structured failure-diagnostics dict for a degraded search() store.
 
     Called from search() for both root-cause variants a selected store can hit:
-    ``reason='exception'`` when the store's search task raised (any exception other
-    than the inner GraphitiBackend.search TimeoutError swallow — see search()'s
+    ``reason='exception'`` when the store's search task raised (see search()'s
     per-task except block), and ``reason='timeout'`` when the store's task was
     still pending when the OUTER ``search_timeout_seconds`` asyncio.wait deadline
     elapsed and was cancelled (there, *exc* is None — there is no exception object,
     only the fact of the timeout).
+
+    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  Since
+    task 5265 a mem0 BACKEND read timeout (``Mem0Backend.search`` exceeding
+    ``backend_read_timeout_seconds``) also arrives at the ``'exception'`` branch,
+    where it used to be swallowed into an empty response and never reach here at
+    all.  Both variants carry ``error_type='TimeoutError'``, so they are told
+    apart ONLY by ``reason``: inner backend read timeout → ``'exception'``;
+    outer fan-out deadline → ``'timeout'``.  The inner one additionally carries
+    a non-empty ``error`` naming the backend read timeout, because
+    ``Mem0Backend`` re-raises with that text rather than letting
+    ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
+
+    GraphitiBackend still swallows its own inner ``TimeoutError`` (at
+    ``search`` and several sibling reads), so a Graphiti backend read timeout
+    does NOT reach this function and leaves the search reported as clean.  That
+    asymmetry is deliberate and temporary: it is entangled with a second,
+    independent degrade mechanism in this module
+    (``_graphiti_classify_or_degrade`` / ``_graphiti_degraded_entity_result`` /
+    ``get_entity``'s fallback arms), so reversing it is design work on the
+    degrade contract and was explicitly held out of task 5265's scope.
 
     This is the diagnosability fix for task 2653: search()'s prior degraded-path
     WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no
@@ -1729,8 +1758,8 @@ class ReconcileStats:
     """Aggregated counts from one ``_reconcile_episode_identity`` run.
 
     Returned to the caller and logged for observability — NOT wired into the
-    durable write-journal schema (extending that schema is out of scope for
-    task 2202 / W6-β). Each field mirrors the int return of the
+    durable write-journal schema (extending that schema is out of scope for task
+    2202 / W6-β). Each int field mirrors the int return of the
     correspondingly-named post-write sweep — including
     ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
     direction counterpart of ``sibling_edges_restored``. ``errors`` collects
@@ -1761,7 +1790,16 @@ class ReconcileStats:
     repair_stats: ReferentRepairStats = field(
         default_factory=lambda: ReferentRepairStats()
     )
+    #: The dependency-direction check's records (task 3770, the ninth
+    #: sub-pass), one per finding it reported. A record whose
+    #: ``contradicts_ground_truth`` is true names an edge that was retired.
+    dependency_direction_findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def dependency_direction_flagged(self) -> int:
+        """The number of dependency-direction findings reported this run."""
+        return len(self.dependency_direction_findings)
 
 
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
@@ -2071,6 +2109,7 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root} registry snapshot (task 3088). Injected by
         # set_known_projects at server startup — MemoryService is constructed
         # before build_known_projects_map runs, so it cannot arrive by
@@ -2230,6 +2269,24 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_recon_journal(self, journal: ReconciliationJournal) -> None:
+        """Wire the reconciliation journal in as a READ-ONLY runs-table source.
+
+        ``get_cycle_summary_presence`` uses it, and only it, to tell a reaped
+        or never-written ``cycle_summary`` row from a genuinely lost one. The
+        service never calls a journal WRITER — the harness owns every write —
+        and it takes the same already-``initialize()``d instance the harness
+        holds rather than opening a second connection: one process, and
+        aiosqlite serialises its own connection.
+
+        Wired UNCONDITIONALLY at startup, above the ``recon_ledger_enabled``
+        gate that guards ``set_recon_ledger``. That asymmetry is the point:
+        journal availability and ledger availability are independent signals,
+        and the presence payload reports them separately as
+        ``run_lookup_available`` and ``ledger_available``.
+        """
+        self.recon_journal = journal
 
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
@@ -3190,6 +3247,111 @@ class MemoryService:
                 failed,
             )
         return invalidated
+
+    async def _check_dependency_direction(
+        self, result: Any, *, group_id: str
+    ) -> list[dict]:
+        """Report extracted dependency facts whose direction Taskmaster rejects.
+
+        The ninth post-write sub-pass (task 3770). The classification rules live
+        in ``middleware/dependency_direction_check.py``.
+
+        - Scope gate first: an episode with no dependency shorthand returns
+          ``[]`` without reading Taskmaster.
+        - The project root is ``self._known_projects[group_id]`` with no
+          fallback. Task ids overlap across projects, so an unregistered group
+          is refused with a WARNING rather than judged against another
+          project's graph.
+        - A finding that contradicts ground truth retires its edge with
+          ``invalid_at`` only; the fact text is never rewritten. An UNSUPPORTED
+          finding is reported and its edge stays valid.
+        - Best-effort: a missing Taskmaster, a failed read or a failed retire
+          never raises. ``CancelledError``, ``KeyboardInterrupt`` and
+          ``SystemExit`` propagate.
+
+        Returns:
+            One record (``DependencyDirectionFinding.to_dict()``) per reported
+            finding. A contradicting finding is reported only once its edge
+            has actually been retired.
+        """
+        if result is None:
+            return []
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        facts = extract_dependency_facts(edges)
+        if not facts or self.taskmaster is None:
+            return []
+        project_root = self._known_projects.get(group_id)
+        if not project_root:
+            logger.warning(
+                'Dependency-direction check SKIPPED for group_id=%r: the group is '
+                'absent from `_known_projects` (%d known project(s)), and no '
+                'fallback root is used. %d dependency fact(s) go unchecked.',
+                group_id, len(self._known_projects), len(facts),
+            )
+            return []
+
+        try:
+            edge_map = await self.taskmaster.get_dependency_edges(project_root)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Dependency-direction check could not read ground truth for %s; '
+                'skipping this episode',
+                project_root,
+            )
+            return []
+
+        index = build_dependency_index(edge_map or {})
+        records: list[dict] = []
+        for finding in check_dependency_direction(facts, index):
+            record = await self._report_dependency_direction_finding(
+                finding, group_id=group_id,
+            )
+            if record is not None:
+                records.append(record)
+        return records
+
+    async def _report_dependency_direction_finding(
+        self, finding: DependencyDirectionFinding, *, group_id: str
+    ) -> dict | None:
+        """Log *finding*, retiring its edge if it contradicts ground truth.
+
+        Returns its record, or ``None`` when the retire failed.
+        """
+        record = finding.to_dict()
+        if not finding.contradicts_ground_truth:
+            logger.warning(
+                'Extracted dependency fact is unsupported by Taskmaster ground '
+                'truth (%s), edge %s left valid: %r — %s',
+                finding.classification, finding.edge_uuid, finding.fact,
+                record['ground_truth'],
+            )
+            return record
+        logger.warning(
+            'Extracted dependency fact contradicts Taskmaster ground truth (%s), '
+            'retiring edge %s: %r — %s',
+            finding.classification, finding.edge_uuid, finding.fact,
+            record['ground_truth'],
+        )
+        try:
+            await self.graphiti.update_edge(
+                finding.edge_uuid, group_id=group_id, invalid_at=datetime.now(UTC),
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Failed to retire direction-mismatched edge %s; '
+                'will retry on the next episode that re-asserts it',
+                finding.edge_uuid,
+            )
+            return None
+        return record
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Collapse every spelling of a touched task's node onto 'Task N'.
@@ -5157,7 +5319,7 @@ class MemoryService:
         content: str = '', referent_source: str = 'derived',
         ambiguous: ReferentSet | None = None,
     ) -> ReconcileStats:
-        """Fold the eight post-write identity/verification/repair sweeps into one call.
+        """Fold the nine post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -5169,7 +5331,7 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the six sub-passes in their pre-existing chain order —
+        Runs the first six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
@@ -5218,11 +5380,18 @@ class MemoryService:
         stays the documented MANUAL escape hatch for that case. Overwriting a
         summary verbatim is not a decision a write-time pass may take unattended.
 
+        ``_check_dependency_direction`` (task 3770) is the ninth and last. It
+        checks the direction of freshly-extracted dependency facts against live
+        Taskmaster edges, retiring an edge only when ground truth contradicts
+        it and never rewriting a fact. It reads only edge ``.fact`` text, so it
+        runs after eta and leaves zeta's and eta's ordering contracts alone.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
         the six int passes, an empty ``ReferentStats`` for zeta, an empty
-        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        ``ReferentRepairStats`` for eta, and an empty list for the
+        dependency-direction check), and the remaining sub-passes still
         run — a single sub-pass failure must never fail the already-committed
         episode write. That guarantee is worth most at eta, the one pass that
         WRITES: its failure is the likeliest to be real, and it arrives after
@@ -5333,6 +5502,11 @@ class MemoryService:
                 episode_uuid=_episode_uuid_of(result),
             ),
             ReferentRepairStats(),
+        )
+        stats.dependency_direction_findings = await _run_pass(
+            '_check_dependency_direction',
+            self._check_dependency_direction(result, group_id=group_id),
+            [],
         )
         return stats
 
@@ -7298,8 +7472,7 @@ class MemoryService:
                 # is shared by every MemoryService.search call site, so without
                 # this one Qdrant read timeout would break every search in the
                 # system — and get_memories_by_metadata genuinely PROPAGATES a
-                # TimeoutError (unlike Mem0Backend.search, which swallows into
-                # {}), so that is a live path, not a hypothetical.
+                # TimeoutError, so that is a live path, not a hypothetical.
                 #
                 # `results` is left exactly as the sort/filter tail produced it
                 # — including its ORDER and every result's topic_anchored flag —
@@ -7761,7 +7934,59 @@ class MemoryService:
         Returns a minimal metadata fingerprint dict:
           {category, agent_id, created_at} for mem0;
           {name, fact_snippet} for graphiti.
-        Raises EdgeNotFoundError (graphiti) or ValueError (mem0 not found).
+
+        WHERE EACH MEM0 FIELD LIVES, and why it is not obvious.  mem0's
+        ``Memory.get`` / ``AsyncMemory.get`` (verified against installed mem0
+        1.0.11, ``mem0/memory/main.py``) do not hand back the stored Qdrant
+        payload as-is.  They LIFT ``promoted_payload_keys`` — ``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role`` — to the record's TOP
+        LEVEL, and EXCLUDE those same keys from ``metadata`` via
+        ``core_and_promoted_keys``.  Every other payload key, ``category``
+        among them, stays INSIDE ``metadata``.  So the correct reads are
+        split across two levels, and reading either field at the other one
+        yields ``None`` for every record ever stored — which is the defect
+        task 5265 fixed, after 5/5 real ``cite_memory`` calls came back with
+        ``category`` and ``agent_id`` null against payloads that carried both.
+
+        TWO TRAPS the reads below must survive, both measured against the
+        installed package:
+          * ``metadata`` can be literally ``None``, not merely absent:
+            ``MemoryItem.model_dump()`` always emits ``metadata: None`` and
+            ``result_item['metadata']`` is overwritten only ``if
+            additional_metadata:``.  The ``or {}`` is load-bearing.
+          * a promoted key is copied only ``if key in memory.payload``, so
+            ``agent_id`` can be absent from the record entirely — hence
+            ``.get()``, never a subscript.
+
+        AUDIT OF THE REMAINING PROMOTED KEYS.  ``agent_id`` is the only one
+        this fingerprint touches.  ``user_id`` / ``run_id`` / ``actor_id`` /
+        ``role`` are equally available at the top level and are deliberately
+        NOT added: the three-key shape is a contract with
+        ``ReconReportState.cite_memory``, ``reconciliation/prompts/__init__``
+        and ``cli_stage_runner``'s JSON schema.
+
+        This read is deliberately NOT re-routed through
+        ``Mem0Backend.get_point_by_id`` to share
+        ``reconciliation/citation_repair.py::_fingerprint_from_record``'s
+        extraction: that would read ``created_at`` off the unnormalised raw
+        payload instead of mem0's ``_normalize_iso_timestamp_to_utc`` value,
+        regressing the one field that was always correct.  The two extractions
+        agree on VALUES while still reading different SHAPES; that agreement
+        is pinned by a test rather than by unifying the call path.
+
+        Raises:
+            EdgeNotFoundError: graphiti path, edge absent.
+            MemoryNotFoundError: mem0 path, the id genuinely does not exist.
+            TimeoutError: PROPAGATED from the backend read, never converted.
+
+        A MISS and a TIMEOUT must never be conflated, in either direction:
+        this function is where the two are still distinguishable, and
+        ``ReconReportState.cite_memory`` renders a ``MemoryNotFoundError`` as
+        ``memory_not_found`` — a false absence in a durable report.  The full
+        chain, and the corroboration gate that bounds it, are stated once at
+        ``backends/mem0_client.py::Mem0Backend.get``; do not re-derive them
+        here.  Do not add a ``try/except TimeoutError`` either: ``Mem0Backend.
+        get`` propagates precisely so this function can tell the two apart.
         """
         if store == 'graphiti':
             name, fact = await self.graphiti.get_edge_text(memory_id, group_id=project_id)
@@ -7776,8 +8001,8 @@ class MemoryService:
             raise MemoryNotFoundError(memory_id)
         metadata = rec.get('metadata') or {}
         return {
-            'category': rec.get('category'),
-            'agent_id': metadata.get('agent_id'),
+            'category': metadata.get('category'),
+            'agent_id': rec.get('agent_id'),
             'created_at': rec.get('created_at'),
         }
 
@@ -8098,6 +8323,7 @@ class MemoryService:
         project_id: str,
         run_id: str,
         stage: str,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
 
@@ -8125,8 +8351,83 @@ class MemoryService:
         cycle_summary — Stage 1 still runs a focused turn on such a pass and
         may still emit findings; it only skips its own per-cycle summary
         write, by design (task 2652) — from a genuine Stage 1 write failure.
+
+        **Typed absence (task 3731).** ``present=False`` on its own conflates
+        four unrelated situations, only ONE of which is a defect:
+
+        1. the stage RAN and its ledger write was lost — a genuine gap;
+        2. the stage never ran (the run died before reaching it);
+        3. the row existed and was reaped by ``ReconLedgerStore.gc()``, which
+           hard-DELETEs, leaving nothing to distinguish it from (2);
+        4. nothing is wired to answer the question.
+
+        ``reason`` names which one, resolved by joining the ``runs`` table —
+        which carries no TTL and so outlives the ledger — through
+        ``recon_journal``. It is single-valued and evaluated top-down:
+
+        ================== ========================================= ========
+        reason             meaning                                   expected
+        ================== ========================================= ========
+        present            row found                                 True
+        ledger_unavailable no ledger wired                           None
+        run_unknown        journal unwired, no runs row, read
+                           raised, stage_reports unparseable, or
+                           the run is in flight and has not
+                           settled its stage_reports yet             None
+        stage_not_run      SETTLED runs row present, stage absent
+                           from stage_reports                        False
+        expired            run older than the retention window, so
+                           any row would have been gc()'d            None
+        missing            stage ran, within retention, no row       True
+        ================== ========================================= ========
+
+        ``stage_not_run`` deliberately outranks ``expired``: it is a positive
+        fact from the never-reaped ``runs`` table and stays true regardless of
+        TTL, whereas ``expired`` only says the evidence was destroyed.
+
+        ``stage_not_run`` is reachable only for a run whose ``stage_reports``
+        have SETTLED (the journal projection's ``settled`` verdict, see
+        ``reconciliation/journal.py::ReconciliationJournal._stage_reports_are_settled``).
+        A run still executing
+        has not had the blob written yet, so the absence of a stage key there is
+        not evidence — and Stage 3 checks the CURRENT run from inside the
+        still-running stage loop, which is the common case, not an edge one.
+        Such a run reports ``run_unknown``, sending the caller to its existing
+        fallback rather than declaring the stage never ran. That covers the
+        adopt-and-resume case too, where the run is executing again behind a
+        disk status that still reads ``'interrupted'``.
+
+        **The consumer rule is: flag a genuine gap ONLY when ``present`` is
+        False AND ``expected`` is True.** ``expected=False`` means there was
+        nothing to write; ``expected=None`` means the question is unanswerable
+        and the caller should fall through to its existing best-effort
+        fallback exactly as it does today.
+
+        ``run_status`` is carried as evidence for a finding's report line and
+        is **DIAGNOSTIC ONLY — never gate on it**. Gating on it looks right on
+        the majority case and is wrong: three measured ``failed`` runs really
+        did execute Stage 2 and lose the ledger write, so a status gate would
+        suppress precisely the real data-loss findings it appears to filter.
+
+        Residual false negative, accepted deliberately: if a stage ran but
+        BOTH its ``stage_reports`` entry and its ledger row were lost, this
+        reports ``stage_not_run`` and the gap is suppressed. That is the
+        fail-safe direction — never flag on uncertainty — and matches the
+        contract's existing inconclusive-means-do-not-report norm (PRD
+        plans/stage3-ledger-presence-prd.md §8.3).
+
+        Now that reaping is routine, ``present=False`` on any run older than
+        the retention window carries NO information about whether the stage
+        wrote a summary — the row would have been hard-DELETEd either way.
+        That is exactly why ``expected`` is ``None`` there rather than True.
+
+        *now* injects the clock for the retention comparison, matching the
+        convention ``ReconLedgerStore`` and ``summary_pool.write_cycle_summary``
+        already follow, so tests can pin the boundary deterministically. The
+        MCP tool surface does not expose it.
         """
         ledger = getattr(self, 'recon_ledger', None)
+        journal = getattr(self, 'recon_journal', None)
         if ledger is None:
             return {
                 'present': False,
@@ -8135,6 +8436,10 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
                 'remediation': None,
+                'reason': 'ledger_unavailable',
+                'expected': None,
+                'run_lookup_available': journal is not None,
+                'run_status': None,
             }
         # Presence is intentionally state-agnostic here: any row matching the
         # five-part identity counts as present, regardless of `record.state`.
@@ -8157,6 +8462,8 @@ class MemoryService:
             # a malformed payload degrades to remediation=None rather than
             # crashing presence detection, while a genuine ledger read error
             # still propagates uncaught (test_ledger_read_error_is_not_swallowed_as_definitive_absent).
+            # The runs-table guard below follows the same rule for the same
+            # reason: it wraps only the journal read, never the ledger read.
             try:
                 payload = json.loads(record.payload_json)
             except (TypeError, ValueError):
@@ -8169,6 +8476,15 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
+
+        reason, expected, run_status = await self._classify_summary_absence(
+            journal,
+            project_id,
+            run_id,
+            stage,
+            present=record is not None,
+            now=now or datetime.now(UTC),
+        )
         return {
             'present': record is not None,
             'ledger_available': True,
@@ -8176,7 +8492,105 @@ class MemoryService:
             'run_id': run_id,
             'stage': stage,
             'remediation': remediation,
+            'reason': reason,
+            'expected': expected,
+            'run_lookup_available': journal is not None,
+            'run_status': run_status,
         }
+
+    async def _classify_summary_absence(
+        self,
+        journal: ReconciliationJournal | None,
+        project_id: str,
+        run_id: str,
+        stage: str,
+        *,
+        present: bool,
+        now: datetime,
+    ) -> tuple[str, bool | None, str | None]:
+        """Explain an absent cycle_summary row as ``(reason, expected, run_status)``.
+
+        See :meth:`get_cycle_summary_presence` for the full ladder. Best-effort
+        by construction: it only ever EXPLAINS an absence the ledger has
+        already established, so every failure degrades to the inconclusive
+        ``run_unknown`` rather than propagating.
+        """
+        if present:
+            # Presence needs no explanation — don't pay for the runs query.
+            return 'present', True, None
+        if journal is None:
+            return 'run_unknown', None, None
+
+        try:
+            execution = await journal.get_run_stage_execution(project_id, run_id, stage)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell a broken
+            # runs lookup from an unrecorded run by the return value alone.
+            logger.warning(
+                'get_cycle_summary_presence: runs lookup FAILED for run_id=%s '
+                'stage=%s in project=%s; cannot type the absence',
+                run_id,
+                stage,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, None
+
+        if execution is None:
+            return 'run_unknown', None, None
+        run_status = execution['status']
+        if execution['stage_ran'] is None:
+            return 'run_unknown', None, run_status
+        if execution['stage_ran'] is False:
+            if not execution['settled']:
+                # The blob is not a finished account of this run, so the
+                # absence of the key is not evidence of anything.
+                return 'run_unknown', None, run_status
+            # Checked BEFORE retention: a positive fact from the never-reaped
+            # runs table, true regardless of TTL.
+            return 'stage_not_run', False, run_status
+
+        # The stage ran. Whether its missing row is data loss depends on
+        # whether the row could still exist at all: past the retention window
+        # gc() has hard-DELETEd it either way, so absence says nothing.
+        #
+        # Aged from started_at, never completed_at, because the two cliffs must
+        # not cross. write_cycle_summary stamps expires_at from ITS OWN write
+        # time, which falls between the two: the run row is completed only
+        # after the whole stage loop — after Stage 3's LLM turn, and far later
+        # for an interrupted-then-resumed run. Aging from completed_at would
+        # put the reader's cliff AFTER gc()'s, and every absence in that window
+        # would read as a confident `missing` for a row that was merely reaped.
+        # started_at is always <= the write time, so the reader's cliff lands
+        # at or before gc()'s and the ambiguous window degrades to the
+        # inconclusive `expired` — the fail-safe direction.
+        reference_iso = execution['started_at']
+        try:
+            reference = datetime.fromisoformat(reference_iso)
+            # A naive journal timestamp is UTC, the convention every other
+            # reader of this column already applies (throughput.py,
+            # summary_pool.py::_assume_utc). Normalising INSIDE the guard keeps
+            # the docstring's promise that every failure here degrades to
+            # run_unknown: a residual mixed-awareness comparison raises
+            # TypeError, which a read-only presence check must not propagate.
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=UTC)
+            expired = reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now
+        except (TypeError, ValueError):
+            logger.warning(
+                'get_cycle_summary_presence: could not age run timestamp %r '
+                'for run_id=%s stage=%s in project=%s; cannot age the absence',
+                reference_iso,
+                run_id,
+                stage,
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, run_status
+        if expired:
+            return 'expired', None, run_status
+        return 'missing', True, run_status
 
     # ------------------------------------------------------------------
     # Delete
@@ -8866,9 +9280,9 @@ class MemoryService:
         # so the metadata-only fast paths would otherwise emit a success
         # envelope AND a journal row for a write that touched nothing.
         #
-        # A TimeoutError from here PROPAGATES untouched. Mem0Backend.
-        # get_point_by_id deliberately does not swallow it (unlike get()), which
-        # is what keeps "genuinely absent" distinguishable from "backend timed
+        # A TimeoutError from here PROPAGATES untouched — the uniform posture
+        # of every Mem0Backend read since task 5265, get() included. That is
+        # what keeps "genuinely absent" distinguishable from "backend timed
         # out"; catching both into one MemoryNotFound outcome would throw that
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)

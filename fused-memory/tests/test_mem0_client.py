@@ -83,6 +83,7 @@ class TestMem0BackendSearch:
         )
 
 
+
 class TestMem0BackendScrollByMetadata:
     """scroll_by_metadata builds a Qdrant payload filter and returns normalised point dicts."""
 
@@ -192,10 +193,11 @@ class TestMem0BackendScrollByMetadata:
     async def test_timeout_propagates_not_swallowed(self, backend):
         """On TimeoutError, the exception propagates — it is NOT swallowed into [].
 
-        Mirrors count_by_metadata's propagate-by-default contract (no
-        try/except around asyncio.wait_for): a timed-out scroll must never be
-        indistinguishable from a genuinely-empty result (no-silent-fail
-        invariant).
+        Mirrors count_by_metadata's propagate-by-default contract: a timed-out
+        scroll must never be indistinguishable from a genuinely-empty result
+        (no-silent-fail invariant).  Since task 5265 the read is bounded by
+        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
+        it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1327,12 +1329,95 @@ class TestMem0BackendScrollAllByMetadata:
             await agen.aclose()
 
 
+class TestMem0BackendGet:
+    """get fetches a single memory by id through mem0's own AsyncMemory.get."""
+
+    @pytest.mark.asyncio
+    async def test_returns_record(self, backend):
+        """A found record is returned verbatim, and mem0's get is called with the id."""
+        record = {'id': 'm1', 'memory': 'txt', 'metadata': {'category': 'x'}}
+        mock_instance = MagicMock()
+        mock_instance.get = AsyncMock(return_value=record)
+
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            result = await backend.get('m1', Scope(project_id='p'))
+
+        assert result == record
+        assert mock_instance.get.await_args.args == ('m1',)
+
+
+class TestMem0BackendSemanticReadTimeouts:
+    """One contract, one test: every mem0-instance read propagates and NAMES itself.
+
+    ``search`` / ``get_all`` / ``get`` share a single implementation of this —
+    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
+    class — so they are asserted together.  Three near-identical copies of
+    this test could drift apart without noticing; one parametrized copy cannot,
+    which matters because the MESSAGE is a contract and not decoration: it is
+    what reaches ``MemoryService._store_failure_diagnostics['error']``, and
+    ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
+    re-raise would propagate the fault while discarding the one detail that
+    attributes it.
+
+    INV-11 ``no-silent-fail-soft``: a log is not a return value.  Each
+    method's OWN consequence — ``search``'s ``{}`` reading as a genuinely
+    empty store, ``get_all``'s two consumers starved of the exception they
+    already handle (``MemoryConsolidator.assemble_payload``'s
+    ``_fetch_degraded_sources``, pinned by
+    ``tests/reconciliation/test_stage1.py::TestConsolidatorFetchDegradedSources
+    ::test_mem0_fetch_failure_tracks_degraded_source``; and
+    ``MemoryService.replay_from_store``'s false "0 queued"), and ``get``'s
+    false absence in a durable report — is stated once in that method's
+    ``Raises:`` block in ``backends/mem0_client.py`` rather than recopied here.
+
+    The direct-to-Qdrant reads and the payload writes hold the same contract:
+    ``TestMem0BackendGetPointById``, ``TestMem0BackendScrollByMetadata``,
+    ``TestMem0BackendPayloadPrimitives.test_timeout_propagates``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('method', 'args'),
+        [
+            ('search', ('q', Scope(project_id='p'))),
+            ('get_all', (Scope(project_id='p'),)),
+            ('get', ('m1', Scope(project_id='p'))),
+        ],
+    )
+    async def test_timeout_propagates_not_swallowed(self, backend, method, args):
+        mock_instance = MagicMock()
+        setattr(mock_instance, method, AsyncMock(side_effect=TimeoutError('too slow')))
+
+        with (
+            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
+            pytest.raises(TimeoutError) as excinfo,
+        ):
+            await getattr(backend, method)(*args)
+
+        message = str(excinfo.value)
+        assert 'timed out' in message, (
+            f'the raised TimeoutError must name the read timeout so the text survives '
+            f"into _store_failure_diagnostics['error']; got {message!r}"
+        )
+        assert method in message, (
+            f'the raised TimeoutError must name WHICH read timed out, or an operator '
+            f'cannot attribute it; got {message!r}'
+        )
+        assert str(backend._read_timeout) in message, (
+            f'the raised TimeoutError must carry the configured read timeout '
+            f'({backend._read_timeout}s); got {message!r}'
+        )
+
+
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 
     Direct-to-Qdrant point-fetch (retrieve by id), non-semantic — mirrors the
-    scroll_by_metadata / count_by_metadata timeout-propagation contract, which is
-    exactly why it bypasses the timeout-swallowing Mem0Backend.get.
+    scroll_by_metadata / count_by_metadata timeout-propagation contract, which
+    every read on this class now shares, Mem0Backend.get included (task 5265).
+    What it bypasses get FOR is the payload SHAPE: this returns the full raw
+    Qdrant payload with every key at one level, while get returns mem0's
+    processed record with promoted_payload_keys lifted out of metadata.
     """
 
     def _make_mock_point(self, point_id: str, payload: dict | None):
@@ -1384,10 +1469,10 @@ class TestMem0BackendGetPointById:
         """On TimeoutError the exception propagates — it is NOT swallowed into None.
 
         Mirrors scroll_by_metadata/count_by_metadata's propagate-by-default
-        contract (no try/except around asyncio.wait_for): a timed-out point-fetch
-        must never be indistinguishable from a genuine not-found (no-silent-fail
-        invariant), which is exactly why this bypasses the timeout-swallowing
-        Mem0Backend.get.
+        contract: a timed-out point-fetch must never be indistinguishable from a
+        genuine not-found (no-silent-fail invariant).  Mem0Backend.get holds the
+        same contract since task 5265, so this is the class-wide posture rather
+        than a property unique to the direct-to-Qdrant reads.
         """
         mock_client = AsyncMock()
         mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1567,8 +1652,8 @@ class TestMem0BackendPayloadPrimitives:
     )
     async def test_timeout_propagates(self, backend, method, args):
         """A write timeout must PROPAGATE, never be swallowed into a falsy return
-        — the house posture on this file (get_point_by_id), in deliberate
-        contrast to get() which does swallow."""
+        — the house posture on this file, shared by every read and write on the
+        class (task 5265 brought search/get_all/get into line)."""
         mock_client = AsyncMock()
         setattr(mock_client, method, AsyncMock(side_effect=TimeoutError))
 
@@ -2496,9 +2581,10 @@ class TestMem0BackendScanPayloadText:
 
     @pytest.mark.asyncio
     async def test_timeout_propagates_not_swallowed(self, backend):
-        """The load-bearing raw-Qdrant invariant: no try/except around
-        asyncio.wait_for, so a timed-out scan is never mistaken for a clean
-        corpus (which is exactly the wrong answer for an incidence sweep)."""
+        """The load-bearing raw-Qdrant invariant: a timed-out scan is never
+        mistaken for a clean corpus (which is exactly the wrong answer for an
+        incidence sweep).  Nothing between the pager and here converts the
+        TimeoutError into a page of zero hits."""
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
 

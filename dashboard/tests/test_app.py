@@ -9,31 +9,73 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.api.window import _parse_window
+from dashboard.api.burndown import _BURNDOWN_WINDOWS
+from dashboard.api.window import ServedWindow, _parse_window, with_window
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
-# _parse_window helper
+# _parse_window: the served-window record, for both vocabularies
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('value, expected', [
-    ('24h', 1),
-    ('7d', 7),
-    ('30d', 30),
-    ('all', 3650),
-    ('weird', 30),  # default
-    (None, 30),
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '24h'}, ServedWindow(requested='24h', served='24h', days=1)),
+    ({'window': '7d'}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '30d'}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='all', days=3650)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='30d', days=30)),
+    ({'window': 'weird'}, ServedWindow(requested='weird', served='30d', days=30)),
+    ({}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': ''}, ServedWindow(requested='30d', served='30d', days=30)),
 ])
-def test_parse_window_known_and_unknown(value, expected):
-    query_params: dict[str, str] = {}
-    if value is not None:
-        query_params['window'] = value
-    assert _parse_window(query_params) == expected
+def test_parse_window_standard_vocabulary(params, expected):
+    assert _parse_window(params) == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='7d', days=7)),
+])
+def test_parse_window_caller_default(params, expected):
+    assert _parse_window(params, default='7d') == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '90d'}, ServedWindow(requested='90d', served='90d', days=90)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='30d', days=30)),
+])
+def test_parse_window_burndown_vocabulary(params, expected):
+    assert _parse_window(params, vocabulary=_BURNDOWN_WINDOWS) == expected
+
+
+def test_parse_window_refuses_a_default_the_vocabulary_cannot_serve():
+    with pytest.raises(ValueError, match='90d'):
+        _parse_window({'window': '7d'}, default='90d')
+
+
+def test_served_window_wire_shape_and_immutability():
+    window = ServedWindow(requested='90d', served='30d', days=30)
+    assert window.to_wire() == {'requested': '90d', 'served': '30d', 'days': 30}
+    with pytest.raises(AttributeError):
+        window.served = '90d'  # type: ignore[misc]
+
+
+def test_with_window_echoes_without_mutating_the_payload():
+    payload = {'COSTS': {'total': 1}, 'served_at': 'S'}
+    window = ServedWindow(requested='7d', served='7d', days=7)
+    echoed = with_window(payload, window)
+    assert echoed == {
+        'COSTS': {'total': 1},
+        'served_at': 'S',
+        'WINDOW': {'requested': '7d', 'served': '7d', 'days': 7},
+    }
+    assert payload == {'COSTS': {'total': 1}, 'served_at': 'S'}
+    assert echoed is not payload
 
 
 # ---------------------------------------------------------------------------
@@ -180,17 +222,19 @@ def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
 
 
 _TASKS_KEYS = {
-    'ACTIVE_TASKS', 'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+    'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
     'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
     'TASKS_PROJECT_COUNT', 'served_at',
 }
-"""The default render's whole payload. DONE_COUNTS is gone, and its ABSENCE is
-asserted rather than an empty dict: ``data.js::applyKey`` returns early on a
-missing key, so the client keeps its seeded default, while ``{}`` would read as
-a measured "no project has any done tasks"."""
+"""The default render's whole payload. DONE_COUNTS and ACTIVE_TASKS are gone,
+and their ABSENCE is asserted rather than an empty value. Both were top-level
+keys, and ``data.js::applyKey`` returns early on a missing key, so the client
+keeps its seeded default and nothing reads it; ``{}`` would instead read as a
+measured "no project has any done tasks". The rows travel only as
+``TASKS_SNAPSHOT[p].rows``."""
 
 
-def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
+def test_tasks_endpoint_carries_no_flat_row_list(client):
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], {})),
@@ -201,7 +245,7 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
     assert 'DONE_COUNTS' not in body
-    assert isinstance(body['ACTIVE_TASKS'], list)
+    assert 'ACTIVE_TASKS' not in body
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
     assert body['TASKS_SNAPSHOT'] == {}
@@ -565,14 +609,14 @@ _RAW_ONLY_KEYS = frozenset({
 
 
 def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
-    """``TASKS_SNAPSHOT[p].rows`` carries the rows ``ACTIVE_TASKS`` carries, not raw MCP rows.
+    """``TASKS_SNAPSHOT[p].rows`` carries the shaped task rows, not raw MCP rows.
 
     ``Datum.to_wire()`` renders ``value`` verbatim. So the unit's RAW rows used
     to ship beside the shaped ones: every active row twice per render, the
     second copy with the whole ``metadata`` blob, on the endpoint this leaf
     exists to shrink. That also broke the PRD's declared
-    ``Datum[list[TaskRow]]``. With one configured root, ``ACTIVE_TASKS`` is
-    exactly that root's rows, so the two exposures must be equal.
+    ``Datum[list[TaskRow]]``. The snapshot is now the rows' only exposure, so
+    each one must carry exactly the shaped fields.
     """
     from test_task_snapshot import CannedMCP, _raw_row
 
@@ -596,7 +640,6 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     for row in wire_rows:
         assert set(row) == _TASK_ROW_KEYS, sorted(set(row) ^ _TASK_ROW_KEYS)
         assert not set(row) & _RAW_ONLY_KEYS
-    assert body['ACTIVE_TASKS'] == wire_rows
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
@@ -617,21 +660,30 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
 
 def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(client):
     """api_tasks must call collect_tasks_with_counts with resolve_external=True
-    and forward the external_deps field in ACTIVE_TASKS rows unchanged.
+    and forward the external_deps field in the snapshot rows unchanged.
 
     Asserts:
     (a) collect_tasks_with_counts is called with resolve_external=True
-    (b) ACTIVE_TASKS[0]['external_deps'] contains the resolved dep
+    (b) TASKS_SNAPSHOT[label]['rows']['value'][0]['external_deps'] contains
+        the resolved dep
     (c) Top-level key set is unchanged (non-breaking)
     """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    label = 'dark-factory'
     mock_row = {
         'id': 'dark-factory/T-5',
-        'project': 'dark-factory',
+        'project': label,
         'title': 'waits on upstream',
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], {}))
+    rows = Datum([mock_row], datetime.now(UTC), DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
+    mock = AsyncMock(return_value=([mock_row], {label: replace(_snapshot(), rows=rows)}))
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -646,7 +698,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     )
 
     # (b) external_deps passes through unmodified
-    assert body['ACTIVE_TASKS'][0]['external_deps'] == [
+    assert body['TASKS_SNAPSHOT'][label]['rows']['value'][0]['external_deps'] == [
         {'id': 'dark_factory:13', 'status': 'done'}
     ]
 
@@ -1384,22 +1436,51 @@ def test_merge_queue_returns_merge_queue(client):
     assert isinstance(body['MERGE_QUEUE'], dict)
 
 
-def test_merge_queue_uses_24h_recent_window(client):
-    """The /api/v2/dashboard/merge-queue endpoint must pass recent_window_minutes=1440
-    to build_per_project_merge_queue.  Asserted via call-site kwargs because the
-    test fixture carries no per-project DBs, so the window is not observable in
-    the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
+@pytest.mark.parametrize('query, expected_hours', [
+    ('?window=7d', 168),
+    ('?window=24h', 24),
+])
+def test_merge_queue_threads_the_chip_window(client, query, expected_hours):
+    """Every merge-queue leg, recent merges included, follows the chip window.
+
+    Asserted via call-site kwargs because the test fixture carries no
+    per-project DBs, so the window is not observable in the JSON payload.
+    There is no separate recent-merges window to pass: the smallest chip is
+    24h, so following the chip can only widen what the old fixed 1440-minute
+    recent window showed."""
     mock_build = AsyncMock(return_value={})
     with (
         patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
         patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+        resp = client.get(f'/api/v2/dashboard/merge-queue{query}')
     assert resp.status_code == 200
     assert mock_build.await_args is not None, "build_per_project_merge_queue was never awaited"
-    assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
-        f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
-    )
+    assert mock_build.await_args.kwargs['hours'] == expected_hours
+    assert 'recent_window_minutes' not in mock_build.await_args.kwargs
+
+
+@pytest.mark.parametrize('path, payload_key, expected_window', [
+    ('/api/v2/dashboard/costs?window=90d', 'COSTS', {'requested': '90d', 'served': '30d', 'days': 30}),
+    ('/api/v2/dashboard/costs?window=7d', 'COSTS', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance', 'PERFORMANCE', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance?window=all', 'PERFORMANCE',
+     {'requested': 'all', 'served': 'all', 'days': 3650}),
+    ('/api/v2/dashboard/merge-queue?window=24h', 'MERGE_QUEUE',
+     {'requested': '24h', 'served': '24h', 'days': 1}),
+    ('/api/v2/dashboard/burndown?window=90d', 'BURNDOWN', {'requested': '90d', 'served': '90d', 'days': 90}),
+    ('/api/v2/dashboard/burndown?window=all', 'BURNDOWN', {'requested': 'all', 'served': '30d', 'days': 30}),
+])
+def test_windowed_payload_echoes_the_served_window(client, path, payload_key, expected_window):
+    """Sketch #8: every windowed payload says which window it was computed over."""
+    with patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)):
+        resp = client.get(path)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['WINDOW'] == expected_window
+    assert payload_key in body
+    if payload_key == 'BURNDOWN':
+        assert 'served_at' in body
 
 
 def test_costs_returns_full_costs_block(client):
@@ -1538,7 +1619,7 @@ def test_burndown_returns_aggregate_and_per_project(client):
     resp = client.get('/api/v2/dashboard/burndown?window=30d')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
+    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'served_at'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
 
@@ -1582,6 +1663,45 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     assert all(n == nows[0] for n in nows), (
         f'expected all per-project aggregates to share one reference now, got {nows!r}'
     )
+
+
+def test_burndown_route_lists_projects_over_the_series_window(client):
+    """The listing and every series share one cutoff, so a project the window
+    never sampled is neither listed nor counted as unmeasured."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        assert client.get('/api/v2/dashboard/burndown?window=7d').status_code == 200
+
+    (listing,) = mock_projects.await_args_list
+    (series,) = mock_series.await_args_list
+    assert listing.kwargs == {'days': 7, 'now': series.kwargs['now']}
+    assert series.kwargs['days'] == 7
+
+
+def test_burndown_route_serves_its_datums_at_the_window_instant(client):
+    """The one captured instant is the window cutoff AND the instant every
+    burndown Datum is judged at, and it crosses the wire as ``served_at`` —
+    which data.js::refreshOne reads into the receipt datum.js ages against."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
+
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
+    ):
+        body = client.get('/api/v2/dashboard/burndown?window=30d').json()
+
+    assert isinstance(body['served_at'], str)
+    (call,) = mock_series.await_args_list
+    assert datetime.fromisoformat(body['served_at']) == call.kwargs['now']
+    assert set(body['BURNDOWN']['latest']) == {
+        'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2272,10 +2392,10 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
 def test_last_good_rows_do_not_veto_the_outage_flag(client):
     """Rows served from a root's last good were not measured this render.
 
-    An offline root still puts its last good rows, aged, into ACTIVE_TASKS.
-    The flag asks whether THIS render measured any root. So when every root
-    is offline, the banner stands over those rows, and each root's ``rows``
-    Datum says how old they are.
+    An offline root still serves its last good rows, aged, in its ``rows``
+    Datum. The flag asks whether THIS render measured any root. So when every
+    root is offline, the banner stands over those rows, and each root's
+    ``rows`` Datum says how old they are.
     """
     from dataclasses import replace
     from datetime import UTC, datetime, timedelta
@@ -2299,7 +2419,7 @@ def test_last_good_rows_do_not_veto_the_outage_flag(client):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body['ACTIVE_TASKS'] == [row]
+    assert body['TASKS_SNAPSHOT']['p0']['rows']['value'] == [row]
     assert body['TASKS_SNAPSHOT']['p0']['rows']['state'] == 'stale'
     assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
     assert body['TASKS_OFFLINE'] is True

@@ -40,6 +40,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _worktree_add_fakes import make_fake_run
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
@@ -112,30 +113,16 @@ MAIN_SHA = 'c' * 40
 
 
 def _make_fake_run(add_rcs: list[int], calls: list[list[str]]):
-    """Fake ``orchestrator.git_ops._run`` recording every argv into *calls*.
+    """``make_fake_run`` driven by ``git worktree add`` return codes alone.
 
-    ``git worktree add`` return codes are consumed in order from *add_rcs*
-    (the last entry repeats once exhausted). A successful add mkdirs the
-    ``--detach`` target, mirroring what real ``git worktree add`` does, so
-    a later unconditional ``shutil.rmtree`` has something real on disk to
-    remove. Every other command (e.g. ``git worktree remove``) always
-    succeeds.
+    A non-zero rc is given the ``lock contention`` stderr these tests'
+    retry assertions assume — a shape the shared retryability predicate
+    classifies as transient.
     """
-    state = {'add_calls': 0}
-
-    async def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if 'worktree' in cmd and 'add' in cmd:
-            idx = state['add_calls']
-            rc = add_rcs[idx] if idx < len(add_rcs) else add_rcs[-1]
-            state['add_calls'] += 1
-            if rc == 0:
-                detach_idx = cmd.index('--detach')
-                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
-            return (rc, '', '' if rc == 0 else 'lock contention')
-        return (0, '', '')
-
-    return _fake_run
+    return make_fake_run(
+        [(rc, '', '' if rc == 0 else 'lock contention') for rc in add_rcs],
+        calls,
+    )
 
 
 class TestEphemeralWorktreeNamingAndAdd:
@@ -1224,3 +1211,179 @@ class TestEphemeralWorktreeWarmSeed:
 
         mock_seed.assert_not_awaited()
         assert entered, 'expected the CM body to run normally'
+
+
+# ---------------------------------------------------------------------------
+# task 5140 step-9: both retrying sites converge on ONE predicate + ONE driver
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeSharedRetryDriver:
+    """task 5140 step-9: ``ephemeral_worktree`` routes its ``git worktree
+    add`` through the SAME ``GitOps._worktree_add_with_retry`` driver
+    ``_create_merge_worktree`` uses — one retry loop and one retryability
+    predicate in git_ops.py, not two — and thereby GAINS the ENOSPC
+    fast-fail it never had (its old inline loop branched solely on
+    ``rc == 0`` and blanket-retried every non-zero rc, a full disk
+    included).
+
+    RED before the re-point: the driver exists but ``ephemeral_worktree``
+    still runs its own inline loop.
+    """
+
+    def test_routes_through_the_shared_driver(self, tmp_path: Path) -> None:
+        """Pins "no second retry loop" — this fails the moment someone
+        reintroduces an inline one."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], [])),
+            patch.object(
+                GitOps, '_worktree_add_with_retry',
+                new_callable=AsyncMock, return_value=(0, '', '', 1),
+            ) as mock_driver,
+        ):
+            asyncio.run(_body())
+
+        assert entered
+        assert mock_driver.await_count == 1, (
+            f'expected ephemeral_worktree to mint via the shared driver exactly '
+            f'once; got {mock_driver.await_count} awaits'
+        )
+        assert mock_driver.await_args is not None, 'await_args must be set after one await'
+        (path_arg, ref_arg), _kwargs = mock_driver.await_args
+        assert Path(path_arg).name.startswith(WorktreeKind.MAIN_PROBE.value), (
+            f'expected the minted _mainprobe-* path handed to the driver; got {path_arg}'
+        )
+        assert ref_arg == MAIN_SHA
+
+    def test_enospc_fails_fast_without_retry_or_remove(self, tmp_path: Path) -> None:
+        """NEW behaviour from task 5140: the old inline loop retried a full
+        disk three times. A disk does not free itself in 1.5s of backoff."""
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=make_fake_run(
+                    [(1, '', 'No space left on device')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 1, (
+            f'expected exactly ONE add attempt on a full disk; got {len(add_calls)}'
+        )
+        assert mock_sleep.await_args_list == [], (
+            f'expected NO backoff on ENOSPC; got {mock_sleep.await_args_list}'
+        )
+        assert not entered, 'expected the CM body to NEVER run when the add fails'
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert not remove_calls, (
+            f'expected NO git worktree remove when add never succeeded; got {remove_calls}'
+        )
+
+    def test_error_text_carries_rc_and_both_streams(self, tmp_path: Path) -> None:
+        """Today's message carries rc and stderr only — stdout is discarded,
+        the same diagnostic loss task 5140 closes on the merge path."""
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                pass  # must never run
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=make_fake_run(
+                    [(1, 'OUT-MARKER', 'ERR-MARKER')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(EphemeralWorktreeError) as exc_info,
+        ):
+            asyncio.run(_body())
+
+        msg = str(exc_info.value)
+        assert 'rc=1' in msg, f'expected the rc in the message; got {msg!r}'
+        assert 'ERR-MARKER' in msg, f'expected stderr in the message; got {msg!r}'
+        assert 'OUT-MARKER' in msg, f'expected stdout in the message; got {msg!r}'
+
+    def test_non_enospc_retry_contract_is_unchanged(self, tmp_path: Path) -> None:
+        """The driver swap must be provably BEHAVIOUR-PRESERVING on the
+        non-ENOSPC path: same 3 attempts, same [0.5, 1.0] backoff, same
+        single target path. (``TestEphemeralWorktreeRetry`` above pins the
+        same contract and must also stay green, untouched.)"""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 0], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            asyncio.run(_body())
+
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected exactly 3 add attempts; got {len(add_calls)}'
+        detach_targets = {c[c.index('--detach') + 1] for c in add_calls}
+        assert len(detach_targets) == 1, (
+            f'expected all retries to target the same path; got {detach_targets}'
+        )
+        assert entered, 'expected the CM body to run once add eventually succeeds'
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
+
+    def test_no_remove_when_add_never_succeeded(self, tmp_path: Path) -> None:
+        """The no-remove-when-never-added guarantee survives the extraction
+        (design decision 4: the driver issues NO git subprocess between
+        attempts — no scoped ``remove --force`` and, under DD5, never a
+        ``prune``)."""
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                pass  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        assert not [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert not [c for c in calls if 'worktree' in c and 'prune' in c], (
+            'git worktree prune is categorically forbidden (DD5)'
+        )

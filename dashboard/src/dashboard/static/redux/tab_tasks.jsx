@@ -1,30 +1,26 @@
 /* Tasks tab: per-project dependency graph + filters + detail panel.
    Least-dependent tasks at top; tasks depending on them stack below. */
-const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
+const { ProjectGroup: PG_T, Segmented: SEG_T, Pip, DatumReading } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
-// One namespace alias, never destructured: data.js's top-level consts share this
-// file's global scope (see test_tab_tasks_prose.py's load-safety pin).
+// One namespace alias, so no data.js const is rebound under its own name —
+// see the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
-const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
-const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
+const {
+  prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, prdProgress, prdProgressReading,
+  groupTasksByPrd, orderPrdGroups,
+} = window.DF_PRD_GROUPING;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
-// Interim, deleted by leaf γ3 — task_done_count.js's header says why.
-const { doneCount } = window.DF_TASK_DONE_COUNT;
-
-// Dot colour per activity pip. activityPips is pure and owns ORDER and
-// zero-suppression; colour is the caller's concern. Each reuses the hue
-// operators already associate with that status elsewhere in this tab
-// (PALETTE aliases `running` to the same hue as `in-progress`).
-const PIP_DOT_COLOR_T = {
-  running: CP_T.accent,
-  blocked: CP_T.bad,
-  'merge-deferred': 'var(--merge-deferred)',
-};
+// Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
+const {
+  projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
+  terminalWindowEntrants, sameDatum,
+  CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
+} = window.DF_TASK_SNAPSHOT;
 
 // CSS accent per probe-status tone (runtime_format.js owns which tone each
 // status gets; this only translates a tone into a colour for the banner's
@@ -246,6 +242,14 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   );
 }
 
+// The Datum this component already holds while a fresh stamped copy is the
+// same Datum, so a memo keyed on it reruns when a poll lands, not per render.
+function useHeldDatum(datum) {
+  const held = uR_T(datum);
+  if (!sameDatum(held.current, datum)) held.current = datum;
+  return held.current;
+}
+
 // Per-project "group by PRD" render: buckets the project's filtered tasks
 // into PRD boxes (groupTasksByPrd), orders the boxes via orderPrdGroups (a
 // PRD consuming another PRD's tasks renders below it; "no PRD" trails), and
@@ -269,7 +273,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
 // renderEdges={false} (skip its own overlay) and handed the SAME shared
 // nodeRefs map (via the nodeRefs prop) so its nodes register into the map
 // the hoisted overlay reads from.
-function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
@@ -299,15 +303,15 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
     `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
     `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
   ).join('|'), [graphTasks]);
-  // fullMembersByPrd (below) only feeds aggregatePrdStatus/summarizePrdMembers,
-  // which look at nothing but id/status/prd — a narrower, cheaper signature.
+  // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
+  // nothing but id/status/prd — a narrower, cheaper signature.
   const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
 
   const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
   const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
 
-  // "n/m done", the outline/pip aggregate status, and the stacked status bar
-  // all read from each PRD's FULL member set (every task with that prd,
+  // The outline/pip aggregate status and the member bar both read from each
+  // PRD's FULL member set (every task with that prd,
   // regardless of the active status display filter or focus narrowing) —
   // per the plan's truthful-burndown requirement. Keyed by prd (null for
   // the "no PRD" bucket) for O(1) lookup per rendered box below. Rendered
@@ -318,6 +322,10 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
     return m;
   }, [allSig]);
 
+  const heldRows = useHeldDatum(rows);
+  const heldTerminal = useHeldDatum(terminal);
+  const progress = uM_T(() => prdProgress(heldRows, heldTerminal), [heldRows, heldTerminal]);
+
   return (
     <div className="prd-groups" ref={containerRef}>
       <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={graphTasks}
@@ -326,7 +334,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
         const key = g.noPrd ? null : g.prd;
         const fullMembers = fullMembersByPrd.get(key) || g.tasks;
         return (
-          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers}
+          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers} progress={progress}
                   selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
         );
       })}
@@ -336,38 +344,26 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, o
 
 // One PRD box's chrome: title (basename via prdTitle, full path as a
 // tooltip), a status-colored outline + title pip (aggregatePrdStatus over
-// the FULL member set, driving an `s-<status>` class exactly like the
+// the FULL member set's tally, driving an `s-<status>` class exactly like the
 // `.taskgraph .node.s-*` idiom — see graph_layout-era node rendering above),
-// "n/m done" + a thin stacked status bar (summarizePrdMembers over the same
-// full member set), and a collapse control that hides the box body while
-// leaving the title bar + bar visible. All-done PRDs default to collapsed.
+// "≥n/m terminal" (prdProgress, over the snapshot rows and the terminal
+// window), a thin bar with one segment per member (prdBarSegments over the
+// tally), and a collapse control that hides the box body while
+// leaving the title bar + bar visible. Finished PRDs default to collapsed.
 //
 // Kept as its own component (not inlined in ProjectPrdGroups' .map() above)
 // so each box's `collapsed` state is an independent useState — Rules of
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
-function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nodeRefs }) {
-  const agg = aggregatePrdStatus(fullMembers);
-  const stats = summarizePrdMembers(fullMembers);
-
-  // active_tasks.py only exempts a PRD's done/cancelled members from its
-  // project-wide terminal-task cap while the PRD still has an active-status
-  // member (`_ACTIVE_STATUSES` server-side — the same statuses
-  // aggregatePrdStatus treats as non-done/non-cancelled: blocked,
-  // in-progress, merge-deferred, pending, deferred). Active-status tasks
-  // are never capped, so if fullMembers (this PRD's complete client-visible
-  // membership) contains none, this PRD was NOT exempt server-side and its
-  // done/cancelled members may extend past that cap — "n/m done" could then
-  // undercount the true total. That's a possibility, not a certainty (the
-  // cap may simply not have been hit), so it's surfaced as a tooltip on the
-  // count rather than a stronger UI treatment.
-  const countMayUndercount = agg === 'done' || agg === 'cancelled';
+function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
+  const summary = uM_T(() => summarizePrdMembers(fullMembers), [fullMembers]);
+  const agg = aggregatePrdStatus(summary);
 
   // Lazy-init only: this is a *default*, not an enforced state — later
   // renders (e.g. a member finishing while the box is open) must not yank a
   // manually-reopened box shut again, so the argument is only consulted by
   // React on the box's first mount.
-  const [collapsed, setCollapsed] = uS_T(agg === 'done');
+  const [collapsed, setCollapsed] = uS_T(() => prdIsFinished(summary));
   const title = g.noPrd ? 'No PRD' : prdTitle(g.prd);
   const headRef = uR_T(null);
 
@@ -376,7 +372,7 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
   // with el=null). The hoisted TaskGraphEdges overlay above silently skips
   // any edge whose endpoint ref is missing — so without this, a cross-box
   // dependency edge into or out of a collapsed box's tasks would vanish
-  // entirely. Since all-done PRDs collapse by default, that would routinely
+  // entirely. Since finished PRDs collapse by default, that would routinely
   // hide real upstream/downstream relationships on first paint. Fix: while
   // collapsed, proxy every member task id to the (always-mounted) header
   // element instead, so those edges anchor to the box's title bar rather
@@ -408,18 +404,6 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
     };
   }, [collapsed, g.tasks, nodeRefs]);
 
-  // Stacked bar segments: only the four buckets the plan calls out
-  // (done/in-progress/blocked/pending). Cancelled (and any other status)
-  // still counts toward stats.total — and therefore toward "n/m done" — but
-  // is not drawn as its own segment, leaving the bar's track color to show
-  // through for that share, same as the plan's explicit segment list.
-  const segs = [
-    { cls: 's-done', n: stats.done },
-    { cls: 's-in-progress', n: stats.inProgress },
-    { cls: 's-blocked', n: stats.blocked },
-    { cls: 's-pending', n: stats.pending },
-  ].filter(s => s.n > 0);
-
   return (
     <div className={`prd-box s-${agg}`}>
       <div className="prd-box-head" ref={headRef} data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
@@ -430,16 +414,12 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
         </span>
         <span className="status-pip"></span>
         <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>{title}</span>
-        <span className="prd-box-count"
-              title={countMayUndercount
-                ? 'No active members in this PRD, so it wasn\'t exempt from the dashboard\'s done/cancelled-task cap — this count may undercount the true total.'
-                : undefined}>
-          {stats.done}/{stats.total} done
-        </span>
+        {/* PRD decision 8: a lower_bound '≥n/m', not a tooltip — task 4416's option (a). */}
+        <span className="prd-box-count"><DatumReading datum={progress} format={prdProgressReading(g.prd)} /> terminal</span>
       </div>
       <div className="prd-bar">
-        {segs.map(s => (
-          <span key={s.cls} className={`prd-bar-seg ${s.cls}`} style={{ width: `${(s.n / stats.total) * 100}%` }} />
+        {prdBarSegments(summary).map(seg => (
+          <span key={seg.member} className="prd-bar-seg" style={{ width: `${seg.share}%`, background: CP_T[seg.tone] }} />
         ))}
       </div>
       {!collapsed && (
@@ -695,15 +675,42 @@ function TasksTab({ projectFilter, search }) {
     return () => document.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // Filter, default {active, pending} on
-  const [filters, setFilters] = tasksPersistedState('df.tasksFilters',
-    { active: true, pending: true, complete: false, deferred: false, cancelled: false });
-  const flipFilter = (k) => setFilters(f => ({ ...f, [k]: !f[k] }));
+  // The census views, in-flight and backlog on by default. A new key, not
+  // 'df.tasksFilters': an old {active, pending, ...} object would read as
+  // "nothing selected" under the view keys.
+  const [filterMap, setFilterMap] = tasksPersistedState('df.tasks.views', { in_flight: true, backlog: true });
+  const filter = Object.fromEntries(CENSUS_VIEWS_T.map(v => [v.key, !!(filterMap || {})[v.key]]));
+  const flipFilter = (key) => setFilterMap({ ...filter, [key]: !filter[key] });
 
-  const allTasks = DF_T.ACTIVE_TASKS;
+  const allTasks = snapshotRowsOver(DF_T);
   const projects = DF_T.PROJECTS.filter(p =>
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
+
+  // PRD decision 5: a project's terminal window is fetched on demand only, once
+  // as the project enters the wanted set and never per poll. It is always
+  // lower_bound, so its age badge says how old it is.
+  const projectIds = projects.map(p => p.id);
+  const grouped = projectIds.filter(id => groupByPrdMap[id] === 'prd');
+  const wanted = terminalWindowProjects(projectIds, filter, grouped);
+  const wantedKey = wanted.join('\n');
+  const [terminalOutcomes, setTerminalOutcomes] = uS_T({});
+  // No cleanup cancels a pending outcome: a later run does not re-request a
+  // project still in the set, so its outcome arrives only via the run that asked.
+  const wantedBefore = uR_T([]);
+  uE_T(() => {
+    const entrants = terminalWindowEntrants(wantedBefore.current, wanted);
+    wantedBefore.current = wanted;
+    setTerminalOutcomes(o => ({ ...o, ...Object.fromEntries(entrants.map(project => [project, null])) }));
+    for (const project of entrants) {
+      DF_LOADER_T.requestOnDemand('terminal', project).then(outcome => {
+        setTerminalOutcomes(o => ({ ...o, [project]: outcome }));
+      });
+    }
+  }, [wantedKey]);
+  const terminalOf = (id) => (wanted.includes(id)
+    ? DF_LOADER_T.onDemandDatum('terminal', id, terminalOutcomes[id] ?? null)
+    : unrequestedTerminalRows(DF_T[DF_LOADER_T.ON_DEMAND_KEYS.terminal.key(id)]));
 
   // Surface a banner when task data is missing or incomplete — without it the
   // Tasks tab renders an empty grid that looks indistinguishable from "no
@@ -734,7 +741,7 @@ function TasksTab({ projectFilter, search }) {
     'count-unknown': 'tasks-count-unknown-banner',
   };
 
-  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // Runtime-probe health, derived frontend-side from the snapshot rows
   // (deliberately not a new top-level payload key — the per-project fact is
   // already fully recoverable from `runtime_status`, so a new key would carry
   // zero extra information). `runtime_status` is produced by
@@ -745,7 +752,7 @@ function TasksTab({ projectFilter, search }) {
   // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
   // answer different questions: tasksBannerNotices reports whether TASK DATA
   // is available, a distinction decided server-side in app.api_tasks, while
-  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // rtProbeSummary is a client-side derivation over the snapshot rows
   // reporting whether we could reach the ORCHESTRATORS. Those are independent
   // — fused-memory being down says nothing about orchestrator reachability —
   // so both banners can show at once, and neither gates the other.
@@ -774,14 +781,6 @@ function TasksTab({ projectFilter, search }) {
   // orchestrators may be healthy — check the dashboard first" shown mid-triage.
   const probeSummary = rtProbeSummary(allTasks);
 
-  function statusMatches(s) {
-    if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
-    if (filters.pending   && s === 'pending')    return true;
-    if (filters.complete  && s === 'done')       return true;
-    if (filters.deferred  && s === 'deferred')   return true;
-    if (filters.cancelled && s === 'cancelled')  return true;
-    return false;
-  }
   function searchMatches(t) {
     if (!search) return true;
     const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
@@ -790,7 +789,8 @@ function TasksTab({ projectFilter, search }) {
     return terms.every(term => haystack.includes(term));
   }
 
-  const selectedTask = selectedId ? allTasks.find(t => t.id === selectedId) : null;
+  const knownTasks = [...allTasks, ...wanted.flatMap(id => terminalOf(id).value || [])];
+  const selectedTask = selectedId ? knownTasks.find(t => t.id === selectedId) : null;
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
@@ -832,11 +832,9 @@ function TasksTab({ projectFilter, search }) {
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>
         <div className="seg">
-          <button className={filters.active    ? 'on' : ''} onClick={() => flipFilter('active')}>active</button>
-          <button className={filters.pending   ? 'on' : ''} onClick={() => flipFilter('pending')}>pending</button>
-          <button className={filters.complete  ? 'on' : ''} onClick={() => flipFilter('complete')}>complete</button>
-          <button className={filters.deferred  ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
-          <button className={filters.cancelled ? 'on' : ''} onClick={() => flipFilter('cancelled')}>cancelled</button>
+          {CENSUS_VIEWS_T.map(v => (
+            <button key={v.key} className={filter[v.key] ? 'on' : ''} onClick={() => flipFilter(v.key)}>{v.label}</button>
+          ))}
         </div>
         <span className={focusMode && focusAnchorId ? 'focus-chip' : ''}
               style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
@@ -849,37 +847,13 @@ function TasksTab({ projectFilter, search }) {
       <div className="col-span-12" style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 16, minHeight: 0 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {projects.map(p => {
-            const projTasks = allTasks.filter(t => t.project === p.id);
-            const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
-            // One pass for every header tally. running / blocked / mergeDeferred
-            // are reported SEPARATELY rather than merged into one "N active"
-            // number: only `running` is bounded by max_concurrent_tasks — a
-            // blocked or merge-deferred task holds no agent slot — so the merged
-            // number routinely exceeded the cap and read as a cap breach.
-            // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
-            // reify "50 active" against 48; neither was a real breach.
-            const statusCounts = projectStatusCounts(projTasks);
-            // Display keys are picked EXPLICITLY rather than spread in from
-            // statusCounts. Its `done` tallies only the done rows loaded into
-            // ACTIVE_TASKS, and the default render fetches none; spreading it
-            // onto the display object would park it beside the measured
-            // `complete` under a near-synonymous name, and the next
-            // `{counts.done} done` edit would silently render a zero nobody
-            // measured.
-            const counts = {
-              total: statusCounts.total,
-              running: statusCounts.running,
-              blocked: statusCounts.blocked,
-              mergeDeferred: statusCounts.mergeDeferred,
-              pending: statusCounts.pending,
-              // The census's done count, or the placeholder when the census
-              // was not measured. A missing count does NOT mean zero: falling
-              // back to a tally of this tab's rows once rendered a confident
-              // "0 done", because no done row is ever sent. The banner's
-              // 'count-unknown' notice names the projects whose rows are
-              // current but whose census is not.
-              complete: doneCount(DF_T.TASKS_SNAPSHOT[p.id]),
-            };
+            const census = projectCensus(DF_T, p.id);
+            const rows = projectRows(DF_T, p.id);
+            const terminal = terminalOf(p.id);
+            const listed = viewRows(rows, terminal, filter);
+            const held = viewRows(rows, terminal, EVERY_VIEW_T).rows;
+            const filtered = listed.rows.filter(searchMatches);
+            const onlyThePlaceholder = listed.placeholder && filtered.length === 0;
             // The ONE focus-narrowing site. Both the header count below and
             // the group body read this single result, so they cannot be fed
             // different arrays — which is exactly what went wrong before
@@ -892,7 +866,7 @@ function TasksTab({ projectFilter, search }) {
             // render paths (a ProjectTaskGraph wrapper, since deleted, and
             // ProjectPrdGroups). For an OPEN group dropping them costs no
             // measured work: both were reference-keyed on `filtered`, which
-            // projTasks.filter(...) above rebuilds as a fresh array on every
+            // listed.rows.filter(...) above rebuilds as a fresh array on every
             // TasksTab render — including the app-wide 1s clock tick — so both
             // already recomputed every render. That is the same hazard
             // ProjectPrdGroups documents for its own signature-keyed memos.
@@ -913,16 +887,9 @@ function TasksTab({ projectFilter, search }) {
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
-                {activityPips(counts).map(pip => (
-                  <span className="pip" key={pip.key}>
-                    <span className="pip-dot" style={{ background: PIP_DOT_COLOR_T[pip.key] }}></span>
-                    {pip.count} {pip.label}
-                  </span>
-                ))}
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
+                {CENSUS_VIEWS_T.map(v => <Pip key={v.key} datum={census} color={CP_T[v.tone]} format={v.reading} />)}
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                  {groupView.shownCount}/{counts.total} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
+                  {groupView.shownCount}/{held.length} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
                 </span>
               </>
             );
@@ -937,13 +904,18 @@ function TasksTab({ projectFilter, search }) {
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
-                {groupView.emptiedByFocus
+                {listed.placeholder && <div className="empty" title={listed.placeholder.title}>{listed.placeholder.text}</div>}
+                {listed.notes.map(note => (
+                  <div key={note} className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{note}</div>
+                ))}
+                {!onlyThePlaceholder && (groupView.emptiedByFocus
                   ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                   : groupByPrd
-                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={projTasks} selectedId={selectedId}
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} rows={rows} terminal={terminal}
+                                        selectedId={selectedId}
                                         onSelect={setSelectedId} onEnterFocus={enterFocus} />
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
-                                 onSelect={setSelectedId} onEnterFocus={enterFocus} />}
+                                 onSelect={setSelectedId} onEnterFocus={enterFocus} />)}
               </PG_T>
             );
           })}

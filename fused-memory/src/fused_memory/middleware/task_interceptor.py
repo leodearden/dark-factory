@@ -40,6 +40,7 @@ from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    LeakedEnvelopeMarkupError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -3041,6 +3042,19 @@ class TaskInterceptor:
                     priority=rt.priority,
                 )
             )
+        except LeakedEnvelopeMarkupError as exc:
+            logger.warning(
+                'task_curator: combine refused for target=%s: the rewrite carries '
+                'leaked tool-call markup in %r',
+                decision.target_id,
+                exc.column,
+                extra={
+                    'column': exc.column,
+                    'fragment': exc.fragment,
+                    'recovered': exc.recovered,
+                },
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 'task_curator: combine update failed for target=%s: %s',

@@ -55,13 +55,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'datumFor',
   'requestOnDemand',
   'onDemandView',
+  'onDemandDatum',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
 // before fetch completes cannot crash any component reading DF_DATA.*.
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
-  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
   'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
@@ -104,7 +105,7 @@ const DATUM_SPEC = { kind: 'datum' };
 // because deriving it from endpointsFor would be deriving the expectation from
 // the thing under test.
 const EXPECTED_ENDPOINT_KEYS = [
-  'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
+  'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
   'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
   'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
@@ -1573,6 +1574,17 @@ test('registry: the reshape drops no key — the union is exactly today\'s set',
   assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
 });
 
+test('registry: ACTIVE_TASKS is retired from the seed and the /tasks row', () => {
+  // EXPECTED_DF_DATA_KEYS is a containment check, so it cannot see a leftover
+  // seed. The rows travel only as TASKS_SNAPSHOT[p].rows now.
+  const { api, window: win } = loadDataJs();
+  assert.ok(!Object.prototype.hasOwnProperty.call(win.DF_DATA, 'ACTIVE_TASKS'), 'DF_DATA still seeds ACTIVE_TASKS');
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(api.endpointsFor('24h')['/api/v2/dashboard/tasks'], 'ACTIVE_TASKS'),
+    'the /tasks registry row still names ACTIVE_TASKS',
+  );
+});
+
 test('registry: every polled key is plain, because beta nests its Datums inside TASKS_SNAPSHOT', () => {
   // Not an aspiration — a description. Beta does serve Datums, but each one
   // sits inside a TASKS_SNAPSHOT entry (census, rows), and TASKS_SNAPSHOT
@@ -1721,6 +1733,22 @@ test('receipts: a successful refresh records servedAt from the body and received
   assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], {
     servedAt: '2026-09-20T12:00:00+00:00',
     receivedAt: 555,
+    window: null,
+  });
+});
+
+test('receipts: a windowed body\'s WINDOW echo is recorded verbatim beside servedAt', async () => {
+  // Transported, not validated: window_chip.js::windowEcho validates at read.
+  const { api, window: win } = loadDataJs();
+  const echo = { requested: '90d', served: '30d', days: 30 };
+  const deps = { fetchImpl: okResponse({ served_at: 'S', WINDOW: echo }), now: () => 555 };
+
+  await api.refreshOne(COSTS_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH], {
+    servedAt: 'S',
+    receivedAt: 555,
+    window: { requested: '90d', served: '30d', days: 30 },
   });
 });
 
@@ -1732,7 +1760,7 @@ test('receipts: a body with no served_at records null, never undefined', async (
 
   await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
 
-  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42 });
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null });
 });
 
 test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {
@@ -1760,6 +1788,35 @@ test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep age
 
     assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], afterSuccess, 'the receipt advanced on a failure');
     assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+  }
+});
+
+test('receipts: a FAILED refresh keeps the WINDOW echo describing the values still on screen', async () => {
+  // A failed refresh replaced no values, so it must not relabel them: the echo
+  // shares the receipt's success-only lifetime.
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({ WINDOW: { requested: '7d', served: '7d', days: 7 } }) }),
+  ]) {
+    const { api, window: win } = loadDataJs();
+    const state = api.createPollState();
+    const echo = { requested: '90d', served: '30d', days: 30 };
+    await api.refreshOne(COSTS_PATH, {}, state, {
+      fetchImpl: okResponse({ served_at: 'S', WINDOW: echo }),
+      now: () => 100,
+    });
+    const before = JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]);
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await api.refreshOne(COSTS_PATH, {}, state, { fetchImpl, now: () => 900 });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]), before, 'a failed refresh relabelled the window');
+    assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH].window, echo);
   }
 });
 
@@ -1941,7 +1998,7 @@ test('on-demand: flow-control and staleness are recorded under the request\'s OW
   assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
   assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
   assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
-  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77 });
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null });
   assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
 });
 
@@ -1971,13 +2028,14 @@ test('on-demand: a poll of /tasks still runs while a terminal request is in flig
   assert.equal(state.get(TERMINAL_STATE_KEY).inFlight, true, 'the held request should be in flight');
   assert.notEqual(state.get(TASKS_PATH)?.inFlight, true, 'the POLLED tasks endpoint was marked in flight');
 
-  await api.refreshOne(TASKS_PATH, { ACTIVE_TASKS: PLAIN_SPEC }, state, {
-    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ ACTIVE_TASKS: [{ id: '1' }] }) }); },
+  const polledSnapshot = { [TERMINAL_PROJECT]: {} };
+  await api.refreshOne(TASKS_PATH, { TASKS_SNAPSHOT: PLAIN_SPEC }, state, {
+    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ TASKS_SNAPSHOT: polledSnapshot }) }); },
     now: () => 101,
   });
 
   assert.deepEqual(polledUrls, [TASKS_PATH], 'the polled tasks fetch was skipped while the terminal request ran');
-  assert.deepEqual(win.DF_DATA.ACTIVE_TASKS, [{ id: '1' }]);
+  assert.deepEqual(win.DF_DATA.TASKS_SNAPSHOT, polledSnapshot);
 
   releaseTerminal();
   await pending;
@@ -2187,7 +2245,7 @@ test('outcomes: the poll loop ignores them — refreshDFData still resolves to u
 // ---------------------------------------------------------------------------
 // taskProse — the Task Detail pane's description/details, fetched per selection
 //
-// The ACTIVE_TASKS rows no longer carry either field (task 5815); the pane asks
+// The snapshot rows no longer carry either field (task 5815); the pane asks
 // for the ONE selected task through the same on-demand seam the terminal row
 // uses. The row is addressed by the row's own uid (`<project>/T-<id>`), whose
 // segments are encoded one by one so the '/' between them stays a path
@@ -2301,6 +2359,99 @@ test('onDemandView: with no value, a settled request that brought none is unavai
       );
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// onDemandDatum — the Datum a caller that REQUESTED an on-demand row shows
+//
+// datumFor answers 'not yet fetched' for every absent key, which is a promise
+// only a requesting caller can keep. A caller holding its own request's outcome
+// knows more: the request is on its way, or it did not succeed. onDemandView
+// already decides which; this turns its answer into the Datum a surface renders.
+// ---------------------------------------------------------------------------
+
+test('onDemandDatum: nothing stored and a request on its way is an unknown saying so', () => {
+  const { api, window: win } = loadDataJs();
+  const reasons = [null, api.REFRESH_OUTCOMES.skippedInFlight].map(outcome => {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(win.DF_DATUM.isDatum(d), true, `outcome ${outcome}`);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}: the hole must say why`);
+    assert.notEqual(d.reason, 'not yet fetched', "datumFor's reason promises nothing about this request");
+    return d.reason;
+  });
+  assert.equal(reasons[0], reasons[1], 'both mean the same thing to the caller: wait');
+});
+
+test('onDemandDatum: nothing stored and a request that did not succeed says it failed', () => {
+  const { api } = loadDataJs();
+  const waiting = api.onDemandDatum('terminal', TERMINAL_PROJECT, null).reason;
+  for (const outcome of [api.REFRESH_OUTCOMES.failed, api.REFRESH_OUTCOMES.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.equal(d.state, 'unknown', `outcome ${outcome}`);
+    assert.equal(d.value, null, `outcome ${outcome}`);
+    assert.ok(d.reason, `outcome ${outcome}`);
+    assert.notEqual(d.reason, waiting, `outcome ${outcome} must not read as still on its way`);
+    assert.notEqual(d.reason, 'not yet fetched', `outcome ${outcome}`);
+  }
+});
+
+test('onDemandDatum: a landed Datum is returned as stored, whatever outcome is passed', async () => {
+  const { api, window: win } = loadDataJs();
+  const O = api.REFRESH_OUTCOMES;
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 55 },
+  });
+  const stored = win.DF_DATA[api.ON_DEMAND_KEYS.terminal.key(TERMINAL_PROJECT)];
+  assert.ok(stored, 'the request should have landed a Datum');
+
+  for (const outcome of [null, O.applied, O.failed, O.skippedInFlight, O.skippedBackoff]) {
+    const d = api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome);
+    assert.deepEqual(d, stored, `outcome ${outcome}`);
+    assert.equal(d._received_at, 55, `outcome ${outcome}: the receipt stamp must survive`);
+  }
+});
+
+test('onDemandDatum: a failed refresh after a good one still shows the earlier Datum', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 300 },
+  });
+  const good = win.DF_DATA[TERMINAL_KEY];
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  let outcome;
+  try {
+    outcome = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 900, ignoreBackoff: true },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
+  assert.deepEqual(api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome), good);
+});
+
+test('onDemandDatum: an undeclared name is refused loudly, as requestOnDemand refuses it', async () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), /termnial/);
+  let requestMessage;
+  await api.requestOnDemand('termnial', TERMINAL_PROJECT, { state: api.createPollState() }).catch(e => {
+    requestMessage = e.message;
+  });
+  assert.throws(() => api.onDemandDatum('termnial', TERMINAL_PROJECT, null), { message: requestMessage });
+});
+
+test('onDemandDatum: a PLAIN row is refused — it has no Datum to answer with', () => {
+  const { api } = loadDataJs();
+  assert.throws(() => api.onDemandDatum('taskProse', PROSE_UID, null), /taskProse/);
 });
 
 // ---------------------------------------------------------------------------
@@ -2461,4 +2612,228 @@ test('on-demand retention: a row that declares no retain keeps every param', asy
   for (const project of projects) {
     assert.ok(win.DF_DATA[`TASKS_TERMINAL:${project}`], `${project} was forgotten`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Slowness pacing (task 5823)
+//
+// A slow-but-successful endpoint is paced by its own measured service time.
+// The rule and its threshold live beside data.js::recordSuccess.
+// ---------------------------------------------------------------------------
+
+const SCHEDULER_PATH = '/api/v2/dashboard/scheduler';
+const ESCALATIONS_PATH = '/api/v2/dashboard/escalations';
+const SIMULATED_MINUTE_MS = 60_000;
+const EXPECTED_MAX_POLL_DUTY_CYCLE = 0.5;
+// The failure-backoff ceiling the schedule test above already pins.
+const EXPECTED_BACKOFF_MAX_MS = 60000;
+
+// A virtual event loop: every sleep and every response resolves at a virtual
+// instant, and each endpoint answers after its configured service time. The
+// no-op timer pair keeps refreshOne's 30s deadline from arming a real timer.
+function makeVirtualServer(serviceMsByPath) {
+  let clock = 0;
+  const timers = [];
+  const calls = new Map();
+  const urls = [];
+  const serviceMs = { ...serviceMsByPath };
+
+  const after = ms => new Promise(resolve => { timers.push({ at: clock + ms, fire: resolve }); });
+
+  function fetchImpl(url) {
+    const path = pollKey(url);
+    calls.set(path, (calls.get(path) || 0) + 1);
+    urls.push(url);
+    return after(serviceMs[path] ?? 0).then(() => ({ ok: true, json: async () => ({}) }));
+  }
+
+  async function advanceTo(target) {
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at);
+      if (timers.length === 0 || timers[0].at > target) break;
+      const next = timers.shift();
+      clock = next.at;
+      next.fire();
+      await drain();
+    }
+    clock = target;
+  }
+
+  return {
+    deps: {
+      fetchImpl,
+      now: () => clock,
+      sleep: after,
+      random: () => 0,
+      setTimeoutImpl: () => 0,
+      clearTimeoutImpl: () => {},
+    },
+    serviceMs,
+    urls,
+    count: path => calls.get(path) || 0,
+    advanceTo,
+  };
+}
+
+async function runTicks(api, server, opts, firstTickAt, tickCount) {
+  for (let i = 0; i < tickCount; i += 1) {
+    await server.advanceTo(firstTickAt + i * EXPECTED_POLL_INTERVAL_MS);
+    api.pollTick(opts);
+    await drain();
+  }
+  await server.advanceTo(firstTickAt + tickCount * EXPECTED_POLL_INTERVAL_MS);
+}
+
+test('pacing: a slow-but-successful endpoint is not asked again until twice its service time after the request started', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(3900);
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH].failures, 0, 'a slow answer is a success, not a failure');
+
+  await server.advanceTo(7799);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 1, 'asked again before twice its 3900ms service time had passed');
+
+  await server.advanceTo(7800);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 2, 'still held once twice its service time had passed');
+});
+
+test('pacing: replaying the three endpoints measured 2026-09-23, each is held at or under the duty-cycle cap - fewer requests per minute than the in-flight guard alone admits', async () => {
+  const measuredServiceMs = { [TASKS_PATH]: 3886, [SCHEDULER_PATH]: 2297, [ESCALATIONS_PATH]: 2120 };
+  // What the in-flight guard alone admits in a minute of 3s ticks: /tasks
+  // lands between ticks, so it is re-issued every 2nd tick; the other two are
+  // under 3000ms, so every tick.
+  const unpacedRequestsPerMinute = { [TASKS_PATH]: 10, [SCHEDULER_PATH]: 20, [ESCALATIONS_PATH]: 20 };
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer(measuredServiceMs);
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  for (const [path, serviceMs] of Object.entries(measuredServiceMs)) {
+    const requests = server.count(path);
+    assert.ok(
+      requests < unpacedRequestsPerMinute[path],
+      `${path}: ${requests} requests in a minute, not fewer than the unpaced ${unpacedRequestsPerMinute[path]}`,
+    );
+    const dutyCycle = requests * serviceMs / SIMULATED_MINUTE_MS;
+    assert.ok(
+      dutyCycle <= EXPECTED_MAX_POLL_DUTY_CYCLE,
+      `${path}: busy ${dutyCycle.toFixed(3)} of the minute, over the ${EXPECTED_MAX_POLL_DUTY_CYCLE} cap`,
+    );
+  }
+  const fastPaths = Object.keys(api.endpointsFor('24h')).map(pollKey).filter(p => !(p in measuredServiceMs));
+  for (const path of fastPaths) {
+    assert.equal(server.count(path), tickCount, `${path} is fast and must be fetched on every tick`);
+  }
+});
+
+test('pacing: a fast endpoint is untouched - even when jitter starts its request late in the tick', async () => {
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer({ [SCHEDULER_PATH]: 1400 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: { ...server.deps, random: () => 0.9 } };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  const paths = Object.keys(api.endpointsFor('24h')).map(pollKey);
+  assert.equal(paths.length, EXPECTED_ENDPOINT_COUNT);
+  for (const path of paths) {
+    assert.equal(server.count(path), tickCount, `${path} was paced, though its own service time is under the threshold`);
+  }
+});
+
+test('pacing: relaxes back as the endpoint speeds up', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, 9);
+  assert.equal(server.count(TASKS_PATH), 3, 'a 3900ms endpoint is asked once per 9s, not every 6s');
+
+  server.serviceMs[TASKS_PATH] = 100;
+  await runTicks(api, server, opts, 27_000, 11);
+  assert.equal(server.count(TASKS_PATH), 3 + 11, 'a fast answer must restore the full cadence on the very next tick');
+});
+
+test('pacing: a chip change still forces a paced WINDOWED endpoint, only the windowed ones, and the forced answer paces the timer path by its own measurement', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000, [CURATOR_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(5000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: costs is paced');
+  assert.equal(server.count(CURATOR_PATH), 1, 'precondition: curator is paced');
+
+  const chip = api.refreshDFData('7d', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the chip change must bypass pacing on a windowed endpoint');
+  assert.ok(server.urls.includes(`${COSTS_PATH}?window=7d`), 'the forced request must carry the new window');
+  assert.equal(server.count(CURATOR_PATH), 1, 'the chip has no bearing on curator, so its pacing must hold');
+
+  await server.advanceTo(9000);
+  await chip;
+
+  await server.advanceTo(12_999);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the forced 4000ms answer, started at 5000, must pace the timer path');
+
+  await server.advanceTo(13_000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 3);
+});
+
+test('pacing: requestOnDemand is never paced - a user action is not a poll loop, even handed a poll cadence in its deps', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const state = api.createPollState();
+  const deps = { ...server.deps, pollIntervalMs: EXPECTED_POLL_INTERVAL_MS };
+
+  const first = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  await drain();
+  await server.advanceTo(4000);
+  assert.equal(await first, api.REFRESH_OUTCOMES.applied);
+
+  const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  await drain();
+  await server.advanceTo(8000);
+  assert.equal(await second, api.REFRESH_OUTCOMES.applied, 'a user re-request of a slow listing must be fetched, not skipped');
+  assert.equal(server.count(TASKS_PATH), 2);
+});
+
+test('pacing: a service time inflated by a wall-clock jump can never hold an endpoint beyond BACKOFF_MAX_MS after its request started', async () => {
+  // A laptop suspended mid-request: the answer lands ten hours "later" by
+  // Date.now(), still a success, so no staleness banner would ever explain
+  // an unbounded hold.
+  const jumpedServiceMs = 36_000_000;
+  const server = makeVirtualServer({ [CURATOR_PATH]: jumpedServiceMs });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(jumpedServiceMs);
+  assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 0, 'nothing would warn the operator of this hold');
+
+  // The cap runs from the request's start, so a late answer lands already past
+  // it: the very next tick asks again. A cap anchored at arrival would still
+  // be holding here.
+  await server.advanceTo(jumpedServiceMs + EXPECTED_POLL_INTERVAL_MS);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(CURATOR_PATH), 2, `held off past ${EXPECTED_BACKOFF_MAX_MS}ms after its request started`);
 });

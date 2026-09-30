@@ -265,6 +265,9 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_reuse_item',
     # Revalidation tools (blast-radius requeue)
     'mcp__plan-tools__update_plan_metadata',
+    # Narrowing-pass option (c); see
+    # orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt
+    'mcp__plan-tools__drop_plan_file',
     'mcp__plan-tools__remove_plan_step',
     'mcp__plan-tools__replace_plan_step',
     'mcp__plan-tools__confirm_plan',
@@ -594,10 +597,64 @@ NEVER — each of these cost a real session a turn or an entire wait
 """
 
 
-# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# Third member of the wait block (task 5519): reading the exit code a wait
+# returned -- your own timeout, or an external kill.  Constraint (b) above binds
+# it, and it stays brace-free like the two members above.  It reads shell
+# 128 + N codes against the clock; verify_classify.py::is_external_kill_rc is a
+# different rule, over negative asyncio returncodes, that ignores a shell 137.
+EXTERNAL_KILL_GUIDANCE = """
+## Reading an exit code: your own timeout, or an external kill?
+
+Read the code against the CLOCK: a command that died far short of the
+`timeout` you set was not timed out, whatever the code says. The three codes:
+- 143 = 128 + 15, SIGTERM: your own Bash `timeout` (120000 ms when omitted).
+- 124: a GNU `timeout N` prefix YOU wrote into the command, as above.
+- 137 = 128 + 9, SIGKILL. Well short of your budget, that is an EXTERNAL
+  killer: the Linux OOM killer, or an operator or sweep `kill -9`. It is NOT
+  the session watchdog: that kill takes your whole session, so if you are
+  reading the code, it was not the watchdog. Raising `timeout` cannot fix an
+  external kill, and re-running the identical command usually reproduces it.
+
+A killed run says NOTHING about the code under test: it is neither failing nor
+hanging. Never report it as a test failure or a hang. Say it was killed
+externally, and quote the raw code.
+
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
+without `pipefail`, so a pipeline reports its LAST stage's status and the real
+exit code is thrown away. A kill that takes the process group also takes
+whatever was buffered in the pipe, leaving a code and no output. Redirect to a
+file and `Read` the file: a killed run then still leaves its partial output
+on disk.
+
+To diagnose a 137, re-run it once, on ONE line:
+
+    /usr/bin/time -v <cmd> > <log> 2>&1; echo "rc=$?"
+
+Make the log path unique (carry your task id): /tmp is shared by every agent
+on the host. `Read` the END of the log: "Command terminated by signal 9", the
+elapsed wall clock, and the max RSS (the largest single process; xdist workers
+are not summed). Before and after that run, read the `oom_kill` line of
+`/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.events`. A rise is
+strong evidence of OOM, not proof: other agents share that cgroup.
+
+Then, in order:
+- Elapsed close to your budget: it was your timeout. Re-size it, or
+  background it per the rules above.
+- Short of budget with `oom_kill` risen or a large max RSS: shrink the run.
+  Shard by directory, cut xdist workers (`-n 4`, not `-n auto`, which starts
+  one per core), or run the heaviest subset alone.
+- Neither: escalate rather than guess a cause (`escalate_blocker` with
+  `category='infra_issue'` if you hold it, otherwise `escalate_info`), quoting
+  the raw code, elapsed time, max RSS and `oom_kill` before and after.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never any member on its
 # own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
-# composition so the two rules cannot drift apart.
-BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+# composition so the three rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = (
+    BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE + EXTERNAL_KILL_GUIDANCE
+)
 
 
 # Pointer form for a TURN prompt whose role system_prompt already carries the
@@ -607,11 +664,12 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~11% of the block's bytes.
+# that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
+# BACKGROUND_WAIT_GUIDANCE 9128 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2418),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9128 = 8.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -1120,6 +1178,28 @@ GREP_LOOKAROUND_GUIDANCE = _GREP_ENGINE_LIMITS + _GREP_PCRE_BASH_RECOURSE
 GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_RECOURSE
 
 
+# The harness guidance every role with a literal system_prompt and unqualified
+# `Bash` carries, spliced straight after its one-line role statement. One
+# composite, so a new block is one edit here rather than one per carrier. Each
+# block's own test module still pins its carrier set against a capability, so
+# a role for which some block stops applying builds its own chain rather than
+# dropping that block from this one -- JUDGE already does: no wait block and
+# the read-only grep variant.
+#
+# APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
+# own test module (each asserts it starts exactly where its predecessor ends),
+# and BACKGROUND_WAIT_GUIDANCE's heading must stay the prompt's first `##`.
+# _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
+# section just above". Inserting anywhere but the end breaks a pin, or
+# silently redirects that pointer.
+_BASH_CAPABLE_ROLE_PREAMBLE = (
+    BACKGROUND_WAIT_GUIDANCE
+    + TOOL_CALL_REJECTION_GUIDANCE
+    + ERROR_REMEDY_HINT_GUIDANCE
+    + GREP_LOOKAROUND_GUIDANCE
+)
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
@@ -1254,9 +1334,9 @@ The server runs the same checks as a backstop, in this order:
 # shared across every project this orchestrator dispatches for, so an
 # unconditional enforcement promise would be false on a host or project that
 # runs unsandboxed (task 4370 review, suggestion 1). Composed the same way
-# BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE compose
-# BACKGROUND_WAIT_GUIDANCE above: each half is self-contained with its own
-# leading/trailing blank line, plain `+` concatenation.
+# BACKGROUND_WAIT_GUIDANCE above is composed from its members: each half is
+# self-contained with its own leading/trailing blank line, plain `+`
+# concatenation.
 #
 # SCOPE_BOUNDARY_GUIDANCE / SCOPE_BOUNDARY_GUIDANCE_SIMPLE remain the public
 # splice units, spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the
@@ -1438,7 +1518,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -1550,7 +1630,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1614,7 +1694,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -1883,7 +1963,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -2246,7 +2326,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -2523,7 +2603,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## What You Do
 
 You receive:
@@ -2643,7 +2723,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

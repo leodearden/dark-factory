@@ -27,6 +27,7 @@ a nested-pytest end-to-end failure contract with a non-vacuity control.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import shutil
 import signal
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -58,8 +60,10 @@ from df_pytest_isolation import (  # noqa: E402
     leaked_drain_process_reason,
     leaked_drain_processes,
     load_scaled_grace,
+    read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -351,6 +355,122 @@ class TestRunInNewSession:
         )
 
 
+def _pid_recorded(pidfile: Path) -> Callable[[], bool]:
+    """A condition that holds once the leaker has written its grandchild's pid."""
+    def condition() -> bool:
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+    return condition
+
+
+def _never() -> bool:
+    return False
+
+
+class TestRunInNewSessionUntil:
+    """The spawner stops the whole process group once an observed condition holds."""
+
+    def test_it_stops_the_group_as_soon_as_the_condition_holds(self, tmp_path: Path) -> None:
+        """``stopped_on_condition`` is the non-vacuity proof: a stop on the 60s
+        deadline raises ``TimeoutExpired`` instead of returning an outcome."""
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            outcome = run_in_new_session_until(
+                ['bash', str(leaker)], condition=_pid_recorded(pidfile),
+                env=_leaker_env(pidfile), timeout=60,
+            )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert outcome.stopped_on_condition is True
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid}, a grandchild backgrounded by the spawned '
+                'script, is STILL ALIVE after the condition stopped the spawn: '
+                'the stop reached the direct child only.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_output_printed_before_the_stop_is_kept(self, tmp_path: Path) -> None:
+        flag = tmp_path / 'ready.flag'
+        env = dict(os.environ)
+        env['FLAG'] = str(flag)
+
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo READY; : > "$FLAG"; sleep 300'],
+            condition=flag.exists, env=env, timeout=60,
+        )
+
+        assert outcome.stopped_on_condition is True
+        assert 'READY' in outcome.completed.stdout
+
+    def test_a_child_that_exits_first_is_reported_as_completed(self) -> None:
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'], condition=_never, timeout=30,
+        )
+
+        assert outcome.stopped_on_condition is False
+        assert isinstance(outcome.completed, subprocess.CompletedProcess)
+        assert outcome.completed.returncode == 3
+        assert outcome.completed.stdout == 'hi\n'
+        assert outcome.completed.stderr == 'boom\n'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            outcome.stopped_on_condition = True  # type: ignore[misc]
+
+    def test_the_deadline_still_binds_and_kills_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=_never,
+                    env=_leaker_env(pidfile), timeout=2,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the deadline path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the deadline fired: the '
+                'deadline path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_condition_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def condition() -> bool:
+            if pid_recorded():
+                raise RuntimeError('condition blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='condition blew up'):
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=condition,
+                    env=_leaker_env(pidfile), timeout=60,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the condition raised: an '
+                'exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+
 class TestWaitProofGraceSecs:
     """The grace a wait-proving test hands its script is DERIVED, not typed.
 
@@ -370,7 +490,8 @@ class TestWaitProofGraceSecs:
     # The two spawn timeouts actually in use, at the three sites step-9 edits:
     # test_defer_withholds_restart_while_busy (3s),
     # test_unknown_grace_withholds_restart_while_absent (3s),
-    # test_boundary4_defers_busy_unit_while_others_proceed (20s).
+    # scripts/tests/test_restart_all_orchestrators.py::
+    # test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await (20s).
     REAL_SPAWN_TIMEOUTS = (3, 20)
 
     def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
@@ -628,6 +749,51 @@ class TestLoadScaledGrace:
             warnings.simplefilter('error')
             assert load_scaled_grace(3, cap_secs=30) == 30
             assert load_scaled_grace(20, cap_secs=20) == 20
+
+
+class TestReadDrainPollTrace:
+    """The drain gate's poll ledger has ONE parser, shared by both test roots."""
+
+    UNIT = 'orchestrator-fake-reify.service'
+
+    def test_an_absent_ledger_reads_as_no_polls(self, tmp_path: Path) -> None:
+        """Callers then fail on their own diagnostic, not a bare FileNotFoundError."""
+        assert read_drain_poll_trace(tmp_path / 'never-written.tsv') == []
+
+    def test_records_are_verdict_unit_pairs_in_file_order(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidle\t{self.UNIT}\n')
+
+        assert read_drain_poll_trace(ledger) == [('busy', self.UNIT), ('idle', self.UNIT)]
+
+    def test_complete_only_drops_a_record_still_being_appended(self, tmp_path: Path) -> None:
+        """A reader racing the script must never count a half-written record."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        assert read_drain_poll_trace(ledger, complete_only=True) == [('busy', self.UNIT)]
+
+    def test_a_finished_ledger_with_a_torn_record_is_rejected(self, tmp_path: Path) -> None:
+        """Read whole, a torn final record must fail loudly rather than vanish."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        with pytest.raises(ValueError):
+            read_drain_poll_trace(ledger, complete_only=False)
+
+    @pytest.mark.parametrize('bad_line', ['busy', f'busy\t{UNIT}\textra'])
+    def test_a_record_without_exactly_two_fields_names_the_line_and_the_ledger(
+        self, tmp_path: Path, bad_line: str,
+    ) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'idle\t{self.UNIT}\n{bad_line}\n')
+
+        with pytest.raises(ValueError) as exc_info:
+            read_drain_poll_trace(ledger)
+
+        message = str(exc_info.value)
+        assert repr(bad_line) in message
+        assert str(ledger) in message
 
 
 # ---------------------------------------------------------------------------

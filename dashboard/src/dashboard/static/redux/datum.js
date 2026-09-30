@@ -8,9 +8,10 @@
 // the two halves findable from each other.
 //
 // THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM — datum.py's dataclass
-// is frozen for the same reason. Three client-built envelopes are sanctioned
-// and no more: unknownDatum, plainDatum and derivedDatum, each below with the
-// gap it covers.
+// is frozen for the same reason. Four client-built envelopes are sanctioned
+// and no more: unknownDatum, plainDatum, derivedDatum and combinedDatum, each
+// below with the gap it covers. combinedDatum is the only one built FROM served
+// Datums: a cross-project total the server serves per project only.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so the render decision is
 // EXECUTABLE: the .jsx files are `type="text/babel"` behind CDN Babel with no
@@ -36,20 +37,11 @@
 // index.html's load order is the enforced contract, pinned per-module by
 // tests/test_index_html.py.
 //
-// WHICH NAME TO BIND IT UNDER DEPENDS ON THE KIND OF FILE, and getting it wrong
-// fails at LOAD rather than at first use:
-//   · a classic `<script>` — data.js, task_row_cells.js, and this file — shares
-//     ONE global lexical scope with every other classic script, so a `const`
-//     matching a top-level declaration elsewhere dies with "Identifier 'x' has
-//     already been declared" before the file reaches its own `window.DF_*`
-//     assignment, taking every downstream destructure with it. Rename in the
-//     destructure: `{ datumView: viewOfDatum }`.
-//   · a `type="text/babel"` tag — charts.jsx, shell.jsx, tabs.jsx and the
-//     tab_*.jsx files — is downlevelled by Babel-standalone, whose top-level
-//     bindings never join that scope. Bind under datum.js's own names.
-// Measured, not assumed: classic_script_scope.test.mjs's SCOPE note records
-// three independent witnesses, and it caught the destructure below in its
-// first spelling.
+// WHICH NAME TO BIND IT UNDER — an export's own name may already be declared at
+// top level by a classic script, and rebinding it can kill the file on LOAD.
+// Rename in the destructure: `{ datumView: viewOfDatum }`. When a name clashes
+// is stated in the SCOPE note of dashboard/tests/js/classic_script_scope.test.mjs,
+// which enforces it for classic and text/babel files alike.
 
 // ── One age formatter for the whole dashboard ──
 // Renamed per the CANONICAL note above: endpoint_staleness.js already declares
@@ -353,6 +345,79 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
   return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
 }
 
+// ── A total over several SERVED Datums ──
+// The census is served per project; the topbar, the rail and any tile scoped to
+// more than one project need the sum. `partsByLabel` is an ordered array of
+// `[label, datum]` pairs, `combine` folds the parts' values (in part order), and
+// `emptyReason` — required — says why an empty scope has no total.
+//
+// A HOLE ANYWHERE IS A HOLE IN THE TOTAL. A partial sum is an under-count passed
+// off as a total, so `combine` never runs over a scope with a gap in it, and the
+// reason names every missing part so the operator reads which one and why.
+//
+// OTHERWISE THE WORST PART DECIDES THE STATE: lower_bound > stale > fresh,
+// lower_bound first so both the '≥' and the age badge survive.
+//
+// THE TOTAL LOOKS AS OLD AS ITS OLDEST-LOOKING PART, AND BADGES EXACTLY WHEN ITS
+// FIRST PART WOULD. Parts may arrive on different payloads, each with its own
+// served_at and received_at, so "oldest" is the greatest displayedAgeMs, not the
+// earliest as_of; the total takes that part's as_of and receipt. Its bound is
+// every part's bound restated on the oldest part's clock — the part's own bound
+// plus the oldest part's lead over it — and the tightest wins: a bare minimum
+// would badge the total while every part is still inside its own bound.
+const COMBINED_STATE_PRECEDENCE = ['lower_bound', 'stale', 'fresh'];
+
+function combinedDatum(partsByLabel, combine, emptyReason) {
+  const parts = partsByLabel.map(([label, part]) => [label, assertDatum(part, 'combinedDatum')]);
+  if (parts.length === 0) return unknownDatum(emptyReason);
+
+  const holes = parts.filter(([, part]) => part.state === 'unknown');
+  if (holes.length > 0) return unknownDatum(labelledReasons(holes));
+
+  const measured = parts.map(([, part]) => part);
+  const ages = displayedAgesOf(measured);
+  const oldestAge = Math.max(...ages);
+  const oldest = measured[ages.indexOf(oldestAge)];
+  const unfresh = parts.filter(([, part]) => part.state !== 'fresh');
+  const state = COMBINED_STATE_PRECEDENCE.find(s => measured.some(part => part.state === s));
+
+  return withReceipt(
+    {
+      value: combine(measured.map(part => part.value)),
+      as_of: oldest.as_of,
+      state,
+      reason: unfresh.length > 0 ? labelledReasons(unfresh) : null,
+      freshness_bound_seconds: Math.min(
+        ...measured.map((part, i) => part.freshness_bound_seconds + (oldestAge - ages[i]) / 1000),
+      ),
+    },
+    { servedAt: oldest._served_at, receivedAt: oldest._received_at },
+  );
+}
+
+// Every part's displayed age at ONE instant. Displayed ages all grow at the
+// same rate, so their order and their differences — all combinedDatum reads —
+// hold at every later render. A part with no receipt has no displayed age to
+// compare, and a total over it could not say how old it looks: a caller's
+// error, thrown like assertDatum's.
+function displayedAgesOf(parts) {
+  const now = Date.now();
+  return parts.map(part => {
+    const age = displayedAgeMs(part, now);
+    if (age === null) {
+      throw new TypeError(
+        'combinedDatum was given a part with no displayed age — stamp every served part ' +
+          'with its receipt (withReceipt) before combining.',
+      );
+    }
+    return age;
+  });
+}
+
+function labelledReasons(parts) {
+  return parts.map(([label, part]) => label + ': ' + part.reason).join('; ');
+}
+
 // The browser default for plainDatum's third parameter, read LAZILY: a node
 // caller passing its own map never touches a browser global, and a render
 // before data.js has published degrades to "no receipt" rather than throwing.
@@ -374,6 +439,7 @@ const DATUM_API = {
   LOWER_BOUND_PREFIX,
   plainDatum,
   derivedDatum,
+  combinedDatum,
   PLAIN_DATUM_BOUND_SECONDS,
 };
 

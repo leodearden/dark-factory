@@ -31,9 +31,8 @@ XDIST_WORKER_CRASH_OUTPUT = (
 # here, dark-factory's own setting) and then calls `triggershutdown()`,
 # abandoning every queued test; its terminal summary re-emits it in this
 # ``=``-barred form.
-XDIST_BAILOUT_LINE = (
-    '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
-)
+XDIST_RESTART_DISABLED_MESSAGE = 'worker gw3 crashed and worker restarting disabled'
+XDIST_BAILOUT_LINE = f' xdist: {XDIST_RESTART_DISABLED_MESSAGE} '.center(80, '=') + '\n'
 
 # The tally pytest prints after that bailout counts only the tests that had
 # already run, so it is PARTIAL. Modelled on esc-4176-6: this truncated tally
@@ -91,4 +90,98 @@ XDIST_FAILED_THEN_CRASHED_OUTPUT = (
     + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
     + XDIST_BAILOUT_LINE
     + '2 failed, 728 passed, 1 skipped in 209.67s\n'
+)
+
+# task 5337: the same worker death under ``-q``, which every module-scoped verify
+# leg passes. xdist gates BOTH bailout literals on ``verbose >= 0``, and its
+# ``replacing crashed worker`` line too, so a truncated -q session differs from
+# a recovered one only in where pytest's FINAL progress line stops. A trimmed
+# transcription of the -q orchestrator leg
+# data/verify-logs/3781/attempt-1.orchestrator.test-20260912T143439_885173Z.log
+# (log lines 137, 140-145 and 159-161), rebased onto this module's
+# in-flight node-id so the crash attribution matches exactly.
+_XDIST_Q_PROGRESS_UP_TO_CRASH = (
+    '.' * 72 + ' [ 45%]\n'
+    + '.' * 45 + '[gw4] node down: Not properly terminated\n'
+)
+
+_XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY = (
+    ' FAILURES '.center(80, '=') + '\n'
+    + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
+    + '[gw4] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+    + f"worker 'gw4' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
+    + ' short test summary info '.center(80, '=') + '\n'
+    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+)
+
+_XDIST_Q_TRUNCATED_TALLY = '1 failed, 9851 passed, 8 warnings in 1553.83s (0:25:53)\n'
+
+XDIST_Q_TRUNCATED_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F..............'.ljust(73) + '[ 46%]\n'
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + _XDIST_Q_TRUNCATED_TALLY
+)
+
+XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F' + '.' * 71 + ' [ 45%]\n'
+    + ' ' * 73 + '[ 46%]\n'
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + _XDIST_Q_TRUNCATED_TALLY
+)
+
+XDIST_Q_RECOVERED_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F' + '.' * 71 + ' [ 46%]\n'
+    + '.' * 72 + ' [ 99%]\n'
+    + '..........'.ljust(73) + '[100%]\n'
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + '1 failed, 21339 passed, 8 warnings in 1953.83s (0:32:33)\n'
+)
+
+XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F' + '.' * 71 + ' [ 46%]\n'
+    + '.' * 72 + ' [ 71%]\n'
+    + '.' * 30 + '\n'
+)
+
+# task 5337: the -q witness's ACCEPTED RESIDUAL. xdist REPLACED the crashed
+# worker (``--max-worker-restart > 0``), then ``-x`` stopped the session on a
+# real failure: the last percentage line reads below 100% and pytest's tally
+# follows, exactly as in a bailout. Measured live (pytest 9.0.3, pytest-xdist
+# 3.8.0, ``-n 2 -q --max-worker-restart=2 -x``), trimmed and rebased like the
+# specimens above.
+XDIST_Q_MAXFAIL_REAL_FAILED_LINE = 'FAILED orchestrator/tests/test_x.py::test_real - assert False\n'
+XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F' + '.' * 71 + ' [ 46%]\n'
+    + '.' * 25 + 'F...\n'
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + XDIST_Q_MAXFAIL_REAL_FAILED_LINE
+    + ' stopping after 2 failures '.center(80, '!') + '\n'
+    + ' xdist.dsession.Interrupted: stopping after 1 failures '.center(80, '!') + '\n'
+    + '2 failed, 9880 passed, 8 warnings in 1560.02s (0:26:00)\n'
+)
+
+# task 5337: a DEFAULT-verbosity bailout, on which both truncation witnesses
+# hold at once: xdist prints the bailout literal (bare, then barred in its
+# summary) AND pytest's final progress line stops short of 100% before the
+# tally. Measured live (pytest 9.0.3, pytest-xdist 3.8.0,
+# ``-n 2 --max-worker-restart=0``, one os._exit test beside 150 passing),
+# rebased onto this module's worker and in-flight node-id.
+XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT = (
+    '.' * 15 + '[gw3] node down: Not properly terminated\n'
+    + 'F\n'
+    + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    + ('.' * 58).ljust(73) + '[ 49%]\n'
+    + ' FAILURES '.center(80, '=') + '\n'
+    + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
+    + '[gw3] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+    + f"worker 'gw3' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
+    + XDIST_BAILOUT_LINE
+    + ' short test summary info '.center(80, '=') + '\n'
+    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+    + ' 1 failed, 73 passed in 5.52s '.center(80, '=') + '\n'
 )

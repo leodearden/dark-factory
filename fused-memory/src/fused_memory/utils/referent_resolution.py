@@ -44,6 +44,10 @@ names: the scan reaches a foreign task ONLY through an explicit qualifier, so
 its silence about that project is silence rather than disagreement
 (:func:`_conflicting_referents`, choice 2).
 
+This module also owns the caller-facing teaching of the shape it enforces
+(:func:`render_referent_declaration_guidance`), so that the rule and the way it
+is taught stay in one place.
+
 This module is a dependency-free leaf — stdlib plus utils/canonical_labels and
 utils/validation, both themselves leaves — so leaf δ (``server/tools.py``) and
 leaf ε (``services/memory_service.py``) can each import it without a cycle.
@@ -83,6 +87,29 @@ _DECLARED_REFERENT_HINT = (
     "'id' must be the task number's digits (an int, or a string of ASCII "
     'digits), never a label like "Task 3127" and never a bool.'
 )
+
+
+def render_referent_declaration_guidance() -> str:
+    """Teach a writing agent to declare referents, in the shape this module enforces.
+
+    Composes :data:`_DECLARED_REFERENT_HINT` verbatim, so the shape sentence an
+    agent is taught is the one its rejection would quote. Plain text built from
+    adjacent literals: consumers interpolate it into their own f-strings, so its
+    braces need no escaping there. ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its worked example through the live gate.
+    """
+    return (
+        '## Declaring What a Write Is About\n'
+        '`add_memory` and `add_episode` take an optional `entities` argument naming '
+        'the referents the write is about. It has three states: omitting it means you '
+        'never considered them, and they are inferred from metadata or the content; '
+        '`[]` records that you considered them and none apply; a list declares them. '
+        f'{_DECLARED_REFERENT_HINT}\n'
+        'Omitting `entities` always succeeds. A declaration that your own content '
+        'contradicts is REJECTED, so declare only what the content is actually about:\n'
+        '`add_memory(content="Task 3127\'s retry loop swallows the timeout", '
+        "category=..., project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`"
+    )
 
 #: The complete set of keys a declared entry may carry. Closed deliberately:
 #: an unrecognized key ('projectId') would otherwise be silently ignored and

@@ -392,7 +392,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # 'skills/**/test_*.py' 'skills/**/*_test.py'` is empty), but the inference
 # drawn from it is FALSE. An honest test_command is not a tests/scripts/
 # pointer: the tests that actually READ or EXECUTE real paths under skills/ at
-# runtime span THREE uv projects. Enumerated first-hand, not copied forward:
+# runtime span the orchestrator, shared and fused-memory uv projects.
+# Enumerated first-hand, not copied forward:
 #   orchestrator/tests/test_skill_prompt.py       — exercises
 #       orchestrator.agents.skill_prompt.load_skill_system_prompt, which walks
 #       up from its own __file__ to the IN-REPO skills/<name>/SKILL.md (not
@@ -418,6 +419,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
+#   fused-memory/tests/test_referent_declaration_examples.py — reads
+#       skills/reflect/SKILL.md to execute its `entities=` examples against
+#       the live entities_gate (task 3675).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -1036,7 +1040,8 @@ verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 # move in the SAME COMMIT as any change to the value below.
 verify_admission_pytest_n: "8"
 
-# TASK-ROLE VERIFY ADMISSION WIDTH (raised 1 -> 3, 2026-09-03).
+# TASK-ROLE VERIFY ADMISSION WIDTH (1 -> 3 on 09-03, -> 1 on 09-08, -> 2 on
+# 09-23, -> 1 on 09-27; 2026).
 #
 # The code default is 1 (config.py::OrchestratorConfig.verify_admission_task_slots)
 # and it had never been set in either yaml, so ONE task-role pytest ran at a
@@ -1100,7 +1105,17 @@ verify_admission_pytest_n: "8"
 # computed from. Task 5798 closes that gap. Until it lands, this knob is being
 # tuned on merge-lane duration plus queue-depth observation, not on task-lane
 # slot utilisation.
-verify_admission_task_slots: 2
+# PUT BACK TO 1 (task 5797 gate, 2026-09-27). The dated-revert clause above
+# fired. Equal 4.3d arms on either side of the 09-23 reload:
+#   orchestrator-suite task-leg verify (verify-summary census):
+#     median 3233s -> 4995s, >=3600s share 27.3% -> 63.3%
+#   task-lane verify after a rebase, all modules (runs.db rebase_verify_cost):
+#     median  222s ->  633s, >=3600s share 11.0% -> 28.1%
+# Journal timeouts 0 -> 2 (fused-memory, 09-24). Merge verify was flat (p50
+# 51.5 -> 54.7 min), and landings/day fell 17.1 -> 14.1. Full before/after on
+# all five measures, with sources and caveats:
+# plans/verify-admission-task-slots-gate.md.
+verify_admission_task_slots: 1
 
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
 # decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
@@ -1390,12 +1405,6 @@ routing:
         min_routing_tier: 1
       set:
         model: "+1"
-    - id: steward-retry-fable
-      match:
-        role: [steward]
-        min_routing_tier: 1
-      set:
-        model: claude-fable-5-1
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
