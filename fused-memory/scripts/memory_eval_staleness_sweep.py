@@ -1880,6 +1880,7 @@ def sweep_report_sections(
         )))
 
     unsearchable = unsearchable_supersedes_refs(list(refs))
+    predecessor_gone = predecessor_gone_supersedes_refs(census.unresolved_refs)
     sections.append(ReportSection('superseded_surfacing', (
         '',
         'Family 1 — superseded entries still surfacing',
@@ -1895,6 +1896,11 @@ def sweep_report_sections(
             '    (no successor text, or a target that is not a memory id;',
             '     each is named under a disclosure below)',
         ] if unsearchable else []),
+        f'  supersedes edges whose predecessor is gone: {len(predecessor_gone)}',
+        *([
+            '    (a reaped predecessor can never surface, so these pairs can',
+            '     never be compared — PRD D12)',
+        ] if predecessor_gone else []),
         f'  comparable pairs (both returned): {surfacing.pairs_comparable}',
         f'  superseded above its successor:   {surfacing.still_surfacing}',
         *_elided(
@@ -1907,9 +1913,15 @@ def sweep_report_sections(
         ),
     )))
 
+    # Unattributed edges first (a stable sort keeps scan order within each
+    # half): at corpus scale nearly every unresolved pointer is a deliberate
+    # deletion, and naming in scan order would spend the whole _MAX_NAMED
+    # budget on those and elide the edge an operator actually has to fix.
+    actionable_first = sorted(census.unresolved_refs, key=lambda ref: ref.reaped_by is not None)
     unresolved_rows = [
-        f'    {ref.key}: {ref.source_id} -> {ref.target!r}'
-        for ref in census.unresolved_refs[:_MAX_NAMED]
+        f'    {ref.key}: {ref.source_id} -> {ref.target!r} '
+        f'[{ref.reaped_by or UNATTRIBUTED}]'
+        for ref in actionable_first[:_MAX_NAMED]
     ]
     sections.append(ReportSection('dangling_pointers', (
         '',
@@ -1918,6 +1930,10 @@ def sweep_report_sections(
         f'  resolved:          {census.resolved}',
         f'  unresolved:        {census.unresolved}',
         *(f'  {key}: {row}' for key, row in sorted(census.by_key.items())),
+        '  by attribution (the same edges, cut by which reaper deletes the target):',
+        *(f'  {bucket}: {row}' for bucket, row in sorted(census.by_reaper.items())),
+        f'  The total is recorded, not alarmed; the {UNATTRIBUTED} bucket is',
+        '  the alarmed population (PRD D11).',
         # Named, not just counted: a bare total tells an operator that
         # something dangles but not which pointer to go and look at.
         *_elided(unresolved_rows, len(census.unresolved_refs)),
@@ -1928,6 +1944,8 @@ def sweep_report_sections(
         '',
         'Family 2b — successor pointer present (per supersedes edge)',
         f'  edges checked: {len(tripwire_items)}',
+        # Outside the tripwire, not lost: still in the census above.
+        f'  edges excluded, target reaped by design: {len(by_design_successor_refs(list(refs)))}',
         f'  edges whose predecessor is gone: {len(failing)}',
         *_elided([f'    {item.item_key}' for item in failing[:_MAX_NAMED]], len(failing)),
     )))
