@@ -82,8 +82,11 @@ import re
 import sys
 import tempfile
 import textwrap
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
 from shared.cli_boundary import (
@@ -2254,6 +2257,7 @@ SECTION_KNOWN_BAD_ROUTING_CAVEAT = 'initial-state-routing-caveat'
 SECTION_KNOWN_BAD_ITEMS = 'initial-state-known-bad-items'
 SECTION_DEGRADED_QUERIES = 'degraded-queries'
 SECTION_TOPICS_NOT_MEASURED = 'topics-not-measured'
+SECTION_TRIPWIRE_BY_CENSUS = 'tripwire-by-census-canonical-presence'
 SECTION_UNMATCHED_CANONICALS = 'canonicals-matched-by-neither-key'
 SECTION_HASH_REPAIRS = 'canonicals-matched-by-last-known-id-only'
 SECTION_CLAIMS_NOT_RECALLED = 'claims-not-recalled'
@@ -2290,6 +2294,319 @@ class ReportSection:
         return '\n'.join(self.lines)
 
 
+# ---------------------------------------------------------------------------
+# The tripwire, split by census canonical presence
+#
+# Search cannot tell "the canonical does not exist" from "it exists but ranks
+# below K"; the metadata census's deterministic count can. Joining the two is a
+# diagnosis riding along a measurement, so an unreadable census is said out
+# loud in the report and never aborts the metric emission.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CensusTopicRow:
+    """One ``registry_coverage.topics`` row of the metadata census."""
+
+    project_id: str
+    topic: str
+    records: int
+    canonical_count: int
+    variant_spelling_records: int | None
+    """``None`` on a census older than schema v5, which did not measure it."""
+
+
+@dataclass(frozen=True)
+class CensusCoverage:
+    """The census's registry gauge, or why it could not be read."""
+
+    source: str
+    rows: Mapping[tuple[str, str], CensusTopicRow] | None
+    """Keyed by ``(project_id, topic)``; ``None`` exactly when unavailable."""
+    unavailable_reason: str | None
+    query_surface_topics: tuple[str, ...] = ()
+    """The registry topics the census deliberately did not gauge."""
+
+
+class _CensusShapeError(ValueError):
+    """The census parsed, but carries no usable registry gauge."""
+
+
+def _census_count(raw: dict, key: str) -> int:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _CensusShapeError(f'a registry_coverage row has a non-integer {key!r}: {raw!r}')
+    return value
+
+
+def _parse_census_row(raw: Any) -> CensusTopicRow:
+    if not isinstance(raw, dict):
+        raise _CensusShapeError(f'a registry_coverage row is not an object: {raw!r}')
+    project_id, topic = raw.get('project_id'), raw.get('topic')
+    if not isinstance(project_id, str) or not isinstance(topic, str):
+        raise _CensusShapeError(f'a registry_coverage row lacks a project_id or topic: {raw!r}')
+    return CensusTopicRow(
+        project_id=project_id,
+        topic=topic,
+        records=_census_count(raw, 'records'),
+        canonical_count=_census_count(raw, 'canonical_count'),
+        variant_spelling_records=(
+            None if raw.get('variant_spelling_records') is None
+            else _census_count(raw, 'variant_spelling_records')
+        ),
+    )
+
+
+def _parse_query_surface_topics(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(
+        isinstance(item, dict) and isinstance(item.get('topic'), str) for item in raw
+    ):
+        raise _CensusShapeError(f'query_surface_topics_not_gauged is misshapen: {raw!r}')
+    return tuple(item['topic'] for item in raw)
+
+
+def _parse_registry_gauge(
+    payload: Any,
+) -> tuple[dict[tuple[str, str], CensusTopicRow], tuple[str, ...]]:
+    if not isinstance(payload, dict):
+        raise _CensusShapeError('the top level is not an object')
+    gauge = payload.get('registry_coverage')
+    if gauge is None:
+        raise _CensusShapeError(
+            'registry_coverage is null or absent; the census reported '
+            f'registry_error={payload.get("registry_error")!r}',
+        )
+    if not isinstance(gauge, dict) or not isinstance(gauge.get('topics'), list):
+        raise _CensusShapeError('registry_coverage.topics is not a list')
+    rows: dict[tuple[str, str], CensusTopicRow] = {}
+    for raw in gauge['topics']:
+        row = _parse_census_row(raw)
+        key = (row.project_id, row.topic)
+        if key in rows:
+            raise _CensusShapeError(f'registry_coverage.topics repeats {key!r}')
+        rows[key] = row
+    return rows, _parse_query_surface_topics(gauge.get('query_surface_topics_not_gauged'))
+
+
+def load_census_coverage(path: str | Path) -> CensusCoverage:
+    """Read the census's registry gauge at *path*. Never raises for a bad census.
+
+    Every failure — unreadable, undecodable, or a gauge that is null or
+    misshapen — becomes ``rows=None`` plus a reason naming *path*, so the report
+    can say why the split is missing while the metrics are emitted regardless.
+    """
+    source = str(path)
+
+    def unavailable(reason: str) -> CensusCoverage:
+        return CensusCoverage(source=source, rows=None, unavailable_reason=reason)
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    except OSError as exc:
+        return unavailable(f'cannot read the census at {source}: {exc}')
+    except ValueError as exc:
+        return unavailable(f'the census at {source} is not decodable JSON: {exc}')
+    try:
+        rows, query_surface = _parse_registry_gauge(payload)
+    except _CensusShapeError as exc:
+        return unavailable(f'the census at {source} carries no usable registry gauge: {exc}')
+    return CensusCoverage(
+        source=source,
+        rows=MappingProxyType(rows),
+        unavailable_reason=None,
+        query_surface_topics=query_surface,
+    )
+
+
+class CanonicalPresence(Enum):
+    """What the census says about a tripwire topic's canonical."""
+
+    CANONICAL_PRESENT = 'canonical-present'
+    ABSENT_WITH_RECORDS = 'absent-with-records'
+    ABSENT_UNPOPULATED = 'absent-unpopulated'
+    QUERY_SURFACE = 'query-surface'
+    NOT_CENSUSED = 'not-censused'
+
+
+_PRESENCE_MEANING = MappingProxyType({
+    CanonicalPresence.CANONICAL_PRESENT:
+        'the census counts a canonical, so a failure is ranking, routing or fixture decay',
+    CanonicalPresence.ABSENT_WITH_RECORDS:
+        'records carry the topic but none is canonical: the census stamping_worklist',
+    CanonicalPresence.ABSENT_UNPOPULATED:
+        'no record under this exact spelling; records under a variant spelling are '
+        'fused-memory/scripts/normalize_topic_slugs.py\'s to rewrite, not a stamping job',
+    CanonicalPresence.QUERY_SURFACE:
+        'keys a briefing query, not a metadata.topic, so the census does not gauge it',
+    CanonicalPresence.NOT_CENSUSED:
+        'the census has no row for this topic',
+})
+
+
+@dataclass(frozen=True)
+class PhrasingRank:
+    """Where one phrasing's search put the canonical, at the tripwire depth."""
+
+    phrasing: str
+    held_out: bool
+    rank: int | None
+    """Full-depth rank; ``None`` when the canonical was not in the fetched list."""
+    matched_by: str | None
+    stores_served: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TopicPresence:
+    """One tripwire item, classed by the census."""
+
+    topic: str
+    project_id: str
+    passed: bool
+    presence: CanonicalPresence
+    census_row: CensusTopicRow | None
+    phrasing_ranks: tuple[PhrasingRank, ...]
+    """Recorded for a failing topic only: it is what distinguishes its causes."""
+
+
+@dataclass(frozen=True)
+class TripwireCensusSplit:
+    """Every tripwire item of one run, each in exactly one :class:`CanonicalPresence`."""
+
+    census_source: str
+    unavailable_reason: str | None
+    topics: tuple[TopicPresence, ...] = ()
+    census_query_surface_topics: tuple[str, ...] = ()
+
+    def by_presence(
+        self, presence: CanonicalPresence, *, passed: bool,
+    ) -> tuple[TopicPresence, ...]:
+        return tuple(
+            t for t in self.topics if t.presence is presence and t.passed is passed
+        )
+
+
+def _presence(entry: RegistryEntry, row: CensusTopicRow | None) -> CanonicalPresence:
+    if entry.is_query_surface:
+        return CanonicalPresence.QUERY_SURFACE
+    if row is None:
+        return CanonicalPresence.NOT_CENSUSED
+    if row.canonical_count > 0:
+        return CanonicalPresence.CANONICAL_PRESENT
+    if row.records > 0:
+        return CanonicalPresence.ABSENT_WITH_RECORDS
+    return CanonicalPresence.ABSENT_UNPOPULATED
+
+
+def split_tripwire_by_census(
+    observations: ProbeObservations,
+    registry: TopicRegistry,
+    coverage: CensusCoverage,
+) -> TripwireCensusSplit:
+    """Class each tripwire item by what *coverage* says exists. Pure.
+
+    The items and their verdicts are :func:`_tripwire_items`' own, so the split
+    qualifies the emitted tripwire and cannot disagree with it. An unavailable
+    census classifies nothing rather than filing every topic as not censused.
+    """
+    if coverage.rows is None:
+        return TripwireCensusSplit(
+            census_source=coverage.source,
+            unavailable_reason=coverage.unavailable_reason,
+        )
+    ranks: dict[str, list[PhrasingRank]] = {}
+    for obs in observations.phrasings:
+        if obs.degraded or obs.k != TRIPWIRE_K:
+            continue
+        ranks.setdefault(obs.topic, []).append(PhrasingRank(
+            phrasing=obs.phrasing,
+            held_out=obs.held_out,
+            rank=obs.rank,
+            matched_by=obs.matched_by,
+            stores_served=obs.stores_served,
+        ))
+    entries_by_item = {entry.item_key: entry for entry in registry.entries}
+    topics = []
+    for item_key, passed in _tripwire_items(observations, TRIPWIRE_K):
+        entry = entries_by_item[item_key]
+        row = coverage.rows.get((entry.project_id, entry.topic))
+        topics.append(TopicPresence(
+            topic=entry.topic,
+            project_id=entry.project_id,
+            passed=passed,
+            presence=_presence(entry, row),
+            census_row=row,
+            phrasing_ranks=() if passed else tuple(ranks.get(entry.topic, ())),
+        ))
+    return TripwireCensusSplit(
+        census_source=coverage.source,
+        unavailable_reason=None,
+        topics=tuple(topics),
+        census_query_surface_topics=coverage.query_surface_topics,
+    )
+
+
+def _phrasing_rank_line(rank: PhrasingRank, fetched_depth: int) -> str:
+    where = f'rank {rank.rank}' if rank.rank is not None else f'not in top-{fetched_depth}'
+    return (
+        f'{rank.phrasing!r} ({"held-out" if rank.held_out else "tuned"}): {where}; '
+        f'matched by {rank.matched_by or "neither key"}; '
+        f'served by {", ".join(rank.stores_served) or "nothing"}'
+    )
+
+
+def _failing_topic_lines(topic: TopicPresence, fetched_depth: int) -> list[str]:
+    row = topic.census_row
+    if topic.presence is CanonicalPresence.CANONICAL_PRESENT:
+        return [f'    - {topic.topic}'] + [
+            f'        {_phrasing_rank_line(rank, fetched_depth)}'
+            for rank in topic.phrasing_ranks
+        ]
+    if topic.presence is CanonicalPresence.ABSENT_WITH_RECORDS and row is not None:
+        return [f'    - {topic.topic} (records: {row.records})']
+    if topic.presence is CanonicalPresence.ABSENT_UNPOPULATED and row is not None:
+        variant = (
+            'not measured by this census' if row.variant_spelling_records is None
+            else row.variant_spelling_records
+        )
+        return [f'    - {topic.topic} (variant-spelling records: {variant})']
+    return [f'    - {topic.topic}']
+
+
+def _tripwire_by_census_lines(split: TripwireCensusSplit, fetched_depth: int) -> list[str]:
+    """The report block for *split*; *fetched_depth* is the deepest ``k`` searched."""
+    lines = ['']
+    lines.append(f'tripwire split by census canonical presence (census: {split.census_source}):')
+    for chunk in _wrap(
+        'The tripwire is measured through search, which cannot '
+        'tell a canonical that does not exist from one that exists but ranks below '
+        'K. The metadata census counts canonicals deterministically, so each item '
+        'is classed here by what the census says exists; the counts behind each '
+        'class are the census\'s registry_coverage, read there. For a failing '
+        'topic whose canonical the census counts, each phrasing\'s rank, matcher '
+        'and serving store tell ranking (a rank below K), routing (served only by '
+        'a store the canonical does not live in) and fixture decay (matched by '
+        'last_known_id, or by neither key) apart.'
+    ):
+        lines.append(f'  {chunk}')
+    if split.unavailable_reason is not None:
+        lines.append(f'  census UNAVAILABLE, so no item is classified: {split.unavailable_reason}')
+        return lines
+    for presence in CanonicalPresence:
+        failed = split.by_presence(presence, passed=False)
+        passed = split.by_presence(presence, passed=True)
+        lines.append(f'  {presence.value} (failed {len(failed)}, passed {len(passed)}):')
+        lines.extend(f'    {chunk}' for chunk in _wrap(_PRESENCE_MEANING[presence], width=72))
+        if presence is CanonicalPresence.QUERY_SURFACE:
+            lines.append(
+                '    census-excluded as query surfaces: '
+                f'{", ".join(split.census_query_surface_topics) or "none named by this census"}'
+            )
+        for topic in failed:
+            lines.extend(_failing_topic_lines(topic, fetched_depth))
+    return lines
+
+
 def probe_report_sections(
     series,
     observations: ProbeObservations,
@@ -2299,12 +2616,16 @@ def probe_report_sections(
     skipped_topics: tuple[str, ...] = (),
     requested_ks: tuple[int, ...] = (),
     measured_ks: tuple[int, ...] = (),
+    census_split: TripwireCensusSplit | None = None,
 ) -> tuple[ReportSection, ...]:
     """The report, decomposed — see :func:`render_probe_report` for the prose.
 
     THE single source of both: :func:`render_probe_report` joins what this
     returns, so a section present here is present there by construction and
     the two cannot drift into disagreeing about what the run disclosed.
+
+    *census_split* is taken already computed, never derived here, so the report
+    renders the very split the caller hands back to its own callers.
     """
     from shared.memory_eval_metrics import render_report  # noqa: PLC0415
 
@@ -2315,16 +2636,15 @@ def probe_report_sections(
 
     emit(SECTION_METRIC_TABLE, [render_report(series).rstrip('\n')])
 
+    # The depths this run actually scored, when the caller did not say.
+    # Assuming DEFAULT_KS instead would name canonical-in-top-10 as unmeasured
+    # on a run that never asked for k=10 — a false narrowing report is no
+    # better than a hidden one.
+    scored_ks = tuple(measured_ks) or tuple(dict.fromkeys(o.k for o in observations.phrasings))
+
     # Directly under the table it qualifies: a family missing from the rows
     # above is the one absence a reader cannot see by reading them.
-    absent_families = metric_families_not_measured(
-        series,
-        # The depths this run actually scored, when the caller did not say.
-        # Assuming DEFAULT_KS instead would name canonical-in-top-10 as
-        # unmeasured on a run that never asked for k=10 — a false narrowing
-        # report is no better than a hidden one.
-        tuple(measured_ks) or tuple(dict.fromkeys(o.k for o in observations.phrasings)),
-    )
+    absent_families = metric_families_not_measured(series, scored_ks)
     if absent_families:
         lines = ['']
         lines.append(f'metric families NOT MEASURED this run ({len(absent_families)}):')
@@ -2403,6 +2723,11 @@ def probe_report_sections(
         )
         lines.extend(f'  - {topic}' for topic in unmeasured)
         emit(SECTION_TOPICS_NOT_MEASURED, lines)
+
+    if census_split is not None:
+        emit(SECTION_TRIPWIRE_BY_CENSUS, _tripwire_by_census_lines(
+            census_split, max(scored_ks, default=TRIPWIRE_K),
+        ))
 
     unmatched_stores: dict[str, set[str]] = {}
     for obs in observations.phrasings:
@@ -2632,6 +2957,7 @@ def render_probe_report(
     skipped_topics: tuple[str, ...] = (),
     requested_ks: tuple[int, ...] = (),
     measured_ks: tuple[int, ...] = (),
+    census_split: TripwireCensusSplit | None = None,
 ) -> str:
     """The prose companion: the shared metric table plus this run's caveats.
 
@@ -2661,6 +2987,7 @@ def render_probe_report(
         skipped_topics=skipped_topics,
         requested_ks=requested_ks,
         measured_ks=measured_ks,
+        census_split=census_split,
     ))
 
 
@@ -2909,6 +3236,9 @@ class ProbeOutcome:
     is_initial_run: bool
     skipped_topics: tuple[str, ...]
     corpus_counts: dict[str, int]
+    census_split: TripwireCensusSplit | None
+    """The tripwire split by census canonical presence; ``None`` when no census
+    was given. The very split the report rendered."""
 
 
 async def run_probe(
@@ -2919,8 +3249,12 @@ async def run_probe(
     ks: tuple[int, ...],
     out_root: str | Path,
     stamp: str | None = None,
+    census: CensusCoverage | None = None,
 ) -> ProbeOutcome:
     """Measure *registry* against *memory* and emit the run's artifacts.
+
+    *census*, when given, splits the tripwire by census canonical presence in
+    the report; it qualifies the metrics and never changes them.
 
     *memory* is injected rather than constructed here, which is what lets the
     read-only guarantee be tested: the whole band runs against a double whose
@@ -2990,20 +3324,26 @@ async def run_probe(
     # shared write still happens first, so emit-time validation continues to
     # gate whether any artifact is created at all — the report is only ever
     # widened over a series that already validated.
+    # The PROBED subset here, so "registry composition (N topics)" counts
+    # what this run actually measured; the rest is named by skipped_topics.
+    probed_registry = TopicRegistry(
+        schema_version=registry.schema_version,
+        entries=probed,
+        disclosures=registry.disclosures,
+    )
+    census_split = (
+        split_tripwire_by_census(observations, probed_registry, census)
+        if census is not None else None
+    )
     sections = probe_report_sections(
         series,
         observations,
         is_initial_run=initial,
-        # The PROBED subset here, so "registry composition (N topics)" counts
-        # what this run actually measured; the rest is named by skipped_topics.
-        registry=TopicRegistry(
-            schema_version=registry.schema_version,
-            entries=probed,
-            disclosures=registry.disclosures,
-        ),
+        registry=probed_registry,
         skipped_topics=skipped,
         requested_ks=tuple(ks),
         measured_ks=measured_ks,
+        census_split=census_split,
     )
     report = join_report_sections(sections)
     with _artifact_write_seam(out_root):
@@ -3019,6 +3359,7 @@ async def run_probe(
         is_initial_run=initial,
         skipped_topics=skipped,
         corpus_counts=counts,
+        census_split=census_split,
     )
 
 
@@ -3086,6 +3427,14 @@ def build_parser() -> LoudArgumentParser:
         help='Path to fused-memory config file (sets CONFIG_PATH env var)',
     )
     parser.add_argument(
+        '--census', default=str(DEFAULT_CENSUS_PATH),
+        help=(
+            'Metadata census JSON, read for the tripwire split by canonical '
+            'presence and by --derive-registry. An unreadable census is named '
+            f'in the report, never fatal to a probe run (default: {DEFAULT_CENSUS_PATH})'
+        ),
+    )
+    parser.add_argument(
         '--derive-registry', dest='derive_registry', action='store_true',
         help=(
             'Print registry candidates derived from the committed offline '
@@ -3096,10 +3445,10 @@ def build_parser() -> LoudArgumentParser:
     return parser
 
 
-def _derive_registry_text() -> str:
+def _derive_registry_text(census_path: str | Path) -> str:
     """``--derive-registry``'s output, with an unreadable source attributed to it."""
     try:
-        return run_derive_registry(DEFAULT_CALIBRATION_PATH, DEFAULT_CENSUS_PATH)
+        return run_derive_registry(DEFAULT_CALIBRATION_PATH, census_path)
     except OSError as exc:
         raise ProbeRunError(f'cannot read a registry derivation source: {exc}') from exc
 
@@ -3129,6 +3478,7 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
             project_ids=tuple(args.project_id),
             ks=tuple(args.k),
             out_root=args.out_root,
+            census=load_census_coverage(args.census),
         )
     finally:
         await memory.close()
@@ -3154,7 +3504,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         if args.derive_registry:
-            text = _derive_registry_text()
+            text = _derive_registry_text(args.census)
         else:
             # Before the store, deliberately. A fixture typo must not cost an
             # embedder spin-up to discover, and — the load-bearing half — a
