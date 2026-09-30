@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _recording_event_store import _RecordingEventStore
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import Scheduler
 
@@ -220,3 +220,53 @@ async def test_4541_replay_the_starved_top_keeps_cfg_from_the_medium_task(tmp_pa
     assert lock_table.snapshot_holders().get('cfg.py') != MEDIUM, (
         '4541 end state: the medium task does not hold cfg'
     )
+
+
+# ---------------------------------------------------------------------------
+# reserve_now installs at the effective tier
+# ---------------------------------------------------------------------------
+
+
+def _a_entries(scheduler: Scheduler, module: str) -> list[dict]:
+    stack = scheduler.lock_table.snapshot_park_stacks().get(module, [])
+    return [entry for entry in stack if entry['owner'] == 'A']
+
+
+@pytest.mark.asyncio
+async def test_reserve_now_parks_at_the_boosted_tier(tmp_path):
+    w = _world(tmp_path)
+    assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
+    w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
+    w.scheduler.get_tasks = AsyncMock(return_value=[_task('A', 'medium', ['r1.py', 'r2.py'])])
+
+    assert await w.scheduler.acquire_next() is None, 'reserve_now tier: A is held off'
+
+    for module in ('r1.py', 'r2.py'):
+        assert [e['rank'] for e in _a_entries(w.scheduler, module)] == [
+            PRIORITY_RANK['critical']
+        ], f'reserve_now tier: A parks {module} once, at the boosted rank'
+    consumed = _for(w.store, 'reserve_now_consumed', 'A')
+    assert [d['priority'] for d in consumed] == ['critical'], (
+        'reserve_now tier: reserve_now_consumed reports the effective tier'
+    )
+    installed, _ = w.scheduler.lock_table.install_parks('C', ['r1.py'], 'critical')
+    assert installed == [], 'reserve_now tier: a same-tier competitor cannot shadow A'
+
+
+@pytest.mark.asyncio
+async def test_reserve_now_never_duplicates_a_park_the_owner_already_holds(tmp_path):
+    w = _world(tmp_path)
+    assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
+    w.scheduler.lock_table.install_parks('A', ['r1.py'], 'critical')
+    w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
+    w.scheduler.get_tasks = AsyncMock(return_value=[_task('A', 'medium', ['r1.py', 'r2.py'])])
+
+    assert await w.scheduler.acquire_next() is None, 'reserve_now dedupe: A is held off'
+
+    assert [e['rank'] for e in _a_entries(w.scheduler, 'r1.py')] == [
+        PRIORITY_RANK['critical']
+    ], 'reserve_now dedupe: r1 keeps exactly one critical A entry'
+    assert _a_entries(w.scheduler, 'r2.py'), 'reserve_now dedupe: A now parks r2'
+    assert [d['modules'] for d in _for(w.store, 'reserve_now_consumed', 'A')] == [
+        ['r2.py']
+    ], 'reserve_now dedupe: only the newly parked r2 is reported'
