@@ -1276,18 +1276,39 @@ class ModuleLockTable:
             module, task_id, ignore_owners=ignore_owners
         ) is not None
 
+    def _owned_keys(self, task_id: str) -> set[str]:
+        """Normalized keys whose stack holds *task_id* at ANY level, top or buried.
+
+        THE single definition of "the owner already parks this key": the
+        install idempotency skip, the completion remainder and ``has_parks``
+        all read it, so they cannot disagree about a buried entry.
+        """
+        return {
+            module
+            for module, stack in self._parked.items()
+            if any(owner == task_id for owner, _ in stack)
+        }
+
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
 
-        Returns True for both active-top AND buried (shadowed) reservations so
-        that ``_bump_skip_and_maybe_park`` does not re-arm a duplicate park for a
-        shadowed owner.
+        A pure query over :meth:`_owned_keys`, so an owner buried beneath a
+        higher-priority shadow still counts as parked.
         """
-        for stack in self._parked.values():
-            for owner, _ in stack:
-                if owner == task_id:
-                    return True
-        return False
+        return bool(self._owned_keys(task_id))
+
+    def unparked_modules(self, task_id: str, modules: list[str]) -> list[str]:
+        """The completion rule's remainder (task 5308): keys *task_id* has not parked.
+
+        Normalizes *modules* exactly as :meth:`install_parks` does, drops empty
+        keys, de-duplicates, and subtracts every key the owner already parks
+        at ANY stack level — a buried entry counts as owned, because
+        re-pushing it would duplicate the owner in that stack.  Sorted.
+        """
+        depth = self._config.lock_depth
+        owned = self._owned_keys(task_id)
+        requested = {normalize_lock(m, depth) for m in modules}
+        return sorted(m for m in requested if m and m not in owned)
 
     def install_parks(
         self, task_id: str, modules: list[str], priority: str
@@ -1295,9 +1316,16 @@ class ModuleLockTable:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
         Returns ``(installed, shadowed)`` where *installed* is the list of
-        normalized modules actually parked (as the active top) and *shadowed* is
-        a list of ``(owner_id, modules_shadowed)`` for any lower-priority parks
-        that were PUSHED beneath the new reservation (retained, not destroyed).
+        normalized modules NEWLY parked (as the active top) by this call and
+        *shadowed* is a list of ``(owner_id, modules_shadowed)`` for any
+        lower-priority parks that were PUSHED beneath the new reservation
+        (retained, not destroyed).
+
+        Idempotent per owner (task 5308): a key *task_id* already parks at any
+        stack level (:meth:`_owned_keys`) is skipped, and so is a second input
+        normalizing to a key this call already pushed.  An owner's existing
+        entry is therefore never re-ranked or re-pushed — it cannot shadow
+        itself — and a rank upgrade happens only through clear + reinstall.
 
         Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
         has ``existing_rank > new_rank`` (strictly lower priority), the new entry
@@ -1318,9 +1346,10 @@ class ModuleLockTable:
         shadow_acc: dict[str, list[str]] = {}
         # Track insertion order of shadowed owners for stable output.
         shadow_order: list[str] = []
+        owned = self._owned_keys(task_id)
         for m in modules:
             normalized = normalize_lock(m, depth)
-            if not normalized:
+            if not normalized or normalized in owned:
                 continue
             # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
             to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
@@ -1360,6 +1389,7 @@ class ModuleLockTable:
             if normalized not in self._parked:
                 self._parked[normalized] = []
             self._parked[normalized].append((task_id, rank))
+            owned.add(normalized)
             installed.append(normalized)
 
         # Build shadowed list in first-seen victim order, original module keys sorted.
