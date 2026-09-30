@@ -1507,11 +1507,14 @@ class TestHostAllocatorPreferRemoteFallbackBoundary:
     """INV-10 boundary: the prefer_remote → local fallback is EXECUTED, not
     merely asserted about.
 
-    Amendment R11 item 2: pinning the policy string is not enough.  This drives
-    the real production quarantine path (quarantine_and_release, the
-    RunnerUnavailable handler in _finalize_inflight) between two acquires, so a
-    mid-dispatch remote failure under prefer_remote is shown to re-dispatch onto
-    local rather than stalling the queue.
+    Amendment R11 item 2: pinning the policy string is not enough.  Between two
+    real acquires this calls quarantine_and_release, the allocator primitive
+    that merge_queue.py::SpeculativeMergeWorker._finalize_inflight invokes on
+    RunnerUnavailable, so the allocator half of the fallback is executed: a
+    remote that failed mid-dispatch under prefer_remote hands the re-dispatch to
+    local instead of stalling the queue.  The merge-lane half (a real
+    RunnerUnavailable reaching _finalize_inflight) is not driven here; the
+    public seam that would let a test do so without private access is task 5453.
     """
 
     def _local_factory(self):
@@ -1528,7 +1531,8 @@ class TestHostAllocatorPreferRemoteFallbackBoundary:
         assert first.name == 'remoteA'
         assert first.is_local is False
 
-        # RunnerUnavailable mid-dispatch, driven through the REAL path.
+        # What _finalize_inflight does with a lease whose runner raised
+        # RunnerUnavailable.
         await alloc.quarantine_and_release(first)
 
         assert 'remoteA' in shared_q

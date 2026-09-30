@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, assert_never, runtime_checkable
 
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig, VerifyHostPolicy
@@ -3292,7 +3292,7 @@ def delta_from_json(s: str) -> ColdWarmVerifyDelta:
 
 
 # ---------------------------------------------------------------------------
-# β: HostLease + HostAllocator — per-host slots, prefer-local-when-free, cancel-aware release
+# β: HostLease + HostAllocator — per-host slots, config-selected order (verify_host_policy), cancel-aware release
 # ---------------------------------------------------------------------------
 
 # Slot state constants
@@ -3353,11 +3353,9 @@ class HostAllocator:
     makes the green-tier ``RELOADABLE_FIELDS`` registration real — a flip lands
     on the NEXT dispatch and cannot split an in-flight merge.
 
-    TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust anchor,
-    after a laptop false-green landed a red commit.  Under ``'prefer_remote'``
-    nearly every verdict becomes a REMOTE verdict, which promotes
-    ``verify_drift_check_every_n_lands`` from a spot check to the standing
-    fidelity guard.  This class sets no cadence.
+    The trust-anchor caveat that goes with ``'prefer_remote'`` is stated once,
+    on ``config.py::OrchestratorConfig.verify_host_policy``.  This class sets
+    no cadence.
 
     Unaffected by the policy: the leaseless main-health probe (above),
     quarantine, PARKED, cancel-aware release, and ``free_host_count``.
@@ -3442,15 +3440,17 @@ class HostAllocator:
         FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
         PARKED remote falls through to local on its own.
         """
-        if policy == 'prefer_remote':
-            remote = self.acquire_remote()
-            if remote is not None:
-                return remote
-            return self.acquire_local(local_factory)
-        local = self.acquire_local(local_factory)
-        if local is not None:
-            return local
-        return self.acquire_remote()
+        match policy:
+            case 'prefer_local':
+                local = self.acquire_local(local_factory)
+                return local if local is not None else self.acquire_remote()
+            case 'prefer_remote':
+                remote = self.acquire_remote()
+                if remote is not None:
+                    return remote
+                return self.acquire_local(local_factory)
+            case _:
+                assert_never(policy)
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""

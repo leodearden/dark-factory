@@ -9839,7 +9839,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # divergence would go undetected — defeating the safety control.
         # Mirrors the _shadow_compare_tasks pattern (see :func:`_maybe_schedule_shadow_compare`).
         self._drift_check_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
-        # β worker-lifetime host allocator (one slot per host, prefer-local).
+        # β worker-lifetime host allocator (one slot per host, config-selected order: verify_host_policy).
         # None until first _ensure_host_allocator(config) call — lazily built
         # because config arrives per-MergeRequest, not at __init__ time.
         self._host_allocator: HostAllocator | None = None
