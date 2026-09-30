@@ -20,7 +20,16 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from task_event_timeline import EXIT_NO_EVENTS, EXIT_OK, EXIT_UNREADABLE, main
+from _task_db_scan import TaskDbProblem
+from task_event_timeline import (
+    EXIT_NO_EVENTS,
+    EXIT_OK,
+    EXIT_UNREADABLE,
+    EventLogProblem,
+    EventLogUnreadable,
+    main,
+    open_event_log,
+)
 
 TASK = '5495'
 _BASE_TIME = datetime(2026, 9, 26, 23, 0, tzinfo=UTC)
@@ -307,21 +316,22 @@ def _worktree_root(tmp_path, make_tasks_db):
     return ['--project-root', str(root)], root / 'data' / 'orchestrator' / 'runs.db'
 
 
-UNREADABLE = [
-    pytest.param(_absent, id='absent'),
-    pytest.param(_directory, id='directory'),
-    pytest.param(_empty_decoy, id='zero-byte-decoy'),
-    pytest.param(_no_tables, id='sqlite-without-tables'),
-    pytest.param(_not_sqlite, id='not-sqlite'),
-    pytest.param(_wrong_store, id='tasks-db-not-runs-db'),
-    pytest.param(_worktree_root, id='project-root-without-data'),
-]
+UNREADABLE = {
+    'absent': (_absent, TaskDbProblem.ABSENT),
+    'directory': (_directory, TaskDbProblem.IS_A_DIRECTORY),
+    'zero-byte-decoy': (_empty_decoy, TaskDbProblem.EMPTY_STUB),
+    'sqlite-without-tables': (_no_tables, TaskDbProblem.NO_TABLES),
+    'not-sqlite': (_not_sqlite, TaskDbProblem.NOT_A_DATABASE),
+    'tasks-db-not-runs-db': (_wrong_store, EventLogProblem.NO_EVENTS_TABLE),
+    'project-root-without-data': (_worktree_root, TaskDbProblem.ABSENT),
+}
 
 
-@pytest.mark.parametrize('build', UNREADABLE)
+@pytest.mark.parametrize('case', UNREADABLE.values(), ids=UNREADABLE.keys())
 def test_an_unreadable_log_is_refused_naming_the_path_it_tried(
-    tmp_path, make_tasks_db, capsys, build,
+    tmp_path, make_tasks_db, capsys, case,
 ):
+    build, _ = case
     location, tried = build(tmp_path, make_tasks_db)
 
     exit_code = main([*location, TASK])
@@ -330,6 +340,18 @@ def test_an_unreadable_log_is_refused_naming_the_path_it_tried(
     assert exit_code == EXIT_UNREADABLE
     assert captured.out == ''
     assert str(tried.resolve()) in captured.err
+
+
+@pytest.mark.parametrize('case', UNREADABLE.values(), ids=UNREADABLE.keys())
+def test_a_refusal_carries_the_path_and_a_structured_reason(tmp_path, make_tasks_db, case):
+    build, reason = case
+    _, tried = build(tmp_path, make_tasks_db)
+
+    with pytest.raises(EventLogUnreadable) as refusal:
+        open_event_log(tried)
+
+    assert refusal.value.path == tried.resolve()
+    assert refusal.value.reason is reason
 
 
 def test_reading_an_absent_log_never_creates_it(tmp_path, make_tasks_db, capsys):

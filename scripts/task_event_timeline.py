@@ -13,10 +13,11 @@ import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata
+from _task_db_scan import TaskDbProblem, TaskDbUnreadable, connect_ro, decode_metadata
 from audit_wiped_metadata_files import runs_db_path
 
 EXIT_OK = 0
@@ -25,14 +26,24 @@ EXIT_NO_EVENTS = 1
 EXIT_UNREADABLE = 3
 
 
-class EventLogUnreadable(Exception):
-    """*path* is not a readable orchestrator event log, for the reason in *detail*."""
+class EventLogProblem(Enum):
+    """Why a readable sqlite database is still not an orchestrator event log."""
 
-    def __init__(self, path: Path, detail: str) -> None:
+    NO_EVENTS_TABLE = "no_events_table"
+
+
+class EventLogUnreadable(Exception):
+    """*path* is not a readable orchestrator event log, for the structured *reason*.
+
+    A :class:`TaskDbProblem` when the file could not be opened as a database at
+    all, an :class:`EventLogProblem` when it opened but is not an event log.
+    """
+
+    def __init__(self, path: Path, reason: TaskDbProblem | EventLogProblem) -> None:
         self.path = path
-        self.detail = detail
+        self.reason = reason
         super().__init__(
-            f"{path}: not a readable orchestrator event log ({detail}). The log lives "
+            f"{path}: not a readable orchestrator event log ({reason.value}). The log lives "
             f"in the MAIN checkout of the TASK's project, at "
             f"<main checkout>/data/orchestrator/runs.db. data/ is gitignored, so it is "
             f"absent from worktrees; `git worktree list --porcelain` names the main "
@@ -46,13 +57,13 @@ def open_event_log(path: Path) -> sqlite3.Connection:
     try:
         conn = connect_ro(path)
     except TaskDbUnreadable as refusal:
-        raise EventLogUnreadable(refusal.path, refusal.reason.value) from refusal
+        raise EventLogUnreadable(refusal.path, refusal.reason) from refusal
     has_events = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
     ).fetchone()
     if has_events is None:
         conn.close()
-        raise EventLogUnreadable(Path(path).resolve(), "no events table")
+        raise EventLogUnreadable(Path(path).resolve(), EventLogProblem.NO_EVENTS_TABLE)
     return conn
 
 
@@ -96,7 +107,12 @@ def read_timeline(
         sql += f" AND event_type IN ({', '.join('?' * len(event_types))})"
         params += event_types
     rows = conn.execute(f"{sql} ORDER BY id", params)
-    return tuple(TimelineEvent(*row[:-1], data=decode_metadata(row[-1])) for row in rows)
+    return tuple(_timeline_event(row) for row in rows)
+
+
+def _timeline_event(row: Sequence) -> TimelineEvent:
+    columns = dict(zip(TimelineEvent._fields, row, strict=True))
+    return TimelineEvent(**{**columns, "data": decode_metadata(columns["data"])})
 
 
 def run_ids(events: Sequence[TimelineEvent]) -> tuple[str, ...]:
