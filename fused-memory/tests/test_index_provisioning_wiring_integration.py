@@ -25,6 +25,7 @@ HAZARD compliance
 from __future__ import annotations
 
 import contextlib
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -35,6 +36,7 @@ from _fm_helpers import (
     falkor_skipif,
     unique_graph_name,
 )
+from _graphiti_fake import FakeGraphitiClient
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.falkor_indices import expected_index_set, normalize_index_records
@@ -153,3 +155,53 @@ class TestStartupSweepLive:
         assert await _missing_indices(backend, registered_name) == [], (
             'the sweep must have run and provisioned the graph it WAS given'
         )
+
+
+class TestFirstWriteLive:
+    """PRD D6's first-write half, against real graphs.
+
+    Only the graphiti_core client is replaced (``FakeGraphitiClient``), so no LLM
+    is involved: provisioning precedes the upstream call, and the real driver
+    does every index read and write.
+    """
+
+    @staticmethod
+    def _with_fake_upstream(backend: GraphitiBackend) -> FakeGraphitiClient:
+        fake = FakeGraphitiClient()
+        backend._client_for = MagicMock(return_value=fake)
+        return fake
+
+    @pytest.mark.asyncio
+    async def test_first_write_provisions_a_registered_graph_with_no_restart(
+        self, scratch, live_backend_factory,
+    ):
+        """PRD boundary test 7: a newly registered project needs no service restart."""
+        name, graph = scratch('first_write')
+        backend = live_backend_factory({name})
+        assert name not in await backend._require_falkor_client().list_graphs(), (
+            'the graph must not exist before its first write'
+        )
+        fake = self._with_fake_upstream(backend)
+
+        await backend.add_episode(name='n', content='c', group_id=name)
+        await await_index_operational(graph)
+
+        assert len(fake.calls) == 1
+        assert await _missing_indices(backend, name) == []
+
+    @pytest.mark.asyncio
+    async def test_first_write_leaves_an_unregistered_graph_untouched(
+        self, scratch, live_backend_factory,
+    ):
+        """PRD boundary test 8, write half."""
+        probe_name, probe_graph = scratch('probe_e1_gw')
+        await _seed_trap_state(probe_graph)
+        other_name, _ = scratch('first_write_other')
+        backend = live_backend_factory({other_name})
+        before = await _normalized_indices(backend, probe_name)
+        fake = self._with_fake_upstream(backend)
+
+        await backend.add_episode(name='n', content='c', group_id=probe_name)
+
+        assert len(fake.calls) == 1, 'the write itself must still have happened'
+        assert await _normalized_indices(backend, probe_name) == before

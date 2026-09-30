@@ -18,12 +18,13 @@ live lane lives in ``tests/test_index_provisioning_wiring_integration.py``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions
-from test_ensure_indices import _issued, _ro_issued, _rows_for
+from test_ensure_indices import _EMPTY_KEY_ERROR, _issued, _ro_issued, _rows_for, _StatefulGraph
 from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import expected_index_set, plan_index_statements
@@ -206,3 +207,185 @@ class TestStartupSweep:
         assert [
             r for r in caplog.records if r.name == _LOGGER and r.levelno >= logging.INFO
         ] == []
+
+
+class TestFirstWriteProvisioning:
+    """PRD D6, first-write half: a registered graph is provisioned before its first write.
+
+    Only the graphiti_core client is stubbed (the ``tests/_graphiti_fake.py``
+    idiom), so the real ``add_episode`` / ``ensure_entity_node`` bodies run.
+    """
+
+    UPSTREAM_RESULT = object()
+
+    def _wire(self, backend, graph, *, listing: list[str]) -> list[str]:
+        """Route every graph key to *graph*, stub upstream, and return the shared event log."""
+        events: list[str] = []
+
+        async def _upstream(**kwargs):
+            events.append('upstream')
+            return self.UPSTREAM_RESULT
+
+        client = MagicMock()
+        client.add_episode = AsyncMock(side_effect=_upstream)
+        backend._client_for = MagicMock(return_value=client)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend._driver.client.list_graphs = AsyncMock(return_value=listing)
+
+        if isinstance(graph.query, AsyncMock):
+            respond = graph.query.side_effect
+
+            def _query(statement, *args, **kwargs):
+                events.append(statement)
+                return respond(statement, *args, **kwargs)
+
+            graph.query = AsyncMock(side_effect=_query)
+        return events
+
+    @staticmethod
+    async def _write(backend, group_id='reg'):
+        return await backend.add_episode(name='n', content='c', group_id=group_id)
+
+    @pytest.mark.asyncio
+    async def test_first_add_episode_on_a_registered_absent_graph_provisions_before_the_write(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock([], header=LIVE_HEADER)
+        graph.ro_query = AsyncMock(side_effect=_EMPTY_KEY_ERROR)
+        events = self._wire(backend, graph, listing=[])
+
+        result = await self._write(backend)
+
+        assert events == _plan_for(set()) + ['upstream']
+        assert _ro_issued(graph) == ['CALL db.indexes()'], 'no readiness poll (INV-7)'
+        assert result is self.UPSTREAM_RESULT
+
+    @pytest.mark.asyncio
+    async def test_add_episode_on_an_unregistered_graph_touches_no_index_state(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        events = self._wire(backend, graph, listing=['unreg'])
+
+        await self._write(backend, group_id='unreg')
+
+        graph.ro_query.assert_not_awaited()
+        graph.query.assert_not_awaited()
+        assert events == ['upstream']
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_first_writes_issue_the_plan_once(
+        self, mock_config, make_backend,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = _StatefulGraph(_TRAP_PRESENT)
+        self._wire(backend, graph, listing=['reg'])
+
+        await asyncio.gather(self._write(backend), self._write(backend))
+
+        assert graph.issued == _plan_for(_TRAP_PRESENT)
+
+    @pytest.mark.asyncio
+    async def test_first_write_under_the_callers_identity_lock_does_not_deadlock(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The ``MemoryService._execute_graphiti_write`` shape: the caller already holds it."""
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        events = self._wire(backend, graph, listing=['reg'])
+
+        async with backend._identity_lock_for('reg'):
+            await asyncio.wait_for(self._write(backend), 5)
+
+        assert events == _plan_for(_TRAP_PRESENT) + ['upstream']
+
+    @pytest.mark.asyncio
+    async def test_a_provisioning_failure_never_fails_the_write_and_is_retried(
+        self, mock_config, make_backend, make_graph_mock, caplog,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock([], header=LIVE_HEADER)
+        graph.ro_query = AsyncMock(side_effect=redis.exceptions.ConnectionError('down'))
+        self._wire(backend, graph, listing=['reg'])
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await self._write(backend)
+
+        assert result is self.UPSTREAM_RESULT
+        assert any(
+            r.name == _LOGGER and r.levelno == logging.WARNING and "'reg'" in r.getMessage()
+            for r in caplog.records
+        ), 'the failed provisioning must be named in a WARNING'
+        assert graph.ro_query.await_count == 1
+
+        await self._write(backend)
+
+        assert graph.ro_query.await_count == 2, 'an uncached graph must be retried'
+
+    @pytest.mark.asyncio
+    async def test_a_hung_provisioning_read_is_bounded_and_releases_the_lock(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.queue.backend_write_timeout_seconds = 0.05
+        backend = make_backend(config, registered_graph_ids={'reg'})
+        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        healthy_read = graph.ro_query.side_effect
+        never = asyncio.Event()
+        reads = 0
+
+        async def _ro_query(statement, *args, **kwargs):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                await never.wait()
+            return healthy_read(statement, *args, **kwargs)
+
+        graph.ro_query = AsyncMock(side_effect=_ro_query)
+        events = self._wire(backend, graph, listing=['reg'])
+
+        await asyncio.wait_for(self._write(backend), 2)
+        assert events == ['upstream'], 'the write must proceed past a hung provisioning read'
+
+        await asyncio.wait_for(self._write(backend), 2)
+        assert events == ['upstream', *_plan_for(_TRAP_PRESENT), 'upstream']
+
+    @pytest.mark.asyncio
+    async def test_later_writes_skip_provisioning_once_cached(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        self._wire(backend, graph, listing=['reg'])
+
+        await self._write(backend)
+        await self._write(backend)
+        await self._write(backend)
+
+        assert _ro_issued(graph) == ['CALL db.indexes()']
+        assert _issued(graph) == _plan_for(_TRAP_PRESENT)
+
+    @pytest.mark.asyncio
+    async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_minting(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock([], header=LIVE_HEADER)
+
+        async def _ro_query(statement, *args, **kwargs):
+            if 'db.indexes' in statement:
+                raise _EMPTY_KEY_ERROR
+            return MagicMock(result_set=[], header=[])  # the resolve read: no such node
+
+        graph.ro_query = AsyncMock(side_effect=_ro_query)
+        self._wire(backend, graph, listing=[])
+        backend.client.embedder.create = AsyncMock(return_value=[0.1])
+        backend.update_node_embedding = AsyncMock()
+
+        await backend.ensure_entity_node('Some Entity', group_id='reg')
+
+        writes = _issued(graph)
+        mint_at = next(i for i, w in enumerate(writes) if w.startswith('CREATE (n:Entity'))
+        assert writes[:mint_at] == _plan_for(set())
