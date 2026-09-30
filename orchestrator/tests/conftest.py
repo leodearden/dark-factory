@@ -451,16 +451,9 @@ def _no_mock_derived_stray_dirs(request):
     does not cascade into a failure for every subsequent test sharing the same
     xdist worker's CWD.
 
-    **Deliberately narrow — directory shape only.**  This does NOT match the
-    ``<MagicMock name='...' id='...'>`` FILE shape.  That is the
-    ``str(mock)``/repr shape, it is pre-existing on main and unrelated to task
-    3223 (produced by ``sqlite3.connect(str(...))`` at
-    ``park_eviction_requests.py:84``, not by ``safe_io``), and it is already
-    contained by the ``<MagicMock*`` entry at ``.gitignore:50`` — dozens of
-    such files currently sit untracked in the main checkout, so a guard
-    matching them would go red on day one for reasons this task cannot fix.
-    That pollution is tracked separately as follow-up ticket
-    ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
+    **Directory shape only.**  This covers the ``os.fspath()`` ``MagicMock/``
+    DIRECTORY shape; the sibling :func:`_no_mock_repr_stray_files` covers the
+    ``str()``/repr ``<MagicMock name='...' id='...'>`` FILE shape.
     """
     yield
     stray = Path.cwd() / "MagicMock"
@@ -475,6 +468,49 @@ def _no_mock_derived_stray_dirs(request):
         "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
         "attribute to auto-spec into a child mock. The stray tree has been "
         "removed so following tests are unaffected."
+    )
+
+
+#: The repr of every unittest.mock class, plus its sqlite -wal/-shm/-journal sidecars.
+_MOCK_REPR_ENTRY_GLOB = '<*Mock *'
+
+
+def _mock_repr_entries(directory: Path) -> frozenset[Path]:
+    return frozenset(directory.glob(_MOCK_REPR_ENTRY_GLOB))
+
+
+@pytest.fixture(autouse=True)
+def _no_mock_repr_stray_files(request):
+    """Fail any test that leaves a NEW ``<...Mock ...>`` repr-named entry in the CWD.
+
+    ``str()`` of a mock is its repr, so a mock-derived path reaching
+    ``sqlite3.connect(str(...))`` or ``open()`` creates a real file named after
+    it.  Only entries absent from the setup snapshot are blamed and removed, so
+    strays that predate the test can neither turn it red nor cascade onto later
+    tests.  Pinned by ``test_mock_repr_stray_guard.py``.
+    """
+    cwd = Path.cwd()
+    before = _mock_repr_entries(cwd)
+    yield
+    new = sorted(_mock_repr_entries(cwd) - before)
+    if not new:
+        return
+    for entry in new:
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    pytest.fail(
+        f"{request.node.nodeid} left mock-repr entries in {cwd}: "
+        f"{[entry.name for entry in new]}. str() of a MagicMock is its repr, so "
+        "a mock-derived path reaching sqlite3.connect(str(...)) or open() "
+        "creates a real file in the CWD. Give the mock a genuine path (e.g. "
+        "`req.config.project_root = tmp_path` or "
+        "`config.park_eviction_requests_db_path = tmp_path / '...'`), or use "
+        "conftest's mock_orch_config. The entries have been removed. Under "
+        "xdist every worker shares this CWD, so a test running concurrently on "
+        "another worker may be the true source; rerun that module with `-n 0` "
+        "to attribute exactly."
     )
 
 
