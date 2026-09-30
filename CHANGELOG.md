@@ -541,7 +541,10 @@ the episode.
   Those tasks' parks were previously kept while running and cleared silently at release,
   so `reservation_used` counts rise.
 - reserve_now installs at the effective (boosted or inherited) tier, and `install_parks`
-  never duplicates an owner's existing entry.
+  never duplicates an owner's existing entry. An owner's lower-tier entry is re-ranked in
+  place (and reported in `reserve_now_consumed`'s `data.modules`) unless a same-or-higher
+  tier top blocks it; an entry is never downgraded. The skip-driven completion rule
+  fills only unparked modules and does not re-rank.
 
 **Migration for historical series.** Count pre-change real installs with
 `json_array_length(json_extract(data, '$.modules')) > 0`; measure the install live-lock

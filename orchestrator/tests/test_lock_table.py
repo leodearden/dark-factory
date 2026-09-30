@@ -121,7 +121,7 @@ class TestInstallParksIsIdempotentPerOwner:
             'one call with two same-key paths must push one entry'
         )
 
-    def test_owner_never_self_shadows_by_reranking(self):
+    def test_a_lower_tier_reinstall_never_downgrades_the_owner(self):
         lt = _lt()
         lt.install_parks('T', ['m1'], 'critical')
         installed, _ = lt.install_parks('T', ['m1'], 'high')
@@ -134,6 +134,44 @@ class TestInstallParksIsIdempotentPerOwner:
         assert _stack(lt, 'm1')[-1] == ('T', PRIORITY_RANK['critical']), (
             'T must stay the active top on m1'
         )
+
+    def test_a_higher_tier_reinstall_reranks_the_owners_top_in_place(self):
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('T', ['m1'], 'medium')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == ['m1'], 'a rank upgrade reports the re-ranked key'
+        assert shadowed == [], 'L was already beneath T, so nothing is newly shadowed'
+        assert _stack(lt, 'm1') == [
+            ('L', PRIORITY_RANK['low']),
+            ('T', PRIORITY_RANK['critical']),
+        ], 'the upgrade replaces the medium entry rather than adding a second one'
+        competitor_installed, _ = lt.install_parks('C', ['m1'], 'high')
+        assert competitor_installed == [], 'a high competitor must not shadow the upgraded T'
+
+    def test_a_higher_tier_reinstall_lifts_a_buried_owner_over_a_lower_top(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == ['m1'], 'a lifted owner reports the key'
+        assert shadowed == [('H', ['m1'])], 'the lifted owner now shadows H'
+        assert _stack(lt, 'm1') == [
+            ('H', PRIORITY_RANK['high']),
+            ('T', PRIORITY_RANK['critical']),
+        ], 'T leaves its buried low slot and tops the stack at critical'
+        assert lt.clear_parks_for('T') == [('H', ['m1'])], 'clearing T restores H'
+
+    def test_a_blocked_rank_upgrade_keeps_the_owners_entry(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'critical')
+        installed, _ = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == [], 'a same-tier top blocks the upgrade (INV-3)'
+        assert _stack(lt, 'm1') == [
+            ('T', PRIORITY_RANK['low']),
+            ('H', PRIORITY_RANK['critical']),
+        ], 'a blocked upgrade leaves T its buried low entry'
 
 
 class TestUnparkedModules:

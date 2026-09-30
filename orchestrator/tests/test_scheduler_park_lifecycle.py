@@ -240,3 +240,24 @@ async def test_reserve_now_never_duplicates_a_park_the_owner_already_holds(tmp_p
     assert [d['modules'] for d in event_data_for(w.store, 'reserve_now_consumed', 'A')] == [
         ['r2.py']
     ], 'reserve_now dedupe: only the newly parked r2 is reported'
+
+
+@pytest.mark.asyncio
+async def test_reserve_now_raises_a_lower_tier_park_to_the_boosted_rank(tmp_path):
+    w = _world(tmp_path)
+    assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
+    w.scheduler.lock_table.install_parks('A', ['r1.py'], 'medium')
+    w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
+    w.scheduler.get_tasks = AsyncMock(return_value=[make_task('A', 'medium', ['r1.py', 'r2.py'])])
+
+    assert await w.scheduler.acquire_next() is None, 'reserve_now upgrade: A is held off'
+
+    for module in ('r1.py', 'r2.py'):
+        assert [e['rank'] for e in _a_entries(w.scheduler, module)] == [
+            PRIORITY_RANK['critical']
+        ], f'reserve_now upgrade: A parks {module} once, at the boosted rank'
+    assert [d['modules'] for d in event_data_for(w.store, 'reserve_now_consumed', 'A')] == [
+        ['r1.py', 'r2.py']
+    ], 'reserve_now upgrade: the re-ranked r1 is reported with the new r2'
+    installed, _ = w.scheduler.lock_table.install_parks('C', ['r1.py'], 'high')
+    assert installed == [], 'reserve_now upgrade: a high competitor cannot shadow A on r1'
