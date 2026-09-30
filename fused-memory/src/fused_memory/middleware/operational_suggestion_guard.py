@@ -86,14 +86,12 @@ this module is only:
   gate — a suppression path this guard has and ``routing_intent_guard`` does
   not — is evaluated INSIDE the marker loop and keeps reading RAW field
   text. So a stamp that merely NAMES a code-level artifact noun still gates
-  a weak marker (``confirm``/``reload``/``deploy``) in that field. Closed as
-  won't-fix by task 5106 on measurement: across all nine project task stores
-  (16,274 rows, 2026-09-30) no field pairs an AUTHORED weak marker with an
-  artifact noun found only inside a stamp, and gating on stamp-stripped text
-  would change the result for zero rows. The one near-miss is a stamp
-  carrying BOTH the marker and the noun -- the shape that widening would flip
-  into a finding manufactured from annotator wording. Both behaviours are
-  pinned on return values in
+  a weak marker (``confirm``/``reload``/``deploy``) in that field. Won't-fix
+  (task 5106, which records the live-corpus measurement): gating on
+  stamp-stripped text would un-gate a weak marker that sits inside a stamp
+  next to that stamp's own artifact noun, manufacturing a finding from
+  annotator wording rather than recovering one the filing author wrote.
+  Both behaviours are pinned on return values in
   ``tests/test_operational_suggestion_guard.py::TestProvenanceStampDoesNotDisarmOperationalSuggestion``.
 
 This module is declaration-only and WARN-ONLY: it never coerces

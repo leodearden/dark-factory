@@ -678,7 +678,7 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
             description=(
                 'Add a typed verdict adapter to the triage judge.'
                 '\n\n[2026-09-30 RULING] Confirm first on a fresh population; '
-                'the classifier trial was inconclusive.'
+                'the verdict schema trial was inconclusive.'
             ),
             details=None,
             task_kind='normal',
