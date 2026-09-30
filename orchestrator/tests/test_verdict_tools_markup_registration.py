@@ -1033,9 +1033,9 @@ class _RefusingQueue:
 class TestVerdictToolsResidueChannelIsShared:
     """The sink files into the real escalation queue, not a doomed worktree file.
 
-    The first cut of this leaf wired ``escalation_sink`` straight to
-    ``TaskArtifacts.write_markup_residue``, which lands under the task
-    worktree — a root the orchestrator destroys with
+    The first cut of this leaf wired ``escalation_sink`` straight to a
+    ``markup_residue-<n>.json`` writer under the task worktree — a root the
+    orchestrator destroys with
     ``git worktree remove --force`` at teardown, and which no watcher ever
     reads. These pin the corrected wiring: the queued escalation is the ONLY
     channel, and a payload the queue cannot take is reported lost rather than

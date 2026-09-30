@@ -1956,11 +1956,8 @@ def _markup_escalation_sink(
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Build plan-tools' emitter — the shared channel, this server's spec.
 
-    No ``last_resort``: plan-tools' payload floor is the queue or nothing. A
-    worktree-local file would die with the lane at
-    ``git worktree remove --force`` and nothing would ever read it, so
-    promising one in the refusal hint would be worse than the honest ``None``
-    the middleware already renders.
+    The queue-or-nothing payload floor is ``markup_sink``'s, shared with
+    verdict-tools.
     """
     return markup_sink.make_escalation_sink(
         worktree=artifacts.worktree,
