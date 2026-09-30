@@ -813,6 +813,11 @@ takes no arguments: it always re-reads that process's own
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
+  cgroup `CPUWeight` a verify scope is spawned with when
+  `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
+  applies from the next verify leg — a scope already running keeps the weight
+  it started with)
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))

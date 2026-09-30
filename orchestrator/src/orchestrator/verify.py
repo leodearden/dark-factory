@@ -5867,15 +5867,16 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     ``use_cgroup_scope=True`` to ``_run_cmd``.  ``_run_cmd`` in turn launches
     the already-wrapped command inside a ``systemd-run --user --scope``
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
-    path, tries to create an *inner* ``systemd-run --user --scope`` scope —
-    a nested transient scope inside the outer ``df-verify`` scope.  Nested
-    ``--user --scope`` invocations are allowed by systemd (each creates a
-    distinct cgroup slice), so this is not a correctness or leak bug; the
-    outer scope's cgroup kill still reaps the entire subtree regardless.
-    The live reify deployment currently sets ``verify_use_cgroup_scope=False``,
-    so this combination does not occur in practice.  ``cpu-governed-exec.sh``
-    also has a runtime probe + fail-open, so a nested-scope failure degrades
-    gracefully.
+    path, creates an *inner* ``systemd-run --user --scope --slice=...``
+    scope.  reify enables both flags (its ``dark-factory-orchestrator.yaml``
+    sets ``verify_use_cgroup_scope: true`` and ``cpu_governance.enabled:
+    true``), so this combination is live on reify's merge leg.  The inner
+    scope MOVES the governed workload out of the outer ``df-verify`` scope
+    into its own scope under that slice, so neither the outer scope's
+    CPUWeight nor its cgroup kill reaches that workload —
+    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
+    nested-scope failure degrades gracefully.
     """
     if cmd is None or not exec_path:
         return cmd

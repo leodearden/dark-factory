@@ -9277,13 +9277,9 @@ class TestRunVerificationGovernRouting:
         scope contains the cpu-governed-exec.sh invocation, which on its
         governed path itself tries to create an inner systemd-run --user --scope.
 
-        In the real environment reify currently sets verify_use_cgroup_scope=False,
-        so this combination does not occur on the live path.  cpu-governed-exec.sh
-        has a runtime probe + fail-open that handles systemd-run absence or
-        failures; the outer scope's cgroup kill still reaps the whole subtree.
-        This test confirms the code paths compose without crashing and that
-        governance wrapping still fires (the nested scope interaction is a
-        runtime-environment concern, not a code-correctness bug).
+        What the nested scope does and does not govern is stated at
+        verify.py::_govern_cpu_str.  This test confirms the two wrappings
+        compose and that governance wrapping still fires.
         """
         import shlex
 
