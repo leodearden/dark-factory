@@ -5,7 +5,9 @@ curation that no signal distinguishes from a healthy one.
 
 1. Every exception arm around the LLM call routes through ``report_failure``.
 2. ``curate()`` constructs no ``CuratorDecision`` directly — every degraded
-   decision leaves through the ``_degraded_create`` funnel that counts it.
+   decision leaves through the ``_degraded_create`` funnel that counts it —
+   and no other ``TaskCurator`` method builds an ``action='create'`` decision
+   itself either, so the batch path cannot fail open uncounted (esc-4448-11).
 
 ``TaskCurator.curate()`` wraps its LLM call in one ``try`` with three handlers.
 Two of them escalate; the third — the catch-all — did not, and that asymmetry
@@ -148,6 +150,51 @@ def test_curate_constructs_no_decision_directly():
         f'decision must be built by {DEGRADED_FUNNEL}() instead, which is what '
         f'increments the degraded streak — a decision constructed here bypasses '
         f'the counter and is invisible to the alarm.'
+    )
+
+
+def _curator_methods() -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = parse_python_module(TASK_CURATOR)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == CURATOR_CLASS:
+            return [
+                child for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+    raise AssertionError(
+        f'{TASK_CURATOR.name}: no class {CURATOR_CLASS} — this guard has lost '
+        f'its subject; re-point it rather than deleting it.'
+    )
+
+
+def _is_create_construction(call: ast.Call) -> bool:
+    action = next((kw.value for kw in call.keywords if kw.arg == 'action'), None)
+    return isinstance(action, ast.Constant) and action.value == 'create'
+
+
+def test_no_curator_method_but_the_funnel_builds_a_create():
+    """The whole class, not just curate(): a create the curator builds for
+    itself — rather than parsing from a model response — is by definition a
+    fail-open, so it must be counted. esc-4448-11 found the batch path's
+    breaker-open short-circuit building its own creates, which filed every
+    batch candidate without dedupe while the streak stood still."""
+    methods = _curator_methods()
+    assert any(m.name == DEGRADED_FUNNEL for m in methods), (
+        f'{CURATOR_CLASS} has no {DEGRADED_FUNNEL}() — re-point this guard.'
+    )
+    rogue = [
+        (method.name, call.lineno)
+        for method in methods
+        if method.name != DEGRADED_FUNNEL
+        for call in calls_named(method, DECISION_TYPE)
+        if _is_create_construction(call)
+    ]
+    assert not rogue, (
+        f'{CURATOR_CLASS} method(s) construct an action=\'create\' '
+        f'{DECISION_TYPE} directly: '
+        + ', '.join(f'{name}() at line {line}' for name, line in rogue)
+        + f'. Build it through {DEGRADED_FUNNEL}() so the degraded streak '
+        'counts it; a create built anywhere else is invisible to the alarm.'
     )
 
 

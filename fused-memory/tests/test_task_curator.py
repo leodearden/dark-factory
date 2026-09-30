@@ -5462,6 +5462,58 @@ class TestZeroOutputBreakerBatchPath:
         # (b) LLM must NOT have been invoked for the batch dispatch.
         assert mock_llm.await_count == call_count_before_batch
 
+    async def test_breaker_open_batch_decisions_count_toward_degraded_streak(self):
+        """esc-4448-11: while the breaker is open the batch path files every
+        candidate without dedupe, so each short-circuited decision is degraded
+        and advances the class-agnostic streak — the same as the size-1
+        curate() breaker-open path. Otherwise a batch-dominant deployment could
+        sit behind an open breaker indefinitely with the alarm silent."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 1
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        config.curator.degraded_streak_threshold = 5
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        mock_llm = AsyncMock(return_value=self._zot_result())
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        # One ZOT opens the breaker (and is itself degraded: streak 1).
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            await curator.curate(
+                CandidateTask(title='Opener'), project_id='p', project_root='/x',
+            )
+        escalator.report_consecutive_degraded.assert_not_awaited()
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        prepared = [
+            PreparedCandidate(
+                candidate=CandidateTask(title=f'Batch {i}', description=f'body {i}'),
+                pool=[], pool_sizes=empty_sizes, prompt_tokens=20,
+            )
+            for i in range(config.curator.degraded_streak_threshold)
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        assert mock_llm.await_count == 1
+        assert [d.justification for d in decisions] == (
+            ['zero-output-breaker-open'] * len(prepared)
+        )
+        assert all(d.action == 'create' and d.degraded for d in decisions)
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
     async def test_batch_zot_without_preopen_trips_breaker(self):
         """A curate_batch_prepared call (no pre-opened breaker) where all candidates
         hit ZOT must open the breaker and bound escalation submissions.

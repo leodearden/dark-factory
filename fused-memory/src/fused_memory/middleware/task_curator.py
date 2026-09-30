@@ -1519,7 +1519,9 @@ class TaskCurator:
     ) -> CuratorDecision:
         """Build a degraded ``action='create'`` decision and count it.
 
-        The single exit every degraded path in :meth:`curate` takes, which is
+        The single exit every degraded path in :meth:`curate` and every
+        breaker-open short-circuit in :meth:`curate_batch_prepared` takes,
+        which is
         what lets the streak be counted without enumerating the reasons a
         curation can degrade. A path that built its own
         :class:`CuratorDecision` would be invisible here and, like the silent
@@ -2116,20 +2118,20 @@ class TaskCurator:
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
-            batch_breaker_now = time.monotonic()
             logger.warning(
                 'curate_batch: zero-output-breaker open — short-circuiting %d '
                 'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
                 len(llm_k_list),
                 self._consecutive_zero_output_timeouts,
             )
-            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
             for _k in llm_k_list:
-                cache_hit_map[_k] = CuratorDecision(
-                    action='create',
+                cache_hit_map[_k] = await self._degraded_create(
                     justification='zero-output-breaker-open',
-                    pool_sizes=_empty_pool_sizes,
-                    latency_ms=int((batch_breaker_now - start) * 1000),
+                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    start=start,
+                    candidate=candidates[unique_indices[_k]],
+                    project_id=project_id,
+                    project_root=project_root,
                 )
             llm_k_list = []
 
