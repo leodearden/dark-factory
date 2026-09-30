@@ -14,8 +14,10 @@ To run just this suite:
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from task_event_timeline import main
 
 TASK = '5495'
@@ -81,6 +83,23 @@ def _run_json(capsys, db, *extra):
     return exit_code, json.loads(capsys.readouterr().out)
 
 
+def _run_text(capsys, db, *extra):
+    exit_code = main(['--db', str(db), TASK, *extra])
+    return exit_code, capsys.readouterr().out.splitlines()
+
+
+def _tokens(line):
+    return set(re.findall(r'[\w.-]+', line))
+
+
+def _event_lines(lines):
+    return [line for line in lines if line.startswith('#')]
+
+
+def _filter_args(event_types):
+    return [arg for event_type in event_types for arg in ('--event-type', event_type)]
+
+
 def test_json_lists_every_event_of_the_task_across_runs_in_id_order(runs_db, runs_db_path, capsys):
     seed(runs_db, ESC_5495_3)
 
@@ -127,3 +146,76 @@ def test_a_malformed_payload_is_listed_and_counted_with_empty_data(runs_db, runs
     assert timeline['events'][-1]['data'] == {}
     assert len(timeline['events']) == len(_task_rows(corpus))
     assert timeline['invocation_outcomes'][-1] == {'role': 'verifier', 'subtype': None, 'count': 1}
+
+
+def test_text_names_the_log_then_one_line_per_event_in_id_order(runs_db, runs_db_path, capsys):
+    seed(runs_db, ESC_5495_3)
+
+    exit_code, lines = _run_text(capsys, runs_db_path)
+
+    assert exit_code == 0
+    assert lines[0] == str(runs_db_path.resolve())
+    rows = _task_rows(ESC_5495_3)
+    event_lines = _event_lines(lines[1:])
+    assert [line.split()[0] for line in event_lines] == [f'#{event_id}' for event_id, _ in rows]
+    for line, (_, row) in zip(event_lines, rows, strict=True):
+        assert {row['run_id'], row['event_type']} <= _tokens(line)
+        subtype = row.get('data', {}).get('subtype')
+        if subtype is not None:
+            assert subtype in _tokens(line)
+    assert sum('error_max_budget_usd' in _tokens(line) for line in event_lines) == 4
+    assert sum('success' in _tokens(line) for line in event_lines) == 1
+
+
+def test_text_summary_counts_events_runs_and_invocation_outcomes(runs_db, runs_db_path, capsys):
+    seed(runs_db, ESC_5495_3)
+
+    _, lines = _run_text(capsys, runs_db_path)
+
+    last_event_line = lines.index(_event_lines(lines)[-1])
+    summary, *outcome_block = [line for line in lines[last_event_line + 1:] if line.strip()]
+    assert {str(len(_task_rows(ESC_5495_3))), '2'} <= _tokens(summary)
+    roles = {_REVIEWER, 'unblock_auto'}
+    outcome_lines = [line for line in outcome_block if roles & _tokens(line)]
+    expected = [
+        {_REVIEWER, 'error_max_budget_usd', '4'},
+        {_REVIEWER, 'success', '1'},
+        {'unblock_auto', '1'},
+    ]
+    assert len(outcome_lines) == len(expected)
+    for line, wanted in zip(outcome_lines, expected, strict=True):
+        assert wanted <= _tokens(line)
+
+
+FILTERS = [
+    pytest.param(['invocation_end'], 6, id='one-type'),
+    pytest.param(['invocation_end', 'escalation_created'], 7, id='repeated-flag'),
+]
+
+
+@pytest.mark.parametrize(('event_types', 'expected_count'), FILTERS)
+def test_event_type_filter_narrows_the_json_listing(
+    runs_db, runs_db_path, capsys, event_types, expected_count,
+):
+    seed(runs_db, ESC_5495_3)
+
+    exit_code, timeline = _run_json(capsys, runs_db_path, *_filter_args(event_types))
+
+    assert exit_code == 0
+    assert len(timeline['events']) == expected_count
+    assert {event['event_type'] for event in timeline['events']} == set(event_types)
+
+
+@pytest.mark.parametrize(('event_types', 'expected_count'), FILTERS)
+def test_event_type_filter_narrows_the_text_listing(
+    runs_db, runs_db_path, capsys, event_types, expected_count,
+):
+    seed(runs_db, ESC_5495_3)
+
+    exit_code, lines = _run_text(capsys, runs_db_path, *_filter_args(event_types))
+
+    assert exit_code == 0
+    event_lines = _event_lines(lines)
+    assert len(event_lines) == expected_count
+    for line in event_lines:
+        assert set(event_types) & _tokens(line)
