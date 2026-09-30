@@ -353,9 +353,6 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
 // No receipt outranks everything, as in plainDatum: before the first payload,
 // an absent Datum is not yet evidence of anything. `absentReason` is required
 // and names what the delivered payload lacks where the caller looked.
-//
-// burndown_bands.js::burndownDatum and task_snapshot.js::snapshotDatum are
-// endpoint-specific copies of this same rule.
 function servedDatum(served, endpointKey, absentReason, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
   if (!receipt) return unknownDatum('not yet fetched');

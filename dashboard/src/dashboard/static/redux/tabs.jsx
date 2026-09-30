@@ -117,6 +117,8 @@ const fmtAgeSecs = secs => {
 // ── Cross-project aggregation helpers (no synthetic fallbacks) ──
 // PERFORMANCE is keyed by project: a served `cards` Datum (paths/escalation/hist/ttc)
 // plus three *_history series. These return null when there's no data (UI renders '—').
+// A project whose cards Datum is a hole has no block, so it carries no weight.
+const cardBlocks = perf => Object.values(perf || {}).map(p => p.cards?.value).filter(Boolean);
 function _weightedMean(samples) {
   // samples: [[value, weight], ...].  Returns null when total weight is 0.
   let num = 0, den = 0;
@@ -130,15 +132,14 @@ function _weightedMean(samples) {
 
 function aggTtcMs(perf, percentile) {
   // Weighted by per-project task count so big projects dominate.
-  const samples = Object.values(perf || {})
-    .map(p => [p.cards.value.ttc?.[percentile], p.cards.value.ttc?.count || 0]);
+  const samples = cardBlocks(perf).map(c => [c.ttc?.[percentile], c.ttc?.count || 0]);
   return _weightedMean(samples);
 }
 
 function aggOnePassPct(perf) {
   let onePass = 0, total = 0;
-  for (const p of Object.values(perf || {})) {
-    for (const path of (p.cards.value.paths || [])) {
+  for (const c of cardBlocks(perf)) {
+    for (const path of (c.paths || [])) {
       total += path.count || 0;
       if (path.path === 'one-pass') onePass += path.count || 0;
     }
@@ -149,12 +150,19 @@ function aggOnePassPct(perf) {
 function aggEscalationRate(perf, kind /* 'steward_rate' | 'interactive_rate' */) {
   // Each project's escalation block carries a *_count and total_tasks; we don't
   // get total_tasks back in the redux shape, so weight by ttc.count instead.
-  const samples = Object.values(perf || {})
-    .map(p => [p.cards.value.escalation?.[kind], p.cards.value.ttc?.count || 0]);
+  const samples = cardBlocks(perf).map(c => [c.escalation?.[kind], c.ttc?.count || 0]);
   return _weightedMean(samples);
 }
 
 const onePassPct = cards => cards.paths.find(x => x.path === 'one-pass')?.pct ?? 0;
+const sumOf = xs => xs.reduce((s, x) => s + x, 0);
+const pathTotal = cards => sumOf(cards.paths.map(x => x.count));
+
+// A PerfTab panel head reading the project's cards Datum, so the chart under it
+// carries the same age badge and reason as the pips. A hole draws no chart.
+function CardsPanelHead({ title, cards, reading }) {
+  return <div className="panel-head"><span className="title">{title}</span><span className="meta"><DatumReading datum={cards} format={reading} /></span></div>;
+}
 
 // ── Deps + locks chip lists ──
 
@@ -438,7 +446,7 @@ function PerfTab({ projectFilter }) {
           const p95 = aggTtcMs(subset, 'p95');
           const onePass = aggOnePassPct(subset);
           const escalation = aggEscalationRate(subset, 'interactive_rate');
-          const totalTasks = Object.values(subset).reduce((s, p) => s + (p.cards.value.ttc?.count || 0), 0);
+          const totalTasks = cardBlocks(subset).reduce((s, c) => s + (c.ttc?.count || 0), 0);
           const fmtPct = v => `${v.toFixed(1)}`;
           // Aggregate historical sparks across the in-scope projects.
           // Per-project hour buckets must be aligned by label before summing.
@@ -520,9 +528,8 @@ function PerfTab({ projectFilter }) {
 
       {projects.map(pid => {
         const p = DF.PERFORMANCE[pid];
-        const block = p.cards.value;
         const cards = servedDatum(p.cards, EP.performance, `the performance payload has no cards Datum for ${pid}`);
-        const donutData = block.paths.map(x => ({ label: x.path, value: x.count, color: CP.paths[x.path] }));
+        const block = cards.value;
         const summary = (
           <>
             <Pip datum={cards} color={CP.accent} format={c => fmtMs(c.ttc.p50)} label="p50" />
@@ -536,9 +543,9 @@ function PerfTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-4 panel">
-                  <div className="panel-head"><span className="title">Completion paths</span></div>
-                  <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                    <DN data={donutData} size={120} thickness={20} centerValue={String(block.paths.reduce((s,x)=>s+x.count,0))} centerLabel="tasks" />
+                  <CardsPanelHead title="Completion paths" cards={cards} reading={c => `${pathTotal(c)} tasks`} />
+                  {block && <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                    <DN data={block.paths.map(x => ({ label: x.path, value: x.count, color: CP.paths[x.path] }))} size={120} thickness={20} centerValue={String(pathTotal(block))} centerLabel="tasks" />
                     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
                       {block.paths.map(x => (
                         <div key={x.path} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
@@ -549,7 +556,7 @@ function PerfTab({ projectFilter }) {
                         </div>
                       ))}
                     </div>
-                  </div>
+                  </div>}
                 </div>
 
                 <div className="col-span-3 panel">
@@ -561,12 +568,12 @@ function PerfTab({ projectFilter }) {
                     </div>
                     <div style={{ height: 1, background: 'var(--line)' }}></div>
                     <div>
-                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Human attention ({block.escalation.interactive_count} interactive)</div>
-                      <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Human attention (<DatumReading datum={cards} format={c => `${c.escalation.interactive_count} interactive`} />)</div>
+                      {block && <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
                         {block.escalation.human_attention.zero > 0 && <span className="badge muted">{block.escalation.human_attention.zero} zero</span>}
                         {block.escalation.human_attention.minimal > 0 && <span className="badge warn">{block.escalation.human_attention.minimal} minimal</span>}
                         {block.escalation.human_attention.significant > 0 && <span className="badge bad">{block.escalation.human_attention.significant} significant</span>}
-                      </div>
+                      </div>}
                     </div>
                   </div>
                 </div>
@@ -613,12 +620,12 @@ function PerfTab({ projectFilter }) {
                 </div>
 
                 <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Review cycles · outer loop</span></div>
-                  <div className="panel-body"><BC labels={block.hist_outer.labels} values={block.hist_outer.values} height={140} /></div>
+                  <CardsPanelHead title="Review cycles · outer loop" cards={cards} reading={c => `${sumOf(c.hist_outer.values)} done`} />
+                  {block && <div className="panel-body"><BC labels={block.hist_outer.labels} values={block.hist_outer.values} height={140} /></div>}
                 </div>
                 <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Verify attempts · inner loop</span></div>
-                  <div className="panel-body"><BC labels={block.hist_inner.labels} values={block.hist_inner.values} height={140} color={CP.info} /></div>
+                  <CardsPanelHead title="Verify attempts · inner loop" cards={cards} reading={c => `${sumOf(c.hist_inner.values)} done`} />
+                  {block && <div className="panel-body"><BC labels={block.hist_inner.labels} values={block.hist_inner.values} height={140} color={CP.info} /></div>}
                 </div>
               </div>
             </ProjectGroup>
