@@ -16,6 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _virtual_clock_helpers import run_on_virtual_clock
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1402,19 +1403,28 @@ class TestFetchPinsRecovery:
         assert 'proj8102' in result
         assert result['proj8102'] is None
 
-    async def test_timeout_maps_to_none(self):
-        """A project that does not answer inside per_call_timeout is UNKNOWN."""
+    def test_timeout_maps_to_none(self):
+        """A project that does not answer inside per_call_timeout is UNKNOWN,
+        while a sibling that did answer keeps its read.
+
+        The answering project must beat the same deadline the slow one misses;
+        on the host clock a stalled worker made it miss that deadline too, so
+        the scenario runs on tests/_virtual_clock_helpers.py's loop clock.
+        """
         from dashboard.data.escalations import fetch_pins_recovery
 
-        handler = _PinsHandler(
-            {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
-            slow_ports={8105: 0.5},
-        )
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await fetch_pins_recovery(
-                client, _pins_urls(8100, 8105), per_call_timeout=0.05,
+        async def scenario():
+            handler = _PinsHandler(
+                {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
+                slow_ports={8105: 0.5},
             )
+            transport = httpx.MockTransport(handler)
+            async with httpx.AsyncClient(transport=transport) as client:
+                return await fetch_pins_recovery(
+                    client, _pins_urls(8100, 8105), per_call_timeout=0.05,
+                )
+
+        result = run_on_virtual_clock(scenario())
 
         assert result['proj8100'] == {'esc-a': ['3543']}
         assert result['proj8105'] is None
