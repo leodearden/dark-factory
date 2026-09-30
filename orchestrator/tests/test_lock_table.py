@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable
 
 #: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
@@ -77,6 +77,89 @@ class TestInstallParksApi:
         lt = _lt()
         with pytest.raises(TypeError):
             lt.install_parks('A', ['backend'], deadline=9999.0)  # type: ignore[call-arg]
+
+
+def _stack(lt: ModuleLockTable, module: str) -> list[tuple[str, int]]:
+    """``module``'s park stack as bottom->top ``(owner, rank)`` pairs."""
+    return [(e['owner'], e['rank']) for e in lt.snapshot_park_stacks().get(module, [])]
+
+
+class TestInstallParksIsIdempotentPerOwner:
+    """An owner already parked on a key is never pushed onto it again (task 5308)."""
+
+    def test_reinstall_on_a_key_the_owner_tops_pushes_nothing(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'high')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'high')
+        assert installed == [], 're-install on an owned top must install nothing'
+        assert shadowed == []
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['high'])], (
+            're-install on an owned top must leave exactly one T entry'
+        )
+
+    def test_reinstall_by_a_buried_owner_pushes_no_second_entry(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')
+        installed, _ = lt.install_parks('T', ['m1'], 'low')
+        assert installed == [], 'a buried owner re-installing must install nothing'
+        assert _stack(lt, 'm1') == [
+            ('T', PRIORITY_RANK['low']),
+            ('H', PRIORITY_RANK['high']),
+        ], 'a buried owner re-installing must not gain a second entry'
+        lt.clear_parks_for('H')
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['low'])], (
+            'clearing H must restore T as the sole top'
+        )
+        assert not lt.try_acquire('X', ['m1']), 'the restored T park must still block X'
+
+    def test_two_paths_normalizing_to_one_key_push_once(self):
+        lt = _lt(lock_depth=2)
+        installed, _ = lt.install_parks('T', ['pkg/a/x.py', 'pkg/a/y.py'], 'high')
+        assert installed == ['pkg/a'], 'one call with two same-key paths installs the key once'
+        assert _stack(lt, 'pkg/a') == [('T', PRIORITY_RANK['high'])], (
+            'one call with two same-key paths must push one entry'
+        )
+
+    def test_owner_never_self_shadows_by_reranking(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'critical')
+        installed, _ = lt.install_parks('T', ['m1'], 'high')
+        assert installed == [], 'a lower-tier re-install by the owner installs nothing'
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['critical'])], (
+            'the owner must keep its single critical-rank entry'
+        )
+        competitor_installed, _ = lt.install_parks('C', ['m1'], 'critical')
+        assert competitor_installed == [], 'a same-tier competitor must not shadow T'
+        assert _stack(lt, 'm1')[-1] == ('T', PRIORITY_RANK['critical']), (
+            'T must stay the active top on m1'
+        )
+
+
+class TestUnparkedModules:
+    """``unparked_modules`` — the completion rule's remainder (task 5308)."""
+
+    def test_normalizes_deduplicates_and_sorts(self):
+        lt = _lt(lock_depth=2)
+        assert lt.unparked_modules('T', ['b/x/1.py', 'a/y/2.py', 'b/x/3.py']) == ['a/y', 'b/x']
+
+    def test_subtracts_keys_the_owner_parks_at_any_level(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('T', ['m2'], 'low')
+        lt.install_parks('H', ['m2'], 'high')
+        assert _stack(lt, 'm2')[-1][0] == 'H', 'premise: T is buried under H on m2'
+        assert lt.unparked_modules('T', ['m1', 'm2', 'm3']) == ['m3']
+
+    def test_another_owners_parks_do_not_count(self):
+        lt = _lt()
+        lt.install_parks('H', ['m1'], 'high')
+        assert lt.unparked_modules('T', ['m1']) == ['m1']
+
+    def test_empty_input_and_empty_modules_yield_nothing(self):
+        lt = _lt()
+        assert lt.unparked_modules('T', []) == []
+        assert lt.unparked_modules('T', ['', 'm1']) == ['m1']
 
 
 class TestInstallParksPreemption:
