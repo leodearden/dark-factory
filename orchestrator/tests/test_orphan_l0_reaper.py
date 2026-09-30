@@ -265,7 +265,7 @@ class TestOrphanL0Reaper:
             ),
             detail='detail',
             # MUST NOT be 'verify_wip_reconciliation' — that would route
-            # through _is_done_step_commit_orphan's get_task branch, which
+            # through is_done_step_commit_orphan's get_task branch, which
             # this test does not stub.
             suggested_action='investigate_and_retry',
             timestamp=ts,
