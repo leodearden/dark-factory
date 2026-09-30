@@ -12,12 +12,15 @@ import copy
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 from escalation.queue import iter_all_escalation_paths
+from shared.timestamps import parse_timestamp_or_warn
 
+from dashboard.data.datum import Datum, DatumState
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
@@ -875,3 +878,116 @@ async def aggregate_performance_history(
             },
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# 6. The per-project cards Datum
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceCards:
+    """One project's card block: the four card families' tally for one window."""
+
+    paths: list[dict]
+    escalation: dict
+    hist_outer: dict
+    hist_inner: dict
+    ttc: dict
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'paths': copy.deepcopy(self.paths),
+            'escalation': copy.deepcopy(self.escalation),
+            'hist_outer': copy.deepcopy(self.hist_outer),
+            'hist_inner': copy.deepcopy(self.hist_inner),
+            'ttc': copy.deepcopy(self.ttc),
+        }
+
+
+def _window_bound_seconds(days: int) -> int:
+    """The cards Datum's freshness bound: the served window's own length."""
+    return int(timedelta(days=days).total_seconds())
+
+
+def _cards_provenance(
+    latest: datetime | None, served_at: datetime, days: int,
+) -> tuple[datetime, DatumState, str | None]:
+    """``(as_of, state, reason)`` for a project whose latest completion is *latest*.
+
+    Fresh exactly when the latest completion lies inside ``[served_at - days,
+    served_at]``, i.e. when the window's tally counts at least one completion.
+    Reasons name the window and the instant, never a *served_at*-derived
+    duration, so they do not change from one poll to the next.
+    """
+    if latest is None:
+        return served_at, DatumState.STALE, 'latest completion time of this project could not be read'
+    latest_iso = latest.astimezone(UTC).isoformat()
+    age_seconds = (served_at - latest).total_seconds()
+    if age_seconds < 0:
+        return latest, DatumState.STALE, (
+            f'last completion {latest_iso} is after the serving instant (clock skew)'
+        )
+    if age_seconds > _window_bound_seconds(days):
+        return latest, DatumState.STALE, (
+            f'no completions in the {days}d window; last completion {latest_iso}'
+        )
+    return latest, DatumState.FRESH, None
+
+
+async def _latest_completion_instants(
+    dbs: list[aiosqlite.Connection | None],
+) -> dict[str, datetime | None]:
+    """``{project_id: latest completion across dbs}``; ``None`` where none parses."""
+    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
+    latest: dict[str, datetime | None] = {}
+    for raw_by_project in per_db:
+        for project_id, raw in raw_by_project.items():
+            instant, parsed = parse_timestamp_or_warn(raw, context='performance.latest_completion')
+            known = latest.get(project_id)
+            if parsed and (known is None or instant > known):
+                latest[project_id] = instant
+            else:
+                latest.setdefault(project_id, None)
+    return latest
+
+
+async def aggregate_performance_cards(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int = 7,
+    now: datetime | None = None,
+) -> dict[str, Datum[PerformanceCards]]:
+    """Each project's card block for the window ``[now - days, now]``, as one Datum.
+
+    The value is the project's window tally; ``as_of`` is its newest
+    contributing event, its latest completion. So "fresh" means the last
+    completion lies inside the window, and an idle project (completions ever,
+    none in the window) is stale by the envelope's own bound.
+    """
+    served_at = resolve_now(now)
+    paths, escalation, histograms, ttc, latest = await asyncio.gather(
+        aggregate_completion_paths(dbs, escalations_dirs, days=days, now=served_at),
+        aggregate_escalation_rates(dbs, escalations_dirs, days=days, now=served_at),
+        aggregate_loop_histograms(dbs, days=days, now=served_at),
+        aggregate_time_centiles(dbs, days=days, now=served_at),
+        _latest_completion_instants(dbs),
+    )
+    cards: dict[str, Datum[PerformanceCards]] = {}
+    for project_id in sorted(paths.keys() & escalation.keys() & histograms.keys() & ttc.keys()):
+        as_of, state, reason = _cards_provenance(latest.get(project_id), served_at, days)
+        cards[project_id] = Datum(
+            value=PerformanceCards(
+                paths=paths[project_id],
+                escalation=escalation[project_id],
+                hist_outer=histograms[project_id]['outer'],
+                hist_inner=histograms[project_id]['inner'],
+                ttc=ttc[project_id],
+            ),
+            as_of=as_of,
+            state=state,
+            reason=reason,
+            freshness_bound_seconds=_window_bound_seconds(days),
+        )
+    return cards
