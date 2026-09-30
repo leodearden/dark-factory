@@ -380,8 +380,25 @@ def _grep_rows_from_checks(
     return rows
 
 
-def load_metadata_checks(db_path: str) -> list[DescriptorRow]:
-    """Every grep ``metadata.delivered_checks`` entry in *db_path*, with status.
+class TaskIndex(NamedTuple):
+    """Everything the join needs from tasks.db, read in one pass.
+
+    ``metadata_rows`` and ``stamped_names`` are two views of ONE fact — what
+    is stamped — derived from the same per-task extraction, so they cannot
+    drift apart. ``metadata_rows`` holds only the evaluable grep descriptors;
+    ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
+    delivered_check, whatever its kind — the set a sidecar capability is
+    deduplicated against.
+    """
+
+    statuses: dict[int, tuple[str, str]]
+    stamps: dict[int, str]
+    metadata_rows: tuple[DescriptorRow, ...]
+    stamped_names: frozenset[tuple[int, str]]
+
+
+def load_task_index(db_path: str) -> TaskIndex:
+    """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
     Read-only URI — the guarantee is structural, not a convention. Malformed
     metadata is SKIPPED rather than raised: a single undecodable row must not
@@ -392,22 +409,32 @@ def load_metadata_checks(db_path: str) -> list[DescriptorRow]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
-        rows: list[DescriptorRow] = []
-        for record in cursor:
+        statuses: dict[int, tuple[str, str]] = {}
+        stamps: dict[int, str] = {}
+        metadata_rows: list[DescriptorRow] = []
+        stamped_names: set[tuple[int, str]] = set()
+        for record in conn.execute(
+            "SELECT tag, id, status, updated_at, metadata FROM tasks"
+        ):
+            task_id = int(record["id"])
+            statuses[task_id] = (record["tag"], record["status"])
+            stamps[task_id] = record["updated_at"]
             checks = extract_delivered_checks(record["metadata"])
-            if not checks:
-                continue
-            rows.extend(
+            metadata_rows.extend(
                 _grep_rows_from_checks(
                     checks,
-                    task_id=int(record["id"]),
+                    task_id=task_id,
                     tag=record["tag"],
                     status=record["status"],
                     source="metadata",
                 )
             )
-        return rows
+            stamped_names.update(
+                (task_id, check["name"])
+                for check in checks
+                if isinstance(check.get("name"), str) and check["name"]
+            )
+        return TaskIndex(statuses, stamps, tuple(metadata_rows), frozenset(stamped_names))
     finally:
         conn.close()
 
@@ -631,43 +658,6 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
         conn.close()
 
 
-class TaskIndex(NamedTuple):
-    """What the join needs from tasks.db beyond the grep rows, read in one pass.
-
-    ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
-    delivered_check, whatever its kind — the set a sidecar capability is
-    deduplicated against.
-    """
-
-    statuses: dict[int, tuple[str, str]]
-    stamps: dict[int, str]
-    stamped_names: frozenset[tuple[int, str]]
-
-
-def _load_task_index(db_path: str) -> TaskIndex:
-    """Statuses, ``updated_at`` stamps and stamped check names, read-only."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        conn.row_factory = sqlite3.Row
-        statuses: dict[int, tuple[str, str]] = {}
-        stamps: dict[int, str] = {}
-        stamped_names: set[tuple[int, str]] = set()
-        for record in conn.execute(
-            "SELECT tag, id, status, updated_at, metadata FROM tasks"
-        ):
-            task_id = int(record["id"])
-            statuses[task_id] = (record["tag"], record["status"])
-            stamps[task_id] = record["updated_at"]
-            stamped_names.update(
-                (task_id, check["name"])
-                for check in extract_delivered_checks(record["metadata"])
-                if isinstance(check.get("name"), str) and check["name"]
-            )
-        return TaskIndex(statuses, stamps, frozenset(stamped_names))
-    finally:
-        conn.close()
-
-
 def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     """Join tasks.db, the sidecars and the tree; classify every descriptor.
 
@@ -683,13 +673,13 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     stamped one is the live behaviour and the sidecar row would be a phantom.
     """
     db = str(tasks_db_path(project_root))
-    index = _load_task_index(db)
+    index = load_task_index(db)
     open_dependents = load_open_dependents(db)
-    metadata_rows = load_metadata_checks(db)
     manifest_rows, unloadable = load_manifest_checks(project_root, index.statuses)
 
-    rows = metadata_rows + [
-        r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names
+    rows = [
+        *index.metadata_rows,
+        *(r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names),
     ]
 
     findings: list[Finding] = []

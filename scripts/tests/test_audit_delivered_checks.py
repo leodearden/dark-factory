@@ -48,7 +48,7 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
-    load_metadata_checks,
+    load_task_index,
 )
 from shared.delivered_check_polarity import CheckOutcome
 
@@ -199,11 +199,11 @@ class TestClassifyDescriptor:
 
 
 # ---------------------------------------------------------------------------
-# load_metadata_checks — tasks.db -> DescriptorRow, read-only.
+# load_task_index — tasks.db -> statuses and stamped checks, read-only.
 # ---------------------------------------------------------------------------
 
 
-class TestLoadMetadataChecks:
+class TestLoadTaskIndex:
     def test_reads_grep_descriptors_with_the_producer_status(self, make_tasks_db):
         db = make_tasks_db([
             {
@@ -223,7 +223,7 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        rows = load_metadata_checks(str(db))
+        rows = load_task_index(str(db)).metadata_rows
 
         assert len(rows) == 1
         row = rows[0]
@@ -231,10 +231,11 @@ class TestLoadMetadataChecks:
         assert (row.pattern, row.expect, row.paths) == ('SomeSymbol', 'present', ('src/',))
         assert row.source == 'metadata'
 
-    def test_script_and_manual_kinds_are_not_swept(self, make_tasks_db):
+    def test_script_and_manual_kinds_are_stamped_but_not_swept(self, make_tasks_db):
         # The sweep is a statement about grep POLARITY against a tree. A script
         # check has no pattern to evaluate and belongs to the script-target
-        # guard in shared/tests/test_capability_manifest.py instead.
+        # guard in shared/tests/test_capability_manifest.py instead. It is
+        # still STAMPED, so it still dedupes a same-named sidecar capability.
         db = make_tasks_db([
             {
                 'id': 11,
@@ -247,7 +248,10 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        assert load_metadata_checks(str(db)) == []
+        index = load_task_index(str(db))
+
+        assert index.metadata_rows == ()
+        assert index.stamped_names == {(11, 'c')}
 
     def test_malformed_metadata_is_skipped_not_raised(self, make_tasks_db):
         # A single undecodable row must not abort a whole-project sweep.
@@ -265,9 +269,11 @@ class TestLoadMetadataChecks:
             },
         ])
 
-        rows = load_metadata_checks(str(db))
+        index = load_task_index(str(db))
 
-        assert [r.task_id for r in rows] == [14]
+        assert [r.task_id for r in index.metadata_rows] == [14]
+        assert index.stamped_names == {(14, 'ok')}
+        assert set(index.statuses) == {12, 13, 14}
 
     def test_connection_is_read_only(self, make_tasks_db):
         # READ-ONLY/REPORT-ONLY is a structural guarantee, not a convention:
@@ -406,7 +412,11 @@ class TestAuditProject:
         sidecar capability whose (task_id, name) is already stamped is a
         phantom WHATEVER kind the stamped copy has. The measured shape: a
         producer's metadata carries the check as kind=path while its sidecar
-        still spells it as a grep."""
+        still spells it as a grep.
+
+        The unstamped sibling cap-y is the positive control: it proves the
+        sidecar was loaded and swept, so cap-x's absence is the dedupe and
+        not a sidecar that silently failed to load."""
         root = _init_repo(
             tmp_path / 'proj',
             {
@@ -426,6 +436,14 @@ class TestAuditProject:
                     '          pattern: NotYetBuilt\n'
                     '          expect: present\n'
                     '          paths: [src/]\n'
+                    '      - name: cap-y\n'
+                    '        binding: b\n'
+                    '        verdict: FAIL\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: AlsoNotYetBuilt\n'
+                    '          expect: present\n'
+                    '          paths: [src/]\n'
                 ),
             },
         )
@@ -439,10 +457,11 @@ class TestAuditProject:
 
         audit = audit_project(str(root))
 
-        assert [
-            f for f in audit.findings
-            if f.row.name == 'cap-x' and f.row.source == 'manifest'
-        ] == []
+        from_sidecar = {
+            f.row.name: f.disposition for f in audit.findings if f.row.source == 'manifest'
+        }
+        assert audit.coverage.sidecars_unloadable == 0
+        assert from_sidecar == {'cap-y': DISPOSITION_UNWIRED_LIVE_GATE}
 
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
