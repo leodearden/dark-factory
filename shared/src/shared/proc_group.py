@@ -101,14 +101,14 @@ def _read_proc_text(path: Path) -> str:
     return path.read_bytes().decode('utf-8', 'replace')
 
 
-class _StatFields(NamedTuple):
+class StatFields(NamedTuple):
     comm: str
     state: str
     ppid: int
     pgrp: int
 
 
-def _read_stat_fields(entry: Path) -> _StatFields | None:
+def read_stat_fields(entry: Path) -> StatFields | None:
     """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
 
     comm is delimited by the LAST ``)``, so a comm containing spaces or parens
@@ -125,7 +125,7 @@ def _read_stat_fields(entry: Path) -> _StatFields | None:
     comm = text[text.find('(') + 1 : rparen]
     fields = text[rparen + 2 :].split()
     try:
-        return _StatFields(
+        return StatFields(
             comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
         )
     except (IndexError, ValueError):
@@ -184,7 +184,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             continue
         pid = int(entry.name)
 
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None or fields.pgrp != pgid:
             continue
 
@@ -354,7 +354,7 @@ def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupM
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None or fields.pgrp not in members:
             continue
         members[fields.pgrp].append(
@@ -482,7 +482,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
         if not entry.name.isdigit():
             continue
 
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None:
             continue
         pgrp = fields.pgrp

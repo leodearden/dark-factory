@@ -77,6 +77,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
+from shared.proc_group import read_stat_fields
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -179,34 +181,22 @@ def start_own_process_group() -> int:
 
 
 def read_ppid_map() -> dict[int, int]:
-    """Parse ``/proc/*/stat`` and return ``{pid: ppid}`` for every live process.
+    """Return ``{pid: ppid}`` for every live process on the host.
 
-    The ``comm`` field (field 2) may contain spaces and parentheses, so we
-    parse by finding the *last* ``') '`` separator (``rsplit``) rather than
-    splitting on whitespace naïvely.  Vanished or unreadable entries are
-    silently skipped (the process exited between the ``glob`` and the
-    ``read``).
+    This walk covers every process on the host, so no single foreign
+    process may fail it: comm is arbitrary BYTES (``prctl(PR_SET_NAME)``
+    accepts any, and the 15-byte truncation can split a UTF-8 sequence).
+    ``shared/src/shared/proc_group.py::read_stat_fields`` is the single
+    parser of that layout; an entry that vanished or is malformed is skipped.
     """
     ppid_map: dict[int, int] = {}
-    proc = Path('/proc')
-    for entry in proc.iterdir():
+    for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        stat_path = entry / 'stat'
-        try:
-            raw = stat_path.read_text()
-        except OSError:
+        fields = read_stat_fields(entry)
+        if fields is None:
             continue
-        # Format: "pid (comm) state ppid ..."
-        # rsplit on ') ' to skip over the comm field safely.
-        try:
-            right = raw.rsplit(') ', 1)[1]
-            fields = right.split()
-            pid = int(entry.name)
-            ppid = int(fields[1])  # field index after stripping pid+comm+state
-            ppid_map[pid] = ppid
-        except (IndexError, ValueError):
-            continue
+        ppid_map[int(entry.name)] = fields.ppid
     return ppid_map
 
 

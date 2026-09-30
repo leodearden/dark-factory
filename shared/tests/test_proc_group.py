@@ -1706,9 +1706,9 @@ class TestReapProcessGroups:
 
         monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
         stat_reads: list[str] = []
-        real_read = proc_group_module._read_stat_fields
+        real_read = proc_group_module.read_stat_fields
         monkeypatch.setattr(
-            'shared.proc_group._read_stat_fields',
+            'shared.proc_group.read_stat_fields',
             lambda entry: stat_reads.append(entry.name) or real_read(entry),
         )
 
