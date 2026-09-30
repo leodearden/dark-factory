@@ -4402,7 +4402,7 @@ async def test_witness_call_fires_only_once_the_wrapped_call_has_finished():
     """A timing-free pin of _witness_call's set-after-the-await rule."""
     seen_at_entry: list[bool] = []
 
-    async def stub(*args, **kwargs):
+    async def stub(*args, **kwargs) -> tuple[str, tuple, dict]:
         seen_at_entry.append(fired.is_set())
         return ('result', args, kwargs)
 
