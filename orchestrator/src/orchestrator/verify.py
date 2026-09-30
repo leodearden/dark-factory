@@ -4924,6 +4924,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
+    cpu_weight: int | None
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5075,6 +5076,18 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     )
 
 
+def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
+    """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
+    share (nice only orders threads inside the scope)."""
+    argv = [
+        'systemd-run', '--user', '--scope', '--quiet', '--collect',
+        f'--unit={scope_unit}',
+    ]
+    if cpu_weight is not None:
+        argv += ['-p', f'CPUWeight={cpu_weight}']
+    return argv
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -5084,6 +5097,7 @@ async def _run_cmd(
     *,
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
+    cpu_weight: int | None = None,
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -5101,7 +5115,9 @@ async def _run_cmd(
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
-    existing test suite are unchanged.
+    existing test suite are unchanged. When *cpu_weight* is not None the scope
+    is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
+    (systemd default).
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -5186,8 +5202,7 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             proc = await asyncio.create_subprocess_exec(
-                'systemd-run', '--user', '--scope', '--quiet', '--collect',
-                f'--unit={scope_unit}',
+                *_scope_launch_argv(scope_unit, cpu_weight),
                 '/bin/bash', '-c', cmd,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
@@ -5890,6 +5905,20 @@ def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
     return nice_prefix(role)
 
 
+def _resolve_scope_cpu_weight(config: OrchestratorConfig, role: str) -> int | None:
+    """Return the cgroup CPUWeight a verify scope for *role* is spawned with.
+
+    Reads ``verify_cgroup_cpu_weight_{merge,task,background}`` at each spawn;
+    ``offline`` and any unrecognized role resolve to None (no property).
+    """
+    weights = {
+        'merge': config.verify_cgroup_cpu_weight_merge,
+        'task': config.verify_cgroup_cpu_weight_task,
+        'background': config.verify_cgroup_cpu_weight_background,
+    }
+    return weights.get(role)
+
+
 def _verify_admission_active(config: OrchestratorConfig) -> bool:
     """Whether the verify-admission gate (flock slot + nice tier) is active.
 
@@ -6447,6 +6476,7 @@ async def run_verification(
                 {
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
+                    'cpu_weight': _resolve_scope_cpu_weight(config, role),
                 }
                 if config.verify_use_cgroup_scope
                 else {}

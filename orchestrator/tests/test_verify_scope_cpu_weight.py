@@ -22,10 +22,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.verify_admission import nice_prefix
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, apply_reload
 from orchestrator.verify import run_verification
-from shared.verify_admission import nice_prefix
 
 _TEST_CMD = 'true test-leg'
 _LINT_CMD = 'true lint-leg'
