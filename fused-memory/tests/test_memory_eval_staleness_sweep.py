@@ -598,6 +598,102 @@ class TestSuccessorPointerItems:
         }
         assert [r.source_id for r in m.unkeyable_successor_refs(refs)] == ['rec-3']
 
+    @staticmethod
+    def _mixed_attribution_refs():
+        """A canonical (supersedes one gone and one live target, plus a
+        corrects edge), a status correction, and one plain successor."""
+        m = _mod()
+        return [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                corrects=UUID_C, canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_A,
+                kind='project_status_correction',
+            )),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=UUID_A)),
+        ]
+
+    def test_a_by_design_edge_mints_no_tripwire_item(self):
+        """Otherwise every reaper action is a brand-new alarm.
+
+        alpha's rule (a) alarms on any failing item absent from the grandfather
+        set, and nothing joins that set after the first run
+        (``shared/src/shared/memory_eval_limits.py::evaluate_tripwire``). Item
+        keys are content hashes, so every new canonical, and every diverged
+        status-correction record (new content, hence a new item_key), would
+        be a brand-new failing item — an alarm on every run a reaper acted.
+        """
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        items = m.successor_pointer_items(refs, {UUID_B: True})
+        plain = [ref for ref in refs if ref.source_id == 'rec-plain']
+        assert [item.item_key for item in items] == [m._tripwire_item_key(plain[0])]
+        assert [item.passed for item in items] == [False]
+
+    def test_the_exclusion_is_by_attribution_not_by_resolution(self):
+        """A by-design edge can never newly break or be fixed: nothing to grade."""
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-canonical', 'canonical words', supersedes=UUID_B, canonical=True,
+        ))
+        assert m.successor_pointer_items(refs, {UUID_B: True}) == []
+
+    def test_the_excluded_edges_are_named_in_ref_order(self):
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        excluded = m.by_design_successor_refs(refs)
+        assert [(ref.source_id, ref.key, ref.target) for ref in excluded] == [
+            ('rec-canonical', 'supersedes', UUID_A),
+            ('rec-canonical', 'supersedes', UUID_B),
+            ('rec-status', 'supersedes', UUID_A),
+        ]
+        # A canonical's corrects edge is never by design.
+        assert all(ref.key == 'supersedes' for ref in excluded)
+
+    def test_naming_the_excluded_edges_never_hashes_a_ref(self):
+        """The unhashable-ref hazard ``_is_unkeyable_successor`` records."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[{'id': UUID_A}],
+                canonical=True,
+            )),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=[{'id': UUID_B}])),
+        ]
+        assert [ref.source_id for ref in m.by_design_successor_refs(refs)] == ['rec-canonical']
+        items = m.successor_pointer_items(refs, {})
+        assert [item.item_key for item in items] == [m._tripwire_item_key(refs[1])]
+
+    def test_a_fully_reaped_corpus_omits_the_tripwire_and_names_the_gap(self):
+        """Never read as a clean structural check: the schema rejects an empty
+        tripwire, and the absence is named."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=UUID_A, canonical=True,
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_B,
+                kind='project_status_correction',
+            )),
+        ]
+        assert m.successor_pointer_items(refs, {UUID_B: True}) == []
+        series = m.build_series(**_inputs_over(refs, {UUID_B: True}))
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT not in _ids(series)
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT in m.metric_families_not_measured(series)
+
+    def test_the_surviving_item_keys_do_not_move(self):
+        """The keys are persisted in alpha's grandfather set."""
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        unattributed = [ref for ref in refs if ref.key == 'supersedes' and ref.reaped_by is None]
+        items = m.successor_pointer_items(refs, {})
+        assert [item.item_key for item in items] == sorted(
+            m._tripwire_item_key(ref) for ref in unattributed
+        )
+
 
 class TestSupersededSurfacing:
     """Both-present-only exposure over corpus-discovered (successor, superseded) pairs."""
