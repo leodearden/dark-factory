@@ -282,6 +282,35 @@ class ClaimQuery:
 
 
 @dataclass(frozen=True)
+class SearchScope:
+    """The store/category scope an entry's real caller searches with.
+
+    Declared only for an entry whose caller scopes its own search — today the
+    briefing's conventions channel
+    (``orchestrator/src/orchestrator/agents/briefing.py::_mcp_search``). An
+    entry without one is searched unscoped and the read router picks, which
+    is what an agent's own ad-hoc search experiences.
+    """
+
+    stores: tuple[str, ...] = ()
+    categories: tuple[str, ...] = ()
+
+    def as_search_kwargs(self) -> dict[str, list[str]]:
+        """``MemoryService.search`` keyword arguments, an empty dimension omitted.
+
+        Omitted rather than sent empty, as ``briefing.py::_mcp_search`` does,
+        so an undeclared dimension is left to the server's own routing
+        instead of becoming a filter that matches nothing.
+        """
+        kwargs: dict[str, list[str]] = {}
+        if self.stores:
+            kwargs['stores'] = list(self.stores)
+        if self.categories:
+            kwargs['categories'] = list(self.categories)
+        return kwargs
+
+
+@dataclass(frozen=True)
 class SupersedesPair:
     """A registry-recorded (superseded, successor) content-hash pair.
 
@@ -308,6 +337,8 @@ class RegistryEntry:
     claim_queries: tuple[ClaimQuery, ...] = ()
     members: tuple[str, ...] = ()
     supersedes_pairs: tuple[SupersedesPair, ...] = ()
+    search_scope: SearchScope | None = None
+    """The scope this topic is searched with; ``None`` searches unscoped."""
     provenance: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
     """Unrecognised keys, preserved verbatim.
@@ -364,7 +395,7 @@ class TopicRegistry:
 
 _ENTRY_KNOWN_KEYS = frozenset({
     'topic', 'project_id', 'derived_from', 'canonical', 'phrasings',
-    'claim_queries', 'members', 'supersedes_pairs', 'provenance',
+    'claim_queries', 'members', 'supersedes_pairs', 'search_scope', 'provenance',
 })
 
 _REQUIRED_ENTRY_KEYS = ('project_id', 'derived_from', 'canonical', 'phrasings')
@@ -468,6 +499,45 @@ def _parse_supersedes_pairs(topic: str, raw: Any) -> tuple[SupersedesPair, ...]:
     return tuple(pairs)
 
 
+def _parse_scope_dimension(
+    topic: str, raw: dict, key: str, vocabulary: tuple[str, ...],
+) -> tuple[str, ...]:
+    values = raw.get(key, [])
+    if not isinstance(values, list):
+        raise _fail(topic, f"'search_scope.{key}' must be a list, got {type(values).__name__}.")
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise _fail(topic, f"'search_scope.{key}' holds {value!r}, not a non-empty string.")
+        if value not in vocabulary:
+            raise _fail(
+                topic, f"'search_scope.{key}' names {value!r}, not one of {list(vocabulary)}.",
+            )
+    return tuple(values)
+
+
+def _parse_search_scope(topic: str, raw: Any) -> SearchScope | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _fail(topic, f"'search_scope' must be an object, got {type(raw).__name__}.")
+    unknown = sorted(set(raw) - {'stores', 'categories'})
+    if unknown:
+        # Strict, unlike the entry's additive tolerance: a misspelt dimension
+        # dropped here would silently widen the search it was meant to narrow.
+        raise _fail(topic, f"'search_scope' carries unknown key(s) {unknown}.")
+    scope = SearchScope(
+        stores=_parse_scope_dimension(topic, raw, 'stores', search_stores()),
+        categories=_parse_scope_dimension(topic, raw, 'categories', corpus_categories()),
+    )
+    if not scope.stores and not scope.categories:
+        raise _fail(
+            topic,
+            "'search_scope' declares neither stores nor categories. An empty scope "
+            'searches unscoped; omit the key to say that.',
+        )
+    return scope
+
+
 def _parse_entry(raw: Any, index: int) -> RegistryEntry:
     if not isinstance(raw, dict):
         raise RegistryError(
@@ -519,6 +589,7 @@ def _parse_entry(raw: Any, index: int) -> RegistryEntry:
         claim_queries=_parse_claim_queries(topic, raw.get('claim_queries')),
         members=tuple(members),
         supersedes_pairs=_parse_supersedes_pairs(topic, raw.get('supersedes_pairs')),
+        search_scope=_parse_search_scope(topic, raw.get('search_scope')),
         provenance=dict(provenance),
         extra={k: v for k, v in raw.items() if k not in _ENTRY_KNOWN_KEYS},
     )
@@ -1009,9 +1080,12 @@ class PhrasingObservation:
     LLM-extracted edge facts — so its canonical is unfindable there however
     healthy retrieval is.
 
-    The probe deliberately does not pin stores: an agent's search is routed
-    too, so "the router sent this query somewhere the canonical does not live"
-    is a real fact about what an agent experiences. But a rate dominated by
+    The probe pins stores ONLY for an entry that declares the scope its real
+    caller searches with (:attr:`RegistryEntry.search_scope`; today the
+    briefing channels). Every other entry is left to the router: an agent's
+    own search is routed too, so "the router sent this query somewhere the
+    canonical does not live" is a real fact about what an agent experiences.
+    But a rate dominated by
     routing that does not SAY so is a silent fail-soft — the limits evaluator
     would compute bounds over router coin-flips — so the served set rides
     along with every observation, into the report AND into the artifact.
@@ -2397,14 +2471,28 @@ def probe_report_sections(
             'per query, and the lists come back homogeneous. A phrasing served '
             'entirely by Graphiti cannot contain a Mem0 entry\'s raw content — '
             'Graphiti returns LLM-extracted edge facts — so its canonical is '
-            'unfindable there however healthy retrieval is. The probe does not '
-            'pin stores, because an agent\'s search is routed too; it reports '
-            'the routing instead, so a rate is never read as a corpus finding '
-            'when it is a routing one.'
+            'unfindable there however healthy retrieval is. The probe pins '
+            'stores ONLY for a topic that declares the scope its real caller '
+            'searches with (search_scope; today the briefing channels) and '
+            'otherwise leaves routing to the router, because an agent\'s own '
+            'search is routed too; it reports the routing instead, so a rate '
+            'is never read as a corpus finding when it is a routing one.'
         ):
             lines.append(f'  {chunk}')
         for store, count in sorted(by_store.items()):
             lines.append(f'  {store}: {count}')
+        scoped_topics = [
+            (entry.topic, entry.search_scope)
+            for entry in (registry.entries if registry is not None else ())
+            if entry.search_scope is not None
+        ]
+        if scoped_topics:
+            lines.append('  topics searched with a declared scope:')
+        for topic, scope in scoped_topics:
+            lines.append(
+                f'  - {topic}: stores={", ".join(scope.stores) or "router"}; '
+                f'categories={", ".join(scope.categories) or "any"}'
+            )
         emit(SECTION_STORES_SERVED, lines)
 
     contamination = [c for c in observations.contamination if not c.degraded]
@@ -2702,6 +2790,16 @@ def corpus_categories() -> tuple[str, ...]:
     return tuple(sorted(c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)))
 
 
+def search_stores() -> tuple[str, ...]:
+    """The store vocabulary a ``search_scope`` may name, from the store's own enum.
+
+    Derived for the same reason :func:`corpus_categories` is.
+    """
+    from fused_memory.models.enums import SourceStore  # noqa: PLC0415
+
+    return tuple(sorted(s.value for s in SourceStore))
+
+
 def graphiti_primary_categories() -> tuple[str, ...]:
     """The categories the Mem0-side corpus count under-reports.
 
@@ -2839,8 +2937,12 @@ async def run_probe(
 
     observations = ProbeObservations()
     for entry in probed:
-        async def search(query: str, limit: int, _project_id: str = entry.project_id):
-            return await memory.search(query, project_id=_project_id, limit=limit)
+        # Default-arg binding, so the closure cannot late-bind the loop variable.
+        async def search(query: str, limit: int, _entry: RegistryEntry = entry):
+            scope = _entry.search_scope.as_search_kwargs() if _entry.search_scope else {}
+            return await memory.search(
+                query, project_id=_entry.project_id, limit=limit, **scope,
+            )
 
         # The FULL registry, not the probed subset: contamination asks whether
         # a result belongs to a different KNOWN topic, so the widest topic
