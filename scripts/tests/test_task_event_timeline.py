@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from task_event_timeline import main
+from task_event_timeline import EXIT_NO_EVENTS, EXIT_OK, EXIT_UNREADABLE, main
 
 TASK = '5495'
 _BASE_TIME = datetime(2026, 9, 26, 23, 0, tzinfo=UTC)
@@ -105,7 +107,7 @@ def test_json_lists_every_event_of_the_task_across_runs_in_id_order(runs_db, run
 
     exit_code, timeline = _run_json(capsys, runs_db_path)
 
-    assert exit_code == 0
+    assert exit_code == EXIT_OK
     assert timeline['db'] == str(runs_db_path.resolve())
     assert timeline['task_id'] == TASK
     assert timeline['runs'] == ['run-813a', 'run-9f00']
@@ -140,7 +142,7 @@ def test_a_malformed_payload_is_listed_and_counted_with_empty_data(runs_db, runs
 
     exit_code, timeline = _run_json(capsys, runs_db_path)
 
-    assert exit_code == 0
+    assert exit_code == EXIT_OK
     malformed_id = len(corpus)
     assert timeline['events'][-1]['id'] == malformed_id
     assert timeline['events'][-1]['data'] == {}
@@ -153,7 +155,7 @@ def test_text_names_the_log_then_one_line_per_event_in_id_order(runs_db, runs_db
 
     exit_code, lines = _run_text(capsys, runs_db_path)
 
-    assert exit_code == 0
+    assert exit_code == EXIT_OK
     assert lines[0] == str(runs_db_path.resolve())
     rows = _task_rows(ESC_5495_3)
     event_lines = _event_lines(lines[1:])
@@ -201,7 +203,7 @@ def test_event_type_filter_narrows_the_json_listing(
 
     exit_code, timeline = _run_json(capsys, runs_db_path, *_filter_args(event_types))
 
-    assert exit_code == 0
+    assert exit_code == EXIT_OK
     assert len(timeline['events']) == expected_count
     assert {event['event_type'] for event in timeline['events']} == set(event_types)
 
@@ -214,8 +216,136 @@ def test_event_type_filter_narrows_the_text_listing(
 
     exit_code, lines = _run_text(capsys, runs_db_path, *_filter_args(event_types))
 
-    assert exit_code == 0
+    assert exit_code == EXIT_OK
     event_lines = _event_lines(lines)
     assert len(event_lines) == expected_count
     for line in event_lines:
         assert set(event_types) & _tokens(line)
+
+
+def test_project_root_reads_that_checkouts_event_log(runs_db, runs_db_path, tmp_path, capsys):
+    seed(runs_db, ESC_5495_3)
+    root = tmp_path / 'project'
+    log = root / 'data' / 'orchestrator' / 'runs.db'
+    log.parent.mkdir(parents=True)
+    shutil.copyfile(runs_db_path, log)
+
+    exit_code = main(['--project-root', str(root), TASK, '--json'])
+
+    assert exit_code == EXIT_OK
+    assert json.loads(capsys.readouterr().out)['db'] == str(log.resolve())
+
+
+NO_MATCH = [
+    pytest.param('9999', [], id='task-absent-from-this-log'),
+    pytest.param(TASK, ['--event-type', 'no_such_type'], id='filter-matches-nothing'),
+]
+
+
+@pytest.mark.parametrize('output_mode', [[], ['--json']], ids=['text', 'json'])
+@pytest.mark.parametrize(('task_id', 'filters'), NO_MATCH)
+def test_no_matching_events_is_a_loud_nonzero_exit(
+    runs_db, runs_db_path, capsys, task_id, filters, output_mode,
+):
+    seed(runs_db, ESC_5495_3)
+
+    exit_code = main(['--db', str(runs_db_path), task_id, *filters, *output_mode])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_NO_EVENTS
+    assert captured.out == ''
+    assert str(runs_db_path.resolve()) in captured.err
+    assert task_id in captured.err
+    for event_type in filters[1::2]:
+        assert event_type in captured.err
+
+
+def _absent(tmp_path, make_tasks_db):
+    path = tmp_path / 'orchestrator' / 'runs.db'
+    path.parent.mkdir()
+    return ['--db', str(path)], path
+
+
+def _directory(tmp_path, make_tasks_db):
+    path = tmp_path / 'orchestrator'
+    path.mkdir()
+    return ['--db', str(path)], path
+
+
+def _empty_decoy(tmp_path, make_tasks_db):
+    path = tmp_path / 'data' / 'runs.db'
+    path.parent.mkdir()
+    path.write_bytes(b'')
+    return ['--db', str(path)], path
+
+
+def _no_tables(tmp_path, make_tasks_db):
+    path = tmp_path / 'blank.db'
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute('PRAGMA user_version = 1')
+        conn.commit()
+    finally:
+        conn.close()
+    return ['--db', str(path)], path
+
+
+def _not_sqlite(tmp_path, make_tasks_db):
+    path = tmp_path / 'runs.db'
+    path.write_bytes(b'not a database, just bytes\n' * 64)
+    return ['--db', str(path)], path
+
+
+def _wrong_store(tmp_path, make_tasks_db):
+    path = make_tasks_db([{'id': 5495}])
+    return ['--db', str(path)], path
+
+
+def _worktree_root(tmp_path, make_tasks_db):
+    root = tmp_path / 'worktree'
+    root.mkdir()
+    return ['--project-root', str(root)], root / 'data' / 'orchestrator' / 'runs.db'
+
+
+UNREADABLE = [
+    pytest.param(_absent, id='absent'),
+    pytest.param(_directory, id='directory'),
+    pytest.param(_empty_decoy, id='zero-byte-decoy'),
+    pytest.param(_no_tables, id='sqlite-without-tables'),
+    pytest.param(_not_sqlite, id='not-sqlite'),
+    pytest.param(_wrong_store, id='tasks-db-not-runs-db'),
+    pytest.param(_worktree_root, id='project-root-without-data'),
+]
+
+
+@pytest.mark.parametrize('build', UNREADABLE)
+def test_an_unreadable_log_is_refused_naming_the_path_it_tried(
+    tmp_path, make_tasks_db, capsys, build,
+):
+    location, tried = build(tmp_path, make_tasks_db)
+
+    exit_code = main([*location, TASK])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_UNREADABLE
+    assert captured.out == ''
+    assert str(tried.resolve()) in captured.err
+
+
+def test_reading_an_absent_log_never_creates_it(tmp_path, make_tasks_db, capsys):
+    location, tried = _absent(tmp_path, make_tasks_db)
+
+    main([*location, TASK])
+
+    assert not tried.exists()
+
+
+@pytest.mark.parametrize('location', [
+    pytest.param([], id='neither'),
+    pytest.param(['--db', 'runs.db', '--project-root', '.'], id='both'),
+])
+def test_exactly_one_log_location_is_required(location):
+    with pytest.raises(SystemExit) as exit_info:
+        main([*location, TASK])
+
+    assert exit_info.value.code == 2
