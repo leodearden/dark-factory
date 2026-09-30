@@ -68,6 +68,7 @@ records nothing; any 8-hex list element reads as a fragment, so a list of
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -327,8 +328,10 @@ async def _resolve_members(
     memory_service: Any,
     project_root: str,
 ) -> dict[str, LivenessVerdict]:
-    """One verdict per DISTINCT candidate id, memoised for this call only: a
-    longer-lived cache would reintroduce the stale read this gate closes."""
+    """One verdict per DISTINCT candidate id, resolved concurrently (the
+    primitive never raises, so no lookup can abort the rest) and memoised for
+    this call only: a longer-lived cache would reintroduce the stale read this
+    gate closes."""
     distinct = dict.fromkeys(
         member
         for members in candidates.values()
@@ -338,10 +341,11 @@ async def _resolve_members(
     if not distinct:
         return {}
     project_id = resolve_project_id_for_root(project_root)
-    verdicts = {
-        memory_id: await resolve_memory_liveness(memory_service, project_id, memory_id)
+    resolved = await asyncio.gather(*(
+        resolve_memory_liveness(memory_service, project_id, memory_id)
         for memory_id in distinct
-    }
+    ))
+    verdicts = dict(zip(distinct, resolved, strict=True))
     inconclusive = {
         memory_id: verdict.error_type
         for memory_id, verdict in verdicts.items()

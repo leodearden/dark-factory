@@ -13,6 +13,7 @@ incidents the gate exists to prevent.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -556,6 +557,32 @@ class TestLiveness:
         assert result.metadata['x_related_memories'] == [LIVE_21F, LIVE_B3F]
         assert [r['path'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == [
             'mem0_falsified_entries[1]', 'x_related_memories[0]',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_distinct_ids_are_resolved_concurrently(self, project_root):
+        in_flight = 0
+        peak = 0
+
+        async def _get(_project_id: str, memory_id: str) -> dict[str, Any] | None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return None if memory_id == DELETED_0D5 else {'id': memory_id}
+
+        service = AsyncMock()
+        service.get_memory_by_id = AsyncMock(side_effect=_get)
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, LIVE_23E, DELETED_0D5],
+        }
+
+        result = await run_gate(project_root, metadata, service=service)
+
+        assert peak == 4
+        assert result.metadata['mem0_falsified_entries'] == [
+            LIVE_B3F, LIVE_21F, LIVE_23E,
         ]
 
     @pytest.mark.asyncio
