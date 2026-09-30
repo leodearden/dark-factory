@@ -50,7 +50,9 @@ through the edge's source-episode content, which carries the deterministic
 Edges whose subject task is live AND whose asserted value matches the live row
 are never selected.  Invalidation sets ``invalid_at``; it never deletes, so the
 audit trail survives and a false selection is reversible via
-``update_edge(clear_invalid_at=True)``.
+``update_edge(clear_invalid_at=True)`` — which clears ``expired_at`` too, so a
+target graphiti-core had already expired (selection filters ``invalid_at``
+only) would come back fully active, not just un-invalidated.
 
 Usage
 -----
@@ -327,7 +329,8 @@ async def apply_cleanup(
                     f'{t["edge_uuid"]} ({t["reason"]}) at {now.isoformat()}. '
                     f'Prior fact: {t["fact"]!r}. '
                     f'Subject task: {t.get("subject")}. '
-                    'Rollback: update_edge(clear_invalid_at=True).'
+                    'Rollback: update_edge(clear_invalid_at=True), which also '
+                    'clears any expired_at graphiti-core set, not just this invalid_at.'
                 ),
                 category='observations_and_summaries',
                 project_id=project_id,

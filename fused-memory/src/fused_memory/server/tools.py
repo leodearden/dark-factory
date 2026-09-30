@@ -6219,13 +6219,17 @@ def create_mcp_server(
           as of that moment. Used by Stage-2 reconciliation to retire
           contradicted facts (e.g. a 'shipped via X' edge where X isn't in
           the task's recorded commit diff) without destroying the audit trail.
-        - ``clear_invalid_at``: when True, resets the edge's ``invalid_at``
-          field to ``None``, restoring it to active (non-superseded) status.
+        - ``clear_invalid_at``: when True, resets BOTH of the edge's
+          retirement markers, ``invalid_at`` and ``expired_at``, to ``None``,
+          restoring it to active (non-superseded) status: the edge again
+          passes the valid-edge predicate and becomes visible to
+          ``get_entity``, ``search``, and ``refresh_entity_summary``.
           Useful to undo a false invalidation. Compatible with ``fact``
           (update text and un-supersede in one call). Mutually exclusive
           with ``invalid_at`` (cannot set and clear simultaneously).
 
-        All other edge properties (valid_at, endpoints, episodes) are preserved.
+        All other edge properties (valid_at, endpoints, episodes) are
+        preserved; only the retirement markers named above change.
 
         Args:
             edge_uuid: UUID of the existing edge (from search results)
@@ -6233,8 +6237,9 @@ def create_mcp_server(
             fact: New fact text for the edge (optional)
             invalid_at: ISO 8601 timestamp to mark the edge as superseded
                 (optional; e.g. "2026-04-19T12:34:56+00:00")
-            clear_invalid_at: When True, clear invalid_at (un-supersede the edge).
-                Mutually exclusive with invalid_at. Compatible with fact.
+            clear_invalid_at: When True, clear invalid_at and expired_at
+                (un-supersede the edge). Mutually exclusive with invalid_at.
+                Compatible with fact.
             agent_id: Which agent is updating (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
