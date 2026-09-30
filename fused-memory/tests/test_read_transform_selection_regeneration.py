@@ -59,6 +59,40 @@ def _without_commit_stamps(report: dict) -> dict:
     return masked
 
 
+_UNTRACKED_REASON = (
+    'no commit stamped: the fixture was untracked when the report was '
+    'generated, so the stamp cannot be verified'
+)
+
+
+def _stamps_not_on_head(provenance: list[dict]) -> list[dict]:
+    """The stamps HEAD's history cannot vouch for, each with its reason."""
+    off_head = []
+    for entry in provenance:
+        commit = entry.get('commit')
+        if not commit:
+            off_head.append(
+                {'path': entry['path'], 'commit': None, 'reason': _UNTRACKED_REASON}
+            )
+            continue
+        result = subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            off_head.append({
+                'path': entry['path'],
+                'commit': commit,
+                'reason': (
+                    f'not an ancestor of HEAD (git rc={result.returncode}'
+                    f'{": " + detail if detail else ""})'
+                ),
+            })
+    return off_head
+
+
 class TestTheCommitStampMaskHidesOnlyTheStamps:
     def test_a_restamped_report_compares_equal(self):
         committed = _committed_report()
