@@ -322,20 +322,6 @@ class TestLoadTopicRegistry:
 # bespoke test parser accepts is not a fixture the runner can read.
 # ---------------------------------------------------------------------------
 
-BRIEFING_QUERIES = (
-    'project overview architecture goals',
-    'coding conventions and project norms',
-    'recent decisions and rationale',
-)
-"""The three literal briefing-assembler queries (briefing.py:978-1013).
-
-The fourth is templated — ``f'task {task_id} context and related decisions'``
-— so it is asserted separately: a literal ``{id}`` is never a real query.
-"""
-
-BRIEFING_TASK_QUERY_PREFIX = 'task '
-BRIEFING_TASK_QUERY_SUFFIX = ' context and related decisions'
-
 MIN_TOPICS = 20
 """A structural floor on fixture BREADTH, not a metric threshold.
 
@@ -383,14 +369,15 @@ class TestCommittedRegistryFixture:
         assert len(registry.entries) >= MIN_TOPICS
 
     def test_the_fixture_carries_its_derivation_disclosures(self, registry):
-        """32 topics is a SELECTION, and the report has to be able to say so.
+        """The committed topics are a SELECTION, and the report has to be able to say so.
 
-        `--derive-registry` emits 74 candidates and skips a census tail
-        larger still. With no `_disclosures` block the registry-composition
-        section renders the composition and nothing else — a reader of a
-        production report sees 32 topics with no hint that anything was left
-        out, which is the narrowing-invisible-by-the-time-anyone-reads-a-run
-        failure the block exists to prevent.
+        `--derive-registry` emits more candidates than the fixture carries
+        and skips a census tail larger still. With no `_disclosures` block
+        the registry-composition section renders the composition and nothing
+        else — a reader of a production report sees the topic count with no
+        hint that anything was left out, which is the
+        narrowing-invisible-by-the-time-anyone-reads-a-run failure the block
+        exists to prevent.
 
         Asserted as "carries the keys", never as "carries these values": the
         counts move whenever the census or the calibration file does, and a
@@ -455,28 +442,8 @@ class TestCommittedRegistryFixture:
             for pair in entry.supersedes_pairs:
                 assert pair.superseded_hash != pair.successor_hash, entry.topic
 
-    # -- the briefing-assembler query surface (eval-design:297) --
-
-    def test_literal_briefing_queries_appear_verbatim(self, registry):
-        all_phrasings = {p.text for e in registry.entries for p in e.phrasings}
-        for query in BRIEFING_QUERIES:
-            assert query in all_phrasings, f'briefing query {query!r} is not probed'
-
-    def test_templated_briefing_query_is_instantiated_not_literal(self, registry):
-        all_phrasings = {p.text for e in registry.entries for p in e.phrasings}
-        matches = [
-            text for text in all_phrasings
-            if text.startswith(BRIEFING_TASK_QUERY_PREFIX)
-            and text.endswith(BRIEFING_TASK_QUERY_SUFFIX)
-        ]
-        assert matches, 'the templated briefing query is not probed'
-        for text in matches:
-            middle = text[len(BRIEFING_TASK_QUERY_PREFIX):-len(BRIEFING_TASK_QUERY_SUFFIX)]
-            assert '{' not in middle and '}' not in middle, (
-                f'{text!r} carries a literal template placeholder; a probe must issue '
-                'the query a caller would actually issue, with a concrete task id.'
-            )
-            assert middle.strip(), text
+    # The briefing-assembler query surface is pinned to its source in
+    # test_memory_eval_briefing_topics.py.
 
     # -- the Goodhart guard, made checkable --
 
@@ -3970,6 +3937,114 @@ class TestSeededInducedRegression:
             await memory.close()
 
 
+BRIEFING_SEEDS = {
+    'briefing-conventions-generic': (
+        'Seeded briefing convention for the E1 flip test: stage explicit paths '
+        'when committing and never park work in a shared stash.',
+        'preferences_and_norms',
+    ),
+    'briefing-conventions-area': (
+        'Seeded briefing gotcha for the E1 flip test: the shared query templates '
+        'decide which memory the dispatched-agent briefing asks for.',
+        'procedural_knowledge',
+    ),
+    'briefing-task-semantic': (
+        'Seeded task context for the E1 flip test: the briefing memory rescope '
+        'replaced hardcoded queries with scoped, task-derived ones.',
+        'observations_and_summaries',
+    ),
+}
+"""One synthetic canonical per briefing topic, in a category its search can see.
+
+Three entries in total, so every search at k=5 returns every entry it is
+scoped to see and the 'before' state is deterministic.
+"""
+
+FLIPPED_BRIEFING_TOPIC = 'briefing-conventions-area'
+
+
+def _seeded_briefing_registry(project_id: str):
+    """The COMMITTED briefing entries, re-keyed onto the seeded canonicals.
+
+    Real phrasings and real search scopes, so the flip is measured through the
+    queries the briefing fires; only the project and the canonical move.
+    Claim queries are dropped: their needles name live-corpus text, and the
+    question here is the tripwire alone.
+    """
+    from dataclasses import replace  # noqa: PLC0415
+
+    m = _mod()
+    committed = m.load_topic_registry(REGISTRY_PATH).by_topic
+    return m.TopicRegistry(schema_version=1, entries=tuple(
+        replace(
+            committed[topic],
+            project_id=project_id,
+            canonical=m.Canonical(content_hash=m.content_key(text), content_prefix=text[:80]),
+            claim_queries=(),
+        )
+        for topic, (text, _) in sorted(BRIEFING_SEEDS.items())
+    ))
+
+
+class TestSeededBriefingTopicFlip:
+    """PRD boundary test 6: deleting one briefing canonical flips exactly its item."""
+
+    @pytest.mark.integration
+    @pytest.mark.timeout(300)
+    @pytest.mark.asyncio
+    @qdrant_skipif()
+    @pytest.mark.skipif(
+        not os.environ.get('OPENAI_API_KEY'),
+        reason='the seeded probe needs a real embedder',
+    )
+    async def test_deleting_one_briefing_canonical_flips_only_its_item(
+        self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
+    ):
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        m = _mod()
+        registry = _seeded_briefing_registry(probe_project_id)
+        memory = MemoryService(probe_config)
+        await memory.initialize()
+        try:
+            # Stubbed for the reason TestSeededInducedRegression gives.
+            instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
+            instance.db.add_history = lambda *a, **kw: None
+
+            seeded_ids = {}
+            for topic, (text, category) in BRIEFING_SEEDS.items():
+                seeded = await memory.add_memory(
+                    text, category=category,
+                    project_id=probe_project_id, agent_id='e1-probe-seed',
+                )
+                seeded_ids[topic] = seeded.memory_ids[0]
+
+            before = await m.run_probe(
+                memory, registry,
+                project_ids=(probe_project_id,), ks=(5,),
+                out_root=tmp_path, stamp='20260930T100000Z',
+            )
+            await memory.delete_memory(
+                seeded_ids[FLIPPED_BRIEFING_TOPIC], store='mem0', project_id=probe_project_id,
+            )
+            after = await m.run_probe(
+                memory, registry,
+                project_ids=(probe_project_id,), ks=(5,),
+                out_root=tmp_path, stamp='20260930T101000Z',
+            )
+
+            flipped_key = registry.by_topic[FLIPPED_BRIEFING_TOPIC].item_key
+            before_items = {i.item_key: i.passed for i in _tripwire(before.series).items or []}
+            after_items = {i.item_key: i.passed for i in _tripwire(after.series).items or []}
+
+            assert set(before_items) == {e.item_key for e in registry.entries}
+            assert all(before_items.values()), before_items
+            assert after_items == {**before_items, flipped_key: False}
+        finally:
+            await memory.close()
+
+
 # ---------------------------------------------------------------------------
 # step-24: which store served the query
 #
@@ -3982,9 +4057,10 @@ class TestSeededInducedRegression:
 # facts are LLM-extracted sentences and can never contain a Mem0 entry's raw
 # content no matter how healthy retrieval is.
 #
-# The probe deliberately does NOT pin stores: an agent's search is routed too,
-# so "the router sent this query somewhere the canonical does not live" is a
-# real retrieval-health fact, not a confound to engineer away. But a rate that
+# The probe pins stores only for an entry declaring its caller's search_scope;
+# otherwise an agent's search is routed too, so "the router sent this query
+# somewhere the canonical does not live" is a real retrieval-health fact, not
+# a confound to engineer away. But a rate that
 # is dominated by routing and does not SAY so is exactly the silent
 # fail-soft this leaf exists to prevent — leaf alpha would end up computing
 # limits over router coin-flips. So the served store set rides along with every
