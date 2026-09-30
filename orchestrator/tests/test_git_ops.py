@@ -16,6 +16,7 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
@@ -52,10 +53,7 @@ from orchestrator.git_ops import (
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 def _seed_default_warm_base(repo: Path) -> None:
@@ -80,15 +78,6 @@ def _seed_default_warm_base(repo: Path) -> None:
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
     (repo / '.worktrees' / '.pool-root').touch()
-
-
-async def _setup_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
@@ -174,14 +163,7 @@ async def _setup_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
     await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)
 
     # Seed origin via a temp non-bare repo
-    seed = tmp_path / 'seed'
-    seed.mkdir()
-    await _run(['git', 'init', '-b', 'main'], cwd=seed)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=seed)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=seed)
-    (seed / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=seed)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=seed)
+    seed = seed_repo(tmp_path / 'seed')
     await _run(['git', 'remote', 'add', 'origin', str(origin)], cwd=seed)
     await _run(['git', 'push', 'origin', 'main'], cwd=seed)
 
@@ -2080,8 +2062,8 @@ class TestHasUncommittedWork:
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
         """Production's repo-root .gitignore carries a tracked `.task/`
         entry (independent of the since-removed `_ensure_task_gitignore`
-        nested gitignore) that every worktree inherits.  `_setup_repo`
-        builds a bare synthetic repo with no .gitignore at all, so commit
+        nested gitignore) that every worktree inherits.  The `git_repo` fixture
+        seeds a bare synthetic repo with no .gitignore at all, so commit
         one here first to exercise the same real-world condition
         `has_uncommitted_work` relies on.
         """
@@ -3563,7 +3545,7 @@ class TestUnmergedDetection:
         # Sentinel standing in for the live task worktree that was corrupted.
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested INSIDE that worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
@@ -10089,7 +10071,7 @@ class TestRecoverRedMain:
             git_repo,
         )
         target_sha, expected_main = await self._two_main_shas(git_repo)
-        # git_repo starts on main (git init -b main in _setup_repo)
+        # git_repo starts on main (git init -b main in _git_fixtures.py::build_repo)
 
         original_run = _run
         recorded: list[list[str]] = []
@@ -10249,7 +10231,7 @@ class TestWarmLaneScriptsHelperIsolation:
     async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested inside that live worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
