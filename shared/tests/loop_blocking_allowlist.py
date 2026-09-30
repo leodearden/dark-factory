@@ -84,10 +84,13 @@ ROW PER SITE, TRIAGE PER CAUSE.  Where a cluster shares one root cause -- the
 caller of ``ReconciliationHarness._escalate`` -- every row carries the SAME
 justification naming that shared cause and its single follow-up -- held in
 one named constant where a cluster's text has had to change after filing
-(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  The ledger
-stays row-per-site so a 23rd handler cannot be added silently under a blessed
-22; the triage stays cluster-per-defect so the follow-ups are one task per
-defect rather than one per line.
+(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  Every
+multi-row cluster added from task 5099 on, and any cluster whose text
+changes, holds its justification in one such named constant; an untouched
+cluster keeps its inline copies until the task owning its rows deletes them.
+The ledger stays row-per-site so a 23rd handler cannot be added silently under
+a blessed 22; the triage stays cluster-per-defect so the follow-ups are one
+task per defect rather than one per line.
 
 Regenerating
 ------------
@@ -151,6 +154,74 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
+#: The shared justification of every ``reconciliation/backlog_policy.py`` row.
+_BACKLOG_POLICY_RECORD_IO_WHY = (
+    'ROOT CAUSE (one defect, 5 rows): BacklogPolicy scans, reads and '
+    'writes its escalation records on the loop thread. on_judge_unhalt '
+    'is_dirs data/escalations, then globs every judge_halt*.json record '
+    'in the queue root -- an O(N) directory read that grows with the '
+    'pending queue -- read_texts each match and reaches '
+    '_restore_policy_keys; _maybe_write_escalation reaches '
+    '_merge_onto_persisted; both helpers read_text then write_text the '
+    'located record under escalation_id_lock. UNDERSTATED BY THESE '
+    'ROWS, and recorded here because no row can carry it: the dominant '
+    'blocking work on the write path is the '
+    'escalation.dedupe.submit_or_dedupe call one line ABOVE the '
+    '_merge_onto_persisted site -- find_dedupe_parent globs and '
+    'JSON-parses every pending record in the project queue '
+    '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
+    'queue 2026-09-18), then queue.submit writes with a durable fsync. '
+    'The scanner reports only _merge_onto_persisted because those '
+    'primitives live in the escalation package, across a boundary its '
+    'fused-memory/src scope cannot follow -- so another row would be a '
+    'blessing test_no_stale_blessings rejects, and this paragraph is '
+    'the only honest place to state it. Filesystem, the limb task '
+    '3778\'s subprocess-only vocabulary omitted. The three record '
+    'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
+    '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
+    '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
+    'added when it widened the vocabulary are TASK 6086, filed to fold '
+    'into the same offload.'
+)
+
+#: The shared justification of every ``server/manifest_stamping.py`` row.
+_MANIFEST_STAMPING_INLINE_IO_WHY = (
+    'ROOT CAUSE (one defect, 7 rows): _stamp_capability_manifests_impl '
+    'does its sidecar I/O INLINE in one coroutine, with no helper '
+    'anywhere for a definition-side census to point at -- the shape '
+    'task 3778\'s methodology is structurally blind to: an is_file() '
+    'existence probe per distinct manifest path, read_text + '
+    'yaml.safe_load of the sidecar, then an atomic write-back '
+    '(write_text of yaml.safe_dump to a temp sibling, os.replace onto '
+    'the sidecar, and the finally-block unlink of the temp). Task 4201 '
+    'measured yaml.safe_load at 8.15 ms for an 11 KB document, so the '
+    'parse alone is the same order as a subprocess spawn and this '
+    'coroutine pays it twice plus every filesystem round trip above. '
+    'One asyncio.to_thread around the whole probe-read-parse-write '
+    'closes all seven. The four read/parse/write rows are OWNED BY '
+    'TASK 5276 -- do not file again: task 4484 step-9\'s ticket '
+    'tkt_0RT7QYENVS6J9WVWCY3FJAVNFR became task 5073, coalesced into '
+    '5276. The is_file, os.replace and unlink rows task 5099 added '
+    'when it widened the vocabulary are TASK 6087, filed to fold into '
+    'the same offload.'
+)
+
+#: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
+_VERIFIER_LLM_TOOL_IO_WHY = (
+    'ROOT CAUSE (one defect, 2 rows): the async tools '
+    'CodebaseVerifier.verify hands the codebase-verification LLM do '
+    'their filesystem work inline on the loop thread, once per tool '
+    'call the model chooses to make -- an LLM-driven, unbounded call '
+    'count. read_file does full_path.read_text(); glob_search runs '
+    'codebase_root.glob(pattern) with an LLM-CHOSEN pattern and sorts '
+    'every match before keeping 50, so a "**/*" walks the whole '
+    'codebase root. The read_file row is OWNED BY TASK 5270 -- do not '
+    'file again: task 4484 step-9\'s ticket '
+    'tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ became task 5078, coalesced into '
+    '5270. The glob_search row task 5099 added when it widened the '
+    'vocabulary is TASK 6088, filed to fold into the same offload.'
+)
+
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
 AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
 
@@ -208,76 +279,22 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy.on_judge_unhalt',
         '8f53c74a5d76',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy.on_judge_unhalt',
         '08a103635fd7',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
         '0d761c10e563',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'its escalation records on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys, and '
-        '_maybe_write_escalation reaches _merge_onto_persisted; both '
-        'helpers read_text then write_text the located record under '
-        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
-        'here because no row can carry it: the dominant blocking work on '
-        'the write path is the escalation.dedupe.submit_or_dedupe call one '
-        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
-        'globs and JSON-parses every pending record in the project queue '
-        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-        'The scanner reports only _merge_onto_persisted because those '
-        'primitives live in the escalation package, across a boundary its '
-        'fused-memory/src scope cannot follow -- so a fourth row would be '
-        'a blessing test_no_stale_blessings rejects, and this paragraph is '
-        'the only honest place to state it. Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
-        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
 
     # ---- reconciliation/harness.py ----
@@ -504,12 +521,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify.read_file',
         'c04bd0d302eb',
-        'to_file',
-        'The async read_file tool handed to the codebase-verification LLM '
-        'does full_path.read_text() inline on the loop thread, once per '
-        'tool call the model chooses to make -- an LLM-driven, unbounded '
-        'call count. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ.',
+        'filed',
+        _VERIFIER_LLM_TOOL_IO_WHY,
     ),
 
     # ---- services/live_workflow_detector.py ----
@@ -553,69 +566,29 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '3817640cc33d',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         'e19569fdcfa0',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '78912ffb516a',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
         '_stamp_capability_manifests_impl',
         '93a769609c9b',
-        'to_file',
-        'ROOT CAUSE (one defect, 4 rows): _stamp_capability_manifests_impl '
-        'does read_text + yaml.safe_load + write_text + yaml.safe_dump '
-        'INLINE in one coroutine, with no helper anywhere for a '
-        'definition-side census to point at -- the shape task 3778\'s '
-        'methodology is structurally blind to. Task 4201 measured '
-        'yaml.safe_load at 8.15 ms for an 11 KB document, so the parse '
-        'alone is the same order as a subprocess spawn and this coroutine '
-        'pays it twice plus two filesystem round trips. One '
-        'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
+        'filed',
+        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
 
     # ---- server/tools.py ----
