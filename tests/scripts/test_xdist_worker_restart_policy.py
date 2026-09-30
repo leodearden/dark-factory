@@ -1,9 +1,12 @@
-"""Thread-method timeouts under xdist must run with worker restarts disabled.
+"""Thread-method timeouts must run with xdist worker restarts disabled.
 
-THE INVARIANT. Every pytest config that pairs ``timeout_method = "thread"`` with
-an xdist ``-n`` in its addopts carries ``--max-worker-restart=0``. Discovered
-from ``[tool.uv.workspace].members``, so a future thread-method member is held
-to it with no edit here.
+THE INVARIANT. Every pytest config that sets ``timeout_method = "thread"``
+carries ``--max-worker-restart=0``, whether or not its own addopts ask for
+xdist: verify injects ``-n`` into every gated pytest leg
+(``orchestrator/src/orchestrator/verify.py::_with_pytest_numprocesses_str``,
+driven by ``verify_admission_pytest_n``), so a thread-method member runs under
+xdist there regardless. Discovered from ``[tool.uv.workspace].members``, so a
+future thread-method member is held to it with no edit here.
 
 WHY. Under thread method pytest-timeout answers a breach by ``os._exit()``ing
 the worker, so a worker death is the routine outcome of any over-cap test. With
@@ -13,16 +16,14 @@ names no test — ``KeyError: <WorkerController gwN>`` raised from
 one replacement worker finishes collecting while another is still collecting.
 The negative control below reproduces that on demand, and asserts the
 unregistered controller is a REPLACEMENT (an id at or beyond the initial worker
-count). The field ids task 5115 measured, gw35 under ``-n auto`` on 32 cores and
-gw19 under ``-n 16``, are replacement ids too.
+count).
 
 WHAT THE FLAG DOES NOT CLOSE. Two workers dying near-simultaneously can still
 abort the session in either regime:
 ``xdist/scheduler/loadscope.py::LoadScopeScheduling.remove_node`` hands the
-first corpse's tests to a peer that is already dead (``OSError: cannot send``).
-That happens before the restart cap is consulted. Task 5114 measured it in 2 of
-10 unordered restart-disabled runs, so the reproduction orders its initial
-deaths to isolate the path the flag does close.
+first corpse's tests to a peer that is already dead (``OSError: cannot send``)
+before the restart cap is consulted. The reproduction orders its initial deaths
+so that it exercises only the path the flag does close.
 
 THE COST is only the tally of tests after the death. The crashed test is
 reported FAILED in both regimes, because
@@ -30,9 +31,6 @@ reported FAILED in both regimes, because
 before it consults the restart cap, so no green run can turn red. A truncated
 tally is already labelled partial by
 ``orchestrator/src/orchestrator/verify.py::_worker_death_truncation_evidence``.
-
-Provenance: task 1907 adopted the flag in orchestrator; task 5114 measured the
-abort and extended it to fused-memory.
 
 OUT OF SCOPE: signal-method members. A signal timeout raises inside the test and
 leaves the worker alive, so the case the flag exists for does not arise there.
@@ -61,12 +59,11 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 RESTART_DISABLED_TOKEN = '--max-worker-restart=0'
 RESTART_FLAG_PREFIX = '--max-worker-restart'
 THREAD_TIMEOUT_METHOD = 'thread'
-WORKERS_FLAG = '-n'
 
 ROOT_CONFIG_NAME = '.'
 
 # A FLOOR, not an equality: orchestrator and fused-memory at authorship.
-MIN_EXPECTED_THREAD_TIMEOUT_XDIST_CONFIGS = 2
+MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS = 2
 
 REPRO_INITIAL_WORKERS = 2
 
@@ -89,8 +86,8 @@ def _pytest_ini_options(pyproject: pathlib.Path) -> dict:
     return data.get('tool', {}).get('pytest', {}).get('ini_options', {})
 
 
-def _thread_timeout_xdist_configs() -> dict[str, str]:
-    """Config name -> addopts, for every config pairing thread timeouts with ``-n``."""
+def _thread_timeout_configs() -> dict[str, str]:
+    """Config name -> addopts, for every config running ``timeout_method = "thread"``."""
     root_data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
     members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
     assert members, (
@@ -102,20 +99,16 @@ def _thread_timeout_xdist_configs() -> dict[str, str]:
     configs: dict[str, str] = {}
     for name in [ROOT_CONFIG_NAME, *members]:
         ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
-        addopts = ini_options.get('addopts', '')
-        if (
-            ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD
-            and WORKERS_FLAG in shlex.split(addopts)
-        ):
-            configs[name] = addopts
+        if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD:
+            configs[name] = ini_options.get('addopts', '')
 
-    assert len(configs) >= MIN_EXPECTED_THREAD_TIMEOUT_XDIST_CONFIGS, (
-        f'only discovered {sorted(configs)} as configs combining '
-        f'timeout_method = {THREAD_TIMEOUT_METHOD!r} with {WORKERS_FLAG} in '
-        f'addopts, expected at least {MIN_EXPECTED_THREAD_TIMEOUT_XDIST_CONFIGS} '
-        '(orchestrator and fused-memory are the known members). Finding fewer '
-        'means this discovery walk rotted, not that the repo changed: a config '
-        'that stopped being discovered is one nothing here checks any more.'
+    assert len(configs) >= MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS, (
+        f'only discovered {sorted(configs)} as configs setting '
+        f'timeout_method = {THREAD_TIMEOUT_METHOD!r}, expected at least '
+        f'{MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS} (orchestrator and fused-memory '
+        'are the known members). Finding fewer means this discovery walk '
+        'rotted, not that the repo changed: a config that stopped being '
+        'discovered is one nothing here checks any more.'
     )
     return configs
 
@@ -124,10 +117,10 @@ def _restart_tokens(addopts: str) -> list[str]:
     return [token for token in shlex.split(addopts) if token.startswith(RESTART_FLAG_PREFIX)]
 
 
-def test_thread_timeout_xdist_configs_disable_worker_restarts() -> None:
+def test_thread_timeout_configs_disable_worker_restarts() -> None:
     declared_by_config = {
         name: _restart_tokens(addopts)
-        for name, addopts in _thread_timeout_xdist_configs().items()
+        for name, addopts in _thread_timeout_configs().items()
     }
     offenders = {
         name: declared
@@ -139,9 +132,10 @@ def test_thread_timeout_xdist_configs_disable_worker_restarts() -> None:
         for name, declared in sorted(offenders.items())
     )
     assert not offenders, (
-        f'these configs run timeout_method = {THREAD_TIMEOUT_METHOD!r} under '
-        f'xdist {WORKERS_FLAG} but do not declare exactly '
-        f'[{RESTART_DISABLED_TOKEN!r}] in addopts (tasks 1907, 5114):\n'
+        f'these configs run timeout_method = {THREAD_TIMEOUT_METHOD!r} but do '
+        f'not declare exactly [{RESTART_DISABLED_TOKEN!r}] in addopts (tasks '
+        '1907, 5114). A missing -n in addopts does not exempt them: verify '
+        'injects one into every gated pytest leg.\n'
         f'{listing}\n'
         'Without the flag, a worker killed by a thread-method timeout can abort '
         'the whole session with an unattributed INTERNALERROR KeyError at '
@@ -160,18 +154,16 @@ _SYNTHETIC_INI = '[pytest]\ntimeout = 1\ntimeout_method = thread\n'
 #     reschedules a dead worker's tests onto a peer that is already dead too;
 #   - the second replacement cannot finish collecting until the controller has
 #     recorded the first one's collection.
-# Worker identity comes from config.workerinput because PYTEST_XDIST_WORKER
-# leaks from an outer xdist run.
-_SYNTHETIC_CONFTEST = f'''\
+_SYNTHETIC_CONFTEST = '''\
 import os
 import pathlib
 import time
 
 import pytest
 
-SIGNALS = pathlib.Path(os.environ['{SIGNAL_DIR_ENV}'])
-INITIAL_WORKERS = int(os.environ['{INITIAL_WORKERS_ENV}'])
-FIRST_REPLACEMENT = f'gw{{INITIAL_WORKERS}}'
+SIGNALS = pathlib.Path(os.environ['XDIST_RESTART_REPRO_SIGNAL_DIR'])
+INITIAL_WORKERS = int(os.environ['XDIST_RESTART_REPRO_INITIAL_WORKERS'])
+FIRST_REPLACEMENT = f'gw{INITIAL_WORKERS}'
 WAIT_CAP_SECS = 60
 
 
@@ -186,16 +178,16 @@ def _worker_id(config):
 
 def pytest_testnodeready(node):
     if _is_replacement(node.gateway.id):
-        (SIGNALS / f'ready-{{node.gateway.id}}').touch()
+        (SIGNALS / f'ready-{node.gateway.id}').touch()
 
 
 def pytest_xdist_node_collection_finished(node, ids):
     if _is_replacement(node.gateway.id):
-        (SIGNALS / f'collected-{{node.gateway.id}}').touch()
+        (SIGNALS / f'collected-{node.gateway.id}').touch()
 
 
 def pytest_handlecrashitem(crashitem, report, sched):
-    (SIGNALS / f'crash-handled-{{report.node.gateway.id}}').touch()
+    (SIGNALS / f'crash-handled-{report.node.gateway.id}').touch()
 
 
 def _wait_for(predicate):
@@ -208,8 +200,8 @@ def _wait_for(predicate):
 def pytest_runtest_protocol(item, nextitem):
     worker_id = _worker_id(item.config)
     if worker_id is not None and not _is_replacement(worker_id) and worker_id != 'gw0':
-        previous = f'gw{{int(worker_id[2:]) - 1}}'
-        _wait_for(lambda: (SIGNALS / f'crash-handled-{{previous}}').exists())
+        previous = f'gw{int(worker_id[2:]) - 1}'
+        _wait_for(lambda: (SIGNALS / f'crash-handled-{previous}').exists())
     return (yield)
 
 
@@ -219,7 +211,7 @@ def pytest_collection_modifyitems(session, config, items):
         return
     _wait_for(lambda: len(list(SIGNALS.glob('ready-*'))) >= INITIAL_WORKERS)
     if worker_id != FIRST_REPLACEMENT:
-        _wait_for(lambda: (SIGNALS / f'collected-{{FIRST_REPLACEMENT}}').exists())
+        _wait_for(lambda: (SIGNALS / f'collected-{FIRST_REPLACEMENT}').exists())
 
 
 @pytest.fixture(autouse=True)
@@ -252,6 +244,14 @@ class _SyntheticSuite:
 @pytest.fixture
 def synthetic_suite(tmp_path: pathlib.Path) -> _SyntheticSuite:
     """The reproduction suite, under *tmp_path* so no other run can collect it."""
+    unread = [
+        name for name in (SIGNAL_DIR_ENV, INITIAL_WORKERS_ENV)
+        if f"os.environ['{name}']" not in _SYNTHETIC_CONFTEST
+    ]
+    assert not unread, (
+        f'_SYNTHETIC_CONFTEST does not read {unread!r}, the environment '
+        '_run_synthetic_suite sets for it: the two spellings drifted apart.'
+    )
     root = tmp_path / 'suite'
     root.mkdir()
     ini = root / 'pytest.ini'
@@ -288,7 +288,7 @@ def _run_synthetic_suite(
             sys.executable, '-m', 'pytest',
             '-c', str(suite.ini),
             '-p', 'no:cacheprovider',
-            WORKERS_FLAG, str(REPRO_INITIAL_WORKERS),
+            '-n', str(REPRO_INITIAL_WORKERS),
             '--dist', 'loadgroup',
             *restart_args,
         ],

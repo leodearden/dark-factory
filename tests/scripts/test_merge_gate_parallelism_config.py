@@ -200,8 +200,8 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    The flag is required exactly where ``timeout_method = "thread"`` runs under
-    xdist — orchestrator and fused-memory — and that invariant, with its
+    The flag is required exactly where ``timeout_method = "thread"`` is set —
+    orchestrator and fused-memory — and that invariant, with its
     executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
     Copying it here would look like completing the family, but these members
     run ``timeout_method = "signal"``: a timeout raises inside the test and the
@@ -215,8 +215,8 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag is required only where timeout_method = "thread" runs under '
-        'xdist (orchestrator, fused-memory — see '
+        'That flag is required only where timeout_method = "thread" is set '
+        '(orchestrator, fused-memory — see '
         'test_xdist_worker_restart_policy.py). This member runs '
         'timeout_method = "signal", where a timeout raises inside the test and '
         'the worker survives, so the case the flag exists for does not arise '
