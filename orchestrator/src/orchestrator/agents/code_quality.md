@@ -21,14 +21,17 @@ Two corollaries:
 - The reader has a bounded context window. Everything a file demands of its
   reader — length, nesting, cross-file lookups, prose to wade through — is a
   cost, not a neutral fact.
-- The mechanical gates in `CONTRIBUTING.md` §4 (pytest, ruff, pyright) are the
-  **floor**. This document is the **bar**. A change can pass every gate and be
-  correctly rejected against it.
+- A project's mechanical gates (in Dark Factory: pytest, ruff and pyright, per
+  `CONTRIBUTING.md` §4) are the **floor**. This definition is the **bar**. A
+  change can pass every gate and be correctly rejected against it.
 
 ## The fourteen heuristics
 
 The headline of each is Leo's wording. The reading beneath it is the
-interpretation confirmed on 2026-09-03; apply both by name.
+interpretation confirmed on 2026-09-03; apply both. Name the heuristic you are
+applying — say "heuristic 13, files make internal sense in isolation" —
+whenever a finding or a design decision turns on it. An unnamed appeal to
+"quality" is neither reviewable nor actionable.
 
 1. **Informative names.** A name says what the thing is and does. A name that
    lies — says one thing while the code does another — is the worst class of
@@ -77,9 +80,9 @@ interpretation confirmed on 2026-09-03; apply both by name.
     function-local imports placed to break cycles, and re-export shims are the
     measurable symptoms.
 14. **No file too large.** The composition hierarchy contains and partitions
-    complexity, so no file has to be big. Big is context-dependent; in this
-    repo treat ~1,500 lines as a soft ceiling and 2,000 (one default `Read`
-    call) as an alarm. Both count raw lines, prose included, because they
+    complexity, so no file has to be big. Big is context-dependent; absent a
+    project-specific figure, treat ~1,500 lines as a soft ceiling and 2,000
+    (one default `Read` call) as an alarm. Both count raw lines, prose included, because they
     measure what one reader must load, not how much code there is. An alarm
     is a trigger to measure, not a number to get under. Measuring means:
     first, whether the prose is in its right home (the Comments stance);
@@ -113,17 +116,21 @@ interpretation confirmed on 2026-09-03; apply both by name.
   rejected alternative, a defence of a decision — belongs in the commit
   message, or in the task record where the agent holds a task write: it is
   the prose most likely to be wrong on the day it is written and the first
-  to drift. This
-  does not license deleting existing rationale during unrelated work — see
-  `CONTRIBUTING.md` §2 on tolerated drift.
+  to drift. This does not license deleting existing rationale during
+  unrelated work — in Dark Factory, see `CONTRIBUTING.md` §2 on tolerated
+  drift.
 - **Tests.** Test access to a module's internals is an interface design smell.
   Tests drive public seams and, where the behaviour is git or the filesystem,
   real fixtures. A test that patches a module's private names by dotted path,
   or reads private attributes, is pinning implementation rather than
-  behaviour; reworking such seams is in scope for quality work, not a
-  distraction from it.
+  behaviour, and the seam it reaches through is usually the real defect.
+  Each of those, and each of heuristic 13's symptoms — a reach-back import
+  into a parent module, a function-local import placed to break a cycle, a
+  re-export shim kept only so an old path resolves — is reportable as an
+  interface-design finding, not a style nit. Reworking such seams is in scope
+  for quality work, not a distraction from it.
 
-## What to measure, and what not to steer by
+## What to measure
 
 Track quality as five separable aspects. Each has an instrument; several also
 need review judgement.
@@ -140,24 +147,27 @@ Read complexity as a pair: the **maximum per function** should fall while the
 **module total** stays flat or falls. A total that rises during a refactor
 means complexity was added, not moved.
 
-Do not steer by any of these:
+Tooling: `radon` (cyclomatic complexity, maintainability index, raw counts)
+and `complexipy` (cognitive complexity, with snapshot and per-function ceiling
+modes for ratchets). Install into the workspace venv with
+`uv pip install radon complexipy` if absent.
 
-- **Raw line count.** Prose can be most of a file (the merge lane's main
-  module was 55% comments and docstrings when measured), so the count says
-  little about how much code is there, and driving it down rewards deleting
-  prose instead of rehoming it, or a cheating split. This is a caution about the metric, not a
-  tolerance for prose: that 55% is the Comments stance's smell, and heuristic
-  14's thresholds are alarms, not targets.
+## Do not steer by
+
+Do not steer quality work by any of these:
+
+- **Raw line count.** Prose can be most of a file (in the factory's own code,
+  the merge lane's main module was 55% comments and docstrings when
+  measured), so the count says little about how much code is there, and
+  driving it down rewards deleting prose instead of rehoming it, or a
+  cheating split. This is a caution about the metric, not a tolerance for
+  prose: that 55% is the Comments stance's smell, and heuristic 14's
+  thresholds are alarms, not targets.
 - **Average complexity.** A file can average B while eight functions score F.
 - **Line coverage under autouse stubs.** A suite that stubs the thing under
   test to "passed" reports coverage of paths it cannot fail.
 - **Test count or test-to-code ratio.** Tests that pin implementation are a
   liability with a green tick.
-
-Tooling: `radon` (cyclomatic complexity, maintainability index, raw counts)
-and `complexipy` (cognitive complexity, with snapshot and per-function ceiling
-modes for ratchets). Install into the workspace venv with
-`uv pip install radon complexipy` if absent.
 
 ## Relationship to the design invariants
 

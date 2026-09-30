@@ -122,7 +122,7 @@ class _LabelSection(NamedTuple):
 #: so the SHAPE compared is identical — only the section locator differs.
 _LABEL_SECTIONS = (
     _LabelSection('## Two stances', '## Two stances', 2),
-    _LabelSection('## Do not steer by', '## What to measure, and what not to steer by', 4),
+    _LabelSection('## Do not steer by', '## Do not steer by', 4),
 )
 
 #: Substrings that would break one of the existing all-roles prompt scanners if
