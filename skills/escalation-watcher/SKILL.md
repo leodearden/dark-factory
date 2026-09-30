@@ -1555,9 +1555,10 @@ hold**:
 **Otherwise**, meaning any condition fails, the evidence cannot be checked, or the recommendation
 is anything but accept, use the normal park procedure above.
 
-**Limits.** A second such escalation on the same task, or more than 3 qualifying in one day, goes
-to the human as a pattern instead: a stream of deviations suggests the planning itself is off. The
-human can revoke this rule at any time.
+**Limits.** A second such escalation on the same task goes to the human as a pattern instead: a
+stream of deviations on one task suggests its planning is off. There is no daily cap: Leo discarded
+it on 2026-09-26 ("Discard the cap. You can ratify these without limit."). The human can revoke
+this rule at any time.
 
 **Worked examples (2026-09-17).**
 - **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
