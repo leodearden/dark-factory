@@ -186,7 +186,7 @@ class TestClassifyDescriptor:
         # an unwired gate as healthy — the silent under-report this
         # disposition exists to remove.
         with pytest.raises(TypeError):
-            classify_descriptor(CheckOutcome.FAIL, status='pending')
+            classify_descriptor(CheckOutcome.FAIL, status='pending')  # pyright: ignore[reportCallIssue]
 
     def test_stamping_matters_in_no_other_cell(self):
         # Every other cell is already decided by polarity or status: an
