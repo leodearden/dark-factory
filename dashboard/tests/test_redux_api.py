@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from dashboard import loops
 from dashboard.data import burndown, census, redux_api
+from dashboard.data.datum import Datum, DatumContractError, DatumState
+from dashboard.data.performance import PerformanceCards
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -815,17 +817,85 @@ def test_shape_costs_flattens_summary_and_sums_by_role():
 # ---------------------------------------------------------------------------
 
 
-def test_shape_performance_unions_project_keys():
-    body = redux_api.shape_performance(
-        paths={'p1': [{'path': 'one-pass', 'count': 10, 'pct': 100.0}]},
-        escalations={'p2': {'steward_rate': 5.0, 'interactive_rate': 0.0}},
-        histograms={'p1': {'outer': {'labels': ['1'], 'values': [10]},
-                            'inner': {'labels': ['1'], 'values': [10]}}},
-        ttc={'p1': {'p50': 60_000}},
+_PERF_SERVED_AT = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+_PERF_WINDOW_SECONDS = 7 * 86400
+
+
+def _perf_cards(
+    as_of: datetime, state: DatumState = DatumState.FRESH, reason: str | None = None,
+) -> Datum[PerformanceCards]:
+    return Datum(
+        value=PerformanceCards(
+            paths=[{'path': 'one-pass', 'count': 10, 'pct': 100.0}],
+            escalation={'total_tasks': 10, 'steward_rate': 5.0, 'interactive_rate': 0.0},
+            hist_outer={'labels': ['0'], 'values': [10]},
+            hist_inner={'labels': ['0'], 'values': [10]},
+            ttc={'p50': 60_000, 'p75': 70_000, 'p90': 80_000, 'p95': 90_000, 'count': 10},
+        ),
+        as_of=as_of,
+        state=state,
+        reason=reason,
+        freshness_bound_seconds=_PERF_WINDOW_SECONDS,
     )
-    assert set(body['PERFORMANCE']) == {'p1', 'p2'}
-    assert body['PERFORMANCE']['p1']['paths'][0]['path'] == 'one-pass'
-    assert body['PERFORMANCE']['p2']['escalation']['steward_rate'] == 5.0
+
+
+_PERF_HISTORY = {
+    'time_centiles_history': {'labels': ['2026-09-30T11:00'], 'p50': [60_000], 'p95': [90_000]},
+    'one_pass_history': {'labels': ['2026-09-30T11:00'], 'values': [100.0]},
+    'escalation_history': {'labels': ['2026-09-30T11:00'], 'values': [0.0]},
+}
+
+
+def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
+    plus_two = timezone(timedelta(hours=2))
+    cards = _perf_cards((_PERF_SERVED_AT - timedelta(hours=1)).astimezone(plus_two))
+    body = redux_api.shape_performance(
+        cards={'/home/leo/src/p1': cards},
+        history={'/home/leo/src/p1': _PERF_HISTORY},
+        served_at=_PERF_SERVED_AT,
+    )
+    entry = body['PERFORMANCE']['p1']
+    assert set(entry) == {'cards', 'time_centiles_history', 'one_pass_history', 'escalation_history'}
+    assert entry['cards'] == cards.to_wire()
+    assert entry['cards']['as_of'] == '2026-09-30T11:00:00+00:00'
+    assert entry['time_centiles_history'] == _PERF_HISTORY['time_centiles_history']
+
+
+def test_shape_performance_project_without_history_gets_empty_blocks():
+    body = redux_api.shape_performance(
+        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        served_at=_PERF_SERVED_AT,
+    )
+    entry = body['PERFORMANCE']['p1']
+    assert entry['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
+    assert entry['one_pass_history'] == {'labels': [], 'values': []}
+    assert entry['escalation_history'] == {'labels': [], 'values': []}
+
+
+def test_shape_performance_lists_exactly_the_projects_with_cards():
+    body = redux_api.shape_performance(
+        cards={
+            'active': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1)),
+            'idle': _perf_cards(
+                _PERF_SERVED_AT - timedelta(days=20), DatumState.STALE,
+                'no completions in the 7d window; last completion 2026-09-10T12:00:00+00:00',
+            ),
+        },
+        history={'active': _PERF_HISTORY, 'history-only': _PERF_HISTORY},
+        served_at=_PERF_SERVED_AT,
+    )
+    performance_by_label = body['PERFORMANCE']
+    assert set(performance_by_label) == {'active', 'idle'}
+    for entry in performance_by_label.values():
+        assert entry['cards']['state'] in {'fresh', 'stale'}
+        assert entry['cards']['value'] is not None
+
+
+def test_shape_performance_propagates_a_broken_cards_datum():
+    """A FRESH Datum older than its own bound is a shaper bug, not a state."""
+    overdue = _perf_cards(_PERF_SERVED_AT - timedelta(days=8))
+    with pytest.raises(DatumContractError):
+        redux_api.shape_performance(cards={'p1': overdue}, served_at=_PERF_SERVED_AT)
 
 
 # ---------------------------------------------------------------------------
