@@ -999,6 +999,10 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
 
+A promoted cluster's `root_cause` and `evidence` are the auto-watcher's narrative, not the record.
+Before ruling on one that joins two or more failures of a task, or restating it to the human, count
+those failures per [`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
+
 **Additive-context convention for spawned `/unblock` prompts.** Several categories below spawn an
 interactive `/unblock` session with a prompt of the form `/unblock <task_id> (esc <escalation_id>,
 <category>, <severity>: <summary>)`. Only the leading `/unblock <task_id>` token is load-bearing:

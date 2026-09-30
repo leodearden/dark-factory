@@ -168,6 +168,14 @@ In the worktree:
   list, means a plain `git rebase --abort` here is not safe — see
   [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) before you run one.
 
+### 1e. Event history
+```bash
+python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py --project-root <PROJECT_ROOT> <TASK_ID>
+```
+Step 2's agent team and Step 3's findings count the task's failure events from this listing before
+joining any of them into one story — see
+[`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
+
 ---
 
 ## Step 2: Deep analysis
