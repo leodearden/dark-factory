@@ -189,6 +189,106 @@ class TestPointerTargets:
         ]
 
 
+class TestByDesignAttribution:
+    """Which ``supersedes`` edges a known reaper deletes the target of BY DESIGN.
+
+    PRD D11: attribution is read off the CITING record's metadata, and only a
+    ``supersedes`` edge is attributable — both reapers delete exactly what they
+    name there and nothing else, so a canonical's dangling ``corrects`` target
+    is real damage and must stay in the alarmed population.
+    """
+
+    def test_the_attribution_vocabulary_is_pinned(self):
+        m = _mod()
+        assert m.REAPER_CONSOLIDATION == 'consolidation'
+        assert m.REAPER_STATUS_CORRECTION == 'status_correction'
+        assert m.UNATTRIBUTED == 'unattributed'
+        # The partition sentinel is a row key, never a reaper.
+        assert m.UNATTRIBUTED not in m.BY_DESIGN_REAPERS
+
+    def test_the_status_correction_writer_is_recognised_by_its_kind(self):
+        m = _mod()
+        assert m.by_design_reaper({'kind': 'project_status_correction'}) == (
+            m.REAPER_STATUS_CORRECTION
+        )
+
+    def test_a_consolidation_canonical_is_recognised_whoever_called_the_op(self):
+        m = _mod()
+        assert m.by_design_reaper({'canonical': True, 'topic': 't'}) == m.REAPER_CONSOLIDATION
+
+    def test_a_legacy_hand_rolled_stage_1_fold_is_recognised_by_agent_id(self):
+        m = _mod()
+        assert m.by_design_reaper({'agent_id': 'recon-stage-memory_consolidator'}) == (
+            m.REAPER_CONSOLIDATION
+        )
+
+    def test_the_more_specific_writer_wins_deterministically(self):
+        m = _mod()
+        both = {'kind': 'project_status_correction', 'canonical': True, 'topic': 't'}
+        assert m.by_design_reaper(both) == m.REAPER_STATUS_CORRECTION
+
+    @pytest.mark.parametrize('metadata', [
+        {},
+        # The EXACT consolidator spelling, never the stage prefix: other
+        # stages write memories and are not reapers.
+        {'agent_id': 'recon-stage-task_knowledge_sync'},
+        # `is True`, the vocabulary validator's own idiom — never truthiness.
+        {'canonical': 1},
+        {'canonical': 'true'},
+        {'kind': None},
+        {'agent_id': 42},
+    ])
+    def test_anything_else_is_not_a_reaper(self, metadata):
+        m = _mod()
+        assert m.by_design_reaper(metadata) is None
+
+    @pytest.mark.parametrize('metadata', [None, ['kind', 'project_status_correction']])
+    def test_a_non_mapping_is_not_a_reaper_and_never_raises(self, metadata):
+        m = _mod()
+        assert m.by_design_reaper(metadata) is None
+
+    def test_only_the_supersedes_edges_of_a_reaper_signed_record_are_attributed(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-1', supersedes=[UUID_A, UUID_B], corrects=UUID_C, canonical=True, topic='t',
+        ))
+        by_key = {(ref.key, ref.target): ref.reaped_by for ref in refs}
+        assert by_key == {
+            ('supersedes', UUID_A): m.REAPER_CONSOLIDATION,
+            ('supersedes', UUID_B): m.REAPER_CONSOLIDATION,
+            # A reaper deletes only what it names in `supersedes`.
+            ('corrects', UUID_C): None,
+        }
+
+    def test_a_plain_record_attributes_nothing(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=[UUID_A], parent_id=UUID_B, corrects=UUID_C))
+        assert [ref.reaped_by for ref in refs] == [None, None, None]
+
+    def test_ordering_stays_deterministic_for_a_reaper_signed_record(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            corrects=UUID_C, parent_id=UUID_B, supersedes=UUID_A, canonical=True, topic='t',
+        ))
+        reordered = m.pointer_targets(_record(
+            supersedes=UUID_A, corrects=UUID_C, parent_id=UUID_B, topic='t', canonical=True,
+        ))
+        assert refs == reordered
+
+    def test_attribution_never_moves_the_stored_tripwire_key(self):
+        """The item_key is persisted in alpha's grandfather set."""
+        m = _mod()
+        (attributed,) = m.pointer_targets(_record(
+            'rec-1', 'canonical words', supersedes=UUID_A, canonical=True,
+        ))
+        plain = m.PointerRef(
+            source_id='rec-1', key='supersedes', target=UUID_A,
+            source_content='canonical words',
+        )
+        assert attributed.reaped_by == m.REAPER_CONSOLIDATION
+        assert m._tripwire_item_key(attributed) == m._tripwire_item_key(plain)
+
+
 class TestDanglingCensus:
     """Resolved vs unresolved, per key, with the unresolved targets NAMED."""
 
