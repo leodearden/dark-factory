@@ -452,6 +452,64 @@ When Leo corrects a non-anomaly you raised, add a dated entry here. That is a do
 the self-execute tier below allows direct to main; CLAUDE.md "Working in the main checkout" says when
 such a commit may land.
 
+### Self-execute tier
+
+Execute these and report each under the brief's **Done** section; do not ask (Leo, 2026-09-25). An
+action that closes or moves a numbered item lands under **Done** by itself (see "The sitting and its
+numbers"). An action tied to no item gets one line under the same heading, in the message that
+carries the brief. Check "Always ask — keyed on record content" below first: it wins on any match.
+
+1. Read-only probes and log pulls.
+2. Installing an already-shipped timer or unit whose action is read-only or reporting.
+3. Filing a delayed follow-up for a gate that fired prematurely: a dependency plus a `delayed`
+   milestone. The milestone shape is in docs/task-authoring.md §"Milestone tasks (dated /
+   delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True` → `add_dependency` →
+   `commit_planning` rule.
+4. Recovering a preserved payload into the task the brief names.
+5. Appending a finding to an existing owner task, ONLY while that task is `pending`, because task
+   text is never re-read after dispatch (see "Findings for another task's owner").
+6. Close-only under the carve-out in "Ruled-elsewhere check (answered-but-unrecorded)", and
+   rubber-stamp confirm-and-close gates: a record whose only ask is to confirm an
+   already-verifiable fact and close it, with no option to choose. Verify the fact yourself first.
+7. Executing a ruling Leo already gave, when the record names it and the originating session has
+   ended. The same carve-out's gates 1, 2 and 4 are the test.
+8. Watcher self-operations: loop cadence, lease release on an announced reboot, writing and reading
+   the handover. Task 5884 owns their mechanics. Force lease release stays forbidden (see
+   "Claiming the Watcher Lease").
+9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
+   gates (ratified 2026-09-25).
+
+#### Always ask — keyed on record content
+
+The trigger is what the RECORD says, never your own "no judgement needed" label: the 08-24 brief
+put a $360 calibration spend in that bucket. If any class below matches, the item is asked, even
+when it also matches a tier line above.
+
+The floor is every human-forever gate in docs/escalation-standing-policy.md §"Human-forever
+gates"; that document defines them. Leo's classes follow, each with the record content that keys
+it, and the gate slug where one corresponds:
+
+- Milestone gates and deterministic-runner filings (`milestone_gate`,
+  `deterministic_runner_filing`).
+- Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
+  (`spend_or_eval_launch`).
+- Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
+  of an orchestrator, watchdog enables that restart units. **Except** restarts of fused-memory and
+  the dashboard, which are allowed but reported after the fact with their root cause.
+- Irreversible or content-losing operations: entity merge or split, memory deletion, branch
+  deletion, cancelling a task with dependents (`irreversible_deletion`).
+- Bypasses: no-verify, skipping the merge queue, force lease release, widening an allowlist past a
+  guard. **Except** direct-to-main docs-only commits, which are allowed; CLAUDE.md "Working in the
+  main checkout" says when one may land.
+- Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
+- Anything with a declared pin (`pin_declared_by`), under a Leo HOLD, or naming Leo's other session
+  or his personal backlog.
+- Priority, pin-queue placement, cross-cluster dependency sequencing.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+
+Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
+asks to launch one.
+
 ## Filing Parked Decisions to the Cockpit Registry (C8)
 
 Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill parks a decision for the
