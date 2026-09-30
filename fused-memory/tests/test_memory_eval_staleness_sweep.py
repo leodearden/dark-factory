@@ -979,6 +979,33 @@ def _attributed_inputs():
     return _inputs_over(_attributed_refs(), {UUID_B: True, UUID_C: False})
 
 
+UUID_D = 'd4e5f607-3333-4c4d-8e5f-607182930415'
+
+
+def _four_cause_refs():
+    """Four supersedes edges, one per cause that can keep family (1) from a pair.
+
+    (i) by design, target live; (ii) by design, target gone; (iii)
+    unattributed, target gone; (iv) unattributed and unsearchable (blank
+    successor content), target gone. Resolve with :data:`FOUR_CAUSE_RESOLUTION`.
+    """
+    m = _mod()
+    return [
+        *m.pointer_targets(_record(
+            'rec-canon-live', 'canonical words', supersedes=UUID_A, canonical=True, topic='t',
+        )),
+        *m.pointer_targets(_record(
+            'rec-status-gone', 'status words', supersedes=UUID_B,
+            kind='project_status_correction',
+        )),
+        *m.pointer_targets(_record('rec-plain-gone', 'plain words', supersedes=UUID_C)),
+        *m.pointer_targets(_record('rec-blank', '', supersedes=UUID_D)),
+    ]
+
+
+FOUR_CAUSE_RESOLUTION = {UUID_A: True, UUID_B: False, UUID_C: False, UUID_D: False}
+
+
 def _ids(series) -> set[str]:
     return {metric.metric_id for metric in series.metrics}
 
@@ -1140,12 +1167,17 @@ class TestBuildSeries:
             'surfacing_queries_degraded',
             'surfacing_search_depth',
             'task_terminal_entry_task_pairs',
+            'successor_edges_by_design',
+            'surfacing_edges_predecessor_gone',
             'pointers_supersedes_examined',
             'pointers_supersedes_resolved',
             'pointers_supersedes_unresolved',
             'pointers_corrects_examined',
             'pointers_corrects_resolved',
             'pointers_corrects_unresolved',
+            'pointers_by_reaper_unattributed_examined',
+            'pointers_by_reaper_unattributed_resolved',
+            'pointers_by_reaper_unattributed_unresolved',
         }
 
         census = inputs['census']
@@ -1164,9 +1196,18 @@ class TestBuildSeries:
         assert counts['surfacing_queries_degraded'] == len(inputs['surfacing'].degraded)
         assert counts['surfacing_search_depth'] == m.SURFACING_SEARCH_DEPTH
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
+        assert counts['successor_edges_by_design'] == len(
+            m.by_design_successor_refs(_full_refs()),
+        )
+        assert counts['surfacing_edges_predecessor_gone'] == len(
+            m.predecessor_gone_supersedes_refs(census.unresolved_refs),
+        )
         for key, row in census.by_key.items():
             for field_name, value in row.items():
                 assert counts[f'pointers_{key}_{field_name}'] == value
+        for bucket, row in census.by_reaper.items():
+            for field_name, value in row.items():
+                assert counts[f'pointers_by_reaper_{bucket}_{field_name}'] == value
 
     def test_the_surfacing_search_depth_rides_in_the_artifact(self):
         """The retrieval depth SETS family 1's denominator, so it is a narrowing.
@@ -1316,8 +1357,12 @@ class TestBuildSeries:
         m = _mod()
         inputs = _multi_cited_inputs()
         counts = m.build_series(**inputs).corpus.counts
+        # The per-KEY rows only: the per-reaper rows are a second cut of the
+        # same edges, and summing both would count every edge twice.
         examined = sum(
-            value for key, value in counts.items() if key.endswith('_examined')
+            counts[f'pointers_{key}_examined']
+            for key in m.POINTER_KEYS
+            if f'pointers_{key}_examined' in counts
         )
         assert examined == inputs['census'].examined
         assert counts['pointer_targets_unique_reads'] <= examined
@@ -1329,6 +1374,74 @@ class TestBuildSeries:
         inputs['corpus_counts'] = {'pointer_refs_malformed': 999}
         with pytest.raises(ValueError, match='collides'):
             m.build_series(**inputs)
+
+    @pytest.mark.parametrize('key', [
+        'successor_edges_by_design',
+        'surfacing_edges_predecessor_gone',
+        'pointers_by_reaper_unattributed_examined',
+    ])
+    def test_the_collision_guard_covers_the_attribution_disclosures(self, key):
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['corpus_counts'] = {key: 999}
+        with pytest.raises(ValueError, match='collides'):
+            m.build_series(**inputs)
+
+    def test_the_reaper_partition_rides_in_the_artifact_lazily(self):
+        m = _mod()
+        refs = _four_cause_refs()
+        counts = m.build_series(**_inputs_over(refs, FOUR_CAUSE_RESOLUTION)).corpus.counts
+        census = m.dangling_census(refs, FOUR_CAUSE_RESOLUTION)
+        reaper_rows = {key for key in counts if key.startswith('pointers_by_reaper_')}
+        assert reaper_rows == {
+            f'pointers_by_reaper_{bucket}_{field_name}'
+            for bucket in (m.REAPER_CONSOLIDATION, m.REAPER_STATUS_CORRECTION, m.UNATTRIBUTED)
+            for field_name in ('examined', 'resolved', 'unresolved')
+        }
+        assert counts['pointers_by_reaper_consolidation_unresolved'] == 0
+        assert counts['pointers_by_reaper_status_correction_unresolved'] == 1
+        assert counts['pointers_by_reaper_unattributed_examined'] == 2
+        # An absent bucket contributes no row: _full_inputs has no reaper at all.
+        full = m.build_series(**_full_inputs()).corpus.counts
+        assert not any(key.startswith('pointers_by_reaper_consolidation_') for key in full)
+        # Disjoint from the per-key rows: no pointer key is `by_reaper`.
+        assert 'by_reaper' not in m.POINTER_KEYS
+        per_key_rows = {
+            f'pointers_{key}_{field_name}'
+            for key in census.by_key
+            for field_name in ('examined', 'resolved', 'unresolved')
+        }
+        assert per_key_rows.isdisjoint(reaper_rows)
+
+    def test_the_reaper_partition_reconstructs_the_total(self):
+        """Nothing that was visible became invisible."""
+        m = _mod()
+        series = m.build_series(**_inputs_over(_four_cause_refs(), FOUR_CAUSE_RESOLUTION))
+        counts = series.corpus.counts
+        reaper_examined = sum(
+            value for key, value in counts.items()
+            if key.startswith('pointers_by_reaper_') and key.endswith('_examined')
+        )
+        assert reaper_examined == _metric(series, m.METRIC_DANGLING_POINTERS).n
+
+    def test_the_tripwire_and_family_1_narrowings_are_separate_causes(self):
+        """Three rows, three causes; none is a second name for another."""
+        m = _mod()
+        refs = _four_cause_refs()
+        counts = m.build_series(**_inputs_over(refs, FOUR_CAUSE_RESOLUTION)).corpus.counts
+        # (i) and (ii): excluded from the tripwire by attribution.
+        assert counts['successor_edges_by_design'] == 2
+        assert counts['successor_edges_by_design'] == len(m.by_design_successor_refs(refs))
+        # (ii) and (iii): searched, but the predecessor is gone, so the pair
+        # can never be comparable (PRD D12).
+        assert counts['surfacing_edges_predecessor_gone'] == 2
+        # (iv): never searched at all.
+        assert counts['surfacing_edges_unsearchable'] == 1
+
+    def test_the_attribution_narrowings_are_emitted_as_zero_when_none(self):
+        counts = _mod().build_series(**_full_inputs()).corpus.counts
+        assert counts['successor_edges_by_design'] == 0
+        assert counts['surfacing_edges_predecessor_gone'] == 0
 
     def test_the_series_round_trips_and_passes_the_real_validator(self):
         import json  # noqa: PLC0415
