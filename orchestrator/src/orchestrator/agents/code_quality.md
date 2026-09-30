@@ -198,8 +198,12 @@ travels with the orchestrator, never with the operated repo;
 Consequences for an editor of this file:
 
 - Editing a rendered section changes dispatched prompt content, even in a
-  docs-only commit. Pre-commit skips pyright for such a commit; the merge gate
-  still runs the shape test in `orchestrator/tests/test_code_quality.py`.
+  docs-only commit. Send every edit to this file through the merge queue,
+  never as a direct commit to main. The shape test in
+  `orchestrator/tests/test_code_quality.py` runs only at the merge gate, and
+  pre-commit runs no render check for a `.md`. A malformed rendered section
+  committed directly to main is not caught before it lands, and every
+  orchestrator then raises at import on its next restart.
 - Rendered sections must read correctly in any operated repo, and stay
   brace-free, because the block reaches a `str.format()` template.
 - Keep the rendered headings. A renamed or removed one raises at orchestrator
