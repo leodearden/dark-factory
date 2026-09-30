@@ -4291,6 +4291,29 @@ def clean_probe_collection(probe_config, probe_project_id):
     client.close()
 
 
+@contextlib.asynccontextmanager
+async def _seeded_memory_service(probe_config, probe_project_id):
+    """An initialized MemoryService over the ephemeral collection, closed on exit.
+
+    mem0's SQLite history writer is process-shared and xdist-contended (and
+    read-only in the sandbox), so it is stubbed here, for the same reason
+    test_recon_dedup_premise.py stubs it: it is not the question under test,
+    and its failure would mask the one that is. This is the one place these
+    tests reach mem0's private instance.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    memory = MemoryService(probe_config)
+    await memory.initialize()
+    try:
+        instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
+        instance.db.add_history = lambda *a, **kw: None
+        yield memory
+    finally:
+        await memory.close()
+
+
 class TestSeededInducedRegression:
     """Delete the canonical; the tripwire item must flip. That is the signal."""
 
@@ -4333,20 +4356,8 @@ class TestSeededInducedRegression:
     async def test_deleting_the_canonical_flips_its_tripwire_item(
         self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
     ):
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
-
         m = _mod()
-        memory = MemoryService(probe_config)
-        await memory.initialize()
-        try:
-            # mem0's SQLite history writer is process-shared and xdist-contended
-            # (and read-only in the sandbox). Stubbed for the same reason
-            # test_recon_dedup_premise.py:135 stubs it: it is not the question
-            # under test, and its failure would mask the one that is.
-            instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
-            instance.db.add_history = lambda *a, **kw: None
-
+        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
             seeded = await memory.add_memory(
                 FLIP_CANONICAL, category='procedural_knowledge',
                 project_id=probe_project_id, agent_id='e1-probe-seed',
@@ -4406,8 +4417,6 @@ class TestSeededInducedRegression:
             assert before.metrics_path != after.metrics_path
             assert before.metrics_path.exists() and after.metrics_path.exists()
             assert before.is_initial_run and not after.is_initial_run
-        finally:
-            await memory.close()
 
 
 BRIEFING_SEEDS = {
@@ -4473,18 +4482,9 @@ class TestSeededBriefingTopicFlip:
     async def test_deleting_one_briefing_canonical_flips_only_its_item(
         self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
     ):
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
-
         m = _mod()
         registry = _seeded_briefing_registry(probe_project_id)
-        memory = MemoryService(probe_config)
-        await memory.initialize()
-        try:
-            # Stubbed for the reason TestSeededInducedRegression gives.
-            instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
-            instance.db.add_history = lambda *a, **kw: None
-
+        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
             seeded_ids = {}
             for topic, (text, category) in BRIEFING_SEEDS.items():
                 seeded = await memory.add_memory(
@@ -4514,8 +4514,6 @@ class TestSeededBriefingTopicFlip:
             assert set(before_items) == {e.item_key for e in registry.entries}
             assert all(before_items.values()), before_items
             assert after_items == {**before_items, flipped_key: False}
-        finally:
-            await memory.close()
 
 
 # ---------------------------------------------------------------------------
