@@ -726,7 +726,41 @@ _PRIMITIVE_CASES = [
     ('socket.create_connection', "return socket.create_connection(('h', 1))",
      'socket.create_connection'),
     ('os.system', "return os.system('ls')", 'os.system'),
+    # -- task 5099: the directory-walk / metadata methods, matched by name
+    ('Path.mkdir', 'return payload.mkdir()', 'mkdir'),
+    ('Path.rmdir', 'return payload.rmdir()', 'rmdir'),
+    ('Path.touch', 'return payload.touch()', 'touch'),
+    ('Path.unlink', 'return payload.unlink()', 'unlink'),
+    ('Path.rename', "return payload.rename('x')", 'rename'),
+    ('Path.exists', 'return payload.exists()', 'exists'),
+    ('Path.is_file', 'return payload.is_file()', 'is_file'),
+    ('Path.is_dir', 'return payload.is_dir()', 'is_dir'),
+    ('Path.stat', 'return payload.stat()', 'stat'),
+    ('Path.iterdir', 'return list(payload.iterdir())', 'iterdir'),
+    ('Path.glob', "return list(payload.glob('*'))", 'glob'),
+    ('Path.rglob', "return list(payload.rglob('*'))", 'rglob'),
+    ('Path.open', 'return payload.open()', 'open'),
+    # -- task 5099: their os / glob spellings, receiver-pinned.  A dotted match
+    # is checked before the method match, so os.stat reports 'os.stat'.
+    ('os.makedirs', 'return os.makedirs(payload)', 'os.makedirs'),
+    ('os.mkdir', 'return os.mkdir(payload)', 'os.mkdir'),
+    ('os.rmdir', 'return os.rmdir(payload)', 'os.rmdir'),
+    ('os.remove', 'return os.remove(payload)', 'os.remove'),
+    ('os.unlink', 'return os.unlink(payload)', 'os.unlink'),
+    ('os.rename', "return os.rename(payload, 'x')", 'os.rename'),
+    ('os.replace', "return os.replace(payload, 'x')", 'os.replace'),
+    ('os.stat', 'return os.stat(payload)', 'os.stat'),
+    ('os.scandir', 'return list(os.scandir(payload))', 'os.scandir'),
+    ('os.path.exists', 'return os.path.exists(payload)', 'os.path.exists'),
+    ('os.path.isfile', 'return os.path.isfile(payload)', 'os.path.isfile'),
+    ('os.path.isdir', 'return os.path.isdir(payload)', 'os.path.isdir'),
+    ('glob.glob', 'return glob.glob(payload)', 'glob.glob'),
 ]
+
+_PRIMITIVE_CASE_IMPORTS = (
+    'import fcntl\nimport glob\nimport os\nimport socket\nimport subprocess\n'
+    'import time\n\nimport yaml'
+)
 
 
 class TestPrimitiveTable:
@@ -741,7 +775,7 @@ class TestPrimitiveTable:
         """Each INV-8 primitive is blocking when a coroutine reaches it without a hop."""
         sources = {
             'pkg/mod.py': _module(
-                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                _PRIMITIVE_CASE_IMPORTS,
                 f'def helper(payload):\n    {body}',
                 """
                 async def caller(payload):
@@ -775,7 +809,7 @@ class TestPrimitiveTable:
         """
         sources = {
             'pkg/mod.py': _module(
-                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                _PRIMITIVE_CASE_IMPORTS,
                 f'async def caller(payload):\n    {body}',
             )
         }
@@ -967,6 +1001,75 @@ class TestPrimitiveTable:
             'of an awaited call still evaluates on the loop thread'
         )
 
+    def test_names_shared_with_builtin_types_are_not_primitives(self):
+        """``replace`` / ``remove`` / ``walk`` stay out of the method table.
+
+        Matching by attribute name alone, they are ``str.replace``,
+        ``list.remove`` and ``ast.walk`` far more often than a filesystem
+        call, and every string edit in the tree would become a merge-blocking
+        row.  Their filesystem spellings are matched only receiver-pinned:
+        ``os.replace``, ``os.remove``, ``os.walk``.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import ast',
+                """
+                async def caller(name, items, x, tree):
+                    name.replace('-', '_')
+                    items.remove(x)
+                    return list(ast.walk(tree))
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert findings == [], (
+            'str.replace / list.remove / ast.walk must not match a method '
+            f'primitive; got {[(f.qualname, f.primitive) for f in findings]}'
+        )
+
+    def test_async_file_apis_sharing_a_primitive_name_are_not_findings(self):
+        """The live shapes the async-consumption rule exists for, once 'open' exists.
+
+        ``await cost_store.open()`` is server/main.py::_setup_curator_usage_gate's
+        async CostStore open -- the false positive widening the table exposed.
+        ``aiofiles.open`` and anyio's ``iterdir`` are the canonical INV-8 fix;
+        flagging them would be a false RED on correctly fixed code.
+        """
+        async_apis = {
+            'awaited store open': """
+                async def a(cost_store):
+                    await cost_store.open()
+                """,
+            'aiofiles open': """
+                async def b(p):
+                    async with aiofiles.open(p) as fh:
+                        return await fh.read()
+                """,
+            'anyio iterdir': """
+                async def c(apath):
+                    async for child in apath.iterdir():
+                        return child
+                """,
+        }
+        for shape, body in async_apis.items():
+            findings = find_loop_blocking_sites(
+                {'pkg/mod.py': _module('import aiofiles', body)}
+            )
+            assert findings == [], (
+                f'{shape} is an async API, not a sync filesystem call; got '
+                f'{[(f.qualname, f.primitive) for f in findings]}'
+            )
+
+        control = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def d(store):
+                return store.open()
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in control] == [('d', 'open')]
+
     def test_asyncio_siblings_are_excluded_wholesale(self):
         """Neither ``asyncio.*`` nor ``anyio.*`` may be read as blocking."""
         for dotted in DOTTED_PRIMITIVES:
@@ -997,6 +1100,13 @@ class TestPrimitiveTable:
         assert {'read_text', 'write_text', 'read_bytes', 'write_bytes'} <= set(
             METHOD_PRIMITIVES
         )
+        assert {'os.makedirs', 'os.mkdir', 'os.rmdir', 'os.remove', 'os.unlink',
+                'os.rename', 'os.replace', 'os.stat', 'os.scandir',
+                'os.path.exists', 'os.path.isfile', 'os.path.isdir',
+                'glob.glob'} <= dotted
+        assert {'mkdir', 'rmdir', 'touch', 'unlink', 'rename', 'exists',
+                'is_file', 'is_dir', 'stat', 'iterdir', 'glob', 'rglob',
+                'open'} <= set(METHOD_PRIMITIVES)
         assert 'open' in BUILTIN_PRIMITIVES, (
             'the plainest filesystem spelling of all is a bare open(); a table '
             'that only knows dotted paths and methods cannot see it'
