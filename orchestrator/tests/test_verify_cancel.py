@@ -2398,6 +2398,57 @@ class TestFireWatchdogKillTriggerLine:
         assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
         assert events[-1] == ('exit', 1)
 
+    @pytest.mark.parametrize(
+        'good_snapshots,expected_term',
+        [([], set()), ([{200: 100, 300: 200, 999: 1}], {200, 300})],
+        ids=['first', 'second'],
+    )
+    def test_a_failed_snapshot_is_reported_and_still_self_exits(
+        self, good_snapshots, expected_term
+    ):
+        """A raising /proc snapshot is diagnosed on stderr and never skips the self-exit."""
+        import signal
+
+        from orchestrator.verify_cancel import (
+            WATCHDOG_FIRE_TRIGGER_TOKEN,
+            WatchdogTrigger,
+            fire_watchdog_kill,
+        )
+
+        snapshots = iter(good_snapshots)
+
+        def ppid_map_provider():
+            snapshot = next(snapshots, None)
+            if snapshot is None:
+                raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+            return snapshot
+
+        events = []
+        fire_watchdog_kill(
+            100,
+            trigger=WatchdogTrigger.HEARTBEAT_STARVATION,
+            grace_secs=5.0,
+            ppid_map_provider=ppid_map_provider,
+            kill=lambda pid, sig: events.append(
+                ('term' if sig == signal.SIGTERM else 'kill', pid)
+            ),
+            killpg=lambda pgid, sig: events.append(('killpg', pgid)),
+            sleep=lambda secs: events.append(('sleep', secs)),
+            exit_fn=lambda code: events.append(('exit', code)),
+            stderr=_RecordingStderr(events),
+        )
+
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1), 'exit_fn must stay the final action'
+
+        written = _written(events)
+        assert written.endswith(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=heartbeat_starvation\n')
+        assert 'UnicodeDecodeError' in written
+
+        assert {e[1] for e in events if e[0] == 'term'} == expected_term
+        assert [e for e in events if e[0] == 'kill'] == []
+        assert [e for e in events if e[0] == 'killpg'] == []
+
     def test_default_stream_is_sys_stderr_resolved_at_call_time(self, monkeypatch):
         """With no stderr= override the token lands on stderr — never on stdout.
 
