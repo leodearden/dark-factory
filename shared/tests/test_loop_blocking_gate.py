@@ -912,6 +912,61 @@ class TestPrimitiveTable:
 
         assert find_loop_blocking_sites(sources) == []
 
+    def test_a_method_call_consumed_asynchronously_is_not_a_filesystem_primitive(self):
+        """An awaited / async-with / async-for method call is an async API.
+
+        The names here are placeholders: the rule is about the CONSTRUCT.  A
+        method primitive is matched by attribute name alone, receiver
+        unresolved, and a sync pathlib method never returns an awaitable, an
+        async context manager or an async iterator -- so a call one of those
+        constructs consumes is some other API (anyio.Path, aiofiles, an async
+        store's ``open()``), which is exactly what an INV-8 fix switches to.
+        """
+        consumed = {
+            'await operand': """
+                async def a(apath):
+                    return await apath.read_text()
+                """,
+            'async-with context expression': """
+                async def b(remote):
+                    async with remote.read_bytes() as fh:
+                        return fh
+                """,
+            'async-for iterable': """
+                async def c(remote):
+                    async for chunk in remote.read_bytes():
+                        return chunk
+                """,
+        }
+        for shape, body in consumed.items():
+            findings = find_loop_blocking_sites({'pkg/mod.py': _module(body)})
+            assert findings == [], (
+                f'a method call consumed as the {shape} is an async API, not a '
+                f'sync filesystem primitive; got '
+                f'{[(f.qualname, f.primitive) for f in findings]}'
+            )
+
+        bare = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def d(path):
+                return path.read_text()
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in bare] == [('d', 'read_text')]
+
+        argument_of_awaited = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def e(writer, path):
+                await writer.send(path.read_text())
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in argument_of_awaited] == [
+            ('e', 'read_text')
+        ], (
+            'only the call that IS the await operand is excluded; an argument '
+            'of an awaited call still evaluates on the loop thread'
+        )
+
     def test_asyncio_siblings_are_excluded_wholesale(self):
         """Neither ``asyncio.*`` nor ``anyio.*`` may be read as blocking."""
         for dotted in DOTTED_PRIMITIVES:
