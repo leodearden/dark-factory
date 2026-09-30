@@ -682,9 +682,17 @@ class TestRunProbe:
         return gate, acct
 
     async def test_success_exit_0_no_cap_patterns(self):
-        """Exit code 0, no cap patterns -> returns True."""
+        """Exit 0 with a served success result -> True"""
         gate, acct = await self._make_probing_gate()
-        proc = _make_mock_proc(returncode=0, stdout=b'ok')
+        served = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': False,
+            'result': 'ok',
+            'num_turns': 1,
+            'total_cost_usd': 0.002,
+        }).encode()
+        proc = _make_mock_proc(returncode=0, stdout=served)
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
@@ -900,15 +908,16 @@ class TestRunProbe:
         assert 'bypassPermissions' in cmd
         assert 'Say ok' in cmd
 
-    async def test_empty_stdout_and_stderr_returns_true(self):
-        """Empty stdout and stderr -> returns True (exit code 0)."""
+    async def test_empty_stdout_and_stderr_returns_false(self):
+        """Empty stdout and stderr -> False even on exit 0: nothing proves the
+        call was served."""
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(returncode=0, stdout=b'', stderr=b'')
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
 
-        assert result is True
+        assert result is False
 
     async def test_nonzero_exit_with_cap_pattern_returns_false(self):
         """Non-zero exit code WITH cap pattern -> returns False.
@@ -2129,14 +2138,14 @@ class TestProbeLoopSpawnFault:
 class TestRunProbeClassifyInvocationConsistency:
     """_run_probe's verdicts must agree with classify_invocation(strict_confirm=False).
 
-    ``test_non_cap_marker_is_not_misread_as_still_capped`` is RED against
-    today's _run_probe: it scans CAP_HIT_PREFIXES/NEAR_CAP_PREFIXES directly
-    with no notion of NON_CAP_CLI_ERROR_MARKERS, so a message that contains
-    both a cap-like prefix and a local-CLI-error marker is misread as "still
-    capped" (returns False) today. Once _run_probe is rewired onto
-    classify_invocation (step-4), CliLocalError precedence applies uniformly
-    and this goes green. The other test pins the already-correct prefix-only
-    (no confirm keyword) behavior against the classifier as a regression guard.
+    ``test_non_cap_marker_is_not_misread_as_still_capped`` pins CliLocalError
+    precedence (reify-3604): a message containing both a cap-like prefix and a
+    local-CLI-error marker is not read as "still capped". Since task 5944 such
+    a probe is also not SERVED, so both readings return False; the one place
+    they still differ is the AUTH_FAILED -> CAPPED demotion, which a "still
+    capped" reading would take and a CliLocalError reading must not. The other
+    test pins the prefix-only (no confirm keyword) behavior against the
+    classifier as a regression guard.
     """
 
     async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
@@ -2164,7 +2173,9 @@ class TestRunProbeClassifyInvocationConsistency:
     async def test_non_cap_marker_is_not_misread_as_still_capped(self):
         """reify-3604 applied to _run_probe: a local CLI/usage error occurring
         alongside cap-like text must not be treated as "still capped"."""
-        gate, acct = await self._make_probing_gate()
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.auth_failed = True
         text = (
             f'{CAP_HIT_PREFIXES[0]} usage limit. Your plan resets in 3h. '
             'permission denied: /tmp/x'
@@ -2177,9 +2188,11 @@ class TestRunProbeClassifyInvocationConsistency:
         proc = _make_mock_proc(returncode=0, stderr=text.encode())
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
-        assert result is True, (
+        assert result is False, 'a local CLI error is not evidence of a served call'
+        assert acct.phase == AccountPhase.AUTH_FAILED, (
             '_run_probe must not misread a local CLI error co-occurring with '
-            'cap-like text as "still capped" (CliLocalError precedence, reify-3604)'
+            'cap-like text as "still capped" and demote AUTH_FAILED -> CAPPED '
+            '(CliLocalError precedence, reify-3604)'
         )
 
 

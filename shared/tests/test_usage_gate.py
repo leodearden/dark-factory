@@ -697,6 +697,149 @@ class TestUsageGateProbeExitCodeClassification:
 
 
 # ---------------------------------------------------------------------------
+# _run_probe re-admits an account only on POSITIVE evidence the API served the
+# call (task 5944) — never on the mere absence of recognised failure text.
+# ---------------------------------------------------------------------------
+
+
+# The exact CLI result measured live on 2026-09-26 (CLI 2.1.283) for the
+# org-disabled max-b/max-c accounts, via the production probe command.
+MEASURED_ORG_DISABLED_403 = json.dumps({
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': True,
+    'api_error_status': 403,
+    'result': (
+        'Your organization has disabled Claude subscription access for Claude '
+        'Code · Use an Anthropic API key instead, or ask your admin to enable '
+        'access'
+    ),
+    'num_turns': 1,
+    'total_cost_usd': 0,
+}).encode()
+
+SERVED_SUCCESS_RESULT = json.dumps({
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': False,
+    'result': 'ok',
+    'num_turns': 1,
+    'total_cost_usd': 0.002,
+}).encode()
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeRequiresServedResult:
+    """_run_probe returns True only when the CLI result proves it was served."""
+
+    @pytest.fixture
+    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
+        gate = make_gate(['probe-acct'])
+        del gate._run_probe  # fall back to class method
+        acct = gate._accounts[0]
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
+        return gate, acct
+
+    @staticmethod
+    def _fake_probe_proc(returncode: int, stdout: bytes) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(stdout, b''))
+        return proc
+
+    async def _probe(
+        self, gate: UsageGate, acct: AccountState, returncode: int, stdout: bytes,
+    ) -> bool:
+        proc = self._fake_probe_proc(returncode, stdout)
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            return await gate._run_probe(acct)
+
+    async def test_exit_0_with_the_measured_403_result_is_not_served(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        assert await self._probe(gate, acct, 0, MEASURED_ORG_DISABLED_403) is False
+
+    async def test_exit_0_with_is_error_true_and_no_status_is_not_served(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'result': 'something failed',
+        }).encode()
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    async def test_exit_0_with_empty_stdout_is_not_served(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        assert await self._probe(gate, acct, 0, b'') is False
+
+    async def test_exit_0_with_non_json_stdout_is_not_served(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        assert await self._probe(gate, acct, 0, b'ok') is False
+
+    async def test_exit_0_served_success_result_is_accepted(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        assert await self._probe(gate, acct, 0, SERVED_SUCCESS_RESULT) is True
+
+    async def test_exit_1_with_the_measured_403_result_is_not_served(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403) is False
+
+    async def test_not_served_warning_names_the_api_error_status(
+        self,
+        gate_with_account: tuple[UsageGate, AccountState],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        gate, acct = gate_with_account
+        caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+
+        await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403)
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'probe-acct' in msg
+            and '403' in msg
+            and 'disabled Claude subscription access' in msg
+            for msg in warnings
+        ), warnings
+
+    async def test_auth_failed_account_stays_auth_failed_on_exit_0_403(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = gate_with_account
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+        proc = self._fake_probe_proc(0, MEASURED_ORG_DISABLED_403)
+
+        with (
+            patch('shared.usage_gate.load_dotenv'),
+            patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                  return_value=proc),
+        ):
+            await gate._reprobe_account(acct)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+
+
+# ---------------------------------------------------------------------------
 # Probe config-dir isolation per (account, pid) — task 2139 (PRD §6 task θ,
 # finding 5 cheap-now half). Concurrent probes across the ~6-process fleet,
 # and the SIGHUP parallel all-account probe gather within one process, must
