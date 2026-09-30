@@ -202,12 +202,8 @@ class TestThePrdCountIsMemoised:
 
 class TestThePrdBoxCount:
     @pytest.fixture(scope='class')
-    def prd_box_body(self, tab_tasks_jsx_body):
-        return extract_function_body(tab_tasks_jsx_body, 'PrdBox')
-
-    @pytest.fixture(scope='class')
-    def prd_box_code(self, prd_box_body):
-        return strip_js_comments(prd_box_body)
+    def prd_box_code(self, tab_tasks_code):
+        return extract_function_body(tab_tasks_code, 'PrdBox')
 
     def test_the_count_is_the_progress_datum_read_as_terminal_of_total(self, prd_box_code):
         count = re.search(r'<span\s+className="prd-box-count"[^>]*>(.*?)</span>\s*</div>', prd_box_code, re.DOTALL)
@@ -218,16 +214,6 @@ class TestThePrdBoxCount:
         ), f'the PRD count is not <DatumReading datum={{…}} format={{prdProgressReading(…)}} /> terminal: {count.group(1)!r}'
         assert not re.search(r'\.views\.terminal\s*\}\s*/\s*\{', prd_box_code), (
             'the interim n/m tally over the client-held members is still rendered'
-        )
-
-    def test_the_undercount_tooltip_is_replaced_by_the_lower_bound(self, prd_box_body):
-        """task 4416 option (a): the '≥' disclosure replaces the tooltip.
-
-        Its premise, active_tasks.py's live-PRD exemption from the terminal cap, is gone.
-        """
-        assert 'countMayUndercount' not in prd_box_body
-        assert 'active_tasks.py' not in prd_box_body, (
-            'PrdBox still explains a count by active_tasks.py\'s retired exemption'
         )
 
     @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])

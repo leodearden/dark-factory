@@ -102,6 +102,7 @@ class TestTheRetiredCountersAreGone:
         [
             'DF_TASK_STATUS_COUNTS', 'DF_TASK_DONE_COUNT', 'projectStatusCounts', 'activityPips',
             'doneCount', 'PIP_DOT_COLOR_T', 'ACTIVE_TASKS', 'DONE_COUNTS', '_fallbackDone', 'statusMatches',
+            'countMayUndercount',
         ],
     )
     def test_no_client_bucketer_remains(self, tab_tasks_code, retired):
