@@ -14,7 +14,8 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
-from dashboard.data import performance
+from dashboard.data import performance, redux_api
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.performance import (
     _HISTORY_CACHE,
     _cutoff,
@@ -23,6 +24,7 @@ from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_performance_cards,
     aggregate_performance_history,
     aggregate_time_centiles,
     get_completion_paths,
@@ -2456,3 +2458,156 @@ class TestCardsShareTheWallClockWindow:
             ttc = await get_time_centiles(conn, days=CARDS_DAYS)
         assert paths['idle'] == []
         assert ttc['idle']['count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# One served Datum per project's cards (task 5594)
+# ---------------------------------------------------------------------------
+
+
+async def _cards_of(tmp_path, escalations_dir, rows: list[tuple]) -> dict:
+    db_path = _make_runs_db(tmp_path, 'cards.db', rows)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await aggregate_performance_cards(
+            [conn], [escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+
+
+class TestPerformanceCardsDatum:
+    """Each project's card block is one Datum whose as_of is the project's
+    latest completion and whose freshness bound is the served window, so an
+    idle project is stale by the envelope's own bound."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_active_project_is_fresh_and_carries_the_window_tally(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        conns, dirs = [active_idle_conn], [empty_escalations_dir]
+        window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
+        datum = (await aggregate_performance_cards(conns, dirs, **window))['active']
+
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert datum.as_of == CARDS_NOW - timedelta(hours=1)
+        assert datum.freshness_bound_seconds == 7 * 86400
+        histograms = (await aggregate_loop_histograms(conns, **window))['active']
+        assert datum.value.to_wire() == {
+            'paths': (await aggregate_completion_paths(conns, dirs, **window))['active'],
+            'escalation': (await aggregate_escalation_rates(conns, dirs, **window))['active'],
+            'hist_outer': histograms['outer'],
+            'hist_inner': histograms['inner'],
+            'ttc': (await aggregate_time_centiles(conns, **window))['active'],
+        }
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_idle_project_is_stale_by_its_last_completion(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        cards = await aggregate_performance_cards(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        datum = cards['idle']
+
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == CARDS_NOW - timedelta(days=20)
+        assert CARDS_NOW - datum.as_of == timedelta(days=20)
+        assert '7d' in datum.reason
+        assert 'last completion' in datum.reason
+        wire = datum.value.to_wire()
+        assert wire['paths'] == []
+        assert wire['ttc']['count'] == 0
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_window_start_is_inclusive_for_state_and_tally(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        cards = await _cards_of(tmp_path, empty_escalations_dir, [
+            _task_row('e1', 'edge', CARDS_NOW - timedelta(days=CARDS_DAYS)),
+        ])
+        datum = cards['edge']
+        assert datum.state is DatumState.FRESH
+        assert sum(entry['count'] for entry in datum.value.to_wire()['paths']) == 1
+
+    @pytest.mark.asyncio
+    async def test_completion_after_the_serving_instant_is_clock_skew(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        cards = await _cards_of(tmp_path, empty_escalations_dir, [
+            _task_row('s1', 'skewed', CARDS_NOW + timedelta(hours=1)),
+        ])
+        datum = cards['skewed']
+        assert datum.state is DatumState.STALE
+        assert 'clock skew' in datum.reason
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_latest_completion_is_stale_at_the_serving_instant(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        unreadable = (*_task_row('u1', 'unreadable', CARDS_NOW)[:-1], 'not-a-time')
+        datum = (await _cards_of(tmp_path, empty_escalations_dir, [unreadable]))['unreadable']
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == CARDS_NOW
+        assert 'could not be read' in datum.reason
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_as_of_is_the_latest_completion_across_dbs(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        db_a = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'shared', CARDS_NOW - timedelta(hours=2)),
+        ])
+        db_b = _make_runs_db(tmp_path, 'b.db', [
+            _task_row('b1', 'shared', CARDS_NOW - timedelta(minutes=30)),
+        ])
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            cards = await aggregate_performance_cards(
+                [a, b], [empty_escalations_dir, empty_escalations_dir],
+                days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert cards['shared'].as_of == CARDS_NOW - timedelta(minutes=30)
+
+    @pytest.mark.asyncio
+    async def test_no_completions_lists_no_projects(self, empty_runs_conn, empty_escalations_dir):
+        window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
+        assert await aggregate_performance_cards(
+            [empty_runs_conn], [empty_escalations_dir], **window,
+        ) == {}
+        assert await aggregate_performance_cards([None], [empty_escalations_dir], **window) == {}
+
+    @pytest.mark.asyncio
+    async def test_shaped_payload_serves_both_states_under_one_now(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        conns = [active_idle_conn]
+        shaped = redux_api.shape_performance(
+            cards=await aggregate_performance_cards(
+                conns, [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            ),
+            history=await aggregate_performance_history(conns, days=CARDS_DAYS, now=CARDS_NOW),
+            served_at=CARDS_NOW,
+        )
+        performance_by_label = shaped['PERFORMANCE']
+
+        active = performance_by_label['active']
+        assert active['cards']['state'] == 'fresh'
+        assert sum(entry['count'] for entry in active['cards']['value']['paths']) == len(
+            active['time_centiles_history']['labels'],
+        )
+
+        idle = performance_by_label['idle']
+        assert idle['cards']['state'] == 'stale'
+        assert idle['cards']['as_of'] == (CARDS_NOW - timedelta(days=20)).isoformat()
+        assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
+        assert idle['one_pass_history'] == {'labels': [], 'values': []}
+        assert idle['escalation_history'] == {'labels': [], 'values': []}
