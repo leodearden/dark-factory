@@ -116,20 +116,6 @@ class TestScopeSpawnCarriesRoleWeight:
             _assert_carries_weight(record, expected)
 
     @pytest.mark.asyncio
-    async def test_offline_role_spawns_scope_without_weight(self, fake_systemd_run, worktree):
-        config = OrchestratorConfig(verify_use_cgroup_scope=True)
-        result = await run_verification(
-            worktree, config, module_config=_module_config(), max_retries=0,
-            role='offline',  # type: ignore[arg-type]
-        )
-        assert result.passed, result.summary
-        records = _recorded(fake_systemd_run)
-        assert len(records) == 3
-        for record in records:
-            assert '-p' not in record, record
-            assert not any(tok.startswith('CPUWeight=') for tok in record), record
-
-    @pytest.mark.asyncio
     async def test_reloaded_weight_applies_to_next_spawn(
         self, fake_systemd_run, worktree, monkeypatch, tmp_path,
     ):
@@ -180,9 +166,9 @@ class TestScopeSpawnCarriesRoleWeight:
 def _cpu_weight_settable() -> bool:
     """Whether this host can spawn a user scope with a CPUWeight and read it back.
 
-    Probed independently of verify.py: a scope has no cpu.weight file until a
-    CPU property is set on it, so keying the skip on the file would turn a
-    dropped property into a skip rather than a failure.
+    Probed independently of verify.py, with a distinctive weight read back
+    exactly: the skip then depends only on the host, so a property verify.py
+    drops shows up in the test as a wrong value (a failure), never as a skip.
     """
     try:
         probe = subprocess.run(

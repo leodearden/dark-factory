@@ -4924,7 +4924,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
-    cpu_weight: int | None
+    cpu_weight: int
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5868,12 +5868,9 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     the already-wrapped command inside a ``systemd-run --user --scope``
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
     path, creates an *inner* ``systemd-run --user --scope --slice=...``
-    scope.  reify enables both flags (its ``dark-factory-orchestrator.yaml``
-    sets ``verify_use_cgroup_scope: true`` and ``cpu_governance.enabled:
-    true``), so this combination is live on reify's merge leg.  The inner
-    scope MOVES the governed workload out of the outer ``df-verify`` scope
-    into its own scope under that slice, so neither the outer scope's
-    CPUWeight nor its cgroup kill reaches that workload —
+    scope.  The inner scope MOVES the governed workload out of the outer
+    ``df-verify`` scope into its own scope under that slice, so neither the
+    outer scope's CPUWeight nor its cgroup kill reaches that workload —
     ``cpu-governed-exec.sh`` sets the workload's weight itself.
     ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
     nested-scope failure degrades gracefully.
@@ -5906,18 +5903,20 @@ def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
     return nice_prefix(role)
 
 
-def _resolve_scope_cpu_weight(config: OrchestratorConfig, role: str) -> int | None:
+def _resolve_scope_cpu_weight(
+    config: OrchestratorConfig, role: Literal['merge', 'task', 'background'],
+) -> int:
     """Return the cgroup CPUWeight a verify scope for *role* is spawned with.
 
-    Reads ``verify_cgroup_cpu_weight_{merge,task,background}`` at each spawn;
-    ``offline`` and any unrecognized role resolve to None (no property).
+    Reads ``verify_cgroup_cpu_weight_{merge,task,background}`` at each spawn.
     """
-    weights = {
-        'merge': config.verify_cgroup_cpu_weight_merge,
-        'task': config.verify_cgroup_cpu_weight_task,
-        'background': config.verify_cgroup_cpu_weight_background,
-    }
-    return weights.get(role)
+    match role:
+        case 'merge':
+            return config.verify_cgroup_cpu_weight_merge
+        case 'task':
+            return config.verify_cgroup_cpu_weight_task
+        case 'background':
+            return config.verify_cgroup_cpu_weight_background
 
 
 def _verify_admission_active(config: OrchestratorConfig) -> bool:

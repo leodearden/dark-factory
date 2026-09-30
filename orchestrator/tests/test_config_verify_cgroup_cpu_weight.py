@@ -9,15 +9,12 @@ test_config_verify_admission_reload.py's stated rationale).
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
-from orchestrator.config import (
-    RELOADABLE_FIELDS,
-    OrchestratorConfig,
-    apply_reload,
-    diff_config,
-)
+from orchestrator.config import OrchestratorConfig, diff_config
 
 WEIGHT_FIELDS = [
     'verify_cgroup_cpu_weight_merge',
@@ -58,35 +55,20 @@ class TestVerifyCgroupCpuWeightBounds:
 
 
 class TestVerifyCgroupCpuWeightReloadDisposition:
-    """Every weight knob is green-tier: hot-reloadable without a restart."""
+    """Every weight knob is green-tier: hot-reloadable without a restart.
+
+    That a reloaded weight reaches the next scope spawn is checked end to end
+    in test_verify_scope_cpu_weight.py.
+    """
 
     @pytest.mark.parametrize('field', WEIGHT_FIELDS)
-    def test_every_field_is_reloadable(self, field):
-        assert field in RELOADABLE_FIELDS, (
-            f'{field!r} is expected to be green-tier reloadable but is '
-            f'missing from RELOADABLE_FIELDS'
-        )
-
-    def test_task_weight_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
+    def test_weight_edit_lands_in_applied_candidates_not_restart_required(
+        self, field, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        live = OrchestratorConfig(verify_cgroup_cpu_weight_task=33)
-        fresh = OrchestratorConfig(verify_cgroup_cpu_weight_task=50)
-        diff = diff_config(live, fresh)
-        assert 'verify_cgroup_cpu_weight_task' in diff.applied_candidates
-        assert 'verify_cgroup_cpu_weight_task' not in diff.restart_required
-
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        live = OrchestratorConfig(verify_cgroup_cpu_weight_task=33)
-        fresh = OrchestratorConfig(verify_cgroup_cpu_weight_task=50)
-        report = apply_reload(live, fresh)
-        assert report['reloaded'] is True
-        assert report['applied']['verify_cgroup_cpu_weight_task'] == {
-            'old': 33, 'new': 50,
-        }
-        assert 'verify_cgroup_cpu_weight_task' not in report['restart_required']
-        assert live.verify_cgroup_cpu_weight_task == 50
+        before: dict[str, Any] = {field: 33}
+        after: dict[str, Any] = {field: 50}
+        diff = diff_config(OrchestratorConfig(**before), OrchestratorConfig(**after))
+        assert field in diff.applied_candidates
+        assert field not in diff.restart_required
