@@ -56,19 +56,14 @@ Delete the vestigial sites (never narrow or carve out), then add the prefix to
 PLACEMENT. ``tests/scripts/`` carries its own module config, so a guard here
 cannot be silenced by editing the command it asserts about — the reasoning in
 ``tests/scripts/test_module_type_check_invocation.py``'s PLACEMENT paragraph.
-The pyright subprocess discipline is replicated from
-``tests/scripts/test_root_py_type_gate.py::_pyright_report``, not imported: this
-directory bans importing a sibling test file.
 """
 from __future__ import annotations
 
-import json
 import pathlib
-import subprocess
-import sys
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from pyright_json import pyright_json_report
 from verify_command_invariants import PYRIGHT, anchor_split, required_segment
 
 if TYPE_CHECKING:
@@ -106,32 +101,6 @@ def _pyright_config_dir(command: str, *, label: str) -> pathlib.Path:
         if token.startswith("--directory="):
             return REPO_ROOT / token.removeprefix("--directory=")
     return REPO_ROOT
-
-
-def _probe_report(config_dir: pathlib.Path, probe: pathlib.Path) -> dict[str, Any]:
-    """The parsed ``pyright --outputjson -p <config_dir> <probe>`` payload."""
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pyright", "--outputjson",
-            "-p", str(config_dir), str(probe),
-        ],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
-    # No try/except-and-skip: a missing or broken pyright must FAIL this guard.
-    assert proc.returncode in (0, 1), (
-        f"`pyright --outputjson` exited {proc.returncode} — expected 0 (clean) "
-        f"or 1 (diagnostics). A missing pyright module or a bad invocation must "
-        f"fail this guard rather than skip it; stderr: {proc.stderr.strip()!r}"
-    )
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
-        raise AssertionError(
-            f"could not parse `pyright --outputjson` output: {exc}; "
-            f"stdout: {proc.stdout[:500]!r}; stderr: {proc.stderr.strip()!r}"
-        ) from exc
 
 
 def _error_rules_by_line(payload: dict[str, Any]) -> list[tuple[int, str]]:
@@ -176,7 +145,7 @@ def test_opted_in_type_gate_reports_a_vestigial_suppression(
     probe = tmp_path / "probe.py"
     probe.write_text(_PROBE_SOURCE, encoding="utf-8")
 
-    payload = _probe_report(config_dir, probe)
+    payload = pyright_json_report([probe], project_dir=config_dir)
 
     analyzed = payload.get("summary", {}).get("filesAnalyzed")
     assert analyzed == 1, (
