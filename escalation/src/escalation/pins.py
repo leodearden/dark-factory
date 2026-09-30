@@ -67,6 +67,7 @@ __all__ = [
     'PinRecord',
     'PinReport',
     'classify_pins',
+    'is_queue_handoff',
     'pinned_only_by_human_parked',
 ]
 
@@ -465,6 +466,18 @@ def pinned_only_by_human_parked(
         return False
     levels = {record.id: record.level for record in records}
     return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+
+
+def is_queue_handoff(record: PinRecord) -> bool:
+    """Does this ONE open record gate a live run?
+
+    True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
+    ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
+    so in practice only info never gates.  Consumers:
+    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`` and
+    ``::TaskWorkflow._wait_for_resolution`` (task 5222 / PRD gamma).
+    """
+    return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
 
 
 def _is_human_level(level: object) -> bool:
