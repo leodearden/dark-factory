@@ -592,6 +592,10 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
         # the skew is large enough to matter.
         if not path.is_file():
             continue
+        # A tracked symlink is an alias, not a site: its target is scanned in
+        # its own right.
+        if path.is_symlink():
+            continue
         found.append(path)
     # `git ls-files` lists an UNMERGED path once per merge stage — a
     # conflicted worktree can yield the same path 2-3x (verified: 3x after a
