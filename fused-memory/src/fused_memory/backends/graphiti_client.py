@@ -1293,8 +1293,8 @@ class GraphitiBackend:
         self._identity_locks: dict[str, asyncio.Lock] = {}
         # Guards ensure_indices' read-diff-write critical section, one Lock per
         # graph.  Deliberately SEPARATE from _identity_locks: asyncio.Lock is not
-        # reentrant, and task γ's first-write choke point calls ensure_indices
-        # from a write path that may already hold _identity_lock_for(group_id) —
+        # reentrant, and γ's first-write choke point provisions from a write
+        # path that may already hold _identity_lock_for(group_id) —
         # reusing that lock would deadlock rather than serialize.
         self._index_provision_locks: dict[str, asyncio.Lock] = {}
         self._llm_client = None
@@ -1407,6 +1407,19 @@ class GraphitiBackend:
             self._identity_locks[group_id] = lock
         return lock
 
+    def _index_provision_lock_for(self, group_id: str) -> asyncio.Lock:
+        """Return the per-graph index-provisioning lock, creating it lazily.
+
+        Same shape as :meth:`_identity_lock_for`, over the separate
+        ``_index_provision_locks`` registry (see ``__init__`` for why sharing the
+        identity lock would deadlock).  Undecorated: callers pass canonical ids.
+        """
+        lock = self._index_provision_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._index_provision_locks[group_id] = lock
+        return lock
+
     def _require_driver(self) -> FalkorDriver:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
@@ -1418,52 +1431,66 @@ class GraphitiBackend:
         return cast(Any, driver).client
 
     async def _ensure_indices(self, group_id: str) -> None:
-        """A DELIBERATE no-op today. NOT the provisioning path — see ``ensure_indices``.
+        """Provision *group_id*'s indices if it is registered and not yet cached.
 
-        ``build_indices_and_constraints`` is overridden to ``pass`` on
-        ``_MultiTenantFalkorDriver`` (D4, kept on purpose: removing it is what
-        caused the ``723ec915c3`` connection storm), so this method builds
-        nothing.  It previously ended with a ``logger.debug`` line claiming the
-        graph's indices had been ensured — fired unconditionally after that
-        no-op, and at DEBUG, so at the service's INFO level it produced neither a
-        positive nor a negative signal.  There was no signal in the logs at all.
-        Task 3707 (β) deleted it; the structured :class:`IndexProvisionResult`
-        (INFO on change, WARNING on failure) replaces it at the boundary where the
-        work actually happens.  ``test_ensure_indices.py`` pins the property
-        behaviourally — this method must emit no log record at ANY level — so the
-        guard tracks the semantics rather than a substring, and stays valid under
-        any rewording here.
+        γ's single entry for both call sites, the startup sweep and the first
+        write, and it NEVER raises: a provisioning failure must fail neither the
+        write that triggered it nor the rest of the sweep.
 
-        β deliberately does NOT route this method through
-        :meth:`ensure_indices`, and that is not an abandoned half-fix.
-        ``initialize()`` enumerates every graph on the server under the
-        ``!= 'default_db' and not endswith('_db')`` filter — all 35 probe / test /
-        scratch graphs plus the 6 real trap graphs — and calls this on each.
-        Wiring it here would therefore provision every real project graph on the
-        next ``fused-memory.service`` restart: destroying esc-3375-1's protected
-        evidence (the current absence of indices) and bypassing PRD D10's
-        activation gate, which is exactly why the follow-on task γ depends on
-        external tasks 3658/3659/3660 and is named "the task whose merge changes
-        live graphs".
+        * A graph is cached once :meth:`_ensure_indices_locked` RETURNS, even with
+          per-statement ``failed`` entries: those are already WARNING-logged, and
+          δ's drift detector owns a persistent gap.
+        * When it RAISES or times out, it is logged and left uncached, so the next
+          write or sweep retries.
+        * The lock hold is bounded by the write timeout.
+        * No OPERATIONAL barrier (INV-7).
 
-        **Task γ owns the rewiring** — both call sites (the startup enumeration
-        and the first-write choke point) — and lands the D5 registry filter in the
-        same change, so the enumeration stops sweeping scratch graphs at the
-        moment it starts doing real work.
+        See docs/prds/falkordb-index-provisioning.md D4-D6.
         """
+        if group_id not in self._registered_graph_ids:
+            return
         if group_id in self._indexed_graphs:
             return
-        driver = self._driver_for(group_id)
-        await driver.build_indices_and_constraints()
-        self._indexed_graphs.add(group_id)
+        async with self._index_provision_lock_for(group_id):
+            # INV-3: _indexed_graphs is an in-process snapshot cache.  It can only
+            # skip redundant WORK, never cause a wrong ACTION: provisioning
+            # re-reads list_indices() (ground truth) and diffs before creating.
+            if group_id in self._indexed_graphs:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._ensure_indices_locked(group_id), timeout=self._write_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Index provisioning on graph %r did not complete (%s: %s); left '
+                    'uncached, so the next write or restart retries it',
+                    group_id, type(exc).__name__, exc, exc_info=True,
+                )
+                return
+            self._indexed_graphs.add(group_id)
+
+    async def provision_registered_graphs(self) -> None:
+        """Provision every registered graph that already exists — PRD D6's startup half.
+
+        The scope is the registry, not a graph name (D5): the RAW listing is
+        intersected with :attr:`registered_graph_ids`, so probe, test and scratch
+        graphs are skipped by construction.  A registered graph with no key yet
+        is left to its first write.  Safe to call at any time (idempotent, and
+        cached per process).  A listing failure propagates; a failure on one
+        graph does not (see :meth:`_ensure_indices`).
+        """
+        existing = await self._require_falkor_client().list_graphs()
+        for graph_name in sorted(set(existing) & self._registered_graph_ids):
+            await self._ensure_indices(graph_name)
 
     async def initialize(self, *, skip_maintenance: bool = False) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
 
         skip_maintenance: when True, skip both startup maintenance blocks
-        (the index-build loop and the W6-ε startup identity scan, which
-        REPAIRS dup-uuid edges — a write). Default False preserves current
-        behavior. Intended for lean, read-only callers (e.g. the ζ
+        (the registered-graph index provisioning sweep and the W6-ε startup
+        identity scan, which REPAIRS dup-uuid edges — a write). Default False
+        preserves current behavior. Intended for lean, read-only callers (e.g. the ζ
         migrate_cross_graph_leak.py dry-run/census) that need a
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
@@ -1545,13 +1572,10 @@ class GraphitiBackend:
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
-        # Build indices on all existing project graphs (lazy set avoids repeats).
+        # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
             try:
-                existing = await self._require_falkor_client().list_graphs()
-                for graph_name in existing:
-                    if graph_name != 'default_db' and not graph_name.endswith('_db'):
-                        await self._ensure_indices(graph_name)
+                await self.provision_registered_graphs()
             except Exception:
                 logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
 
@@ -4980,11 +5004,7 @@ class GraphitiBackend:
         """
         # See the "Serialized per graph" contract bullet: the diff read and the
         # writes it plans must not interleave with another call for this graph.
-        lock = self._index_provision_locks.get(group_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._index_provision_locks[group_id] = lock
-        async with lock:
+        async with self._index_provision_lock_for(group_id):
             return await self._ensure_indices_locked(group_id)
 
     async def _ensure_indices_locked(self, group_id: str) -> IndexProvisionResult:
