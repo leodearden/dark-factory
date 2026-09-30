@@ -1,0 +1,75 @@
+"""The committed selection report is what the stock CLI makes of the cache.
+
+``plans/read-transform-selection-report.{json,md}`` must equal a stock-flag
+run of ``scripts/read_transform_selection.py`` over the committed fixtures
+and fetch cache, so a metric change that lands without a regeneration fails
+here.  ``test_read_transform_selection.py`` pins the same artifact AS DATA;
+this file pins that the data is still what the generator produces, and that
+every commit the report stamps is on this history.
+
+Merge lane, offline: no network, Qdrant or OPENAI_API_KEY.  Git is needed
+only to resolve the stamps.
+
+On failure, re-run the stock command (``REGENERATE_COMMAND``) and commit BOTH
+files.  Never hand-edit either one (PRD G6/D10).
+"""
+from __future__ import annotations
+
+import copy
+import functools
+import json
+import types
+from pathlib import Path
+
+from _fm_helpers import load_script_module
+
+SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'read_transform_selection.py'
+
+REGENERATE_COMMAND = (
+    'uv run --project fused-memory python '
+    'fused-memory/scripts/read_transform_selection.py'
+)
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    return load_script_module(SCRIPT_PATH, mod_name='read_transform_selection')
+
+
+@functools.cache
+def _committed_report() -> dict:
+    return json.loads(_mod().DEFAULT_SELECTION_JSON.read_text(encoding='utf-8'))
+
+
+@functools.cache
+def _committed_markdown() -> str:
+    return _mod().DEFAULT_SELECTION_MD.read_text(encoding='utf-8')
+
+
+class TestTheCommitStampMaskHidesOnlyTheStamps:
+    def test_a_restamped_report_compares_equal(self):
+        committed = _committed_report()
+        restamped = copy.deepcopy(committed)
+        for entry in restamped['fixture_provenance']:
+            entry['commit'] = 'f' * 40
+
+        assert _without_commit_stamps(restamped) == _without_commit_stamps(committed)
+
+    def test_a_moved_metric_still_compares_unequal(self):
+        committed = _committed_report()
+        moved = copy.deepcopy(committed)
+        moved['arms'][_mod().ARM_KEYS[0]]['e2']['tokens_per_query'] += 1
+
+        assert _without_commit_stamps(moved) != _without_commit_stamps(committed)
+
+    def test_a_changed_fixture_path_still_compares_unequal(self):
+        committed = _committed_report()
+        moved = copy.deepcopy(committed)
+        moved['fixture_provenance'][0]['path'] += '.renamed'
+
+        assert _without_commit_stamps(moved) != _without_commit_stamps(committed)
+
+    def test_masking_leaves_its_input_untouched(self):
+        _without_commit_stamps(_committed_report())
+
+        assert _committed_report()['fixture_provenance'][0]['commit']
