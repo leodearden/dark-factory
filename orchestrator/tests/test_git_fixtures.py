@@ -173,7 +173,7 @@ def test_a_non_empty_destination_commits_its_existing_files(
     assert _out(repo, 'log', '-1', '--format=%s') == 'Initial commit'
 
 
-def test_a_copy_costs_at_most_one_git_spawn(
+def test_a_copy_costs_exactly_one_git_spawn(
     templates: RepoTemplates, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     templates.seed(tmp_path / 'warm', README_SEED)
@@ -181,7 +181,24 @@ def test_a_copy_costs_at_most_one_git_spawn(
 
     templates.seed(tmp_path / 'measured', README_SEED)
 
-    assert _spawns(log) <= 1
+    assert _spawns(log) == 1
+
+
+def test_a_non_empty_destination_costs_a_full_build(
+    templates: RepoTemplates, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    populated = tmp_path / 'populated'
+    populated.mkdir()
+    (populated / 'extra.txt').write_text('already here\n')
+    log = _install_git_spawn_counter(monkeypatch, tmp_path / 'shim')
+
+    build_repo(tmp_path / 'reference', README_SEED)
+    full_build_cost = _spawns(log)
+    templates.seed(populated, README_SEED)
+    in_place_cost = _spawns(log) - full_build_cost
+
+    assert full_build_cost > 1
+    assert in_place_cost == full_build_cost
 
 
 def test_seed_repo_uses_the_session_templates(tmp_path: Path) -> None:
@@ -243,7 +260,7 @@ class TestSharedWorkflowSeeders:
         assert _out(repo, 'config', 'user.name') == 'Test'
         assert _git(repo, 'diff-files', '--quiet').returncode == 0
 
-    def test_a_warm_call_costs_at_most_one_git_spawn(
+    def test_a_warm_call_costs_exactly_one_git_spawn(
         self, seeder: Seeder, files: dict[str, str], subject: str,
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -254,7 +271,7 @@ class TestSharedWorkflowSeeders:
 
         asyncio.run(seeder(tmp_path / 'measured'))
 
-        assert _spawns(log) <= 1
+        assert _spawns(log) == 1
 
 
 _MIGRATED_MODULES = tuple(

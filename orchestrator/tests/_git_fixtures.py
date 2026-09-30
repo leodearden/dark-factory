@@ -90,12 +90,17 @@ class RepoTemplates:
     def seed(self, dest: Path, seed: RepoSeed = README_SEED) -> Path:
         """Make *dest* a pristine repo for *seed*.
 
-        A non-empty *dest* is built in place instead of copied into, so its
-        existing files land in the initial commit exactly as ``git add -A``
+        An absent or empty *dest* gets a copy of the template: one git spawn.
+        A non-empty *dest* cannot be copied into without leaving its files
+        untracked, so it pays for a full :func:`build_repo` in place instead,
+        and its files land in the initial commit exactly as ``git add -A``
         would have put them there.
         """
         if dest.exists() and any(dest.iterdir()):
             return build_repo(dest, seed)
+        return self._copy_template(dest, seed)
+
+    def _copy_template(self, dest: Path, seed: RepoSeed) -> Path:
         shutil.copytree(self._template(seed), dest, symlinks=True, dirs_exist_ok=True)
         _git(dest, 'update-index', '--refresh')
         return dest
@@ -125,7 +130,11 @@ def session_templates(root: Path) -> Iterator[RepoTemplates]:
 
 
 def seed_repo(dest: Path, seed: RepoSeed = README_SEED) -> Path:
-    """Make *dest* a pristine repo for *seed* from the session's templates."""
+    """Make *dest* a pristine repo for *seed* via the session's :meth:`RepoTemplates.seed`.
+
+    Seed an absent or empty *dest*: a non-empty one forfeits the copy and pays
+    for a full build.
+    """
     if _session is None:
         raise RuntimeError(
             'no session RepoTemplates is installed; '
