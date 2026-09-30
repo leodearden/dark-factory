@@ -6,7 +6,7 @@ the reviewer's copy lands in the optimizer-editable HEURISTICS half, that the
 architect-only addendum reaches only the architect, and that the block IS the
 render of the packaged normative doc rather than a hand-written copy.
 
-The block's own shape — headings, numbering, labels, brace-freedom — is tested
+The block's own shape — headings, numbering, list shape, brace-freedom — is tested
 against the doc in ``orchestrator/tests/test_code_quality.py``.
 """
 

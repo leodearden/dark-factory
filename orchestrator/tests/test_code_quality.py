@@ -2,8 +2,7 @@
 the role prompts' code-quality block from the packaged normative doc.
 
 The synthetic half proves ``section()`` and ``render()`` can FAIL: a missing,
-empty or brace-carrying rendered section raises, naming the section, and the
-parsers below raise on a hole in a numbered list.
+empty or brace-carrying rendered section raises, naming the section.
 """
 
 from __future__ import annotations
@@ -22,114 +21,24 @@ from orchestrator.agents.code_quality import NORMATIVE_DOC, guidance, render, se
 # orchestrator/, the repo root and a ``.worktrees/<id>`` checkout alike.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_ANCHOR = '## The fourteen heuristics'
 _TITLE = '## Code quality — judge against this definition'
+_DEFINITION = '## Definition'
+_HEURISTICS = '## The fourteen heuristics'
+_STANCES = '## Two stances'
+_DO_NOT_STEER = '## Do not steer by'
 
-#: A headline is ``<n>. **<text>**`` at COLUMN 0, so an indented continuation
-#: line's own bold run (the real doc's heuristic 14 carries ``**No cheating**``)
-#: is never read as a further headline.
-_HEADLINE_RE = re.compile(r'^(\d{1,2})\. \*\*(.+?)\*\*', re.MULTILINE)
-
-#: A bullet label is ``- **<text>**`` at COLUMN 0, for the same reason: a
-#: bullet's continuation lines carry their own inline bold and are not items.
-_BULLET_LABEL_RE = re.compile(r'^- \*\*(.+?)\*\*', re.MULTILINE)
-
-
-def numbered_headlines(text: str, heading: str) -> list[str]:
-    """Return the bold headlines of the numbered list under *heading*, in order.
-
-    Raises :class:`ValueError` naming the observed numbers when they are not
-    exactly ``1..n``: an item dropped from the middle of the list leaves a hole,
-    and a hole is an error rather than a shorter answer.
-    """
-    matches = _HEADLINE_RE.findall(section(text, heading))
-    numbers = [int(number) for number, _ in matches]
-    if numbers != list(range(1, len(numbers) + 1)):
-        raise ValueError(
-            f'the numbered list under {heading!r} is not numbered 1..n — '
-            f'observed {numbers}. An item was dropped, renumbered, or lost its '
-            'bold headline.'
-        )
-    return [headline for _, headline in matches]
-
-
-def bold_item_labels(text: str, heading: str) -> list[str]:
-    """Return the bold LABELS of the bullet list under *heading*, in order."""
-    return _BULLET_LABEL_RE.findall(section(text, heading))
-
-
-# ---------------------------------------------------------------------------
-# Parser synthetics. A numbered bold item BEFORE the anchor and one AFTER the
-# section's terminating ``## `` heading must both be excluded.
-# ---------------------------------------------------------------------------
-
-_WELL_FORMED = (
-    '# Code quality\n\n'
-    '## Definition\n\n'
-    '1. **Not a heuristic.** A numbered bold item in an EARLIER section.\n\n'
-    f'{_ANCHOR}\n\n'
-    'Prose between the heading and the list, which this parser never reads.\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n'
-    '2. **Simple control flows.** Few decision points per unit.\n'
-    '3. **SPOT — single point of truth.** Each fact lives in one place.\n\n'
-    '## Two stances\n\n'
-    '4. **Not a heuristic either.** A numbered bold item in a LATER section.\n'
-)
-
-_WITH_CONTINUATION = (
-    f'{_ANCHOR}\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n'
-    '   **No cheating**: an indented continuation line has its own bold run.\n'
-    '2. **Simple control flows.** Few decision points per unit.\n\n'
-    '## Two stances\n'
-)
-
-_WITH_UNBOLDED_TAIL = (
-    f'{_ANCHOR}\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n'
-    '2. A numbered line carrying no bold headline at all.\n\n'
-    '## Two stances\n'
-)
-
-_WITH_UNBOLDED_MIDDLE = (
-    f'{_ANCHOR}\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n'
-    '2. A numbered line carrying no bold headline at all.\n'
-    '3. **Simple control flows.** Few decision points per unit.\n\n'
-    '## Two stances\n'
-)
-
-_NON_CONTIGUOUS = (
-    f'{_ANCHOR}\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n'
-    '2. **Simple control flows.** Few decision points per unit.\n'
-    '4. **Small function scopes.** A function does one thing.\n\n'
-    '## Two stances\n'
-)
-
-# The anchor DEMOTED below ``## ``, with the section that follows carrying
-# numbered bold items of its own. A substring search would match the demoted
-# heading, and the ``^## `` terminator would not close it.
-_DEMOTED_ANCHOR = (
-    f'#{_ANCHOR}\n\n'
-    '1. **Informative names.** A name says what the thing is and does.\n\n'
-    '## A later section\n\n'
-    '2. **Not a heuristic.** A numbered bold item the slice must never reach.\n'
-)
-
-# Continuation lines sit at column 0 carrying their own inline bold.
-_BULLET_SECTION = (
-    '## Two stances\n\n'
-    '- **Comments.** Aim for code that is clear with no or low comments, since\n'
-    'a continuation line carries its own **inline bold** and is not an item.\n'
-    "- **Tests.** Test access to a module's internals is an interface smell.\n\n"
-    '## Do not steer by\n\n'
-    '- **Raw line count.** A bullet in a LATER section.\n'
-)
+#: The rendered sections whose body is a ``- **Label.**`` bullet list.
+_BULLET_SECTION_HEADINGS = (_STANCES, _DO_NOT_STEER)
+#: The doc sections rendered verbatim under their own heading, in order.
+_VERBATIM_SECTION_HEADINGS = (_HEURISTICS, *_BULLET_SECTION_HEADINGS)
+#: The doc sections render() carries, in the order it carries them.
+_RENDERED_SOURCE_HEADINGS = (_DEFINITION, *_VERBATIM_SECTION_HEADINGS)
+#: The rendered block's headings: the title stands in for ``## Definition``.
+_EXPECTED_RENDERED_HEADINGS = (_TITLE, *_VERBATIM_SECTION_HEADINGS)
 
 
 class TestSection:
-    """``section()`` — the one slicer behind ``render()`` and both parsers."""
+    """``section()`` — the slicer behind ``render()``."""
 
     _TEXT = (
         '# Title\n\n'
@@ -158,80 +67,6 @@ class TestSection:
             section(self._TEXT.replace('## B', '### B'), '## B')
 
 
-class TestHeadlineParser:
-    """The numbered-headline parser, against synthetic strings only."""
-
-    def test_headlines_returned_in_document_order(self):
-        assert numbered_headlines(_WELL_FORMED, _ANCHOR) == [
-            'Informative names.',
-            'Simple control flows.',
-            'SPOT — single point of truth.',
-        ]
-
-    def test_indented_continuation_bold_run_is_not_a_headline(self):
-        assert numbered_headlines(_WITH_CONTINUATION, _ANCHOR) == [
-            'Informative names.',
-            'Simple control flows.',
-        ]
-
-    def test_numbered_line_without_a_bold_headline_is_not_picked_up(self):
-        assert numbered_headlines(_WITH_UNBOLDED_TAIL, _ANCHOR) == ['Informative names.']
-
-    def test_unbolded_line_inside_the_list_is_caught_by_the_contiguity_check(self):
-        # Not picking up an unbolded line is only safe because a DROPPED item
-        # inside the list shows up as a hole in the numbering.
-        with pytest.raises(ValueError, match=r'\[1, 3\]'):
-            numbered_headlines(_WITH_UNBOLDED_MIDDLE, _ANCHOR)
-
-    def test_section_stops_at_the_next_heading(self):
-        headlines = numbered_headlines(_WELL_FORMED, _ANCHOR)
-        assert 'Not a heuristic.' not in headlines
-        assert 'Not a heuristic either.' not in headlines
-
-    def test_missing_heading_raises_naming_the_heading_it_looked_for(self):
-        text = _WELL_FORMED.replace(_ANCHOR, '## The fifteen heuristics')
-        with pytest.raises(ValueError, match=re.escape(_ANCHOR)):
-            numbered_headlines(text, _ANCHOR)
-
-    def test_non_contiguous_numbering_raises_naming_the_observed_numbers(self):
-        with pytest.raises(ValueError, match=r'\[1, 2, 4\]'):
-            numbered_headlines(_NON_CONTIGUOUS, _ANCHOR)
-
-    def test_one_renamed_headline_changes_the_parsed_list(self):
-        drifted = _WELL_FORMED.replace(
-            '2. **Simple control flows.**', '2. **Straightforward control flows.**',
-        )
-        assert numbered_headlines(drifted, _ANCHOR) != numbered_headlines(_WELL_FORMED, _ANCHOR)
-
-    def test_a_demoted_heading_raises_rather_than_matching_as_a_substring(self):
-        with pytest.raises(ValueError, match=re.escape(_ANCHOR)):
-            numbered_headlines(_DEMOTED_ANCHOR, _ANCHOR)
-
-
-class TestBoldItemLabels:
-    """The bullet-label parser, against synthetic strings only."""
-
-    def test_labels_returned_in_document_order(self):
-        assert bold_item_labels(_BULLET_SECTION, '## Two stances') == ['Comments.', 'Tests.']
-
-    def test_a_continuation_lines_inline_bold_is_not_a_label(self):
-        assert 'inline bold' not in bold_item_labels(_BULLET_SECTION, '## Two stances')
-
-    def test_section_stops_at_the_next_heading(self):
-        assert bold_item_labels(_BULLET_SECTION, '## Do not steer by') == ['Raw line count.']
-
-    def test_missing_heading_raises_naming_the_heading_it_looked_for(self):
-        with pytest.raises(ValueError, match=re.escape('## Nowhere')):
-            bold_item_labels(_BULLET_SECTION, '## Nowhere')
-
-    def test_one_renamed_label_changes_the_parsed_list(self):
-        drifted = _BULLET_SECTION.replace('- **Comments.**', '- **On comments.**')
-        assert (
-            bold_item_labels(drifted, '## Two stances')
-            != bold_item_labels(_BULLET_SECTION, '## Two stances')
-        )
-
-
 # ---------------------------------------------------------------------------
 # render() over a synthetic doc with the real doc's section layout. Each body
 # is a distinctive sentence so presence and absence are unambiguous.
@@ -240,27 +75,23 @@ class TestBoldItemLabels:
 _PREAMBLE = '# Code quality\n\nPreamble sentence that is never rendered.\n'
 
 _SECTIONS = {
-    '## Definition': 'Definition sentence of the synthetic doc.',
-    _ANCHOR: (
+    _DEFINITION: 'Definition sentence of the synthetic doc.',
+    _HEURISTICS: (
         'Heuristics intro sentence.\n\n'
         '1. **Informative names.** A name says what the thing is.\n'
         '2. **Simple control flows.** Few decision points per unit.'
     ),
-    '## Two stances': (
+    _STANCES: (
         '- **Comments.** Stance sentence about comments.\n'
         '- **Tests.** Stance sentence about tests.'
     ),
     '## What to measure': 'Measurement sentence that is never rendered.',
-    '## Do not steer by': '- **Raw line count.** Do-not-steer sentence.',
+    _DO_NOT_STEER: '- **Raw line count.** Do-not-steer sentence.',
     '## Relationship to the design invariants': 'Relationship sentence that is never rendered.',
     '## Reach': 'Reach sentence that is never rendered.',
 }
 
-#: The doc sections render() carries, in the order it carries them.
-_RENDERED_SOURCE_HEADINGS = ('## Definition', _ANCHOR, '## Two stances', '## Do not steer by')
-#: The rendered sections whose body is a ``- **Label.**`` bullet list.
-_BULLET_SECTION_HEADINGS = ('## Two stances', '## Do not steer by')
-_EXCLUDED_HEADINGS = ('## What to measure', '## Relationship to the design invariants', '## Reach')
+_EXCLUDED_HEADINGS = tuple(h for h in _SECTIONS if h not in _RENDERED_SOURCE_HEADINGS)
 
 
 def _doc(sections: dict[str, str]) -> str:
@@ -285,18 +116,15 @@ class TestRender:
         assert not rendered.endswith('\n\n')
 
     def test_carries_exactly_the_rendered_headings_in_order(self):
-        assert re.findall(r'^## .*$', render(_doc(_SECTIONS)), re.MULTILINE) == [
-            _TITLE,
-            _ANCHOR,
-            '## Two stances',
-            '## Do not steer by',
-        ]
+        assert tuple(re.findall(r'^## .*$', render(_doc(_SECTIONS)), re.MULTILINE)) == (
+            _EXPECTED_RENDERED_HEADINGS
+        )
 
     def test_the_definition_body_sits_verbatim_under_the_title(self):
         rendered = render(_doc(_SECTIONS))
-        assert section(rendered, _TITLE).strip() == _SECTIONS['## Definition']
+        assert section(rendered, _TITLE).strip() == _SECTIONS[_DEFINITION]
 
-    @pytest.mark.parametrize('heading', _RENDERED_SOURCE_HEADINGS[1:])
+    @pytest.mark.parametrize('heading', _VERBATIM_SECTION_HEADINGS)
     def test_each_rendered_section_body_is_verbatim(self, heading):
         assert section(render(_doc(_SECTIONS)), heading).strip() == _SECTIONS[heading]
 
@@ -310,7 +138,7 @@ class TestRender:
     def test_editing_a_rendered_sentence_changes_the_render(self):
         edited = 'Stance sentence about comments, edited in the doc alone.'
         rendered = render(
-            _with('## Two stances', _SECTIONS['## Two stances'].replace(
+            _with(_STANCES, _SECTIONS[_STANCES].replace(
                 'Stance sentence about comments.', edited,
             ))
         )
@@ -322,16 +150,17 @@ class TestRender:
             render(_without(heading))
 
     def test_a_whitespace_only_rendered_section_raises_naming_it(self):
-        with pytest.raises(ValueError, match=re.escape('## Two stances')):
-            render(_with('## Two stances', '   \n\t'))
+        with pytest.raises(ValueError, match=re.escape(_STANCES)):
+            render(_with(_STANCES, '   \n\t'))
 
     @pytest.mark.parametrize('brace', ['{', '}'])
     def test_a_brace_in_a_rendered_section_raises_naming_it(self, brace):
-        with pytest.raises(ValueError, match=re.escape('## Do not steer by')):
-            render(_with('## Do not steer by', f'- **Raw line count.** A literal {brace} here.'))
+        with pytest.raises(ValueError, match=re.escape(_DO_NOT_STEER)):
+            render(_with(_DO_NOT_STEER, f'- **Raw line count.** A literal {brace} here.'))
 
-    def test_a_brace_in_an_excluded_section_does_not_raise(self):
-        render(_with('## Reach', 'A literal { brace in a section that is never rendered.'))
+    @pytest.mark.parametrize('heading', _EXCLUDED_HEADINGS)
+    def test_a_brace_in_an_excluded_section_does_not_raise(self, heading):
+        render(_with(heading, 'A literal { brace in a section that is never rendered.'))
 
 
 class TestNormativeDocLocation:
@@ -391,19 +220,15 @@ class TestRenderedGuidanceShape:
         assert not block.endswith('\n\n')
 
     def test_carries_exactly_the_rendered_headings_in_order(self, block):
-        assert re.findall(r'^## .*$', block, re.MULTILINE) == [
-            _TITLE,
-            _ANCHOR,
-            '## Two stances',
-            '## Do not steer by',
-        ]
+        assert tuple(re.findall(r'^## .*$', block, re.MULTILINE)) == _EXPECTED_RENDERED_HEADINGS
 
-    def test_carries_fourteen_numbered_heuristics(self, block):
-        assert len(numbered_headlines(block, _ANCHOR)) == 14
+    def test_numbers_the_heuristics_one_to_fourteen(self, block):
+        numbers = re.findall(r'^(\d+)\. \*\*', section(block, _HEURISTICS), re.MULTILINE)
+        assert numbers == [str(n) for n in range(1, 15)]
 
     @pytest.mark.parametrize('heading', _BULLET_SECTION_HEADINGS)
     def test_each_bullet_section_is_a_bold_labelled_list(self, block, heading):
-        assert bold_item_labels(block, heading), (
+        assert re.search(r'^- \*\*', section(block, heading), re.MULTILINE), (
             f"{heading!r} carries no '- **Label.**' bullet at column 0: the "
             "section must stay a bold-labelled bullet list."
         )
