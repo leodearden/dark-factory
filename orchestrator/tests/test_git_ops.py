@@ -3401,7 +3401,13 @@ class TestAdvanceMainConflictMarkerGate:
         wt = await git_ops.create_worktree('task-dir-no-longer-blocks')
         lane = wt.path
 
-        # Force a `.task/` entry into the branch tree with RAW git.
+        # Force a `.task/` entry into the branch tree with RAW git.  Pin the
+        # repo's excludes file to an empty one first: without it `git add -A`
+        # honours the host user's global excludes (~/.config/git/ignore), and a
+        # host that ignores `.task/` there would silently skip the hostile add.
+        await _run(
+            ['git', 'config', 'core.excludesFile', '/dev/null'], cwd=lane,
+        )
         task_dir = lane / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{}')
