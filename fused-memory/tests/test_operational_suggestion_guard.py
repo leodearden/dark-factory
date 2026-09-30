@@ -671,6 +671,28 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         )
         assert 'confirm' in ungated.markers
 
+    def test_weak_marker_and_artifact_noun_both_inside_a_stamp_stay_gated(self):
+        """The one near-miss shape the task-5106 census found in live task
+        rows: the stamp carries BOTH the weak marker and the artifact noun, so
+        the raw-text gate keeps the marker gated. Gating stamp-stripped text
+        instead would turn this into a finding built from annotator wording,
+        not the filing author's."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Add a typed verdict adapter to the triage judge.'
+                '\n\n[2026-09-30 RULING] Confirm first on a fresh population; '
+                'the classifier trial was inconclusive.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, (
+            "A weak marker inside a stamp stays gated by that stamp's own "
+            f'artifact noun (task 5106 won\'t-fix), got: {finding!r}'
+        )
+
 
 class TestProvenanceStampRecognizerParityWithRoutingIntentGuard:
     """The stamp recognizer is duplicated LOCALLY in this guard rather than
