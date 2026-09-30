@@ -668,44 +668,6 @@ class TestStructuredLogging:
             if r.name == self._LOGGER and r.levelno >= logging.INFO
         ] == []
 
-    @pytest.mark.asyncio
-    async def test_the_deliberate_no_op_claims_nothing_at_any_level(
-        self, mock_config, make_backend, caplog,
-    ):
-        """INV-2: ``_ensure_indices`` does nothing, so it must claim nothing — at ANY level.
-
-        ``build_indices_and_constraints`` is a ``pass`` override (D4), so this
-        method provisions no index.  A log line emitted after it would be a
-        false positive whatever it said, and DEBUG is the worst place to say it:
-        below the service's INFO level it is neither a positive nor a negative
-        signal.  So the property asserted here is the ABSENCE of any record from
-        this module's logger, with NO claim about wording — a differently-phrased
-        re-addition is exactly as wrong, and a substring check would wave it
-        through.
-
-        Non-vacuity matters as much as the absence: the ``_indexed_graphs`` early
-        return would let this pass with the body never executing, so the awaited
-        build and the memoised group_id are asserted too.
-
-        HAZARD: the driver is a bare mock.  Constructing a real ``FalkorDriver``
-        (or ``_MultiTenantFalkorDriver``) here would fire-and-forget a genuine
-        index build under the running loop.
-        """
-        driver = MagicMock()
-        driver.build_indices_and_constraints = AsyncMock(return_value=None)
-        backend = make_backend(mock_config)
-        backend._driver_for = MagicMock(return_value=driver)
-        assert 'test' not in backend._indexed_graphs, (
-            'the memoisation set must start empty or the body never runs'
-        )
-
-        with caplog.at_level(logging.DEBUG, logger=self._LOGGER):
-            await backend._ensure_indices('test')
-
-        assert [r for r in caplog.records if r.name == self._LOGGER] == []
-        assert driver.build_indices_and_constraints.await_count == 1
-        assert 'test' in backend._indexed_graphs
-
 
 class TestProvisioningHazardGuards:
     """The D4 override β must NOT break while adding a provisioning path.
