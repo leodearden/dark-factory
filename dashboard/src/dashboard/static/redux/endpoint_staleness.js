@@ -101,11 +101,12 @@ function staleEntryFor(stale, path) {
 }
 
 /**
- * A human age for `ms`, e.g. '45s', '6m', '19h 48m'.
+ * A human age for `ms`, e.g. '45s', '6m', '19h 48m', '1d 3h'.
  *
  * Hours are rendered as hours rather than as a four-digit minute count: the
  * incident this indicator exists for ran 19.8h, and an operator should not
- * have to divide 1188 by 60 to notice that.
+ * have to divide 1188 by 60 to notice that. Days are rendered as days for the
+ * same reason: an idle project's cards are weeks old, and '480h' is 20 days.
  */
 function formatAge(ms) {
   const n = Number(ms)
@@ -115,8 +116,13 @@ function formatAge(ms) {
   const mins = Math.floor(secs / 60)
   if (mins < 60) return mins + 'm'
   const hours = Math.floor(mins / 60)
-  const rest = mins % 60
-  return rest === 0 ? hours + 'h' : hours + 'h ' + rest + 'm'
+  if (hours < 24) {
+    const restMins = mins % 60
+    return restMins === 0 ? hours + 'h' : hours + 'h ' + restMins + 'm'
+  }
+  const days = Math.floor(hours / 24)
+  const restHours = hours % 24
+  return restHours === 0 ? days + 'd' : days + 'd ' + restHours + 'h'
 }
 
 function attemptPhrase(failures) {
