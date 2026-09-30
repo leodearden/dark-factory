@@ -189,6 +189,20 @@ _CONTROL_INIFILE_SOURCE = '''\
 addopts = ""
 '''
 
+#: The file ``_ESCAPE_SENTINEL_SOURCE`` writes beside itself when imported. Its
+#: existence after a run means a probe session reached outside its own directory.
+_ESCAPE_MARKER_NAME = 'probe-escaped-its-directory'
+
+#: A conftest.py planted one directory ABOVE the probe. A hermetic probe session
+#: never imports it; one that does has also rooted collection above the probe.
+_ESCAPE_SENTINEL_SOURCE = f'''\
+import pathlib
+
+pathlib.Path(__file__).with_name({_ESCAPE_MARKER_NAME!r}).write_text(
+    'imported from above the probe directory\\n'
+)
+'''
+
 
 def _require_apply_warning_filters():
     """Return ``_pytest.config.apply_warning_filters``, or fail LOUDLY.
@@ -409,10 +423,13 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     """
     require_orchestrator_inifile(pytestconfig, subject=_PIN_SUBJECT)
 
-    probe = tmp_path / 'test_df4075_thread_probe.py'
+    probe_dir = tmp_path / 'probe'
+    probe_dir.mkdir()
+    probe = probe_dir / 'test_df4075_thread_probe.py'
     probe.write_text(_PROBE_TEST_SOURCE)
-    control_inifile = tmp_path / 'pyproject.toml'
+    control_inifile = probe_dir / 'pyproject.toml'
     control_inifile.write_text(_CONTROL_INIFILE_SOURCE)
+    (tmp_path / 'conftest.py').write_text(_ESCAPE_SENTINEL_SOURCE)
 
     def _run(inifile: Path) -> subprocess.CompletedProcess:
         # ``-o addopts=`` clears the inifile's own addopts so the probe does
@@ -434,7 +451,7 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
             ],
             capture_output=True,
             text=True,
-            cwd=str(tmp_path),
+            cwd=str(probe_dir),
             env=sanitized_probe_env(),
         )
 
@@ -448,6 +465,17 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
 
     treatment = _run(ORCH_PYPROJECT)
     combined = treatment.stdout + treatment.stderr
+    assert not (tmp_path / _ESCAPE_MARKER_NAME).exists(), (
+        f'PROBE NOT HERMETIC — a probe session imported the conftest.py '
+        f'planted one directory ABOVE its own ({tmp_path / "conftest.py"}). '
+        f'Under -c {ORCH_PYPROJECT}, pytest defaults confcutdir to '
+        f'{ORCH_PYPROJECT.parent}, so every ancestor of the probe that is not '
+        f'also an ancestor of that directory — /tmp included — counts as inside '
+        f'it: pytest imports any conftest.py found there and roots collection '
+        f'at Dir(/tmp), listing the whole fleet-shared /tmp. A contaminated run '
+        f'cannot attribute its outcome to the inifile. Task 5146.'
+        f'\noutput:\n{combined}'
+    )
     assert treatment.returncode != 0, (
         f'a test whose thread died with an unhandled RuntimeError PASSED under '
         f'{ORCH_PYPROJECT} (exit 0). The same probe also passes under a '
