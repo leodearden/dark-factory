@@ -184,10 +184,23 @@ via the four-site lockstep edit `CONTRIBUTING.md` §6 describes.
 
 Interactive sessions get this document through `CLAUDE.md` and
 `~/.claude/CLAUDE.md`. `/review`'s integration reviewer gets it through
-`review/briefing.yaml`; `/prd` through its project overlay. Orchestrator-
-dispatched task and reviewer agents receive only their role system prompt,
-which cannot follow a cross-reference, so for them the substance is carried
-inline in `orchestrator/src/orchestrator/agents/roles.py::CODE_QUALITY_GUIDANCE`
-(task 5225); `orchestrator/tests/test_code_quality_guidance_parity.py` guards
-the headline and label tokens on both sides, and the bullet bodies are
-mirrored by hand.
+`review/briefing.yaml`; `/prd` through its project overlay.
+
+Orchestrator-dispatched agents receive only their role system prompt, which
+cannot follow a cross-reference. So the Definition, The fourteen heuristics,
+Two stances and Do not steer by sections are rendered verbatim into the
+reviewer, architect and deep_reviewer prompts at import, by
+`orchestrator/src/orchestrator/agents/code_quality.py::guidance`. This file is
+package data at `orchestrator/src/orchestrator/agents/code_quality.md`, so it
+travels with the orchestrator, never with the operated repo;
+`docs/code-quality.md` is a symlink to it.
+
+Consequences for an editor of this file:
+
+- Editing a rendered section changes dispatched prompt content, even in a
+  docs-only commit. Pre-commit skips pyright for such a commit; the merge gate
+  still runs the shape test in `orchestrator/tests/test_code_quality.py`.
+- Rendered sections must read correctly in any operated repo, and stay
+  brace-free, because the block reaches a `str.format()` template.
+- Keep the rendered headings. A renamed or removed one raises at orchestrator
+  import.
