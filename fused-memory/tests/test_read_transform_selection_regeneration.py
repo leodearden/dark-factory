@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import subprocess
 import types
 from pathlib import Path
 
@@ -85,3 +86,34 @@ class TestTheCommitStampMaskHidesOnlyTheStamps:
         _without_commit_stamps(_committed_report())
 
         assert _committed_report()['fixture_provenance'][0]['commit']
+
+
+class TestAStampOffThisHistoryIsReported:
+    def test_an_unresolvable_or_missing_commit_is_reported_and_head_is_not(self):
+        head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        entries = [
+            {'path': 'a', 'commit': '0' * 40},
+            {'path': 'b', 'commit': None},
+            {'path': 'c', 'commit': head},
+        ]
+
+        assert [p['path'] for p in _stamps_not_on_head(entries)] == ['a', 'b']
+
+    def test_each_report_names_its_commit_and_a_reason(self):
+        entries = [
+            {'path': 'a', 'commit': '0' * 40},
+            {'path': 'b', 'commit': None},
+        ]
+
+        reported = _stamps_not_on_head(entries)
+
+        assert len(reported) == 2
+        for item in reported:
+            assert isinstance(item, dict)
+            assert {'path', 'commit', 'reason'} <= item.keys()
+            assert item['reason']
+        assert [item['commit'] for item in reported] == ['0' * 40, None]
