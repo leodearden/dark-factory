@@ -51,6 +51,7 @@ class TestPinnedVocabulary:
         m = _mod()
         assert m.METRIC_SUPERSEDED_STILL_SURFACING == 'superseded-still-surfacing'
         assert m.METRIC_DANGLING_POINTERS == 'dangling-pointers'
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED == 'dangling-pointers-unattributed'
         assert m.METRIC_SUCCESSOR_POINTER_PRESENT == 'successor-pointer-present'
         assert m.METRIC_TASK_TERMINAL_STALENESS == 'task-terminal-staleness'
 
@@ -843,6 +844,45 @@ def _full_inputs():
     }
 
 
+def _attributed_refs():
+    """One reaper-signed unresolved supersedes edge, one unattributed resolved
+    edge and one unattributed unresolved edge.
+
+    A SIBLING of :func:`_full_refs`, never a widening of it: that fixture's
+    single-citation, plain-record numbers are load-bearing for
+    ``TestBuildSeries``.
+    """
+    m = _mod()
+    return [
+        *m.pointer_targets(_record(
+            'rec-canonical', 'canonical words', supersedes=UUID_A, canonical=True, topic='t',
+        )),
+        *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+        *m.pointer_targets(_record('rec-2', 'a correction', corrects=UUID_C)),
+    ]
+
+
+def _inputs_over(refs, resolution):
+    """:func:`_full_inputs`'s shape over *refs*, with the other families held fixed."""
+    m = _mod()
+    return {
+        'census': m.dangling_census(refs, resolution),
+        'tripwire_items': m.successor_pointer_items(refs, resolution),
+        'surfacing': m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B, UUID_A]),
+        'staleness': m.terminal_staleness(
+            [_record('rec-3', 'Task 4802 status=in-progress')], {'4802': 'done'},
+        ),
+        'corpus_counts': {},
+        'project_id': 'dark_factory',
+        'stamp': STAMP,
+        'refs': refs,
+    }
+
+
+def _attributed_inputs():
+    return _inputs_over(_attributed_refs(), {UUID_B: True, UUID_C: False})
+
+
 def _ids(series) -> set[str]:
     return {metric.metric_id for metric in series.metrics}
 
@@ -1188,6 +1228,100 @@ class TestBuildSeries:
         )
 
         series = _mod().build_series(**_full_inputs())
+        validate_metric_series(series)
+        assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
+
+
+class TestDanglingMetricSplit:
+    """PRD D11: the total is recorded; only the unattributed population alarms.
+
+    At corpus scale 90 of 92 supersedes edges dangle by design (task 3211's
+    re-measure), so the total tracks reaping ACTIVITY. It keeps its id and its
+    population and becomes a scalar — recorded, trended, never alarmed — while
+    a new count over the edges no reaper deletes carries E4's alarm.
+    """
+
+    def test_the_new_metric_id_is_spelled_exactly(self):
+        m = _mod()
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED == 'dangling-pointers-unattributed'
+        # alpha's scoped_grandfather_key separator must never appear in an id.
+        assert '::' not in m.METRIC_DANGLING_POINTERS_UNATTRIBUTED
+
+    def test_the_total_is_a_scalar_over_the_unchanged_population(self):
+        m = _mod()
+        inputs = _attributed_inputs()
+        total = _metric(m.build_series(**inputs), m.METRIC_DANGLING_POINTERS)
+        assert total.kind == 'scalar'
+        assert total.direction is None
+        assert total.value == inputs['census'].unresolved
+        assert total.n == inputs['census'].examined
+
+    def test_the_unattributed_count_is_the_alarmed_population(self):
+        m = _mod()
+        inputs = _attributed_inputs()
+        unattributed = _metric(
+            m.build_series(**inputs), m.METRIC_DANGLING_POINTERS_UNATTRIBUTED,
+        )
+        row = inputs['census'].by_reaper[m.UNATTRIBUTED]
+        assert unattributed.kind == 'count'
+        assert unattributed.direction == 'higher_is_worse'
+        assert unattributed.value == row['unresolved']
+        assert unattributed.n == row['examined']
+        assert unattributed.details_path == f'report-{STAMP}.txt'
+        # The fixture is not vacuous: the reaper-signed edge is in the total
+        # and out of the alarmed count.
+        assert unattributed.n < inputs['census'].examined
+
+    def test_a_fully_reaped_corpus_records_the_total_and_names_the_gap(self):
+        """The live 97.8% shape, taken to its limit.
+
+        Zero unattributed exposure means ABSENT, never a 0/0 datapoint (D1),
+        and the absence is named rather than left to read as health.
+        """
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_C,
+                kind='project_status_correction',
+            )),
+        ]
+        series = m.build_series(**_inputs_over(refs, {}))
+        assert _metric(series, m.METRIC_DANGLING_POINTERS).value > 0
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED not in _ids(series)
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED in m.metric_families_not_measured(series)
+
+    def test_the_alarm_eligible_metric_count_does_not_move(self):
+        """alpha's own eligibility predicate (``evaluate_series``: ``kind != 'scalar'``).
+
+        The scalar replaces the count one-for-one, so the derived alpha — budget
+        over runs times alarmed metrics — is unmoved.
+        """
+        series = _mod().build_series(**_full_inputs())
+        assert len([x for x in series.metrics if x.kind != 'scalar']) == 4
+
+    def test_the_pinned_ids_carry_the_new_family_after_the_total(self):
+        assert _mod().pinned_metric_ids() == (
+            'superseded-still-surfacing',
+            'dangling-pointers',
+            'dangling-pointers-unattributed',
+            'successor-pointer-present',
+            'task-terminal-staleness',
+        )
+
+    def test_the_split_series_passes_the_real_validator_and_round_trips(self):
+        import json  # noqa: PLC0415
+
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            parse_metric_series,
+            serialize_metric_series,
+            validate_metric_series,
+        )
+
+        series = _mod().build_series(**_attributed_inputs())
         validate_metric_series(series)
         assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
 
