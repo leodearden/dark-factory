@@ -590,21 +590,37 @@ and are not restated here.
   dead-filer L0 does not pin, because its handoff has no consumer left.
   `PinReport.vetoes_done_flip` is the conservative MARK_DONE veto: a dead L0
   still vetoes, because a done-flip is terminal.
-  - `_RECOVERY`'s escalation element (`task_ground_truth.py::_shape`) and the
-    done-flip gate `Harness._already_landed_dispatch_gate` ask
-    `vetoes_done_flip` — which is why a genuinely-landed task carrying a lone
-    `escalate_info` record does not re-dispatch forever (task 3534).
-  - The sweep-side appliers — `Harness._reconcile_one_stranded`'s in-progress
-    and blocked arms and `Scheduler._phase_redispatch_stranded_blocked`
-    (`scheduler.py`) — ask `.pins` through
-    `orchestrator/src/orchestrator/recovery_pins.py`. Its
-    `records_pin_blocked_recovery` adds the `MERGE_REMEDIABLE_ESC_CATEGORIES`
+  The sweep-side predicates over that classification live in
+  `orchestrator/src/orchestrator/recovery_pins.py`.
+  - **Done-flip question (`vetoes_done_flip`).** `_RECOVERY`'s escalation
+    element (`task_ground_truth.py::_vetoes_done_flip`, read by `_shape`), the
+    done-flip gate `Harness._already_landed_dispatch_gate`, and
+    `Harness._reconcile_one_stranded`'s blocked-arm MARK_DONE upgrade (branch
+    on `main` or carrying a merge marker), the last through
+    `recovery_pins.py::records_pin_blocked_done_flip`. This is why a
+    genuinely-landed task carrying a lone `escalate_info` record does not
+    re-dispatch forever (task 3534).
+  - **Recovery question (`.pins`).** `Harness._reconcile_one_stranded`'s
+    in-progress arm; its blocked-arm RE_FILE upgrade (branch off-main) and
+    its CONVERT scoping clause, together with
+    `Scheduler._phase_redispatch_stranded_blocked` (`scheduler.py`), through
+    `recovery_pins.py::records_pin_blocked_recovery`; and the re-file dedup in
+    `Harness._recover_stranded_deterministic_task`, through
+    `records_pin_recovery` — so, unlike the stranded sweep's re-file dedup
+    below, a dead-filer L0 does not suppress that re-file.
+  - **Both blocked-arm predicates** carry the `MERGE_REMEDIABLE_ESC_CATEGORIES`
     relaxation, so a record set made up entirely of `stranded_blocked`
-    records does not veto the merge it asks for.
-  - The re-file dedup asks `records_would_duplicate_a_handoff`.
+    records does not veto the merge it asks for. They differ on exactly one
+    input: a dead-filer L0 holds the done-flip but not the recovery.
+  - **Owned-record question.** `Harness._reconcile_one_stranded`'s re-file
+    dedup asks `records_would_duplicate_a_handoff`, which counts a dead-filer
+    L0 even though it does not pin: the orphan-L0 reaper will promote it, so a
+    second L1 filed now would duplicate it.
 
-  Every site reads one classification, so the sites cannot disagree on level,
-  severity or liveness (INV-5 `no-lockstep-duplication`). The store's third
+  Every site reads one classification, so the sites cannot disagree on how a
+  record classifies by level, severity or liveness (INV-5
+  `no-lockstep-duplication`); they differ only in which question they ask.
+  The store's third
   state travels beside it: `TaskGroundTruth._resolve_open_escalations` reports
   an unreadable or absent store as a distinct flag
   (`TruthReport.escalation_store_unavailable`), never as a bare empty list,
