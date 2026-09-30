@@ -1142,6 +1142,9 @@ class TestUpdateMergeMode:
         assert 'origin_finding_ids' not in rejection['error']
         assert rejection['metadata_mode'] == metadata_mode
         assert rejection['append'] == append
+        assert "'merge' or 'replace'" in rejection['error']
+        if (metadata_mode, append) == (None, False):
+            assert 'stored member' not in rejection['error']
         for token in ('merge', 'replace', 'memory_hints'):
             assert token in rejection['hint'], token
         assert result.stats is None

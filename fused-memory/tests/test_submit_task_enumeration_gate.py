@@ -441,8 +441,9 @@ class TestUpdatePersistence:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'merge_flags', [{'append': True}, {'metadata_mode': 'additive'}],
-        ids=['append', 'additive'],
+        'merge_flags',
+        [{'append': True}, {'metadata_mode': 'additive'}, {'append': False}],
+        ids=['append', 'additive', 'bare-append-false'],
     )
     async def test_a_non_overwriting_enumeration_update_is_refused_unwritten(
         self, persisting_server, backend, project_root, seeded_task_id,
@@ -461,6 +462,22 @@ class TestUpdatePersistence:
         assert 'enumeration_liveness' not in result
         task_interceptor.update_task.assert_not_awaited()
         assert seeded == {**SEED_METADATA, 'pending_since': seeded['pending_since']}
+        assert await stored_metadata(backend, project_root, seeded_task_id) == seeded
+
+    @pytest.mark.asyncio
+    async def test_a_contradictory_merge_append_pair_is_refused_by_the_backend(
+        self, persisting_server, backend, project_root, seeded_task_id,
+    ):
+        seeded = await stored_metadata(backend, project_root, seeded_task_id)
+
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata={'mem0_falsified_entries': [*LIVE_IDS, DELETED_0D5]},
+            merge_flags={'metadata_mode': 'merge', 'append': True},
+        )
+
+        assert 'error' in result
+        assert 'enumeration_liveness' not in result
         assert await stored_metadata(backend, project_root, seeded_task_id) == seeded
 
     @pytest.mark.asyncio

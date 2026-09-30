@@ -273,7 +273,8 @@ def _overwrites_top_level_keys(metadata_mode: str | None, append: bool | None) -
     ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_resolve_metadata_mode``;
     this is a fail-closed allowlist of its overwriting outcomes, so a mode the
     backend adds later is classified non-overwriting and rejected loudly, never
-    silently misreported as landed."""
+    silently misreported as landed. ``('merge', True)`` passes here only
+    because the backend refuses that pair itself, so nothing lands."""
     if metadata_mode in ('merge', 'replace'):
         return True
     return metadata_mode is None and append is None
@@ -285,9 +286,9 @@ def _not_overwriting_rejection(
     return {
         'error': (
             f'an update re-asserting the Mem0 enumeration(s) {enumerations} '
-            f'under metadata_mode={metadata_mode!r}, append={append!r} would '
-            'keep every stored member and the stored liveness stamp, so the '
-            "gate's drops and stamp would not persist"
+            f'under metadata_mode={metadata_mode!r}, append={append!r} does not '
+            "resolve to 'merge' or 'replace', the only merges under which the "
+            "gate's drops and fresh stamp replace the stored list and stamp"
         ),
         'error_type': ENUMERATION_UPDATE_NOT_OVERWRITING,
         'enumerations': enumerations,
