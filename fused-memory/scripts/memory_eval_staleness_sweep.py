@@ -142,6 +142,58 @@ for why a second parser for the other two would re-introduce 3112's bug.
 swept anyway so the first genuine use is measured rather than discovered.
 """
 
+REAPER_CONSOLIDATION = 'consolidation'
+"""The consolidation reaper: a canonical minted by
+``fused_memory/services/consolidation_ops.py::apply_retain_arm`` (which stamps
+``canonical: True``), whose ``supersedes`` ``consolidate_memories`` narrows to
+the confirmed-gone set — plus legacy hand-rolled Stage-1 folds signed with
+:data:`CONSOLIDATOR_AGENT_ID`."""
+
+REAPER_STATUS_CORRECTION = 'status_correction'
+"""The status-correction reaper:
+``fused_memory/reconciliation/harness.py::ReconciliationHarness._reconcile_status_correction``
+writes :data:`STATUS_CORRECTION_KIND` plus ``supersedes``, then deletes that set."""
+
+BY_DESIGN_REAPERS: tuple[str, ...] = (REAPER_CONSOLIDATION, REAPER_STATUS_CORRECTION)
+"""Every writer whose contract deletes the targets it names in ``supersedes``.
+A new reaper is added HERE or its edges alarm (PRD D11)."""
+
+UNATTRIBUTED = 'unattributed'
+"""The partition-row key for edges no reaper's contract deletes — deliberately
+not a member of :data:`BY_DESIGN_REAPERS`."""
+
+STATUS_CORRECTION_KIND = 'project_status_correction'
+"""The ``kind`` the status-correction writer stamps on its record."""
+
+CONSOLIDATOR_AGENT_ID = 'recon-stage-memory_consolidator'
+"""Stage 1's agent_id, composed in
+``fused_memory/reconciliation/stages/base.py`` as ``recon-stage-<stage id>``.
+The EXACT spelling, never the prefix: other stages write memories and reap
+nothing."""
+
+
+def by_design_reaper(metadata: Any) -> str | None:
+    """The reaper whose contract deletes this record's ``supersedes`` targets, if any.
+
+    Read off the CITING record's metadata and never parsed from its content:
+    the "CANONICAL (consolidates ...)" prose is LLM-authored. ``canonical`` is
+    tested with ``is True``, the vocabulary validator's own idiom, so a ``1``
+    or ``'true'`` never attributes. Status correction is checked first, so a
+    record carrying both signatures gets the more specific writer.
+
+    One residual (PRD D11): a reaper-written edge whose target vanished for an
+    unrelated reason is indistinguishable from a reaped one, and is treated as
+    by-design because that target was going to be deleted anyway.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get('kind') == STATUS_CORRECTION_KIND:
+        return REAPER_STATUS_CORRECTION
+    if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
+        return REAPER_CONSOLIDATION
+    return None
+
+
 TRIPWIRE_ITEM_PREFIX = 's-'
 """``TripwireItem.item_key`` shape. A STORED key (α's grandfather set persists
 it), not a display string."""
@@ -227,12 +279,16 @@ class PointerRef:
     a UUID that rotated under re-consolidation would read as a brand-new
     failure and fire a false alarm. Carrying it on the ref is what lets
     :func:`successor_pointer_items` stay pure over the refs alone.
+
+    *reaped_by* is the by-design reaper whose contract deletes this edge's
+    target (:func:`by_design_reaper`), set only on ``supersedes`` edges.
     """
 
     source_id: str
     key: str
     target: Any
     source_content: str = ''
+    reaped_by: str | None = None
 
 
 def pointer_targets(record: dict) -> list[PointerRef]:
@@ -261,6 +317,7 @@ def pointer_targets(record: dict) -> list[PointerRef]:
     metadata = record.get('metadata') or {}
     source_id = str(record.get('id') or '')
     source_content = record.get('content') or ''
+    reaper = by_design_reaper(metadata)
     refs: list[PointerRef] = []
     for key in POINTER_KEYS:
         for target in normalize_supersedes(metadata.get(key)):
@@ -269,6 +326,7 @@ def pointer_targets(record: dict) -> list[PointerRef]:
                 key=key,
                 target=target,
                 source_content=source_content,
+                reaped_by=reaper if key == 'supersedes' else None,
             ))
     return refs
 
