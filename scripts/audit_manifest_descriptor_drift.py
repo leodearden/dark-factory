@@ -120,17 +120,11 @@ if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
 from shared.capability_manifest import (  # noqa: E402
+    MECHANICAL_CHECK_KINDS,
     DeliveredCheckMeta,
     load_capability_manifest,
 )
 from shared.task_statuses import TERMINAL  # noqa: E402
-
-# The kinds the stamper actually copies. manifest_stamping.py step 5 reads
-# `if check is None or check.kind not in ('grep', 'script'): continue`, so a
-# 'manual' capability never reaches metadata.delivered_checks at all and can
-# never drift. Comparing one would emit a permanent false positive on every
-# manual-checked capability in the corpus.
-MECHANICAL_CHECK_KINDS = ("grep", "script")
 
 # The sidecar filename suffix: what the stamper appends to a task's prd_path,
 # and what `git ls-files` matches.
@@ -395,7 +389,7 @@ def _expected_meta(capability_name: str, check: object) -> dict:
     difference between the 8 real drift rows and 22 absent-vs-default artifacts.
 
     MAY RAISE, and the caller GUARDS it symmetrically with the task-record
-    side. Today it cannot: a validated sidecar grep/script ``DeliveredCheck``
+    side. Today it cannot: a validated sidecar mechanical ``DeliveredCheck``
     shares ``_check_kind_conditional_fields`` with :class:`DeliveredCheckMeta`
     and ``ManifestCapability.name`` carries ``min_length=1``, so every
     conversion succeeds. But that is an IMPLICIT coupling between two models
