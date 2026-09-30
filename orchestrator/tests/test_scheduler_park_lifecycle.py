@@ -129,6 +129,69 @@ async def test_the_dispatched_tasks_park_no_longer_starves_the_top_in_the_same_t
     )
 
 
+@pytest.mark.asyncio
+async def test_a_dispatch_restarts_the_blocked_install_streak(tmp_path):
+    w = _world(tmp_path)
+    lock_table = w.scheduler.lock_table
+    tasks = [
+        make_task('T', 'high', ['a.py', 'b.py']),
+        make_task('F', 'high', ['b.py'], status='in-progress'),
+    ]
+    w.scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    def block_t() -> None:
+        assert lock_table.try_acquire('seed', ['a.py'])
+        lock_table.install_parks('F', ['b.py'], 'high')
+
+    block_t()
+    for _ in range(3):
+        assert await w.scheduler.acquire_next() is None, 'streak: T is held off'
+    lock_table.release('seed')
+    lock_table.clear_parks_for('F')
+    result = await w.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'T', 'streak: T dispatches once unblocked'
+    w.scheduler.release('T')
+
+    block_t()
+    assert await w.scheduler.acquire_next() is None, 'streak: T is held off again'
+
+    attempts = [d['attempts'] for d in event_data_for(w.store, 'reservation_install_blocked', 'T')]
+    assert attempts == [1, 1], (
+        "streak: T's dispatch restarts the count, so its next blocked attempt reports again"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release clears only parks installed after dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_clears_a_park_armed_on_a_running_task_and_restores_the_shadow(tmp_path):
+    w = _world(tmp_path)
+    low = make_task('L', 'low', ['r1.py'])
+    w.scheduler.get_tasks = AsyncMock(return_value=[make_task('R', 'medium', ['r1.py']), low])
+    result = await w.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'R', 'post-dispatch park: R dispatches'
+
+    running = make_task('R', 'medium', ['r1.py'], status='in-progress')
+    w.scheduler.get_tasks = AsyncMock(return_value=[running, low])
+    assert await w.scheduler.acquire_next() is None, 'post-dispatch park: L is held off r1'
+    w.overrides.set_override(w.root, 'R', reserve_now=True)
+    assert await w.scheduler.acquire_next() is None
+    stacks = w.scheduler.lock_table.snapshot_park_stacks()
+    assert [entry['owner'] for entry in stacks['r1.py']] == ['L', 'R'], (
+        'post-dispatch park: premise — reserve_now on the running R shadows L on r1'
+    )
+
+    w.scheduler.release('R')
+
+    assert 'R' not in _stack_owners(w.scheduler), 'post-dispatch park: release clears R'
+    assert [e['data'] for e in event_payloads(w.store, 'reservation_restored')] == [
+        {'restored_owner': 'L', 'modules': ['r1.py']},
+    ], 'post-dispatch park: release restores L on r1'
+
+
 # ---------------------------------------------------------------------------
 # Task 4541 replay
 # ---------------------------------------------------------------------------
