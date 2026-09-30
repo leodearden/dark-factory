@@ -258,6 +258,8 @@ _SECTIONS = {
 
 #: The doc sections render() carries, in the order it carries them.
 _RENDERED_SOURCE_HEADINGS = ('## Definition', _ANCHOR, '## Two stances', '## Do not steer by')
+#: The rendered sections whose body is a ``- **Label.**`` bullet list.
+_BULLET_SECTION_HEADINGS = ('## Two stances', '## Do not steer by')
 _EXCLUDED_HEADINGS = ('## What to measure', '## Relationship to the design invariants', '## Reach')
 
 
@@ -372,9 +374,9 @@ def block() -> str:
 
 
 class TestRenderedGuidanceShape:
-    """The real rendered block's STRUCTURE: headings, numbering and labels.
+    """The real rendered block's STRUCTURE: headings, heuristic numbering and list shape.
 
-    No sentence of doc prose is asserted; section bodies are free to change.
+    No doc prose and no item label is asserted; section bodies and labels are free to change.
     """
 
     def test_is_nonempty(self, block):
@@ -399,16 +401,12 @@ class TestRenderedGuidanceShape:
     def test_carries_fourteen_numbered_heuristics(self, block):
         assert len(numbered_headlines(block, _ANCHOR)) == 14
 
-    def test_carries_the_two_stances(self, block):
-        assert bold_item_labels(block, '## Two stances') == ['Comments.', 'Tests.']
-
-    def test_carries_the_four_do_not_steer_by_items(self, block):
-        assert bold_item_labels(block, '## Do not steer by') == [
-            'Raw line count.',
-            'Average complexity.',
-            'Line coverage under autouse stubs.',
-            'Test count or test-to-code ratio.',
-        ]
+    @pytest.mark.parametrize('heading', _BULLET_SECTION_HEADINGS)
+    def test_each_bullet_section_is_a_bold_labelled_list(self, block, heading):
+        assert bold_item_labels(block, heading), (
+            f"{heading!r} carries no '- **Label.**' bullet at column 0: the "
+            "section must stay a bold-labelled bullet list."
+        )
 
     def test_is_brace_free(self, block):
         assert_brace_free('guidance()', block, remedy=_FORMAT_REMEDY)
