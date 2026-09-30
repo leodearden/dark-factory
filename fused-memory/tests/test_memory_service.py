@@ -61,7 +61,7 @@ def service(mock_config):
         return_value={'uuid': 'test-uuid', 'fact': 'updated', 'refreshed_nodes': []}
     )
     svc.graphiti.get_edge_text = AsyncMock(return_value=('edge-name', 'updated'))
-    svc.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+    svc.graphiti.get_edge_retirement_markers = AsyncMock(return_value=(None, None))
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
@@ -9830,7 +9830,7 @@ class TestUpdateEdgeClearInvalidAt:
 
     @pytest.mark.asyncio
     async def test_clear_invalid_at_result_is_verified_true(self, service):
-        """Clear-only update is verified=True when the invalid_at readback confirms the clear.
+        """Clear-only update is verified=True when the readback confirms BOTH markers cleared.
 
         Revised (task 1940) from the old 'verified=True without a readback'
         contract: the no-fact branch used to hardcode verified=True even
@@ -9840,26 +9840,26 @@ class TestUpdateEdgeClearInvalidAt:
             return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('edge', 'fact'))
-        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+        service.graphiti.get_edge_retirement_markers = AsyncMock(return_value=(None, None))
         result = await service.update_edge(
             edge_uuid='e-1', project_id='proj', clear_invalid_at=True
         )
         assert result.get('verified') is True, (
-            'clear-only update must be verified=True when invalid_at readback is None'
+            'clear-only update must be verified=True when both marker readbacks are None'
         )
-        service.graphiti.get_edge_invalid_at.assert_awaited_once_with(
+        service.graphiti.get_edge_retirement_markers.assert_awaited_once_with(
             'e-1', group_id='proj'
         )
         service.graphiti.get_edge_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_clear_only_verified_false_when_still_invalid(self, service):
-        """get_edge_invalid_at returning a non-None value means the clear did not persist."""
+        """A surviving invalid_at in the readback means the clear did not persist."""
         service.graphiti.update_edge = AsyncMock(
             return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
         )
-        service.graphiti.get_edge_invalid_at = AsyncMock(
-            return_value='2026-01-01T00:00:00+00:00'
+        service.graphiti.get_edge_retirement_markers = AsyncMock(
+            return_value=('2026-01-01T00:00:00+00:00', None)
         )
         result = await service.update_edge(
             edge_uuid='e-1', project_id='proj', clear_invalid_at=True
@@ -9869,14 +9869,33 @@ class TestUpdateEdgeClearInvalidAt:
         assert result['verification_error']  # non-empty string
 
     @pytest.mark.asyncio
+    async def test_clear_verified_false_when_expired_at_survives(self, service):
+        """invalid_at cleared but expired_at still set → the edge is still retired → verified False."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_retirement_markers = AsyncMock(
+            return_value=(None, datetime(2026, 1, 1, tzinfo=UTC))
+        )
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is False, (
+            'a restore that clears invalid_at but leaves expired_at set leaves the edge '
+            'failing _ACTIVE_EDGE_PREDICATE and invisible to every valid-edge read; '
+            'a readback of invalid_at alone reported this as verified=True'
+        )
+        assert 'expired_at' in result.get('verification_error', '')
+
+    @pytest.mark.asyncio
     async def test_fact_plus_clear_verified_false_when_not_cleared(self, service):
         """fact readback matches but invalid_at readback is non-None → verified False (AND)."""
         service.graphiti.update_edge = AsyncMock(
             return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
-        service.graphiti.get_edge_invalid_at = AsyncMock(
-            return_value='2026-01-01T00:00:00+00:00'
+        service.graphiti.get_edge_retirement_markers = AsyncMock(
+            return_value=('2026-01-01T00:00:00+00:00', None)
         )
         result = await service.update_edge(
             edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
@@ -9893,7 +9912,7 @@ class TestUpdateEdgeClearInvalidAt:
             return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
-        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+        service.graphiti.get_edge_retirement_markers = AsyncMock(return_value=(None, None))
         result = await service.update_edge(
             edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
         )
@@ -9910,7 +9929,7 @@ class TestUpdateEdgeClearInvalidAt:
             return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale fact'))
-        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+        service.graphiti.get_edge_retirement_markers = AsyncMock(return_value=(None, None))
         result = await service.update_edge(
             edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
         )
@@ -9931,7 +9950,7 @@ class TestUpdateEdgeClearInvalidAt:
             return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale fact'))
-        service.graphiti.get_edge_invalid_at = AsyncMock(side_effect=RuntimeError('boom'))
+        service.graphiti.get_edge_retirement_markers = AsyncMock(side_effect=RuntimeError('boom'))
         result = await service.update_edge(
             edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
         )
@@ -9979,49 +9998,52 @@ class TestUpdateEdgeClearInvalidAt:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 (task-1940): GraphitiBackend.get_edge_invalid_at RED tests
+# GraphitiBackend.get_edge_retirement_markers (task 1940, widened by task 4714)
 # ---------------------------------------------------------------------------
 
-class TestGraphitiBackendGetEdgeInvalidAt:
-    """GraphitiBackend.get_edge_invalid_at(uuid, group_id) reads back the raw invalid_at property.
+class TestGraphitiBackendGetEdgeRetirementMarkers:
+    """GraphitiBackend.get_edge_retirement_markers(uuid, group_id) reads back the raw
+    ``(invalid_at, expired_at)`` pair in one query.
 
-    Used by MemoryService.update_edge's clear_invalid_at verification (task 1940) to
-    confirm an edge was actually restored to active status, independent of the
-    fact-text readback used for the ``fact`` verification path.
+    Used by MemoryService.update_edge's clear_invalid_at verification to confirm an
+    edge was actually restored to active status — active means BOTH markers are
+    null, matching ``_ACTIVE_EDGE_PREDICATE`` — independent of the fact-text
+    readback used for the ``fact`` verification path.
     """
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_invalid_at_is_null(
+    async def test_returns_none_pair_when_both_markers_are_null(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """A [[None]] row (invalid_at IS NULL) must return None."""
+        """A [[None, None]] row (fully active edge) must return (None, None)."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([[None]])
+        graph = make_graph_mock([[None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
-        assert result is None
+        result = await backend.get_edge_retirement_markers('edge-uuid-1', group_id='test')
+        assert result == (None, None)
 
     @pytest.mark.asyncio
-    async def test_returns_raw_invalid_at_value(
+    async def test_returns_raw_marker_values(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """A row carrying a stored invalid_at must be returned verbatim (no parsing)."""
+        """Stored invalid_at / expired_at values must be returned verbatim (no parsing)."""
         backend = make_backend(mock_config)
-        ts = '2026-06-01T00:00:00+00:00'
-        graph = make_graph_mock([[ts]])
+        invalid_ts = '2026-06-01T00:00:00+00:00'
+        expired_ts = '2026-06-02T00:00:00+00:00'
+        graph = make_graph_mock([[invalid_ts, expired_ts]])
         backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
-        assert result == ts
+        result = await backend.get_edge_retirement_markers('edge-uuid-1', group_id='test')
+        assert result == (invalid_ts, expired_ts)
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """get_edge_invalid_at is a read — it must use ro_query and never call graph.query."""
+        """get_edge_retirement_markers is a read — one ro_query, never graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([[None]])
+        graph = make_graph_mock([[None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
+        await backend.get_edge_retirement_markers('edge-uuid-1', group_id='test')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
 
@@ -10029,17 +10051,18 @@ class TestGraphitiBackendGetEdgeInvalidAt:
     async def test_passes_uuid_param_and_matches_relates_to(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """The Cypher matches RELATES_TO and returns e.invalid_at; uuid is passed as a param."""
+        """The Cypher matches RELATES_TO and returns both markers; uuid is passed as a param."""
         from _fm_helpers import extract_cypher, extract_params
 
         backend = make_backend(mock_config)
-        graph = make_graph_mock([[None]])
+        graph = make_graph_mock([[None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_edge_invalid_at('specific-edge-uuid', group_id='test')
+        await backend.get_edge_retirement_markers('specific-edge-uuid', group_id='test')
         cypher = extract_cypher(graph.ro_query.call_args)
         params = extract_params(graph.ro_query.call_args)
         assert 'RELATES_TO' in cypher
         assert 'invalid_at' in cypher
+        assert 'expired_at' in cypher
         assert params == {'uuid': 'specific-edge-uuid'}
 
     @pytest.mark.asyncio
@@ -10053,7 +10076,7 @@ class TestGraphitiBackendGetEdgeInvalidAt:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(EdgeNotFoundError):
-            await backend.get_edge_invalid_at('missing-edge-uuid', group_id='test')
+            await backend.get_edge_retirement_markers('missing-edge-uuid', group_id='test')
 
 
 # ---------------------------------------------------------------------------

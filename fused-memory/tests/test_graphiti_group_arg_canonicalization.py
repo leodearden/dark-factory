@@ -272,7 +272,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('update_node_summary', ('n1', 's'), {'group_id': _PATH_SHAPED}),
     ('update_node_name', ('n1', 'Name'), {'group_id': _PATH_SHAPED}),
     ('get_edge_text', ('e1',), {'group_id': _PATH_SHAPED}),
-    ('get_edge_invalid_at', ('e1',), {'group_id': _PATH_SHAPED}),
+    ('get_edge_retirement_markers', ('e1',), {'group_id': _PATH_SHAPED}),
     ('update_node_embedding', ('n1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('update_edge_embedding', ('e1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
