@@ -510,6 +510,64 @@ it, and the gate slug where one corresponds:
 Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
 asks to launch one.
 
+### Disposition before briefing (H1–H6)
+
+Every item that is neither a standing fact nor self-executed gets exactly one of three dispositions
+before it may enter the numbered brief (Leo, 2026-09-25):
+
+1. **Brief directly.**
+2. **Pre-investigate, then brief.**
+3. **Ask Leo directly**, with the readable evidence attached.
+
+Six rules decide which. Each carries the measured cases it was drawn from, so you can recognise the
+next one.
+
+- **H1 — second-hand premise ⇒ investigate first.** The deciding claim came from the record text, a
+  handover or a prior session, not from something this session verified now. Use a verifier
+  sub-agent with a refute mandate. Exemplars: recon gate 652 ("migrate" accepted, then refuted the
+  next day); esc-5485-8 (the premise was a rebase artifact); task 4803 ("undefer" while folded into
+  5255).
+- **H2 — options you cannot write a ramification line for ⇒ investigation-shaped, never a bare
+  pick.** Exemplars: esc-5588-8 ("file a trace task or close" hid 300 prompt replays in 30 days);
+  red-tier host levers asked with no options; xdist flags proposed without ramifications when task
+  1907 held the answer.
+- **H3 — design or architectural scope, or anything adjacent to a Leo HOLD ⇒ pre-investigate to
+  "ready to discuss", never to "resolved".** Opus by default; Fable only where an Opus attempt
+  struggled or the discussion is strategy-level. Exemplars: esc-5601-7, esc-5620-6, esc-4811-3,
+  esc-3169-1.
+- **H4 — a recommendation, evidence this session verified itself, and a reversible action ⇒ brief
+  directly, one numbered line.** Exemplar: 48 such items in the month to 2026-09-23, all taken.
+- **H5 — inputs only Leo has ⇒ ask directly, do not investigate, but gather the readable
+  measurement first.** Such inputs: attention or priority, spend, risk appetite, reversal of his
+  own ruling. Exemplars: esc-3637-1; the $360 calibration; merge_verify_breadth, where the brief
+  lacked "scoped admitted reds".
+- **H6 — two or fewer options on a design-shaped item ⇒ run a cheap option-space seat first.** Its
+  brief: "what else, including nothing, deferring gated on X, questioning the premise". Exemplars:
+  over-delivery-gap; esc-4131-9 (ruled D, never offered); esc-5332-7; steward-budget-C.
+
+**When several rules fire.** H1's premise check always runs first. H6's option-space seat runs
+before or inside an H3 investigation. H5 decides "ask directly" over H2, H3 or H6 investigation,
+because investigating cannot supply an input only Leo has. H4 applies only when no other rule
+fires. Leo's own investigation template (2026-09-21), "investigate and either resolve directly if
+clear-cut, or get ready to discuss in depth", is the brief for H1 and H2 seats, within two limits:
+"resolve directly" never crosses "Always ask — keyed on record content", and an H3 seat stops at
+ready to discuss.
+
+#### Sub-agent or `/spawn` (Leo's rule, 2026-09-25)
+
+- If handling will take a multi-turn conversation with Leo, `/spawn` a session. That keeps the
+  conversation un-interleaved and out of this session's context, which is reserved for system
+  supervision. The category handlers' interactive `/unblock` spawns below are this case.
+- If it ends in a single report and a single ruling, use a sub-agent (the `Agent` tool) and deliver
+  its result into this session. That means fewer terminals; Leo has run more than 15 at once.
+
+Join a completed spawn per "Joining a completed spawn: read `result.md`, don't explore".
+
+#### No cap on items awaiting Leo
+
+The brief lists every item awaiting Leo; the queue exists to show them all. Leo ruled against the
+study's proposed cap on 2026-09-25.
+
 ## Filing Parked Decisions to the Cockpit Registry (C8)
 
 Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill parks a decision for the
