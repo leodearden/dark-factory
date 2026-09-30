@@ -4191,3 +4191,68 @@ class TestMergeParkLockGraceSeconds:
             'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
             'registered beside the git.offline_lane_* leaves)'
         )
+
+
+class TestInfoL0RouterConfig:
+    """The four info-L0 disposition router knobs
+    (plans/info-l0-disposition-router-prd.md D5/D9/D12, §Contract)."""
+
+    _LEAVES = (
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
+    )
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    def test_defaults(self):
+        config = OrchestratorConfig()
+        assert config.info_l0_router_enabled is True
+        assert config.info_l0_router_ticket_timeout_secs == 900.0
+        assert config.info_l0_router_max_conversions_per_sweep == 20
+        assert config.info_l0_note_detail_chars == 1200
+
+    @pytest.mark.parametrize(
+        ('field', 'bad'),
+        [
+            # gt=0: a zero timeout would fail every D9 hold on its first tick.
+            ('info_l0_router_ticket_timeout_secs', 0),
+            ('info_l0_router_ticket_timeout_secs', -1),
+            ('info_l0_router_max_conversions_per_sweep', -1),
+            ('info_l0_note_detail_chars', -1),
+        ],
+    )
+    def test_out_of_bounds_values_rejected(self, field, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad})
+
+    @pytest.mark.parametrize('leaf', _LEAVES)
+    def test_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_apply_reload_retunes_the_live_config(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            info_l0_router_enabled=False,
+            info_l0_router_ticket_timeout_secs=60.0,
+            info_l0_router_max_conversions_per_sweep=5,
+            info_l0_note_detail_chars=400,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['restart_required'] == {}
+        assert report['applied'] == {
+            'info_l0_router_enabled': {'old': True, 'new': False},
+            'info_l0_router_ticket_timeout_secs': {'old': 900.0, 'new': 60.0},
+            'info_l0_router_max_conversions_per_sweep': {'old': 20, 'new': 5},
+            'info_l0_note_detail_chars': {'old': 1200, 'new': 400},
+        }
+        assert live.info_l0_router_enabled is False
+        assert live.info_l0_router_ticket_timeout_secs == 60.0
+        assert live.info_l0_router_max_conversions_per_sweep == 5
+        assert live.info_l0_note_detail_chars == 400
