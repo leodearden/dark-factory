@@ -233,3 +233,19 @@ class TestTheCommittedReportIsWhatTheCacheProduces:
         )
 
         assert _regenerated_pair()[1] == _committed_markdown(), _STALE_REMEDY
+
+
+class TestEveryCommittedFixtureStampIsOnThisHistory:
+    def test_every_stamp_is_an_ancestor_of_head(self):
+        stamps = _committed_report()['fixture_provenance']
+        assert stamps
+
+        off = _stamps_not_on_head(stamps)
+
+        assert off == [], '\n'.join([
+            *(f'{item["path"]}: {item["commit"]} — {item["reason"]}' for item in off),
+            "a stamp off HEAD's history is usually a commit a pre-merge rebase "
+            "rewrote (task 4004's report named two); regenerate with "
+            f'`{REGENERATE_COMMAND}` on the CURRENT history and commit both '
+            'files — do not hand-edit the sha',
+        ])
