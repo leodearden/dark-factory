@@ -91,6 +91,16 @@ logger = logging.getLogger(__name__)
 _PROC_ROOT = Path('/proc')
 
 
+def _read_proc_text(path: Path) -> str:
+    """Read a /proc text field for display; raises only OSError.
+
+    Its bytes are arbitrary (a process sets its own comm and argv), so
+    undecodable ones become U+FFFD rather than raising.  Pathnames that are
+    compared, not displayed, need ``os.fsdecode`` instead.
+    """
+    return path.read_bytes().decode('utf-8', 'replace')
+
+
 class _StatFields(NamedTuple):
     comm: str
     state: str
@@ -106,7 +116,7 @@ def _read_stat_fields(entry: Path) -> _StatFields | None:
     rather than costing the pid its entry.
     """
     try:
-        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+        text = _read_proc_text(entry / 'stat')
     except OSError:
         return None
     rparen = text.rfind(')')
@@ -180,7 +190,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
-            wchan = (entry / 'wchan').read_text().strip()
+            wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
             wchan = '?'
 
@@ -190,8 +200,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         # log friendliness.  Mirrors the wchan try/except idiom so
         # snapshot_process_group never raises (module invariant).
         try:
-            raw = (entry / 'cmdline').read_bytes()
-            cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
+            cmdline = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
             if not cmdline:
                 cmdline = fields.comm  # kernel thread — fall back to short comm
             if len(cmdline) > 200:
@@ -416,6 +425,10 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     Short-circuits cheapest-first: cwd, then open fds, then mmap'd pathnames
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
     permission-denied pid is skipped rather than raising (module invariant).
+    ``maps`` pathnames are decoded with ``os.fsdecode``, the surrogateescape
+    str space ``os.readlink`` returns for the cwd and fd signals, and lines are
+    split only on ``'\\n'``, the one byte the kernel escapes in them, so a
+    pathname holding any other byte compares correctly and never raises.
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
@@ -434,10 +447,10 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
 
     # 3. mmap'd pathnames — an mmap'd .rlib / .so living under the tree.
     try:
-        maps_text = (entry / 'maps').read_text()
+        maps_text = os.fsdecode((entry / 'maps').read_bytes())
     except OSError:
         return False
-    for line in maps_text.splitlines():
+    for line in maps_text.split('\n'):
         # maps line: "addr perms offset dev inode  pathname" — pathname is the
         # 6th field (may contain spaces; keep it whole with maxsplit=5). Skip
         # anonymous/special regions ([heap], [stack], anon → no leading '/').

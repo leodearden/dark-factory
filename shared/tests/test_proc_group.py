@@ -1004,6 +1004,25 @@ class TestSnapshotProcessGroup:
             f'  pid={fake_pid} ppid=1 state=S wchan=do_wait comm={comm_name} cmdline=?'
         ], rows
 
+    def test_an_undecodable_wchan_still_yields_the_row(self, monkeypatch, tmp_path):
+        """wchan is arbitrary bytes; they render as U+FFFD instead of losing the snapshot."""
+        target_pgid = 77777
+        fake_pid = 77778
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            _synthetic_stat_line(fake_pid, target_pgid, comm='plain')
+        )
+        (entry / 'wchan').write_bytes(b'\xff\xfe\n')
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        rows = snapshot_process_group(target_pgid).splitlines()
+
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=S wchan=�� comm=plain cmdline=?'
+        ], rows
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_snapshot_includes_cmdline(self, tmp_path):
@@ -1040,6 +1059,11 @@ class TestScanProcessGroupsUnderPath:
     whose cwd / open fds / mmap'd paths fall at-or-under the ``_merge-verify``
     worktree of a *previous* orchestrator run.  Like snapshot_process_group it
     must never raise, even on vanished/permission-denied pids.
+
+    Every test here pays for a walk of the real /proc, whose cost scales with
+    the host's process count (task 4520). So each makes one walk and keeps
+    only what a fabricated /proc cannot show; the rest belongs in
+    :class:`TestScanProcessGroupsAgainstASyntheticProc`.
     """
 
     @pytest.mark.asyncio
@@ -1147,6 +1171,65 @@ class TestScanProcessGroupsUnderPath:
                 _kill_group(p.pid)
                 with contextlib.suppress(Exception):
                     await p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_a_pid_with_an_undecodable_mmapd_path_under_root_is_still_found(self, tmp_path):
+        """maps pathnames are raw bytes; a non-UTF-8 one must not empty the scan.
+
+        The child maps the file through libc directly (``mmap.mmap`` would
+        keep a dup of the fd open), closes its only fd, and runs with its cwd
+        outside root, so its maps line is the only thing tying its group to
+        root. The fd precondition is asserted, not assumed.
+
+        What only this real walk shows is that the kernel writes the raw,
+        unescaped non-UTF-8 bytes into maps. The decoding choice itself is
+        pinned by the synthetic
+        ``test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes``.
+        """
+        base = tmp_path.resolve()
+        root = base / '_merge-verify'
+        elsewhere = base / 'elsewhere'
+        root.mkdir()
+        elsewhere.mkdir()
+        mapped = os.path.join(os.fsencode(root), b'\xff\xfe.bin')
+        with open(mapped, 'wb') as f:
+            f.write(b'x')
+        script = (
+            'import ctypes, mmap, os, sys, time\n'
+            'libc = ctypes.CDLL(None)\n'
+            'libc.mmap.restype = ctypes.c_void_p\n'
+            'libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,'
+            ' ctypes.c_int, ctypes.c_int, ctypes.c_long)\n'
+            'fd = os.open(os.fsencode(sys.argv[1]), os.O_RDONLY)\n'
+            'addr = libc.mmap(None, 1, mmap.PROT_READ, mmap.MAP_PRIVATE, fd, 0)\n'
+            'os.close(fd)\n'
+            "print('mmap failed' if addr == ctypes.c_void_p(-1).value else 'ready',"
+            ' flush=True)\n'
+            'time.sleep(30)\n'
+        )
+        with subprocess.Popen(
+            [sys.executable, '-c', script, mapped],
+            cwd=elsewhere,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                fd_dir = f'/proc/{pgid}/fd'
+                fd_targets = [os.readlink(f'{fd_dir}/{n}') for n in os.listdir(fd_dir)]
+                assert not [t for t in fd_targets if t.startswith(f'{root}{os.sep}')], (
+                    fd_targets
+                )
+                found = scan_process_groups_under_path(root)
+                assert pgid in found, (
+                    f'pgid {pgid} is missing from {found}; its only reference '
+                    f'to {root} is an mmap of the non-UTF-8-named {mapped!r}'
+                )
+            finally:
+                _kill_group(pgid)
 
     def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
         """A readlink that raises (vanished / permission-denied pid) is swallowed.
@@ -1331,6 +1414,46 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         assert found == {100, 200, 500}
         assert 600 not in found and 700 not in found
         assert 800 not in found and 810 not in found
+
+    @pytest.mark.parametrize(
+        'odd_bytes',
+        [
+            pytest.param(b'\xff', id='undecodable'),
+            pytest.param(b'\r', id='carriage-return'),
+            pytest.param(b'\x0b', id='vertical-tab'),
+            pytest.param(b'\x0c', id='form-feed'),
+            pytest.param(b'\x1c', id='file-separator'),
+            pytest.param(b'\xc2\x85', id='next-line-U+0085'),
+            pytest.param(b'\xe2\x80\xa8', id='line-separator-U+2028'),
+        ],
+    )
+    def test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes(
+        self, tmp_path, monkeypatch, odd_bytes
+    ):
+        """A maps pathname matches a root whose name holds any byte but a newline.
+
+        Two ways such a byte in root's own name costs the match. An undecodable
+        one raises under a strict decode and becomes U+FFFD under 'replace', and
+        neither equals root's surrogate-escaped form, the str space readlink and
+        str(Path) use. A line break other than '\\n' cuts the pathname under
+        ``str.splitlines``, although the kernel escapes only '\\n' in maps. No
+        cwd and no fd dir, so maps alone decides.
+        """
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / '900'
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(_synthetic_stat_line(900, 900))
+        root_bytes = os.fsencode(tmp_path) + b'/_merge-verify-' + odd_bytes
+        (entry / 'maps').write_bytes(
+            b'55d4c7e1a000-55d4c7e3b000 rw-p 00000000 00:00 0          [heap]\n'
+            b'7f0a1c000000-7f0a1c021000 r--p 00000000 08:01 1311       /usr/lib/libc.so.6\n'
+            b'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       '
+            + root_bytes
+            + b'/\xfe.so\n'
+        )
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        assert scan_process_groups_under_path(os.fsdecode(root_bytes)) == {900}
 
     def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
         """The `not proc_dir.exists()` branch — an empty result, not a raise.
