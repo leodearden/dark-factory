@@ -839,10 +839,13 @@ flowchart LR
   naming the role and task_id. (Contrast the severity axis, which fails safe by
   *downgrading* rather than rejecting — see Born-at-L2 below.) Either way the record is
   outside the workflow's level=0 dismissal sweeps by construction, is visible
-  to the level-filtering auto-watcher, and pins the task via
-  `escalation.pins` QUEUE_HANDOFF regardless of the filer's liveness. A
-  separate orphan sweep (`Harness._reap_orphan_l0_escalations`) reclaims L0s
-  whose steward died without escalating.
+  to the level-filtering auto-watcher, and pins the task as a `QUEUE_HANDOFF`
+  (`escalation/src/escalation/pins.py::classify_pins`) regardless of the
+  filer's liveness — unless it is `info` severity, which never pins at any
+  level. `TaskSteward._auto_escalate_to_human`
+  (`orchestrator/src/orchestrator/steward.py`) carries the L0's severity onto
+  the L1. A separate orphan sweep (`Harness._reap_orphan_l0_escalations`)
+  promotes to L1 an aged L0 whose filing incarnation is dead (§3.7).
 - **L1 auto-watcher.** A repeatedly-spawned Claude CLI rotation (§2.1) that
   only launches when there's an actionable pending L1, running the
   `escalation-watcher-auto` skill.
@@ -863,7 +866,7 @@ flowchart LR
 
   | Action | Effect on the task |
   |---|---|
-  | `resume` | → `pending`, `resume_from_pause` (two preconditions — see below) |
+  | `resume` | → `pending`, `resume_from_pause` (only when no live claimant — see below) |
   | `restart` | → `pending`, `restart_from_scratch` |
   | `park` | → `blocked`; the L2 escalation stays open |
   | `abandon` | → `cancelled` |
@@ -881,24 +884,22 @@ flowchart LR
   sources its target from that same row and so writes `pending`. There is no
   distinct paused-workflow target.
 
-  Two preconditions on `resume` are worth stating, because together they are
-  why a **stranded** row is unreachable by it:
-
-  1. **Status string equality, not liveness.** `_cascade_unblock_member`
-     (`harness.py`) re-reads the row and returns early at
-     `if status != 'blocked'`. Every other status — including an
-     `in-progress` row whose claimant is long dead — is DEBUG-skipped.
-     (`infra-hold` has its own pre-gate just above, which writes `in-progress`
-     instead.) The flip itself sits behind a same-signature re-block guard.
-  2. **L0 resolutions never reach it.** `_on_escalation_resolved` nests the
-     entire resume disposition inside `if escalation.level >= 1`, so resolving
-     an L0 produces no status change at all.
-
-  Normatively this is a defect, not a design: the spec
-  ([docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md)
-  §7.4, PRD leaf ζ) requires `resume` to key off **claimant liveness** rather
-  than `status == 'blocked'` string equality, and requires the L0-resolution
-  path to reach orphaned rows. Neither has landed yet.
+  `resume` is gated on **claimant liveness**, at every level (normative rule:
+  [docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md)
+  §7.4). `Harness._on_escalation_resolved` routes an L0's `resume` exactly as
+  it routes an L1's or L2's: it schedules `_cascade_unblock_member`
+  (`harness.py`) for an L2-cascade member, or for any record whose task has
+  no live workflow in this process (`_escalation_events`) — a live workflow
+  was already woken and owns its own re-pend. `_cascade_unblock_member` flips
+  only a row whose status is in `_RESUME_REPEND_STATUSES` (`blocked`,
+  `in-progress` — an allow-list, so terminal, parked, queue-owned, human-only
+  and already-`pending` rows are skipped) **and** that has no live claimant.
+  It re-derives both from one corroborating `get_task` snapshot immediately
+  before the write, and aborts on disagreement. The flip sits behind the
+  same-signature re-block guard. `infra-hold` has its own pre-gate ahead of
+  that gate, which re-pends to `pending` (task 3538). So resolving a stranded
+  `in-progress` row's record with `resume` re-pends it immediately, whatever
+  its branch shape, instead of leaving it to the stranded sweep.
 
   A level cap prevents the watcher's own MCP connection from resolving
   anything at L2 (`level_forbidden`) — except a narrow, evidence-gated
