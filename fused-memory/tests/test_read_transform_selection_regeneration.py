@@ -15,13 +15,17 @@ files.  Never hand-edit either one (PRD G6/D10).
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
+import io
 import json
 import subprocess
+import tempfile
 import types
 from pathlib import Path
 
+import pytest
 from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'read_transform_selection.py'
@@ -93,6 +97,57 @@ def _stamps_not_on_head(provenance: list[dict]) -> list[dict]:
     return off_head
 
 
+_STALE_REMEDY = (
+    f'the committed report is stale: regenerate with `{REGENERATE_COMMAND}` '
+    'and commit BOTH plans/read-transform-selection-report.{json,md}; never '
+    'hand-edit (PRD G6/D10), even if the recommendation moves'
+)
+
+
+@functools.cache
+def _regenerated_pair() -> tuple[dict, str]:
+    """The stock CLI's output, with only its two destinations redirected."""
+    with tempfile.TemporaryDirectory(prefix='read-transform-regen-') as tmp:
+        out = Path(tmp)
+        json_out, md_out = out / 'report.json', out / 'report.md'
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = _mod().main(['--json-out', str(json_out), '--md-out', str(md_out)])
+        assert code == 0, (
+            f'`{REGENERATE_COMMAND}` exited {code}:\n{stderr.getvalue()}'
+        )
+        return (
+            json.loads(json_out.read_text(encoding='utf-8')),
+            md_out.read_text(encoding='utf-8'),
+        )
+
+
+def _differing_leaves(committed, regenerated, path: str = '') -> list[str]:
+    """One line per differing leaf, for a failure message only."""
+    if isinstance(committed, dict) and isinstance(regenerated, dict):
+        lines = []
+        for key in sorted(committed.keys() | regenerated.keys()):
+            where = f'{path}.{key}' if path else str(key)
+            if key not in regenerated:
+                lines.append(f'{where}: only in committed')
+            elif key not in committed:
+                lines.append(f'{where}: only in regenerated')
+            else:
+                lines += _differing_leaves(committed[key], regenerated[key], where)
+        return lines
+    if (
+        isinstance(committed, list) and isinstance(regenerated, list)
+        and len(committed) == len(regenerated)
+    ):
+        lines = []
+        for index, (a, b) in enumerate(zip(committed, regenerated, strict=True)):
+            lines += _differing_leaves(a, b, f'{path}[{index}]')
+        return lines
+    if committed != regenerated:
+        return [f'{path}: committed {committed!r} != regenerated {regenerated!r}']
+    return []
+
+
 class TestTheCommitStampMaskHidesOnlyTheStamps:
     def test_a_restamped_report_compares_equal(self):
         committed = _committed_report()
@@ -151,3 +206,30 @@ class TestAStampOffThisHistoryIsReported:
             assert {'path', 'commit', 'reason'} <= item.keys()
             assert item['reason']
         assert [item['commit'] for item in reported] == ['0' * 40, None]
+
+
+@pytest.mark.xdist_group('read_transform_regeneration')
+class TestTheCommittedReportIsWhatTheCacheProduces:
+    """Grouped onto one xdist worker so the regeneration is paid once."""
+
+    def test_the_json_is_a_stock_regeneration_except_for_commit_stamps(self):
+        regenerated = _without_commit_stamps(_regenerated_pair()[0])
+        committed = _without_commit_stamps(_committed_report())
+
+        assert regenerated == committed, '\n'.join([
+            *_differing_leaves(committed, regenerated)[:25],
+            _STALE_REMEDY,
+        ])
+
+    def test_the_markdown_is_a_stock_regeneration_byte_for_byte(self):
+        stamped = [
+            entry['commit'] for entry in _committed_report()['fixture_provenance']
+            if entry.get('commit')
+        ]
+        printed = [sha for sha in stamped if sha in _committed_markdown()]
+        assert not printed, (
+            f'the renderer now prints a commit stamp ({printed}); mask it here '
+            'as the JSON test does, or this comparison fails on every rebase'
+        )
+
+        assert _regenerated_pair()[1] == _committed_markdown(), _STALE_REMEDY
