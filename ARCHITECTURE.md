@@ -579,28 +579,41 @@ and are not restated here.
   **no** status), and `LEAVE`.
   The matching sweep for stranded `blocked` rows is the scheduler phase
   `_phase_redispatch_stranded_blocked` (`scheduler.py`).
-- **Pin discrimination — what an open record actually vetoes.** The shared
-  classifier `escalation/src/escalation/pins.py` distinguishes a **dead own-L0**
-  (`DEAD_L0`) from a **queue-backed L1/L2 handoff** (`QUEUE_HANDOFF`) from a
-  non-pinning `info` annotation, fails safe *to* pinning on an unknown severity,
-  and treats an unreadable store as a distinguishable third result
-  (`classify_pins(records=None)` → `store_unavailable`) rather than as "no
-  records". It is **already consumed in production by the done-flip gate**
-  (`Harness._already_landed_dispatch_gate`, asking `PinReport.vetoes_done_flip`;
-  task 3534 / spec §8-E8) — which is why a genuinely-landed task carrying a
-  lone `escalate_info` record no longer re-dispatches forever. What is **not**
-  yet rewired is the *stranded-recovery* veto: `_shape()` still folds the
-  question to `has_open_escalation = bool(report.open_escalations)`
-  (`task_ground_truth.py`) and `_phase_redispatch_stranded_blocked` still
-  short-circuits on a bare `get_by_task(tid, status='pending')` truthiness read
-  (`scheduler.py`), so at those two sites an open record of *any* level
-  and *any* severity holds a strand off. The plumbing is already in place —
-  `EscalationRef` carries `severity` and `filing_claimant_run_id` precisely so
-  a consumer can feed `classify_pins` without re-reading the store.
-  One gap is deliberately still open and should not be read as settled: when no
-  escalation queue is injected, `_resolve_open_escalations` returns `[]`, which
-  is indistinguishable from a genuine "no open escalations" — the
-  collapse the `store_unavailable` result exists to prevent. That is task 3535.
+- **Pin discrimination — the sweeps and gates consume the shared
+  classifier.** `escalation/src/escalation/pins.py::classify_pins`
+  distinguishes a **dead own-L0** (`DEAD_L0`) from a **queue-backed L1/L2
+  handoff** (`QUEUE_HANDOFF`) from a non-pinning `info` annotation, fails safe
+  *to* pinning on an unknown severity, and treats an unreadable store as a
+  distinguishable third result (`classify_pins(records=None)` →
+  `store_unavailable`) rather than as "no records". One classification answers
+  two questions. `PinReport.pins` is the recovery/redispatch veto: a
+  dead-filer L0 does not pin, because its handoff has no consumer left.
+  `PinReport.vetoes_done_flip` is the conservative MARK_DONE veto: a dead L0
+  still vetoes, because a done-flip is terminal.
+  - `_RECOVERY`'s escalation element (`task_ground_truth.py::_shape`) and the
+    done-flip gate `Harness._already_landed_dispatch_gate` ask
+    `vetoes_done_flip` — which is why a genuinely-landed task carrying a lone
+    `escalate_info` record does not re-dispatch forever (task 3534).
+  - The sweep-side appliers — `Harness._reconcile_one_stranded`'s in-progress
+    and blocked arms and `Scheduler._phase_redispatch_stranded_blocked`
+    (`scheduler.py`) — ask `.pins` through
+    `orchestrator/src/orchestrator/recovery_pins.py`. Its
+    `records_pin_blocked_recovery` adds the `MERGE_REMEDIABLE_ESC_CATEGORIES`
+    relaxation, so a record set made up entirely of `stranded_blocked`
+    records does not veto the merge it asks for.
+  - The re-file dedup asks `records_would_duplicate_a_handoff`.
+
+  Every site reads one classification, so the sites cannot disagree on level,
+  severity or liveness (INV-5 `no-lockstep-duplication`). The store's third
+  state travels beside it: `TaskGroundTruth._resolve_open_escalations` reports
+  an unreadable or absent store as a distinct flag
+  (`TruthReport.escalation_store_unavailable`), never as a bare empty list,
+  and it surfaces as `recovery_left` with reason
+  `escalation_store_unavailable`. It is deliberately not folded into the
+  disposition — an unreadable store alone does not pin, a standing decision
+  documented at `task_ground_truth.py::_vetoes_done_flip` — and the
+  scheduler's blocked sweep never flips a row when its queue is absent or its
+  read raises.
 - **Converting a pinned strand.** `_RECOVERY` maps a stranded, unclaimed
   `in-progress` row whose open record vetoes a done-flip to
   `CONVERT_TO_BLOCKED` in all four branch states, landed-but-pinned rows
@@ -611,8 +624,8 @@ and are not restated here.
   its record's resolution — by a human, or, for a dead-filer L0, by the
   supervised consumer that takes it once the orphan-L0 reaper has promoted it
   to L1 ("Orphaned L0 records" below) — where a `resume` re-pends it (§6).
-  Every CONVERT row is keyed `in-progress`, so a converted
-  row can never match one again: conversion is one-shot. A row that the
+  Every CONVERT row is keyed `in-progress`, so a converted row can never
+  match one again: conversion is one-shot. A row that the
   blocked-arm upgrade clauses would move again on the next sweep —
   `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
   is False, because it is pinned only by merge-remediable `stranded_blocked`
@@ -630,9 +643,12 @@ and are not restated here.
   quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
 - **Orphaned L0 records.** A *separate* sweep,
-  `Harness._reap_orphan_l0_escalations` (`harness.py`), reclaims L0
-  escalation *records* whose steward died without escalating (§6). The two are
-  easily conflated — one reaps directories, the other reaps queue rows.
+  `Harness._reap_orphan_l0_escalations` (`harness.py`), promotes to L1 any L0
+  escalation *record* older than `orphan_l0_timeout_secs` whose **filing**
+  incarnation is provably dead, judged by the classifier's L0 liveness link
+  (§6). A newer live workflow on the same task does not keep a prior
+  incarnation's L0 alive. The two are easily conflated — one reaps
+  directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
   `max_consecutive_merge_thrash=2`, `max_failure_signature_repeat=3`) — past
