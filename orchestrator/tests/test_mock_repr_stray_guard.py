@@ -1,4 +1,4 @@
-"""conftest.py's ``_no_mock_repr_stray_files`` fails the test that leaves a new
+"""conftest.py's ``_no_mock_repr_stray_entries`` fails the test that leaves a new
 ``<...Mock ...>`` entry in the CWD and removes that entry, while entries that
 predate the test are neither blamed nor touched.
 

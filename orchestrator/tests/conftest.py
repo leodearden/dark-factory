@@ -451,9 +451,9 @@ def _no_mock_derived_stray_dirs(request):
     does not cascade into a failure for every subsequent test sharing the same
     xdist worker's CWD.
 
-    **Directory shape only.**  This covers the ``os.fspath()`` ``MagicMock/``
-    DIRECTORY shape; the sibling :func:`_no_mock_repr_stray_files` covers the
-    ``str()``/repr ``<MagicMock name='...' id='...'>`` FILE shape.
+    **``os.fspath()`` shape only.**  This covers the ``MagicMock/`` tree; the
+    sibling :func:`_no_mock_repr_stray_entries` covers any file or directory
+    named by a mock's ``str()``/repr, ``<MagicMock name='...' id='...'>``.
     """
     yield
     stray = Path.cwd() / "MagicMock"
@@ -480,7 +480,7 @@ def _mock_repr_entries(directory: Path) -> frozenset[Path]:
 
 
 @pytest.fixture(autouse=True)
-def _no_mock_repr_stray_files(request):
+def _no_mock_repr_stray_entries(request):
     """Fail any test that leaves a NEW ``<...Mock ...>`` repr-named entry in the CWD.
 
     ``str()`` of a mock is its repr, so a mock-derived path reaching
