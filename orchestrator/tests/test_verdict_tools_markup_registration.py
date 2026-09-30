@@ -151,6 +151,30 @@ def queue_under(root: Path) -> EscalationQueue:
     return EscalationQueue(root / markup_sink.MARKUP_QUEUE_DIRNAME)
 
 
+def queued_residue(root: Path) -> list[Any]:
+    """Every pending residue record a sink steered at *root* queued."""
+    return queue_under(root).get_by_task(
+        verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
+    )
+
+
+def steer_project_root(monkeypatch, root: Path | None) -> None:
+    """Point BOTH injected channels — escalation sink and fact journal — at
+    *root*; ``None`` makes the root unresolvable, so the queue is unreachable.
+
+    ``raising`` is left at its default TRUE deliberately: a renamed or inlined
+    ``_markup_project_root`` must fail here, not leave monkeypatch quietly
+    creating an unused attribute. Without it most rows would fail loudly
+    anyway, but a row whose assertions are only that the call succeeded — the
+    journal-outage row — would pass VACUOUSLY, never having been steered at the
+    collision it means to force. ``test_plan_tools_markup_guard.py`` patches
+    the identical seam the same way.
+    """
+    monkeypatch.setattr(
+        verdict_tools, '_markup_project_root', lambda worktree: root,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The B14 signal: a REQUIRED list-typed parameter, absorbed and restored.
 # ---------------------------------------------------------------------------
@@ -481,20 +505,6 @@ class TestUnrepairableResidueIsPreserved:
                 })
         return json.loads(str(excinfo.value))
 
-    @staticmethod
-    def _steer(monkeypatch, tmp_path: Path) -> None:
-        """Point the sink at a real ``EscalationQueue`` under *tmp_path*."""
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
-
-    @staticmethod
-    def _queued_residue(tmp_path: Path) -> list[Any]:
-        """Every pending residue record the refusal queued under *tmp_path*."""
-        return queue_under(tmp_path).get_by_task(
-            verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
-        )
-
     @pytest.mark.asyncio
     async def test_the_call_is_refused(self, artifacts: TaskArtifacts):
         """(a) The boundary is a GUESS, so nothing is forwarded.
@@ -529,13 +539,13 @@ class TestUnrepairableResidueIsPreserved:
         Verbatim and entire, deliberately unlike ``build_markup_block``'s
         200-char excerpt: this is the only surviving copy.
         """
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
         value = self._value()
         assert len(value) == 3525
 
         await self._refuse(artifacts)
 
-        queued = self._queued_residue(tmp_path)
+        queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
         assert value in queued[0].detail
 
@@ -545,7 +555,7 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """(d) A bounced reviewer must be able to point an operator at its own
         preserved data — an id it cannot look up is no better than none."""
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
 
         payload = await self._refuse(artifacts)
 
@@ -559,11 +569,11 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
         the flat fields locating the leak."""
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
 
         await self._refuse(artifacts)
 
-        (filed,) = self._queued_residue(tmp_path)
+        (filed,) = queued_residue(tmp_path)
         assert filed.category == 'mcp_markup_residue'
         assert filed.level == 2
         assert "owner='l2-escalation-watcher'" in filed.detail
@@ -576,7 +586,7 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """(f) On this server preservation ACTUALLY happened, so the
         preserved variant of the hint is the true one."""
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
 
         payload = await self._refuse(artifacts)
 
@@ -593,9 +603,7 @@ class TestUnrepairableResidueIsPreserved:
         middleware and so bought the caller a preservation claim that was
         false. The caller still holds the payload, and must be told to keep it.
         """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: None,
-        )
+        steer_project_root(monkeypatch, None)
 
         payload = await self._refuse(artifacts)
 
@@ -657,9 +665,7 @@ class TestUnrepairableResidueIsPreserved:
         catch that disagreement. What happens when the queue cannot be reached
         at all is the business of the (f, floor) row above.
         """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
+        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         await self._refuse(artifacts)
@@ -983,15 +989,11 @@ class TestTheWidenedRepairVocabularyStaysContained:
         self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """Nothing is guessed AND nothing is destroyed — the C2 pair."""
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
+        steer_project_root(monkeypatch, tmp_path)
 
         await self._submit(artifacts)
 
-        queued = queue_under(tmp_path).get_by_task(
-            verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
-        )
+        queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected one residue record, got {queued!r}'
         assert "field='metadata'" in queued[0].detail
         assert 'swallowed tail' in queued[0].detail
@@ -1003,9 +1005,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
         """Queue or nothing on the FORWARD tier too: the call still lands, and
         the dropped slice is reported as preserved nowhere rather than under a
         worktree-local filename that dies with the lane."""
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: None,
-        )
+        steer_project_root(monkeypatch, None)
 
         result = await self._submit(artifacts)
 
@@ -1296,33 +1296,12 @@ class TestTheVerdictFactReachesADurableJournal:
     write no line whether or not the wiring landed.
     """
 
-    @staticmethod
-    def _steer(monkeypatch, tmp_path: Path) -> None:
-        """Point BOTH injected channels at *tmp_path*, failing if the seam went.
-
-        ``raising`` is left at its default TRUE deliberately. The step-1 rows
-        that first drove this passed it as False because the seam did not exist
-        yet; once the seam landed, that flag became the thing DISABLING the
-        only check that it still does. With it, a renamed or inlined
-        ``_markup_project_root`` would leave monkeypatch quietly creating an
-        unused attribute — and while most rows here would then fail loudly (an
-        empty journal), ``test_a_journal_outage_never_changes_the_outcome``
-        would pass VACUOUSLY: its assertions are all that the call succeeded,
-        which is equally true when the journal was never steered at the
-        directory collision it means to force.
-        ``test_plan_tools_markup_guard.py`` patches the identical seam the same
-        way.
-        """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
-
     @pytest.mark.asyncio
     async def test_a_repaired_call_is_journalled_with_its_task_id(
         self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(a) THE user-observable signal, on the measured leak shape."""
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         await repaired_call(artifacts)
@@ -1349,7 +1328,7 @@ class TestTheVerdictFactReachesADurableJournal:
         escalation channel is not consulted, so no residue record does either.
         Only the journal knows this happened at all.
         """
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
 
         result = await repaired_call(artifacts)
 
@@ -1372,7 +1351,7 @@ class TestTheVerdictFactReachesADurableJournal:
         / window_seconds / outcome / project, and ``project`` is structurally
         None on this boundary. WHICH caller leaked is a per-event fact.
         """
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         for _ in range(3):
@@ -1393,7 +1372,7 @@ class TestTheVerdictFactReachesADurableJournal:
         record-keeping file could not be written.
         """
         markup_journal.journal_path(tmp_path, 'verdict-tools').mkdir(parents=True)
-        self._steer(monkeypatch, tmp_path)
+        steer_project_root(monkeypatch, tmp_path)
 
         result = await repaired_call(artifacts)
 
@@ -1460,9 +1439,7 @@ class TestTheStormRecordNamesTheJournal:
         merely better-worded. So this one FOLLOWS it: pull the path the record
         names out of its own body, open that exact file, and read the line.
         """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
+        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         await repaired_call(artifacts)
