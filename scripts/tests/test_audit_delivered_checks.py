@@ -85,13 +85,13 @@ class TestClassifyDescriptor:
         """(a) The mode-2/mode-3 defect class: the producer closed, and the
         capability its check asserts is nowhere on main. Whatever the check was
         supposed to gate was never gated."""
-        assert classify_descriptor(CheckOutcome.FAIL, status='done') == DISPOSITION_BROKEN
+        assert classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True) == DISPOSITION_BROKEN
 
     def test_done_and_expect_absent_still_matching_is_broken(self):
         """(b) The same defect from the other polarity. FAIL already encodes
         the polarity — interpret_grep_rc inverts on `expect` — so the
         classifier never re-derives it and the two cells collapse to one rule."""
-        assert classify_descriptor(CheckOutcome.FAIL, status='done') == DISPOSITION_BROKEN
+        assert classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True) == DISPOSITION_BROKEN
 
     @pytest.mark.parametrize('status', ['pending', 'blocked', 'in-progress', 'deferred'])
     def test_non_terminal_and_already_passing_is_a_vacuous_live_gate(self, status):
@@ -100,7 +100,7 @@ class TestClassifyDescriptor:
         producer cannot change the verdict, so any dependent is either released
         for the wrong reason or held for one that will never clear."""
         assert (
-            classify_descriptor(CheckOutcome.PASS, status=status)
+            classify_descriptor(CheckOutcome.PASS, status=status, stamped=True)
             == DISPOSITION_VACUOUS_LIVE_GATE
         )
 
@@ -108,12 +108,12 @@ class TestClassifyDescriptor:
     def test_non_terminal_and_failing_is_healthy(self, status):
         """(d) The normal majority: a forward-looking check on unbuilt work.
         This cell MUST stay silent or the report is unreadable."""
-        assert classify_descriptor(CheckOutcome.FAIL, status=status) == DISPOSITION_HEALTHY
+        assert classify_descriptor(CheckOutcome.FAIL, status=status, stamped=True) == DISPOSITION_HEALTHY
 
     def test_done_and_passing_is_delivered(self):
         """(e) The success state, and the one a status-blind sweep misreads as
         vacuity for 57% of the corpus."""
-        assert classify_descriptor(CheckOutcome.PASS, status='done') == DISPOSITION_DELIVERED
+        assert classify_descriptor(CheckOutcome.PASS, status='done', stamped=True) == DISPOSITION_DELIVERED
 
     def test_supersession_outranks_broken(self):
         """(f) SUPERSESSION IS NOT A DEFECT. The measured case: task 3618's
@@ -122,7 +122,7 @@ class TestClassifyDescriptor:
         correct, delivered, and then legitimately undone by later work — so it
         must never be counted as an authoring defect."""
         assert (
-            classify_descriptor(CheckOutcome.FAIL, status='done', superseded_by='3578')
+            classify_descriptor(CheckOutcome.FAIL, status='done', stamped=True, superseded_by='3578')
             == DISPOSITION_SUPERSEDED
         )
 
@@ -131,11 +131,11 @@ class TestClassifyDescriptor:
         # Letting it relabel a delivered or healthy row would launder a real
         # disposition into a footnote.
         assert (
-            classify_descriptor(CheckOutcome.PASS, status='done', superseded_by='3578')
+            classify_descriptor(CheckOutcome.PASS, status='done', stamped=True, superseded_by='3578')
             == DISPOSITION_DELIVERED
         )
         assert (
-            classify_descriptor(CheckOutcome.FAIL, status='pending', superseded_by='3578')
+            classify_descriptor(CheckOutcome.FAIL, status='pending', stamped=True, superseded_by='3578')
             == DISPOSITION_HEALTHY
         )
 
@@ -143,8 +143,8 @@ class TestClassifyDescriptor:
         # A cancelled task promised nothing and gates nothing. Reporting its
         # failing check as `broken` would be a false positive on abandoned
         # work; reporting it as a live gate would be false too.
-        assert classify_descriptor(CheckOutcome.FAIL, status='cancelled') == DISPOSITION_INERT
-        assert classify_descriptor(CheckOutcome.PASS, status='cancelled') == DISPOSITION_INERT
+        assert classify_descriptor(CheckOutcome.FAIL, status='cancelled', stamped=True) == DISPOSITION_INERT
+        assert classify_descriptor(CheckOutcome.PASS, status='cancelled', stamped=True) == DISPOSITION_INERT
 
     def test_unevaluable_is_its_own_disposition(self):
         # ERRORED is not FAIL. git being unable to answer must never be
@@ -153,7 +153,7 @@ class TestClassifyDescriptor:
         # runtime gate's own rc>=2 -> ERRORED boundary exists to prevent.
         for status in ('done', 'pending', 'cancelled', None):
             assert (
-                classify_descriptor(CheckOutcome.ERRORED, status=status)
+                classify_descriptor(CheckOutcome.ERRORED, status=status, stamped=True)
                 == DISPOSITION_UNEVALUABLE
             )
 
@@ -161,8 +161,8 @@ class TestClassifyDescriptor:
         """(g) COVERAGE, never silence. A sidecar capability whose task_id
         resolves to no row in tasks.db cannot be classified — but dropping it
         would present a partial sweep as a complete one."""
-        assert classify_descriptor(CheckOutcome.PASS, status=None) == DISPOSITION_NO_TASK
-        assert classify_descriptor(CheckOutcome.FAIL, status=None) == DISPOSITION_NO_TASK
+        assert classify_descriptor(CheckOutcome.PASS, status=None, stamped=True) == DISPOSITION_NO_TASK
+        assert classify_descriptor(CheckOutcome.FAIL, status=None, stamped=True) == DISPOSITION_NO_TASK
 
     @pytest.mark.parametrize('status', ['pending', 'in-progress', 'deferred', 'blocked'])
     def test_live_failing_check_never_stamped_is_an_unwired_live_gate(self, status):
@@ -180,7 +180,13 @@ class TestClassifyDescriptor:
             classify_descriptor(CheckOutcome.FAIL, status=status, stamped=True)
             == DISPOSITION_HEALTHY
         )
-        assert classify_descriptor(CheckOutcome.FAIL, status=status) == DISPOSITION_HEALTHY
+
+    def test_stamped_must_be_stated_by_every_caller(self):
+        # A default of True would let a caller that forgot the argument read
+        # an unwired gate as healthy — the silent under-report this
+        # disposition exists to remove.
+        with pytest.raises(TypeError):
+            classify_descriptor(CheckOutcome.FAIL, status='pending')
 
     def test_stamping_matters_in_no_other_cell(self):
         # Every other cell is already decided by polarity or status: an
@@ -195,7 +201,11 @@ class TestClassifyDescriptor:
             (CheckOutcome.ERRORED, 'pending', DISPOSITION_UNEVALUABLE),
         ]
         for outcome, status, expected in cases:
-            assert classify_descriptor(outcome, status=status, stamped=False) == expected
+            for stamped in (True, False):
+                assert (
+                    classify_descriptor(outcome, status=status, stamped=stamped)
+                    == expected
+                )
 
 
 # ---------------------------------------------------------------------------

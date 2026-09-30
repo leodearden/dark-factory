@@ -260,8 +260,8 @@ def classify_descriptor(
     outcome: CheckOutcome,
     *,
     status: str | None,
+    stamped: bool,
     superseded_by: str | None = None,
-    stamped: bool = True,
 ) -> str:
     """Disposition for one descriptor, from its outcome and its producer's status.
 
@@ -287,7 +287,9 @@ def classify_descriptor(
        descriptor was never *stamped* onto its producer, in which case the
        runtime gate cannot see it at all. Stamping matters only in this cell,
        where the descriptor would be a sound gate; every other cell is
-       already decided by polarity and status.
+       already decided by polarity and status. *stamped* has no default:
+       a caller that forgot it would silently read an unwired gate as
+       healthy, so every call site must state it.
 
     *superseded_by* only ever explains away a would-be DEFECT. It is ignored
     on every other cell, so a supersession signal can never launder a real
