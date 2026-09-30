@@ -819,6 +819,21 @@ def unsearchable_supersedes_refs(refs: list[PointerRef]) -> list[PointerRef]:
     return [ref for ref in refs if _is_unsearchable_supersedes(ref)]
 
 
+def predecessor_gone_supersedes_refs(unresolved_refs: list[PointerRef]) -> list[PointerRef]:
+    """The searched ``supersedes`` refs whose superseded target did not resolve.
+
+    Family (1) DID pose a query for these, but a predecessor that is gone can
+    never be returned, so the pair can never be comparable (PRD D12). Pass
+    ``census.unresolved_refs``. Disjoint from
+    :func:`unsearchable_supersedes_refs` by construction — it reuses that
+    predicate — so the two rows name separate causes.
+    """
+    return [
+        ref for ref in unresolved_refs
+        if ref.key == 'supersedes' and not _is_unsearchable_supersedes(ref)
+    ]
+
+
 def _degraded_observation(
     ref: PointerRef,
     *,
@@ -1145,11 +1160,35 @@ def _disclosure_counts(
     from one the corpus genuinely stopped surfacing. Recorded on every run, a
     later change to the depth explains its own step in leaf α's trend; recorded
     nowhere, it looks like the corpus moved.
+
+    The ``pointers_by_reaper_{bucket}_{field}`` rows carry ``census.by_reaper``
+    the way the per-key rows carry ``by_key``, lazily. There are two reapers
+    with different mechanisms — an every-cycle Python writer capped at one live
+    record per project, and consolidation canonicals that accumulate — and an
+    aggregate cannot tell them apart. The ``by_reaper`` segment keeps these
+    rows disjoint from the per-key ones; they are a second cut of the same
+    edges, never a term to add to them.
+
+    ``successor_edges_by_design`` is the tripwire's attribution narrowing: the
+    supersedes edges :func:`by_design_successor_refs` excludes from its items
+    (PRD D11). Emitted every run, as ``0`` when none, so a tripwire whose ``n``
+    shrank because reaping grew is distinguishable from a corpus that stopped
+    superseding.
+
+    ``surfacing_edges_predecessor_gone`` is family (1)'s structural narrowing
+    and the answer to "why is ``pairs_comparable`` small": a reaped predecessor
+    cannot surface, so its pair can never be comparable (PRD D12). It counts
+    only edges family (1) DID search, so it never overlaps
+    ``surfacing_edges_unsearchable``.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
         'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
+        'successor_edges_by_design': len(by_design_successor_refs(refs)),
         'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
+        'surfacing_edges_predecessor_gone': len(
+            predecessor_gone_supersedes_refs(census.unresolved_refs),
+        ),
         'surfacing_edges_unsearchable': len(unsearchable_supersedes_refs(refs)),
         'surfacing_queries_degraded': len(surfacing.degraded),
         'surfacing_search_depth': surfacing_depth,
@@ -1158,6 +1197,9 @@ def _disclosure_counts(
     for key, row in sorted(census.by_key.items()):
         for field_name, value in sorted(row.items()):
             counts[f'pointers_{key}_{field_name}'] = value
+    for bucket, row in sorted(census.by_reaper.items()):
+        for field_name, value in sorted(row.items()):
+            counts[f'pointers_by_reaper_{bucket}_{field_name}'] = value
     return counts
 
 
