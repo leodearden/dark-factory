@@ -541,19 +541,8 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
-    # Since task 5308: never emitted with empty modules; data.modules is the
-    # set NEWLY parked by that attempt, so a completion emits another row
-    # carrying only the increment.  Historical-series break: CHANGELOG.md.
+    # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     reservation_installed = 'reservation_installed'
-    # Emitted by Scheduler._complete_parks when an install attempt parked
-    # FEWER modules than it requested because a same-or-higher-rank foreign
-    # active-top park blocked them (INV-3) — empty and partial installs are
-    # one signal.  Payload: {requested, installed, blocked, attempts,
-    # skip_count, priority}; ``attempts`` is the owner's consecutive
-    # blocked-attempt count.  Rate-limited to attempts in {1, 10, 100, 1000,
-    # 10000}; the attempt itself runs on every qualifying skip.  The streak
-    # resets when an attempt leaves nothing blocked, when the remainder is
-    # empty, or when the task dispatches.
     reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'

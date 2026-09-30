@@ -5375,7 +5375,8 @@ class Scheduler:
         skip, or a lower-tier task takes it in between.  Only the blocked
         EVENT is rate-limited, geometrically on the owner's consecutive
         blocked-attempt streak, which any attempt that leaves nothing
-        blocked resets.
+        blocked resets, as does the owner's dispatch
+        (:meth:`_settle_fairness_on_dispatch`).
         """
         streak = self._streak_park_install_blocked
         remainder = self.lock_table.unparked_modules(task_id, modules)
