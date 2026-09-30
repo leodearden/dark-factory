@@ -395,12 +395,19 @@ class DanglingCensus:
     zero-exposure metric: a fabricated "nothing wrong here" is worse than a
     gap, and the report names every family so the absence cannot read as
     health.
+
+    ``by_reaper`` is a second cut of the SAME edges, keyed by
+    ``ref.reaped_by`` or :data:`UNATTRIBUTED` and just as lazy. ``by_key``
+    answers which pointer kind broke; ``by_reaper`` answers whether anything
+    broke that was not deliberately reaped (PRD D11). They are orthogonal
+    cuts, read per question and never summed together.
     """
 
     examined: int
     resolved: int
     unresolved: int
     by_key: dict[str, dict[str, int]]
+    by_reaper: dict[str, dict[str, int]]
     unresolved_refs: list[PointerRef]
 
 
@@ -426,23 +433,33 @@ def dangling_census(
     costs no accounting.
     """
     by_key: dict[str, dict[str, int]] = {}
+    by_reaper: dict[str, dict[str, int]] = {}
     unresolved_refs: list[PointerRef] = []
     resolved = 0
     for ref in refs:
-        row = by_key.setdefault(ref.key, {'examined': 0, 'resolved': 0, 'unresolved': 0})
-        row['examined'] += 1
+        # Both cuts are bumped on the SAME branch of ONE traversal, so they
+        # cannot disagree about any ref.
+        rows = (
+            by_key.setdefault(ref.key, {'examined': 0, 'resolved': 0, 'unresolved': 0}),
+            by_reaper.setdefault(
+                ref.reaped_by or UNATTRIBUTED, {'examined': 0, 'resolved': 0, 'unresolved': 0},
+            ),
+        )
         target = ref.target if isinstance(ref.target, str) else None
-        if target is not None and resolution.get(target, False):
-            row['resolved'] += 1
+        outcome = 'resolved' if target is not None and resolution.get(target, False) else 'unresolved'
+        for row in rows:
+            row['examined'] += 1
+            row[outcome] += 1
+        if outcome == 'resolved':
             resolved += 1
         else:
-            row['unresolved'] += 1
             unresolved_refs.append(ref)
     return DanglingCensus(
         examined=len(refs),
         resolved=resolved,
         unresolved=len(unresolved_refs),
         by_key=by_key,
+        by_reaper=by_reaper,
         unresolved_refs=unresolved_refs,
     )
 
