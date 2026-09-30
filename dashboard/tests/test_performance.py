@@ -2495,6 +2495,7 @@ class TestPerformanceCardsDatum:
         assert datum.reason is None
         assert datum.as_of == CARDS_NOW - timedelta(hours=1)
         assert datum.freshness_bound_seconds == 7 * 86400
+        assert datum.value is not None
         histograms = (await aggregate_loop_histograms(conns, **window))['active']
         assert datum.value.to_wire() == {
             'paths': (await aggregate_completion_paths(conns, dirs, **window))['active'],
@@ -2515,13 +2516,18 @@ class TestPerformanceCardsDatum:
         datum = cards['idle']
 
         assert datum.state is DatumState.STALE
+        assert datum.as_of is not None
+        assert datum.reason is not None
+        assert datum.value is not None
         assert datum.as_of == CARDS_NOW - timedelta(days=20)
         assert CARDS_NOW - datum.as_of == timedelta(days=20)
         assert '7d' in datum.reason
         assert 'last completion' in datum.reason
         wire = datum.value.to_wire()
         assert wire['paths'] == []
-        assert wire['ttc']['count'] == 0
+        ttc = wire['ttc']
+        assert isinstance(ttc, dict)
+        assert ttc['count'] == 0
         validate_datum(datum, CARDS_NOW)
 
     @pytest.mark.asyncio
