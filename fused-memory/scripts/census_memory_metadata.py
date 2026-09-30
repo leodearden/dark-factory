@@ -1444,6 +1444,7 @@ def _regrowth_unavailable(reason: str) -> dict[str, Any]:
         'new_topics': [],
         'grown_topics': [],
         'lost_canonical_topics': [],
+        'removed_topics': [],
     }
 
 
@@ -1503,6 +1504,18 @@ def _topic_regrowth(
                 'canonical_before': was.get('canonical'),
                 'canonical_after': now.get('canonical'),
             })
+    # A target that LEFT the registry shrinks registry_topics_total and can
+    # shrink the zero-canonical count with it; named, so a smaller
+    # denominator is never read as stamping progress.
+    removed_topics = []
+    for key in sorted(before.keys() - after.keys()):
+        project_id, topic = _split(key)
+        removed_topics.append({
+            'project_id': project_id,
+            'topic': topic,
+            'records_before': before[key].get('records'),
+            'canonical_before': before[key].get('canonical'),
+        })
     return {
         'available': True,
         'scope': 'registry',
@@ -1510,6 +1523,7 @@ def _topic_regrowth(
         'new_topics': new_topics,
         'grown_topics': grown_topics,
         'lost_canonical_topics': lost_canonical_topics,
+        'removed_topics': removed_topics,
     }
 
 
@@ -2631,6 +2645,20 @@ def _render_coverage_trend(report: dict[str, Any]) -> list[str]:
                 _num(r.get('records')), _num(r.get('canonical')),
             ]
             for r in regrowth.get('new_topics') or []
+        ],
+        None,
+        aligns=['---', '---', '---:', '---:'],
+        cut=False,
+    )
+    lines += _render_named_rows(
+        'Left the registry',
+        ['project', 'topic', 'records before', 'canonical before'],
+        [
+            [
+                f'`{r["project_id"]}`', f'`{r["topic"]}`',
+                _num(r.get('records_before')), _num(r.get('canonical_before')),
+            ]
+            for r in regrowth.get('removed_topics') or []
         ],
         None,
         aligns=['---', '---', '---:', '---:'],

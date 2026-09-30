@@ -2170,6 +2170,36 @@ class TestCoverageDiff:
             },
         ]
 
+    def test_regrowth_names_topics_that_LEFT_the_registry(self):
+        # A re-keyed registry drops a target: registry_topics_total falls and
+        # the zero-canonical count may fall with it. Unnamed, that reads as
+        # stamping progress when the target set merely shrank.
+        prior = _topic_report(
+            {'dark_factory': [
+                {'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'},
+                {'topic': 'retired'}, {'topic': 'retired'},
+            ]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        regrowth = _mod.build_coverage_diff(self._current(), history)['topic_regrowth']
+        assert regrowth['removed_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'retired',
+                'records_before': 2, 'canonical_before': 0,
+            },
+        ]
+
+    def test_regrowth_names_no_removed_topic_when_the_registry_only_grew(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['removed_topics'] == []
+
     def test_regrowth_scope_is_disclosed_as_registry_bounded(self):
         # The signal is scoped to the committed registry because that is
         # what the history may bound-safely carry. Disclosed, never silently
@@ -2193,6 +2223,7 @@ class TestCoverageDiff:
         assert regrowth['available'] is False
         assert regrowth['reason']
         assert regrowth['new_topics'] == []
+        assert regrowth['removed_topics'] == []
 
     # ---- wiring + determinism -------------------------------------------
 
@@ -3119,6 +3150,20 @@ class TestRenderMarkdownCoverageTrend:
         grew = _md_section(md, '#### Grew in member records')
         assert '| `dark_factory` | `alpha` | 1 | 2 |' in grew
 
+    def test_a_topic_that_left_the_registry_renders_named(self):
+        prior = _topic_report(
+            {'dark_factory': [{'topic': 'retired', 'canonical': True}]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        md = _mod.render_markdown(_coverage_md_report(history=history))
+        removed = _md_section(md, '#### Left the registry')
+        assert '| `dark_factory` | `retired` | 1 | 1 |' in removed
+
     def test_a_class_with_nothing_to_report_says_so_rather_than_vanishing(self):
         # The mirror image, and why the row assertions above are keyed to
         # their own section: an empty class must render an explicit "(none)"
@@ -3127,6 +3172,7 @@ class TestRenderMarkdownCoverageTrend:
         md = _mod.render_markdown(_coverage_md_report(history=self._history()))
         assert _md_section(md, '#### Lost their `canonical: true`').strip() == '_(none)_'
         assert _md_section(md, '#### Grew in member records').strip() == '_(none)_'
+        assert _md_section(md, '#### Left the registry').strip() == '_(none)_'
 
     def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
         # `'registry' in md.lower()` could not fail: the document always
