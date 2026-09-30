@@ -2304,9 +2304,7 @@ def test_no_sql_side_clock_reads_in_data_layer():
     source line -- so a comment or docstring *naming* the forbidden pattern
     in prose (as performance.py's do) cannot trip a false positive; only
     string literals that could actually reach SQLite as a query are
-    inspected. Does not fire on `_project_cutoffs` (performance.py), which
-    uses `datetime(MAX(completed_at), ...)` and is deliberately out of
-    scope for this task (see design decision).
+    inspected.
 
     Detection lives in `_sql_clock_read_violations`, which reports a match
     directly off the AST literal -- file, the literal's start line, and the
@@ -2340,3 +2338,121 @@ def test_no_sql_side_clock_reads_in_data_layer():
         'dashboard.data.utils.resolve_now '
         '(see dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# Cards and sparklines share one wall-clock window (task 5594)
+# ---------------------------------------------------------------------------
+
+CARDS_NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+CARDS_DAYS = 7
+
+
+def _task_row(
+    task_id: str,
+    project_id: str,
+    completed_at: datetime,
+    *,
+    outcome: str = 'done',
+    duration_ms: int = 1000,
+    verify_attempts: int = 0,
+    review_cycles: int = 0,
+) -> tuple:
+    return (
+        f'run-{project_id}', task_id, project_id, None, outcome, 0.0, duration_ms,
+        0, 0, verify_attempts, review_cycles, 0.0, 0, completed_at.isoformat(),
+    )
+
+
+def _active_and_idle_rows(now: datetime) -> list[tuple]:
+    """'active' completes three tasks inside the 7d window ending at *now*,
+    plus one done row at now - 7d - 30m: outside the wall-clock window but
+    inside the window anchored to its latest completion (latest - 7d =
+    now - 7d - 1h). 'idle' last completed anything 20 days before *now*."""
+    return [
+        _task_row('a1', 'active', now - timedelta(hours=1), duration_ms=1000),
+        _task_row('a2', 'active', now - timedelta(hours=2), duration_ms=3000, verify_attempts=1),
+        _task_row('a3', 'active', now - timedelta(hours=3), outcome='blocked'),
+        _task_row('a4', 'active', now - timedelta(days=7, minutes=30), duration_ms=9000),
+        _task_row('i1', 'idle', now - timedelta(days=20), duration_ms=5000),
+        _task_row('i2', 'idle', now - timedelta(days=20, hours=1), duration_ms=6000),
+    ]
+
+
+@pytest.fixture()
+async def active_idle_conn(tmp_path):
+    db_path = _make_runs_db(tmp_path, 'active_idle.db', _active_and_idle_rows(CARDS_NOW))
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestCardsShareTheWallClockWindow:
+    """The four card families count the rows of the wall-clock window
+    ``[now - days, now]`` that the sparklines count, never a window anchored
+    to each project's latest completion."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_completion_paths(self, active_idle_conn, empty_escalations_dir):
+        result = await aggregate_completion_paths(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert sum(entry['count'] for entry in result['active']) == 3
+        assert result['idle'] == []
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates(self, active_idle_conn, empty_escalations_dir):
+        result = await aggregate_escalation_rates(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert result['active']['total_tasks'] == 3
+        assert result['idle']['total_tasks'] == 0
+
+    @pytest.mark.asyncio
+    async def test_loop_histograms(self, active_idle_conn):
+        result = await aggregate_loop_histograms([active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert sum(result['active']['outer']['values']) == 2
+        assert sum(result['active']['inner']['values']) == 2
+        assert result['idle'] == {
+            'outer': {'labels': ['0', '1', '2', '3+'], 'values': [0, 0, 0, 0]},
+            'inner': {'labels': ['0', '1', '2', '3', '4', '5+'], 'values': [0, 0, 0, 0, 0, 0]},
+        }
+
+    @pytest.mark.asyncio
+    async def test_time_centiles(self, active_idle_conn):
+        result = await aggregate_time_centiles([active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert result['active']['count'] == 2
+        assert result['idle']['count'] == 0
+        assert result['idle']['p50'] == 0
+
+    @pytest.mark.asyncio
+    async def test_cards_count_the_rows_the_sparkline_counts(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        paths = await aggregate_completion_paths(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        history = await aggregate_performance_history(
+            [active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        hour_buckets = history['active']['time_centiles_history']['labels']
+        assert sum(entry['count'] for entry in paths['active']) == len(hour_buckets)
+
+    @pytest.mark.asyncio
+    async def test_default_now_is_the_wall_clock(self, tmp_path, empty_escalations_dir):
+        """With no ``now``, an idle project's 20-day-old rows are outside the
+        window ending at the current clock, whatever its latest completion."""
+        db_path = _make_runs_db(tmp_path, 'idle_only.db', [
+            _task_row('i1', 'idle', datetime.now(UTC) - timedelta(days=20)),
+            _task_row('i2', 'idle', datetime.now(UTC) - timedelta(days=20, hours=1)),
+        ])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            paths = await get_completion_paths(conn, empty_escalations_dir, days=CARDS_DAYS)
+            ttc = await get_time_centiles(conn, days=CARDS_DAYS)
+        assert paths['idle'] == []
+        assert ttc['idle']['count'] == 0
