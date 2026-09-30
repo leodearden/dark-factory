@@ -22,7 +22,6 @@ from shared.briefing_queries import QUERY_SPECS, BriefingScope, queries_for
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
-BRIEFING_DERIVATION = 'briefing_query'
 _SCOPE_KEYS = frozenset({'task_id', 'title', 'files'})
 
 
@@ -78,10 +77,7 @@ def briefing_drift(registry) -> list[str]:
     the rendered queries in order, and the spec's own search scope.
     """
     specs = {spec.slug: spec for spec in QUERY_SPECS}
-    entries = {
-        entry.topic: entry for entry in registry.entries
-        if entry.derived_from == BRIEFING_DERIVATION
-    }
+    entries = {entry.topic: entry for entry in registry.entries if entry.is_query_surface}
     drift = [f'{slug}: no registry topic for this briefing spec' for slug in sorted(specs.keys() - entries.keys())]
     drift += [f'{topic}: briefing_query topic has no spec' for topic in sorted(entries.keys() - specs.keys())]
     for topic in sorted(entries.keys() & specs.keys()):
@@ -102,7 +98,7 @@ def registry():
 
 
 def _briefing_entries(registry):
-    return [e for e in registry.entries if e.derived_from == BRIEFING_DERIVATION]
+    return [e for e in registry.entries if e.is_query_surface]
 
 
 def _reword_area_phrasing(payload: dict) -> None:
