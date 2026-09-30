@@ -22,6 +22,17 @@ from pydantic import ValidationError
 from orchestrator.config import OrchestratorConfig
 
 
+# Real-subprocess tests run _run_cmd, whose TimeoutError path escalates
+# terminate_process_group(grace_secs=5.0) as SIGTERM-wait then SIGKILL-wait, so
+# its bounded worst case is (largest _run_cmd timeout, 10.0) + 2 * 5.0 = 20s.
+# timeout_method="thread" makes a marker breach os._exit() the xdist worker, so
+# the marker carries 3x headroom over that bound for CPU-starved hosts.
+_TERMINATE_GRACE_SECS = 5.0
+_LARGEST_RUN_CMD_TIMEOUT_SECS = 10.0
+_WORST_CASE_SECS = _LARGEST_RUN_CMD_TIMEOUT_SECS + 2 * _TERMINATE_GRACE_SECS
+REAL_SUBPROCESS_TEST_TIMEOUT = int(3 * _WORST_CASE_SECS)
+
+
 def _load_package_defaults() -> dict:
     """Read the shipped defaults.yaml so tests stay in sync automatically."""
     defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
@@ -496,7 +507,7 @@ class TestRunCmdClockStop:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_happy_exclude_span(self, tmp_path: Path):
         """(a) HAPPY/EXCLUDE-SPAN: stopped span is excluded from wall-clock budget.
 
@@ -521,7 +532,7 @@ class TestRunCmdClockStop:
         assert timed_out is False, f'Expected timed_out=False; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_heartbeat_idle_kill(self, tmp_path: Path):
         """(b) HEARTBEAT-IDLE KILL: silent stop triggers idle backstop.
 
@@ -541,7 +552,7 @@ class TestRunCmdClockStop:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_resumed_budget_kill(self, tmp_path: Path):
         """(c) RESUMED-BUDGET KILL: post-START wall-clock fires.
 
@@ -566,7 +577,7 @@ class TestRunCmdClockStop:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_enabled_no_markers_normal_hang(self, tmp_path: Path):
         """(d) ENABLED-NO-MARKERS: clock_stop enabled but stub emits no markers.
 
@@ -583,7 +594,7 @@ class TestRunCmdClockStop:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_gate_disabled_markers_ignored(self, tmp_path: Path):
         """(e) GATE/DISABLED: clock_stop=None; markers in output are ignored.
 
@@ -611,7 +622,7 @@ class TestRunCmdMaxTotalSecs:
     """max_total_secs cumulative-stopped-time cap."""
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_max_total_secs_exceeded(self, tmp_path: Path):
         """max_total_secs=0.5; stub HEARTBEATs forever (never STARTs).
 
@@ -633,7 +644,7 @@ class TestRunCmdMaxTotalSecs:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(10)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_max_total_secs_zero_means_unlimited(self, tmp_path: Path):
         """max_total_secs=0 (unlimited); heartbeating stub is NOT killed by total cap.
 
@@ -670,7 +681,7 @@ class TestClockStopMessageAttribution:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_external_stop_not_blamed_on_wall_clock_budget(self, tmp_path: Path):
         """(a) esc-3694-3 regression: a TimeoutError surfacing from the read
         for a reason OTHER than the armed read_timeout elapsing must not be
@@ -716,7 +727,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_elapsed_is_measured_at_the_stop_not_the_last_read(self, tmp_path: Path):
         """(b) defect 2: the reported elapsed must be measured when the stop
         actually fires, not frozen at when the last output arrived.
@@ -745,7 +756,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_legitimate_heartbeat_idle_kill_is_still_named(self, tmp_path: Path):
         """(c) guard against the rewire producing a false 'unattributed':
         a genuine heartbeat-idle backstop kill is still named."""
@@ -775,7 +786,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_legitimate_max_total_secs_kill_is_still_named(self, tmp_path: Path):
         """(d) guard against the rewire producing a false 'unattributed' on
         the max-total-stopped-cap NARROWING path — the path where the armed
@@ -798,7 +809,7 @@ class TestClockStopMessageAttribution:
         assert 'unattributed' not in out, f'Legitimate kill wrongly reported unattributed: {out!r}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_unattributed_stop_warns_with_structured_facts(self, tmp_path: Path, caplog):
         """(a) The self-consistency guard must be LOUD, not just honest in
         the returned string (scope item 2): a refused attribution logs a
@@ -860,7 +871,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_genuine_expiry_does_not_warn(self, tmp_path: Path, caplog):
         """(b) A genuine wall-clock expiry must stay silent — the guard must
         fire only on the anomaly, or it becomes noise on every ordinary
