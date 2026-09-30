@@ -194,7 +194,8 @@ bumps the heartbeat.
 ```
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
-3. Handle each drained escalation
+3. Handle each drained escalation: standing facts → self-execute tier → briefing disposition
+   (see "Before an item reaches Leo")
 4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
    an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
@@ -403,9 +404,9 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 ### 3. Task progress
 
-**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on.
+**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on. What "act" may cover is the self-execute tier (see "Before an item reaches Leo"), and its always-ask list overrides 3a.
 
-**3b — Unclear decisions that matter: ask the human.** When the best action is ambiguous AND the choice has real consequences:
+**3b — Unclear decisions that matter: ask the human.** Before you ask, give the item its briefing disposition (see "Disposition before briefing (H1–H6)"). When the best action is ambiguous AND the choice has real consequences:
 - Leave the escalation pending on the queue
 - Tell the human about it with full context (they may be away for hours — that's OK)
 - Create a local task/todo to track the need for resolution
@@ -415,6 +416,159 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - **File a DecisionRecord via `write-decision`** (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to the reminder above, so this item surfaces in the cockpit decision queue.
 
 It is better to stall development than to bake in a significant bad decision.
+
+## Before an item reaches Leo
+
+Every drained item passes three checks, in this order, before it may appear in the numbered brief:
+
+1. **Standing-facts register**: is this a question at all?
+2. **Self-execute tier**: may I just do it and report it under **Done**?
+3. **Disposition before briefing (H1–H6)**: brief directly, pre-investigate then brief, or ask Leo
+   directly with the readable evidence attached.
+
+These are Leo's rulings of 2026-09-25 on the watcher prompting study, carried by task 5883. They
+sharpen Priority Hierarchy 3a and 3b above.
+
+### Standing-facts register
+
+Consult this before asserting an anomaly or asking Leo a config question. An item that matches an
+entry is not a question and never enters the numbered list. Each entry gives the fact, where its
+authority lives, what not to raise, and when it was recorded. The authority holds the numbers; this
+list only points at it.
+
+- **Orchestrator restarts on the fleet redeploy cadence (about 8h) are expected, not anomalies.**
+  Authority: OPERATIONS.md §"Fleet redeploy & watchdog". Do not raise a restart until
+  `scripts/orchestrator-watchdog.py --report` (read-only) fails to explain it. Recorded 2026-09-25,
+  after it was raised on 08-22 although CLAUDE.md had carried it since 07-22.
+- **The host is never quiet.** Authority: Leo. Benchmark and measure under load. Never ask Leo to
+  wait for, or schedule, a quiet host. Recorded 2026-09-25.
+- **Backburnered projects: pump_web_ui (its hopper is empty by design) and autopilot_video.**
+  Authority: Leo; their watcher-cost question belongs to task 4001. An empty queue or an idle
+  orchestrator there is not an anomaly. Recorded 2026-09-25.
+- **Items Leo holds in another session, or in his personal backlog, are never a question.**
+  Authority: Leo. Record each as a `standing` with a `manual` release predicate (see "Investigate
+  before you `record`"), so it renders in the **Standing / no action** footer. Recorded 2026-09-25.
+
+When Leo corrects a non-anomaly you raised, add a dated entry here. That is a docs-only commit, which
+the self-execute tier below allows direct to main; CLAUDE.md "Working in the main checkout" says when
+such a commit may land.
+
+### Self-execute tier
+
+Execute these and report each under the brief's **Done** section; do not ask (Leo, 2026-09-25). An
+action that closes or moves a numbered item lands under **Done** by itself (see "The sitting and its
+numbers"). An action tied to no item gets one line under the same heading, in the message that
+carries the brief. Check "Always ask — keyed on record content" below first: it wins on any match.
+
+1. Read-only probes and log pulls.
+2. Installing an already-shipped timer or unit whose action is read-only or reporting.
+3. Filing a delayed follow-up for a gate that fired prematurely: a dependency plus a `delayed`
+   milestone. The milestone shape is in docs/task-authoring.md §"Milestone tasks (dated /
+   delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True` → `add_dependency` →
+   `commit_planning` rule.
+4. Recovering a preserved payload into the task the brief names.
+5. Appending a finding to an existing owner task, ONLY while that task is `pending`, because task
+   text is never re-read after dispatch (see "Findings for another task's owner").
+6. Close-only under the carve-out in "Ruled-elsewhere check (answered-but-unrecorded)", and
+   rubber-stamp confirm-and-close gates: a record whose only ask is to confirm an
+   already-verifiable fact and close it, with no option to choose. Verify the fact yourself first.
+7. Executing a ruling Leo already gave, when the record names it and the originating session has
+   ended. The same carve-out's gates 1, 2 and 4 are the test.
+8. Watcher self-operations: loop cadence, lease release on an announced reboot, writing and reading
+   the handover. Task 5884 owns their mechanics. Force lease release stays forbidden (see
+   "Claiming the Watcher Lease").
+9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
+   gates (ratified 2026-09-25).
+
+#### Always ask — keyed on record content
+
+The trigger is what the RECORD says, never your own "no judgement needed" label: the 08-24 brief
+put a $360 calibration spend in that bucket. If any class below matches, the item is asked, even
+when it also matches a tier line above.
+
+The floor is every human-forever gate in docs/escalation-standing-policy.md §"Human-forever
+gates"; that document defines them. Leo's classes follow, each with the record content that keys
+it, and the gate slug where one corresponds:
+
+- Milestone gates and deterministic-runner filings (`milestone_gate`,
+  `deterministic_runner_filing`).
+- Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
+  (`spend_or_eval_launch`).
+- Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
+  of an orchestrator, watchdog enables that restart units (`physical_operator_action`). **Except**
+  restarts of fused-memory and the dashboard, which are allowed but reported after the fact with
+  their root cause.
+- Irreversible or content-losing operations: entity merge or split, memory deletion, branch
+  deletion, cancelling a task with dependents (`irreversible_deletion`).
+- Bypasses: no-verify, skipping the merge queue, force lease release, widening an allowlist past a
+  guard. **Except** direct-to-main docs-only commits, which are allowed; CLAUDE.md "Working in the
+  main checkout" says when one may land.
+- Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
+- A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
+  other session or his personal backlog.
+- Priority, pin-queue placement, cross-cluster dependency sequencing.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+
+Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
+asks to launch one.
+
+### Disposition before briefing (H1–H6)
+
+Every item that is neither a standing fact nor self-executed gets exactly one of three dispositions
+before it may enter the numbered brief (Leo, 2026-09-25):
+
+1. **Brief directly.**
+2. **Pre-investigate, then brief.**
+3. **Ask Leo directly**, with the readable evidence attached.
+
+Six rules decide which. Each carries the measured cases it was drawn from, so you can recognise the
+next one.
+
+- **H1 — second-hand premise ⇒ investigate first.** The deciding claim came from the record text, a
+  handover or a prior session, not from something this session verified now. Use a verifier
+  sub-agent with a refute mandate. Exemplars: recon gate 652 ("migrate" accepted, then refuted the
+  next day); esc-5485-8 (the premise was a rebase artifact); task 4803 ("undefer" while folded into
+  5255).
+- **H2 — options you cannot write a ramification line for ⇒ investigation-shaped, never a bare
+  pick.** Exemplars: esc-5588-8 ("file a trace task or close" hid 300 prompt replays in 30 days);
+  red-tier host levers asked with no options; xdist flags proposed without ramifications when task
+  1907 held the answer.
+- **H3 — design or architectural scope, or anything adjacent to a Leo HOLD ⇒ pre-investigate to
+  "ready to discuss", never to "resolved".** Opus by default; Fable only where an Opus attempt
+  struggled or the discussion is strategy-level. Exemplars: esc-5601-7, esc-5620-6, esc-4811-3,
+  esc-3169-1.
+- **H4 — a recommendation, evidence this session verified itself, and a reversible action ⇒ brief
+  directly, one numbered line.** Exemplar: 48 such items in the month to 2026-09-23, all taken.
+- **H5 — inputs only Leo has ⇒ ask directly, do not investigate, but gather the readable
+  measurement first.** Such inputs: attention or priority, spend, risk appetite, reversal of his
+  own ruling. Exemplars: esc-3637-1; the $360 calibration; merge_verify_breadth, where the brief
+  lacked "scoped admitted reds".
+- **H6 — two or fewer options on a design-shaped item ⇒ run a cheap option-space seat first.** Its
+  brief: "what else, including nothing, deferring gated on X, questioning the premise". Exemplars:
+  over-delivery-gap; esc-4131-9 (ruled D, never offered); esc-5332-7; steward-budget-C.
+
+**When several rules fire.** H1's premise check always runs first. H6's option-space seat runs
+before or inside an H3 investigation. H5 decides "ask directly" over H2, H3 or H6 investigation,
+because investigating cannot supply an input only Leo has. H4 applies only when no other rule
+fires. Leo's own investigation template (2026-09-21), "investigate and either resolve directly if
+clear-cut, or get ready to discuss in depth", is the brief for H1 and H2 seats, within two limits:
+"resolve directly" never crosses "Always ask — keyed on record content", and an H3 seat stops at
+ready to discuss.
+
+#### Sub-agent or `/spawn` (Leo's rule, 2026-09-25)
+
+- If handling will take a multi-turn conversation with Leo, `/spawn` a session. That keeps the
+  conversation un-interleaved and out of this session's context, which is reserved for system
+  supervision. The category handlers' interactive `/unblock` spawns below are this case.
+- If it ends in a single report and a single ruling, use a sub-agent (the `Agent` tool) and deliver
+  its result into this session. That means fewer terminals; Leo has run more than 15 at once.
+
+Join a completed spawn per "Joining a completed spawn: read `result.md`, don't explore".
+
+#### No cap on items awaiting Leo
+
+The brief lists every item awaiting Leo; the queue exists to show them all. Leo ruled against the
+study's proposed cap on 2026-09-25.
 
 ## Filing Parked Decisions to the Cockpit Registry (C8)
 
@@ -1003,6 +1157,10 @@ A promoted cluster's `root_cause` and `evidence` are the auto-watcher's narrativ
 Before ruling on one that joins two or more failures of a task, or restating it to the human, count
 those failures per [`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
 
+Every handler below ends in an action or a question to Leo. The self-execute tier bounds the
+action, and the question passes through its briefing disposition first (see "Before an item
+reaches Leo").
+
 **Additive-context convention for spawned `/unblock` prompts.** Several categories below spawn an
 interactive `/unblock` session with a prompt of the form `/unblock <task_id> (esc <escalation_id>,
 <category>, <severity>: <summary>)`. Only the leading `/unblock <task_id>` token is load-bearing:
@@ -1292,6 +1450,8 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Every option carries its `ramification`. Every item carries a recommendation with its evidence
   chain, or an explicit `no_lean` with its reason.
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
+- The item's briefing disposition decides whether it is recorded now, after investigation, or as a
+  direct ask (see "Disposition before briefing (H1–H6)").
 
 #### Gate facts are yours to supply
 
@@ -1485,7 +1645,8 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human**, except for the narrow self-close case defined in "Standing rule:
 accept verified info-level design deviations" below — check that subsection first:
-1. Present the concern with full context
+1. Present the concern with full context, after its briefing disposition — H3 and H6 usually fire
+   here (see "Disposition before briefing (H1–H6)")
 2. Leave the escalation pending — the open escalation record IS the durable record that something
    needs doing
 3. Create a local todo **for this session only** — it does not survive session end and is not the
@@ -1555,9 +1716,10 @@ hold**:
 **Otherwise**, meaning any condition fails, the evidence cannot be checked, or the recommendation
 is anything but accept, use the normal park procedure above.
 
-**Limits.** A second such escalation on the same task, or more than 3 qualifying in one day, goes
-to the human as a pattern instead: a stream of deviations suggests the planning itself is off. The
-human can revoke this rule at any time.
+**Limits.** A second such escalation on the same task goes to the human as a pattern instead: a
+stream of deviations on one task suggests its planning is off. There is no daily cap: Leo discarded
+it on 2026-09-26 ("Discard the cap. You can ratify these without limit."). The human can revoke
+this rule at any time.
 
 **Worked examples (2026-09-17).**
 - **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
@@ -1792,6 +1954,7 @@ window this is the difference between one durable session and repeated restarts.
 - ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
   top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
+- Choosing between a sub-agent and a `/spawn`ed session: see "Sub-agent or `/spawn`"
 
 **Keep in top-level context:**
 - The watch loop itself (your core job)
@@ -1807,7 +1970,7 @@ Maintain awareness of escalations waiting for human input. When the human return
 status, answer with the sitting preparer (see "Sitting preparer (`prepare-sitting` mode)" above)
 rather than a hand-assembled list: `brief --ledger <session ledger>` is the numbered list, with each
 item's options, recommendation and age, and its standing footer says what is waiting on someone
-else.
+else. The brief lists every item awaiting Leo, with no cap (see "No cap on items awaiting Leo").
 
 Remind about unresolved items roughly every 3-5 escalation handling cycles — enough to keep them visible without being noisy.
 
