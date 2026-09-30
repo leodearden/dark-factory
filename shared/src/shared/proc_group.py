@@ -91,6 +91,16 @@ logger = logging.getLogger(__name__)
 _PROC_ROOT = Path('/proc')
 
 
+def _read_proc_text(path: Path) -> str:
+    """Read a /proc text field for display; raises only OSError.
+
+    Its bytes are arbitrary (a process sets its own comm and argv), so
+    undecodable ones become U+FFFD rather than raising.  Pathnames that are
+    compared, not displayed, need ``os.fsdecode`` instead.
+    """
+    return path.read_bytes().decode('utf-8', 'replace')
+
+
 class _StatFields(NamedTuple):
     comm: str
     state: str
@@ -106,7 +116,7 @@ def _read_stat_fields(entry: Path) -> _StatFields | None:
     rather than costing the pid its entry.
     """
     try:
-        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+        text = _read_proc_text(entry / 'stat')
     except OSError:
         return None
     rparen = text.rfind(')')
@@ -180,7 +190,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
-            wchan = (entry / 'wchan').read_bytes().decode('utf-8', 'replace').strip()
+            wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
             wchan = '?'
 
@@ -190,8 +200,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         # log friendliness.  Mirrors the wchan try/except idiom so
         # snapshot_process_group never raises (module invariant).
         try:
-            raw = (entry / 'cmdline').read_bytes()
-            cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
+            cmdline = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
             if not cmdline:
                 cmdline = fields.comm  # kernel thread — fall back to short comm
             if len(cmdline) > 200:
