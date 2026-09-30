@@ -1795,6 +1795,49 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     )
 
 
+_UNDECODABLE_COMM_CHILD_SCRIPT = (
+    'import ctypes, sys\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'sys.stdin.read()\n'
+)
+
+
+class TestReadPpidMap:
+    """read_ppid_map() walks every process on the host, whatever its name."""
+
+    @pytest.mark.timeout(15)
+    def test_a_child_with_an_undecodable_comm_is_still_mapped_to_its_parent(self):
+        """comm is arbitrary bytes; one foreign name must neither fail nor thin the walk."""
+        import subprocess
+        import sys
+
+        from orchestrator.verify_cancel import read_ppid_map
+
+        child = subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_CHILD_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == b'ready'
+            assert b'(\xff\xfe)' in Path(f'/proc/{child.pid}/stat').read_bytes(), (
+                'harness failure: the child did not rename itself to undecodable bytes'
+            )
+
+            assert read_ppid_map()[child.pid] == os.getpid()
+        finally:
+            assert child.stdin is not None
+            child.stdin.close()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+
 # ---------------------------------------------------------------------------
 # Task 4195 step-1: run_stdin_heartbeat — the PRODUCER half of the same
 # connection-death wire protocol whose CONSUMER (run_stdin_watchdog) is tested
