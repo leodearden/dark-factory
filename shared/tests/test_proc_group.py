@@ -1059,6 +1059,11 @@ class TestScanProcessGroupsUnderPath:
     whose cwd / open fds / mmap'd paths fall at-or-under the ``_merge-verify``
     worktree of a *previous* orchestrator run.  Like snapshot_process_group it
     must never raise, even on vanished/permission-denied pids.
+
+    Every test here pays for a walk of the real /proc, whose cost scales with
+    the host's process count (task 4520). So each makes one walk and keeps
+    only what a fabricated /proc cannot show; the rest belongs in
+    :class:`TestScanProcessGroupsAgainstASyntheticProc`.
     """
 
     @pytest.mark.asyncio
@@ -1175,6 +1180,11 @@ class TestScanProcessGroupsUnderPath:
         keep a dup of the fd open), closes its only fd, and runs with its cwd
         outside root, so its maps line is the only thing tying its group to
         root. The fd precondition is asserted, not assumed.
+
+        What only this real walk shows is that the kernel writes the raw,
+        unescaped non-UTF-8 bytes into maps. The decoding choice itself is
+        pinned by the synthetic
+        ``test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes``.
         """
         base = tmp_path.resolve()
         root = base / '_merge-verify'
