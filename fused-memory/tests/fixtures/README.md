@@ -242,7 +242,9 @@ The probed-topic registry for the **E1 retrieval-health** eval
 (`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
 `fused-memory/scripts/memory_eval_retrieval_probe.py` via
 `load_topic_registry()`; its shape is contract-tested in
-`fused-memory/tests/test_memory_eval_retrieval_probe.py`.
+`fused-memory/tests/test_memory_eval_retrieval_probe.py`, and its
+`briefing_query` topics are pinned to their source in
+`fused-memory/tests/test_memory_eval_briefing_topics.py`.
 
 ### Purpose
 
@@ -271,6 +273,8 @@ below. Per entry:
 | `claim_queries[]` | `{query, needles}`. A claim is recalled when **all** needles appear in some returned entry — deliberately weaker than canonical identity, so a consolidation that moved a claim into a different entry does not read as knowledge loss. |
 | `members[]` | Content hashes of entries the curator adjudicated as the same claim. |
 | `supersedes_pairs[]` | `{superseded_hash, successor_hash}`, recorded **offline**. |
+| `search_scope` | Optional `{stores, categories}` the probe forwards to `search`, for a topic whose real caller scopes its own search. Absent means unscoped (the router picks). Parsed strictly: an empty or misspelt scope is a load failure, not a silent widening. |
+| `briefing_scopes[]` | `briefing_query` topics only: the pinned `BriefingScope` inputs (`task_id`, `title`, `files`) the tuned phrasings are rendered from. Read only by `test_memory_eval_briefing_topics.py`; the probe carries it in `RegistryEntry.extra`. |
 
 Unknown keys on an entry load untouched (the loader is required-strict /
 additive-tolerant), so 3201's widened derivation is an improvement rather
@@ -296,7 +300,7 @@ relation is therefore recorded at derivation time from committed sources, and
 the runtime metric reduces to "is `index(superseded) < index(successor)` in
 this one result list" — no pointer-shape knowledge at runtime at all.
 
-### Provenance (32 topics)
+### Provenance
 
 - **20 `curator_gate`** — one per adjudicated cluster in
   `write_triage_calibration.jsonl` (17 `esc-55xx`/`56xx` gates). The
@@ -309,15 +313,23 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   `fused_memory/config/schema.py:_default_topic_guard_clusters()`.
 - **4 `census_topic`** — multi-entry topics from
   `plans/memory-metadata-census-report.json`.
-- **1 `briefing_query`** — `g7-design-invariants`, carrying the four
-  briefing-assembler queries (`briefing.py:978-1013`) as its phrasings. This
-  is the highest-leverage query surface in the system: those four run against
-  every dispatched task's context window.
+- **3 `briefing_query`** — one per query spec in
+  `shared/src/shared/briefing_queries.py::QUERY_SPECS`, keyed by the spec's
+  own `slug` (PRD `docs/prds/memory-briefing-and-fusion.md` D9). This is the
+  highest-leverage query surface in the system: these queries run against
+  every dispatched task's context window. The tuned phrasings are the
+  queries `queries_for()` fires for the pinned `briefing_scopes`, and the
+  conventions topics carry the conventions channel's `search_scope`; both are
+  **pinned by `test_memory_eval_briefing_topics.py`, not hand-maintained**,
+  so a reworded template fails that test rather than silently leaving the
+  probe measuring a query nobody issues. These topics key a query the
+  briefing fires, not a `metadata.topic` value, so the metadata census does
+  not gauge them.
 - **3 `hand`** — single-entry dark_factory topics.
 
 ### What the registry does **not** cover (`_disclosures`)
 
-32 topics is a *selection*. `scripts/memory_eval_retrieval_probe.py
+The committed topics are a *selection*. `scripts/memory_eval_retrieval_probe.py
 --derive-registry` emits 74 candidates from the committed offline sources,
 and the census tail it never offered at all is larger still. Every one of
 those narrowings is recorded in the top-level `_disclosures` block and
@@ -341,11 +353,14 @@ A `_disclosures` value that is not an integer is a **named load failure**,
 not a silently dropped key — dropping it would erase the record that a
 narrowing happened, which is exactly the state the block exists to prevent.
 
-The `topic_guard_cluster`, `census_topic`, `hand` and `briefing_query`
-canonicals were resolved by a **read-only Qdrant payload scroll** on
-2026-07-30 (no embedder, no writes), because unlike the curator clusters their
-content is not committed anywhere in this repo. Their hashes are therefore
-re-derivable only against a live store; the curator-gate 20 are not.
+The `topic_guard_cluster`, `census_topic` and `hand` canonicals were resolved
+by a **read-only Qdrant payload scroll** on 2026-07-30 (no embedder, no
+writes), because unlike the curator clusters their content is not committed
+anywhere in this repo. The `briefing_query` canonicals were hand-adjudicated
+on 2026-09-30 by read-only searches under each topic's own `search_scope`,
+chosen as the entry that SHOULD answer the query rather than whatever ranked
+first. Both sets of hashes are therefore re-derivable only against a live
+store; the curator-gate 20 are not.
 
 ### Exclusions
 

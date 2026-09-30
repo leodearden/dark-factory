@@ -104,11 +104,11 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
-# THE shared slug predicate, imported and called -- never re-expressed as a
-# second regex here (INV-5; tests/test_topic_slug_namespace.py pins the same
-# identity by ``is``). topic_slug is a stdlib-only leaf, so this adds no
-# heavy import to the census.
-from fused_memory.topic_slug import is_valid_topic_slug
+# THE shared slug predicate and fold, imported and called -- never
+# re-expressed as a second regex here (INV-5; tests/test_topic_slug_namespace.py
+# pins the same identity by ``is``). topic_slug is a stdlib-only leaf, so this
+# adds no heavy import to the census.
+from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
 
 logger = logging.getLogger('census_memory_metadata')
 
@@ -600,7 +600,13 @@ def build_report(
         # scope-wide uniqueness probe. New top-level 'registry_coverage'
         # (the accountable 32-topic target) and 'coverage_trend' (this run
         # against the most recent prior run in the committed history).
-        'schema_version': 4,
+        # v5 (task 4856): registry_coverage stops gauging query-surface
+        # (briefing_query) entries and names them in
+        # 'query_surface_topics_not_gauged'; each row gains
+        # 'variant_spelling_records' (records under another spelling that
+        # folds to the same slug); the zero-canonical rows are split into
+        # 'stamping_worklist' (records present) and 'unpopulated_topics'.
+        'schema_version': 5,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
@@ -687,12 +693,12 @@ ENFORCE_FLIP_PRECONDITIONS: tuple[dict[str, str], ...] = (
 )
 
 
-#: The committed 32-entry registry: the ACCOUNTABLE target set. Every one of
-#: its topics should carry exactly one live ``canonical: true`` in its own
-#: project. Bounded and named, unlike a corpus-wide stamping percentage over
-#: ~49.6k records, most of which is cycle_summary-class with no meaningful
-#: topic -- and it is precisely the set E1's retrieval-health run scores
-#: 32/32 failing.
+#: The committed registry: the ACCOUNTABLE target set. Every one of its
+#: metadata topics (query-surface entries excluded) should carry exactly one
+#: live ``canonical: true`` in its own project. Bounded and named, unlike a
+#: corpus-wide stamping percentage over ~49.6k records, most of which is
+#: cycle_summary-class with no meaningful topic -- and it is precisely the
+#: set E1's retrieval-health run scores.
 DEFAULT_REGISTRY_PATH = str(
     _REPO_ROOT / 'fused-memory' / 'tests' / 'fixtures'
     / 'memory_eval_topic_registry.json'
@@ -808,17 +814,41 @@ def _build_registry_coverage(
     if not entries:
         return None, 'topic registry loaded but holds zero entries'
 
+    # A query-surface entry keys a query a caller fires, never a
+    # metadata.topic value, so gauging it would add a permanent, unfixable
+    # zero-canonical row. Named rather than silently dropped.
+    query_surface = sorted(
+        (
+            {'project_id': str(entry.project_id), 'topic': str(entry.topic)}
+            for entry in entries if entry.is_query_surface
+        ),
+        key=lambda r: (r['project_id'], r['topic']),
+    )
+    gauged = [entry for entry in entries if not entry.is_query_surface]
+    folded_records = {
+        project_id: _records_by_folded_slug(census)
+        for project_id, census in project_totals.items()
+    }
+
     rows: list[dict[str, Any]] = []
     exactly_one = zero = multiple = 0
-    for entry in sorted(entries, key=lambda e: (str(e.project_id), str(e.topic))):
+    for entry in sorted(gauged, key=lambda e: (str(e.project_id), str(e.topic))):
         topic = str(entry.topic)
         project_id = str(entry.project_id)
         # A registry entry naming an uncensused project measures ZERO, not
         # "unknown": the topic demonstrably has no canonical in this run's
         # evidence, and omitting the row would shrink the denominator.
         census = project_totals.get(project_id)
+        # EXACT spelling stays the gauged number: get_memories_by_metadata
+        # ({'topic': T}) is exact-match, so a record under a variant spelling
+        # is genuinely not addressable by the registry slug.
         records = census.topic_values.get(topic, 0) if census else 0
         canonical_count = census.canonical_true_by_topic.get(topic, 0) if census else 0
+        folded = derive_topic_slug(topic)
+        variant_spelling_records = (
+            folded_records.get(project_id, Counter()).get(folded, 0) - records
+            if folded is not None else 0
+        )
         if canonical_count == 0:
             zero += 1
         elif canonical_count == 1:
@@ -830,19 +860,44 @@ def _build_registry_coverage(
             'topic': topic,
             'records': records,
             'canonical_count': canonical_count,
+            'variant_spelling_records': variant_spelling_records,
         })
 
+    zero_canonical = [r for r in rows if r['canonical_count'] == 0]
     return {
         'registry_topics_total': len(rows),
         'registry_topics_with_exactly_one_canonical': exactly_one,
         'registry_topics_with_zero_canonical': zero,
         'registry_topics_with_multiple_canonical': multiple,
-        # The ACTIONABLE worklist -- exactly the set 3201's idempotent retro
-        # sweep would stamp, which is why the nightly wrapper runs it (dry-run)
-        # right after this census.
-        'zero_canonical_topics': [r for r in rows if r['canonical_count'] == 0],
+        # Every zero-canonical row, kept whole for history and back-compat.
+        # It needs TWO remedies, split below.
+        'zero_canonical_topics': zero_canonical,
+        # Records present, none canonical: exactly the set 3201's idempotent
+        # retro sweep would stamp, which is why the nightly wrapper runs it
+        # (dry-run) right after this census.
+        'stamping_worklist': [r for r in zero_canonical if r['records'] > 0],
+        # No record under this exact spelling. Retro-stamping cannot help:
+        # where variant_spelling_records > 0 the remedy is
+        # fused-memory/scripts/normalize_topic_slugs.py (task 4878), which
+        # rewrites the legacy spelling; otherwise it is a registry decision.
+        'unpopulated_topics': [r for r in zero_canonical if r['records'] == 0],
+        'query_surface_topics_not_gauged': query_surface,
         'topics': rows,
     }, None
+
+
+def _records_by_folded_slug(census: CategoryCensus) -> Counter[str]:
+    """Records per :func:`derive_topic_slug` fold of every topic value.
+
+    A value that folds to ``None`` has no honest slug, so it is nobody's
+    variant.
+    """
+    folded: Counter[str] = Counter()
+    for value, count in census.topic_values.items():
+        slug = derive_topic_slug(value)
+        if slug is not None:
+            folded[slug] += count
+    return folded
 
 
 def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None:
@@ -1285,9 +1340,9 @@ def _coverage_run_row(report: dict[str, Any], *, stamp: str | None = None) -> di
     artifact, which is REWRITTEN rather than appended.
 
     The single exception is ``registry_topics``, and only because the
-    COMMITTED 32-entry registry bounds it. It is what lets the trend name
+    COMMITTED registry bounds it. It is what lets the trend name
     the actionable regression -- "this registry topic LOST its canonical"
-    -- at ~32 tiny rows per run instead of 353 live topic values. Its scope
+    -- at a few dozen tiny rows per run instead of 353 live topic values. Its scope
     is disclosed by construction: a topic outside the registry cannot
     appear in it.
 
@@ -1389,6 +1444,7 @@ def _regrowth_unavailable(reason: str) -> dict[str, Any]:
         'new_topics': [],
         'grown_topics': [],
         'lost_canonical_topics': [],
+        'removed_topics': [],
     }
 
 
@@ -1400,7 +1456,7 @@ def _topic_regrowth(
 
     Both sides must exist. A missing baseline digest would otherwise report
     every registry target as "newly appearing" the first time the gauge
-    runs -- a fabricated signal indistinguishable from a genuine 32-topic
+    runs -- a fabricated signal indistinguishable from a genuine registry-wide
     regression -- and a missing current digest would report silence, which
     reads as "nothing moved" rather than "nothing was measured" (INV-2).
     """
@@ -1448,6 +1504,18 @@ def _topic_regrowth(
                 'canonical_before': was.get('canonical'),
                 'canonical_after': now.get('canonical'),
             })
+    # A target that LEFT the registry shrinks registry_topics_total and can
+    # shrink the zero-canonical count with it; named, so a smaller
+    # denominator is never read as stamping progress.
+    removed_topics = []
+    for key in sorted(before.keys() - after.keys()):
+        project_id, topic = _split(key)
+        removed_topics.append({
+            'project_id': project_id,
+            'topic': topic,
+            'records_before': before[key].get('records'),
+            'canonical_before': before[key].get('canonical'),
+        })
     return {
         'available': True,
         'scope': 'registry',
@@ -1455,6 +1523,7 @@ def _topic_regrowth(
         'new_topics': new_topics,
         'grown_topics': grown_topics,
         'lost_canonical_topics': lost_canonical_topics,
+        'removed_topics': removed_topics,
     }
 
 
@@ -2434,18 +2503,46 @@ def _render_registry_coverage(report: dict[str, Any], top_n: int | None) -> list
         '',
     ]
     lines += _render_named_rows(
-        'Worklist — registry topics with no live `canonical: true`',
+        'Stamping worklist — zero canonical, records present',
         ['project', 'topic', 'records', 'canonical'],
         [
             [
                 f'`{row["project_id"]}`', f'`{row["topic"]}`',
                 f'{row["records"]:,}', f'{row["canonical_count"]:,}',
             ]
-            for row in gauge.get('zero_canonical_topics') or []
+            for row in gauge.get('stamping_worklist') or []
         ],
         top_n,
         aligns=['---', '---', '---:', '---:'],
     )
+    lines += _render_named_rows(
+        'Unpopulated — zero canonical, no record under this exact spelling',
+        ['project', 'topic', 'records', 'variant-spelling records'],
+        [
+            [
+                f'`{row["project_id"]}`', f'`{row["topic"]}`',
+                f'{row["records"]:,}', _num(row.get('variant_spelling_records')),
+            ]
+            for row in gauge.get('unpopulated_topics') or []
+        ],
+        top_n,
+        aligns=['---', '---', '---:', '---:'],
+    )
+    lines += [
+        'A variant-spelling record folds to the registry slug but is stored '
+        'under another spelling, so an exact-match read cannot reach it and '
+        'retro-stamping cannot fix it: its remedy is '
+        '`fused-memory/scripts/normalize_topic_slugs.py` (task 4878).',
+        '',
+    ]
+    query_surface = gauge.get('query_surface_topics_not_gauged') or []
+    if query_surface:
+        named = ', '.join(f'`{row["project_id"]}`/`{row["topic"]}`' for row in query_surface)
+        lines += [
+            f'Not gauged — query-surface topics (they key a query, not a '
+            f'`metadata.topic`): {named}.',
+            '',
+        ]
     return lines
 
 
@@ -2548,6 +2645,20 @@ def _render_coverage_trend(report: dict[str, Any]) -> list[str]:
                 _num(r.get('records')), _num(r.get('canonical')),
             ]
             for r in regrowth.get('new_topics') or []
+        ],
+        None,
+        aligns=['---', '---', '---:', '---:'],
+        cut=False,
+    )
+    lines += _render_named_rows(
+        'Left the registry',
+        ['project', 'topic', 'records before', 'canonical before'],
+        [
+            [
+                f'`{r["project_id"]}`', f'`{r["topic"]}`',
+                _num(r.get('records_before')), _num(r.get('canonical_before')),
+            ]
+            for r in regrowth.get('removed_topics') or []
         ],
         None,
         aligns=['---', '---', '---:', '---:'],
@@ -2824,7 +2935,7 @@ def _build_parser() -> argparse.ArgumentParser:
         '--registry', dest='registry', default=DEFAULT_REGISTRY_PATH,
         help=(
             'Committed topic registry scored by the coverage gauge '
-            '(default: the 32-entry fixture). A load failure is DISCLOSED as '
+            '(default: the committed fixture). A load failure is DISCLOSED as '
             'registry_coverage: null + registry_error, never as an all-zero '
             'gauge.'
         ),

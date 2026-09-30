@@ -1310,11 +1310,16 @@ class TestTopicSlugConformance:
 
 
 class _FakeEntry:
-    """Minimal stand-in for the probe's RegistryEntry (topic + project_id)."""
+    """Minimal stand-in for the probe's RegistryEntry.
 
-    def __init__(self, topic: str, project_id: str):
+    ``is_query_surface`` mirrors the probe's property of that name: an entry
+    keying a query a caller fires, not a ``metadata.topic`` value.
+    """
+
+    def __init__(self, topic: str, project_id: str, *, is_query_surface: bool = False):
         self.topic = topic
         self.project_id = project_id
+        self.is_query_surface = is_query_surface
 
 
 class _FakeRegistry:
@@ -1326,9 +1331,8 @@ class TestRegistryCoverageGauge:
     """The TARGET: every committed registry topic carries exactly one canonical.
 
     A corpus-wide stamping percentage over 49.6k records has no owner and no
-    bounded worklist.  The committed 32-entry registry is a bounded, named,
-    checkable set -- and it is precisely the set E1's retrieval-health run
-    scores 32/32 failing.
+    bounded worklist.  The committed registry is a bounded, named, checkable
+    set -- and it is precisely the set E1's retrieval-health run scores.
 
     NOT a duplicate of E1's METRIC_TOPIC_CANONICAL_PRESENT (INV-5): that one
     is computed from _tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
@@ -1460,7 +1464,8 @@ class TestRegistryCoverageGauge:
             _FakeEntry('missing', 'dark_factory'),
         ])
         block = self._report(cells, registry)['registry_coverage']
-        # The actionable list -- exactly what 3201's retro sweep would stamp.
+        # The whole zero-canonical population, kept for history and
+        # back-compat; the stampable / unpopulated split is tested below.
         assert [r['topic'] for r in block['zero_canonical_topics']] == [
             'bare', 'missing',
         ]
@@ -1578,11 +1583,136 @@ class TestRegistryCoverageGauge:
         second = self._report(cells, registry)
         assert json.dumps(first) == json.dumps(second)
 
-    def test_the_committed_registry_still_holds_the_32_named_targets(self):
+    def test_the_committed_registry_holds_the_gauged_targets(self):
         # The accountable set this task names as the TARGET. If the fixture
         # grows or shrinks, the target moved and the docs must say so.
         registry = _mod.topic_registry_loader()(_mod.DEFAULT_REGISTRY_PATH)
-        assert len(registry.entries) == 32
+        assert sum(1 for e in registry.entries if not e.is_query_surface) == 31
+        assert {e.topic for e in registry.entries if e.is_query_surface} == {
+            'briefing-conventions-generic',
+            'briefing-conventions-area',
+            'briefing-task-semantic',
+        }
+
+    def test_query_surface_entries_are_not_gauged_but_are_named(self):
+        # A query-surface topic keys a query a caller fires, not a
+        # metadata.topic value: no record is ever stamped with it, so gauging
+        # it would add a permanent, unfixable zero-canonical row.
+        cells = {'dark_factory': {OBS: _census([{'topic': 'alpha', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('briefing-x', 'dark_factory', is_query_surface=True),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert [r['topic'] for r in block['topics']] == ['alpha']
+        assert block['registry_topics_total'] == 1
+        assert block['query_surface_topics_not_gauged'] == [
+            {'project_id': 'dark_factory', 'topic': 'briefing-x'},
+        ]
+
+    def test_variant_spelling_records_are_counted_per_row(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'alpha_beta'},
+                    {'topic': 'alpha_beta'},
+                    {'topic': 'alpha-beta'},
+                    {'topic': 'snake-slug'},
+                    {'topic': '!!!'},
+                    {'topic': '!!!'},
+                    {'topic': '???'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('alpha-beta', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+            _FakeEntry('snake_slug', 'dark_factory'),
+            _FakeEntry('???', 'dark_factory'),
+        ])
+        rows = {
+            r['topic']: r
+            for r in self._report(cells, registry)['registry_coverage']['topics']
+        }
+        # records stays the EXACT-spelling count: get_memories_by_metadata is
+        # exact-match, so a variant spelling is not addressable by the slug.
+        assert rows['alpha-beta']['records'] == 1
+        assert rows['alpha-beta']['variant_spelling_records'] == 2
+        assert rows['gamma']['variant_spelling_records'] == 0
+        # The fold runs on BOTH sides.
+        assert rows['snake_slug']['records'] == 0
+        assert rows['snake_slug']['variant_spelling_records'] == 1
+        # A value that folds to None is never a variant, not even of another
+        # value that also folds to None.
+        assert rows['???']['records'] == 1
+        assert rows['???']['variant_spelling_records'] == 0
+
+    def test_zero_canonical_topics_split_into_stamping_worklist_and_unpopulated(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'has-one', 'canonical': True},
+                    {'topic': 'stampable'},
+                    {'topic': 'stampable'},
+                    {'topic': 'legacy_topic'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry(t, 'dark_factory')
+            for t in ('has-one', 'stampable', 'legacy-topic', 'absent')
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+
+        stamping = block['stamping_worklist']
+        unpopulated = block['unpopulated_topics']
+        assert [r['topic'] for r in stamping] == ['stampable']
+        assert [r['topic'] for r in unpopulated] == ['absent', 'legacy-topic']
+        assert {r['topic']: r['variant_spelling_records'] for r in unpopulated} == {
+            'absent': 0, 'legacy-topic': 1,
+        }
+        # A partition of the zero-canonical rows, which keep their content.
+        assert sorted(r['topic'] for r in stamping + unpopulated) == sorted(
+            r['topic'] for r in block['zero_canonical_topics']
+        )
+        assert [r['topic'] for r in block['zero_canonical_topics']] == [
+            'absent', 'legacy-topic', 'stampable',
+        ]
+
+    def test_the_markdown_renders_both_worklists(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'stampable'},
+                    {'topic': 'legacy_topic'},
+                    {'topic': 'legacy_topic'},
+                    {'topic': 'legacy_topic'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('stampable', 'dark_factory'),
+            _FakeEntry('legacy-topic', 'dark_factory'),
+            _FakeEntry('briefing-x', 'dark_factory', is_query_surface=True),
+        ])
+        md = _mod.render_markdown(self._report(cells, registry))
+        section = _md_section(
+            md, '### Registry coverage — the accountable target', stop='### ',
+        )
+        table_rows = {
+            row[1]: row
+            for line in section.splitlines() if line.startswith('| `')
+            for row in [[c.strip() for c in line.strip().strip('|').split('|')]]
+        }
+        assert '`stampable`' in table_rows
+        # The unpopulated row carries its variant-spelling count.
+        assert '3' in table_rows['`legacy-topic`']
+        assert '`briefing-x`' in section
+
+    def test_schema_version_is_bumped_for_the_split_worklists(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _FakeRegistry([_FakeEntry('a', 'dark_factory')]))
+        assert report['schema_version'] >= 5
 
 
 def _history_report(registry=None, **kwargs) -> dict:
@@ -2040,6 +2170,36 @@ class TestCoverageDiff:
             },
         ]
 
+    def test_regrowth_names_topics_that_LEFT_the_registry(self):
+        # A re-keyed registry drops a target: registry_topics_total falls and
+        # the zero-canonical count may fall with it. Unnamed, that reads as
+        # stamping progress when the target set merely shrank.
+        prior = _topic_report(
+            {'dark_factory': [
+                {'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'},
+                {'topic': 'retired'}, {'topic': 'retired'},
+            ]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        regrowth = _mod.build_coverage_diff(self._current(), history)['topic_regrowth']
+        assert regrowth['removed_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'retired',
+                'records_before': 2, 'canonical_before': 0,
+            },
+        ]
+
+    def test_regrowth_names_no_removed_topic_when_the_registry_only_grew(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['removed_topics'] == []
+
     def test_regrowth_scope_is_disclosed_as_registry_bounded(self):
         # The signal is scoped to the committed registry because that is
         # what the history may bound-safely carry. Disclosed, never silently
@@ -2063,6 +2223,7 @@ class TestCoverageDiff:
         assert regrowth['available'] is False
         assert regrowth['reason']
         assert regrowth['new_topics'] == []
+        assert regrowth['removed_topics'] == []
 
     # ---- wiring + determinism -------------------------------------------
 
@@ -2989,6 +3150,20 @@ class TestRenderMarkdownCoverageTrend:
         grew = _md_section(md, '#### Grew in member records')
         assert '| `dark_factory` | `alpha` | 1 | 2 |' in grew
 
+    def test_a_topic_that_left_the_registry_renders_named(self):
+        prior = _topic_report(
+            {'dark_factory': [{'topic': 'retired', 'canonical': True}]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        md = _mod.render_markdown(_coverage_md_report(history=history))
+        removed = _md_section(md, '#### Left the registry')
+        assert '| `dark_factory` | `retired` | 1 | 1 |' in removed
+
     def test_a_class_with_nothing_to_report_says_so_rather_than_vanishing(self):
         # The mirror image, and why the row assertions above are keyed to
         # their own section: an empty class must render an explicit "(none)"
@@ -2997,6 +3172,7 @@ class TestRenderMarkdownCoverageTrend:
         md = _mod.render_markdown(_coverage_md_report(history=self._history()))
         assert _md_section(md, '#### Lost their `canonical: true`').strip() == '_(none)_'
         assert _md_section(md, '#### Grew in member records').strip() == '_(none)_'
+        assert _md_section(md, '#### Left the registry').strip() == '_(none)_'
 
     def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
         # `'registry' in md.lower()` could not fail: the document always
