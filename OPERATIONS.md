@@ -1455,6 +1455,19 @@ and `systemctl --user daemon-reload` + `enable` the sockets. The next
 orders the old process's stop before the socket's start, so the socket binds
 the port the old process just released.
 
+Changing the ports of a socket that is already listening (adding or moving a
+`ListenStream=`) is different. The running service still holds the old
+listener, so the socket cannot rebind until the process exits, and a combined
+`systemctl --user restart <x>.socket <service>` is refused (`Socket service
+<service> already active, refusing`). Run `systemctl --user stop <service>`
+(its stop hook stops the socket too), then
+`systemctl --user start <x>.socket <service>` — what `scripts/setup-host.sh`
+section 4 does for fused-memory. The port is closed for that stop, so
+connected sessions may drop once. Before restarting fused-memory by hand,
+check `systemctl --user is-active fm-staleness-redeploy.service`: the
+fused-memory tier has no restart lease, so a staleness redeploy in flight
+restarts it again underneath you (seen 2026-09-29).
+
 ### fused-memory liveness revive
 
 `fused-memory.service` has its own liveness pass —
