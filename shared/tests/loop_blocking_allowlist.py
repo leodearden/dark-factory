@@ -106,7 +106,9 @@ Baseline measured at HEAD 6696f1ce0c: 167 files scanned, 60 findings.
 Task 4484's amendment pass re-measured 62 over the same 167 files: one
 row withdrawn as a scanner false positive (see the
 create_mcp_server._claim_commit_presence row) and three added by widening
-the vocabulary to shutil.rmtree.
+the vocabulary to shutil.rmtree.  Task 5099 re-measured at HEAD b4e1349e1c
+after widening it to the directory-walk/metadata calls: 190 files scanned,
+91 findings (55 before; census section 4c).
 """
 
 from __future__ import annotations

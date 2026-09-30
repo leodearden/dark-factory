@@ -283,7 +283,7 @@ BUILTIN_PRIMITIVES: dict[str, str] = {
 # by attribute name alone they are str.replace, list.remove and ast.walk, so
 # every string edit would become a merge-blocking row -- their os.* spellings
 # are matched above as receiver-pinned dotted paths.  `resolve` (Path.resolve)
-# and os.path.realpath are the next widening, owned by task 6089 (+13 rows).
+# and os.path.realpath are the next widening, owned by task 6089 (+12 rows).
 METHOD_PRIMITIVES: dict[str, str] = {
     'read_text': (
         'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
