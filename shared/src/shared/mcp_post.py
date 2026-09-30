@@ -59,7 +59,7 @@ genuinely needs a non-``tools/call`` request or a hand-built envelope.
 
 KNOWINGLY PARALLEL TO ``orchestrator.mcp_lifecycle``.  Three primitives here
 have long-lived twins there: :data:`MCP_POST_HEADERS` /
-``mcp_lifecycle.MCP_HEADERS``, :func:`_decode_body` /
+``mcp_lifecycle.MCP_HEADERS``, :func:`decode_mcp_response_body` /
 ``McpSession._parse_response``, and :func:`_parse_sse` /
 ``mcp_lifecycle._parse_sse_response``.  The dependency direction supports
 consolidating (``orchestrator`` already imports ``shared``), and doing so is
@@ -74,6 +74,7 @@ Public API::
     from shared.mcp_post import (
         MCP_POST_HEADERS,
         check_mcp_post_response,
+        decode_mcp_response_body,
         mcp_endpoint_url,
         mcp_tool_call_payload,
         open_mcp_client,
@@ -100,6 +101,7 @@ from typing import Any
 __all__ = [
     'MCP_POST_HEADERS',
     'check_mcp_post_response',
+    'decode_mcp_response_body',
     'mcp_endpoint_url',
     'mcp_tool_call_payload',
     'open_mcp_client',
@@ -141,13 +143,14 @@ def mcp_endpoint_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/mcp"
 
 
-def _decode_body(resp: Any) -> Any:
-    """Decode a JSON or SSE response body.
+def decode_mcp_response_body(resp: Any) -> Any:
+    """Decode an MCP response body sent as JSON or as SSE (Streamable HTTP).
 
-    Mirrors ``McpSession._parse_response`` — FastMCP may answer a Streamable
-    HTTP POST with ``text/event-stream`` instead of ``application/json``, and a
-    naive ``resp.json()`` would then warn on every SUCCESSFUL write.  Raises on
-    an undecodable body; the sole caller turns that into a warning.
+    FastMCP may answer with ``text/event-stream`` instead of
+    ``application/json``; for SSE the last ``data:`` frame wins.  An
+    unlabelled or mislabelled body falls back to the SSE spelling.  RAISES
+    ``ValueError`` when the body is neither JSON nor carries a ``data:`` line —
+    :func:`check_mcp_post_response` is the never-raises wrapper.
     """
     content_type = str(resp.headers.get('content-type', ''))
     if 'text/event-stream' in content_type:
@@ -225,7 +228,7 @@ def check_mcp_post_response(resp: Any, *, context: str) -> bool:
             )
             return False
 
-        payload = _decode_body(resp)
+        payload = decode_mcp_response_body(resp)
 
         if isinstance(payload, dict):
             error = payload.get('error')

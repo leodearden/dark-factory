@@ -259,7 +259,7 @@ def test_a_null_jsonrpc_error_member_is_not_treated_as_an_error(caplog):
 # WHY THIS BRANCH IS NOT OPTIONAL COVERAGE.  The fix adds
 # ``Accept: application/json, text/event-stream`` to all five POSTs — that
 # header is what INVITES FastMCP to answer in SSE at all.  So the change made
-# ``_decode_body``'s ``text/event-stream`` branch newly reachable in
+# ``decode_mcp_response_body``'s ``text/event-stream`` branch newly reachable in
 # production while nothing exercised it.  If ``_parse_sse`` were wrong, every
 # SUCCESSFUL write would emit a "could not be inspected" WARNING: the exact
 # inverse of this module's loud-only-on-real-failure contract, and
@@ -386,7 +386,7 @@ def test_sse_labelled_body_with_no_data_line_warns_instead_of_raising(caplog):
 def test_an_unlabelled_sse_body_is_still_decoded(caplog):
     """A body that IS SSE but is not labelled falls back to the SSE spelling.
 
-    ``_decode_body`` tries ``resp.json()`` first and only then ``_parse_sse``.
+    ``decode_mcp_response_body`` tries ``resp.json()`` first and only then ``_parse_sse``.
     Pins that fallback so a server sending SSE under ``application/json`` (or
     no content-type at all) does not warn on a delivered write.
     """
