@@ -8453,13 +8453,14 @@ class MemoryService:
         be supplied. Setting ``invalid_at`` marks the edge as superseded as of
         that moment (used by reconciliation to retire contradicted facts without
         destroying their audit trail). Setting ``clear_invalid_at=True`` resets
-        ``invalid_at`` to ``None``, restoring the edge to active status.
+        BOTH retirement markers, ``invalid_at`` and ``expired_at``, to
+        ``None``, restoring the edge to active status.
 
         **Guard-2 verification (TOCTOU note):** when *fact* is supplied, a
         ``get_edge_text`` readback is performed after the save to confirm
         persistence. When *clear_invalid_at* is supplied, a separate
-        ``get_edge_invalid_at`` readback confirms the edge was actually
-        restored to active status — this is independent of the fact
+        ``get_edge_retirement_markers`` readback confirms the edge was actually
+        restored to active status (BOTH markers null) — this is independent of the fact
         verdict, so a combined ``fact`` + ``clear_invalid_at`` call is
         ``verified`` only when *both* readbacks confirm. A pure
         ``invalid_at=<timestamp>`` supersede (no fact, no clear) is not
@@ -8473,7 +8474,7 @@ class MemoryService:
         per edge so it is rare in practice.  Undercounting ``edges_updated``
         (the conservative outcome) is safer than overcounting, so the
         behaviour is intentional.  Both readbacks (``get_edge_text`` and
-        ``get_edge_invalid_at``) resolve their Cypher through the same
+        ``get_edge_retirement_markers``) resolve their Cypher through the same
         per-``group_id`` graph object (``GraphitiBackend._graph_for``) that
         the backend's explicit ``clear_invalid_at`` write uses, so
         read-after-write consistency for *our own* write is expected within
@@ -8547,13 +8548,19 @@ class MemoryService:
         # verified only when both readbacks confirm.
         if clear_invalid_at:
             try:
-                readback_invalid_at = await self.graphiti.get_edge_invalid_at(
-                    edge_uuid, group_id=project_id
+                readback_invalid_at, readback_expired_at = (
+                    await self.graphiti.get_edge_retirement_markers(
+                        edge_uuid, group_id=project_id
+                    )
                 )
-                cleared = readback_invalid_at is None
+                cleared = readback_invalid_at is None and readback_expired_at is None
                 result['verified'] = bool(result.get('verified', True)) and cleared
                 if not cleared:
-                    error_msg = f'invalid_at not cleared: readback={readback_invalid_at!r}'
+                    error_msg = (
+                        'retirement markers not cleared: '
+                        f'invalid_at={readback_invalid_at!r}, '
+                        f'expired_at={readback_expired_at!r}'
+                    )
                     existing_error = result.get('verification_error')
                     result['verification_error'] = (
                         f'{existing_error}; {error_msg}' if existing_error else error_msg

@@ -4075,13 +4075,15 @@ class GraphitiBackend:
         return (row[0] or '', row[1] or '')
 
     @_canonicalize_group_args
-    async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:
-        """Return the raw stored ``invalid_at`` for the RELATES_TO edge with the given UUID.
+    async def get_edge_retirement_markers(self, uuid: str, *, group_id: str) -> tuple[Any, Any]:
+        """Return the raw stored ``(invalid_at, expired_at)`` for a RELATES_TO edge.
 
-        Returns ``None`` when the property is null or absent (i.e. the edge is
-        active/non-superseded). The value is returned verbatim (no parsing) —
+        Returns ``(None, None)`` when the edge is fully active — an edge is
+        active only when BOTH markers are null, matching
+        ``_ACTIVE_EDGE_PREDICATE``. Values are returned verbatim (no parsing) —
         used by MemoryService.update_edge to verify that a clear_invalid_at
-        write actually persisted, independent of the fact-text readback.
+        write actually persisted, independent of the fact-text readback. Both
+        markers are read in one query so they are observed at one instant.
 
         Uses ro_query since no writes are performed.
 
@@ -4091,12 +4093,13 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-            'RETURN e.invalid_at'
+            'RETURN e.invalid_at, e.expired_at'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
-        return result.result_set[0][0]
+        row = result.result_set[0]
+        return (row[0], row[1])
 
     @_canonicalize_group_args
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
