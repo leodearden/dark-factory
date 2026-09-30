@@ -3081,6 +3081,138 @@ class TestReport:
         assert UUID_C in sections['dangling_pointers'].text
 
 
+def _gone_target(index: int) -> str:
+    """A distinct well-formed memory id that no resolution map carries."""
+    return f'00000000-0000-4000-8000-{index:012d}'
+
+
+def _canonical_refs(count: int, *, prefix: str = 'rec-reaped') -> list:
+    """*count* consolidation canonicals, each superseding its own gone target."""
+    m = _mod()
+    return [
+        ref
+        for index in range(count)
+        for ref in m.pointer_targets(_record(
+            f'{prefix}-{index:03d}', f'canonical words {index}',
+            supersedes=_gone_target(index), canonical=True, topic='t',
+        ))
+    ]
+
+
+def _report_over(refs, resolution, *, surfacing=None):
+    """``build_series`` and the PURE ``sweep_report_sections`` over one input set."""
+    m = _mod()
+    inputs = _inputs_over(refs, resolution)
+    if surfacing is not None:
+        inputs['surfacing'] = surfacing
+    series = m.build_series(**inputs)
+    sections = m.sweep_report_sections(
+        series,
+        census=inputs['census'],
+        tripwire_items=inputs['tripwire_items'],
+        surfacing=inputs['surfacing'],
+        staleness=inputs['staleness'],
+        scan_stats={'procedural_knowledge': {'scanned': 3, 'truncated': 0}},
+        terminal_join=m.TerminalTaskJoin(statuses={}),
+        refs=refs,
+    )
+    return series, {section.key: section for section in sections}
+
+
+def _lines_carrying_number(text: str, number: int) -> list[str]:
+    """The lines of *text* on which *number* stands as a token of its own.
+
+    A token, not a substring: every memory id is full of digits, so a bare
+    ``str(number) in text`` would pass on an id and prove nothing.
+    """
+    return [
+        line for line in text.splitlines()
+        if str(number) in (token.strip(':(),;') for token in line.split())
+    ]
+
+
+class TestAttributionInReport:
+    """The human report cannot bury real damage under by-design noise (PRD D11).
+
+    At corpus scale nearly every unresolved pointer is a reaped supersedes
+    target, so a report that named unresolved edges in scan order would spend
+    its whole ``_MAX_NAMED`` budget on deliberate deletions and elide the one
+    edge an operator actually has to fix. Keyed on section keys, ids and
+    constants, never on English wording.
+    """
+
+    def test_an_unattributed_edge_is_named_ahead_of_by_design_ones(self):
+        m = _mod()
+        refs = [
+            *_canonical_refs(m._MAX_NAMED + 5),
+            *m.pointer_targets(_record('rec-real-damage', 'plain words', supersedes=UUID_C)),
+        ]
+        _, sections = _report_over(refs, {})
+        assert 'rec-real-damage' in sections['dangling_pointers'].text
+
+    def test_every_attribution_bucket_is_named_in_the_census_section(self):
+        m = _mod()
+        refs = _four_cause_refs()
+        census = m.dangling_census(refs, FOUR_CAUSE_RESOLUTION)
+        _, sections = _report_over(refs, FOUR_CAUSE_RESOLUTION)
+        assert set(census.by_reaper) == {
+            m.REAPER_CONSOLIDATION, m.REAPER_STATUS_CORRECTION, m.UNATTRIBUTED,
+        }
+        for bucket in census.by_reaper:
+            assert bucket in sections['dangling_pointers'].text
+
+    def test_a_fully_reaped_corpus_names_both_gaps(self):
+        """Absence is a named gap, never a clean result."""
+        m = _mod()
+        refs = [
+            *_canonical_refs(2),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_C,
+                kind='project_status_correction',
+            )),
+        ]
+        series, sections = _report_over(refs, {})
+        assert not any(ref.reaped_by is None for ref in refs)
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED not in _ids(series)
+        not_measured = sections['not_measured'].text
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED in not_measured
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT in not_measured
+
+    def test_the_predecessor_gone_count_sits_beside_family_1s_denominator(self):
+        """PRD D12: a small ``pairs_comparable`` must carry its stated cause.
+
+        Seven searched supersedes edges whose predecessor is gone, against four
+        comparable pairs and the default depth of ten — so seven is a number
+        no other line of the section can be carrying.
+        """
+        m = _mod()
+        refs = [
+            *_canonical_refs(5),
+            *m.pointer_targets(_record('rec-plain-1', 'plain one', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-plain-2', 'plain two', supersedes=UUID_B)),
+        ]
+        surfacing = m.SurfacingObservation(
+            pairs_comparable=4, still_surfacing=0, records=(), inversions=(),
+        )
+        series, sections = _report_over(refs, {}, surfacing=surfacing)
+        gone = series.corpus.counts['surfacing_edges_predecessor_gone']
+        assert gone == 7
+        text = sections['superseded_surfacing'].text
+        assert len(_lines_carrying_number(text, gone)) == 1
+        assert _lines_carrying_number(text, surfacing.pairs_comparable)
+
+    def test_the_tripwire_section_counts_the_edges_it_excludes_by_design(self):
+        m = _mod()
+        refs = [
+            *_canonical_refs(6),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=UUID_C)),
+        ]
+        series, sections = _report_over(refs, {})
+        by_design = series.corpus.counts['successor_edges_by_design']
+        assert by_design == 6
+        assert len(_lines_carrying_number(sections['successor_pointer_tripwire'].text, by_design)) == 1
+
+
 # ---------------------------------------------------------------------------
 # The seeded live-store test — the task's user-observable signal
 #
