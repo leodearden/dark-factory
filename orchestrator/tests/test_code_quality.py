@@ -14,8 +14,9 @@ import re
 from pathlib import Path
 
 import pytest
+from _role_splice_contract import MARKDOWN_HEADING, assert_brace_free, assert_nonempty
 
-from orchestrator.agents.code_quality import NORMATIVE_DOC, render, section
+from orchestrator.agents.code_quality import NORMATIVE_DOC, guidance, render, section
 
 # Resolved from THIS FILE, never from the process CWD, so it holds from
 # orchestrator/, the repo root and a ``.worktrees/<id>`` checkout alike.
@@ -347,3 +348,71 @@ class TestNormativeDocLocation:
         assert not os.path.isabs(os.readlink(docs))
         with importlib.resources.as_file(NORMATIVE_DOC) as packaged:
             assert docs.resolve() == packaged.resolve()
+
+
+#: Substrings that would break one of the existing all-roles prompt scanners if
+#: a doc edit introduced them into a rendered section.
+_FORBIDDEN_IN_ANY_PROMPT_BLOCK = (
+    'mcp__',
+    'submit_review_verdict',
+    'Output pure JSON',
+    'produce a structured JSON review',
+    ':!.task',
+)
+
+_FORMAT_REMEDY = (
+    'Rewrite the doc line without braces: the block reaches '
+    "roles.py::_REVIEWER_HEURISTICS_TEMPLATE's str.format() call."
+)
+
+
+@pytest.fixture(scope='module')
+def block() -> str:
+    return guidance()
+
+
+class TestRenderedGuidanceShape:
+    """The real rendered block's STRUCTURE: headings, numbering and labels.
+
+    No sentence of doc prose is asserted; section bodies are free to change.
+    """
+
+    def test_is_nonempty(self, block):
+        assert_nonempty(
+            'guidance()', block,
+            remedy='Restore the rendered sections of the packaged code_quality.md.',
+        )
+
+    def test_opens_its_own_section_and_ends_with_exactly_one_newline(self, block):
+        assert block.startswith(MARKDOWN_HEADING)
+        assert block.endswith('\n')
+        assert not block.endswith('\n\n')
+
+    def test_carries_exactly_the_rendered_headings_in_order(self, block):
+        assert re.findall(r'^## .*$', block, re.MULTILINE) == [
+            _TITLE,
+            _ANCHOR,
+            '## Two stances',
+            '## Do not steer by',
+        ]
+
+    def test_carries_fourteen_numbered_heuristics(self, block):
+        assert len(numbered_headlines(block, _ANCHOR)) == 14
+
+    def test_carries_the_two_stances(self, block):
+        assert bold_item_labels(block, '## Two stances') == ['Comments.', 'Tests.']
+
+    def test_carries_the_four_do_not_steer_by_items(self, block):
+        assert bold_item_labels(block, '## Do not steer by') == [
+            'Raw line count.',
+            'Average complexity.',
+            'Line coverage under autouse stubs.',
+            'Test count or test-to-code ratio.',
+        ]
+
+    def test_is_brace_free(self, block):
+        assert_brace_free('guidance()', block, remedy=_FORMAT_REMEDY)
+
+    @pytest.mark.parametrize('forbidden', _FORBIDDEN_IN_ANY_PROMPT_BLOCK)
+    def test_cannot_break_the_all_roles_scanners(self, block, forbidden):
+        assert forbidden not in block
