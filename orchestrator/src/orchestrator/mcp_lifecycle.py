@@ -15,7 +15,7 @@ from typing import Any
 
 import anyio
 import httpx
-from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
+from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.proc_group import terminate_process_group
 
@@ -1057,11 +1057,7 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                # Launch contract: shared/jcodemunch_launch.py::JCODEMUNCH_COMMAND / ::JCODEMUNCH_ENV.
-                'jcodemunch': {
-                    'command': JCODEMUNCH_COMMAND,
-                    'env': dict(JCODEMUNCH_ENV),
-                },
+                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:

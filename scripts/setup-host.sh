@@ -869,19 +869,39 @@ else
   ok "Project config already exists"
 fi
 
-# Add jcodemunch MCP to user-level Claude config (idempotent)
-if command -v claude &>/dev/null; then
-  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
-  # that pipeline can report an installed server as absent.
-  # Here the cost is re-running `claude mcp add` on a server already registered.
-  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
-  # run `claude mcp list` on hosts with no claude installed.
-  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
-  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
-    ok "jcodemunch MCP already in user config"
+# Install the prebuilt, version-pinned launcher the shared launch contract
+# (shared/src/shared/jcodemunch_launch.py) names, then register jcodemunch in
+# the user-level Claude config from that contract, replacing any existing entry
+# so every run converges on it: `claude mcp add-json` refuses a name that
+# already exists. `uv tool install` exits 0 even when its bin dir is not on
+# PATH, so registration is gated on the registered command resolving.
+if ! _jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)" \
+  || ! _jcodemunch_install_argv_lines="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch install-argv)" \
+  || ! _jcodemunch_command="$(jq -r .command <<<"$_jcodemunch_server_json")"; then
+  fail "The jcodemunch launch contract did not render, so its launcher was not installed and jcodemunch was not registered in user config"
+  warn "  Fix: make 'PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch [install-argv]' succeed, then re-run scripts/setup-host.sh"
+else
+  mapfile -t _jcodemunch_install_argv <<<"$_jcodemunch_install_argv_lines"
+  if "${_jcodemunch_install_argv[@]}"; then
+    ok "$_jcodemunch_command launcher installed at the contract's pin"
   else
-    claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
-    ok "jcodemunch MCP added to user config"
+    fail "$_jcodemunch_command launcher install failed"
+    warn "  Fix: ${_jcodemunch_install_argv[*]}"
+  fi
+  if ! command -v "$_jcodemunch_command" &>/dev/null; then
+    fail "$_jcodemunch_command is not on PATH, so jcodemunch was not registered in user config"
+    warn "  Fix: put \"\$(uv tool dir --bin)\" on PATH (uv tool update-shell), then re-run scripts/setup-host.sh"
+  elif command -v claude &>/dev/null; then
+    _jcodemunch_removed=""
+    if claude mcp remove --scope user jcodemunch >/dev/null 2>&1; then
+      _jcodemunch_removed=", and its previous registration there was removed"
+    fi
+    if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
+      ok "jcodemunch MCP registered in user config"
+    else
+      fail "jcodemunch MCP not registered in user config$_jcodemunch_removed"
+      warn "  Fix: claude mcp add-json --scope user jcodemunch \"\$(PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch)\""
+    fi
   fi
 fi
 
