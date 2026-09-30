@@ -46,6 +46,18 @@ def _committed_markdown() -> str:
     return _mod().DEFAULT_SELECTION_MD.read_text(encoding='utf-8')
 
 
+def _without_commit_stamps(report: dict) -> dict:
+    """A copy minus ``fixture_provenance[*].commit``, which a pre-merge rebase rewrites.
+
+    Each is the fixture's LAST-TOUCHING commit, per
+    ``fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance``.
+    """
+    masked = copy.deepcopy(report)
+    for entry in masked.get('fixture_provenance') or []:
+        entry.pop('commit', None)
+    return masked
+
+
 class TestTheCommitStampMaskHidesOnlyTheStamps:
     def test_a_restamped_report_compares_equal(self):
         committed = _committed_report()
