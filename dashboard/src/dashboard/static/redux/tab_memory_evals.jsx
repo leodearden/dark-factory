@@ -39,14 +39,10 @@
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
 // ME-prefixed like the two lines above.  The prefix is a readability
-// convention here, NOT a collision workaround: this file is a
-// `type="text/babel"` .jsx, and Babel-standalone downlevels .jsx top-level
-// bindings so they never join the classic-script shared global lexical scope.
-// That is an observed fact, not an assumption — tabs.jsx, tab_escalations.jsx
-// and tab_escalation_analytics.jsx each already declare their own top-level
-// `const DF` / `useOpenSet` / `usePersistedState` and all render fine.  See the
-// SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs before
-// "fixing" this.
+// convention here, NOT a collision workaround: .jsx files may repeat each
+// other's top-level names.  See the SCOPE note in
+// dashboard/tests/js/classic_script_scope.test.mjs, which enforces the one
+// clash a .jsx binding can have, before "fixing" this.
 const { useState: MEuS } = React;
 
 // The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481); their

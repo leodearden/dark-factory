@@ -6,38 +6,24 @@ sys.path pollution -- mirrors the pattern in test_consolidate_namespace_families
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import sys
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load clear_malformed_empty_memory.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'clear_malformed_empty_memory'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='clear_malformed_empty_memory')
 
 
 # ===========================================================================
@@ -62,27 +48,14 @@ def _make_record(payload: dict | None = None) -> MagicMock:
     return record
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    retrieves (task 4127). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory -- and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock Qdrant client, MagicMock points, no live Qdrant), so the
-    environment must not be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it retrieves (task
+    4127). This suite is deliberately MOCK-unit (an AsyncMock Qdrant client,
+    MagicMock points, no live Qdrant). ``TestRunApplyStoreMutationPreflight``
+    re-rigs this per test -- to refuse, to record, or to pass -- so the guard's
+    own behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -543,57 +516,18 @@ class TestRunApplyStoreMutationPreflight:
     than an exception to it.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis, isolated from ``main``'s generic
-        handler.
-
-        Both emit ERROR from this script's logger, so neither the level nor the
-        logger name can tell them apart -- only the fail-closed marker and the
-        remedy can, and carrying those is the entire reason the site-specific
-        message exists. ``main`` logs "fatal error during cleanup", which tells
-        an operator reading the journal nothing about what was refused or what
-        to do instead.
-
-        Pinned on those two clauses ONLY -- the marker and the remedy noun --
-        so every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content. Level and logger name are
-        shared with ``main``'s own ERROR record, and mere record-existence would
-        still pass if the whole diagnosis were replaced by "boom" -- precisely
-        the regression this exists to catch. Verified non-vacuous: mutating the
-        marker in the script turns this assertion red (task 4127 amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'clear_malformed_empty_memory'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(args, client, 'fused_dark_factory')
 
@@ -605,7 +539,7 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """It aborts without even retrieving -- one probe per run, and no
         round-trip to a store it was never going to be allowed to mutate."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
@@ -622,7 +556,7 @@ class TestRunApplyStoreMutationPreflight:
         payload + classification report can always be obtained safely, from
         anywhere. That report IS the investigation (module docstring).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=False)
@@ -685,7 +619,7 @@ class TestRunApplyStoreMutationPreflight:
         ``asyncio.run`` so ``_run_live`` never constructs a real MemoryService
         (``TestMainFatalErrorHandling``'s idiom).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         monkeypatch.setattr(
@@ -705,7 +639,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during cleanup" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'clear_malformed_empty_memory'), (
             "main's blanket handler only says 'fatal error during cleanup', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

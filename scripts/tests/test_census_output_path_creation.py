@@ -56,6 +56,10 @@ def _minimal_v2_codebook() -> dict:
     }
 
 
+def _never_roll_back(**kwargs):
+    raise AssertionError("roll_back must not run on a landed commit")
+
+
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """Every ``run_census`` seam, wired to trivial inline fakes, with the
     four output paths under directories that do NOT exist in *root*.
@@ -76,6 +80,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         escalate_fn=lambda **kw: None,
         status_fetcher=lambda: {"statuses": {}},
         commit=lambda **kw: None,
+        roll_back=_never_roll_back,
         codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
             project_id="target_project",

@@ -14,6 +14,8 @@ from unittest.mock import patch
 import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
+from _fm_helpers import as_async_run_git as _as_async_run_git
+
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_HEARTBEAT_TTL,
@@ -170,43 +172,47 @@ class TestWorktreeSignal:
 
         return side_effect
 
-    def test_worktree_registered_true_when_branch_present(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_worktree_registered_true_when_branch_present(self, tmp_path):
         """worktree_registered=True and is_live=True when branch task/<id> is listed."""
         side_effect = self._run_side_effect(
             _worktree_porcelain_with_branch(_BRANCH)
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert isinstance(result, WorkflowLiveness)
         assert result.worktree_registered is True
         assert result.is_live is True
         assert result.branch == _BRANCH
 
-    def test_worktree_registered_false_when_branch_absent(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_worktree_registered_false_when_branch_absent(self, tmp_path):
         """worktree_registered=False when no task/<id> branch in worktree list."""
         side_effect = self._run_side_effect(
             _worktree_porcelain_no_branch()
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is False
 
-    def test_worktree_signal_false_on_subprocess_error(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_worktree_signal_false_on_subprocess_error(self, tmp_path):
         """subprocess.run raising does not propagate — worktree_registered=False (fail-safe)."""
         def raise_oserror(args, **kwargs):
             raise OSError('git not found')
 
-        with patch('subprocess.run', side_effect=raise_oserror):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(raise_oserror)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is False
         assert result.recent_commit is False
         # is_live False because all three signals are suppressed
         assert result.is_live is False
 
-    def test_worktree_signal_false_on_non_zero_returncode(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_worktree_signal_false_on_non_zero_returncode(self, tmp_path):
         """A non-zero returncode from worktree list => worktree_registered=False (fail-safe)."""
         # Override: make worktree list return non-zero
         def failing_side_effect(args, **kwargs):
@@ -214,8 +220,8 @@ class TestWorktreeSignal:
                 return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
             return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
 
-        with patch('subprocess.run', side_effect=failing_side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(failing_side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is False
 
@@ -245,12 +251,13 @@ class TestRecentCommitSignal:
             )
         return side_effect
 
-    def test_recent_commit_true_when_commit_within_threshold(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_true_when_commit_within_threshold(self, tmp_path):
         """recent_commit=True and is_live=True when tip commit is within max_commit_age_hours."""
         # Commit 1 hour ago — well within default threshold (6h)
         ts = (self._NOW - timedelta(hours=1)).isoformat()
-        with patch('subprocess.run', side_effect=self._run_side_effect(ts)):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._run_side_effect(ts))):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_commit_age_hours=6.0
             )
 
@@ -258,45 +265,50 @@ class TestRecentCommitSignal:
         assert result.is_live is True
         assert result.last_commit_at is not None
 
-    def test_recent_commit_false_when_commit_older_than_threshold(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_false_when_commit_older_than_threshold(self, tmp_path):
         """recent_commit=False when tip commit is older than max_commit_age_hours."""
         # Commit 10 hours ago — outside the 6h threshold
         ts = (self._NOW - timedelta(hours=10)).isoformat()
-        with patch('subprocess.run', side_effect=self._run_side_effect(ts)):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._run_side_effect(ts))):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_commit_age_hours=6.0
             )
 
         assert result.recent_commit is False
 
-    def test_recent_commit_false_when_branch_missing(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_false_when_branch_missing(self, tmp_path):
         """recent_commit=False when git log returns non-zero (branch does not exist)."""
-        with patch('subprocess.run', side_effect=self._run_side_effect(None, log_rc=1)):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._run_side_effect(None, log_rc=1))):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW
             )
 
         assert result.recent_commit is False
 
-    def test_recent_commit_false_on_empty_log_output(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_false_on_empty_log_output(self, tmp_path):
         """recent_commit=False when git log returns empty string."""
-        with patch('subprocess.run', side_effect=self._run_side_effect('', log_rc=0)):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._run_side_effect('', log_rc=0))):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW
             )
 
         assert result.recent_commit is False
 
-    def test_recent_commit_false_on_parse_error(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_false_on_parse_error(self, tmp_path):
         """recent_commit=False when git log returns an unparseable timestamp."""
-        with patch('subprocess.run', side_effect=self._run_side_effect('not-a-timestamp')):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._run_side_effect('not-a-timestamp'))):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW
             )
 
         assert result.recent_commit is False
 
-    def test_recent_commit_false_on_subprocess_exception(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_false_on_subprocess_exception(self, tmp_path):
         """recent_commit=False when subprocess raises during git log (fail-safe)."""
         call_count = [0]
 
@@ -310,8 +322,8 @@ class TestRecentCommitSignal:
             # git log call
             raise subprocess.TimeoutExpired(cmd=args, timeout=10)
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW
             )
 
@@ -336,7 +348,8 @@ class TestOrchestratorLiveSignal:
             )
         return side_effect
 
-    def test_orchestrator_live_true_when_is_orchestrator_live_for_returns_true(
+    @pytest.mark.asyncio
+    async def test_orchestrator_live_true_when_is_orchestrator_live_for_returns_true(
         self, tmp_path, monkeypatch
     ):
         """orchestrator_live=True and is_live=True when is_orchestrator_live_for returns True.
@@ -347,25 +360,27 @@ class TestOrchestratorLiveSignal:
         # Override the default autouse=False patch (both git signals stay False via side_effect)
         monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: True)
 
-        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._all_git_signals_false())):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.orchestrator_live is True
         assert result.worktree_registered is False
         assert result.recent_commit is False
         assert result.is_live is True
 
-    def test_orchestrator_live_false_when_is_orchestrator_live_for_returns_false(
+    @pytest.mark.asyncio
+    async def test_orchestrator_live_false_when_is_orchestrator_live_for_returns_false(
         self, tmp_path
     ):
         """orchestrator_live=False (default autouse patch) and git signals False => is_live=False."""
-        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._all_git_signals_false())):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.orchestrator_live is False
         assert result.is_live is False
 
-    def test_is_orchestrator_live_for_is_called_with_project_root(
+    @pytest.mark.asyncio
+    async def test_is_orchestrator_live_for_is_called_with_project_root(
         self, tmp_path, monkeypatch
     ):
         """is_orchestrator_live_for must be called with project_root as its argument."""
@@ -378,8 +393,8 @@ class TestOrchestratorLiveSignal:
         monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', capturing_detector)
 
         project_root = str(tmp_path)
-        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
-            detect_live_workflow(_TASK_ID, project_root)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._all_git_signals_false())):
+            await detect_live_workflow(_TASK_ID, project_root)
 
         assert len(captured_roots) == 1
         assert str(captured_roots[0]) == project_root
@@ -388,7 +403,8 @@ class TestOrchestratorLiveSignal:
 class TestAllSignalsFalse:
     """When all three signals are False, is_live is False — the genuine stranded case."""
 
-    def test_all_false_yields_not_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_all_false_yields_not_live(self, tmp_path):
         """is_live=False with all three signals False — genuine stranded work must escalate."""
         def all_signals_false(args, **kwargs):
             return subprocess.CompletedProcess(
@@ -396,8 +412,8 @@ class TestAllSignalsFalse:
                 stdout=_worktree_porcelain_no_branch(), stderr=''
             )
 
-        with patch('subprocess.run', side_effect=all_signals_false):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(all_signals_false)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is False
         assert result.recent_commit is False
@@ -408,7 +424,8 @@ class TestAllSignalsFalse:
 class TestConvenienceWrapper:
     """is_workflow_live_for_task returns the same boolean as detect_live_workflow.is_live."""
 
-    def test_wrapper_returns_true_when_live(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_wrapper_returns_true_when_live(self, tmp_path, monkeypatch):
         """is_workflow_live_for_task returns True when is_live is True."""
         monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: True)
 
@@ -418,14 +435,15 @@ class TestConvenienceWrapper:
                 stdout=_worktree_porcelain_no_branch(), stderr=''
             )
 
-        with patch('subprocess.run', side_effect=all_git_false):
-            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path))
-            expected = detect_live_workflow(_TASK_ID, str(tmp_path)).is_live
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(all_git_false)):
+            live = await is_workflow_live_for_task(_TASK_ID, str(tmp_path))
+            expected = (await detect_live_workflow(_TASK_ID, str(tmp_path))).is_live
 
         assert live is True
         assert live == expected
 
-    def test_wrapper_returns_false_when_not_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_wrapper_returns_false_when_not_live(self, tmp_path):
         """is_workflow_live_for_task returns False when all signals are False."""
         def all_git_false(args, **kwargs):
             return subprocess.CompletedProcess(
@@ -433,12 +451,13 @@ class TestConvenienceWrapper:
                 stdout=_worktree_porcelain_no_branch(), stderr=''
             )
 
-        with patch('subprocess.run', side_effect=all_git_false):
-            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(all_git_false)):
+            live = await is_workflow_live_for_task(_TASK_ID, str(tmp_path))
 
         assert live is False
 
-    def test_wrapper_accepts_same_kwargs_as_detect(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_wrapper_accepts_same_kwargs_as_detect(self, tmp_path):
         """is_workflow_live_for_task forwards kwargs (e.g. now, max_commit_age_hours)."""
         now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
         # Recent commit (1h ago)
@@ -454,8 +473,8 @@ class TestConvenienceWrapper:
                 args=args, returncode=0, stdout=ts, stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path), now=now, max_commit_age_hours=6.0
             )
 
@@ -483,14 +502,15 @@ class TestStatusScopedOrchestratorSignal:
         return side_effect
 
     @pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
-    def test_ineligible_status_suppresses_orchestrator_signal(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_ineligible_status_suppresses_orchestrator_signal(self, tmp_path, status):
         """Ineligible statuses force orchestrator_live False even when _orchestrator_live=True.
 
         Both git signals are False, so is_live=False proves the project-wide
         orchestrator lock is not being consulted at all for these statuses.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
             )
 
@@ -502,7 +522,8 @@ class TestStatusScopedOrchestratorSignal:
     @pytest.mark.parametrize(
         'status', ['pending', 'in-progress', 'review', 'merge-deferred']
     )
-    def test_non_ineligible_status_preserves_orchestrator_signal(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_non_ineligible_status_preserves_orchestrator_signal(self, tmp_path, status):
         """Non-ineligible statuses leave the project-wide orchestrator_live signal intact.
 
         'blocked' is deliberately EXCLUDED from this parametrize list (unlike prior to
@@ -513,25 +534,27 @@ class TestStatusScopedOrchestratorSignal:
         TestBlockedDeterministicOrchestratorSuppression for 'blocked''s task_kind-aware
         coverage.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
             )
 
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_status_none_preserves_orchestrator_signal_backward_compatible(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_status_none_preserves_orchestrator_signal_backward_compatible(self, tmp_path):
         """status=None (the default) is backward-compatible: signal is unaffected."""
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), _orchestrator_live=True
             )
 
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_ineligible_status_does_not_suppress_worktree_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_ineligible_status_does_not_suppress_worktree_signal(self, tmp_path):
         """A deferred task with a REGISTERED worktree is still live — per-task evidence wins."""
         def side_effect(args, **kwargs):
             if '--porcelain' in args:
@@ -543,8 +566,8 @@ class TestStatusScopedOrchestratorSignal:
                 args=args, returncode=1, stdout='', stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status='deferred', _orchestrator_live=True
             )
 
@@ -552,10 +575,11 @@ class TestStatusScopedOrchestratorSignal:
         assert result.worktree_registered is True
         assert result.is_live is True
 
-    def test_is_workflow_live_for_task_forwards_status(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_is_workflow_live_for_task_forwards_status(self, tmp_path):
         """is_workflow_live_for_task forwards status through to detect_live_workflow."""
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path), status='deferred', _orchestrator_live=True
             )
 
@@ -590,14 +614,15 @@ class TestBlockedDeterministicOrchestratorSuppression:
             )
         return side_effect
 
-    def test_blocked_deterministic_suppresses_orchestrator_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_blocked_deterministic_suppresses_orchestrator_signal(self, tmp_path):
         """status='blocked' + task_kind='deterministic' forces orchestrator_live False.
 
         Both git signals are False, so is_live=False proves the project-wide
         orchestrator lock is not being consulted at all for this combination.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='deterministic', _orchestrator_live=True,
             )
@@ -616,7 +641,8 @@ class TestBlockedDeterministicOrchestratorSuppression:
     # inverted bare-suppression case and the with-worktree/with-recent-commit
     # preservation cases.
 
-    def test_blocked_deterministic_does_not_suppress_worktree_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_blocked_deterministic_does_not_suppress_worktree_signal(self, tmp_path):
         """A blocked deterministic task with a REGISTERED worktree is still live —
         per-task evidence wins even though the bare orchestrator signal is suppressed.
         """
@@ -630,8 +656,8 @@ class TestBlockedDeterministicOrchestratorSuppression:
                 args=args, returncode=1, stdout='', stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='deterministic', _orchestrator_live=True,
             )
@@ -641,7 +667,8 @@ class TestBlockedDeterministicOrchestratorSuppression:
         assert result.is_live is True
 
     @pytest.mark.parametrize('status', ['pending', 'in-progress', 'review', 'merge-deferred'])
-    def test_non_blocked_status_preserves_orchestrator_signal_even_when_deterministic(
+    @pytest.mark.asyncio
+    async def test_non_blocked_status_preserves_orchestrator_signal_even_when_deterministic(
         self, tmp_path, status
     ):
         """Only the blocked+deterministic combination triggers the new rule.
@@ -649,8 +676,8 @@ class TestBlockedDeterministicOrchestratorSuppression:
         Other live statuses (pending/in-progress/review/merge-deferred) with a
         deterministic task_kind leave the project-wide orchestrator_live signal intact.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status=status, task_kind='deterministic', _orchestrator_live=True,
             )
@@ -658,10 +685,11 @@ class TestBlockedDeterministicOrchestratorSuppression:
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_is_workflow_live_for_task_forwards_task_kind(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_is_workflow_live_for_task_forwards_task_kind(self, tmp_path):
         """is_workflow_live_for_task forwards task_kind through to detect_live_workflow."""
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='deterministic', _orchestrator_live=True,
             )
@@ -701,7 +729,8 @@ class TestBlockedNormalOrchestratorSuppression:
         return side_effect
 
     @pytest.mark.parametrize('task_kind', ['normal', None])
-    def test_blocked_normal_bare_orchestrator_signal_suppressed(self, tmp_path, task_kind):
+    @pytest.mark.asyncio
+    async def test_blocked_normal_bare_orchestrator_signal_suppressed(self, tmp_path, task_kind):
         """status='blocked' + task_kind in ('normal', None) + no worktree/commit forces
         orchestrator_live False — the bare-orchestrator false positive (tasks 2335/2196).
 
@@ -711,8 +740,8 @@ class TestBlockedNormalOrchestratorSuppression:
         TestBlockedDeterministicOrchestratorSuppression where the old
         test_blocked_non_deterministic_preserves_orchestrator_signal used to live).
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind=task_kind, _orchestrator_live=True,
             )
@@ -722,7 +751,8 @@ class TestBlockedNormalOrchestratorSuppression:
         assert result.recent_commit is False
         assert result.is_live is False
 
-    def test_blocked_normal_with_registered_worktree_preserves_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_blocked_normal_with_registered_worktree_preserves_signal(self, tmp_path):
         """status='blocked' + task_kind='normal' + a REGISTERED worktree keeps
         orchestrator_live True — genuine per-task evidence means the bare-evidence
         guard does not apply, and the project-wide lock is still reported honestly
@@ -738,8 +768,8 @@ class TestBlockedNormalOrchestratorSuppression:
                 args=args, returncode=1, stdout='', stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='normal', _orchestrator_live=True,
             )
@@ -748,7 +778,8 @@ class TestBlockedNormalOrchestratorSuppression:
         assert result.worktree_registered is True
         assert result.is_live is True
 
-    def test_blocked_normal_with_recent_commit_preserves_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_blocked_normal_with_recent_commit_preserves_signal(self, tmp_path):
         """status='blocked' + task_kind='normal' + a recent commit on task/<id> keeps
         orchestrator_live True — genuine per-task evidence means the bare-evidence
         guard does not apply.
@@ -766,8 +797,8 @@ class TestBlockedNormalOrchestratorSuppression:
                 args=args, returncode=0, stdout=recent_ts, stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='normal', _orchestrator_live=True,
                 now=now,
@@ -778,7 +809,8 @@ class TestBlockedNormalOrchestratorSuppression:
         assert result.is_live is True
 
     @pytest.mark.parametrize('status', ['pending', 'in-progress', 'review', 'merge-deferred'])
-    def test_non_blocked_status_preserves_orchestrator_signal_for_normal_task(
+    @pytest.mark.asyncio
+    async def test_non_blocked_status_preserves_orchestrator_signal_for_normal_task(
         self, tmp_path, status
     ):
         """Only the blocked+normal(-or-None) combination triggers rule 3. Other live
@@ -786,8 +818,8 @@ class TestBlockedNormalOrchestratorSuppression:
         leave the project-wide orchestrator_live signal intact — the status guard
         preserves dispatch-raceable / in-pipeline tasks regardless of task_kind.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status=status, task_kind='normal', _orchestrator_live=True,
             )
@@ -795,12 +827,13 @@ class TestBlockedNormalOrchestratorSuppression:
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_is_workflow_live_for_task_suppresses_for_blocked_normal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_is_workflow_live_for_task_suppresses_for_blocked_normal(self, tmp_path):
         """is_workflow_live_for_task returns False for a blocked normal task with no
         git signals and only the bare project-wide orchestrator lock as evidence.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='normal', _orchestrator_live=True,
             )
@@ -914,7 +947,8 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
             )
         return side_effect
 
-    def test_pending_deterministic_pure_gate_suppresses_orchestrator_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pending_deterministic_pure_gate_suppresses_orchestrator_signal(self, tmp_path):
         """THE REGRESSION — status='pending' + deterministic + pure_gate forces
         orchestrator_live False.
 
@@ -924,8 +958,8 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         signals are False, so is_live=False proves the project-wide lock is not being
         consulted at all for this combination.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind='deterministic', pure_gate=True,
                 _orchestrator_live=True,
@@ -936,15 +970,16 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.recent_commit is False
         assert result.is_live is False
 
-    def test_pending_deterministic_without_pure_gate_preserves_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pending_deterministic_without_pure_gate_preserves_signal(self, tmp_path):
         """NARROWING — pure_gate=False keeps the orchestrator signal for a pending
         deterministic task.
 
         Such a task carries a `before_done` deploy/predicate and may be mid-run inside
         DeterministicRunner with zero git evidence to reveal it; recon must not race it.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind='deterministic', pure_gate=False,
                 _orchestrator_live=True,
@@ -954,14 +989,15 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.is_live is True
 
     @pytest.mark.parametrize('task_kind', ['normal', None], ids=['normal', 'absent'])
-    def test_non_deterministic_task_kind_preserves_signal(self, tmp_path, task_kind):
+    @pytest.mark.asyncio
+    async def test_non_deterministic_task_kind_preserves_signal(self, tmp_path, task_kind):
         """task_kind guard — rule 5 requires task_kind == 'deterministic'.
 
         An ordinary pending task is dispatch-eligible, so the project-wide lock stays
         real evidence for it regardless of any pure_gate value.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind=task_kind, pure_gate=True,
                 _orchestrator_live=True,
@@ -971,10 +1007,11 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.is_live is True
 
     @pytest.mark.parametrize('status', ['in-progress', 'review', 'merge-deferred'])
-    def test_non_pending_status_preserves_signal(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_non_pending_status_preserves_signal(self, tmp_path, status):
         """status guard — only 'pending' joins 'blocked' for the deterministic rules."""
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status=status, task_kind='deterministic', pure_gate=True,
                 _orchestrator_live=True,
@@ -983,14 +1020,15 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_pure_gate_omitted_is_inert(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pure_gate_omitted_is_inert(self, tmp_path):
         """DEFAULT INERTNESS — omitting pure_gate entirely preserves today's behavior.
 
         Byte-for-byte backward compatibility for every existing caller that does not
         pass the new kwarg.
         """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind='deterministic', _orchestrator_live=True,
             )
@@ -998,7 +1036,8 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_pure_gate_does_not_suppress_worktree_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pure_gate_does_not_suppress_worktree_signal(self, tmp_path):
         """PER-TASK EVIDENCE WINS — a pending pure gate with a REGISTERED worktree is
         still live, even though the bare orchestrator signal is suppressed.
 
@@ -1016,8 +1055,8 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
                 args=args, returncode=1, stdout='', stderr=''
             )
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind='deterministic', pure_gate=True,
                 _orchestrator_live=True,
@@ -1027,10 +1066,11 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
         assert result.worktree_registered is True
         assert result.is_live is True
 
-    def test_is_workflow_live_for_task_forwards_pure_gate(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_is_workflow_live_for_task_forwards_pure_gate(self, tmp_path):
         """is_workflow_live_for_task forwards pure_gate through **kwargs."""
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(self._no_worktree_no_commit_side_effect())):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path),
                 status='pending', task_kind='deterministic', pure_gate=True,
                 _orchestrator_live=True,
@@ -1106,7 +1146,8 @@ class TestPrunableWorktreeSignal:
 
         return side_effect
 
-    def test_prunable_worktree_not_counted(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_prunable_worktree_not_counted(self, tmp_path):
         """A prunable (reaped) worktree entry does not count as worktree_registered,
         even though its branch line is present in the same porcelain stanza.
         """
@@ -1115,13 +1156,14 @@ class TestPrunableWorktreeSignal:
             log_rc=1,
             revlist_stdout='0',
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is False
         assert result.is_live is False
 
-    def test_live_nonprunable_worktree_still_counts_even_when_bare(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_live_nonprunable_worktree_still_counts_even_when_bare(self, tmp_path):
         """A LIVE (non-prunable) worktree stays a live signal even when the branch
         itself is bare (zero own commits) — a just-started dispatch (branch created,
         no commits yet) must stay live.
@@ -1131,8 +1173,8 @@ class TestPrunableWorktreeSignal:
             log_rc=1,
             revlist_stdout='0',
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path))
 
         assert result.worktree_registered is True
         assert result.is_live is True
@@ -1175,40 +1217,43 @@ class TestBareBranchRecentCommit:
             )
         return side_effect
 
-    def test_bare_branch_suppresses_recent_commit(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_bare_branch_suppresses_recent_commit(self, tmp_path):
         """A recent tip timestamp is suppressed when rev-list reports zero own
         commits — the recent tip is only the base commit, not task work.
         """
         ts = (self._NOW - timedelta(hours=1)).isoformat()
         side_effect = self._run_side_effect(ts, revlist_stdout='0', revlist_rc=0)
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.recent_commit is False
 
-    def test_recent_commit_preserved_when_branch_has_own_commits(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_preserved_when_branch_has_own_commits(self, tmp_path):
         """A recent tip timestamp is preserved when rev-list reports own commits."""
         ts = (self._NOW - timedelta(hours=1)).isoformat()
         side_effect = self._run_side_effect(ts, revlist_stdout='3', revlist_rc=0)
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.recent_commit is True
 
-    def test_revlist_error_treated_as_not_bare(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_revlist_error_treated_as_not_bare(self, tmp_path):
         """An unknown own-commit count (rev-list error or exception) fails safe:
         not bare => no suppression => recent_commit stays True.
         """
         ts = (self._NOW - timedelta(hours=1)).isoformat()
 
         side_effect_rc1 = self._run_side_effect(ts, revlist_rc=1)
-        with patch('subprocess.run', side_effect=side_effect_rc1):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect_rc1)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
         assert result.recent_commit is True
 
         side_effect_raises = self._run_side_effect(ts, revlist_raises=True)
-        with patch('subprocess.run', side_effect=side_effect_raises):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect_raises)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
         assert result.recent_commit is True
 
 
@@ -1249,7 +1294,8 @@ class TestBareStrandedOrchestratorSuppression:
         return side_effect
 
     @pytest.mark.parametrize('status', ['pending', 'in-progress', 'review', 'merge-deferred'])
-    def test_bare_stranded_task_not_live_under_running_orchestrator(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_bare_stranded_task_not_live_under_running_orchestrator(self, tmp_path, status):
         """A prunable worktree + a bare branch must suppress the bare project-wide
         orchestrator_live signal, across every status not already covered by
         rules 1-3 — the exact reify#5245 shape.  Also asserts through
@@ -1257,11 +1303,11 @@ class TestBareStrandedOrchestratorSuppression:
         makes (status passed, task_kind not passed).
         """
         side_effect = self._side_effect(_worktree_porcelain_prunable(_BRANCH))
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True,
             )
-            live = is_workflow_live_for_task(
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True,
             )
 
@@ -1271,22 +1317,24 @@ class TestBareStrandedOrchestratorSuppression:
         assert result.is_live is False
         assert live is False
 
-    def test_bare_branch_with_live_worktree_stays_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_bare_branch_with_live_worktree_stays_live(self, tmp_path):
         """A LIVE (non-prunable) worktree on a bare branch must NOT be suppressed —
         rule 4 must not fire when a live worktree exists, protecting a
         freshly-dispatched pipeline (branch just created, worktree present, no
         commits yet).
         """
         side_effect = self._side_effect(_worktree_porcelain_with_branch(_BRANCH))
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
             )
 
         assert result.worktree_registered is True
         assert result.is_live is True
 
-    def test_absent_branch_preserves_orchestrator_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_absent_branch_preserves_orchestrator_signal(self, tmp_path):
         """No branch at all (not-yet-dispatched task) => rev-list fails => count
         None => NOT bare => rule 4 stays inert => the deliberate task-2031
         dispatch-race protection is preserved (a live orchestrator elsewhere
@@ -1295,15 +1343,16 @@ class TestBareStrandedOrchestratorSuppression:
         side_effect = self._side_effect(
             _worktree_porcelain_no_branch(), revlist_rc=1, revlist_stdout='',
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
             )
 
         assert result.orchestrator_live is True
         assert result.is_live is True
 
-    def test_revlist_error_keeps_orchestrator_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_revlist_error_keeps_orchestrator_signal(self, tmp_path):
         """A rev-list exception (not just a non-zero return) also yields an unknown
         count => NOT bare => the orchestrator signal is preserved (fail-safe
         toward live, matching TestBareBranchRecentCommit's rev-list-error case).
@@ -1318,8 +1367,8 @@ class TestBareStrandedOrchestratorSuppression:
                 raise subprocess.TimeoutExpired(cmd=args, timeout=10)
             return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
 
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
             )
 
@@ -1338,7 +1387,8 @@ class TestWorktreeStaleSignal:
 
     _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
 
-    def test_stale_fires_on_old_tip_with_registered_worktree(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_stale_fires_on_old_tip_with_registered_worktree(self, tmp_path):
         """A 30-day-old tip on a registered worktree => worktree_stale True, with
         the raw worktree_registered/recent_commit/last_commit_at signals
         preserved (not rewritten by the new companion signal)."""
@@ -1347,27 +1397,29 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is True
         assert result.worktree_registered is True
         assert result.recent_commit is False
         assert result.last_commit_at is not None
 
-    def test_fresh_tip_not_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_fresh_tip_not_stale(self, tmp_path):
         """A 1-hour-old tip is well within any staleness window."""
         ts = (self._NOW - timedelta(hours=1)).isoformat()
         side_effect, _calls = _git_side_effect(
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_tip_older_than_recent_commit_threshold_not_yet_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_tip_older_than_recent_commit_threshold_not_yet_stale(self, tmp_path):
         """A 10-hour-old tip is older than the 6h recent-commit threshold (so
         recent_commit is False) but far newer than the 168h staleness default —
         the two thresholds are independent."""
@@ -1376,13 +1428,14 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.recent_commit is False
         assert result.worktree_stale is False
 
-    def test_tip_exactly_at_threshold_not_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_tip_exactly_at_threshold_not_stale(self, tmp_path):
         """The comparison is strict (`>`), mirroring _check_recent_commit's `<=`
         boundary: a tip exactly `max_worktree_age_hours` old is not yet
         considered stale. Guards against an accidental flip to `>=`, which
@@ -1392,12 +1445,13 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_no_worktree_registered_not_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_worktree_registered_not_stale(self, tmp_path):
         """Staleness is a statement ABOUT a registered worktree — with none
         registered, worktree_stale is False regardless of tip age."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -1405,12 +1459,13 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_no_branch(),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_prunable_worktree_not_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_prunable_worktree_not_stale(self, tmp_path):
         """A prunable (reaped) worktree registration is already handled by task
         2767's worktree_registered=False; it must not ALSO be double-reported
         as stale."""
@@ -1419,28 +1474,30 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_prunable(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_registered is False
         assert result.worktree_stale is False
 
-    def test_threshold_disabled_via_none(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_threshold_disabled_via_none(self, tmp_path):
         """max_worktree_age_hours=None is the explicit opt-out."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
         side_effect, _calls = _git_side_effect(
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
             )
 
         assert result.worktree_stale is False
 
     @pytest.mark.parametrize('threshold', [0, 0.0, -1.0])
-    def test_non_positive_threshold_is_inert(self, tmp_path, threshold):
+    @pytest.mark.asyncio
+    async def test_non_positive_threshold_is_inert(self, tmp_path, threshold):
         """A non-positive threshold would mark every registered worktree stale
         instantly; treat it as disabled — fail-safe toward live."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -1448,8 +1505,8 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=threshold,
             )
 
@@ -1464,19 +1521,21 @@ class TestWorktreeStaleSignal:
             (0, '', True),  # subprocess.TimeoutExpired
         ],
     )
-    def test_unknown_tip_age_never_stale(self, tmp_path, log_rc, log_stdout, log_raises):
+    @pytest.mark.asyncio
+    async def test_unknown_tip_age_never_stale(self, tmp_path, log_rc, log_stdout, log_raises):
         """An unknown tip age (missing branch, empty/unparseable output, or a
         raised TimeoutExpired) is never positive evidence of staleness."""
         side_effect, _calls = _git_side_effect(
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=log_rc, log_stdout=log_stdout, log_raises=log_raises,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_default_field_value_on_plain_live_result(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_default_field_value_on_plain_live_result(self, tmp_path):
         """A plain live result (registered worktree, fresh tip) has
         worktree_stale default False."""
         ts = (self._NOW - timedelta(hours=1)).isoformat()
@@ -1484,8 +1543,8 @@ class TestWorktreeStaleSignal:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
@@ -1504,7 +1563,8 @@ class TestWorktreeStaleBareBranchGuard:
 
     _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
 
-    def test_bare_branch_not_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_bare_branch_not_stale(self, tmp_path):
         """A branch with zero own commits: the ancient tip is the base commit,
         not task work -- worktree_stale stays False even at a 30-day-old tip."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -1512,12 +1572,13 @@ class TestWorktreeStaleBareBranchGuard:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_branch_with_own_commits_is_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_branch_with_own_commits_is_stale(self, tmp_path):
         """A branch with own commits beyond base_branch: the old tip is genuine
         task-work evidence -- worktree_stale fires."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -1525,8 +1586,8 @@ class TestWorktreeStaleBareBranchGuard:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is True
 
@@ -1538,7 +1599,8 @@ class TestWorktreeStaleBareBranchGuard:
             (0, '', True),  # subprocess.TimeoutExpired
         ],
     )
-    def test_unknown_own_commit_count_fails_safe(
+    @pytest.mark.asyncio
+    async def test_unknown_own_commit_count_fails_safe(
         self, tmp_path, revlist_rc, revlist_stdout, revlist_raises
     ):
         """An unknown own-commit count (`_branch_own_commit_count` returns
@@ -1550,12 +1612,13 @@ class TestWorktreeStaleBareBranchGuard:
             revlist_rc=revlist_rc, revlist_stdout=revlist_stdout,
             revlist_raises=revlist_raises,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
 
-    def test_at_most_one_revlist_call(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_at_most_one_revlist_call(self, tmp_path):
         """The own-commit-count confirmation is memoized: at most one rev-list
         subprocess call per detect_live_workflow invocation, guarding against
         the memo being dropped and a second subprocess call being added to
@@ -1565,12 +1628,13 @@ class TestWorktreeStaleBareBranchGuard:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert calls['rev_list'] == 1
 
-    def test_revlist_skipped_when_threshold_disabled(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_revlist_skipped_when_threshold_disabled(self, tmp_path):
         """The rev-list confirmation is deferred behind the cheap age test: with
         max_worktree_age_hours=None disabling the check outright, rev-list is
         never consulted at all -- even with a registered worktree and a
@@ -1585,15 +1649,16 @@ class TestWorktreeStaleBareBranchGuard:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
             )
 
         assert result.worktree_stale is False
         assert calls['rev_list'] == 0
 
-    def test_branch_bare_rule_unaffected_by_new_revlist_call(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_branch_bare_rule_unaffected_by_new_revlist_call(self, tmp_path):
         """A registered LIVE worktree pins branch_bare False via the
         pre-existing short-circuit (lines 402-403) regardless of what the new
         worktree_stale rev-list confirmation finds -- _orchestrator_signal_
@@ -1604,8 +1669,8 @@ class TestWorktreeStaleBareBranchGuard:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
             )
 
@@ -1860,12 +1925,13 @@ class TestCorroborationGate:
 
         return side_effect
 
-    def test_gate_fires_worktree_only_uncorroborated(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gate_fires_worktree_only_uncorroborated(self, tmp_path):
         """in-progress, worktree-only (recent_commit False), corroborated=False
         → is_live False, indeterminate True, raw signals preserved."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False,
             )
@@ -1874,13 +1940,14 @@ class TestCorroborationGate:
         assert result.is_live is False
         assert result.indeterminate is True
 
-    def test_gate_fires_orchestrator_only_uncorroborated(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gate_fires_orchestrator_only_uncorroborated(self, tmp_path):
         """in-progress, orchestrator-lock-only (no worktree, non-bare branch),
         corroborated=False → is_live False, indeterminate True, orchestrator
         signal still reported honestly."""
         side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', _orchestrator_live=True, corroborated=False,
             )
@@ -1890,35 +1957,38 @@ class TestCorroborationGate:
         assert result.is_live is False
         assert result.indeterminate is True
 
-    def test_gate_inert_when_corroborated_true(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gate_inert_when_corroborated_true(self, tmp_path):
         """corroborated=True keeps the task live (indeterminate False)."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=True,
             )
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_gate_inert_when_corroborated_none_default(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gate_inert_when_corroborated_none_default(self, tmp_path):
         """corroborated=None (default) is backward-compatible — existing behavior."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, status='in-progress',
             )
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_recent_commit_exempt_from_gate(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_recent_commit_exempt_from_gate(self, tmp_path):
         """A recent commit is genuine per-task evidence — gate does not fire."""
         recent_ts = (self._NOW - timedelta(hours=1)).isoformat()
         side = self._side_effect(
             worktree_branch=False, log_rc=0, log_stdout=recent_ts, revlist_stdout='1',
         )
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False,
             )
@@ -1927,23 +1997,25 @@ class TestCorroborationGate:
         assert result.indeterminate is False
 
     @pytest.mark.parametrize('status', ['pending', 'review', 'merge-deferred'])
-    def test_gate_is_in_progress_only(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_gate_is_in_progress_only(self, tmp_path, status):
         """Non-in-progress statuses are never gated, even worktree-only + corroborated=False."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status=status, corroborated=False,
             )
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
         """All signals False (nothing to downgrade) → is_live False AND indeterminate
         False — distinct from the gated indeterminate case."""
         side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False,
             )
@@ -1953,21 +2025,23 @@ class TestCorroborationGate:
         assert result.is_live is False
         assert result.indeterminate is False
 
-    def test_is_workflow_live_for_task_forwards_corroborated(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_is_workflow_live_for_task_forwards_corroborated(self, tmp_path):
         """The convenience wrapper threads corroborated through **kwargs."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            live = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            live = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False,
             )
         assert live is False
 
-    def test_indeterminate_defaults_false_on_normal_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_indeterminate_defaults_false_on_normal_live(self, tmp_path):
         """A normal live result (no status/corroborated) has indeterminate False."""
         side = self._side_effect(worktree_branch=True, log_rc=1)
-        with patch('subprocess.run', side_effect=side):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
         assert result.is_live is True
         assert result.indeterminate is False
 
@@ -1991,7 +2065,8 @@ class TestWorktreeStaleGate:
 
     _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
 
-    def test_gate_fires_when_stale_is_sole_signal(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gate_fires_when_stale_is_sole_signal(self, tmp_path):
         """A stale worktree with no live orchestrator downgrades is_live to
         False and flags indeterminate True; the raw signals are preserved."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -1999,8 +2074,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_registered is True
         assert result.worktree_stale is True
@@ -2009,7 +2084,8 @@ class TestWorktreeStaleGate:
         assert result.is_live is False
         assert result.indeterminate is True
 
-    def test_live_orchestrator_lock_overrides_staleness(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_live_orchestrator_lock_overrides_staleness(self, tmp_path):
         """A stale worktree never overrides a live project-wide orchestrator
         lock -- the signal is still reported honestly, but is_live stays
         True and indeterminate stays False."""
@@ -2018,8 +2094,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
             )
 
@@ -2027,7 +2103,8 @@ class TestWorktreeStaleGate:
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_corroborated_true_prevents_stale_downgrade(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_corroborated_true_prevents_stale_downgrade(self, tmp_path):
         """A caller-supplied corroborated=True (fresh per-task evidence -- a
         live claimant heartbeat, a scheduler holder/park, or a post-restart
         routing decision) must not be overridden by branch age alone: the
@@ -2040,8 +2117,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=True,
             )
@@ -2050,7 +2127,8 @@ class TestWorktreeStaleGate:
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_deferred_task_with_stale_worktree_finally_resolves(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_deferred_task_with_stale_worktree_finally_resolves(self, tmp_path):
         """The know_live-598 deferral shape: a deferred task with a lingering
         worktree registration and old commits under a (still-running) live
         orchestrator. _orchestrator_signal_ineligible rule 1 zeroes
@@ -2063,12 +2141,12 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='deferred', _orchestrator_live=True,
             )
-            result_disabled = detect_live_workflow(
+            result_disabled = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='deferred', _orchestrator_live=True, max_worktree_age_hours=None,
             )
@@ -2081,7 +2159,8 @@ class TestWorktreeStaleGate:
         assert result_disabled.is_live is True
 
     @pytest.mark.parametrize('status', ['done', 'cancelled'])
-    def test_done_and_cancelled_tasks_with_stale_worktree_resolve(self, tmp_path, status):
+    @pytest.mark.asyncio
+    async def test_done_and_cancelled_tasks_with_stale_worktree_resolve(self, tmp_path, status):
         """Rule 1 of _orchestrator_signal_ineligible covers deferred/done/
         cancelled alike, and a lingering worktree on a done/cancelled task --
         the most common lingering-registration shape after a merge -- is the
@@ -2094,8 +2173,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status=status, _orchestrator_live=True,
             )
@@ -2105,21 +2184,23 @@ class TestWorktreeStaleGate:
         assert result.is_live is False
         assert result.indeterminate is True
 
-    def test_fresh_worktree_stays_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_fresh_worktree_stays_live(self, tmp_path):
         """A 1-hour-old tip is well within any staleness window."""
         ts = (self._NOW - timedelta(hours=1)).isoformat()
         side_effect, _calls = _git_side_effect(
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.worktree_stale is False
         assert result.is_live is True
         assert result.indeterminate is False
 
-    def test_tip_inside_staleness_window_stays_live(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_tip_inside_staleness_window_stays_live(self, tmp_path):
         """Regression guard: the 6h recent-commit threshold must not leak
         into the 168h staleness threshold."""
         ts = (self._NOW - timedelta(hours=10)).isoformat()
@@ -2127,28 +2208,30 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.recent_commit is False
         assert result.worktree_stale is False
         assert result.is_live is True
 
-    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
         """Preserves the task-2963 semantic distinction between 'never had a
         signal' and 'had a signal that was downgraded'."""
         side_effect, _calls = _git_side_effect(
             worktree_stdout=_worktree_porcelain_no_branch(),
             log_rc=1, log_stdout='', revlist_stdout='1',
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.is_live is False
         assert result.indeterminate is False
         assert result.worktree_stale is False
 
-    def test_coexists_with_corroboration_gate(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_coexists_with_corroboration_gate(self, tmp_path):
         """Both gates agree on a stale, uncorroborated in-progress task --
         ORing them together must not produce a contradiction."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -2156,8 +2239,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False,
             )
@@ -2165,7 +2248,8 @@ class TestWorktreeStaleGate:
         assert result.is_live is False
         assert result.indeterminate is True
 
-    def test_corroboration_gate_fires_without_staleness(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_corroboration_gate_fires_without_staleness(self, tmp_path):
         """Pins that the pre-existing task-2963 gate is untouched: with
         staleness disabled and no tip at all, it alone still downgrades
         is_live."""
@@ -2173,8 +2257,8 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=1, log_stdout='',
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            result = detect_live_workflow(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
                 _TASK_ID, str(tmp_path), now=self._NOW,
                 status='in-progress', corroborated=False, max_worktree_age_hours=None,
             )
@@ -2183,7 +2267,8 @@ class TestWorktreeStaleGate:
         assert result.indeterminate is True
         assert result.worktree_stale is False
 
-    def test_wrapper_passthrough(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_wrapper_passthrough(self, tmp_path):
         """The convenience wrapper threads max_worktree_age_hours through
         **kwargs."""
         ts = (self._NOW - timedelta(days=30)).isoformat()
@@ -2191,16 +2276,17 @@ class TestWorktreeStaleGate:
             worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
             log_rc=0, log_stdout=ts,
         )
-        with patch('subprocess.run', side_effect=side_effect):
-            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path), now=self._NOW)
-            live_disabled = is_workflow_live_for_task(
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            live = await is_workflow_live_for_task(_TASK_ID, str(tmp_path), now=self._NOW)
+            live_disabled = await is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
             )
 
         assert live is False
         assert live_disabled is True
 
-    def test_stale_downgrade_logs_at_info(self, tmp_path, caplog):
+    @pytest.mark.asyncio
+    async def test_stale_downgrade_logs_at_info(self, tmp_path, caplog):
         """The stale gate firing is observable via logs (loud-over-silent-
         degradation norm): every other fail-safe branch in this module logs
         at debug, but this is the one path that flips a signal AGAINST
@@ -2213,9 +2299,638 @@ class TestWorktreeStaleGate:
         )
         with (
             caplog.at_level(logging.INFO, logger='fused_memory.services.live_workflow_detector'),
-            patch('subprocess.run', side_effect=side_effect),
+            patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)),
         ):
-            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
 
         assert result.is_live is False
         assert 'stale-worktree downgrade' in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-5: the worktree-list hoist
+# ---------------------------------------------------------------------------
+
+
+def _counting_git_side_effect(worktree_stdout: str):
+    """A `_git_side_effect` that additionally tallies calls PER git subcommand.
+
+    Returns ``(side_effect, counts)`` where ``counts`` carries a
+    ``'worktree_list'`` key.  The hoist's whole point is that this particular
+    tally stops scaling with the number of tasks probed, so it has to be
+    countable independently of the other two legs.
+    """
+    counts = {'worktree_list': 0, 'log': 0, 'rev_list': 0}
+
+    def side_effect(args, **kwargs):
+        if '--porcelain' in args:
+            counts['worktree_list'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=worktree_stdout, stderr='',
+            )
+        if 'rev-list' in args:
+            counts['rev_list'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='3', stderr='',
+            )
+        counts['log'] += 1
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
+
+    return side_effect, counts
+
+
+class TestParseWorktreeIndex:
+    """`parse_worktree_index` is the SINGLE home of the stanza/prunable semantics.
+
+    `_check_worktree_registered` is re-expressed on top of it, so the porcelain
+    grammar cannot drift between the per-task probe and the hoisted index.
+    """
+
+    def test_matching_stanza_without_prunable_line_is_not_prunable(self):
+        index = detector_module.parse_worktree_index(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        assert index[f'refs/heads/{_BRANCH}'] is False
+
+    def test_matching_stanza_with_prunable_line_is_prunable(self):
+        index = detector_module.parse_worktree_index(
+            _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        assert index[f'refs/heads/{_BRANCH}'] is True
+
+    def test_absent_branch_is_absent_from_the_map(self):
+        index = detector_module.parse_worktree_index(_worktree_porcelain_no_branch())
+
+        assert f'refs/heads/{_BRANCH}' not in index
+        assert index['refs/heads/main'] is False
+
+    @pytest.mark.parametrize(
+        'stdout',
+        ['', '\n', '\n\n\n', '   \n  \n', 'garbage without any branch line\n',
+         'worktree /x\nHEAD abc\n\n'],
+        ids=['empty', 'newline', 'blank-stanzas', 'whitespace', 'garbage', 'detached'],
+    )
+    def test_malformed_or_empty_input_yields_empty_map_never_raises(self, stdout):
+        assert detector_module.parse_worktree_index(stdout) == {}
+
+    def test_multiple_stanzas_all_indexed(self):
+        stdout = (
+            _worktree_porcelain_no_branch()
+            + _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        index = detector_module.parse_worktree_index(stdout)
+
+        assert index == {'refs/heads/main': False, f'refs/heads/{_BRANCH}': True}
+
+
+@pytest.mark.usefixtures('_patch_orchestrator_live_default')
+class TestDetectLiveWorkflowWorktreeIndexHoist:
+    """`worktree_index` short-circuits the per-task `git worktree list` probe.
+
+    Three-valued contract, deliberately:
+      ``None``  -> unknown (probe failed, or no hoist) -> probe per task
+      ``{}``    -> known: the repo has no registered worktrees -> no probe
+      ``{...}`` -> known: use it
+
+    Collapsing `None` into `{}` would turn a transient git glitch into a
+    project-wide "nothing is live" verdict — precisely the false negative the
+    exemption rules exist to prevent.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_injected_index_issues_no_worktree_list_subprocess(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': False},
+            )
+
+        assert counts['worktree_list'] == 0, 'the hoisted index must skip the probe'
+        assert result.worktree_registered is True
+        # The other two legs are untouched by this hoist and still run.
+        assert counts['log'] + counts['rev_list'] > 0
+
+    @pytest.mark.asyncio
+    async def test_default_none_is_todays_behaviour_one_probe_per_detect(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert counts['worktree_list'] == 1
+        assert result.worktree_registered is True
+
+    @pytest.mark.asyncio
+    async def test_empty_map_means_known_empty_not_unknown(self, tmp_path):
+        """`{}` is a POSITIVE answer, distinct from `None` — still no probe."""
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            result = await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, worktree_index={},
+            )
+
+        assert counts['worktree_list'] == 0
+        assert result.worktree_registered is False
+
+    @pytest.mark.asyncio
+    async def test_injected_prunable_entry_is_not_registered(self, tmp_path):
+        """Fail-safe parity: prunable => not registered, same as the subprocess path."""
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            hoisted = await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': True},
+            )
+            probed = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert counts['worktree_list'] == 1, 'only the un-hoisted call may probe'
+        assert hoisted.worktree_registered is False
+        assert probed.worktree_registered is False
+
+
+class TestWorktreeIndexFor:
+    """`worktree_index_for` is the one place the hoisted subprocess happens."""
+
+    @pytest.mark.asyncio
+    async def test_returns_parsed_index_on_success(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            index = await detector_module.worktree_index_for(str(tmp_path))
+
+        assert index == {f'refs/heads/{_BRANCH}': False}
+        assert counts['worktree_list'] == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_subprocess_error(self, tmp_path):
+        """`None`, NOT `{}` — an error must not read as "no worktrees exist"."""
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(OSError('boom'))):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_timeout(self, tmp_path):
+        """A timeout is RETURNED as a flagged result, so only the rc check catches it.
+
+        `run_git` hands back `GitResult(returncode=TIMEOUT_RETURNCODE,
+        timed_out=True)` rather than raising, so the `returncode != 0` leg is
+        the ONLY thing standing between a timed-out probe and a `{}` that would
+        read as "no worktrees exist" — the exact false negative the
+        `None`-vs-`{}` sentinel contract exists to prevent.
+
+        The call tally is load bearing: this test previously patched the
+        retired `subprocess.run` seam, which intercepted nothing, forked a REAL
+        `git worktree list --porcelain` child, and passed incidentally via the
+        non-zero-rc leg because `tmp_path` sits outside a git repo. A future
+        seam move now fails loudly here instead of silently reverting to
+        real-subprocess passthrough.
+        """
+        calls = 0
+        timing_out = _as_async_run_git(subprocess.TimeoutExpired(cmd=['git'], timeout=10))
+
+        async def counting_run_git(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return await timing_out(*args, **kwargs)
+
+        with patch.object(detector_module, 'run_git', counting_run_git):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+        assert calls == 1, (
+            'the run_git seam did not intercept — the probe reached a real git child'
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_nonzero_returncode(self, tmp_path):
+        def _fail(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout='', stderr='not a git repository',
+            )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(_fail)):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_map_for_a_repo_with_no_matching_worktrees(self, tmp_path):
+        """Success with nothing to report is `{}` — a real answer, not `None`."""
+        side_effect, _ = _counting_git_side_effect('')
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            assert await detector_module.worktree_index_for(str(tmp_path)) == {}
+
+
+class TestWorktreeIndexForLogsEveryUnknownLoudly:
+    """An "unknown" index is never silent — WARNING, not DEBUG.
+
+    The three failure legs are the ones this function DESIGNS for, so a
+    caller's `except Exception` can never see them; at DEBUG they were the
+    silent ones. An unknown index makes every probed task re-run its own
+    worktree list (up to MAX_ACTIVE_TASKS_RENDERED of them, at `_GIT_TIMEOUT`
+    each when git hangs) — the invisible degradation task 3778 exists to end.
+    """
+
+    _LOGGER = 'fused_memory.services.live_workflow_detector'
+    _EVENT = 'live_workflow_detector.worktree_index_unavailable'
+
+    async def _warnings_for(self, side_effect, tmp_path, caplog) -> list[str]:
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(
+                detector_module, 'run_git', side_effect=_as_async_run_git(side_effect),
+            ),
+        ):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_spawn_oserror_warns(self, tmp_path, caplog):
+        warnings = await self._warnings_for(OSError('boom'), tmp_path, caplog)
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'boom' in warnings[0], 'the WARNING must name the underlying error'
+
+    @pytest.mark.asyncio
+    async def test_nonzero_returncode_warns(self, tmp_path, caplog):
+        def _fail(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout='', stderr='not a git repository',
+            )
+
+        warnings = await self._warnings_for(_fail, tmp_path, caplog)
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'not a git repository' in warnings[0], 'git stderr is the diagnosis'
+
+    @pytest.mark.asyncio
+    async def test_timeout_warns_and_says_so(self, tmp_path, caplog):
+        """A timeout is the costliest leg (`_GIT_TIMEOUT` per probe), so it is named.
+
+        `run_git` RETURNS a timeout as `timed_out=True` with a non-zero rc
+        rather than raising, so it shares the rc leg — the message reads
+        `timed_out` to distinguish "git hung" from "git said no".
+        """
+        warnings = await self._warnings_for(
+            subprocess.TimeoutExpired(cmd=['git'], timeout=10), tmp_path, caplog,
+        )
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'TIMED OUT' in warnings[0], (
+            'a hung git must be distinguishable from a non-zero rc: '
+            f'{warnings[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_is_quiet(self, tmp_path, caplog):
+        """No false alarm on the happy path — the signal has to stay meaningful."""
+        side_effect, _ = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(
+                detector_module, 'run_git', side_effect=_as_async_run_git(side_effect),
+            ),
+        ):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is not None
+
+        noisy = [
+            r.getMessage() for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not noisy, f'a successful probe must not warn; got {noisy}'
+
+
+class TestWorktreeIndexKwargs:
+    """`worktree_index_kwargs` is the SINGLE home of the hoist wiring.
+
+    Both fan-out call sites (`_render_live_workflow_section` and the harness
+    integrity gate) splat it into `detect_live_workflow`, so the three-valued
+    contract — and its fail-safe — lives in one place rather than being spelled
+    out twice (task 3778 review, heuristic 11 SPOT).
+    """
+
+    _LOGGER = 'fused_memory.services.live_workflow_detector'
+
+    @pytest.mark.asyncio
+    async def test_known_index_is_passed_as_the_kwarg(self, tmp_path):
+        side_effect, _ = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {'worktree_index': {f'refs/heads/{_BRANCH}': False}}
+
+    @pytest.mark.asyncio
+    async def test_known_empty_repo_is_a_real_answer_not_an_omission(self, tmp_path):
+        """`{'worktree_index': {}}` — the hoist must not be wasted on the cheap case."""
+        side_effect, _ = _counting_git_side_effect('')
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {'worktree_index': {}}
+
+    @pytest.mark.asyncio
+    async def test_unknown_omits_the_kwarg_entirely(self, tmp_path):
+        """A failed probe must NOT arrive as an empty index.
+
+        `{'worktree_index': {}}` from a hoisted ERROR would report every task
+        `worktree_registered=False` — a transient git glitch read as a
+        project-wide "nothing is live". Omitting the kwarg restores the
+        pre-hoist per-task probe instead.
+        """
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(OSError('boom'))):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_degrades_and_warns_with_a_traceback(
+        self, tmp_path, caplog,
+    ):
+        """The fail-safe catch lives here so no call site can forget it."""
+        async def _boom(_project_root):
+            raise RuntimeError('unclassified')
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(detector_module, 'worktree_index_for', _boom),
+        ):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {}
+        warnings = [
+            r for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert 'worktree_index_unavailable' in warnings[0].getMessage()
+        assert warnings[0].exc_info is not None, (
+            'an UNEXPECTED exception must carry its traceback — it is the only '
+            'leg whose cause the message cannot name'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 3778 — the async surface and its new patch seam
+# ---------------------------------------------------------------------------
+
+class TestDetectorIsAsyncOverRunGit:
+    """The detector's git probes are non-blocking, via `shared.git_async.run_git`.
+
+    The measured defect: `detect_live_workflow` shelled out with blocking
+    `subprocess.run` while being fanned out across every active task from
+    inside a coroutine, pinning the event loop for 15-43 s at a time.
+
+    Two properties are pinned here. (1) The public entry points are coroutine
+    functions, so a caller physically cannot invoke them without an `await`.
+    (2) `run_git` is bound as an attribute of the detector MODULE — a bare-name
+    import, not a qualified `shared.git_async.run_git` call — which is what
+    makes `patch.object(detector_module, 'run_git', ...)` the single seam
+    intercepting every git call the detector can make. That binding is load
+    bearing for the ~90 canned-response tests migrated onto it.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _recording_run_git(calls: list):
+        """A `run_git` fake recording every invocation; reports no signals."""
+        from shared.git_async import GitResult
+
+        async def fake(cmd, cwd=None, *, input_text=None, timeout=None):
+            calls.append({'cmd': list(cmd), 'timeout': timeout})
+            return GitResult(returncode=1, stdout='', stderr='')
+
+        return fake
+
+    # ----- (a) the surface is async -----
+
+    def test_public_entry_points_are_coroutine_functions(self):
+        import inspect
+
+        assert inspect.iscoroutinefunction(detector_module.detect_live_workflow), (
+            'detect_live_workflow must be async — a sync detector shelling out to '
+            'git is the event-loop stall task 3778 exists to fix'
+        )
+        assert inspect.iscoroutinefunction(detector_module.is_workflow_live_for_task)
+
+    def test_probe_helpers_are_coroutine_functions(self):
+        import inspect
+
+        for name in (
+            '_check_worktree_registered',
+            '_check_recent_commit',
+            '_branch_own_commit_count',
+            'worktree_index_for',
+        ):
+            fn = getattr(detector_module, name)
+            assert inspect.iscoroutinefunction(fn), f'{name} still blocks the loop'
+
+    # ----- (b) every git call goes through the module-bound run_git -----
+
+    @pytest.mark.asyncio
+    async def test_all_probes_route_through_module_bound_run_git(self, tmp_path):
+        """No `subprocess.run` survives anywhere under a detect call."""
+        calls: list = []
+        with (
+            patch.object(detector_module, 'run_git', self._recording_run_git(calls)),
+            patch('subprocess.run') as blocking,
+        ):
+            await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert not blocking.called, (
+            'the detector still reaches blocking subprocess.run — '
+            f'{blocking.call_args_list}'
+        )
+        assert calls, 'no git call was routed through run_git at all'
+        # Match on argv ELEMENTS, never a substring of the joined command: the
+        # project_root is a tmp_path whose name can itself contain 'worktree'.
+        assert any('--porcelain' in c['cmd'] for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_every_call_carries_the_per_call_git_timeout(self, tmp_path):
+        """(d) `_GIT_TIMEOUT` is still applied per call, not dropped in the move.
+
+        `run_git` degrades a timeout into a fail-open result, but only when it
+        is given one; an un-timed-out probe can hang the caller forever.
+        """
+        calls: list = []
+        with patch.object(detector_module, 'run_git', self._recording_run_git(calls)):
+            await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert calls
+        assert all(c['timeout'] == detector_module._GIT_TIMEOUT for c in calls), (
+            f'expected every probe to pass timeout={detector_module._GIT_TIMEOUT}; '
+            f'got {[c["timeout"] for c in calls]}'
+        )
+
+    # ----- (c) the fail-open contract survives the seam change -----
+
+    @pytest.mark.asyncio
+    async def test_run_git_raising_oserror_is_fail_safe(self, tmp_path):
+        """`run_git` propagates OSError (git binary missing); the detector absorbs it."""
+        async def boom(cmd, cwd=None, *, input_text=None, timeout=None):
+            raise OSError('git: command not found')
+
+        with patch.object(detector_module, 'run_git', boom):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+
+    @pytest.mark.asyncio
+    async def test_timed_out_result_is_fail_safe(self, tmp_path):
+        """A timeout is RETURNED by run_git, not raised — it must read as no signal."""
+        from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+        async def timed_out(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(
+                returncode=TIMEOUT_RETURNCODE, stdout='', stderr='timed out',
+                timed_out=True,
+            )
+
+        with patch.object(detector_module, 'run_git', timed_out):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_nonzero_returncode_is_fail_safe(self, tmp_path):
+        from shared.git_async import GitResult
+
+        async def rc1(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(returncode=1, stdout='', stderr='fatal: not a git repo')
+
+        with patch.object(detector_module, 'run_git', rc1):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stdout_is_fail_safe(self, tmp_path):
+        """rc==0 with garbage output must not fabricate a signal."""
+        from shared.git_async import GitResult
+
+        async def garbage(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(returncode=0, stdout='not-a-timestamp', stderr='')
+
+        with patch.object(detector_module, 'run_git', garbage):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.last_commit_at is None
+
+    # ----- (e) the step-6 hoist still short-circuits on the new seam -----
+
+    @pytest.mark.asyncio
+    async def test_injected_worktree_index_still_skips_the_probe(self, tmp_path):
+        """The task-3778 hoist must survive the async conversion."""
+        calls: list = []
+        with patch.object(detector_module, 'run_git', self._recording_run_git(calls)):
+            result = await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': False},
+            )
+
+        assert result.worktree_registered is True
+        # Element match, not substring: tmp_path's own name contains 'worktree'.
+        assert not any('--porcelain' in c['cmd'] for c in calls), (
+            f'hoisted index was ignored — worktree list still probed: {calls}'
+        )
+
+
+class TestAsyncRunGitAdapter:
+    """The migration adapter itself is load-bearing, so it is tested.
+
+    ~90 tests are re-pointed at `run_git` through `_as_async_run_git`. If the
+    adapter silently mistranslated a canned response, those tests would keep
+    passing while asserting against behaviour the real helper never produces.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_process_becomes_a_git_result(self):
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='  out\n', stderr=' err ',
+            )
+
+        result = await _as_async_run_git(side_effect)(['git', 'status'])
+
+        assert result.returncode == 0
+        assert result.stdout == 'out', 'run_git strips stdout; the adapter must too'
+        assert result.stderr == 'err'
+        assert result.timed_out is False
+        assert result.ok is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_expired_is_converted_not_raised(self):
+        """`subprocess.run` raises on timeout; `run_git` returns a flagged result."""
+        def side_effect(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+
+        result = await _as_async_run_git(side_effect)(['git', 'log'], timeout=10)
+
+        assert result.timed_out is True
+        assert result.returncode != 0
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_bare_exception_side_effect_is_raised(self):
+        """mock semantics: a bare exception instance means 'raise this'."""
+        with pytest.raises(OSError, match='boom'):
+            await _as_async_run_git(OSError('boom'))(['git', 'status'])
+
+    @pytest.mark.asyncio
+    async def test_bare_timeout_expired_instance_is_converted(self):
+        result = await _as_async_run_git(
+            subprocess.TimeoutExpired(cmd=['git'], timeout=10)
+        )(['git', 'log'], timeout=10)
+
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_argv_is_forwarded_to_the_side_effect(self):
+        """Dispatching side_effects branch on argv, so it must arrive intact."""
+        seen: list = []
+
+        def side_effect(args, **kwargs):
+            seen.append(args)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout='', stderr='')
+
+        await _as_async_run_git(side_effect)(['git', '-C', '/p', 'worktree', 'list'])
+
+        assert seen == [['git', '-C', '/p', 'worktree', 'list']]

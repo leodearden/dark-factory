@@ -1,14 +1,15 @@
 // Module-contract tests for burndown_bands.js — the pure render DECISIONS
-// behind the Burndown tab's stacked status-mix bands, their legend, and the
-// concurrency-parity banner (tabs.jsx BurnTab, both the aggregate and the
+// behind the Burndown tab: the nine stacked status-mix bands, their legend,
+// the concurrency-parity banner, and the reader that stamps the burndown
+// payload's served Datums (tabs.jsx BurnTab, both the aggregate and the
 // per-project views).
 //
 // WHAT THIS SUITE ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. Only the RENDER
-// decision: which bands exist in which order, which colour each gets, and
-// whether the parity banner draws at all. The WIRE shapes — that
-// shape_burndown emits in_progress_live / in_progress_stranded /
-// concurrency_cap, and that the server computes parity_alarm correctly — are
-// already covered behaviourally by dashboard/tests/test_redux_api.py and
+// decisions: which bands exist in which order, which colour each gets, whether
+// the parity banner draws, and how a served Datum is read. The WIRE shapes —
+// that shape_burndown emits every census member's series and the `latest` /
+// `forecast` Datums, and that the server computes parity_alarm correctly — are
+// covered behaviourally by dashboard/tests/test_redux_api.py and
 // test_burndown_parity_alarm.py, and are not restated here.
 //
 // COLOURS ARE INJECTED, never read off a global (the prd_grouping.js
@@ -20,139 +21,141 @@
 // nothing to say about themes. What matters is that the right palette SLOT
 // reaches the right band, and that the slots stay distinct.
 //
+// THE VOCABULARY IS THE GENERATED ONE. Members, views, tones and series keys
+// are read off the loaded window.DF_TASK_VOCAB rather than restated, except
+// the stack order, which is spelled out once as a literal because the order
+// itself is the decision under test.
+//
+// LOADED THROUGH A WINDOW SHIM, in index.html's order: burndown_bands.js
+// destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope with no
+// fallback, and datum.js in turn destructures window.DF_ENDPOINT_STALENESS —
+// task_snapshot.test.mjs::loadTaskSnapshot has the same shape.
+//
 // Run via `node --test` (dashboard/tests/test_graph_layout_js.py's
 // `**/*.test.mjs` glob auto-discovers this file — no wrapper change needed).
-// burndown_bands.js resolves as CommonJS (no package.json in this repo), and
-// node's cjs-module-lexer cannot see exports assigned from a variable, so we
-// default-import and destructure rather than using named imports.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import bands from '../../src/dashboard/static/redux/burndown_bands.js';
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
-const { burndownStacks, burndownLegend, parityBannerState } = bands;
+const REDUX = '../../src/dashboard/static/redux/';
+const LOAD_CHAIN = ['datum.js', 'task_vocab.js', 'burndown_bands.js'].map(name => REDUX + name);
 
-const MODULE_SPECIFIER = '../../src/dashboard/static/redux/burndown_bands.js';
-const EXPECTED_FUNCTION_NAMES = ['burndownStacks', 'burndownLegend', 'parityBannerState'];
-
-// Sentinel palette — deliberately not colours. If an implementation ever
-// hard-codes a real oklch string instead of reading the injected slot, these
-// assertions fail loudly rather than coincidentally matching.
-const CP = {
-  ok: 'C_OK',
-  accent: 'C_ACCENT',
-  stranded: 'C_STRANDED',
-  bad: 'C_BAD',
-  warn: 'C_WARN',
-};
-
-// A burndown block with distinct array identities per field, so the tests can
-// assert each band is sourced from its OWN same-named field by reference —
-// index-shifting one band onto another's series is the failure mode the
-// per-project call site (pb.*) is exposed to.
-function mkBlock(extra) {
-  return {
-    labels: ['d1', 'd2'],
-    done: [1, 2],
-    in_progress_live: [3, 4],
-    in_progress_stranded: [5, 6],
-    blocked: [7, 8],
-    pending: [9, 10],
-    ...(extra || {}),
-  };
+function loadBurndownBands() {
+  const win = { DF_ENDPOINT_STALENESS: staleness };
+  globalThis.window = win;
+  const require = createRequire(import.meta.url);
+  for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
+  const [, , bandsApi] = LOAD_CHAIN.map(specifier => require(specifier));
+  return { api: bandsApi, window: win };
 }
 
-test('default-imported module exposes the burndown render decisions', () => {
+const { api: bands, window: loadedWindow } = loadBurndownBands();
+const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = bands;
+const { BURNDOWN_ENDPOINT } = bands;
+const { MEMBERS, TONES, SERIES_KEYS } = loadedWindow.DF_TASK_VOCAB;
+const { datumView } = loadedWindow.DF_DATUM;
+
+const EXPECTED_FUNCTION_NAMES = [
+  'burndownStacks',
+  'burndownLegend',
+  'parityBannerState',
+  'burndownDatum',
+  'forecastText',
+];
+const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'BURNDOWN_ENDPOINT'];
+
+// Terminal at the bottom, then backlog, then in-flight; members in TaskStatus
+// declaration order inside each view. So the three members task 5591 added
+// (review, merge-deferred, infra-hold) sit on top, where a pre-migration hole
+// in them blanks only their own bands: StackedAreaChart draws a layer only
+// where every layer below it is measured.
+const STACK_ORDER = [
+  'done',
+  'cancelled',
+  'pending',
+  'deferred',
+  'in-progress',
+  'blocked',
+  'review',
+  'merge-deferred',
+  'infra-hold',
+];
+
+// Sentinel palette over the nine tone slots — deliberately not colours. If an
+// implementation ever hard-codes a real oklch string instead of reading the
+// injected slot, these assertions fail loudly rather than coincidentally
+// matching.
+const CP = {
+  ok: 'C_OK',
+  fg2: 'C_FG2',
+  warn: 'C_WARN',
+  fg3: 'C_FG3',
+  accent: 'C_ACCENT',
+  bad: 'C_BAD',
+  info: 'C_INFO',
+  accent2: 'C_ACCENT2',
+  stranded: 'C_STRANDED',
+};
+
+const SPLIT_KEYS = ['in_progress_live', 'in_progress_stranded', 'in_progress_rows'];
+
+// A burndown block with a distinct array identity per series, so the tests can
+// assert each band is sourced from its OWN member's series by reference —
+// index-shifting one band onto another's series is the failure mode the
+// per-project call site (pb.*) is exposed to.
+function mkBlock() {
+  const block = { labels: ['d1', 'd2'] };
+  [...Object.values(SERIES_KEYS), ...SPLIT_KEYS].forEach((key, i) => {
+    block[key] = [i, i + 100];
+  });
+  return block;
+}
+
+test('the module exposes its readers and assigns window.DF_BURNDOWN_BANDS', () => {
+  assert.deepEqual(Object.keys(bands).sort(), EXPECTED_EXPORT_NAMES.slice().sort());
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof bands[name], 'function', `bands.${name} should be a function`);
   }
+  assert.equal(BURNDOWN_ENDPOINT, '/api/v2/dashboard/burndown');
+  // The browser half of the dual export: tabs.jsx destructures this global.
+  assert.equal(loadedWindow.DF_BURNDOWN_BANDS, bands);
 });
 
-test('module also assigns window.DF_BURNDOWN_BANDS (browser dual-export)', () => {
-  // Shim a bare browser-like global, then bust the require cache the top-level
-  // `import` above already populated, so the module body's
-  // `if (typeof window !== 'undefined')` branch runs against our shim.
-  globalThis.window = {};
-  try {
-    const require = createRequire(import.meta.url);
-    const resolved = require.resolve(MODULE_SPECIFIER);
-    delete require.cache[resolved];
-    const required = require(MODULE_SPECIFIER);
+// ---------------------------------------------------------------------------
+// burndownStacks — nine census bands, in view order, each on its own series
+// ---------------------------------------------------------------------------
 
-    assert.ok(globalThis.window.DF_BURNDOWN_BANDS, 'window.DF_BURNDOWN_BANDS was not set');
-    assert.deepEqual(
-      Object.keys(globalThis.window.DF_BURNDOWN_BANDS).sort(),
-      EXPECTED_FUNCTION_NAMES.slice().sort(),
-    );
-    assert.deepEqual(Object.keys(required).sort(), EXPECTED_FUNCTION_NAMES.slice().sort());
-    for (const name of EXPECTED_FUNCTION_NAMES) {
-      assert.equal(typeof globalThis.window.DF_BURNDOWN_BANDS[name], 'function');
-    }
-  } finally {
-    delete globalThis.window;
+test('burndownStacks: exactly nine bands, one per census member', () => {
+  const stacks = burndownStacks(mkBlock(), CP);
+
+  assert.equal(stacks.length, 9);
+  assert.deepEqual(stacks.map(s => s.member).sort(), MEMBERS.slice().sort());
+});
+
+test('burndownStacks: stacks terminal, then backlog, then in-flight, members in declaration order', () => {
+  assert.deepEqual(burndownStacks(mkBlock(), CP).map(s => s.member), STACK_ORDER);
+});
+
+test("burndownStacks: each band is keyed and sourced by its member's series key, by identity", () => {
+  // By identity, not by value: this is what makes the per-project call site
+  // (which passes pb.*, a different block from the aggregate b.*) index-safe.
+  const block = mkBlock();
+  for (const band of burndownStacks(block, CP)) {
+    assert.equal(band.key, SERIES_KEYS[band.member]);
+    assert.equal(band.values, block[SERIES_KEYS[band.member]], `${band.member} reads another series`);
   }
 });
 
-// ---------------------------------------------------------------------------
-// burndownStacks — the five bands, in order, each on its own series
-// ---------------------------------------------------------------------------
-
-test('burndownStacks: returns exactly the five bands in their fixed order', () => {
-  const stacks = burndownStacks(mkBlock(), CP);
-
-  assert.deepEqual(stacks.map(s => s.key), [
-    'done',
-    'in_progress_live',
-    'in_progress_stranded',
-    'blocked',
-    'pending',
-  ]);
+test("burndownStacks: each band draws in its member's census tone", () => {
+  for (const band of burndownStacks(mkBlock(), CP)) {
+    assert.equal(band.color, CP[TONES[band.member]], `${band.member} is not in its tone`);
+  }
 });
 
-test('burndownStacks: live and stranded in-progress are SEPARATE stacked bands', () => {
-  // The feature itself. Merging them back into one band is the regression this
-  // assertion exists to catch — a stranded task would then be invisible,
-  // stacked inside the same colour as a healthy one.
-  const stacks = burndownStacks(mkBlock(), CP);
-  const live = stacks.filter(s => s.key === 'in_progress_live');
-  const stranded = stacks.filter(s => s.key === 'in_progress_stranded');
-
-  assert.equal(live.length, 1, 'expected exactly one in_progress_live band');
-  assert.equal(stranded.length, 1, 'expected exactly one in_progress_stranded band');
-});
-
-test('burndownStacks: the undivided in_progress band NEVER appears alongside its parts', () => {
-  // Pins the invariant the call-site comment states: stacking the whole beside
-  // its parts would draw a total no census ever produced. The server
-  // guarantees live + stranded sum to in_progress, so emitting all three
-  // double-counts every in-progress task.
-  const stacks = burndownStacks(mkBlock({ in_progress: [99, 99] }), CP);
-
-  assert.ok(
-    stacks.every(s => s.key !== 'in_progress'),
-    `an undivided 'in_progress' band was stacked beside its parts: ${stacks.map(s => s.key).join(', ')}`,
-  );
-});
-
-test('burndownStacks: live and stranded get DISTINCT colours, from their own palette slots', () => {
-  const stacks = burndownStacks(mkBlock(), CP);
-  const live = stacks.find(s => s.key === 'in_progress_live');
-  const stranded = stacks.find(s => s.key === 'in_progress_stranded');
-
-  assert.notEqual(
-    live.color,
-    stranded.color,
-    'live and stranded bands share a colour — separating the bands achieves ' +
-      'nothing if they render indistinguishably',
-  );
-  assert.equal(live.color, CP.accent);
-  assert.equal(stranded.color, CP.stranded);
-});
-
-test('burndownStacks: all five band colours are pairwise distinct', () => {
-  const stacks = burndownStacks(mkBlock(), CP);
-  const colors = stacks.map(s => s.color);
+test('burndownStacks: all nine band colours are pairwise distinct', () => {
+  const colors = burndownStacks(mkBlock(), CP).map(s => s.color);
 
   assert.equal(
     new Set(colors).size,
@@ -161,67 +164,39 @@ test('burndownStacks: all five band colours are pairwise distinct', () => {
   );
 });
 
-test('burndownStacks: each band is sourced from its OWN same-named block field', () => {
-  // By identity, not by value: this is what makes the per-project call site
-  // (which passes pb.*, a different block from the aggregate b.*) index-safe.
-  // A band wired to the wrong field would still render a plausible chart.
-  const block = mkBlock();
-  const stacks = burndownStacks(block, CP);
-  const byKey = Object.fromEntries(stacks.map(s => [s.key, s]));
-
-  assert.equal(byKey.done.values, block.done);
-  assert.equal(byKey.in_progress_live.values, block.in_progress_live);
-  assert.equal(byKey.in_progress_stranded.values, block.in_progress_stranded);
-  assert.equal(byKey.blocked.values, block.blocked);
-  assert.equal(byKey.pending.values, block.pending);
-});
-
-test('burndownStacks: palette slots reach the bands they name', () => {
-  const stacks = burndownStacks(mkBlock(), CP);
-  const byKey = Object.fromEntries(stacks.map(s => [s.key, s.color]));
-
-  assert.deepEqual(byKey, {
-    done: CP.ok,
-    in_progress_live: CP.accent,
-    in_progress_stranded: CP.stranded,
-    blocked: CP.bad,
-    pending: CP.warn,
-  });
+test('burndownStacks: the in-progress split is not stacked among the census members', () => {
+  // The split partitions in_progress_rows, the ROWS' count — another instant
+  // from the census members. Stacking it beside them would draw a total no
+  // census ever produced.
+  const keys = burndownStacks(mkBlock(), CP).map(s => s.key);
+  for (const split of SPLIT_KEYS) {
+    assert.ok(!keys.includes(split), `${split} was stacked among the census bands: ${keys.join(', ')}`);
+  }
 });
 
 test('burndownStacks: tolerates a null/undefined block without throwing', () => {
   // BurnTab renders before the first burndown payload has necessarily arrived.
   // The band SET is structural and must survive that — an empty chart, not a
-  // blanked tab. This is what makes the `const b = block || {}` arm real: delete
-  // it and this test throws instead of passing.
+  // blanked tab.
   for (const empty of [null, undefined]) {
     const stacks = burndownStacks(empty, CP);
 
-    assert.equal(stacks.length, 5, `a ${empty} block should still define five bands`);
-    assert.deepEqual(stacks.map(s => s.key), [
-      'done',
-      'in_progress_live',
-      'in_progress_stranded',
-      'blocked',
-      'pending',
-    ]);
-    // No series to draw, but the palette slots still resolve: an absent block
-    // must not also cost the colours.
+    assert.deepEqual(stacks.map(s => s.member), STACK_ORDER);
     assert.ok(stacks.every(s => s.values === undefined), 'an absent block should yield no series');
-    assert.equal(stacks.find(s => s.key === 'in_progress_stranded').color, CP.stranded);
+    // An absent block must not also cost the colours.
+    assert.ok(stacks.every(s => s.color === CP[TONES[s.member]]));
   }
 });
 
 test('burndownStacks: tolerates a missing palette without throwing', () => {
-  // Symmetric to the block arm above: `const cp = palette || {}`. A caller that
-  // has not resolved CP yet gets colourless bands, not an exception.
   for (const nopalette of [null, undefined]) {
-    const stacks = burndownStacks(mkBlock(), nopalette);
+    const block = mkBlock();
+    const stacks = burndownStacks(block, nopalette);
 
-    assert.equal(stacks.length, 5);
+    assert.equal(stacks.length, 9);
     assert.ok(stacks.every(s => s.color === undefined), 'an absent palette should yield no colours');
     // The series still arrive — losing the palette must not also lose the data.
-    assert.deepEqual(stacks.find(s => s.key === 'pending').values, [9, 10]);
+    assert.ok(stacks.every(s => s.values === block[s.key]));
   }
 });
 
@@ -229,17 +204,13 @@ test('burndownStacks: tolerates a missing palette without throwing', () => {
 // burndownLegend — the key to the bands above, which must agree with them
 // ---------------------------------------------------------------------------
 
-test('burndownLegend: five entries, labelled for a reader rather than for the wire', () => {
-  const legend = burndownLegend(CP);
-
-  assert.deepEqual(legend.map(e => e.label), ['done', 'live', 'stranded', 'blocked', 'pending']);
+test('burndownLegend: nine entries labelled by census member, in stack order', () => {
+  assert.deepEqual(burndownLegend(CP).map(e => e.label), STACK_ORDER);
 });
 
 test('burndownLegend: legend colours match the stack colours pairwise, in order', () => {
-  // The real seam. Before the extraction this legend was two verbatim-
-  // duplicated array literals (the aggregate view and the per-project view),
-  // each free to drift from the bands it explains — a legend that disagrees
-  // with its chart is worse than no legend, because it is believed.
+  // A legend that disagrees with its chart is worse than no legend, because it
+  // is believed.
   const legend = burndownLegend(CP);
   const stacks = burndownStacks(mkBlock(), CP);
 
@@ -255,14 +226,10 @@ test('burndownLegend: legend colours match the stack colours pairwise, in order'
 });
 
 test('burndownLegend: tolerates a missing palette without throwing', () => {
-  // The legend is derived from burndownStacks, so it inherits that tolerance —
-  // asserted here rather than assumed, because the derivation is the very thing
-  // a future edit might unpick.
   for (const nopalette of [undefined, null]) {
     const legend = burndownLegend(nopalette);
 
-    assert.equal(legend.length, 5);
-    assert.deepEqual(legend.map(e => e.label), ['done', 'live', 'stranded', 'blocked', 'pending']);
+    assert.deepEqual(legend.map(e => e.label), STACK_ORDER);
     assert.ok(legend.every(e => e.color === undefined), 'an absent palette should yield no colours');
   }
 });
@@ -348,4 +315,83 @@ test('parityBannerState: the trailing text carries the project list when present
   );
 
   assert.ok(state.text.endsWith(' · a, b'), `expected the project list to close the text: ${state.text}`);
+});
+
+// ---------------------------------------------------------------------------
+// burndownDatum — a served Datum, stamped with the burndown receipt
+// ---------------------------------------------------------------------------
+
+const SERVED_AT = '2026-05-20T00:30:00+00:00';
+const RECEIVED_AT = 1_000_000;
+
+function servedLatest(overrides) {
+  return {
+    value: { counts: { pending: 4 }, completed: 3, velocity: 1.5, window_days: 2 },
+    as_of: '2026-05-20T00:10:00+00:00',
+    state: 'stale',
+    reason: 'bravo: not measured at the newest sample',
+    freshness_bound_seconds: 1200,
+    ...(overrides || {}),
+  };
+}
+
+function withBurndownReceipt() {
+  return { __receipt: { [BURNDOWN_ENDPOINT]: { servedAt: SERVED_AT, receivedAt: RECEIVED_AT } } };
+}
+
+test('burndownDatum: nothing is fetched until the burndown receipt exists', () => {
+  const datum = burndownDatum({ __receipt: {} }, { latest: servedLatest() }, 'latest');
+
+  assert.equal(datum.state, 'unknown');
+  assert.equal(datum.reason, 'not yet fetched');
+});
+
+test('burndownDatum: a missing block or a non-Datum field is a hole naming the field', () => {
+  for (const block of [undefined, null, {}, { forecast: 12 }]) {
+    const datum = burndownDatum(withBurndownReceipt(), block, 'forecast');
+
+    assert.equal(datum.state, 'unknown');
+    assert.ok(datum.reason.includes('forecast'), `the reason does not name the field: ${datum.reason}`);
+  }
+});
+
+test('burndownDatum: a served Datum comes back stamped, as a copy', () => {
+  const latest = servedLatest();
+  const block = { latest };
+  const before = JSON.parse(JSON.stringify(block));
+
+  const datum = burndownDatum(withBurndownReceipt(), block, 'latest');
+
+  assert.notEqual(datum, latest);
+  assert.equal(datum._served_at, SERVED_AT);
+  assert.equal(datum._received_at, RECEIVED_AT);
+  assert.deepEqual(datum.value, latest.value);
+  assert.deepEqual(block, before, 'the polled payload was mutated');
+});
+
+test("burndownDatum: a stamped STALE reading badges its age and shows the server's reason", () => {
+  const datum = burndownDatum(withBurndownReceipt(), { latest: servedLatest() }, 'latest');
+  const view = datumView(datum, { now: RECEIVED_AT, format: r => String(r.completed) });
+
+  assert.equal(view.text, '3');
+  assert.equal(view.title, servedLatest().reason);
+  assert.notEqual(view.age, null, 'a stale burndown reading drew no age badge');
+});
+
+test('burndownDatum: a stamped FRESH reading within its bound draws no badge', () => {
+  const fresh = servedLatest({ as_of: '2026-05-20T00:29:00+00:00', state: 'fresh', reason: null });
+  const datum = burndownDatum(withBurndownReceipt(), { latest: fresh }, 'latest');
+  const view = datumView(datum, { now: RECEIVED_AT, format: r => String(r.completed) });
+
+  assert.equal(view.age, null);
+  assert.equal(view.title, null);
+});
+
+// ---------------------------------------------------------------------------
+// forecastText — the Forecast tile's reading of a served forecast value
+// ---------------------------------------------------------------------------
+
+test('forecastText: one number when the two forecasts agree, a range when they do not', () => {
+  assert.equal(forecastText({ forecast_low: 12, forecast_high: 12 }), '12d');
+  assert.equal(forecastText({ forecast_low: 10, forecast_high: 14 }), '10–14d');
 });

@@ -19,6 +19,7 @@ instrument as it exists rather than as it will exist.
 """
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 
@@ -379,7 +380,11 @@ def test_summary_rows_match_the_report_layer_field_for_field():
     for row in rows:
         ref = reference[row['config_name']]
         for field in ('n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
-                      'mean_plan_quality'):
+                      'mean_plan_quality',
+                      # The task-4760 decline split obeys the SAME rule as every
+                      # count above it: surfaced from the report layer's
+                      # admitted-pool accumulator, never re-derived here.
+                      'declined', 'no_plan_declined'):
             assert row[field] == ref[field], f'{row["config_name"]}.{field} drifted'
 
 
@@ -609,7 +614,8 @@ def test_partition_is_exact():
         'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'no_plan', 'f4': 'unmeasured',
     }
     assert part['counts'] == {
-        'ceiling': 1, 'intermittent': 1, 'no_plan': 1, 'unmeasured': 1,
+        'ceiling': 1, 'intermittent': 1, 'no_plan': 1, 'declined': 0,
+        'unmeasured': 1,
     }
     assert part['discarded'] == ['f1']
     assert part['retained'] == ['f2', 'f3', 'f4']
@@ -635,6 +641,228 @@ def test_partition_bands_on_the_most_retaining_cell():
 
     assert part['by_fixture'] == {'f1': 'intermittent'}
     assert part['discarded'] == []
+
+
+# ----- task 4766: the no-plan rung SPLITS on terminal_kind -----
+#
+# ``no_plan`` conflated two OPPOSITE verdicts on a candidate: one that could not
+# plan at all (the headroom this pool is selected for) and one that took an
+# explicit plan-tools decline exit (a CORRECT refusal of moot, blocked or
+# ill-posed work). Ruling D9 (task 3636) records the cost: tranche 1 read 47 of
+# 53 ``plan_steps = 0`` cells as an 89% planning failure when every one was a
+# verified-true decline — "the no-plan band is DECLINE-SHAPED, not
+# incapability-shaped".
+#
+# The split is LABELLING ONLY. Both bands are RETAINED (PRD D6 discards only the
+# unambiguous ceiling band, Leo-ratified at the γ2 gate), and
+# ``test_the_split_cannot_re_select_the_pool`` proves exhaustively that no
+# fixture changes side — the hazard task 4760 refused to take on, whose own
+# words were that "re-banding inside a measurement-plumbing change would
+# silently re-select the hard pool".
+
+
+def _decline_kinds():
+    """The REAL decline vocabulary, read off the instrument at collection time.
+
+    Never a hard-coded list of five strings. ``DECLINE_KINDS`` derives from
+    metrics.py's single ``_DECLINE_READERS`` map precisely so a sixth architect
+    exit cannot be half-added; parametrizing over the tuple extends that
+    discipline to the bander, so a new exit that nobody taught ``band_for_cell``
+    about fails here instead of silently banding ``no_plan``. Spelled as a
+    deferred import for the same reason every other ``orchestrator`` import in
+    this module is.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    return DECLINE_KINDS
+
+
+def _non_decline_kinds():
+    """The REST of the closed vocabulary — every terminal kind that is NOT a decline.
+
+    Derived as ``TERMINAL_KINDS - DECLINE_KINDS`` rather than typed out as
+    ``('none', 'planned')``, for the same reason :func:`_decline_kinds` is
+    derived: a non-decline terminal kind added later must be exercised HERE the
+    moment it exists, instead of leaving ``band_for_cell``'s treatment of it
+    unpinned while its decline siblings are covered. Together the two helpers
+    span the closed vocabulary with no third, hand-maintained list in between.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS, TERMINAL_KINDS
+
+    kinds = tuple(k for k in TERMINAL_KINDS if k not in DECLINE_KINDS)
+    assert kinds, 'premise: an empty parametrize would SKIP this test silently'
+    return kinds
+
+
+@pytest.mark.parametrize('kind', _decline_kinds())
+def test_a_no_plan_cell_that_explicitly_declined_bands_declined(kind):
+    """Each of the five plan-tools decline exits bands ``declined``, not ``no_plan``.
+
+    The cell is otherwise the ordinary no-plan shape — ``plan_steps = 0`` with a
+    valid reference — so the ONLY thing moving it out of ``no_plan`` is the
+    terminal kind.
+    """
+    m = _metrics(plan_steps=0, plan_quality=0.0,
+                 extra_metrics={'judged_without_reference': False,
+                                'terminal_kind': kind})
+
+    assert mod.band_for_cell(m, 0.80) == 'declined'
+
+
+@pytest.mark.parametrize('kind', _non_decline_kinds())
+def test_a_no_plan_cell_with_a_non_decline_kind_still_bands_no_plan(kind):
+    """Only DECLINE_KINDS moves the rung. The rest of the closed vocabulary does not.
+
+    Today that is ``none`` — the real silent-failure shape — and ``planned``, a
+    member of TERMINAL_KINDS that is not a decline; the parametrization is read
+    off the instrument, so a kind added tomorrow arrives here on its own. All of
+    them must stay in the band that means "this candidate emitted no plan",
+    because that is the headroom evidence the screen exists to find.
+    """
+    m = _metrics(plan_steps=0, plan_quality=0.0,
+                 extra_metrics={'judged_without_reference': False,
+                                'terminal_kind': kind})
+
+    assert mod.band_for_cell(m, 0.80) == 'no_plan'
+
+
+def test_an_unmeasured_terminal_kind_is_never_read_as_a_decline():
+    """UNMEASURED bands ``no_plan``, in BOTH of its shapes — never ``declined``.
+
+    ``terminal_kind_of`` deliberately conflates a missing key with an explicit
+    ``None``: both mean we never measured why this cell has no plan, and its
+    docstring records that a third arm for the explicit null would misread the
+    cell as "did not decline". A ``--results-dir`` replay of the tranche-1
+    corpus is entirely keyless, so the legacy shape is the COMMON case, not an
+    exotic one. Banding either ``declined`` would fabricate a refusal nobody
+    observed; ``no_plan`` already means "we cannot tell why there is no plan",
+    which is the conservative direction D6 demands of every ambiguous rung.
+
+    Sibling of ``test_a_legacy_cell_reads_unmeasured_never_a_fabricated_kind``.
+    """
+    common = {'plan_steps': 0, 'plan_quality': 0.0}
+    ref_ok = {'judged_without_reference': False}
+    explicit_null = _metrics(
+        **common, extra_metrics={**ref_ok, 'terminal_kind': None},
+    )
+    legacy = _metrics(**common, extra_metrics=ref_ok,
+                      drop_metrics=_PRE_TERMINAL_KIND)
+    assert 'terminal_kind' not in legacy, 'premise: this cell predates task 4760'
+
+    assert mod.band_for_cell(explicit_null, 0.80) == 'no_plan'
+    assert mod.band_for_cell(legacy, 0.80) == 'no_plan'
+
+
+def test_declined_is_a_retained_band_wired_into_every_constant():
+    """The name exists in all three tuples, and the two tuples cannot drift apart.
+
+    ``RETAINED_BANDS`` gets no edit of its own — its ``b != 'ceiling'``
+    derivation picks ``declined`` up from ``BANDS`` automatically, which is D6's
+    "discard only the ceiling band" rule staying single-sourced. The
+    precedence SLOT is pinned because it is load-bearing, not cosmetic: see
+    ``test_the_split_cannot_re_select_the_pool``.
+    """
+    assert 'declined' in mod.BANDS
+    assert 'declined' in mod.RETAINED_BANDS
+    assert 'declined' in mod._BAND_PRECEDENCE
+    # Two tuples over one vocabulary: a band added to either alone would make
+    # partition_bands raise (index) or drop a counts key.
+    assert set(mod._BAND_PRECEDENCE) == set(mod.BANDS)
+    assert (mod._BAND_PRECEDENCE.index('declined')
+            == mod._BAND_PRECEDENCE.index('no_plan') + 1)
+
+
+_ALL_BANDS = ('ceiling', 'intermittent', 'no_plan', 'declined', 'unmeasured')
+"""The five band names, spelled OUT so the exhaustive enumeration cannot shrink.
+
+Reading these off ``mod.BANDS`` would let a regression that drops a band also
+delete the cases that would have caught it. The tie back to production is an
+explicit set-equality assertion inside the test instead.
+"""
+
+_PRE_SPLIT_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
+"""Task 4760's four-band precedence, RECOMPUTED here rather than imported.
+
+The point of the lock below is to compare this change against the behaviour it
+replaces, so importing the (now five-band) production tuple would compare it
+against itself and assert nothing.
+"""
+
+_BAND_CELL_KWARGS = {
+    'ceiling': dict(plan_steps=6, plan_quality=0.92,
+                    extra_metrics={'judged_without_reference': False,
+                                   'terminal_kind': 'planned'}),
+    'intermittent': dict(plan_steps=5, plan_quality=0.40,
+                         extra_metrics={'judged_without_reference': False,
+                                        'terminal_kind': 'planned'}),
+    'no_plan': dict(plan_steps=0, plan_quality=0.0,
+                    extra_metrics={'judged_without_reference': False,
+                                   'terminal_kind': 'none'}),
+    'declined': dict(plan_steps=0, plan_quality=0.0,
+                     extra_metrics={'judged_without_reference': False,
+                                    'terminal_kind': 'false_premise'}),
+    'unmeasured': dict(cap_tainted=True, invocation_error='architect: cap_hit',
+                       extra_metrics={'judged_without_reference': False,
+                                      'terminal_kind': 'none'}),
+}
+"""One ``_cell`` kwargs recipe per band. Each is checked to really band that way."""
+
+
+def _pre_split_label(cell_bands):
+    """The label task 4760's four-band bander gave a fixture with these cells."""
+    folded = ['no_plan' if b == 'declined' else b for b in cell_bands]
+    return min(folded, key=_PRE_SPLIT_PRECEDENCE.index)
+
+
+def test_the_split_cannot_re_select_the_pool():
+    """THE SAFETY LOCK: the split REFINES labels and moves no fixture, exhaustively.
+
+    Over every multiset of one to three cell-bands — every shape a fixture with
+    up to three admitted cells can take — two properties must hold:
+
+    (i) DISPOSITION INVARIANCE. The fixture lands on the same side of
+        retained/discarded as it did under the pre-split four-band rule. This is
+        what makes the change safe to land on an already-committed corpus: it
+        cannot re-select the hard pool, which is exactly the hazard task 4760
+        declined to take on inside a measurement-plumbing change.
+
+    (ii) LABEL REFINEMENT. The new label either equals the old one, or is
+        ``declined`` precisely where the old was ``no_plan``. Nothing else moves.
+
+    Placing ``declined`` immediately after ``no_plan`` in ``_BAND_PRECEDENCE``
+    is the UNIQUE slot satisfying these; the plausible alternative (last before
+    ``ceiling``, making the label mean strict unanimity) violates (ii) 25 times
+    over this same enumeration, relabelling ``{declined, unmeasured}`` fixtures
+    as ``unmeasured`` and so sending γ1's re-run recipe at a fixture that
+    already holds an admissible cell. So the assertion genuinely discriminates
+    between the two placements rather than passing for any of them.
+    """
+    assert set(_ALL_BANDS) == set(mod.BANDS), 'the enumeration must cover every band'
+
+    for size in (1, 2, 3):
+        for cell_bands in itertools.combinations_with_replacement(_ALL_BANDS, size):
+            results = [
+                _cell('f', 'A', trial=i + 1, **_BAND_CELL_KWARGS[band])
+                for i, band in enumerate(cell_bands)
+            ]
+            for result, band in zip(results, cell_bands, strict=True):
+                assert mod.band_for_cell(result.metrics, 0.80) == band, (
+                    f'premise: the {band!r} recipe must build a {band!r} cell'
+                )
+
+            part = mod.partition_bands(results, 0.80)
+            new = part['by_fixture']['f']
+            old = _pre_split_label(cell_bands)
+
+            assert new == old or (new == 'declined' and old == 'no_plan'), (
+                f'{cell_bands}: {old!r} -> {new!r} is not a refinement'
+            )
+            assert ('f' in part['retained']) == (old != 'ceiling'), (
+                f'{cell_bands}: retention changed (was {old!r}, now {new!r})'
+            )
+            assert ('f' in part['discarded']) == (old == 'ceiling'), (
+                f'{cell_bands}: discard changed (was {old!r}, now {new!r})'
+            )
 
 
 def test_banding_without_q_ceiling_exits(tmp_path, monkeypatch):
@@ -696,6 +924,11 @@ def test_output_schema_carries_the_four_required_per_candidate_fields():
             # partially-instrumented corpus stays legible rather than merely
             # unknown.
             'judged_without_reference_unmeasured_cells',
+            # WHY those no_plan cells are there (task 4760): how many took an
+            # explicit plan-tools decline exit, broken out by kind, and how much
+            # of the no-plan band that accounts for. Surfaced from the report
+            # layer, and adjusting nothing — a decline is a CORRECT refusal.
+            'declined', 'no_plan_declined', 'declined_by_kind',
         }
     by_name = {e['config_name']: e for e in report['candidates']}
     assert by_name['architect-fable-high']['model'] == 'claude-fable-5'
@@ -711,6 +944,11 @@ def test_report_carries_cells_and_cell_matrix():
         assert set(cell) == {
             'task_id', 'config_name', 'trial', 'outcome', 'plan_quality',
             'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted',
+            # The terminal statement this cell ended on (task 4760), so a
+            # ``plan_steps = 0`` row splits by cause with no transcript
+            # forensics — the artifacts that would answer it are destroyed by
+            # ``cleanup_eval_worktree`` before anything else can read them.
+            'terminal_kind',
         }
     # The ENUMERATED expected matrix rides along, so a cell that never returned
     # is visible as a gap rather than silently absent.
@@ -1868,3 +2106,407 @@ def test_architect_cells_is_the_single_source_of_the_role_filter():
     assert mod.partition_bands([architect, implementer], 0.80)['by_fixture'] == {
         'f1': 'ceiling',
     }
+
+
+# ===== task 4760: the no-plan band, SURFACED split by terminal cause =====
+#
+# ``no_plan`` says HOW MANY architect cells emitted no plan and never WHY, and
+# the two causes it conflates are opposite verdicts on the candidate: a genuine
+# "could not plan" is a content failure, whereas ``report_false_premise`` and its
+# four siblings are the architect CORRECTLY refusing an unplannable task. Tranche
+# 1 read 47 of 47 ``plan_steps = 0`` cells as an 89% planning failure when every
+# one was an explicit, adversarially-verified-true decline — and separating the
+# two took manual forensics over artifacts ``cleanup_eval_worktree`` had already
+# destroyed. These counts are SURFACED from ``build_plan_quality_report``, never
+# derived here, for exactly the reason every other count in this driver is.
+
+_PRE_TERMINAL_KIND = ('terminal_kind',)
+"""``drop_metrics`` argument for a cell that PREDATES task 4760.
+
+The :data:`_PRE_SIGMA` precedent, one field over. ``terminal_kind`` is a declared
+``EvalMetrics`` field, so ``to_dict``'s bare ``asdict`` puts the key on every
+cell the live instrument emits — that presence-on-every-cell property is what
+makes KEY ABSENCE the one unambiguous "this cell predates the field" signal, and
+it must not be weakened to a conditional emit. A ``--results-dir`` replay of the
+tranche-1 corpus is all keyless, so that shape has to be constructible on
+purpose rather than inherited from the dataclass not yet having the field.
+"""
+
+
+def _declining_results():
+    """A: every no-plan cell is a DECLINE. B: one silent no-plan cell.
+
+    THE tranche-1 shape in miniature beside its control. Both arms have the same
+    ``no_plan`` count, so a reader with only that number cannot tell a candidate
+    that correctly refused two unplannable fixtures from one that failed to plan
+    on the same two — which is the whole defect.
+    """
+    return [
+        _cell('f1', 'architect-opus-max', plan_quality=0.0, plan_steps=0,
+              extra_metrics={'terminal_kind': 'false_premise'}),
+        _cell('f2', 'architect-opus-max', plan_quality=0.0, plan_steps=0,
+              extra_metrics={'terminal_kind': 'already_done'}),
+        _cell('f3', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
+              extra_metrics={'terminal_kind': 'planned'}),
+        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0,
+              extra_metrics={'terminal_kind': 'none'}),
+        _cell('f2', 'architect-fable-high', plan_quality=0.0, plan_steps=0,
+              extra_metrics={'terminal_kind': 'blocking_dependency'}),
+        _cell('f3', 'architect-fable-high', plan_quality=0.70, plan_steps=5,
+              extra_metrics={'terminal_kind': 'planned'}),
+    ]
+
+
+def test_summary_fields_carry_the_decline_split():
+    """The split rides in the SHARED schema tuple, not in an ad-hoc row edit."""
+    assert 'declined' in mod._SUMMARY_FIELDS
+    assert 'no_plan_declined' in mod._SUMMARY_FIELDS
+    # Named once, so the summary and the renderer cannot disagree about it.
+    assert len(set(mod._SUMMARY_FIELDS)) == len(mod._SUMMARY_FIELDS)
+
+
+def test_decline_counts_are_surfaced_verbatim_from_the_report_layer():
+    """THE anti-drift assertion, extended to the task-4760 counts.
+
+    ``declined`` / ``no_plan_declined`` / ``declined_by_kind`` are
+    ``build_plan_quality_report``'s per-config accumulator over the ADMITTED
+    pool. Re-deriving any of them here — over every architect cell rather than
+    the admitted one, say — is the exact drift that made this driver print
+    ``unmeasured`` while the report object it had built one line earlier printed
+    ``1``.
+    """
+    results = _declining_results()
+    rows = _summary_rows(results)
+    reference = _report_entries(results)
+
+    assert set(rows) == set(reference)
+    for name, row in rows.items():
+        ref = reference[name]
+        for field in ('no_plan', 'declined', 'no_plan_declined',
+                      'declined_by_kind'):
+            assert row[field] == ref[field], f'{name}.{field} drifted'
+
+
+def test_every_summary_row_carries_the_per_kind_breakout():
+    """``declined_by_kind`` rides on every row — the kinds are not fungible.
+
+    An ``already_done`` and a ``false_premise`` are opposite findings about the
+    FIXTURE (one says the work landed, the other says the premise is false), and
+    a single "declined" total would let a corpus of stale fixtures read as one
+    of ill-posed ones.
+    """
+    rows = _summary_rows(_declining_results())
+
+    assert rows['architect-opus-max']['declined_by_kind'] == {
+        'already_done': 1, 'false_premise': 1,
+    }
+    assert rows['architect-fable-high']['declined_by_kind'] == {
+        'blocking_dependency': 1,
+    }
+    # Key-sorted, so a committed artifact diffs cleanly.
+    for row in rows.values():
+        assert list(row['declined_by_kind']) == sorted(row['declined_by_kind'])
+
+
+def test_the_raw_cell_dump_splits_no_plan_by_cause():
+    """``terminal_kind`` per cell — the field that removes the forensics.
+
+    Reading tranche 1 required opening transcripts, because the decline
+    artifacts themselves were destroyed by ``cleanup_eval_worktree`` before
+    anything persisted them. With the kind in the cell dump an analyst splits
+    ``plan_steps = 0`` by cause straight off the artifact.
+    """
+    assert 'terminal_kind' in mod._CELL_FIELDS
+
+    candidates = mod.resolve_candidates(
+        ['architect-opus-max', 'architect-fable-high']
+    )
+    report = mod.build_campaign_report(_declining_results(), candidates, [])
+    by_cell = {
+        (c['task_id'], c['config_name']): c for c in report['cells']
+    }
+
+    assert by_cell[('f1', 'architect-opus-max')]['terminal_kind'] == 'false_premise'
+    assert by_cell[('f1', 'architect-fable-high')]['terminal_kind'] == 'none'
+    assert by_cell[('f3', 'architect-opus-max')]['terminal_kind'] == 'planned'
+    # Both zero-step cells are still zero-step: the split EXPLAINS plan_steps,
+    # it does not restate it.
+    assert by_cell[('f1', 'architect-opus-max')]['plan_steps'] == 0
+    assert by_cell[('f1', 'architect-fable-high')]['plan_steps'] == 0
+
+
+def test_a_legacy_cell_reads_unmeasured_never_a_fabricated_kind():
+    """A pre-4760 cell carries ``None``, which renders as the loud sentinel."""
+    candidates = mod.resolve_candidates(['architect-opus-max'])
+    legacy = _cell('f1', 'architect-opus-max', plan_quality=0.0, plan_steps=0,
+                   drop_metrics=_PRE_TERMINAL_KIND)
+
+    report = mod.build_campaign_report([legacy], candidates, [])
+
+    assert report['cells'][0]['terminal_kind'] is None
+    # …and the renderer's shared value formatter says so in words, never '0'
+    # and never a kind nobody measured.
+    assert mod._fmt(report['cells'][0]['terminal_kind']) == mod.UNMEASURED
+    # The candidate row counts it as unmeasured rather than as "did not decline".
+    assert report['candidates'][0]['declined'] == 0
+    assert report['candidates'][0]['no_plan'] == 1
+
+
+def test_the_rendered_table_carries_a_declined_column_beside_no_plan():
+    """The split renders NEXT TO the number it explains, on the same line."""
+    report = {'candidates': mod.summarize_candidates(_declining_results())}
+
+    text = mod.format_campaign_report(report)
+    header = next(
+        line for line in text.splitlines() if 'no_plan' in line
+    )
+    line = next(
+        line for line in text.splitlines()
+        if line.startswith('architect-opus-max')
+    )
+
+    assert 'declined' in header
+    assert header.index('declined') > header.index('no_plan')
+    assert header.index('declined') < header.index('plan_rate')
+    # Two no-plan cells, both of them refusals.
+    assert line.split()[4:6] == ['2', '2'], line
+
+
+def test_the_tranche_one_reading_is_legible_end_to_end():
+    """THE property whose absence forced the tranche-1 forensics.
+
+    A candidate whose every no-plan cell was an explicit refusal reports
+    ``no_plan == no_plan_declined``, and the rendered table shows it — a
+    POSITIVE reliability result (the architect correctly refused unplannable
+    fixtures), not an 89%-planning-failure result. Its control arm, one silent
+    no-plan cell among two, must NOT read the same way.
+    """
+    rows = _summary_rows(_declining_results())
+    declining, control = rows['architect-opus-max'], rows['architect-fable-high']
+
+    assert declining['no_plan'] == 2
+    assert declining['no_plan_declined'] == declining['no_plan']
+    assert control['no_plan'] == 2
+    assert control['no_plan_declined'] == 1
+
+    text = mod.format_campaign_report({'candidates': list(rows.values())})
+    control_line = next(
+        line for line in text.splitlines()
+        if line.startswith('architect-fable-high')
+    )
+    assert control_line.split()[4:6] == ['2', '1'], control_line
+    # plan_rate is UNTOUCHED by any of it: both arms planned 1 of 3.
+    assert declining['plan_rate'] == control['plan_rate'] == 0.3333
+
+
+def test_rendering_the_decline_split_is_deterministic():
+    """The widened table still formats byte-identically twice."""
+    report = {'candidates': mod.summarize_candidates(_declining_results())}
+
+    assert mod.format_campaign_report(report) == mod.format_campaign_report(report)
+
+
+# RETIRED (task 4766): ``test_banding_ignores_the_terminal_kind_entirely``.
+#
+# It asserted ``band_for_cell`` bands a declining cell, a silent one and a
+# keyless one all ``no_plan`` — task 4760's DELIBERATE scope marker, not stale
+# cruft, whose own docstring deferred the question to "the companion sampler
+# task's scope". Task 4766 IS that resolution (the sampler companion, 4759,
+# turned out to own fixture base-pinning instead), so the assertion is inverted
+# ON PURPOSE and its successors live in the step-9 banding block above:
+# ``test_a_no_plan_cell_that_explicitly_declined_bands_declined`` (the
+# inversion), ``test_a_no_plan_cell_with_a_non_decline_kind_still_bands_no_plan``
+# and ``test_an_unmeasured_terminal_kind_is_never_read_as_a_decline`` (the two
+# halves the old pin got right, kept), and
+# ``test_the_split_cannot_re_select_the_pool`` — which proves exhaustively that
+# the pool is NOT re-selected, discharging the exact worry the retired pin
+# existed to hold. This note is here so a reader diffing 4760 against 4766 can
+# tell a resolved boundary from an accidentally-inverted assertion.
+
+
+# ===== task 4766: the unanimously-declining fixture, legible end to end =====
+#
+# The fixture-level half of the split. ``reify_task_3883`` is the real shape it
+# was built for: six of six no-plan cells across both candidate arms, every one
+# an adversarially-verified-true ``report_false_premise``. Under the four-band
+# scheme that fixture read as the single strongest piece of evidence for the
+# headroom the screen was selecting for, when it was in fact the strongest
+# evidence that the task was ill-posed. It stays RETAINED — PRD D6 discards only
+# the unambiguous ceiling band, Leo-ratified at the γ2 gate — so what changes is
+# what the partition is CALLED, which is what lets the redesigned eval set
+# ruling D9 (task 3636) calls for exclude decline-shaped fixtures on recorded
+# evidence rather than on repeated transcript forensics.
+
+
+def _unanimously_declining_results():
+    """THE reify_task_3883 shape in miniature: 6 of 6 no-plan cells, all declines."""
+    return [
+        _cell('f', config, trial=trial, plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'})
+        for config in ('architect-opus-max', 'architect-fable-high')
+        for trial in (1, 2, 3)
+    ]
+
+
+def test_a_unanimously_declining_fixture_is_labelled_declined_and_retained():
+    """The explicit answer to "retained, discarded, or routed?": RETAINED, relabelled.
+
+    Locked so a later change cannot quietly start discarding it. Discarding
+    would reverse a Leo-ratified rule (D6: discard ONLY the unambiguous ceiling
+    band, ambiguity -> retain) and would save nothing — ruling D9 superseded the
+    stage-2 design outright, and ``partition_bands``' output has exactly one
+    consumer, the text renderer in the same module.
+    """
+    part = mod.partition_bands(_unanimously_declining_results(), 0.80)
+
+    assert part['by_fixture'] == {'f': 'declined'}
+    assert part['counts']['declined'] == 1
+    assert part['counts']['no_plan'] == 0
+    assert part['retained'] == ['f']
+    assert part['discarded'] == []
+
+
+def test_one_silent_cell_beside_a_decline_keeps_the_fixture_in_no_plan():
+    """A sibling's correct refusal must not MASK a genuine failure to plan.
+
+    One arm declined and the other emitted nothing and said nothing about why.
+    That second cell is real headroom evidence, so the fixture keeps the label
+    that reports it. ``declined`` means every ADMITTED no-plan cell was an
+    explicit refusal — which is exactly what ``_BAND_PRECEDENCE`` placing
+    ``no_plan`` ahead of ``declined`` buys.
+    """
+    results = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'}),
+        _cell('f', 'architect-fable-high', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none'}),
+    ]
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['by_fixture'] == {'f': 'no_plan'}
+    assert part['counts']['no_plan'] == 1
+    assert part['counts']['declined'] == 0
+    assert part['retained'] == ['f']
+
+
+def test_a_declined_fixture_can_still_hold_a_cap_excluded_cell():
+    """ADMITTED is the load-bearing word in the rendered NOTE, so pin what it admits.
+
+    A cap-tainted cell with ``plan_steps = 0`` never reaches the split: it bands
+    ``unmeasured`` one rung EARLIER, and ``unmeasured`` sits after ``declined``
+    in the precedence — so this fixture bands ``declined`` while holding a
+    zero-step cell that said NOTHING about why it produced no plan. Reading that
+    label as "every cell here refused" is the same over-strong inference the
+    whole band exists to prevent, one level down, which is why the NOTE names
+    the admitted population and points at cap_excl.
+    """
+    results = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'}),
+        _cell('f', 'architect-fable-high', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none', 'cap_tainted': True}),
+    ]
+    bands = [mod.band_for_cell(r.metrics, 0.80) for r in results]
+    assert bands == ['declined', 'unmeasured'], 'premise: the cap cell skips the rung'
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['by_fixture'] == {'f': 'declined'}
+    assert part['retained'] == ['f']
+
+
+def _band_count_line(lines, band):
+    """Index of *band*'s count line in the rendered PRD-D6 block."""
+    return next(i for i, line in enumerate(lines)
+                if line.startswith(f'  {band:<14}'))
+
+
+def test_the_banding_block_renders_declined_beside_no_plan():
+    """The count renders NEXT TO the number it refines, as the table column does."""
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    lines = mod.format_campaign_report(report).splitlines()
+
+    assert _band_count_line(lines, 'declined') == _band_count_line(lines, 'no_plan') + 1
+    assert lines[_band_count_line(lines, 'declined')].split() == ['declined', '1']
+    assert lines[_band_count_line(lines, 'no_plan')].split() == ['no_plan', '0']
+
+
+def test_the_banding_block_explains_that_a_decline_is_not_headroom():
+    """The NOTE an operator needs to not re-derive the tranche-1 misreading.
+
+    A count line alone reproduces the defect one level up: a reader who sees
+    ``declined 1`` and does not know what it means still has to go and find out
+    whether it counts against the candidate. It does not — it is a correct
+    refusal — and the fixture is retained anyway, so the note has to say both.
+    """
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    text = mod.format_campaign_report(report)
+
+    assert 'CORRECT REFUSAL' in text
+    assert 'RETAINED' in text
+    # The provenance, so the reading is checkable rather than asserted.
+    assert 'D9' in text or '3636' in text
+    # Named exits, not a gesture at "a decline": the closed vocabulary is what
+    # makes the band decidable.
+    assert 'report_false_premise' in text
+
+
+def test_every_decline_kind_gets_a_named_exit():
+    """The rendered exit list is DERIVED, so a sixth architect exit names itself.
+
+    A unit test of the pure helper, deliberately NOT a pin on the renderer's
+    prose: task 4064's norm records that once a message derives its enumeration
+    from a single source of truth, the derivation IS the anti-drift guarantee,
+    and an "every member appears in the text" loop advertises coverage it does
+    not have (it passes on incidental occurrences elsewhere in the same output).
+    What is worth pinning is this function's contract — one ``report_*`` exit per
+    kind, in vocabulary order, each NAMING its kind — because two of the five
+    spellings are irregular and looked up from a hand-written map.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    names = mod.decline_exit_names().split(' / ')
+
+    assert len(names) == len(DECLINE_KINDS)
+    assert all(n.startswith('report_') for n in names)
+    # Order-sensitive and kind-by-kind: an unregistered new kind still renders
+    # (as ``report_<kind>``) rather than dropping out of the list silently.
+    assert [k for k, name in zip(DECLINE_KINDS, names, strict=True) if k in name] == list(
+        DECLINE_KINDS), f'a kind is unnamed by its own exit: {names}'
+
+
+def test_the_decline_note_is_gated_on_a_nonzero_count():
+    """A campaign where nobody declined renders EXACTLY as it did before.
+
+    Same gate as the ``declined_any`` legend, and for the same recorded reason:
+    a campaign with no refusals must not grow a paragraph about refusals it
+    never made. The count line itself is unconditional — the artifact's schema
+    must not shift with its contents — so only the prose is gated.
+    """
+    quiet = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none'}),
+    ]
+    report = {'bands': mod.partition_bands(quiet, 0.80)}
+    assert report['bands']['counts']['declined'] == 0, 'premise: nobody declined'
+
+    lines = mod.format_campaign_report(report).splitlines()
+
+    assert lines[_band_count_line(lines, 'declined')].split() == ['declined', '0']
+    assert 'CORRECT REFUSAL' not in '\n'.join(lines)
+
+
+def test_rendering_the_banding_block_with_declines_is_deterministic():
+    """The widened block still formats byte-identically twice."""
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    assert mod.format_campaign_report(report) == mod.format_campaign_report(report)

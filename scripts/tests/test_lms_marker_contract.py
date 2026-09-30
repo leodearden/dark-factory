@@ -55,6 +55,7 @@ EXPECTED_SERVING_FILES = {
     'lms_healthcheck.py',
     'lms_manifest.py',
     'lms_serve.py',
+    'lms_slate_run.py',
     'lms_vram.py',
 }
 

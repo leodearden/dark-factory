@@ -13,12 +13,36 @@ registries -- nothing in refresh_registry, _rebuild_queue, or
 _update_attention (the C5b queue-build/reorder/set_urgency path) calls
 write_record/write_decision/update_decision_state/set_manual_boost. The
 cockpit's ONLY unconditional write target is its own cockpit-ui.json (via
-cockpit.ui_config); C5b's explicit-action keybindings (boost/drop) add
-sanctioned, action-only writes to a DECISION's manual_boost/state via C1's
-set_manual_boost/update_decision_state -- see test_app.py's
-TestWriteDiscipline (the C5a session/detail path) and
+cockpit.ui_config) -- and even that write is DEBOUNCED for the app's whole
+life: the session table's two selection seams (CockpitApp._sync_detail_pane
+on a cursor move, CockpitApp._resync_session_detail on a rebuild) only
+RECORD the live selection in _selected_slug, and CockpitApp._flush_ui_config
+writes from the poll timer (CockpitApp._poll_registry) only when that
+differs from what was last persisted, leaving CockpitApp.on_unmount as the
+single unconditional final write. So neither a keypress nor a table rebuild
+ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
+debounce reduces how OFTEN that synchronous mkdir + mkstemp + json.dump +
+os.replace runs, it does not move it off the event-loop thread the way
+esc-2303-1 threaded the registry scan, and the poll-tick flush still
+performs it inline. The only other event-path I/O is C5b's sanctioned
+decision writes: its explicit-action keybindings (boost/drop) add
+action-only writes to a DECISION's manual_boost/state via C1's
+set_manual_boost/update_decision_state, each of which runs synchronously on
+the event-loop thread and is followed there by a full
+list_decisions(self.fleet_root) re-scan (CockpitApp._reread_decisions,
+shared by CockpitApp._apply_boost and CockpitApp.action_drop) -- see
+test_app.py's TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
+
+Every decision READ goes through cockpit.registry_reader.scan_decisions --
+registry_reader's folding wrapper over C1's list_decisions, which
+canonicalizes DecisionRecord.project (task 3812) -- at both of this
+module's read sites: _scan_registry, and _reread_decisions (the post-write
+re-read _apply_boost and action_drop share). That does not weaken the
+discipline above: scan_decisions is itself read-only, so the canonicalized
+record exists in memory only and can never be written back (this module
+still never calls write_decision).
 """
 
 from __future__ import annotations
@@ -28,13 +52,14 @@ import os
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
     SessionRecord,
-    list_decisions,
+    Status,
     set_manual_boost,
     update_decision_state,
 )
@@ -49,6 +74,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
+from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback, copy_to_system_clipboard
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
@@ -58,7 +84,12 @@ from cockpit.panes.decision_queue import (
     resolve_target,
 )
 from cockpit.panes.detail_pane import DetailPane
-from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
+from cockpit.panes.session_table import (
+    LiveSessions,
+    SessionTable,
+    filter_live_sessions,
+    order_sessions,
+)
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.panes.weight_editor import WeightEditorScreen, known_projects
@@ -67,6 +98,7 @@ from cockpit.registry_reader import (
     SessionScanner,
     SessionScannerProtocol,
     build_snapshot,
+    scan_decisions,
     snapshot_changed,
 )
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
@@ -144,6 +176,22 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
     }
 
 
+class DetailOwner(StrEnum):
+    """Which table's cursor last claimed the detail pane.
+
+    Ownership is a property of the TABLE that moved, never of the record
+    KIND on screen: the queue's own session rows render exactly what the
+    session table renders, so the rendered kind cannot tell the two apart.
+    CLAIMED only by on_data_table_row_highlighted, and released back to
+    SESSION_TABLE -- the default, and the only owner that always has a
+    selection to render -- by _resync_queue_detail when the queue empties.
+    Read only by the two rebuild-time re-syncs.
+    """
+
+    SESSION_TABLE = 'session-table'
+    QUEUE = 'queue'
+
+
 class CockpitApp(App):
     """Fleet Cockpit TUI: decision queue + session table + detail pane, polling for changes."""
 
@@ -190,6 +238,7 @@ class CockpitApp(App):
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
         spawn_script: Path | str | None = None,
+        copy_runner: Callable[[str], CopyAttempt] | None = None,
         priorities: Priorities | None = None,
         **kwargs,
     ) -> None:
@@ -205,6 +254,7 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
+        self._copy_runner = copy_runner if copy_runner is not None else copy_to_system_clipboard
         self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
         # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
         # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
@@ -223,15 +273,19 @@ class CockpitApp(App):
         self._has_scanned = False
         # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
         # the next-to-issue sequence number (see _next_scan_seq), bumped once
-        # per scan INITIATED -- by refresh_registry or _poll_registry, both
-        # always on the main thread. _applied_scan_seq is the high-water
-        # mark of the newest sequence _apply_scan has actually applied. A
-        # scan whose seq is older than that mark read the registry before a
-        # fresher scan already landed, and _apply_scan drops it rather than
-        # letting it regress the view. Like _scan_in_flight below, both are
-        # only ever mutated on the main thread, so neither needs a lock.
+        # per scan INITIATED -- by refresh_registry, _poll_registry or
+        # _reread_decisions, all always on the main thread. Each of the two
+        # registries has its own high-water mark of the newest sequence
+        # actually applied: _applied_scan_seq for sessions, which only a full
+        # scan reads, and _applied_decisions_seq for decisions, which
+        # _reread_decisions' decisions-only read advances too. A read under
+        # an older seq than its registry's mark predates a fresher read that
+        # already landed, and _apply_scan discards it rather than letting it
+        # regress the view. Like _scan_in_flight below, all three are only
+        # ever mutated on the main thread, so none needs a lock.
         self._scan_seq = 0
         self._applied_scan_seq = 0
+        self._applied_decisions_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
         # _poll_registry/_scan_registry_worker): True while a scan launched
         # by _poll_registry is still running. Only ever read/written on the
@@ -240,6 +294,24 @@ class CockpitApp(App):
         # in _poll_registry is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
+        # The pane starts on the session-flavoured placeholder (and, when
+        # cockpit-ui.json carries one, the restored session), so the
+        # session table owns it until an operator moves the queue's cursor.
+        self._detail_owner = DetailOwner.SESSION_TABLE
+        # Round-tripped through on_mount/_persist_ui_config so a hand-edited
+        # cockpit-ui.json value survives a save -- see _persist_ui_config's
+        # docstring. Seeded from the constructor kwarg here only so an
+        # out-of-order _persist_ui_config call (before on_mount ever runs)
+        # has a defined value rather than raising AttributeError.
+        self._persisted_poll_interval: float = poll_interval
+        # Debounce baseline for cockpit-ui.json: the last selected_slug
+        # actually handed to save_ui_config, i.e. what the on-disk file
+        # holds. Re-seeded in on_mount from load_ui_config, advanced only in
+        # _persist_ui_config, and read by _flush_ui_config -- see that
+        # method for why this is a baseline and not a "changed" latch.
+        # Seeded here, like _persisted_poll_interval above, only so an early
+        # call has a defined value.
+        self._persisted_selected_slug: str | None = None
         # Keyed by resolved DisplayTarget, NOT by item key -- see
         # _update_attention's docstring: a decision and the AWAITING_INPUT
         # session it links to can resolve to the SAME target, so urgency
@@ -248,12 +320,24 @@ class CockpitApp(App):
         self._attention_targets: set[DisplayTarget] = set()
         self._queue_items_by_key: dict[str, QueueItem] = {}
         # In-memory "already acted on" marker, set by action_focus_selected.
-        # Pruned to the live queue on every rebuild (_rebuild_queue) so a
-        # key never keeps reporting "handling" past the ask it was set for.
+        # Expires with the ASK it was set against, under the same shared
+        # predicate as the overlays below (_prune_overlays). The
+        # queue-membership line at the tail of _rebuild_queue is only a guard.
         self._handling: set[str] = set()
+        # Ephemeral in-memory overlays, keyed the same way (a session key is
+        # stable for the session's whole lifetime). Pruned on every rebuild
+        # by that same ASK LIVENESS rule (_prune_overlays) and NOT by queue
+        # membership: a dropped item is by construction absent from the
+        # rebuilt queue, so _rebuild_queue's `&= queue keys` line would clear
+        # every drop on the very rebuild action_drop itself triggers.
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
         self._deferred: dict[str, datetime] = {}
+        # The ask identity each overlaid key was recorded against, written by
+        # _record_overlay before the overlay's own rebuild and compared by
+        # _prune_overlays. Garbage-collected there too, so this bookkeeping
+        # side-table cannot itself become the next unbounded-growth leak.
+        self._overlay_asks: dict[str, tuple] = {}
         # Ephemeral, defaults OFF on every launch -- see _rebuild_session_table
         # and action_toggle_history. Never persisted to cockpit-ui.json: the
         # user-observable "on launch: tens, not 10k" signal (FINDING F2,
@@ -270,25 +354,41 @@ class CockpitApp(App):
         )
 
     def on_mount(self) -> None:
-        selected_slug = load_ui_config(self.fleet_root).selected_slug
+        # Only selected_slug is restored into the live view below.
+        # poll_interval is stashed too, but purely so _persist_ui_config can
+        # write it back unchanged -- it never feeds set_interval, so a
+        # hand-edited cockpit-ui.json value is preserved, not honored (task
+        # 4054: no restore path / no CLI override for poll_interval).
+        ui_config = load_ui_config(self.fleet_root)
+        self._persisted_poll_interval = ui_config.poll_interval
+        # Seeded BEFORE refresh_registry(), so the baseline exists before any
+        # selection is recorded: a restore that succeeds leaves nothing for
+        # the first flush to write, one that fails soft onto row 0 leaves the
+        # stale file for it to correct.
+        self._persisted_selected_slug = ui_config.selected_slug
         self.refresh_registry()
-        if selected_slug is not None:
-            self.query_one('#session-table', SessionTable).select_slug(selected_slug)
+        if ui_config.selected_slug is not None:
+            self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
         self.set_interval(self.poll_interval, self._poll_registry)
 
     def on_unmount(self) -> None:
+        # Unconditional, not _flush_ui_config: an app mounted over an empty
+        # registry keeps both _selected_slug and its baseline at None, and
+        # would otherwise never create cockpit-ui.json at all.
         self._persist_ui_config()
 
     def _next_scan_seq(self) -> int:
         """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
 
         self._scan_seq += 1 is a non-atomic read-modify-write; only
-        refresh_registry and _poll_registry call this, and both always run
-        on the main thread (mirrors the _scan_in_flight discipline -- see
-        __init__), so no lock is needed. The returned value must travel WITH
-        its scan as an explicit parameter through to _apply_scan, never via
-        a shared mutable attribute -- the whole point of the guard is that a
-        still in-flight, older scan carries its own older sequence.
+        refresh_registry, _poll_registry and _reread_decisions call this,
+        and all three always run on the main thread (mirrors the
+        _scan_in_flight discipline -- see __init__), so no lock is needed.
+        The returned value must travel WITH its scan as an explicit value --
+        a parameter through to _apply_scan, or _reread_decisions' own local
+        -- never via a shared mutable attribute: the whole point of the
+        guard is that a still in-flight, older scan carries its own older
+        sequence.
         """
         self._scan_seq += 1
         return self._scan_seq
@@ -318,9 +418,16 @@ class CockpitApp(App):
         Touches only self._scanner/self.fleet_root -- no widget access -- so
         this is safe to call off the main/UI thread (see
         _scan_registry_worker, which does exactly that).
+
+        Decisions are read via registry_reader.scan_decisions, the folding
+        wrapper over C1's list_decisions, so DecisionRecord.project arrives
+        already canonicalized -- the same rule the scanner applies to
+        SessionRecord.project (task 3812). Why both row kinds must fold
+        together is argued in registry_reader's module docstring, the one
+        home for that rationale.
         """
         records = self._scanner.scan()
-        decisions = list_decisions(self.fleet_root)
+        decisions = scan_decisions(self.fleet_root)
         return records, decisions
 
     def _apply_scan(
@@ -346,34 +453,41 @@ class CockpitApp(App):
         already torn down -- the threaded hand-off's shutdown-race hazard.
 
         Also guards against a stale threaded-poll result landing after a
-        fresher scan already applied (esc-2517-1, task 2606): *seq* is the
+        fresher read already applied (esc-2517-1, task 2606): *seq* is the
         monotonic sequence number the caller obtained from _next_scan_seq()
-        at scan-initiation time (see refresh_registry/_poll_registry). Any
-        seq strictly older than self._applied_scan_seq (the high-water mark
-        of the newest scan already applied) is dropped before the snapshot
-        diff even runs, so an in-flight background scan that read the
-        registry before a fresher one landed can never regress the view.
-        self._applied_scan_seq advances even on a no-op (snapshot-unchanged)
-        apply, so a later stale result is still correctly dropped.
+        at scan-initiation time (see refresh_registry/_poll_registry). Each
+        half of the result is checked against its own high-water mark. A
+        seq strictly older than self._applied_scan_seq (the newest scan
+        already applied) is dropped whole before the snapshot diff even
+        runs, so an in-flight background scan that read the registry before
+        a fresher one landed can never regress the view. A seq older only
+        than self._applied_decisions_seq keeps its sessions but not its
+        decisions, which give way to those a later _reread_decisions
+        already adopted: that re-read covers decisions alone, so it says
+        nothing about sessions. Both marks advance even on a no-op
+        (snapshot-unchanged) apply, so a later stale result is still
+        correctly discarded.
 
         Note: seq order tracks scan-*initiation* order, not measured
         read-completion order -- it is a proxy for freshness, not a direct
-        stamp of it. In principle a scan issued earlier (lower seq) could
-        finish its off-thread registry read later than one issued after it,
-        and this guard would drop that earlier-issued-but-actually-fresher
-        result. That window cannot open today: _scan_in_flight (see
-        _poll_registry) admits only one in-flight poll worker at a time, so
-        poll-issued scans can never race each other, and refresh_registry
-        only ever runs synchronously at on_mount, before the poll timer is
-        registered. The guard's correctness therefore rests on that
-        backpressure serialization keeping initiation order equal to
-        landing order, not on seq tracking true read recency.
+        stamp of it. Scans never race each other: _scan_in_flight (see
+        _poll_registry) admits only one in-flight poll worker at a time,
+        and refresh_registry only ever runs synchronously at on_mount,
+        before the poll timer is registered. A keypress's _reread_decisions
+        can take a seq while a poll scan is in flight, though, so that
+        scan's decisions are discarded even when its read finished after
+        the re-read. That never regresses the view; anything only the
+        discarded read saw shows up with the next scan.
         """
         if not self.is_running:
             return
         if seq < self._applied_scan_seq:
             return
         self._applied_scan_seq = seq
+        if seq < self._applied_decisions_seq:
+            decisions = self._decisions
+        else:
+            self._applied_decisions_seq = seq
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -386,7 +500,7 @@ class CockpitApp(App):
         self._snapshot = new_snapshot
         self._decisions_snapshot = new_decisions_snapshot
         self._decisions = decisions
-        self._records = order_sessions(records)
+        self._records = order_sessions(records, focus_first=True)
         try:
             self._rebuild_session_table()
             self._rebuild_queue()
@@ -405,11 +519,52 @@ class CockpitApp(App):
         the FULL self._records, so outstanding-children counts never
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
+
+        Either way the table is handed a LiveSessions view, so what the cap
+        hid travels with the rows it kept and the table can say so: history
+        mode builds its own view over the full set, hiding nothing.
+
+        The rebuild owns the detail pane only while the pane still belongs
+        to the session table: a rebuild refreshes whichever kind currently
+        owns the detail, and only an operator cursor move transfers that
+        ownership (see on_data_table_row_highlighted). Hence the two
+        deliberate moves below -- `prevent` so a programmatic rebuild emits
+        no cursor events at all, and _resync_session_detail so the explicit
+        re-sync that replaces them respects the same ownership rule. The
+        re-sync has always been explicit rather than left to those reposts,
+        because clear()'s cursor reset only reposts when the highlighted row
+        INDEX changes; suppressing them costs nothing and stops a
+        same-content rebuild from stealing a decision an operator is reading.
         """
-        visible = self._records if self._show_history else filter_live_sessions(self._records)
+        if self._show_history:
+            view = LiveSessions(visible=self._records, total=len(self._records))
+        else:
+            view = filter_live_sessions(self._records)
         table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(visible, self._now_fn(), all_records=self._records)
-        self._sync_detail_pane(table.highlighted_slug())
+        with self.prevent(DataTable.RowHighlighted):
+            table.replace_rows(view, self._now_fn(), all_records=self._records)
+        self._resync_session_detail(table.highlighted_slug())
+
+    def _resync_session_detail(self, slug: str | None) -> None:
+        """Rebuild-time counterpart of _sync_detail_pane -- remember, re-render if ours.
+
+        _selected_slug is assigned unconditionally, so cockpit-ui.json's
+        restore seam stays a pure function of the session table's cursor
+        regardless of which pane is on screen. The RE-RENDER is what's
+        gated: a rebuild refreshes the detail only while this table still
+        owns the pane, never stealing it back from a queue row the
+        operator moved to.
+
+        Nothing is written here, even when the rebuild moved the cursor
+        itself (the highlighted session left the live view, say) and no
+        RowHighlighted reports it: recording the slug is enough, because
+        _flush_ui_config compares against what was last persisted rather
+        than waiting to be told of a move, so the next poll tick writes it
+        -- the same unpersisted window a keypress has.
+        """
+        self._selected_slug = slug
+        if self._detail_owner is DetailOwner.SESSION_TABLE:
+            self._show_session_detail(slug)
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
@@ -434,7 +589,19 @@ class CockpitApp(App):
         (main-thread-only, like the flag check above) and hands it to the
         worker, so a stale hand-off can be dropped once it lands -- see
         _apply_scan's stale-scan guard (esc-2517-1).
+
+        Doubles as the flush point for the cockpit-ui.json write debounce
+        (see _flush_ui_config), reusing this timer rather than adding a
+        second recurring wake-up. The flush must run BEFORE the
+        _scan_in_flight early return: a 10k+-session scan routinely outlasts
+        the poll interval, so a flush placed after it would be starved for
+        as long as scans keep overlapping -- the busy-fleet case where the
+        operator is most likely to be moving the cursor.
+        test_app.py::TestUIConfigWriteDebounce::
+        test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
+        placement.
         """
+        self._flush_ui_config()
         if self._scan_in_flight:
             return
         self._scan_in_flight = True
@@ -508,6 +675,187 @@ class CockpitApp(App):
         """
         self._scan_in_flight = False
 
+    def _ask_identity(
+        self,
+        key: str,
+        *,
+        sessions_by_slug: dict[str, SessionRecord] | None = None,
+        decisions_by_id: dict[str, DecisionRecord] | None = None,
+    ) -> tuple | None:
+        """The identity of the live ask *key* currently names, or None if there is none.
+
+        None means "no live ask under this key" -- either nothing in the
+        registries answers to it, or what does is no longer asking. A
+        'session:<slug>' key is live only while that session is
+        AWAITING_INPUT, and its identity is that ask's (question.text,
+        question.asked_at). A 'decision:<id>' key is live only while that
+        decision is OPEN. Any other key shape is not live (fail-soft: an
+        unrecognized key expires its overlay rather than pinning it
+        forever).
+
+        *sessions_by_slug*/*decisions_by_id*, when given, replace the
+        linear scans below with an O(1) lookup -- _live_overlay_keys builds
+        them once per prune (see there). Omitted, this falls back to
+        scanning, which is what the single-key _record_overlay call site
+        (once per keypress) wants.
+
+        A QUESTION-LESS awaiting session identifies as (None,
+        record.start_ts) rather than a bare constant, so two records that
+        merely happen to share a slug (one reaped, one recreated) do not
+        collide -- a recreated record carries a fresh start_ts and so
+        expires the earlier record's overlay. `None` (not '') keeps it
+        unambiguously distinct from a real ask whose text is empty. What
+        this deliberately does NOT claim to distinguish is two SUCCESSIVE
+        question-less asks on the SAME record: a question-less ask leaves
+        no on-disk stamp of its own (that is exactly what asked_at is for),
+        and start_ts is immutable for a record's whole life, so no identity
+        derivable from the record can tell them apart. The normal path is
+        unaffected -- any tick that OBSERVES the intervening non-awaiting
+        status returns None here and expires the overlay then and there;
+        only a round trip completed entirely between two polls survives it,
+        and closing that would need a durable stamp the record does not
+        carry. See TestDroppedOverlayExpiresWithTheAsk's question-less case.
+
+        Both liveness gates compare by VALUE (==), never by identity (is),
+        exactly as order_queue's own state/status filters do.
+        DecisionRecord.state is documented as a plain str field with NO
+        from_dict coercion through DecisionState (additive-safe: an
+        unrecognized wire value must round-trip rather than raise), so
+        `state is DecisionState.OPEN` would be False for every record read
+        back off disk and would silently expire every decision overlay on
+        the very rebuild that set it.
+
+        Keying the session case on the QUESTION rather than on bare status
+        is strictly stronger, and the difference is reachable:
+        orchestrator.session_hooks.run_notification writes
+        status=AWAITING_INPUT plus a fresh Question on every Notification
+        hook, with no required intervening Stop hook (-> IDLE). So
+        AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) really happens, and a
+        status-only rule would still silently suppress Q2.
+
+        The DECISION identity is (text, filed_at) and deliberately excludes
+        manual_boost and state: _apply_boost's decision path calls
+        set_manual_boost and then re-scans self._decisions, so an identity
+        sensitive to manual_boost would spuriously expire a live overlay on
+        the operator's own keypress. OPEN-ness is already the liveness
+        gate, so state is not part of the identity either.
+
+        KEEP IN LOCKSTEP WITH THE SNAPSHOTS. This identity is only ever
+        consulted from a rebuild, and a rebuild only happens when the tick
+        diff sees a change (_apply_scan short-circuits otherwise), so each
+        snapshot must be at least as strong as the identity above or a real
+        identity change never wakes the prune at all:
+          - session -> registry_reader.build_snapshot, which appends
+            question.text AND question.asked_at for precisely this reason.
+          - decision -> _DECISION_SNAPSHOT_FIELDS, which already carries
+            text, filed_at and state -- a strict superset of (text,
+            filed_at) plus its OPEN gate, so there is no hole on that side.
+        """
+        kind, _, ident = key.partition(':')
+        if kind == 'session':
+            record = (
+                sessions_by_slug.get(ident)
+                if sessions_by_slug is not None
+                else next((r for r in self._records if r.session_slug == ident), None)
+            )
+            if record is None or record.status != Status.AWAITING_INPUT:
+                return None
+            question = record.question
+            if question is None:
+                return (None, record.start_ts)
+            return (question.text, question.asked_at)
+        if kind == 'decision':
+            decision = (
+                decisions_by_id.get(ident)
+                if decisions_by_id is not None
+                else self._decision_by_id(ident)
+            )
+            if decision is None or decision.state != DecisionState.OPEN:
+                return None
+            return (decision.text, decision.filed_at)
+        return None
+
+    def _record_overlay(self, key: str) -> None:
+        """Record the ask identity *key*'s overlay is being set against.
+
+        Every overlay-writing action handler must call this BEFORE its
+        trailing _rebuild_queue() -- _prune_overlays runs first inside that
+        rebuild, and without the pre-recorded identity it would clear the
+        operator's own keypress before the queue was ever re-rendered.
+
+        When _ask_identity returns None the identity is deliberately NOT
+        recorded, so the overlay expires on the very next rebuild. That is
+        the fail-soft direction (PRD §2): an overlay that expires too early
+        merely re-shows an ask the operator can re-drop, whereas one that
+        lingers silently suppresses a real ask -- the whole defect this
+        machinery exists to kill.
+        """
+        identity = self._ask_identity(key)
+        if identity is not None:
+            self._overlay_asks[key] = identity
+
+    def _prune_overlays(self) -> None:
+        """Expire every overlay entry whose ask is gone or has been replaced.
+
+        Covers all four ephemeral collections -- self._dropped,
+        self._boosts, self._deferred and self._handling -- under one shared
+        predicate (_live_overlay_keys): an entry survives only while the ask
+        it was recorded against is still the same live ask, i.e. the
+        identity stored in self._overlay_asks still equals the CURRENT
+        _ask_identity(key). This is the single statement of that rule --
+        the collections' own declarations and their action handlers point
+        here rather than restating it. self._handling alone also meets a
+        queue-membership guard at the tail of _rebuild_queue, which is not
+        a second rule; see there.
+
+        Then garbage-collects self._overlay_asks down to the keys still
+        referenced by SOME overlay, so the bookkeeping side-table cannot
+        become the next leak. `live` IS that set: it is by construction the
+        subset of the pre-prune union that survives, so the four
+        collections below sum to exactly it afterwards.
+        """
+        live = self._live_overlay_keys(
+            self._dropped | self._boosts.keys() | self._deferred.keys() | self._handling
+        )
+        self._dropped = {key for key in self._dropped if key in live}
+        self._boosts = {key: boost for key, boost in self._boosts.items() if key in live}
+        self._deferred = {key: stamp for key, stamp in self._deferred.items() if key in live}
+        self._handling = {key for key in self._handling if key in live}
+        self._overlay_asks = {
+            key: identity for key, identity in self._overlay_asks.items() if key in live
+        }
+
+    def _live_overlay_keys(self, keys: set[str]) -> set[str]:
+        """The subset of *keys* whose overlay is still live -- the expiry rule, stated once.
+
+        A key survives only when it still names a live ask
+        (_ask_identity is not None) AND that ask is the same one the overlay
+        was recorded against (self._overlay_asks still matches it).
+
+        Resolved for the WHOLE key set in one pass, against a single
+        slug->record and id->decision index built here, rather than by
+        calling _ask_identity per key per overlay. This runs at the head of
+        every _rebuild_queue -- i.e. on every poll tick that diffs as
+        changed -- and _ask_identity's index-less fallback scans
+        self._records linearly, so a key overlaid in all four collections
+        would cost four full scans of a registry the cockpit explicitly
+        sizes for 10k+ sessions (see _scan_registry_worker). order_queue
+        builds the same slug index immediately afterwards for exactly this
+        reason.
+        """
+        if not keys:
+            return set()
+        sessions_by_slug = {record.session_slug: record for record in self._records}
+        decisions_by_id = {decision.id: decision for decision in self._decisions}
+        live: set[str] = set()
+        for key in keys:
+            identity = self._ask_identity(
+                key, sessions_by_slug=sessions_by_slug, decisions_by_id=decisions_by_id
+            )
+            if identity is not None and self._overlay_asks.get(key) == identity:
+                live.add(key)
+        return live
+
     def _rebuild_queue(self) -> None:
         """Re-score and re-render the DecisionQueue from current in-memory state, right now.
 
@@ -523,12 +871,35 @@ class CockpitApp(App):
         decision-row boost) call this afterward instead of waiting for the
         next poll tick.
 
-        Also prunes self._handling down to the keys still present in the
-        freshly-built queue: a key whose item left (resolved/dropped, or a
-        session moved off AWAITING_INPUT) stops being "handling" so a later,
-        unrelated ask that happens to reuse the same key (e.g. the same
-        session asking a brand new question) starts out unmarked.
+        Like its _rebuild_session_table sibling, this rebuild is
+        programmatic, so it emits no cursor events at all -- replace_rows
+        does clear() + move_cursor, which reposts RowHighlighted on every
+        rebuild whose highlighted row INDEX shifts, and `prevent` stops
+        that repost from handing the detail pane to the queue behind the
+        operator's back. A rebuild refreshes whichever table currently owns
+        the detail; only an operator cursor move transfers that ownership
+        (see on_data_table_row_highlighted). The explicit
+        _resync_queue_detail below is what refreshes the highlighted row in
+        those suppressed reposts' place.
+
+        Every ephemeral collection -- self._handling included -- expires
+        with the ASK it was recorded against. _prune_overlays states that
+        rule and runs as the first statement below, so the queue is always
+        built from already-pruned state.
+
+        The tail `self._handling &= self._queue_items_by_key.keys()` line
+        has no visible effect today. It is kept only as a guard, so that a
+        row restored by an un-drop action, should one ever be added, comes
+        back unmarked. The one mark it clears that _prune_overlays keeps
+        sits on a still-live ask self._dropped holds out of the queue:
+        order_queue builds no item for a dropped key, and the drop ends
+        only when its ask does, in the same _prune_overlays pass that
+        clears the mark. The line cannot move up into _prune_overlays:
+        self._queue_items_by_key is not rebuilt until order_queue returns,
+        so at the head it would read the PREVIOUS rebuild's queue and clear
+        the mark for a row about to reappear.
         """
+        self._prune_overlays()
         now = self._now_fn()
         queue_items = order_queue(
             self._decisions,
@@ -541,10 +912,39 @@ class CockpitApp(App):
             deferred=self._deferred,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
-        queue.replace_rows(queue_items, now)
+        with self.prevent(DataTable.RowHighlighted):
+            queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
         self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
+        self._resync_queue_detail(queue.highlighted_key())
+
+    def _resync_queue_detail(self, key: str | None) -> None:
+        """Rebuild-time counterpart of _sync_queue_detail -- re-render if ours.
+
+        The queue-side mirror of _resync_session_detail: refreshes the
+        highlighted row's detail with the freshly-scanned record while the
+        queue still owns the pane, and does nothing at all when it doesn't.
+        Must run after self._queue_items_by_key is rebuilt -- that is the
+        index _sync_queue_detail resolves *key* through.
+
+        An EMPTY queue (*key* None) RELEASES ownership rather than holding
+        it. The queue has no row left to own the pane with -- a watcher
+        resolved the last open decision, or the last awaiting-input session
+        was answered -- so holding on would lock the session table's
+        rebuilds out of the pane too, and the operator would be left
+        reading a decision that no longer exists with nothing able to clear
+        it. That is the one place "leave the pane as it is" degrades into a
+        wedged view rather than a transient miss, so the session table
+        takes the pane back and renders its own selection.
+        """
+        if self._detail_owner is not DetailOwner.QUEUE:
+            return
+        if key is None:
+            self._detail_owner = DetailOwner.SESSION_TABLE
+            self._show_session_detail(self._selected_slug)
+            return
+        self._sync_queue_detail(key)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
         """Resolve the focus/arrange backend for *kind* ('wm'/'tmux').
@@ -579,7 +979,19 @@ class CockpitApp(App):
         queue, even though the other (the session) is still asking. Then
         reorders each backend's own targets -- grouped by kind so a wm
         target never pollutes a tmux backend's positional reorder (whose
-        index IS the destination window position) and vice versa. This
+        index IS the destination window position) and vice versa.
+
+        That same decision/session target collision means the REORDER list
+        must be deduped too, keeping the FIRST occurrence: queue_items is
+        score-descending, so the first occurrence is the highest-scoring
+        item and its position is the priority position the target should
+        land at. Passing a target twice is actively destructive, not merely
+        redundant -- TmuxBackend.reorder assigns a running per-session
+        index, so a duplicate consumes two indices, its second park then
+        fails against the source window it just vacated (a warning), and
+        the final compacted 0..N-1 range is left with a gap. A single
+        global `seen` set is equivalent to a per-kind one because a
+        DisplayTarget carries exactly one kind. This
         method and its caller are the ONLY place the refresh path may call
         backend.*; it calls ONLY set_urgency/reorder, NEVER focus/tile
         (those live exclusively in explicit-action handlers, e.g.
@@ -593,9 +1005,12 @@ class CockpitApp(App):
         self._attention_targets = new_targets
 
         targets_by_kind: dict[str, list[DisplayTarget]] = {}
+        seen: set[DisplayTarget] = set()
         for item in queue_items:
-            if item.target is not None:
-                targets_by_kind.setdefault(item.target.kind, []).append(item.target)
+            if item.target is None or item.target in seen:
+                continue
+            seen.add(item.target)
+            targets_by_kind.setdefault(item.target.kind, []).append(item.target)
         for kind, targets in targets_by_kind.items():
             self._backend_for(kind).reorder(targets)
 
@@ -615,25 +1030,48 @@ class CockpitApp(App):
         "handling" (an in-memory, best-effort "already acted on" marker,
         fed back into the next order_queue call) -- even when no target
         resolved, since the operator's acknowledgement is real regardless
-        of whether a live window was found. This mark is not permanent:
-        _rebuild_queue prunes self._handling down to whatever is still in
-        the queue on every rebuild, so the flag tracks the CURRENT ask, not
-        any historical acknowledgement -- a key that later leaves the queue
-        and resurfaces (e.g. the same session filing a brand new question)
-        starts unmarked again. Fail-soft: an empty queue (no highlighted
-        key) or a key not present in the last-built queue no-ops without
-        raising -- a gone/unlinked lead is simply not focusable, never a
-        crash.
+        of whether a live window was found. This mark is not permanent: it
+        expires with the ask it was set against, under the same rule as the
+        _dropped/_boosts/_deferred overlays (see _prune_overlays), which is
+        why _record_overlay is called here -- ahead of the mark, the same
+        order every other overlay-writing handler uses. Fail-soft: an empty
+        queue (no highlighted key) or a key not present in the last-built
+        queue no-ops without raising -- a gone/unlinked lead is simply not
+        focusable, never a crash.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
         if key is None:
             return
+        self._record_overlay(key)
         self._handling.add(key)
         item = self._queue_items_by_key.get(key)
         if item is None or item.target is None:
             return
         self._backend_for(item.target.kind).focus(item.target)
+
+    def _reread_decisions(self) -> None:
+        """Adopt decisions as they now stand, after one of this app's own sanctioned writes.
+
+        Lets the queue re-score without waiting for a poll tick, and updates
+        the snapshot too, so that tick does not re-detect the write as an
+        external change. Reads through registry_reader.scan_decisions, so
+        the task-3812 project fold holds here as well.
+
+        A SEQUENCED read: it takes a seq from _next_scan_seq() and advances
+        _applied_decisions_seq, so a poll scan issued before the write,
+        whose read may predate it, lands without its decisions (see
+        _apply_scan's stale-scan guard). Unsequenced, that late landing
+        reverted the write in the view, and the next 'b' built on the stale
+        boost and persisted it, losing a press (task 5839). It leaves
+        _applied_scan_seq alone because it reads no sessions: advancing that
+        mark dropped the scan's sessions too, so keypresses landing mid-scan
+        froze the session table for as long as they kept coming.
+        """
+        seq = self._next_scan_seq()
+        self._decisions = scan_decisions(self.fleet_root)
+        self._decisions_snapshot = _decisions_snapshot(self._decisions)
+        self._applied_decisions_seq = seq
 
     def _decision_by_id(self, decision_id: str) -> DecisionRecord | None:
         return next((d for d in self._decisions if d.id == decision_id), None)
@@ -644,17 +1082,24 @@ class CockpitApp(App):
         Exactly one of *delta* (additive -- b/B) or *absolute* (a direct
         set -- a digit key) is given. A DECISION-backed highlighted row
         persists its new manual_boost via C1's set_manual_boost -- the
-        cockpit's own sanctioned decision write -- then re-scans decisions
-        so self._decisions (and its snapshot, so a later poll tick doesn't
-        redundantly re-detect this same change as external) reflect the
+        cockpit's own sanctioned decision write -- then re-reads decisions
+        through _reread_decisions, so self._decisions reflects the
         persisted value directly; no in-memory overlay is needed once a
         decision's boost is on disk. A SESSION-backed row has no
         persisted priority field at all (PRD §2 design decisions), so its
         boost lives ONLY in self._boosts, an ephemeral overlay order_queue
-        layers on top of the item's base (always-0) manual_boost. Either
-        way, the queue is re-scored and re-rendered immediately after --
-        never waits for the next poll tick. Fail-soft: no highlighted row,
-        or a key not present in the last-built queue, no-ops.
+        layers on top of the item's base (always-0) manual_boost. That
+        overlay expires with the ask it was set against (see
+        _prune_overlays) -- a session key is stable for the session's whole
+        lifetime, so a permanent boost would mis-rank a brand-new,
+        unrelated question from the same session -- which is why the
+        session branch records the identity BEFORE the rebuild below; the
+        prune inside it would otherwise clear the operator's own keypress.
+        The DECISION branch records nothing: it persists to disk and writes
+        no overlay at all. Either way, the queue is re-scored and
+        re-rendered immediately after -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -672,8 +1117,7 @@ class CockpitApp(App):
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
             set_manual_boost(item.decision_id, new_boost, root=self.fleet_root)
-            self._decisions = list_decisions(self.fleet_root)
-            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+            self._reread_decisions()
         else:
             current_boost = self._boosts.get(key, 0)
             if absolute is not None:
@@ -681,6 +1125,7 @@ class CockpitApp(App):
             else:
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
+            self._record_overlay(key)
             self._boosts[key] = new_boost
         self._rebuild_queue()
 
@@ -709,17 +1154,23 @@ class CockpitApp(App):
         """'x' -- drop the highlighted row (PRD §9 C5b).
 
         A DECISION-backed row persists via C1's update_decision_state --
-        the cockpit's other sanctioned decision write -- then re-scans
-        decisions so self._decisions (and its snapshot) reflect the
-        persisted state directly; order_queue's own state=='open' filter
-        then excludes it, exactly like _apply_boost's re-scan. A
+        the cockpit's other sanctioned decision write -- then re-reads
+        decisions through _reread_decisions, so self._decisions reflects
+        the persisted state directly; order_queue's own state=='open'
+        filter then excludes it. A
         SESSION-backed row has no cockpit-writable state field at all
         (PRD §2 design decisions), so it is instead added to
         self._dropped, an in-memory overlay order_queue filters out by
-        key -- never written to the session's own record. Either way the
-        queue is re-scored and re-rendered immediately -- never waits for
-        the next poll tick. Fail-soft: no highlighted row, or a key not
-        present in the last-built queue, no-ops.
+        key -- never written to the session's own record. That drop
+        expires with the ask it was set against (see _prune_overlays): a
+        session key is stable for the session's whole lifetime, so a
+        permanent drop would silently suppress a brand-new, unrelated
+        question from the same session forever. The identity must be
+        recorded BEFORE the rebuild below, or the prune inside it would
+        clear the operator's own keypress. Either way the queue is
+        re-scored and re-rendered immediately -- never waits for the next
+        poll tick. Fail-soft: no highlighted row, or a key not present in
+        the last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -730,9 +1181,9 @@ class CockpitApp(App):
             return
         if item.kind == 'decision' and item.decision_id is not None:
             update_decision_state(item.decision_id, DecisionState.DROPPED, root=self.fleet_root)
-            self._decisions = list_decisions(self.fleet_root)
-            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+            self._reread_decisions()
         else:
+            self._record_overlay(key)
             self._dropped.add(key)
         self._rebuild_queue()
 
@@ -748,9 +1199,14 @@ class CockpitApp(App):
         registry nor a session record has a cockpit-writable "deferred"
         field (PRD §2 design decisions): a defer is a pure, ephemeral
         "sink this for now" applied on top of whatever order_queue reads.
-        Re-scores and re-renders the queue immediately -- never waits for
-        the next poll tick. Fail-soft: no highlighted row, or a key not
-        present in the last-built queue, no-ops.
+        Uniformly for both kinds, that stamp expires with the ask it was
+        set against (see _prune_overlays), so it can never sink a later,
+        unrelated ask that happens to reuse the same key -- which is why
+        the identity is recorded BEFORE the rebuild below; the prune inside
+        it would otherwise clear the operator's own keypress. Re-scores and
+        re-renders the queue immediately -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -758,6 +1214,7 @@ class CockpitApp(App):
             return
         if key not in self._queue_items_by_key:
             return
+        self._record_overlay(key)
         self._deferred[key] = self._now_fn()
         self._rebuild_queue()
 
@@ -769,9 +1226,23 @@ class CockpitApp(App):
         work in the running cockpit -- this is the in-app replacement.
         Mirrors action_drop/action_defer's highlighted-row lookup exactly
         (fail-soft: no highlighted row, or a key not present in the
-        last-built queue, no-ops). Delegates to Textual's own
-        App.copy_to_clipboard, which writes an OSC 52 escape sequence --
-        terminal-native, works over SSH, no xclip/wl-copy subprocess.
+        last-built queue, no-ops).
+
+        A LOCAL clipboard helper (wl-copy/xclip/xsel, via
+        cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard) is tried
+        first, and OSC 52 is only the fallback for when no local helper can
+        reach a clipboard -- the over-SSH case. OSC 52 alone reached no
+        clipboard at all on the operator's terminal; that module's docstring
+        carries the incident account (task 5448).
+
+        This method owns three things and nothing else: the highlighted-row
+        lookup, the guard around the injected seam, and the two side effects
+        cockpit/src/cockpit/clipboard.py::copy_feedback asks for. Which
+        mechanism the toast names, its severity, and whether OSC 52 still
+        runs are all copy_feedback's call. Both outcomes DO toast -- without
+        that, a future capability regression is again invisible at the
+        moment of use.
+
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-
         discipline invariant (see TestCopyAction).
@@ -783,7 +1254,19 @@ class CockpitApp(App):
         item = self._queue_items_by_key.get(key)
         if item is None:
             return
-        self.copy_to_clipboard(format_copy_payload(item))
+        payload = format_copy_payload(item)
+        try:
+            attempt = self._copy_runner(payload)
+        except Exception:
+            # copy_runner is caller-injectable, so a keypress handler must
+            # not depend on the bundled implementation's never-raise promise
+            # being kept by whatever was passed in (PRD §2).
+            _log.exception('action_copy: copy runner failed for %r', key)
+            attempt = CopyAttempt(CopyOutcome.HELPER_FAILED)
+        feedback = copy_feedback(attempt)
+        if feedback.write_osc52:
+            self.copy_to_clipboard(payload)
+        self.notify(feedback.message, title='Copy', severity=feedback.severity)
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
@@ -951,40 +1434,111 @@ class CockpitApp(App):
             return
         self._backend_for(target.kind).focus(target)
 
-    def _sync_detail_pane(self, slug: str | None) -> None:
+    def _show_session_detail(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
 
         Looked up against self._records -- the ordered set from the most
         recent scan -- so this always reflects current data, not whatever
-        object identity a stale event might carry. Also remembers *slug* for
-        _persist_ui_config, since on_unmount runs after the DataTable itself
-        has already been torn down and can no longer be queried.
+        object identity a stale event might carry.
+
+        The render half alone, with no _selected_slug bookkeeping, so the
+        decision queue's own session rows can reuse it without writing the
+        session TABLE's restore seam -- see _sync_queue_detail.
         """
-        self._selected_slug = slug
         record = next((r for r in self._records if r.session_slug == slug), None)
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
 
+    def _sync_detail_pane(self, slug: str | None) -> None:
+        """Render *slug*'s record into the detail pane AND remember it as the selection.
+
+        The session table's path: the render (_show_session_detail) plus
+        remembering *slug* for _persist_ui_config, since on_unmount runs
+        after the DataTable itself has already been torn down and can no
+        longer be queried.
+        """
+        self._selected_slug = slug
+        self._show_session_detail(slug)
+
+    def _sync_queue_detail(self, key: str | None) -> None:
+        """Render the DecisionQueue row *key* into the detail pane.
+
+        Resolves *key* the way every other queue action does -- key ->
+        QueueItem (self._queue_items_by_key) -- so the pane sees the same
+        item identity as focus/boost/copy, with no second index. Both row
+        kinds render: a session row reuses the session render, since the
+        queue truncates its question exactly as it truncates a decision's.
+        A decision row resolves on to its DecisionRecord and renders THAT
+        rather than the QueueItem, because severity/state and the true
+        filed_at live only on the record (the queue's deferred overlay may
+        have shifted the item's).
+
+        Never writes _selected_slug -- that is the session TABLE's restore
+        seam (cockpit-ui.json), and a decision has no session slug to
+        restore to, so the queue renders through _show_session_detail
+        rather than _sync_detail_pane.
+
+        Fail-soft (PRD §2): an empty queue, a key with no QueueItem, or an
+        item whose backing record is gone leaves the pane as it is rather
+        than raising or blanking it.
+        """
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        if item.kind == 'session':
+            self._show_session_detail(item.session_slug)
+            return
+        if item.decision_id is None:
+            return
+        decision = self._decision_by_id(item.decision_id)
+        if decision is None:
+            return
+        detail = self.query_one('#detail', DetailPane)
+        detail.show_decision(decision, self._records, self._now_fn())
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Keep the detail pane in sync with the SessionTable's highlighted row.
+        """Keep the detail pane in sync with whichever table's cursor moved.
 
         Covers interactive cursor moves (e.g. arrow keys, or a test/caller
-        calling move_cursor directly). The complementary rebuild-time sync
-        lives in refresh_registry -- clear()'s cursor reset only reposts
-        this message when the highlighted row index actually changes, so a
-        same-row-different-content rebuild needs its own explicit sync.
+        calling move_cursor directly). SessionTable and DecisionQueue are
+        both DataTable subclasses, so Textual routes both their
+        RowHighlighted messages through this same handler (dispatch is by
+        the base DataTable message namespace, not the subclass) --
+        event.data_table disambiguates, the same way
+        on_data_table_row_selected does.
 
-        SessionTable and DecisionQueue are both DataTable subclasses, so
-        Textual routes both their RowHighlighted messages through this same
-        handler (dispatch is by the base DataTable message namespace, not
-        the subclass) -- event.data_table disambiguates so moving the
-        DecisionQueue's cursor never clobbers the session detail sync.
+        This handler is the ONLY thing that CLAIMS the detail pane for a
+        table: an operator cursor move hands the pane to the table that
+        moved, and a registry rebuild then refreshes whichever one
+        currently owns it (see _rebuild_session_table/_rebuild_queue, both
+        of which suppress their own programmatic cursor events). The one
+        other write to self._detail_owner is _resync_queue_detail's
+        RELEASE back to the session table when the queue empties, which
+        takes ownership away from a table that no longer has a row rather
+        than claiming it on any operator's behalf. Only the session branch
+        touches _selected_slug/cockpit-ui.json -- that restore seam is the
+        session table's alone, and a decision has no session slug to
+        restore to.
+
+        Runs once per cursor-move EVENT, so holding an arrow key down over a
+        large session table fires it continuously -- it must do NO I/O. The
+        selection is only RECORDED here (via _sync_detail_pane); the write
+        (cockpit/src/cockpit/ui_config.py::save_ui_config) is deferred to
+        _flush_ui_config, so a keypress burst costs at most one write per
+        poll interval.
         """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        if event.data_table is queue:
+            self._detail_owner = DetailOwner.QUEUE
+            self._sync_queue_detail(event.row_key.value)
+            return
         table = self.query_one('#session-table', SessionTable)
         if event.data_table is not table:
             return
+        self._detail_owner = DetailOwner.SESSION_TABLE
         self._sync_detail_pane(event.row_key.value)
-        self._persist_ui_config()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Route a DecisionQueue selection (Enter, via DataTable's own
@@ -1009,17 +1563,70 @@ class CockpitApp(App):
             if slug is not None:
                 self._focus_slug(slug, self._records)
 
+    def _flush_ui_config(self) -> None:
+        """Debounced half of the cockpit-ui.json write path; called from _poll_registry.
+
+        Writes only when the live selection differs from what was last
+        persisted, so an idle cockpit does ZERO writes per tick rather than
+        merely trading one write per keypress for one per poll interval.
+
+        The gate asks "is the on-disk file stale", NOT "did the selection
+        change since the last flush", and that is what lets both selection
+        seams (_sync_detail_pane and _resync_session_detail) merely record
+        the slug with no marking: a rebuild that moves the cursor with no
+        RowHighlighted is caught the same way as a keypress, a burst that
+        returns to where it started writes nothing, and a restore at mount
+        that already matches the file writes nothing either.
+
+        There is nothing to retry on. _persist_ui_config advances the
+        baseline immediately after the fail-soft
+        cockpit/src/cockpit/ui_config.py::save_ui_config call, which logs
+        and swallows OSError and returns None either way, so a failed write
+        is dropped exactly as a highlight-time save failure used to be. The
+        next selection change makes the two values differ again, and
+        on_unmount's unconditional write gets one more attempt at shutdown.
+        """
+        if self._selected_slug == self._persisted_selected_slug:
+            return
+        self._persist_ui_config()
+
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
 
         Persists just enough to restore the operator's place across a
-        restart (selected_slug) plus the poll_interval currently in effect.
+        restart (selected_slug) plus the poll_interval last seen on disk.
         Never touches sessions/ or decisions/. Reads self._selected_slug
         (not the DataTable) so this is safe to call from on_unmount, after
         the table has already been torn down.
+
+        The only callers are _flush_ui_config (the debounced poll-tick
+        write) and on_unmount (unconditional, once at shutdown). A new
+        caller on any event path should go through _flush_ui_config
+        instead, so a keypress keeps costing a comparison rather than a
+        write.
+
+        This is also the SINGLE site where _persisted_selected_slug
+        advances, which is what makes _flush_ui_config's comparison mean
+        "the on-disk file is stale". It takes cfg.selected_slug -- what was
+        actually handed to the writer -- so the baseline can never disagree
+        with the bytes that were written.
+
+        poll_interval is round-tripped from self._persisted_poll_interval
+        (stashed once in on_mount from load_ui_config), NOT taken from
+        self.poll_interval (the live constructor kwarg driving
+        set_interval) -- writing the live value unconditionally would
+        silently clobber a value an operator hand-edited into
+        cockpit-ui.json between launches. The field is still never read
+        back into app behaviour: nothing mutates self.poll_interval (no
+        action, no binding, no main() CLI flag), so it stays inert by
+        design (task 4054); do not wire it into set_interval without first
+        adding a way to change it.
         """
-        cfg = CockpitUIConfig(selected_slug=self._selected_slug, poll_interval=self.poll_interval)
+        cfg = CockpitUIConfig(
+            selected_slug=self._selected_slug, poll_interval=self._persisted_poll_interval
+        )
         save_ui_config(cfg, self.fleet_root)
+        self._persisted_selected_slug = cfg.selected_slug
 
 
 def main() -> None:

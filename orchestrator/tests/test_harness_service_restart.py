@@ -29,6 +29,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.harness import Harness
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
+    FLEET_LEASE_RELPATH,
     StaleServiceRestartCoordinator,
 )
 
@@ -85,6 +86,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # this (as merge_phase_grace_secs) — the fused-memory/dashboard builders
     # keep the 0.0 default (no hold, byte-identical behaviour).
     mock_orch_config.orchestrator_restart_merge_phase_grace_secs = 600.0
+    # In-flight fleet-redeploy lease max-age (task 4755). Mirrors the real
+    # Config default (2h). Only the orchestrator's own coordinator receives a
+    # lease_path at all — the fused-memory/dashboard builders pass neither, so
+    # their gate stays disabled and their behaviour byte-identical.
+    mock_orch_config.orchestrator_restart_lease_max_age_secs = 7200.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -910,6 +916,61 @@ class TestBuildOrchestratorRestartCoordinator:
 
         expected = Path(harness.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
         assert coord._state_path == expected
+
+    # -- in-flight fleet-redeploy lease (task 4755) ------------------------
+    #
+    # The lease is the ONE gate on this coordinator that reads disk at gate
+    # time, which is why the wiring is pinned rather than left to the
+    # builder: _load_last_fire_wall runs once at construction, so without a
+    # lease_path nothing a sweep writes during this process's lifetime is
+    # observable at all, and the coordinator redeploys the fleet on top of
+    # its own in-flight sweep (measured 2026-08-24/25).
+
+    def test_lease_path_value_preserved_via_fleet_lease_relpath(self, harness: Harness):
+        """lease_path is project_root / FLEET_LEASE_RELPATH, from the constant.
+
+        Same shape as the state_path pin above, and for the same reason: the
+        literal exists in four places that cannot import each other, so the
+        builder must derive this one from the shared constant rather than
+        spelling it again.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        expected = Path(harness.config.project_root) / FLEET_LEASE_RELPATH
+        assert coord._lease_path == expected
+
+    def test_lease_max_age_matches_config(self, harness: Harness):
+        """The max-age bound comes from config, not from the class default.
+
+        The bound is DERIVED from the drain busy-grace, so an operator who
+        changes that grace needs one knob to change here too; a coordinator
+        silently holding the code default would ignore them.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._lease_max_age_secs == (
+            harness.config.orchestrator_restart_lease_max_age_secs
+        )
+
+    def test_fused_memory_coordinator_has_no_lease_path(self, harness: Harness):
+        """fused-memory is untouched: no lease_path => no gate.
+
+        Its sweeps are driven by scripts/restart-fused-memory.sh, a
+        deliberately separate fleet with its own clock and its own transient
+        unit name, and this task's lease is written only by
+        restart-all-orchestrators.sh. Gating it on the ORCHESTRATOR fleet's
+        lease would be a cross-fleet coupling the two-independent-clocks
+        design forbids.
+        """
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._lease_path is None
+
+    def test_dashboard_coordinator_has_no_lease_path(self, harness: Harness):
+        """dashboard is untouched: no lease_path => no gate."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._lease_path is None
 
 
 # ---------------------------------------------------------------------------

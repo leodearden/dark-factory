@@ -12,6 +12,12 @@ Older stamps (already covered by a prior run, or predating the fix this
 predicate soaks) are reported but do not gate, so they are not re-escalated
 on every invocation.
 
+"Wrapper" here is function-level reuse, not CLI reuse: this script imports
+that module's :func:`build_audit_report` and drives its own backend, never
+invoking that script's ``_run``. Its ``--fail-on-findings`` 0/1/2 ladder is
+therefore NOT this script's, and the "Contract" block below — the reserved
+exit 3 included — is the only exit-code ladder this predicate speaks.
+
 Freshness (task 3576): the timestamp compared against ``--since`` is
 ``metadata.done_provenance.stamped_at`` — the dedicated stamp-*write*
 instant recorded server-side by fused-memory's
@@ -81,6 +87,27 @@ the predicate convention; stdout is human/log triage plus one machine
   - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
+  - Exit 3: the project task store does not exist — ``--project-root``
+    names a path with no ``.taskmaster/tasks/tasks.db`` (a task worktree,
+    typically). Reserved because ``SqliteTaskBackend.get_tasks``
+    auto-creates that db and returns ``{"tasks": []}`` for ANY
+    ``project_root`` without raising, so the alternative is 0 tasks, 0
+    offenders and exit 0: a false all-clear on a check whose exit 0 means
+    "check passed". See
+    ``fused_memory/utils/target_store_preflight.py`` — the normative copy
+    of the policy, the measurement behind it, and the remedy.
+
+    Not folded into 1, unlike the unconfigured-backend case that shares
+    that rung: ``parse_since``'s ValueError is raised where main() can see
+    it, but this one arrives from deep inside ``_run()``, and an uncaught
+    exception exits **1** — colliding with the "gating offenders found" /
+    "backend not configured" rung above, which is exactly the confusion
+    the reservation buys out. Fail-closed for a machine consumer either
+    way: ``deterministic_runner.py::DeterministicRunner._run_predicate``
+    branches on ``rc != 0`` alone, so 3 blocks identically to 1 and can
+    never read as "passed". The reader the reservation actually serves is
+    the L2 resolver hand-running this script from PRD label ι's RUNBOOK,
+    who reads the code directly.
 
 Trailing JSON summary
 ---------------------
@@ -144,18 +171,29 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-# Deliberately exempt from this file's deferred-import convention (see _run,
-# which defers `os`, the sibling audit module, and the fused_memory backend/
-# config imports). `dark-factory-shared` is a hard install dependency of the
+# BOTH module-level imports below are deliberately exempt from this file's
+# deferred-import convention (see _run, which defers `os`, the sibling audit
+# module, and the fused_memory backend/config imports), on the same grounds:
+# neither adds an environment requirement that running this script did not
+# already have. `dark-factory-shared` is a hard install dependency of the
 # fused-memory package — declared in fused-memory/pyproject.toml, not an
-# optional or path-sensitive one — so importing it at module level adds no
-# environment requirement that running this script did not already have. The
-# sibling audit script (audit_found_on_main_provenance.py) imports it at
-# module level from this same directory for the same reason. The deferred
-# imports below exist for a DIFFERENT reason: they are either sys.path[0]-
-# sensitive (the sibling script) or heavyweight, and the test suite
-# importlib-loads this module in isolation.
+# optional or path-sensitive one. `target_store_preflight` is pure stdlib
+# ("No probe write, no mem0 import, no network, no backend import" — its own
+# closing line) and ships inside the very package this script lives in. The
+# sibling audit script (audit_found_on_main_provenance.py) imports both at
+# module level from this same directory, as do the other two task-store
+# scripts for the guard. `TargetStoreMissing` comes along with the guard
+# because main() needs it in scope to map the refusal onto exit 3, and one
+# import beats a second one at a different altitude for a single name. The
+# deferred imports exist for a DIFFERENT reason: they are either
+# sys.path[0]-sensitive (the sibling script) or heavyweight, and the test
+# suite importlib-loads this module in isolation.
 from shared.task_metadata import parse_metadata
+
+from fused_memory.utils.target_store_preflight import (
+    TargetStoreMissing,
+    assert_task_store_exists,
+)
 
 logger = logging.getLogger('check_found_on_main_spurious_rate')
 
@@ -453,6 +491,16 @@ def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def _run(args: argparse.Namespace, since: datetime) -> int:
+    # FIRST, ahead of the logging setup, the deferred imports and the config
+    # load: a mis-targeted --project-root is diagnosed before any of that, and
+    # out-ranks the coarse `config.taskmaster is None` -> 1 rung below. Here
+    # rather than in main() so programmatic callers inherit the guard;
+    # main() owns mapping the refusal onto exit 3 (module docstring
+    # "Contract"), exactly as it already does for parse_since -> 2.
+    assert_task_store_exists(
+        args.project_root, operation='check_found_on_main_spurious_rate',
+    )
+
     # `since` arrives already parsed by main() — this function never calls
     # parse_since itself. That keeps main()'s ValueError/exit-2 usage-error
     # mapping scoped tightly around just the parse_since(args.since) call:
@@ -595,7 +643,17 @@ def main() -> int:
         print(f'error: invalid --since {args.since!r}: {exc}', file=sys.stderr)
         return 2
 
-    return asyncio.run(_run(args, since))
+    # The store guard's twin of the mapping above, written to the same
+    # template and scoped just as tightly: _run() raises the typed refusal,
+    # main() owns the ladder. To stderr, never stdout — the LAST stdout line
+    # is the machine-read counts object (module docstring "Trailing JSON
+    # summary") and a refusal prints no counts, so keeping the message off
+    # stdout means it can never be mistaken for a verdict payload.
+    try:
+        return asyncio.run(_run(args, since))
+    except TargetStoreMissing as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 3
 
 
 if __name__ == '__main__':

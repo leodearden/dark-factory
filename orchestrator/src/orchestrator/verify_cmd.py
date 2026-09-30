@@ -83,6 +83,12 @@ class VerifyCmd:
     entry (set by ``govern_cpu``) is treated as a resolved cpu-governed-exec
     path and wraps the *entire* rendered command as an outermost
     ``/bin/bash -c`` payload.
+
+    ``tool_version`` carries the ``@<version>`` suffix of an npx PACKAGE SPEC
+    (``npx pyright@1.1.408`` -> ``'1.1.408'``), so ``render`` can reproduce a
+    pinned spelling that ``_TOOL_HEAD`` alone cannot. It defaults to ``None``
+    — the unpinned spelling — which keeps dataclass equality and ``replace()``
+    semantics identical to before task 3931 for every command in the tree.
     """
 
     tool: ToolKind
@@ -93,6 +99,7 @@ class VerifyCmd:
     env: Mapping[str, str] = field(default_factory=dict)
     wrappers: tuple[str, ...] = ()
     raw: str | None = None
+    tool_version: str | None = None
 
 
 # Shell chain-delimiter tokens. shlex.split has no concept of shell operators —
@@ -105,18 +112,103 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
 # Genuinely value-taking pytest flags that consume a SEPARATE following
 # token (as opposed to a boolean flag, or a `--flag=value` single token).
-# Used by _split_pytest_args to bind a value flag to its value as an
-# adjacent pair inside base_flags at parse time, so a later base_flags
-# append (apply_pytest_numprocesses, serial_pytest, with_junitxml) can never
-# be inserted between the flag and its value (task 2727). This set must
-# stay CLOSED to only value-taking flags — listing a boolean flag (e.g.
-# -x/-s/-v/-q/-l) here would make the walk swallow the following target
-# token, a silent, worse failure than the stranded-value bug this fixes.
+# THE COMPLETE parse-side declaration: _split_pytest_args binds each of these
+# to its value as an adjacent pair inside base_flags at parse time, so a later
+# base_flags append (apply_pytest_numprocesses, serial_pytest, with_junitxml)
+# can never be inserted between the flag and its value (task 2727). A flag is
+# listed here because PYTEST takes its value as a separate token — a fact that
+# holds no matter who wrote the flag, an operator's config or this module's
+# own mutators. This set must stay CLOSED to only value-taking flags —
+# listing a boolean flag (e.g. -x/-s/-v/-q/-l) here would make the walk
+# swallow the following target token, a silent, worse failure than the
+# stranded-value bug this fixes.
+#
+# OMITTING a value-taking flag is the other direction of the same defect,
+# and task 5408 measured what it costs on a live config. With `--dist`
+# unlisted, parse_config_command on scripts/orchestrator.yaml::test_command
+# stranded `--dist` at the end of base_flags and admitted its value
+# `loadgroup` as a TEST TARGET; with_junitxml then rendered
+# `... -n auto --dist --junitxml /tmp/j.xml ... loadgroup`, which exits rc=4
+# with `argument --dist: expected one argument` — on the merge gate's own
+# path, since verify.py injects --junitxml for role=='merge' with
+# merge_verify_breadth=='full'. So the whole xdist worker-flag family is
+# listed here: `--numprocesses`/`--maxprocesses` are xdist's long spellings
+# for the worker count and its cap, and a set that binds `-n` but not `-n`'s
+# own long spelling is the same latent defect one config rename away.
+#
+# `--timeout`/`--junitxml` were the last two omissions (task 5580, measured
+# below): value-taking flags no config had to contain, because this module
+# emits them itself.
 _PYTEST_VALUE_FLAGS = frozenset({
-    '-k', '-m', '-p', '-o', '-c', '-n', '-W',
+    '-k', '-m', '-c', '-W', '-p', '-o', '-n',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
+    '--dist', '--numprocesses', '--maxprocesses',
+    '--timeout', '--junitxml',
 })
+
+# The SUBSET of the above that THIS MODULE's own mutators emit —
+# `-p no:xdist -o addopts=` (serial_pytest), `-n <count>`
+# (apply_pytest_numprocesses), `--timeout <secs>` (with_pytest_timeout),
+# `--junitxml <path>` (with_junitxml). A subset rather than a second
+# declaration folded into the set above, because the two answer orthogonal
+# questions: the parse side answers "does pytest take a separate value token
+# for this flag", a fact about pytest; this answers "do WE write it", a fact
+# about this module. Keeping them apart means a mutator that stops emitting a
+# flag (say serial_pytest preferring `--override-ini`) shrinks only this set
+# and cannot silently un-bind that flag for a config that still writes it.
+#
+# The one direction that must stay closed is enforced twice over: the assert
+# below holds this set inside the parse-side set at import, and
+# _append_value_flag — the single site that emits a pair — checks membership
+# here. So a future mutator emitting an undeclared value flag fails at its
+# first call, and declaring one the parser does not bind fails at import,
+# rather than either failing in the fleet.
+#
+# The drift that closes was real and costly. A merge-gate command is rewritten
+# as a STRING twice — confirm_isolated_rerun_verdict renders the scoped
+# re-run ending in `--timeout 300`, then run_verification RE-PARSES that
+# string to append `--junitxml` — and neither of those two self-emitted flags
+# was bound, so `300` came back as a test TARGET and the flag was stranded::
+#
+#     pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
+#     pytest: error: argument --timeout: expected one argument      (rc=4)
+#
+# Measured cost: every merge_gate observation in the flake ledger — 350
+# `fails_in_isolation`, ZERO `passes_in_isolation`, 2026-08-30 to 2026-09-17 —
+# recorded a rejected command as a real red (task 5580).
+_EMITTED_VALUE_FLAGS = frozenset({'-p', '-o', '-n', '--timeout', '--junitxml'})
+
+assert _EMITTED_VALUE_FLAGS <= _PYTEST_VALUE_FLAGS, (
+    f'{sorted(_EMITTED_VALUE_FLAGS - _PYTEST_VALUE_FLAGS)} are emitted as '
+    f'value flags but are not bound at parse time, so the next rewrite of a '
+    f'rendered command would strand them and admit their values as test '
+    f'targets'
+)
+
+
+def _append_value_flag(cmd: VerifyCmd, flag: str, value: str) -> VerifyCmd:
+    """Append a ``<flag> <value>`` pair to *cmd*'s ``base_flags``.
+
+    THE single site that emits such a pair, so the emit side and the parse
+    side cannot disagree: a flag this module appends is declared in
+    ``_EMITTED_VALUE_FLAGS``, which the import-time assert above holds inside
+    ``_PYTEST_VALUE_FLAGS`` — so it is, by construction, a flag
+    ``_split_pytest_args`` binds to its value when the rendered command is
+    re-parsed by the next rewrite. Without that, an unbound flag is stranded
+    and its value is admitted as a TEST TARGET — see ``_EMITTED_VALUE_FLAGS``.
+
+    The assert is the same defensive, self-describing style as ``render``'s
+    P1/P3 invariant asserts: no current caller can reach it, and it is what a
+    future mutator emitting a new value flag trips on.
+    """
+    assert flag in _EMITTED_VALUE_FLAGS, (
+        f'{flag!r} is emitted as a value flag but is not declared in '
+        f'_EMITTED_VALUE_FLAGS, so nothing holds it inside '
+        f'_PYTEST_VALUE_FLAGS and re-parsing the rendered command could '
+        f'strand it and admit {value!r} as a test target'
+    )
+    return replace(cmd, base_flags=(*cmd.base_flags, flag, value))
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
 # CARGO_CLIPPY intentionally exclude this — cargo's rest-tokens are carried
@@ -496,7 +588,67 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
         head_positions.add(idx + 2)
 
     kw_tokens = keyword.split()
-    return any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions)
+    if any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions):
+        return True
+    # Task 3931 / esc-3805-1: a VERSIONED npx package spec still invokes the
+    # tool. `npx pyright@1.1.408` puts `pyright@1.1.408` at the head position,
+    # which exact token equality above reads as "does not invoke pyright" — so
+    # split_chain_tail's later-segment scan stops seeing a pinned clause and
+    # can flip the chain's accept/reject verdict purely because a version was
+    # pinned. Matched only at an npx head position and only for a single-token
+    # keyword, so a `@` in any other position is still no match.
+    if tokens[0:1] == ['npx'] and len(kw_tokens) == 1 and len(tokens) > 1:
+        return tokens[1].startswith(f'{kw_tokens[0]}@')
+    return False
+
+
+def keyword_truncation_end(head: str, end: int) -> int:
+    """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
+
+    Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
+    ``verify_plan._scope_prefix_to_keyword`` — truncate their matched segment
+    to everything up to and including the first occurrence of the keyword,
+    historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
+    That slice cuts mid-token at the ``@`` of a pinned npx package spec, so
+    ``npx pyright@1.1.408`` was truncated to ``npx pyright`` BEFORE being
+    re-parsed: the pin was destroyed by the truncation, independently of
+    whether the parser could carry it. A gate spelled as pinned therefore ran
+    whatever npx last cached — MEASURED byte-identical output for the pinned
+    and unpinned fleet chains.
+
+    Both callers route through this one helper for the same reason they route
+    through ``split_chain_tail``: their lockstep is STRUCTURAL, not a
+    convention kept by hand.
+
+    THE BOUNDARY RULE, and why it is this narrow. The extension applies ONLY
+    when the very next character is ``@`` — the npm package-spec version
+    separator — and then runs to the end of that token (stopping at whitespace
+    or any shell metacharacter, so a chain operator can never be swallowed).
+    Every other mid-token keyword occurrence keeps its pre-3931 truncation
+    byte-for-byte.
+
+    The rejected alternative was "retain whatever token the keyword ends
+    inside". That would also absorb an unrelated LONGER token: ``npx
+    pyright-foo`` is a DIFFERENT tool whose name merely starts with the
+    keyword, and retaining ``pyright-foo`` whole would reclassify the command
+    as ``ToolKind.NPX``, where ``scope_to`` treats the tool name as a target
+    and REPLACES it with the touched file. Anchoring on ``@`` keeps the
+    widening to exactly the shape that needs it. Pinned by
+    ``test_verify.py::TestVersionPinSurvivesScoping`` and
+    ``test_verify_plan.py::TestVersionPinSurvivesPrefixScoping``.
+    """
+    if head[end : end + 1] != '@':
+        return end
+    stop = end + 1
+    while stop < len(head) and not head[stop].isspace() and head[stop] not in _SHELL_METACHARS:
+        stop += 1
+    return stop
+
+
+# Characters that can never be part of an npx package-spec token — every one
+# of them would start (or be part of) shell control flow, so
+# `keyword_truncation_end`'s scan must stop before it swallows one.
+_SHELL_METACHARS = frozenset('&|;()<>`$"\'')
 
 
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
@@ -1056,6 +1208,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
 
     head = rest[0]
     wrappers: tuple[str, ...] = ()
+    tool_version: str | None = None
     if head == 'pytest':
         tool = ToolKind.PYTEST
         rest = rest[1:]
@@ -1072,9 +1225,23 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         tool = ToolKind.CARGO_CLIPPY
         rest = rest[2:]
     elif head == 'npx':
-        if rest[1:2] == ['pyright']:
+        # Task 3931 / esc-3805-1: accept a VERSIONED npx package spec
+        # (`npx pyright@1.1.408`) as a pyright invocation, not just the bare
+        # token. This branch previously compared by exact token equality, so
+        # any pinned spelling fell through to ToolKind.NPX below — the command
+        # stopped being recognised as pyright at all, and `scope_to` then
+        # treated `pyright@1.1.408` as a TARGET and REPLACED it with the
+        # touched file (measured: `npx pyright@1.1.408` scoped to `a/b.py`
+        # rendered as `npx a/b.py`). Pinning the YAML alone was therefore a
+        # silent no-op on precisely the FILE_SCOPED path that generated
+        # esc-3805-1. Split on the FIRST `@` only: npm scoped names
+        # (`@scope/pkg@ver`) keep their leading `@` in the package part.
+        pkg = rest[1] if len(rest) > 1 else ''
+        pkg_name, _, pkg_version = pkg.partition('@') if not pkg.startswith('@') else (pkg, '', '')
+        if pkg_name == 'pyright':
             tool = ToolKind.PYRIGHT
             wrappers = ('npx',)
+            tool_version = pkg_version or None
             rest = rest[2:]
         else:
             tool = ToolKind.NPX
@@ -1111,6 +1278,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         targets=targets,
         wrappers=wrappers,
         raw=None,
+        tool_version=tool_version,
     )
 
 
@@ -1197,9 +1365,21 @@ def _render_structured(cmd: VerifyCmd) -> str:
             segments.append(f'uv run --project {shlex.quote(cmd.uv_project)}')
         else:
             segments.append('uv run')
-    if 'npx' in cmd.wrappers:
+    npx_wrapped = 'npx' in cmd.wrappers
+    if npx_wrapped:
         segments.append('npx')
-    segments.append(_TOOL_HEAD[cmd.tool])
+    head = _TOOL_HEAD[cmd.tool]
+    if npx_wrapped and cmd.tool_version is not None:
+        # Task 3931 / esc-3805-1: emit the VERSIONED npx package spec
+        # (`pyright@1.1.408`) rather than the bare `_TOOL_HEAD` value.
+        # Rebuilding the head from that constant unconditionally is what made
+        # a pin unrecoverable — a pinned YAML clause rendered back out
+        # UNPINNED, so the gate advertised a fixed pyright while running
+        # whatever npx last cached. Gated on the npx wrapper deliberately:
+        # `_TOOL_HEAD` is shared with the non-npx `pyright` spelling, which
+        # names a resolved executable and takes no package version.
+        head = f'{head}@{cmd.tool_version}'
+    segments.append(head)
     segments.extend(shlex.quote(flag) for flag in cmd.base_flags)
     segments.extend(shlex.quote(target) for target in cmd.targets)
     return ' '.join(segments)
@@ -1631,34 +1811,152 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     return ''.join(out)
 
 
+# The pytest-xdist worker flags a serial recovery must SHED, not merely
+# neutralise. Every one is also in _PYTEST_VALUE_FLAGS, so the parse has
+# already bound each to its value as an adjacent pair and the strip below
+# can drop the pair by position rather than re-deriving the grammar.
+#
+# DELIBERATELY NARROWER than xdist's full option surface, which also carries
+# --max-worker-restart --tx --px --rsyncdir --rsyncignore --testrunuid
+# --maxschedchunk -d --loadscope-reorder --no-loadscope-reorder. Those reach
+# pytest only through a pyproject `addopts` today, where the appended
+# `-o addopts=` already clears them; measured across all nine discovered
+# module configs, the only xdist flags on ARGV are the worker count and its
+# distribution mode. Widening this set is not free — a flag added here that
+# takes a SEPARATE value token must join _PYTEST_VALUE_FLAGS in the same
+# edit, or the strip drops the flag and leaves its value behind as a
+# phantom test target, which is the defect one direction over.
+_XDIST_WORKER_FLAGS = frozenset({'-n', '--numprocesses', '--dist', '--maxprocesses'})
+
+
+def _is_xdist_worker_flag(token: str) -> bool:
+    """True for an xdist worker flag in either spelling.
+
+    THE one place "is this token a worker flag" is decided, consulted by both
+    the structured strip and the raw refusal screen so they cannot disagree
+    about what they are looking for. Covers the bare form (``-n``, whose
+    value is a separate token) and the attached ``--dist=loadgroup`` form
+    (one token, and so NOT a ``_PYTEST_VALUE_FLAGS`` member — see that set's
+    comment). Deciding how WIDE the resulting drop is stays with the caller,
+    because only the separate-token form owns a following token.
+    """
+    return token in _XDIST_WORKER_FLAGS or any(
+        token.startswith(f'{flag}=') for flag in _XDIST_WORKER_FLAGS
+    )
+
+
+def _strip_xdist_worker_flags(base_flags: tuple[str, ...]) -> tuple[str, ...]:
+    """Return *base_flags* with every xdist worker flag (and its value) removed.
+
+    Same left-to-right walk as ``_split_pytest_args``, and it consults the
+    same ``_PYTEST_VALUE_FLAGS`` to decide whether a flag owns the following
+    token — so the two cannot drift on what "takes a value" means. ALL
+    occurrences go, not just the first: ``verify.py`` can apply the worker
+    cap BEFORE forcing serial, which leaves a doubled ``-n auto ... -n 8`` on
+    argv, and a first-occurrence-only strip would leave the identical usage
+    error behind.
+    """
+    kept: list[str] = []
+    i = 0
+    n = len(base_flags)
+    while i < n:
+        token = base_flags[i]
+        if not _is_xdist_worker_flag(token):
+            kept.append(token)
+            i += 1
+        elif token in _PYTEST_VALUE_FLAGS and i + 1 < n:
+            i += 2  # bare flag: its value is the bound adjacent token
+        else:
+            i += 1  # attached `--flag=value`, or a trailing bare flag
+    return tuple(kept)
+
+
+def _raw_pytest_carries_xdist_worker_flag(raw: str) -> bool:
+    """True when a real pytest invocation in *raw* names an xdist worker flag.
+
+    The raw chain's REFUSAL screen for ``serial_pytest``, mirroring
+    ``_has_unspliceable_pytest_invocation``'s role for the appender: a chain
+    that already carries ``-n``/``--dist`` on argv cannot be made serial by
+    appending ``-p no:xdist``, and there is no sound blind surgery that would
+    remove it (``_unspliceable_pytest_spans`` records, with measured
+    counterexamples, why regex edits to a raw chain silently run the WRONG
+    TESTS). Refusing costs that one retry its recovery flags, loudly.
+
+    Tokenised with ``shlex`` rather than by whitespace, so a worker flag
+    spelled inside another argument — ``pytest -k 'a -n b' tests/`` — is not
+    mistaken for one on argv; over-refusing would silently disable serial
+    recovery for a command that never had the defect, which is the failure
+    ``_pytest_invocation_spans`` exists to avoid on the other axis. A span
+    that will not tokenise ends mid-quote, and ``_unspliceable_pytest_spans``
+    already refuses the whole string for that, so answering True there cannot
+    change the outcome.
+    """
+    for match in _pytest_invocation_spans(raw):
+        try:
+            tokens = shlex.split(match.group(0))
+        except ValueError:
+            return True
+        if any(_is_xdist_worker_flag(token) for token in tokens):
+            return True
+    return False
+
+
 def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
 
-    Appends ``-p no:xdist -o addopts=`` (clears any pyproject-level
-    ``addopts``, e.g. ``-n auto`` — the ``-o addopts=""`` workaround task
-    2045 proved recovers a shared-venv-mutation transient; ``-p no:xdist``
-    is belt-and-suspenders) to a structured command's ``base_flags``, or —
-    for a raw-retained pytest chain — to every ``pytest`` invocation's
-    arguments in ``raw`` via a localised regex rewrite (moved from
-    ``_force_serial_pytest``), so each chained invocation recovers
-    independently. No-ops unless ``cmd.tool is ToolKind.PYTEST`` (covers
-    OPAQUE and every other tool — P1).
+    Appends ``-p no:xdist -o addopts=`` (the ``-o addopts=""`` workaround
+    task 2045 proved recovers a shared-venv-mutation transient; ``-p
+    no:xdist`` is belt-and-suspenders) to a structured command's
+    ``base_flags``, or — for a raw-retained pytest chain — to every
+    ``pytest`` invocation's arguments in ``raw`` via a localised regex
+    rewrite (moved from ``_force_serial_pytest``), so each chained
+    invocation recovers independently. No-ops unless ``cmd.tool is
+    ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1).
 
-    Also a no-op on the raw path when the appender REFUSES (task 4121 — see
-    ``_unspliceable_pytest_spans``). Returning *cmd* ITSELF rather than an
-    equal ``replace`` copy is deliberate: the caller's ``is`` identity guard
+    ``-o addopts=`` reaches only a PYPROJECT-level ``-n auto``, and that
+    limit is load-bearing rather than incidental: a worker flag already on
+    ARGV survives it, and ``-p no:xdist`` then UNREGISTERS the option that
+    flag names. Measured on the live ``scripts`` leg (task 5408)::
+
+        pytest ... -n auto --dist loadgroup -p no:xdist -o addopts= <target>
+        pytest: error: unrecognized arguments: -n --dist          (rc=4)
+
+    So the structured path SHEDS those flags via
+    ``_strip_xdist_worker_flags`` before appending the recovery pair. This is
+    the mirror of ``_is_serial_forced``, which stops a later
+    ``apply_pytest_numprocesses`` ADDING ``-n`` after the fact; read the two
+    together — they close the same plugin/option interaction from opposite
+    directions, and neither alone is sufficient.
+
+    Two no-ops on the raw path, both returning *cmd* ITSELF rather than an
+    equal ``replace`` copy: the caller's ``is`` identity guard
     (``verify._serial_pytest_str``'s ``if rewritten is parsed: return cmd``)
     only fires on identity, and it is what hands back the operator's own
     command string BYTE-identically instead of an argv-equivalent re-render.
+
+    * The appender REFUSES (task 4121 — see ``_unspliceable_pytest_spans``).
+    * A pytest invocation in the chain already carries a worker flag
+      (``_raw_pytest_carries_xdist_worker_flag``). There is no raw
+      counterpart to the structured strip, and inventing one would mean the
+      blind regex surgery ``_unspliceable_pytest_spans`` documents as WORSE
+      than doing nothing; refusing costs that retry its recovery flags,
+      rendering a guaranteed rc=4 would cost it the run AND misreport the
+      cause. Defensive only — measured across all nine discovered module
+      configs, every ``test_command`` parses structured.
     """
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
+        if _raw_pytest_carries_xdist_worker_flag(cmd.raw):
+            return cmd
         rewritten = _append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
+    shed = replace(cmd, base_flags=_strip_xdist_worker_flags(cmd.base_flags))
+    return _append_value_flag(
+        _append_value_flag(shed, '-p', 'no:xdist'), '-o', 'addopts=',
+    )
 
 
 def _is_serial_forced(cmd: VerifyCmd) -> bool:
@@ -1672,6 +1970,11 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
     ``apply_pytest_numprocesses`` consults this to stay a no-op on any
     already-serial command (the env-transient and flaky-scoped recovery
     re-runs both pass such commands back through the injection site).
+
+    That is one direction of the interaction. The other — a worker flag
+    already on argv when the command is forced serial — is closed in
+    ``serial_pytest``, which strips it there rather than relying on ``-o
+    addopts=`` (which cannot reach argv). The two docstrings are one account.
 
     ``no:xdist`` is checked across both ``base_flags`` and ``targets``: a
     freshly ``serial_pytest``-ed structured command carries the ``-p
@@ -1721,7 +2024,7 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
+    return _append_value_flag(cmd, '-n', n)
 
 
 def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
@@ -1753,7 +2056,7 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--junitxml', junit_path))
+    return _append_value_flag(cmd, '--junitxml', junit_path)
 
 
 def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
@@ -1774,7 +2077,8 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
 
     The α confirm gate injects this AFTER ``serial_pytest``'s
     ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test
-    ``timeout=60`` default lives in ``[tool.pytest.ini_options]``, NOT in
+    ``timeout`` default (300 since 2026-09-12, 60 before that) lives in
+    ``[tool.pytest.ini_options]``, NOT in
     ``addopts``, so ``-o addopts=`` does not clear it. Without a GENEROUS
     explicit override the isolated confirm re-run could itself starve into a
     false non-suppression (never masking a real red is a hard constraint, but
@@ -1783,7 +2087,7 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--timeout', str(secs)))
+    return _append_value_flag(cmd, '--timeout', str(secs))
 
 
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:

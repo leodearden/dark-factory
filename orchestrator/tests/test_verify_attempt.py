@@ -75,7 +75,7 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
-            'segments',
+            'segments', 'load',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
@@ -115,6 +115,7 @@ class TestCheckRun:
             'started_at': 'ts',
             'duration_secs': 3.25,
             'segments': None,
+            'load': None,
         }
 
 
@@ -211,6 +212,76 @@ class TestCheckRunSegments:
         # Passed through, not copied-and-rebuilt: a rebuild would be a second
         # definition of the segment shape, free to drift from _run_segmented's.
         assert run.to_dict()['segments'] is segments
+
+
+class TestCheckRunLoad:
+    """task 3353 (ruling D17): CheckRun carries the host load it ran under.
+
+    Every property here is COPIED from `segments` next door, so the two
+    neighbouring fields cannot drift:
+
+    - LAST field and defaulted, so every pre-existing positional construction
+      stays valid.
+    - A flat JSON-native dict, not a nested dataclass, for the same stated
+      reason the rest of this schema is flat: `to_dict()`'s output is written
+      straight into JSON, so anything needing its own serialisation step is a
+      second place for the shape to drift.
+    - Emitted UNCONDITIONALLY, as None when the check ran no command. A
+      conditionally-present key would leave a consumer unable to tell "this
+      build predates load stamping" from "this run was not stamped" — an
+      absent-vs-null ambiguity in the very schema whose job is to make such
+      distinctions unambiguous, and one the census would have to guess about
+      for exactly the historical records it most needs to classify.
+    """
+
+    def test_load_defaults_to_none(self):
+        """Every pre-3353 construction site stays valid — it is the LAST field."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        run = CheckRun(
+            label='test',
+            cmd='uv run pytest',
+            rc=0,
+            output='',
+            timed_out=False,
+            started_at='ts',
+            duration_secs=1.5,
+        )
+        assert run.load is None
+        assert run.to_dict()['load'] is None
+
+    def test_load_is_positionally_last(self):
+        """`segments` keeps its slot, so a positional caller passing it still works."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        run = CheckRun('test', 'cmd', 0, '', False, 'ts', 1.5, [{'index': 1}])
+        assert run.segments == [{'index': 1}]
+        assert run.load is None
+
+    def test_skipped_leaves_load_none(self):
+        """A module_config skip ran no command, so it ran under no load."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        assert CheckRun.skipped('test').load is None
+        assert CheckRun.skipped('test').to_dict()['load'] is None
+
+    def test_load_round_trips_through_to_dict_unchanged(self):
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        load = {
+            'start': {'cpu_some10': 2.5, 'cpu_some60': 1.8, 'runqueue_ratio': 0.75},
+            'end': {'cpu_some10': 9.5, 'cpu_some60': 4.0, 'runqueue_ratio': 2.25},
+            'xdist': {'n_flag': None, 'auto_num_workers': '6'},
+        }
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='',
+            timed_out=False, started_at='ts', duration_secs=1.5, load=load,
+        )
+
+        assert run.to_dict()['load'] == load
+        # Passed through, not copied-and-rebuilt: a rebuild would be a second
+        # definition of the load shape, free to drift from _load_sample's.
+        assert run.to_dict()['load'] is load
 
 
 def _run(label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0):

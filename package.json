@@ -1,0 +1,8 @@
+{
+  "name": "dark-factory",
+  "private": true,
+  "description": "Not an npm package. This file exists for ONE reason: it is the single authored declaration of the pyright version dark-factory-orchestrator.yaml's type_check_command resolves. That chain is seven bare `npx pyright` clauses (deliberately — see the comment above type_check_command), and npx with nothing installed fetches pyright@latest, so a green main could turn red on an npm publish and two verify hosts could disagree. verify_cold_preprovision_command runs `npm ci` from the committed package-lock.json in every cold worktree, which puts this exact version in node_modules/.bin for npx to find. Keep it equal to uv.lock's pyright (pyright-python) version, which is what `uv run pyright` resolves in every <pkg>/orchestrator.yaml module config and in hooks/project-checks. All of that is enforced by tests/scripts/test_pyright_version_pin.py (task 4538); bump with `npm install --save-exact pyright@<version>`.",
+  "devDependencies": {
+    "pyright": "1.1.408"
+  }
+}

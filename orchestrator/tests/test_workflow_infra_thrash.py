@@ -13,11 +13,10 @@ iteration-log growth — that is intentional and the counter resets to 1.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
@@ -81,7 +80,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_infra_resumes = max_consecutive_infra_resumes
 
     if update_task_raises:

@@ -7,39 +7,20 @@ test_audit_found_on_main_provenance.py / test_audit_duplicate_tasks.py.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load correct_found_on_main_backlog.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'correct_found_on_main_backlog'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='correct_found_on_main_backlog')
 Correction = _mod.Correction
 REOPEN_DISPOSITIONS = _mod.REOPEN_DISPOSITIONS
 BENIGN_DISPOSITIONS = _mod.BENIGN_DISPOSITIONS
@@ -741,6 +722,20 @@ class _FakeFusedMemoryConfigWithoutTaskmaster:
         self.taskmaster = None
 
 
+def _project_root_with_task_store(tmp_path) -> str:
+    """Return a project_root whose ``.taskmaster/tasks/tasks.db`` really exists.
+
+    ``_run()`` preflights the task store (task 4319), so every ``_run()`` test
+    needs a root that passes the guard. A literal like ``'/proj'`` does not
+    exist, so it would be refused — correctly. These tests exercise the REAL
+    guard rather than monkeypatching it away.
+    """
+    db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.touch()
+    return str(tmp_path)
+
+
 @pytest.mark.asyncio
 class TestRunCliWiring:
     """_run() end-to-end: config load, the sibling audit import, backend
@@ -749,7 +744,7 @@ class TestRunCliWiring:
     untested (mirroring audit_found_on_main_provenance's own _run/main),
     which the review amendment asks to cover."""
 
-    async def test_dry_run_wires_report_into_plan_and_exits_zero(self, monkeypatch):
+    async def test_dry_run_wires_report_into_plan_and_exits_zero(self, tmp_path, monkeypatch):
         report = _report([_detail('9999', 'misattributed', reasons=['z'])])
         _install_fake_audit_module(monkeypatch, report)
         monkeypatch.setattr(
@@ -766,20 +761,23 @@ class TestRunCliWiring:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
         )
 
-        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=False)
+        project_root = _project_root_with_task_store(tmp_path)
+        args = argparse.Namespace(
+            project_root=project_root, config=None, ref='main', apply=False,
+        )
         exit_code = await _mod._run(args)
 
         assert exit_code == 0
         backend = backend_holder['backend']
         assert backend.started is True
         assert backend.closed is True
-        assert backend.get_tasks_calls == ['/proj']
+        assert backend.get_tasks_calls == [project_root]
         # Dry run: the wiring reaches plan_corrections/apply_corrections but
         # performs zero writes.
         assert backend.update_calls == []
         assert backend.status_and_stamp_audit_calls == []
 
-    async def test_apply_wires_through_to_annotate_and_exits_zero(self, monkeypatch):
+    async def test_apply_wires_through_to_annotate_and_exits_zero(self, tmp_path, monkeypatch):
         report = _report([_detail('9999', 'misattributed', reasons=['z'])])
         _install_fake_audit_module(monkeypatch, report)
         monkeypatch.setattr(
@@ -796,7 +794,10 @@ class TestRunCliWiring:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
         )
 
-        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=True)
+        project_root = _project_root_with_task_store(tmp_path)
+        args = argparse.Namespace(
+            project_root=project_root, config=None, ref='main', apply=True,
+        )
         exit_code = await _mod._run(args)
 
         assert exit_code == 0
@@ -805,7 +806,7 @@ class TestRunCliWiring:
         assert backend.update_calls[0]['task_id'] == '9999'
 
     async def test_missing_taskmaster_config_returns_1_without_creating_backend(
-        self, monkeypatch,
+        self, tmp_path, monkeypatch,
     ):
         report = _report([])
         _install_fake_audit_module(monkeypatch, report)
@@ -819,13 +820,16 @@ class TestRunCliWiring:
             lambda *a, **kw: created.append(1),  # noqa: ARG005
         )
 
-        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=False)
+        project_root = _project_root_with_task_store(tmp_path)
+        args = argparse.Namespace(
+            project_root=project_root, config=None, ref='main', apply=False,
+        )
         exit_code = await _mod._run(args)
 
         assert exit_code == 1
         assert created == []
 
-    async def test_apply_with_reopen_failure_exits_non_zero(self, monkeypatch):
+    async def test_apply_with_reopen_failure_exits_non_zero(self, tmp_path, monkeypatch):
         report = _report([_detail('1175', 'reverted', reasons=['x'])])
         _install_fake_audit_module(monkeypatch, report)
         monkeypatch.setattr(
@@ -852,7 +856,110 @@ class TestRunCliWiring:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
         )
 
-        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=True)
+        project_root = _project_root_with_task_store(tmp_path)
+        args = argparse.Namespace(
+            project_root=project_root, config=None, ref='main', apply=True,
+        )
         exit_code = await _mod._run(args)
 
         assert exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# TestRunTargetStorePreflight
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRunTargetStorePreflight:
+    """The target-store refusal (task 4319).
+
+    ``SqliteTaskBackend.get_tasks`` auto-creates ``.taskmaster/tasks/tasks.db``
+    and returns ``{"tasks": []}`` for ANY ``--project-root``, never raising.
+    ``.taskmaster/`` is neither present in nor tracked by a task worktree, so
+    without this guard a worktree path yields an empty task tree, zero
+    corrections and exit 0 — a false all-clear.
+
+    ``_run()`` imports the backend and config FUNCTION-LOCALLY, so these
+    monkeypatch the SOURCE module paths; patching an attribute on the script
+    module would have no effect.
+    """
+
+    def _patch(self, monkeypatch) -> list[object]:
+        """Patch config + backend; return the list recording constructions.
+
+        The recording factory doubles as the "guard fired before construction"
+        probe: reaching ``get_tasks`` is precisely what auto-creates the empty
+        db, so a refusal after construction has already lost.
+        """
+        report = _report([_detail('9999', 'misattributed', reasons=['z'])])
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        constructions: list[object] = []
+
+        def _make_backend(taskmaster_config):
+            constructions.append(taskmaster_config)
+            return _FakeRunBackend(taskmaster_config)
+
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
+        )
+        return constructions
+
+    @pytest.mark.parametrize('apply', [False, True])
+    async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch, apply):
+        constructions = self._patch(monkeypatch)
+        args = argparse.Namespace(
+            project_root=str(tmp_path), config=None, ref='main', apply=apply,
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(args)
+
+        assert constructions == []
+
+    async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+        args = argparse.Namespace(
+            project_root=str(tmp_path), config=None, ref='main', apply=False,
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(args)
+
+        assert not (tmp_path / '.taskmaster').exists()
+
+    async def test_refusal_is_not_an_apply_exit_code(self, tmp_path, monkeypatch):
+        """A refusal is an exception, never ``_apply_exit_code``'s 0 or 1.
+
+        That helper exists so a "successful"-looking exit can never mask a
+        done -> pending flip that did not persist (task 1175). The guard
+        EXTENDS that property to "I was pointed at the wrong checkout" rather
+        than punching a hole in it: 0 still means a clean run against a store
+        that really existed.
+        """
+        self._patch(monkeypatch)
+        args = argparse.Namespace(
+            project_root=str(tmp_path), config=None, ref='main', apply=True,
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(args)
+
+        assert _mod._apply_exit_code({'errors': 0, 'reopen_failed': []}) == 0
+
+    async def test_proceeds_when_the_db_exists(self, tmp_path, monkeypatch):
+        constructions = self._patch(monkeypatch)
+        args = argparse.Namespace(
+            project_root=_project_root_with_task_store(tmp_path),
+            config=None,
+            ref='main',
+            apply=False,
+        )
+
+        exit_code = await _mod._run(args)
+
+        assert exit_code == 0
+        assert len(constructions) == 1

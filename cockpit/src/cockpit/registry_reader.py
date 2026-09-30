@@ -4,6 +4,25 @@ Fleet Cockpit C5a (plans/fleet-cockpit-prd.md §9). Imports the frozen
 orchestrator.session_registry contract (PRD §6 G5: consumers import, never
 re-derive the record shape). This module is read-only: it never calls
 write_record/write_decision/update_decision_state/set_manual_boost.
+
+It is also the cockpit's PROJECT-TOKEN CANONICALIZATION BOUNDARY (task
+3812), and this docstring is the ONE place that argument is written down --
+everything else that needs it points here. Read-only is unchanged --
+nothing here writes to disk -- but every record that enters the cockpit
+through this module leaves it with ``.project`` folded onto the one
+canonical spelling (``session_registry.normalize_project_token``, task
+3807). The reason the fold has to sit HERE, at the reader, rather than in
+the display or scoring adapters downstream: the cockpit unions its two
+record kinds -- sessions and decisions -- onto ONE ``project_weights`` key
+and ONE weight picker (``priority.score``'s
+``project_weights[item.project]`` lookup and
+``panes.weight_editor.known_projects``), so the two kinds must fold
+together or an operator's weight silently applies to only one of them. The
+on-disk records themselves stay raw and unmigrated; this is a read-side
+fold, retroactive over every already-written record. Its two entry points
+are ``_read_record_soft`` (sessions) and ``scan_decisions`` (decisions),
+and both reach the rule itself through the one ``_canonicalize_project``
+helper below.
 """
 
 from __future__ import annotations
@@ -13,12 +32,16 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from orchestrator import session_registry
+from orchestrator.session_registry import normalize_project_token
 
 logger = logging.getLogger(__name__)
 
 # Substantive SessionRecord fields a snapshot is keyed on. Deliberately
 # excludes start_ts/age-derived values so a purely-time-passing poll tick
-# (nothing on disk actually changed) diffs as a no-op.
+# (nothing on disk actually changed) diffs as a no-op. That rule is about
+# values that MOVE ON THEIR OWN, not about timestamps as such: build_snapshot
+# appends the record's question.asked_at for exactly the reason spelled out
+# in its docstring.
 _SNAPSHOT_FIELDS = (
     'status',
     'title',
@@ -28,6 +51,40 @@ _SNAPSHOT_FIELDS = (
     'escalation_id',
     'parent_session_id',
 )
+
+
+def _canonicalize_project(
+    record: session_registry.SessionRecord | session_registry.DecisionRecord,
+) -> None:
+    """Fold *record*'s ``.project`` onto its canonical spelling, in place.
+
+    The single enforcement point for this module's canonicalization
+    boundary (see the module docstring for why the cockpit folds at all).
+    Both entry points -- ``_read_record_soft`` for sessions,
+    ``scan_decisions`` for decisions -- go through here, so the rule exists
+    once instead of twice-and-cross-referenced and the two record kinds
+    cannot drift apart. Both are plain mutable dataclasses carrying a
+    ``.project``; nothing else about them is touched.
+
+    In place, because both callers hand over a record ``session_registry``
+    has just parsed for them and that this module exclusively owns --
+    mirroring ``migrate_decision_project_tokens``' own
+    ``record.project = ...`` idiom.
+
+    The inequality guard mirrors that same function's already-canonical
+    test (``normalize_project_token(p) == p``): a record already spelled
+    canonically is left untouched rather than rebound to an equal string.
+    What the guard elides is that attribute rebind and nothing more -- the
+    fold has already run and already built its stripped/casefolded/
+    regex-substituted string by the time the guard is reached. Nor is the
+    untouched case the common one here: the dominant on-disk spelling in
+    this fleet is ``dark-factory`` (42,026 records measured 2026-09-07,
+    against 1,493 ``dark_factory``), which is NOT canonical, so a cold scan
+    really does rewrite most of what it reads.
+    """
+    canonical = normalize_project_token(record.project)
+    if canonical != record.project:
+        record.project = canonical
 
 
 def _read_record_soft(
@@ -43,12 +100,61 @@ def _read_record_soft(
     test_scan_matches_scan_sessions_for_seeded_dir). *caller* is folded into
     the warning message only, preserving each call site's original
     log-message prefix for anyone grepping logs.
+
+    It is also where the returned record's ``.project`` -- and ONLY
+    ``.project`` -- is rewritten onto its canonical spelling, via
+    ``_canonicalize_project`` (task 3812; the module docstring has the why).
+    Being the one shared parse step is exactly why the call belongs here:
+    both scan paths inherit the fold by construction rather than by
+    convention, the same property they already inherit for fail-soft, and
+    SessionScanner's mtime cache therefore stores ALREADY-CANONICAL records
+    -- so the fold is paid once per PARSE, not once per poll tick. Every
+    other field is left byte-identical to what was written, notably
+    ``.title``, the literal terminal title ``.project`` was originally
+    parsed out of: rewriting one and not the other is intended, since the
+    title is display text while the project token is a join key.
     """
     try:
-        return session_registry.read_record(slug, root=root)
+        record = session_registry.read_record(slug, root=root)
     except (FileNotFoundError, session_registry.CorruptSessionRecord):
         logger.warning('%s: skipping unreadable record for %s', caller, slug, exc_info=True)
         return None
+    _canonicalize_project(record)
+    return record
+
+
+def scan_decisions(root: Path | str | None = None) -> list[session_registry.DecisionRecord]:
+    """Return every readable DecisionRecord, ``.project`` canonicalized.
+
+    The decision-side twin of scan_sessions (task 3812), applying the same
+    rule through the same ``_canonicalize_project`` helper. Why both record
+    kinds have to fold together is argued once in the module docstring.
+
+    The whole READ -- and therefore the whole fail-soft policy: absent
+    decisions/ dir -> [], a single corrupt or foreign ``*.json`` logged and
+    skipped rather than aborting the rest -- is delegated to
+    ``session_registry.list_decisions``. This is a fold over that reader,
+    never a second implementation of it, so its contract cannot drift away
+    from the frozen one (pinned by
+    test_returns_the_same_ids_in_the_same_order_as_list_decisions).
+
+    The fold is IDEMPOTENT and therefore a NO-OP for every decision written
+    since task 3807 -- the ``write-decision`` verb already stamps the
+    canonical token at the write path. What it exists for is the LEGACY rows
+    still sitting on disk that ``migrate_decision_project_tokens`` has not
+    been run over (measured 2026-09-07: 19 OPEN ``df`` + 2 OPEN
+    ``dark-factory``), and, more durably, so the cockpit's guarantee rests on
+    a rule it applies itself rather than on a migration having been run
+    somewhere else.
+
+    Read-only, like everything in this module: the canonicalized records are
+    in-memory only and are never written back (the cockpit never calls
+    write_decision).
+    """
+    decisions = session_registry.list_decisions(root)
+    for record in decisions:
+        _canonicalize_project(record)
+    return decisions
 
 
 def scan_sessions(root: Path | str | None = None) -> list[session_registry.SessionRecord]:
@@ -206,12 +312,30 @@ def build_snapshot(
     Deliberately excludes start_ts/age so a quiet (nothing-changed) tick
     produces an identical snapshot -- this is what lets the app's poll
     rebuild the table only when something real changed (PRD §5).
+
+    question.asked_at is deliberately INCLUDED, and that is not in tension
+    with the exclusion rule above. This snapshot is the WAKE-UP TRIGGER for
+    CockpitApp._prune_overlays: _apply_scan short-circuits on an unchanged
+    snapshot, so a tick that diffs as a no-op never reaches _rebuild_queue
+    and never runs the prune. The trigger must therefore be AT LEAST AS
+    STRONG as the identity the prune keys an overlay on
+    (CockpitApp._ask_identity: `(question.text, question.asked_at)`) -- a
+    weaker trigger lets a real new ask pass the diff unnoticed and pins the
+    operator's stale drop forever, silently suppressing a live ask. Do not
+    "optimize" asked_at back out of this tuple.
+
+    It does NOT reintroduce the flicker the start_ts exclusion guards
+    against: asked_at is an on-disk stamp written only when a new Question
+    is stamped, unlike start_ts-derived age which moves on every tick by
+    construction. A quiet poll (nothing changed on disk) still diffs as a
+    no-op.
     """
     snapshot: dict[str, tuple] = {}
     for record in records:
         values = tuple(getattr(record, field) for field in _SNAPSHOT_FIELDS)
         question_text = record.question.text if record.question is not None else None
-        snapshot[record.session_slug] = (*values, question_text)
+        question_asked_at = record.question.asked_at if record.question is not None else None
+        snapshot[record.session_slug] = (*values, question_text, question_asked_at)
     return snapshot
 
 

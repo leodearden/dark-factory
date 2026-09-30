@@ -25,14 +25,21 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _merge_queue_doubles import ResolvingMergeQueue
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from _workflow_helpers import _bind_landed_row
 from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
-from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +48,27 @@ def _reset_merge_provenance():
     MergeProvenance._outbox = None
     yield
     MergeProvenance._outbox = None
+
+
+def _preset_cancel_event() -> asyncio.Event:
+    """An already-set soft-cancel event for ``TaskWorkflow(cancel_event=...)``.
+
+    ``_await_cancellable`` races the request future against this event, so
+    presetting it is the public way to make the cancel arm win — the request
+    future is left pending by ``ResolvingMergeQueue(outcome=None)``.
+    """
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
+#: What the fixtures whose trigger must NOT fire hand their queue. Nothing is
+#: enqueued on their green path, so it goes unused — but a regression that DOES
+#: fire resolves at once and reds on ``result is None``, where a never-resolving
+#: queue would instead hang in ``_await_cancellable`` (which races only the
+#: request future and an unset cancel event, with no timeout) until
+#: pytest-timeout killed the xdist worker 300 seconds later.
+_FAST_FAIL_OUTCOME = MergeOutcome('done', merge_sha='deadbeef')
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +90,8 @@ def _make(
     metadata: dict | None = None,
     tasks_by_train_return: list[dict] | None = None,
     get_statuses_return: tuple[dict[str, str], Exception | None] | None = None,
+    merge_outcome: MergeOutcome | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> _Fixture:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -77,7 +107,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
     # task ν: GroupMergeRequest construction now parses branch/tip_branch via
@@ -119,7 +149,7 @@ def _make(
     esc_queue.submit = MagicMock()
     esc_queue.get_by_task = MagicMock(return_value=[])
 
-    merge_queue: asyncio.Queue = asyncio.Queue()
+    merge_queue: asyncio.Queue = ResolvingMergeQueue(merge_outcome)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -130,6 +160,7 @@ def _make(
         mcp=MagicMock(),
         escalation_queue=esc_queue,  # type: ignore[arg-type]
         merge_queue=merge_queue,
+        cancel_event=cancel_event,
     )
 
     wf.artifacts = MagicMock()
@@ -158,8 +189,8 @@ async def test_tip_fires_group_merge_happy_path():
     """TIP member fires GroupMergeRequest when all three members are merge-deferred.
 
     Scenario: train T1, three members root→tip (101,102,103); self is 103 (tip,
-    order 2); all statuses are merge-deferred.  _await_cancellable returns
-    MergeOutcome('done', merge_sha='deadbeef').
+    order 2); all statuses are merge-deferred.  The queue resolves the enqueued
+    request with MergeOutcome('done', merge_sha='deadbeef').
 
     Asserts:
       (a) _maybe_enqueue_group_merge() returns WorkflowOutcome.DONE
@@ -179,10 +210,8 @@ async def test_tip_fires_group_merge_happy_path():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
     )
-
-    outcome_future = MergeOutcome('done', merge_sha='deadbeef')
-    f.wf._await_cancellable = AsyncMock(return_value=outcome_future)  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -253,28 +282,21 @@ async def test_inline_mark_member_done_consumes_landed_row(tmp_path: Path):
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
     )
-    f.wf._await_cancellable = AsyncMock(  # type: ignore[method-assign]
-        return_value=MergeOutcome('done', merge_sha='deadbeef'),
-    )
-
-    outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
-    outbox.record(LandedRow(
-        task_id='101', branch_tip_sha='tip', advanced_sha='deadbeef', landed_at=1.0,
-    ))
-    MergeProvenance.bind(outbox)
+    _bind_landed_row(tmp_path, task_id='101', advanced_sha='deadbeef')
 
     await f.wf._maybe_enqueue_group_merge()
     req = f.merge_queue.get_nowait()
 
     # Row present BEFORE the done-write.
-    assert outbox.lookup('101') is not None
+    assert MergeProvenance.lookup('101') is not None
 
     await req.mark_member_done('101', 'sha9')
 
     # Member's write-ahead row consumed inline on the successful mark_done
     # (PRD B1: lookup==None after done).
-    assert outbox.lookup('101') is None
+    assert MergeProvenance.lookup('101') is None
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +319,8 @@ async def test_partial_train_does_not_fire():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
-    # Should not be called, but stub defensively
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
-
     result = await f.wf._maybe_enqueue_group_merge()
 
     assert result is None, (
@@ -330,8 +350,8 @@ async def test_self_status_trusted_over_lagging_get_tasks():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='abc'),
     )
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done', merge_sha='abc'))  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -360,9 +380,8 @@ async def test_non_tip_member_does_not_fire():
         task_id='101',
         metadata={'train': {'id': 'T1', 'order': 0}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
-
     result = await f.wf._maybe_enqueue_group_merge()
 
     assert result is None, (
@@ -377,14 +396,14 @@ async def test_non_tip_member_does_not_fire():
 async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
     """Test D — _enter_merge_deferred returns MERGE_DEFERRED when trigger returns None.
 
-    Patch _maybe_enqueue_group_merge to AsyncMock→None; assert that
-    _enter_merge_deferred sets status=merge-deferred and returns MERGE_DEFERRED.
+    The train has no members (``tasks_by_train`` returns []), so the real
+    trigger parks on its own — no stub needed. Assert that _enter_merge_deferred
+    sets status=merge-deferred and returns MERGE_DEFERRED.
     """
     f = _make(
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
     )
-    f.wf._maybe_enqueue_group_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     outcome = await f.wf._enter_merge_deferred()
 
@@ -406,7 +425,7 @@ async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
 async def test_blocked_outcome_escalates_to_human():
     """Tip fires but merge fails with status='blocked' → _mark_blocked(escalate_to_human=True).
 
-    _await_cancellable returns MergeOutcome('blocked', reason='...rebase conflict...').
+    The queue resolves the request with MergeOutcome('blocked', reason='...rebase conflict...').
     Assert:
       (a) result is WorkflowOutcome.BLOCKED
       (b) _mark_blocked was awaited once with escalate_to_human=True
@@ -422,11 +441,11 @@ async def test_blocked_outcome_escalates_to_human():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome(
+            'blocked',
+            reason='Train merge rejected: tip branch rebase conflict on main',
+        ),
     )
-    failed_outcome = MergeOutcome(
-        'blocked', reason='Train merge rejected: tip branch rebase conflict on main',
-    )
-    f.wf._await_cancellable = AsyncMock(return_value=failed_outcome)  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -453,7 +472,8 @@ async def test_blocked_outcome_escalates_to_human():
 
 @pytest.mark.asyncio
 async def test_soft_cancel_delegates_to_handle_soft_cancel():
-    """_await_cancellable raises WorkflowCancelled('soft') (W9-θ) → propagates
+    """A set cancel event wins _await_cancellable's race (W9-θ), so
+    WorkflowCancelled('soft') propagates
     straight out of _maybe_enqueue_group_merge uncaught, to run()'s single
     WorkflowCancelled catch site.
 
@@ -472,16 +492,22 @@ async def test_soft_cancel_delegates_to_handle_soft_cancel():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        cancel_event=_preset_cancel_event(),
     )
-    f.wf._await_cancellable = AsyncMock(side_effect=WorkflowCancelled('soft'))  # type: ignore[method-assign]
-    handle_soft_cancel = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
-    f.wf._handle_soft_cancel = handle_soft_cancel  # type: ignore[method-assign]
 
     with pytest.raises(WorkflowCancelled) as excinfo:
         await f.wf._maybe_enqueue_group_merge()
 
     assert excinfo.value.kind == 'soft'
-    handle_soft_cancel.assert_not_awaited()
+    # Escaping UNCAUGHT is the contract, and it has a public projection:
+    # _finalise_cancellation — run()'s catch site, and the only caller of
+    # _handle_soft_cancel — enters CANCELLED before delegating, so a phase
+    # still short of CANCELLED proves this layer did not handle the cancel
+    # itself and then re-raise.
+    assert f.wf.state is not WorkflowState.CANCELLED, (
+        f'Expected the cancel to propagate uncaught, but the workflow already '
+        f'finalised it locally: state={f.wf.state!r}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +565,7 @@ async def _armed_member_callback(
         task_id='103',
         metadata={'train': {'id': _DC_TRAIN, 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
     )
     f.wf.config.delivered_checks = DeliveredChecksConfig(
         enabled=enabled, check_timeout_secs=7.5,
@@ -550,9 +577,6 @@ async def _armed_member_callback(
             if member_metadata is None else member_metadata
         ),
     })
-    f.wf._await_cancellable = AsyncMock(  # type: ignore[method-assign]
-        return_value=MergeOutcome('done', merge_sha='deadbeef'),
-    )
     await f.wf._maybe_enqueue_group_merge()
     req = f.merge_queue.get_nowait()
     f.scheduler.get_task.reset_mock()

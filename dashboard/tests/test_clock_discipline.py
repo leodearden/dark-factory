@@ -20,9 +20,13 @@ so they call `datetime.now(UTC)` directly rather than `resolve_now(None)` —
 and either thread that single value through a fan-out (`now=now` kwargs,
 mirroring how `resolve_now` callers behave in the data layer) or use it
 once locally (e.g. a ticket-age computation). Each such site is tagged
-`# clock-exempt: single-capture route`. No module besides
-`dashboard/data/*.py` and `app.py` is scanned by this guard; that boundary
-is intentional, not an oversight.
+`# clock-exempt: single-capture route`. The scan covers
+`dashboard/data/*.py`, `app.py`, `dashboard/api/*.py` and `loops.py` — the
+data layer plus every module the composition layer was split into (task
+5586 moved two tagged single-capture routes, `api_burndown` and
+`api_merge_queue`, out of `app.py` into `dashboard/api/`, and the guard
+follows them rather than quietly shedding the coverage). No module beyond
+those is scanned; that boundary is intentional, not an oversight.
 
 The matcher intentionally does not require the receiver to be a bare
 `datetime` name: it flags any `.now(...)` attribute call, so an aliased
@@ -154,6 +158,12 @@ def test_aliased_module_import_fires():
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
 _APP_PY = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'app.py'
+_API_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'api'
+_LOOPS_PY = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'loops.py'
+
+# Seven route modules plus the package marker. A rename or a further split
+# must fail loudly here rather than silently shrinking the scan.
+_MIN_API_MODULES = 8
 
 
 def test_no_bare_clock_reads_in_data_modules():
@@ -213,4 +223,40 @@ def test_no_bare_clock_reads_in_app_composition_layer():
     assert not violations, (
         'Bare datetime.now() reads found in app.py (missing a '
         '`# clock-exempt:` tag):\n' + '\n'.join(violations)
+    )
+
+
+def test_no_bare_clock_reads_in_extracted_route_and_loop_modules():
+    """The modules split out of `app.py` carry the same clock discipline.
+
+    Task 5586 moved six route handlers and the two background samplers out
+    of `app.py`. Two of those handlers (`api_burndown`, `api_merge_queue`)
+    read the clock once per request under a `# clock-exempt: single-capture
+    route` tag, so scanning only `app.py` after the move would drop their
+    coverage without a single test turning red — the exact way a guard rots.
+    The member count is asserted first so a later rename or split fails
+    loudly instead of quietly emptying the scan.
+    """
+    api_files = sorted(_API_DIR.glob('*.py'))
+
+    assert len(api_files) >= _MIN_API_MODULES, (
+        f'only {len(api_files)} modules found under {_API_DIR} '
+        f'({[p.name for p in api_files]}) — fewer than the '
+        f'{_MIN_API_MODULES} that existed when this guard was written; '
+        'a check that quietly stops checking is indistinguishable from a '
+        'passing one'
+    )
+    assert _LOOPS_PY.is_file(), f'scan target is missing: {_LOOPS_PY}'
+
+    scanned = api_files + [_LOOPS_PY]
+
+    violations: list[str] = []
+    for path in scanned:
+        rel = path.relative_to(_API_DIR.parent.parent)
+        for lineno, text in find_clock_violations(path.read_text()):
+            violations.append(f'{rel}:{lineno}: {text.strip()}')
+
+    assert not violations, (
+        'Bare datetime.now() reads found in the modules extracted from '
+        'app.py (missing a `# clock-exempt:` tag):\n' + '\n'.join(violations)
     )

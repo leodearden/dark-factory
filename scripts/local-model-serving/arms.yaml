@@ -295,8 +295,19 @@ arms:
   #
   # RE-MEASURED 2026-08-06 AFTER the pooling KV bound landed, superseding the
   # figures this comment used to carry (qwen3-0.6b 16603 MiB, qwen3-4b 16078
-  # MiB): granite 789 MiB/129 ms, gte-modernbert 788 MiB/115 ms, qwen3-0.6b
-  # 3584 MiB/507 ms, qwen3-4b 10114 MiB/630 ms.  The two ~790 MiB arms are
+  # MiB), and the LATENCIES re-measured again 2026-09-12 (task 4229's live
+  # slate, on the instrument task 3781 built) -- COLD (discarded warm-up) then
+  # WARM (measured).  These are the figures the COMMITTED artifact carries:
+  #   granite         787 MiB    53.4 ms cold ->  36.2 ms warm
+  #   gte-modernbert  787 MiB    37.9 ms cold ->  27.5 ms warm
+  #   qwen3-0.6b     3581 MiB   571.3 ms cold ->  38.8 ms warm
+  #   qwen3-4b      10123 MiB   616.4 ms cold ->  40.8 ms warm
+  # The old single figures (129/115/507/630 ms) were the COLD column and
+  # overstated served latency by up to 14.7x.  NOT COMPARABLE ACROSS ARMS: each
+  # is a single-sample health probe, engine-warm and prefix-cold, and is not
+  # zeta's p95-under-load envelope metric (task 3719).  Do not rank arms on
+  # them -- see the artifact's `latency_caveat` field and the README section
+  # "How the instrument separates cold from warm".  The two ~790 MiB arms are
   # encoder models; the other two are DECODERS that emit embeddings, and vLLM
   # hands a decoder a paged KV cache sized to fill --gpu-memory-utilization
   # whether a pooling model can use it or not.

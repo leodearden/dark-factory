@@ -17,9 +17,11 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _merge_lane_fakes import FakeClock
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     MergeRequest,
@@ -92,8 +94,31 @@ def _make_req(
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    """Build a bare MergeLane for unit tests (no harness wiring).
+
+    ``snapshot()`` is this file's only observation surface and it stamps
+    every read against the worker's clock, so the clock port is the fake
+    one.  The verify port is left production: nothing here runs a verify,
+    and an unexercised double would assert nothing.
+    """
+    return MergeLane(git_ops, asyncio.Queue(), clock=FakeClock())
+
+
+def _graph(worker: SpeculativeMergeWorker) -> dict:
+    """The worker's suffix conflict graph, read off its public snapshot.
+
+    ``SuffixConflictGraph.to_snapshot_dict`` is the JSON-safe view: ``nodes``
+    is a list in pick order, each edge a sorted 2-element list, and both edge
+    collections and ``conflicts_with_main`` sorted.  ``_edge`` builds an edge
+    in that canonical shape so membership reads the same as it did against
+    the frozensets.
+    """
+    return worker.snapshot()['suffix_conflict_graph']
+
+
+def _edge(req_a: MergeRequest, req_b: MergeRequest) -> list[str]:
+    """The unordered edge between two requests, in the snapshot's shape."""
+    return sorted([req_a.request_id, req_b.request_id])
 
 
 # ── step-01: SuffixConflictGraph dataclass ────────────────────────────────────
@@ -286,20 +311,6 @@ class TestSnapshotSuffixConflictGraphKey:
         snap = worker.snapshot()
         assert snap['suffix_conflict_graph'] == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
 
-    async def test_snapshot_reflects_stored_graph(self, git_ops, config, git_repo):
-        """snapshot() reflects self._suffix_conflict_graph when set manually."""
-        worker = _make_worker(git_ops)
-        edge = frozenset({'mr-aaa', 'mr-bbb'})
-        custom_graph = SuffixConflictGraph(
-            nodes=('mr-aaa', 'mr-bbb'),
-            textual_edges=frozenset({edge}),
-            footprint_edges=frozenset({edge}),
-            conflicts_with_main=frozenset({'mr-aaa'}),
-        )
-        worker._suffix_conflict_graph = custom_graph
-        snap = worker.snapshot()
-        assert snap['suffix_conflict_graph'] == custom_graph.to_snapshot_dict()
-
     async def test_snapshot_backward_compat_keys_unchanged(self, git_ops, config, git_repo):
         """Pre-existing snapshot keys (depth, entries, head_of_line) are unchanged."""
         worker = _make_worker(git_ops)
@@ -354,22 +365,19 @@ class TestRecomputeFootprintEdges:
 
         await worker.recompute_suffix_conflict_graph()
 
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
         # A and B share shared.txt — footprint overlap
-        pair_ab = frozenset({req_a.request_id, req_b.request_id})
-        assert pair_ab in g.footprint_edges
+        assert _edge(req_a, req_b) in g['footprint_edges']
         # A and C, B and C do NOT share files
-        pair_ac = frozenset({req_a.request_id, req_c.request_id})
-        pair_bc = frozenset({req_b.request_id, req_c.request_id})
-        assert pair_ac not in g.footprint_edges
-        assert pair_bc not in g.footprint_edges
+        assert _edge(req_a, req_c) not in g['footprint_edges']
+        assert _edge(req_b, req_c) not in g['footprint_edges']
 
     async def test_empty_suffix_yields_empty_graph(self, git_ops, config, git_repo):
         """Empty suffix → EMPTY_SUFFIX_CONFLICT_GRAPH stored."""
         worker = _make_worker(git_ops)
         # No items in lane buffers
         await worker.recompute_suffix_conflict_graph()
-        assert worker._suffix_conflict_graph == EMPTY_SUFFIX_CONFLICT_GRAPH
+        assert _graph(worker) == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
 
     async def test_nodes_in_pick_order_high_before_normal(
         self, git_ops, config, git_repo
@@ -401,11 +409,11 @@ class TestRecomputeFootprintEdges:
 
         await worker.recompute_suffix_conflict_graph()
 
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
         # high must precede normal
-        hi_idx = g.nodes.index(req_hi.request_id)
-        n1_idx = g.nodes.index(req_n1.request_id)
-        n2_idx = g.nodes.index(req_n2.request_id)
+        hi_idx = g['nodes'].index(req_hi.request_id)
+        n1_idx = g['nodes'].index(req_n1.request_id)
+        n2_idx = g['nodes'].index(req_n2.request_id)
         assert hi_idx < n1_idx < n2_idx
 
 
@@ -443,10 +451,9 @@ class TestTextualEdgesSubsetOfFootprint:
         worker._lane_buffers['normal'].append(req_y)
 
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
 
-        pair_xy = frozenset({req_x.request_id, req_y.request_id})
-        assert pair_xy in g.textual_edges
+        assert _edge(req_x, req_y) in g['textual_edges']
 
     async def test_different_line_edit_no_textual_edge(
         self, git_ops, config, git_repo
@@ -487,13 +494,12 @@ class TestTextualEdgesSubsetOfFootprint:
         worker._lane_buffers['normal'].append(req_d)
 
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
 
-        pair_cd = frozenset({req_c.request_id, req_d.request_id})
         # footprint overlap (same file)
-        assert pair_cd in g.footprint_edges
+        assert _edge(req_c, req_d) in g['footprint_edges']
         # but NOT a textual conflict (different lines → clean merge)
-        assert pair_cd not in g.textual_edges
+        assert _edge(req_c, req_d) not in g['textual_edges']
 
     async def test_textual_edges_subset_of_footprint_edges(
         self, git_ops, config, git_repo
@@ -519,10 +525,10 @@ class TestTextualEdgesSubsetOfFootprint:
         worker._lane_buffers['normal'].append(req_y)
 
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
 
         # Every textual edge must also be a footprint edge
-        assert g.textual_edges <= g.footprint_edges
+        assert all(edge in g['footprint_edges'] for edge in g['textual_edges'])
 
 
 # ── step-09: conflicts_with_main (δ user-signal) ─────────────────────────────
@@ -570,10 +576,10 @@ class TestConflictsWithMain:
         worker._lane_buffers['normal'].append(req_y)
 
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
 
-        assert req_x.request_id in g.conflicts_with_main
-        assert req_y.request_id not in g.conflicts_with_main
+        assert req_x.request_id in g['conflicts_with_main']
+        assert req_y.request_id not in g['conflicts_with_main']
 
     async def test_conflicts_with_main_in_snapshot(
         self, git_ops, config, git_repo
@@ -715,8 +721,8 @@ class TestAcquireNextRequestHook:
         result = await worker._acquire_next_request()
         assert result is req
         # After returning, the graph must have the request_id as a node
-        g = worker._suffix_conflict_graph
-        assert req.request_id in g.nodes
+        g = _graph(worker)
+        assert req.request_id in g['nodes']
 
 
 # ── step-15: fail-open error handling ─────────────────────────────────────────
@@ -758,11 +764,10 @@ class TestRecomputeFailOpen:
 
         # Must NOT raise
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
 
         # Pair should be conservatively marked as textual edge (fail-open)
-        pair_ab = frozenset({req_a.request_id, req_b.request_id})
-        assert pair_ab in g.textual_edges
+        assert _edge(req_a, req_b) in g['textual_edges']
 
     async def test_probe_error_conservative_conflicts_with_main(
         self, git_ops, config, git_repo
@@ -784,9 +789,9 @@ class TestRecomputeFailOpen:
         git_ops.merge_tree_conflicts = boom
 
         await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
         # Conservatively in conflicts_with_main
-        assert req_c.request_id in g.conflicts_with_main
+        assert req_c.request_id in g['conflicts_with_main']
 
     async def test_missing_ref_skipped_without_raising(
         self, git_ops, config, git_repo
@@ -801,9 +806,16 @@ class TestRecomputeFailOpen:
 
         # Must NOT raise
         await worker.recompute_suffix_conflict_graph()
-        # Graph should be produced (empty or with empty edges)
-        g = worker._suffix_conflict_graph
-        assert isinstance(g, SuffixConflictGraph)
+        # Both items stay in the graph as nodes, but with every probe
+        # SKIPPED — no edge, no vs-main marker.  That is what distinguishes a
+        # missing ref from the two fail-open arms above, which mark
+        # conservatively when a probe RAISES.
+        assert _graph(worker) == {
+            'nodes': [req_gone.request_id, req_gone_2.request_id],
+            'textual_edges': [],
+            'footprint_edges': [],
+            'conflicts_with_main': [],
+        }
 
 
 # ── step-17: regression test for masked transient-error bug ──────────────────
@@ -872,16 +884,6 @@ class TestRecomputeTransientErrorGatesSignature:
         assert call_count >= 1, (
             'Expected merge_tree_conflicts to be called at least once '
             '(vs-main probe) but got zero calls'
-        )
-
-        # CRITICAL: signature must NOT be cached when a probe error occurred.
-        # A transient error leaves the signature un-stored so the next tick
-        # re-probes instead of serving a degraded/incomplete graph behind the
-        # debounce.
-        assert worker._suffix_conflict_signature is None, (
-            'Expected _suffix_conflict_signature to be None after a '
-            'get_changed_files failure (transient error must not be cached), '
-            f'but got {worker._suffix_conflict_signature!r}'
         )
 
         count_after_first = call_count

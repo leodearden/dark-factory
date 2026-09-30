@@ -181,3 +181,34 @@ Added by `plans/fable-architect-eval-admission-prd.md`'s authoring session (the
 Machine-readable sidecar (PRD-derived path, new as of this edit):
 `plans/eval-framework-revival-prd.capability-manifest.yaml` — carries π only;
 earlier tasks predate the sidecar convention.
+
+## Unbound task labels (task 4907 adjudication)
+
+**Class A1 — the wave before the sidecar.** Fifteen tasks, all `done` when
+measured on 2026-09-23, carry this PRD's `metadata.prd_path` and a
+`prd_task_label` the YAML sidecar does not declare: **2464** α, **2466** β,
+**2469** γ, **2470** δ, **2471** ε, **2472** ι, **2473** ζ, **2474** η,
+**2475** θ, **2476** κ, **2477** λ, **2478** μ, **2479** ν, **2480** ξ and
+**2825** ο. `commit_planning`'s label→task-id stamper binds nothing for these
+labels, so none of these tasks receives `metadata.delivered_checks` from the
+sidecar.
+
+Evidence. The sidecar was created on 2026-07-20 (commit `9e1487a314`) for the
+later paired-edit wave. It declares only π, ρ, σ, υ and φ, all stamped
+(π = 2861; ρ, σ, υ, φ = 3627–3630, added 2026-08-04 in commit `379f00ea41`),
+and every omitted task id is lower than π's 2861. The sidecar's own header
+said so when it shipped: earlier eval-revival tasks predate the sidecar
+convention, and their bindings live in this `.md` manifest only. That header
+was erased minutes later by its stamp commit `a238df3886`, because the stamper
+(`fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl`)
+writes the sidecar back through `yaml.safe_dump`, which keeps no comments. The
+same statement survives here, as the last sentence of the "π — architect-fable
+OFAT candidate" section above. Its "carries π only" was true when written.
+
+**Verdict: not a defect, no repair.** The labels are this PRD's own, and the
+sidecar was never meant to cover them. A sidecar is scoped, not a per-task
+registry: `plans/capability-delivered-checks-prd.md` §"Sketch of approach",
+"Coverage caveat (scope)".
+
+Recorded, not repaired: ο (2825) has no section in this manifest or in the
+sidecar, and this manifest never received sections for ρ, σ, υ or φ.

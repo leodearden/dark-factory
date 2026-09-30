@@ -62,7 +62,7 @@ def _make_fake_main_run_census():
         calls.append(kwargs)
         return mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-08-03.md",
-            filed_task_ids=[], stop_reason="exhausted",
+            filed_ticket_ids=[], stop_reason="exhausted",
         )
 
     fake_run_census.calls = calls

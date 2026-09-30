@@ -499,3 +499,158 @@ class TestAdjudicateNeutralCwd:
         assert call_kwargs['cwd'] == neutral_cli_cwd()
         assert call_kwargs['cwd'] != tmp_path
         assert call_kwargs['cwd'] != Path('/some/project')
+
+
+# ===========================================================================
+# Task 3122: is_confirmed_misroute — the correctly-polarised accessor for a
+# soft-signal caller, whose base state is ALLOW rather than REJECT.
+# ===========================================================================
+
+
+class TestIsConfirmedMisrouteDataclass:
+    """Direct dataclass polarity — no LLM needed."""
+
+    def test_clean_reject_is_the_only_true_case(self):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        assert (
+            AdjudicationVerdict(verdict='reject', failed=False).is_confirmed_misroute
+            is True
+        )
+
+    def test_allow_is_not_a_confirmed_misroute(self):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        assert (
+            AdjudicationVerdict(verdict='allow', failed=False).is_confirmed_misroute
+            is False
+        )
+
+    def test_uncertain_is_not_a_confirmed_misroute(self):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        assert (
+            AdjudicationVerdict(verdict='uncertain', failed=False).is_confirmed_misroute
+            is False
+        )
+
+    def test_failed_reject_is_not_a_confirmed_misroute(self):
+        """A reject the adjudicator did not actually reach confirms nothing."""
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        assert (
+            AdjudicationVerdict(verdict='reject', failed=True).is_confirmed_misroute
+            is False
+        )
+
+    def test_default_constructed_verdict_is_not_a_confirmed_misroute(self):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        assert AdjudicationVerdict().is_confirmed_misroute is False
+
+    def test_the_two_properties_are_not_complements(self):
+        """POLARITY PIN — each is fail-safe toward its OWN caller's base state.
+
+        ``should_allow_creation`` is fail-safe toward REJECTING (its caller's
+        base state is reject); ``is_confirmed_misroute`` is fail-safe toward
+        DOING NOTHING (its caller's base state is allow).  They are therefore
+        BOTH False across every failed state and across ``uncertain`` — never
+        complements.  Consuming ``not should_allow_creation`` at the
+        soft-signal call site would stamp a misroute on every timeout,
+        breaker-open and exception.
+        """
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        states = [
+            AdjudicationVerdict(verdict='allow', failed=False),
+            AdjudicationVerdict(verdict='reject', failed=False),
+            AdjudicationVerdict(verdict='uncertain', failed=False),
+            AdjudicationVerdict(verdict='reject', failed=True),
+            AdjudicationVerdict(verdict='uncertain', failed=True),
+        ]
+        # Not a complement in ANY state: at most one of the five agrees by
+        # coincidence, and the interesting ones disagree outright.
+        both_false = [
+            v
+            for v in states
+            if v.should_allow_creation is False and v.is_confirmed_misroute is False
+        ]
+        assert len(both_false) == 3
+
+        infra_failure = AdjudicationVerdict(verdict='uncertain', failed=True)
+        assert infra_failure.should_allow_creation is False
+        assert infra_failure.is_confirmed_misroute is False
+
+
+@pytest.mark.asyncio
+class TestIsConfirmedMisrouteThroughTheLlmSeam:
+    """Infrastructure failure and a real confirmed misroute stay distinguishable."""
+
+    async def test_clean_reject_confirms_the_misroute(self, tmp_path):
+        """The one that matters most: a real reject IS confirmable."""
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(
+            success=True,
+            structured_output={'verdict': 'reject', 'reason': 'genuinely modifies it'},
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is True
+        assert verdict.failed is False
+
+    async def test_breaker_open_does_not_confirm(self, tmp_path):
+        cfg = PathScopeAdjudicatorConfig(zero_output_breaker_threshold=1)
+        adj = _make_adjudicator(cfg, tmp_path=tmp_path)
+        zot = _agent_result(success=False, output='', timed_out=True, turns=0)
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot)):
+            await _do_adjudicate(adj)
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot)) as mock2:
+            verdict = await _do_adjudicate(adj)
+
+        assert mock2.await_count == 0
+        assert verdict.is_confirmed_misroute is False
+
+    async def test_exception_does_not_confirm(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        with patch(_INVOKE_PATH, side_effect=RuntimeError('boom')):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is False
+
+    async def test_zero_output_timeout_does_not_confirm(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(success=False, output='', timed_out=True, subtype='error')
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is False
+
+    async def test_budget_misconfig_does_not_confirm(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is False
+
+    async def test_non_dict_structured_output_does_not_confirm(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(success=True, structured_output='reject')
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is False
+
+    async def test_unknown_verdict_string_does_not_confirm(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(
+            success=True,
+            structured_output={'verdict': 'misroute', 'reason': 'not in the enum'},
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert verdict.is_confirmed_misroute is False

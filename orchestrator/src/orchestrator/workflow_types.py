@@ -270,11 +270,14 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
         WarmLaneDiskPressure,
+        WarmLaneLockContention,
+        WarmLaneLockTimeout,
         WarmLanePoolExhausted,
         WarmLanePoolHardDown,
         WarmLaneRequeue,
         WarmLaneReseedContaminated,
         WarmLaneSoftPressure,
+        WarmLaneStealFailed,
         WorktreeConflictError,
         WorktreeMissing,
     )
@@ -378,6 +381,39 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='warm_lane_pool_hard_down',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # Lane-lock contention (task 4211): seed exited 77 under reify's
+        # opt-in --distinct-lock-refusal-rc (reify 5568) because another live
+        # consumer holds <lane_dir>.lock, so it refused rather than seeded.
+        #
+        # An EXPLICIT own-key row, not MRO inheritance, and that is the whole
+        # point of the row.  _lookup_disposition walks __mro__, so a
+        # WarmLaneRequeue subclass with no row of its own resolves to the base
+        # row above — whose reason_prefix is literally
+        # 'warm_lane_disk_pressure (transient infra)'.  Inheriting it would
+        # keep rendering a lane-lock refusal as disk pressure, which is
+        # precisely the operator-facing defect this task fixes (the misleading
+        # string operators read throughout reify esc-5556-1, when seed's two
+        # refusal arms both exited 75 and seed has no disk-pressure exit-75
+        # path at all).  BD-2 completeness does NOT catch this — MRO
+        # resolution already satisfies it — so the guard is the OWN-KEY
+        # assertion in test_block_disposition.py, mirroring the
+        # LaneLockSelfOwnedLeak precedent.
+        #
+        # counts_against_requeue_cap=False: the DISK_PRESSURE / HARD_DOWN /
+        # SOFT_PRESSURE shared-resource shape, deliberately NOT
+        # WarmLaneReseedContaminated's =True.  Per the family comment above,
+        # only per-task DATA-INTEGRITY faults burn the cap; a lock held by
+        # ANOTHER live consumer is a shared-resource condition and no fault of
+        # the requeued task, so charging its cap would punish the wrong party
+        # and recreate the retry-cap-escalation storm task 2988 fixed.
+        WarmLaneLockContention: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_lock_contention (transient contention)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
         # θ proactive soft-floor throttle (task 2443, §9.5 inv.11): pure
         # backpressure/defer for a FRESH allocation — deliberately weaker
         # than ε's hard-floor WarmLaneDiskPressure exit-75 row above, so it
@@ -403,6 +439,62 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='warm_lane_soft_pressure (backpressure)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # ── Steal-path family (task 4930) ────────────────────────────────
+        # Both come from the reclaim-on-exhaustion steal path and neither is
+        # the requeued task's fault, but they split on the requeue cap:
+        #
+        # WarmLaneLockTimeout is transient SHARED-RESOURCE CONTENTION — the
+        # seed lost the bounded <lane>.lock wait to a concurrent GC reseed /
+        # thin / seed (rc=124). In the measured producer the holder is a GC
+        # reseed that DOES finish (holds 25-88s, median ~34s, against a 30s
+        # wait), so the condition clears on its own and must not burn the
+        # requeued task's cap; exactly the shape of its WarmLaneDiskPressure /
+        # WarmLaneSoftPressure neighbours above.
+        #
+        # ACCEPTED RISK — the live-but-wedged holder. flock releases a lock on
+        # holder *death*, never on a stuck-but-live process (the reason
+        # GitOps._seed_warm_lane bounds the wait at all), so a hung thin
+        # `rm -rf`, a stalled GC reclaim, or a caller that seeds with the
+        # default lane_lock=SeedLaneLock.TAKE while already holding the lock
+        # produces rc=124 on EVERY attempt and does NOT self-clear. On the
+        # steal path the retry driver moves to a DIFFERENT lane
+        # (LANE_LOCK_TIMEOUT is in git_ops._STEAL_RETRYABLE), but a FREE-lane
+        # acquire re-picks the same lowest-index lane, so this uncounted row
+        # lets such a task requeue indefinitely with no cap escalation. That
+        # is accepted rather than overlooked: counting the common
+        # (self-clearing) case would charge every task caught behind an
+        # ordinary GC overlap for contention it did not cause, and the wedged
+        # case is not silent — each attempt logs an `acquire_warm_lane:`
+        # WARNING naming rc=124 and the lane, and every requeue carries the
+        # greppable reason_prefix below. If chronic rc=124 on a single lane is
+        # ever observed in the journal, the fix is to unwedge the holder (or
+        # flip this row to counts_against_requeue_cap=True, as
+        # WarmLaneStealFailed does), NOT to widen the bounded wait.
+        #
+        # WarmLaneStealFailed is NOT self-clearing. Chronic pool pressure keeps
+        # the valve stealing, and a pool that is handing out hostile lanes goes
+        # on doing so until an operator intervenes — so counting it (like
+        # WarmLaneReseedContaminated below) preserves a bounded LOUD path via
+        # the requeue-cap escalation, in place of the per-task BLOCKED+L1 that
+        # task 4930 removes. Without the count the task would trade "always
+        # escalates" for "requeues forever in silence", which is the worse
+        # failure of the two.
+        WarmLaneLockTimeout: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_lock_timeout (transient infra)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WarmLaneStealFailed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='warm_lane_steal_failed (pool pressure)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # Reseed contamination (task 2854): a fresh-reseed acquire left the

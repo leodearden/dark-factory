@@ -143,16 +143,17 @@ def _item(
 ) -> QueueItem:
     """A QueueItem built straight from a row tuple — no DB needed.
 
-    The 12-tuple order is QueueItem.__slots__ (durable_queue.py:114-118):
-    id, group_id, operation, payload, callback_type, status, attempts,
-    max_attempts, next_retry_at, created_at, completed_at, error.
+    The 13-tuple order is QueueItem.__slots__: id, group_id, operation,
+    payload, callback_type, status, attempts, max_attempts, next_retry_at,
+    created_at, completed_at, error, executed. It must stay in step with the
+    write_queue column order, which QueueItem unpacks positionally.
     *payload* may be a dict (serialised here, as enqueue does) or a raw string,
     so the malformed-JSON cases can be expressed directly.
     """
     payload_text = payload if isinstance(payload, str) else json.dumps(payload)
     return QueueItem((
         item_id, group_id, operation, payload_text, None, 'in_flight',
-        attempts, max_attempts, 0.0, 0.0, None, None,
+        attempts, max_attempts, 0.0, 0.0, None, None, None,
     ))
 
 

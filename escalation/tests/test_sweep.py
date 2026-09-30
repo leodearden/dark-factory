@@ -7,6 +7,13 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
+
+from _scan_race_helpers import (
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
 from escalation import sweep
 from escalation.models import Escalation
@@ -310,6 +317,93 @@ class TestSweepSafety:
         assert report.skipped_unparsable == 1
         assert report.archived == 0
 
+    def test_undecodable_bytes_in_root_do_not_abort_the_pass(self, tmp_path: Path):
+        """A non-UTF-8 esc-*.json is counted unparsable; the pass still completes.
+
+        The sibling above writes ``b'{not valid json'`` -- valid UTF-8 that
+        fails at ``Escalation.from_json``.  This one fails EARLIER, inside
+        ``read_text()``'s decode, which is a different exception path:
+        ``UnicodeDecodeError`` subclasses ``ValueError`` and NOT ``OSError``,
+        so a read guard that catches only FileNotFoundError/OSError lets it
+        escape.  Blast radius when it does: ``run_startup_sweep`` is wrapped in
+        a bare ``except Exception`` by the escalation server, so the whole
+        startup pass -- archive, loose-reap, prune, lock-reap -- is skipped and
+        logged as merely non-fatal.  That is the whole-pass abort this class of
+        fix exists to eliminate, so it is pinned here.
+        """
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        bad = tmp_path / 'esc-9-1.json'
+        bad.write_bytes(b'\xff\xfe\x00bad')
+
+        report = sweep.sweep(tmp_path, apply=True)
+
+        # The pass completed its real work despite the bad file.
+        assert report.archived == 1
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        # A content fault that STAYED in root -- not a benign relocation.
+        # Conflating the two would misreport corruption as a routine race.
+        assert report.skipped_unparsable == 1
+        assert report.skipped_vanished == 0
+        assert bad.exists()
+        # Arithmetic pinned against ground truth, not against a restatement
+        # of the formula.
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+    def test_unreadable_file_is_counted_loud_and_does_not_abort_the_pass(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file is counted and the pass continues.
+
+        This is a deliberate BEHAVIOUR CHANGE, so it is pinned: before the fix
+        a PermissionError propagated out of sweep() and — since the escalation
+        server wraps run_startup_sweep in a bare ``except Exception`` — took
+        the whole startup pass with it.  Now the record is skipped, counted,
+        and warned about.
+
+        It is the failure mode operators are most likely to actually hit (a
+        bad umask, a root-owned file, a full-disk EIO), and without a pin a
+        refactor that folds 'unreadable' back into an early return, or drops
+        the ``reason != 'ok'`` catch-all, silently reintroduces the abort.
+        """
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        doomed = _write_root_esc(
+            tmp_path, 'esc-9-1', 'resolved', resolved_at=self.RESOLVED_AT,
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', unreadable_read_text(doomed)),
+        ):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # The pass completed its real work despite the unreadable file.
+        assert report.archived == 1, f'expected the healthy record archived; got {report.archived}'
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+
+        # An I/O fault is a file left IN root for an operator to act on — the
+        # documented meaning of skipped_unparsable — and NOT a benign
+        # relocation, which is the one thing it must never be conflated with.
+        assert report.skipped_unparsable == 1, (
+            f'expected the unreadable file counted; got {report.skipped_unparsable}'
+        )
+        assert report.skipped_vanished == 0, (
+            f'an unreadable file did not vanish; got {report.skipped_vanished}'
+        )
+        assert doomed.exists(), 'an unreadable file must be left exactly where it was'
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+        # Loud, and on the I/O channel: an operator told 'Failed to parse'
+        # goes hunting for corrupt JSON instead of checking permissions.
+        loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'expected a WARNING naming {doomed}; got '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f'an I/O fault must not be reported as a parse failure; got '
+            f'{[r.getMessage() for r in loud]}'
+        )
+
     def test_missing_resolved_at_on_resolved_file_skipped(self, tmp_path: Path):
         """resolved file with resolved_at=None stays in root, counted as skipped."""
         path = _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=None)
@@ -562,6 +656,50 @@ class TestRunStartupSweep:
         ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
 
 
+class TestSweepSurvivesRecordVanishedMidScan:
+    """One record vanishing must not abort a whole sweep pass — and must be
+    accounted for HONESTLY rather than folded into an existing counter."""
+
+    def test_sweep_completes_and_counts_the_vanished_record(self, tmp_path: Path):
+        """RED on main for two independent reasons: FileNotFoundError escapes
+        the read, and SweepReport has no skipped_vanished field."""
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-2-1', 'pending')
+        doomed = _write_root_esc(
+            tmp_path, 'esc-3-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00',
+        )
+
+        flaky = relocating_read_text(doomed, tmp_path / 'archive' / '2026-09-04')
+
+        with patch.object(Path, 'read_text', flaky):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # (b) The sweep still completes its real work.
+        assert report.archived == 1, f'expected the terminal record archived; got {report.archived}'
+        assert report.untouched_pending == 1, (
+            f'expected the pending record untouched; got {report.untouched_pending}'
+        )
+
+        # (c) A file relocated by someone else is NOT an unparsable file left
+        # in root.  Folding it into skipped_unparsable would misreport a benign
+        # race as operator-actionable corruption.
+        assert report.skipped_vanished == 1, (
+            f'expected 1 vanished record; got {report.skipped_vanished}'
+        )
+        assert report.skipped_unparsable == 0, (
+            f'a vanished file is not unparsable; got {report.skipped_unparsable}'
+        )
+
+        # (d) root_after must match GROUND TRUTH, not a restatement of the
+        # formula: the vanished file was counted in root_before yet belongs to
+        # none of the other subtracted categories, so without its own term the
+        # operator-facing figure over-reports.
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json'))), (
+            f'root_after={report.root_after} disagrees with the actual on-disk '
+            f'root count {len(list(tmp_path.glob("esc-*.json")))}'
+        )
+
+
 class TestReapLooseArchiveFiles:
     """Tests for sweep.reap_loose_archive_files."""
 
@@ -707,6 +845,85 @@ class TestReapLooseArchiveFiles:
 
         assert loose_path.exists()
         assert count == 0
+
+    def test_undecodable_bytes_do_not_abort_the_reap(self, tmp_path: Path):
+        """A non-UTF-8 loose file is left in place; the reap still relocates the rest.
+
+        Distinct from the sibling above: ``b'{not valid json'`` is valid UTF-8
+        and fails at ``Escalation.from_json``, whereas these bytes fail inside
+        ``read_text()``'s decode.  ``UnicodeDecodeError`` subclasses
+        ``ValueError`` but not ``OSError``, so a read guard covering only
+        FileNotFoundError/OSError lets it escape and abort the whole reap pass.
+        """
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        good_path = archive_root / 'esc-1-1.json'
+        good_path.write_text(
+            Escalation(
+                id='esc-1-1',
+                task_id='1',
+                agent_role='test',
+                severity='info',
+                category='cleanup_needed',
+                summary='loose test',
+                status='resolved',
+                resolved_at='2026-05-20T10:00:00+00:00',
+            ).to_json()
+        )
+        bad_path = archive_root / 'esc-7-1.json'
+        bad_path.write_bytes(b'\xff\xfe\x00bad')
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # The good record was still relocated -- the pass continued.
+        assert count == 1
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not good_path.exists()
+        # The undecodable one is left exactly where it was, for an operator.
+        assert bad_path.exists()
+
+
+    def test_reap_survives_a_loose_file_relocated_mid_scan(self, tmp_path: Path):
+        """A concurrent sweep can relocate a loose file between this scan's
+        glob and its read — neither actor holds a lock over that window, since
+        _relocate_terminal takes the per-id lock only around the move itself.
+
+        RED on main: this loop catches only
+        (JSONDecodeError, KeyError, TypeError, ValueError), so the
+        FileNotFoundError propagates and the whole reap pass aborts.
+        """
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        for esc_id in ('esc-1-1', 'esc-2-1'):
+            esc = Escalation(
+                id=esc_id,
+                task_id='1',
+                agent_role='test',
+                severity='info',
+                category='cleanup_needed',
+                summary='loose test',
+                status='resolved',
+                resolved_at='2026-05-20T10:00:00+00:00',
+            )
+            (archive_root / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = archive_root / 'esc-2-1.json'
+        flaky = relocating_read_text(doomed, archive_root / '2026-05-20')
+
+        with patch.object(Path, 'read_text', flaky):
+            count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # (b) The tally counts relocations this pass actually performed; the
+        # one a concurrent sweep already moved is neither counted nor re-moved.
+        assert count == 1, f'expected 1 relocation performed by this pass; got {count}'
+
+        # (c) Both records end up filed, and nothing is left loose.
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert (archive_root / '2026-05-20' / 'esc-2-1.json').exists()
+        assert not list(archive_root.glob('esc-*.json')), (
+            f'no loose file may remain; found '
+            f'{[p.name for p in archive_root.glob("esc-*.json")]}'
+        )
 
 
 class TestSweepRelocationLock:
@@ -1269,3 +1486,281 @@ class TestArchiveStemsHelper:
 
         assert stems == {'esc-1-1'}
         assert [r.getMessage() for r in caplog.records] == []
+
+
+def _relocating_lock(doomed: Path, dest_dir: Path):
+    """Interpose sweep's per-id lock to relocate *doomed* just before it is held.
+
+    Models the concurrent actor FAITHFULLY rather than mocking an exception.
+    ``resolve()`` takes the same per-id sidecar lock around
+    ``_archive_resolved``, so the only way it can move a record out from under
+    a sweep is by completing and releasing before the sweep acquires — which
+    is exactly this wrapper.  The lock does not protect the sweep, because
+    the sweep's READ happened earlier and OUTSIDE the lock: by the time it
+    takes the lock, the record it parsed is already stale.
+
+    Fires once (guarded on ``doomed.exists()``), then delegates to the real
+    context manager so the lock semantics under test are unchanged.
+    """
+    real = sweep.escalation_id_lock
+
+    @contextlib.contextmanager
+    def wrapper(queue_dir: Path, escalation_id: str, *args, **kwargs):
+        if doomed.exists():
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(doomed), str(dest_dir / doomed.name))
+        with real(queue_dir, escalation_id, *args, **kwargs):
+            yield
+
+    return wrapper
+
+
+class TestSweepSurvivesArchiveCopyFaults:
+    """The reconciliation branch reads the ARCHIVE copy too, and that read is
+    just as unlocked as the root one.
+
+    ``archive_index`` is built by a single rglob BEFORE the loop, so every
+    indexed path is a snapshot that a concurrent actor can invalidate: a
+    ``prune_archive`` (which ``run_startup_sweep`` itself runs as pass 3, so a
+    second orchestrator's startup sweep during a fleet redeploy is the live
+    case) rmtrees a whole dated subdir at once.  Before this fix the branch did
+    a bare ``Escalation.from_json(existing_archive.read_text())``, so the
+    resulting FileNotFoundError escaped ``sweep()`` — and the escalation server
+    wraps ``run_startup_sweep`` in a bare ``except Exception``, turning it into
+    a silently skipped startup pass.  That is the whole-pass abort this change
+    exists to eliminate, at a site INSIDE the loop being hardened.
+    """
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_archive_copy_pruned_mid_scan_falls_back_to_relocating_the_root(
+        self, tmp_path: Path,
+    ):
+        """A vanished archive copy means "no archive copy": relocate the root.
+
+        RED before the fix: FileNotFoundError out of the reconciliation read
+        aborts the entire pass, so NEITHER record is archived.
+        """
+        archive_copy = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None,
+        )
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward',
+        )
+        # A second, unrelated terminal record with no archive copy at all: it
+        # proves the PASS CONTINUES rather than merely not raising.
+        _write_root_esc(tmp_path, 'esc-2-1', 'resolved', resolved_at=self.RESOLVED_AT)
+
+        with patch.object(Path, 'read_text', pruning_read_text(archive_copy)):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # Both root records left root for the archive.
+        assert report.archived == 2, f'expected both records archived; got {report.archived}'
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-2-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+
+        # The ROOT files did not vanish and nothing was left in root for an
+        # operator: neither skip counter may move.
+        assert report.skipped_vanished == 0, (
+            f'the root records did not vanish; got {report.skipped_vanished}'
+        )
+        assert report.skipped_unparsable == 0, (
+            f'nothing was left in root to act on; got {report.skipped_unparsable}'
+        )
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+    def test_corrupt_archive_copy_leaves_the_root_copy_alone_and_counts_it(
+        self, tmp_path: Path,
+    ):
+        """An unreadable/unparsable archive copy must not abort the pass either.
+
+        Richness cannot be compared when the archive side will not parse, and
+        overwriting it blindly could destroy the only good copy — so the root
+        record stays exactly where it is, counted as operator-actionable, and
+        BOTH files survive for the operator to adjudicate.
+
+        RED before the fix: JSONDecodeError escapes and the pass aborts.
+        """
+        archive_copy = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None,
+        )
+        archive_copy.write_text('{not valid json')
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward',
+        )
+        _write_root_esc(tmp_path, 'esc-2-1', 'resolved', resolved_at=self.RESOLVED_AT)
+
+        report = sweep.sweep(tmp_path, apply=True)
+
+        # The pass completed its real work on the healthy record.
+        assert report.archived == 1, f'expected the healthy record archived; got {report.archived}'
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-2-1.json').exists()
+
+        # Nothing was destroyed: both copies of esc-1-1 are still on disk.
+        assert root_path.exists(), 'the root copy must not be moved onto a corrupt archive copy'
+        assert archive_copy.read_text() == '{not valid json', 'the archive copy must be untouched'
+
+        # Left IN root for an operator-actionable reason — the counter's
+        # documented meaning — and NOT a benign relocation.
+        assert report.skipped_unparsable == 1, (
+            f'expected the corrupt-archive pair counted once; got {report.skipped_unparsable}'
+        )
+        assert report.skipped_vanished == 0
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+
+class TestSweepSurvivesRelocationInTheMoveWindow:
+    """Guarding the READ closes only half the window; the MOVE is still exposed.
+
+    ``sweep()`` reads a record OUTSIDE any lock, then takes the per-id lock to
+    move it.  A concurrent ``resolve()`` that completes in between leaves the
+    source gone, and ``_atomic_move``'s ``os.replace`` re-raises every OSError
+    whose errno is not EXDEV — ENOENT included.  So the same concurrency class
+    the read guard fixes could still abort the whole pass a few lines later.
+    All three movers in the loop are pinned: the archive-missing relocation,
+    the root-wins overwrite, and the archive-wins unlink.
+    """
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_relocation_source_vanishing_is_counted_not_raised(self, tmp_path: Path):
+        """RED before the fix: FileNotFoundError out of _relocate_terminal."""
+        doomed = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT,
+        )
+        _write_root_esc(tmp_path, 'esc-2-1', 'resolved', resolved_at=self.RESOLVED_AT)
+
+        lock = _relocating_lock(doomed, tmp_path / 'archive' / '2026-09-04')
+        with patch.object(sweep, 'escalation_id_lock', lock):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # The other record still made it: the pass continued.
+        assert report.archived == 1, f'expected the surviving record archived; got {report.archived}'
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-2-1.json').exists()
+        # The vanished one is counted on the benign channel, not as corruption.
+        assert report.skipped_vanished == 1, (
+            f'expected the concurrently-relocated record counted; got {report.skipped_vanished}'
+        )
+        assert report.skipped_unparsable == 0
+        # root_after against ground truth: the record left root even though
+        # THIS pass is not the one that moved it.
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+    def test_root_wins_overwrite_source_vanishing_is_counted_not_raised(
+        self, tmp_path: Path,
+    ):
+        """Same window in the reconciliation root-wins branch's _atomic_move."""
+        _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None,
+        )
+        doomed = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward',
+        )
+
+        lock = _relocating_lock(doomed, tmp_path / 'archive' / '2026-09-04')
+        with patch.object(sweep, 'escalation_id_lock', lock):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        assert report.reconciled_root_wins == 0, (
+            'no reconciliation happened — the root copy was gone before the move'
+        )
+        assert report.skipped_vanished == 1, (
+            f'expected the vanished root copy counted; got {report.skipped_vanished}'
+        )
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+    def test_archive_wins_unlink_source_vanishing_is_counted_not_raised(
+        self, tmp_path: Path,
+    ):
+        """Same window in the reconciliation archive-wins branch's os.unlink."""
+        _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by='steward',
+        )
+        doomed = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT, resolved_by=None,
+        )
+
+        lock = _relocating_lock(doomed, tmp_path / 'archive' / '2026-09-04')
+        with patch.object(sweep, 'escalation_id_lock', lock):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        assert report.reconciled_archive_wins == 0, (
+            'this pass did not drop the duplicate — someone else moved it first'
+        )
+        assert report.skipped_vanished == 1, (
+            f'expected the vanished root copy counted; got {report.skipped_vanished}'
+        )
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+
+class TestScanLogsNameTheScanThatHitTheFile:
+    """Every skip channel must say WHICH scan tripped over the file.
+
+    Before the shared helper, sweep()'s and reap_loose_archive_files()' parse
+    failures were distinguishable by their own wording ('skipping unparsable
+    %s' vs 'reap_loose: skipping unparsable %s') on the ``escalation.sweep``
+    logger.  Routing both through a helper that lives in queue.py moved them
+    onto the ``escalation.queue`` logger with one shared message, so the
+    ``context`` prefix is now the ONLY thing that tells an operator which of
+    the two passes hit the file — and a logger-name filter no longer helps.
+    That makes it a contract, not a nicety.
+    """
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def _messages(self, caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_root_sweep_parse_failure_names_the_root_sweep(self, tmp_path: Path, caplog):
+        (tmp_path / 'esc-99-1.json').write_text('{not valid json')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.sweep(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(m.startswith('sweep:') and 'Failed to parse' in m for m in msgs), (
+            f"expected a parse warning attributed to 'sweep'; got {msgs}"
+        )
+
+    def test_loose_reap_parse_failure_names_the_reap(self, tmp_path: Path, caplog):
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        (archive_root / 'esc-99-1.json').write_text('{not valid json')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(m.startswith('reap_loose:') and 'Failed to parse' in m for m in msgs), (
+            f"expected a parse warning attributed to 'reap_loose'; got {msgs}"
+        )
+
+    def test_archive_copy_parse_failure_is_distinguishable_from_the_root_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """The reconciliation branch reads a SECOND file for the same record.
+
+        Both reads are of ``esc-1-1``, so without distinct contexts an operator
+        cannot tell whether the root copy or the archive copy is the corrupt
+        one — and they would go looking in the wrong tier.
+        """
+        archive_copy = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None,
+        )
+        archive_copy.write_text('{not valid json')
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.sweep(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(
+            m.startswith('sweep.archive_copy:') and str(archive_copy) in m for m in msgs
+        ), f"expected the warning to name the ARCHIVE copy's read; got {msgs}"

@@ -1,10 +1,22 @@
-"""Functions for discovering orchestrator processes and task status.
+"""Discovering orchestrator PROCESSES: which ones run, and against what root.
 
-Scans running processes (via ``ps aux``) and fetches task trees from the
-fused-memory MCP server (which is the source of truth post-2026-05-02
-SQLite cutover). ``discover_orchestrators`` is async because the MCP call
-is async; the process-scanning helper remains sync and runs via
-``asyncio.to_thread`` from the async caller.
+Scans running processes (via ``ps aux``) and resolves each to the project root
+it targets. That is the whole job. ``discover_orchestrators`` is async only
+because the ``ps`` scan runs via ``asyncio.to_thread``; the scanning helper
+itself is sync.
+
+RETIRED, and deliberately: this module used to additionally fetch EVERY
+resolved root's whole task tree from fused-memory — under a two-layer budget,
+a per-root cache and an offline/degraded split of its own — to compute a
+five-key ``summary`` and a ``last_update`` for each entry. Those were the only
+consumers of the fetch, and both are gone from the wire. The task snapshot
+unit behind ``/api/v2/dashboard/tasks``
+(``dashboard/src/dashboard/data/task_snapshot.py``) is the SINGLE place the
+dashboard measures a task population now, so a second implementation here
+would be one more copy to keep in agreement by hand — and the one that fell
+behind, since nothing on this route ever validated its counts. A handler that
+reads no task tree needs no budget for one, which is why the budget constants
+went with it rather than being left inert.
 
 FORMAT COUPLING
 ================
@@ -52,10 +64,7 @@ import re
 import subprocess
 from pathlib import Path
 
-import httpx
-
 from dashboard.config import DashboardConfig
-from dashboard.data.tasks import fetch_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -355,18 +364,26 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
-async def discover_orchestrators(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-) -> list[dict]:
-    """Discover running orchestrators and enrich with task tree data.
+async def discover_orchestrators(config: DashboardConfig) -> list[dict]:
+    """Every running orchestrator process, grouped by the root it targets.
 
-    For each running orchestrator process, attaches:
-    - tasks: parsed task list fetched from fused-memory MCP
-    - summary: status counts {total, done, in_progress, blocked, pending}
+    Returns one entry per resolved project root — ``pids``, ``prd``, ``label``,
+    ``project_root``, ``running``, ``started`` — or ``[]`` when nothing is
+    running. Multiple PIDs that resolve to the same canonical root are ONE
+    entry with every pid in ``pids``, which is what makes the tab's row count
+    a count of projects rather than of processes.
 
-    Returns [] if no orchestrator processes are running.
-    Per-project task fetches that hit MCP errors degrade to an empty list.
+    NO TASK TREE IS READ, and *config* is the only argument because none is
+    needed for one: the MCP client this used to take is gone with the fetch.
+    Task counts live on ``/api/v2/dashboard/tasks``, inside a
+    ``Datum`` that says when they were measured — see
+    ``dashboard/src/dashboard/data/task_snapshot.py``. Two consequences worth
+    stating, since a reader may look for the old ones:
+
+    * there is no budget here to overrun, and no degraded/offline outcome to
+      report — nothing is attempted that could fail. ``ps`` is a local scan;
+    * ``last_update`` is no longer emitted. It was the max ``updated_at``
+      across a root's tasks, and nothing here reads a task any more.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -391,66 +408,18 @@ async def discover_orchestrators(
     # same project are merged into a single entry with a 'pids' list.
     groups: dict[Path, list[dict]] = {}
     for proc in processes:
-        root = _resolve_root(proc)
-        groups.setdefault(root, []).append(proc)
-
-    # Cache per-project data so we don't re-fetch the same task list
-    # when multiple processes share a project root.
-    # Cache tuple: (tasks, offline, error)
-    project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
+        groups.setdefault(_resolve_root(proc), []).append(proc)
 
     result: list[dict] = []
     for project_root, group in groups.items():
-        if project_root not in project_cache:
-            fetched = await fetch_tasks(client, config, project_root)
-            if isinstance(fetched, list):
-                tasks = fetched
-                offline = False
-                fetch_error: str | None = None
-            else:
-                # Offline marker: {'offline': True, 'error': ...}
-                tasks = []
-                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-            project_cache[project_root] = (tasks, offline, fetch_error)
-
-        tasks, offline, fetch_error = project_cache[project_root]
-        summary = {
-            'total': len(tasks),
-            'done': sum(1 for t in tasks if t.get('status') == 'done'),
-            'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
-            'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
-            'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
-        }
-        # Lexicographic max over ISO-8601 strings is correct here because
-        # tasks.py copies updatedAt verbatim from a single upstream source, so
-        # all values share the same format and UTC offset.  If the source ever
-        # emits mixed offsets, switch to key=datetime.fromisoformat.
-        # Scope: top-level tasks only, matching the summary counts above.
-        # If subtask recency should count, flatten the task tree first.
-        last_update = max(
-            (t['updated_at'] for t in tasks if t.get('updated_at')),
-            default=None,
-        )
-
-        # Display label: prefer PRD path, fall back to project root path
+        # Display label: prefer PRD path, fall back to project root path.
         prd = next((p['prd'] for p in group if p.get('prd')), None)
-        label = prd if prd else str(project_root)
-
-        entry: dict = {
+        result.append({
             'pids': [p['pid'] for p in group],
             'prd': prd,
-            'label': label,
+            'label': prd if prd else str(project_root),
             'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
-            'last_update': last_update,
-            'tasks': tasks,
-            'summary': summary,
-            'offline': offline,
-        }
-        if fetch_error:
-            entry['error'] = fetch_error
-        result.append(entry)
-
+        })
     return result

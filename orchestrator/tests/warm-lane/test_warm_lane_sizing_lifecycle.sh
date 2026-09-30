@@ -332,7 +332,14 @@ _seed_divergent_lane() {
     local dir="$1" branch="$2"
     make_lane "$dir" "$branch"
     mkdir -p "$dir/target"
-    dd if=/dev/zero of="$dir/target/blob.bin" bs=1024 count="$B_BLOB_KIB" 2>/dev/null
+    # conv=fsync forces writeback (and any resulting extent-tree growth)
+    # to complete before dd returns, so the BEFORE `du -sB1` below always
+    # observes the blob's final on-disk block count. Without it, ext4
+    # delayed allocation can defer writeback past the BEFORE read; if the
+    # blob then fragments into >4 extents it gains an extent-tree index
+    # block, growing st_blocks by one fs block between BEFORE and AFTER
+    # and flaking B14-B16 (esc-7287-6).
+    dd if=/dev/zero of="$dir/target/blob.bin" bs=1024 count="$B_BLOB_KIB" conv=fsync 2>/dev/null
 }
 
 _seed_divergent_lane "$B_MOUNT/_lane-a" "task/5176101"

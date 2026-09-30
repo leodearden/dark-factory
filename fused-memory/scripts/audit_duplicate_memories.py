@@ -193,6 +193,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 from fused_memory.reconciliation.task_filter import (
     # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
     # `src/` and `scripts/` (tests/test_task_filter.py
@@ -208,6 +210,15 @@ from fused_memory.reconciliation.task_filter import (
     # the two soft-block write gates, which is why `STRICT_CLAUSE_BOUNDARY_RE`
     # is the WRONG constant here: its narrow alphabet is precisely what
     # returned the empty set on all four real records.
+    #
+    # Report-only bounds what `--apply` can DELETE, not what the metric
+    # series can ALARM on: `liveness_snapshot_recurrences` is a
+    # `count`/`higher_is_worse` metric, so a group this splitter manufactures
+    # is a false accretion signal until the next run, not a harmless one a
+    # reviewer's glance fully absorbs. That is why
+    # `liveness_snapshot_subject_facts` gates a clause-scoped key on TWO
+    # conditions — divergence, and field-vocabulary equality with the
+    # record's own key — rather than trusting the widened splitter alone.
     _CLAUSE_SPLIT_RE,
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
@@ -677,22 +688,35 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
-def _asserts_one_field_twice(core_fact: str) -> bool:
-    """Does a whole-record key carry TWO values for ONE field?
+def _field_names(pairs: Iterable[str]) -> list[str]:
+    """Field names of an iterable of `<field>=<value>` pairs, duplicates kept.
+
+    The one split both `_key_field_names` (a core_fact's `|`-joined pairs)
+    and `liveness_snapshot_subject_facts`'s field-vocabulary gate (a
+    clause's pair set) route through, so the module keeps a single copy of
+    this read rather than two hand-rolled ones that could drift apart.
+    """
+    return [pair.split('=', 1)[0] for pair in pairs]
+
+
+def _key_field_names(core_fact: str) -> list[str]:
+    """Field names a `|`-joined core_fact key names, in order, duplicates kept.
 
     Reads the KEY, not the content: pairs are `|`-joined and no value can
     contain a `|` (`_LIVE_FIELD_SCAN_RE` excludes it from both branches), so
-    this costs a split and no regex consult. True means the record's union key
-    is a CHIMERA no single-task snapshot can ever match -- the one shape
-    clause scoping exists to rescue.
+    this costs a split and no regex consult.
     """
-    seen: set[str] = set()
-    for pair in core_fact.split('|'):
-        field = pair.split('=', 1)[0]
-        if field in seen:
-            return True
-        seen.add(field)
-    return False
+    return _field_names(core_fact.split('|'))
+
+
+def _asserts_one_field_twice(core_fact: str) -> bool:
+    """Does a whole-record key carry TWO values for ONE field?
+
+    True means the record's union key is a CHIMERA no single-task snapshot
+    can ever match -- the one shape clause scoping exists to rescue.
+    """
+    names = _key_field_names(core_fact)
+    return len(names) != len(set(names))
 
 
 def liveness_snapshot_subject_facts(
@@ -712,6 +736,41 @@ def liveness_snapshot_subject_facts(
     turn on where the author put a full stop, since ``.`` and a newline are
     both clause boundaries. Gating on divergence also skips the clause scan
     entirely for the overwhelmingly common coherent record.
+
+    A clause-scoped key clears a SECOND gate before it is added: it must name
+    the SAME SET of field NAMES as *core_fact* itself, not merely a non-empty
+    one. Divergence DUPLICATES a field name — the name set is unchanged — while
+    a FRAGMENT (a clause that names only some of the fields its record was
+    recognised to speak about) OMITS one, shrinking the name set. Field-NAME-set
+    equality is what separates the case clause scoping exists for from the case
+    that manufactures a group the whole-record key never would have. A
+    PAIR-level "not a strict subset of *core_fact*" predicate does NOT work
+    here — do not "simplify" it back to one: a divergent record's union key is
+    the UNION of the conflicting values, so the GOOD clause key (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=in-progress``) IS a strict
+    pair-subset of the union (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress``)
+    — that predicate would kill the exact case this rescope exists to serve.
+    A clause key that SURVIVES this gate therefore states its record's whole
+    field vocabulary for its subject, so when it collides with another
+    record's whole-record key, both sides assert the same COMPLETE fact about
+    the same subject — a true recurrence, not a fragment collision.
+
+    The comparison target, *core_fact*, is the RECORD's whole-document union
+    — the field vocabulary named anywhere in the record, across every
+    subject's clauses — not a vocabulary re-derived for one subject alone.
+    That is a deliberate, CONSERVATIVE choice with a known recall cost: a
+    clause can be a COMPLETE statement about its own subject and still be
+    dropped, when some OTHER subject's clause in the same record names
+    additional fields the first clause does not. ``_LIVENESS_DIVERGENT_PARTIAL_94``
+    is exactly this shape — task 94's clause names only ``status``, which is
+    the entire claim any clause in that record ever makes about task 94, yet
+    it is dropped because task 96's separate clause names two more fields
+    elsewhere in the same content (``TestLivenessClauseFragmentFalseGroup``
+    pins the resulting refusal). The trade is accepted because the failure
+    direction is safe: dropping a key can only cost a report-only group,
+    never manufacture a false one, and it never vacates the subject's own
+    unconditional *core_fact* bucket.
 
     The clause-scoped key comes from splitting the content with
     ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
@@ -739,8 +798,8 @@ def liveness_snapshot_subject_facts(
     Returns:
         ``{subject_task_id: {facts to bucket it under}}``, carrying EVERY
         subject. Each set ALWAYS contains *core_fact*, plus the subject's
-        clause-scoped fact under the divergence rule above. Because
-        *core_fact* is unconditional this projection is ADDITIVE by
+        clause-scoped fact under the divergence and field-vocabulary gates
+        above. Because *core_fact* is unconditional this projection is ADDITIVE by
         construction — no pre-rescope bucket membership can be vacated, so it
         warrants no new ``_LIVENESS_DISCLOSURE_KEYS`` counter
         (``TestLivenessSubjectFactsIsAdditive``). Does not mutate *record*.
@@ -759,6 +818,22 @@ def liveness_snapshot_subject_facts(
             pairs = _readable_field_pairs(clause) or set()
             for ref in refs:
                 scoped.setdefault(ref, set()).update(pairs)
+
+    if scoped:
+        # SECOND gate: a clause key earns its bucket only when it names the
+        # SAME field-NAME set as the record's own union key -- see the
+        # docstring's field-vocabulary paragraph for why this must be a
+        # name-SET comparison, not a pair-subset one, and for the known
+        # recall trade this record-level comparison makes. A subject
+        # dropped here still keys on the unconditional seed below, so this
+        # cannot vacate a bucket. Guarded on `scoped` so the overwhelmingly
+        # common coherent record (or a divergent one whose clauses named no
+        # subject) does no extra work here either.
+        record_fields = set(_key_field_names(core_fact))
+        scoped = {
+            ref: pairs for ref, pairs in scoped.items()
+            if set(_field_names(pairs)) == record_fields
+        }
 
     facts: dict[str, set[str]] = {}
     for subject in subjects:
@@ -842,15 +917,21 @@ def find_liveness_snapshot_recurrences(
     twice, and ``liveness_snapshot_recurrences`` is an ARMED count. The richer
     key wins that collapse — always the whole-record one, since a clause key's
     pairs are a subset — so the survivor is the group that predates clause
-    scoping.
+    scoping. A clause-scoped bucket only exists when both of
+    ``liveness_snapshot_subject_facts``'s gates below let it through, so a
+    bucket that can never exist can never join some unrelated record's
+    whole-record bucket either.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
     which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
     and adds each subject's own clause-scoped key beside the whole-record one
-    — but ONLY for a record whose union key names one field twice. A multi-task
-    re-verification reporting DIVERGENT values per task therefore joins each
-    subject's own group, where that union matched neither single-task snapshot
-    and the recurrence went unreported (pinned by
+    — but only when BOTH of that function's gates hold: the DIVERGENCE gate
+    (the record's union key names one field twice) and the FIELD-VOCABULARY
+    gate (the clause names every field that union names, not a strict subset
+    of them — a fragment). A multi-task re-verification reporting DIVERGENT
+    values per task therefore joins each subject's own group, where that
+    union matched neither single-task snapshot and the recurrence went
+    unreported (pinned by
     ``test_divergent_per_task_statuses_group_per_subject``). A record whose
     union is COHERENT keys exactly as it did before clause scoping, so
     grouping never turns on where the author put a full stop — ``.`` and
@@ -861,7 +942,7 @@ def find_liveness_snapshot_recurrences(
     which is what makes the rescope monotone: a bucket membership that existed
     before clause scoping cannot be vacated by it, so the rescope can only ADD
     recall and grows no new disclosure counter
-    (``TestLivenessSubjectFactsIsAdditive``, ``TestLivenessSubjectFactsFallback``).
+    (``TestLivenessSubjectFactsIsAdditive``).
 
     Clause scoping was INERT when the detector was first written:
     ``_CLAUSE_SPLIT_RE`` split on EVERY ``.``, shattering
@@ -2112,6 +2193,17 @@ def compute_cluster_metrics(
         # every swept category, empty ones included — an absent metric is
         # indistinguishable from "not measured".
         #
+        # The value counts GROUPS, one per `(category, subject, member set)`
+        # — not one per bucket. `find_liveness_snapshot_recurrences` collapses
+        # a subject keyed twice over the SAME members (its clause-scoped fact
+        # and its whole-record union) to the single richer-keyed group before
+        # returning, so this reads a regression only on new membership, never
+        # on a second key over membership already counted.
+        # `TestLivenessRecurrenceMetricsUnderDualKeying` arms that guarantee
+        # at THIS layer, not just the detector's own return, so a reader who
+        # changes the keying can see which number moves and where it is
+        # pinned.
+        #
         # Carries `details_path` like every other metric whose full shape
         # lives in the companion file: the scalar says HOW MANY groups, but
         # the per-group `subject_task_id`/`core_fact`/`member_ids` table
@@ -2850,6 +2942,15 @@ def _apply_refusal_reason(
     return None
 
 
+EXIT_RUN_FAILED = 1
+"""The run did not finish: the store could not be opened, the metrics artifact
+could not be written, ``--apply`` was refused or had nothing to apply, a
+deletion failed, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+
 async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
@@ -2923,8 +3024,15 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize()
     try:
+        try:
+            await memory.initialize()
+        except OSError as exc:
+            logger.error(
+                'ABORT: the memory store could not be opened (%s): %s',
+                type(exc).__name__, exc,
+            )
+            return EXIT_RUN_FAILED
         # The ANN cutoff is READ from the calibration (or an explicit
         # override), PER CATEGORY. An empty mapping means no category is
         # calibrated: the ANN path is disabled and counted, never run against
@@ -2986,7 +3094,9 @@ async def _run(args: argparse.Namespace) -> int:
             ),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
+        # A failed stdout stops the run before any side effect.
         print(json.dumps(plan, indent=2, default=str))
+        sys.stdout.flush()
 
         # build_sweep_plan owns the remap-stage losses (a cross-category or
         # unswept-category ANN pair), so the plan's echoed copy — not the dict
@@ -3032,9 +3142,16 @@ async def _run(args: argparse.Namespace) -> int:
                 corpus_counts={c: len(v) for c, v in records_by_category.items()},
                 eval_id=args.eval_id, run_stamp=stamp,
             )
-            metrics_path, _report, _details = emit_metrics_artifact(
-                series, details, args.metrics_root, stamp,
-            )
+            try:
+                metrics_path, _report, _details = emit_metrics_artifact(
+                    series, details, args.metrics_root, stamp,
+                )
+            except OSError as exc:
+                logger.error(
+                    'ABORT: cannot write the metrics artifact under %s: %s',
+                    args.metrics_root, exc,
+                )
+                return EXIT_RUN_FAILED
             logger.info('Wrote metrics artifact %s', metrics_path)
 
         if not args.apply:
@@ -3044,7 +3161,7 @@ async def _run(args: argparse.Namespace) -> int:
         refusal = _apply_refusal_reason(records, scan_stats, args.scan_limit)
         if refusal:
             logger.error('ABORT: %s.', refusal)
-            return 1
+            return EXIT_RUN_FAILED
 
         # The apply gate: clusters whose only evidence is an ANN CHAIN stay in
         # the report but never reach an irreversible delete.
@@ -3064,7 +3181,7 @@ async def _run(args: argparse.Namespace) -> int:
                 'cluster(s) withheld by the apply gate) — nothing to apply.',
                 len(plan['delete_candidates']), len(withheld),
             )
-            return 1
+            return EXIT_RUN_FAILED
 
         result = await apply_deletions(
             memory, args.project_id, plan, dry_run=False,
@@ -3074,7 +3191,7 @@ async def _run(args: argparse.Namespace) -> int:
             'Applied: deleted %d/%d memory/memories; %d error(s)',
             result['deleted'], len(apply_candidates), result['delete_errors'],
         )
-        return 1 if result['delete_errors'] > 0 else 0
+        return EXIT_RUN_FAILED if result['delete_errors'] > 0 else 0
     finally:
         await memory.close()
 
@@ -3097,14 +3214,14 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
     3136 schedules — must keep parsing byte-for-byte, so all of this task's
     flags carry defaults.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', required=True,
         help='Project id to scan for near-duplicate memories',
@@ -3165,4 +3282,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

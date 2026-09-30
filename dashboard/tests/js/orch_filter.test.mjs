@@ -1,99 +1,64 @@
-// Module-contract tests for orch_filter.js — a plain-JS (no JSX/Babel)
-// module holding the pure empty-state label for the Orchestrators tab's
-// multi-select task filter (OrchTab in tabs.jsx). Run via `node --test` (see
-// dashboard/tests/test_graph_layout_js.py for the pytest wrapper that
-// surfaces this suite in CI via its `**/*.test.mjs` glob — no wrapper change
-// needed for this new file).
+// Module-contract tests for orch_filter.js — the pure empty-state sentence for
+// the Orchestrators tab's multi-select VIEW filter (OrchTab in tabs.jsx). Run
+// via `node --test` (dashboard/tests/test_graph_layout_js.py surfaces every
+// **/*.test.mjs here in CI).
 //
-// orch_filter.js has no package.json in the repo, so it resolves as
-// CommonJS (`module.exports = <object>`). Node's cjs-module-lexer cannot
-// statically detect named exports assigned from a variable, so
-// `import { orchEmptyLabel } from '...'` would come back undefined. We
-// therefore default-import the module and destructure instead (mirrors
-// runtime_format.test.mjs / prd_grouping.test.mjs / graph_layout.test.mjs).
+// The facets are the census VIEWS, taken from task_snapshot.js::CENSUS_VIEWS
+// so the view labels exist once. orch_filter.js destructures
+// window.DF_TASK_SNAPSHOT at module scope with no fallback, so it is loaded
+// through a window shim in index.html's order: endpoint_staleness → datum →
+// task_vocab → task_snapshot → orch_filter (task_snapshot.test.mjs has the same
+// shape).
 //
-// The regression under test (task 3313) is described once, in orch_filter.js's
-// own header comment.
+// The regression the sentence guards (task 3313) is described once, in
+// orch_filter.js's own header comment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import orchFilter from '../../src/dashboard/static/redux/orch_filter.js';
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
+const REDUX = '../../src/dashboard/static/redux/';
+const LOAD_CHAIN = ['datum.js', 'task_vocab.js', 'task_snapshot.js', 'orch_filter.js'].map(n => REDUX + n);
+
+function loadOrchFilter() {
+  const win = { DF_ENDPOINT_STALENESS: staleness };
+  globalThis.window = win;
+  const require = createRequire(import.meta.url);
+  for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
+  const loaded = LOAD_CHAIN.map(specifier => require(specifier));
+  return { api: loaded[loaded.length - 1], window: win };
+}
+
+const { api: orchFilter, window: loadedWindow } = loadOrchFilter();
 const { orchEmptyLabel } = orchFilter;
+const { CENSUS_VIEWS } = loadedWindow.DF_TASK_SNAPSHOT;
 
-const MODULE_SPECIFIER = '../../src/dashboard/static/redux/orch_filter.js';
 const EXPECTED_FUNCTION_NAMES = ['orchEmptyLabel'];
 
-const NONE_SELECTED = 'No filters selected — choose Active, Pending or Complete above';
+const NONE_SELECTED = 'No filters selected — choose in-flight, backlog or terminal above';
 
-test('default-imported module exposes the orch-filter functions', () => {
-  for (const name of EXPECTED_FUNCTION_NAMES) {
-    assert.equal(
-      typeof orchFilter[name],
-      'function',
-      `orchFilter.${name} should be a function`,
-    );
-  }
-});
-
-test('module also assigns window.DF_ORCH_FILTER (browser dual-export)', () => {
-  // Shim a bare browser-like global before requiring the module fresh via
-  // CommonJS require, so the module body's `if (typeof window !== 'undefined')`
-  // branch executes against our shim.
-  globalThis.window = {};
-  try {
-    const require = createRequire(import.meta.url);
-    // Node's ESM loader resolves a CommonJS module (no package.json/type in
-    // this repo) by delegating to the CJS loader and populating the shared
-    // require.cache — so by the time this test runs, the top-level `import
-    // orchFilter from ...` above has ALREADY cached this exact file. A plain
-    // require() here would return that cached module.exports without
-    // re-running the module body, meaning the dual-export line would never
-    // see our globalThis.window shim. Busting the cache entry forces a
-    // fresh execution against the now-shimmed window.
-    const resolved = require.resolve(MODULE_SPECIFIER);
-    delete require.cache[resolved];
-    const required = require(MODULE_SPECIFIER);
-
-    assert.ok(globalThis.window.DF_ORCH_FILTER, 'window.DF_ORCH_FILTER was not set');
-
-    // The fresh require() and the top-level import() produce two distinct
-    // API object instances (separate module executions), so we compare
-    // structurally — same set of exported names, each a function — rather
-    // than asserting reference/deep equality against the ESM-imported
-    // `orchFilter`.
-    assert.deepEqual(
-      Object.keys(globalThis.window.DF_ORCH_FILTER).sort(),
-      EXPECTED_FUNCTION_NAMES.slice().sort(),
-    );
-    assert.deepEqual(Object.keys(required).sort(), EXPECTED_FUNCTION_NAMES.slice().sort());
-    for (const name of EXPECTED_FUNCTION_NAMES) {
-      assert.equal(typeof globalThis.window.DF_ORCH_FILTER[name], 'function');
-    }
-  } finally {
-    delete globalThis.window;
-  }
+test('the module exposes orchEmptyLabel and assigns window.DF_ORCH_FILTER', () => {
+  assert.deepEqual(Object.keys(orchFilter).sort(), EXPECTED_FUNCTION_NAMES);
+  assert.equal(typeof orchEmptyLabel, 'function');
+  assert.equal(loadedWindow.DF_ORCH_FILTER, orchFilter);
 });
 
 // ---------------------------------------------------------------------------
-// orchEmptyLabel — all eight combinations of the three facets.
-//
-// The facets are named in canonical button order (active, pending, complete),
-// matching the segmented control rendered directly above the table in OrchTab
-// (tabs.jsx), so the sentence always reads in the order the operator's eye
-// scans the buttons.
+// orchEmptyLabel — all eight combinations of the three views, named in the
+// census's view order, which is also the order of the filter buttons above the
+// table.
 // ---------------------------------------------------------------------------
 
 const ALL_COMBINATIONS = [
-  [{ active: false, pending: false, complete: false }, NONE_SELECTED],
-  [{ active: true, pending: false, complete: false }, 'No active tasks'],
-  [{ active: false, pending: true, complete: false }, 'No pending tasks'],
-  [{ active: false, pending: false, complete: true }, 'No complete tasks'],
-  [{ active: true, pending: true, complete: false }, 'No active or pending tasks'],
-  [{ active: true, pending: false, complete: true }, 'No active or complete tasks'],
-  [{ active: false, pending: true, complete: true }, 'No pending or complete tasks'],
-  [{ active: true, pending: true, complete: true }, 'No active, pending or complete tasks'],
+  [{ in_flight: false, backlog: false, terminal: false }, NONE_SELECTED],
+  [{ in_flight: true, backlog: false, terminal: false }, 'No in-flight tasks'],
+  [{ in_flight: false, backlog: true, terminal: false }, 'No backlog tasks'],
+  [{ in_flight: false, backlog: false, terminal: true }, 'No terminal tasks'],
+  [{ in_flight: true, backlog: true, terminal: false }, 'No in-flight or backlog tasks'],
+  [{ in_flight: true, backlog: false, terminal: true }, 'No in-flight or terminal tasks'],
+  [{ in_flight: false, backlog: true, terminal: true }, 'No backlog or terminal tasks'],
+  [{ in_flight: true, backlog: true, terminal: true }, 'No in-flight, backlog or terminal tasks'],
 ];
 
 for (const [filter, expected] of ALL_COMBINATIONS) {
@@ -104,69 +69,59 @@ for (const [filter, expected] of ALL_COMBINATIONS) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Canonical ordering — the label order comes from the module's own facet
-// table, NOT from Object.keys iteration order. This matters because
-// flipFilter rebuilds the per-pid object with spread on every click, so key
-// insertion order tracks the operator's click history: without a fixed table
-// the same two facets would read "No complete or active tasks" for one
-// operator and "No active or complete tasks" for another.
-// ---------------------------------------------------------------------------
-
-test('orchEmptyLabel: reversed key insertion order still reads in canonical order', () => {
-  assert.equal(orchEmptyLabel({ complete: true, active: true }), 'No active or complete tasks');
-});
-
-test('orchEmptyLabel: all three inserted in reverse still reads in canonical order', () => {
+test('orchEmptyLabel: the facets ARE the census views — labels single-sourced', () => {
+  // A hand copy of the view labels here, kept equal by a parity test, is the
+  // twin pattern PRD decision 4 rejected.
+  const all = Object.fromEntries(CENSUS_VIEWS.map(v => [v.key, true]));
+  const labels = CENSUS_VIEWS.map(v => v.label);
   assert.equal(
-    orchEmptyLabel({ complete: true, pending: true, active: true }),
-    'No active, pending or complete tasks',
+    orchEmptyLabel(all),
+    `No ${labels.slice(0, -1).join(', ')} or ${labels[labels.length - 1]} tasks`,
   );
+  for (const v of CENSUS_VIEWS) {
+    assert.equal(orchEmptyLabel({ [v.key]: true }), `No ${v.label} tasks`);
+  }
 });
 
-// ---------------------------------------------------------------------------
-// Falsy / omitted keys are treated as off — getFilter normalises to three
-// booleans, but the helper must not depend on that normalisation having run.
-// ---------------------------------------------------------------------------
-
-test('orchEmptyLabel: omitted keys are treated as off', () => {
-  assert.equal(orchEmptyLabel({ active: true }), 'No active tasks');
-});
-
-test('orchEmptyLabel: explicit false / 0 / undefined values are treated as off', () => {
-  assert.equal(orchEmptyLabel({ active: true, pending: false, complete: 0 }), 'No active tasks');
-  assert.equal(
-    orchEmptyLabel({ active: true, pending: undefined, complete: '' }),
-    'No active tasks',
-  );
-});
-
-test('orchEmptyLabel: an empty object is the none-selected state', () => {
+test('orchEmptyLabel: the none-selected sentence names the three view labels', () => {
+  for (const v of CENSUS_VIEWS) assert.ok(NONE_SELECTED.includes(v.label), v.label);
   assert.equal(orchEmptyLabel({}), NONE_SELECTED);
 });
 
 // ---------------------------------------------------------------------------
-// Defensive input — a non-object argument must not throw (a throw during
-// render takes out all of OrchTab, not just this cell). getFilter normalises
-// every stored value, including the legacy strings, to a three-boolean object
-// before calling us, so these shapes are unreachable in practice; when the
-// branch does run it mirrors getFilter's own DEFAULT_FILTER (active-only)
-// rather than inventing a third behaviour, so the sentence agrees with what
-// the table would actually be showing.
+// Canonical ordering — from the view table, NOT from Object.keys order.
+// flipFilter rebuilds the per-pid object with spread on every click, so key
+// insertion order tracks the operator's click history.
 // ---------------------------------------------------------------------------
 
-const GET_FILTER_DEFAULT_LABEL = 'No active tasks';
-
-test('orchEmptyLabel: undefined does not throw and mirrors getFilter\'s default', () => {
-  assert.equal(orchEmptyLabel(undefined), GET_FILTER_DEFAULT_LABEL);
+test('orchEmptyLabel: reversed key insertion order still reads in view order', () => {
+  assert.equal(orchEmptyLabel({ terminal: true, in_flight: true }), 'No in-flight or terminal tasks');
+  assert.equal(
+    orchEmptyLabel({ terminal: true, backlog: true, in_flight: true }),
+    'No in-flight, backlog or terminal tasks',
+  );
 });
 
-test('orchEmptyLabel: null does not throw and mirrors getFilter\'s default', () => {
-  assert.equal(orchEmptyLabel(null), GET_FILTER_DEFAULT_LABEL);
+test('orchEmptyLabel: omitted and falsy keys are off', () => {
+  assert.equal(orchEmptyLabel({ in_flight: true }), 'No in-flight tasks');
+  assert.equal(orchEmptyLabel({ in_flight: true, backlog: 0, terminal: '' }), 'No in-flight tasks');
 });
 
-test('orchEmptyLabel: the legacy \'all\' string shape mirrors getFilter\'s default', () => {
-  // getFilter maps this exact stored shape to DEFAULT_FILTER = active-only,
-  // so the label must say "active", not "no filters selected".
-  assert.equal(orchEmptyLabel('all'), GET_FILTER_DEFAULT_LABEL);
+test('orchEmptyLabel: the retired active/pending/complete keys no longer name a facet', () => {
+  // A browser holding the old object under the old storage key never reaches
+  // here (OrchTab persists under a new key), but a stray old-shaped object
+  // must read as "nothing selected", not as a phantom facet.
+  assert.equal(orchEmptyLabel({ active: true, pending: true, complete: true }), NONE_SELECTED);
+});
+
+// ---------------------------------------------------------------------------
+// Defensive input — a non-object must not throw (a throw during render takes
+// out all of OrchTab). It mirrors OrchTab's own default, in-flight only, so the
+// sentence agrees with what the table would be showing.
+// ---------------------------------------------------------------------------
+
+test('orchEmptyLabel: a non-object falls back to the in-flight default', () => {
+  for (const input of [undefined, null, 'all', 42]) {
+    assert.equal(orchEmptyLabel(input), 'No in-flight tasks', String(input));
+  }
 });

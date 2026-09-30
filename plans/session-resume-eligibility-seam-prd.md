@@ -245,16 +245,63 @@ so it is upstream — no DAG inversion.
 
 ## 11. Open questions (tactical, not design-blocking)
 
-1. **The numeric value of D3's outer bound.** Deliberately unfixed — a guessed threshold is exactly what G6
-   branch 1 rejects. Derive it at implementation from the observed distribution of legitimate task in-flight
-   duration in `runs.db` (mirroring 3621's derived-bound test), and pin the derivation, not the number. Decide in δ.
+1. ~~**The numeric value of D3's outer bound.**~~ **RESOLVED 2026-09-07 in δ (task 3730) — shipped as
+   `session_resume.absolute_resume_age_secs = 432000` (5 days), and the DERIVATION is what was pinned.**
+
+   The bound answers "past what sidecar age can no legitimate in-flight task still be running?" — and the question
+   as posed here had one term too few. A sidecar's `started_at` is stamped per *invocation*
+   (`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke`), so its age when the guard evaluates it is
+   in-flight-time-at-crash **plus** however long the orchestrator was down before re-dispatching. Both terms are
+   measured from `runs.db` by
+   `orchestrator/src/orchestrator/resume_age_bound.py::observed_resume_age_inputs`:
+
+   | term | definition | measured 2026-09-07 |
+   |---|---|---|
+   | T1 in-flight | max `task_completed.duration_ms`, `outcome NOT IN ('cancelled','soft-cancelled')` — a cancellation's duration reflects operator action, not work | 8.90 h over n=4,730 |
+   | T2 downtime | max gap between consecutive `events` rows over the trailing 90 days, over ALL event types (any event proves the orchestrator was alive) | 56.99 h over n=303,040 gaps |
+
+   `required = ceil((T1 + T2) × RESUME_AGE_SAFETY_FACTOR)`, factor 1.5 → 355,803 s = 4.12 days; shipped is that
+   rounded up to the next whole day. Re-measured against the 2026-09-04 planning figures both terms moved under 1%
+   in three days, which is itself evidence the derivation is stable rather than noise-driven.
+
+   **Why the second term is load-bearing, and not merely conservative.** T1 alone maxes at 8.90 h and cannot clear
+   the 24h `freshness_window_secs` at any safety factor a reviewer would accept — so a single-term derivation would
+   have forced exactly the reverse-engineered multiplier G6 branch 1 and 3621's "magic number wearing a formula"
+   rule reject. T2 is a PHYSICAL reason the absolute bound exceeds freshness: the sidecar sits untouched across an
+   outage, accruing age while nothing runs.
+
+   **What is pinned is the method.** `orchestrator/tests/test_resume_age_bound.py` re-derives the requirement
+   against the live `runs.db` on every verify run and fails if the shipped default no longer clears it (skipping,
+   never failing, when the db is absent or the sample is below `MIN_SAMPLE_TASKS` — absence must never read as a
+   zero, since a zero term satisfies any bound trivially). A host-independent companion proves the arithmetic
+   falsifiable over a synthetic sample built by construction, and an ANTI-INFLATION clamp fails a default raised
+   high enough that no realistic fleet could ever trip the live guard. Both halves mirror 3621's precedent
+   (`scripts/tests/test_gc_agent_transcripts.py`), whose shape transfers even though its source (the filesystem
+   archive) does not.
 2. ~~**Whether 3578's HARD GATE gets exercised cross-lane.**~~ **CLOSED 2026-08-19 — see §14.** The concern was
    that prior-PRD decision D10 made DF the validation case *precisely because the cwd-move question is vacuous
    there*, so 3578 could close having validated only same-path restore. 3578 measured the moved-cwd case directly
    (CLI 2.1.236): the CLI ignores the encoded directory name and the recorded `cwd` alike, so the *CLI-accepts-it*
    half is answered for pooled-lane projects too — the reify exercise no longer needs forcing.
-3. Whether `resume_count` should reset when a resume is archive-mediated rather than live-dir-mediated. Affects only
-   the `capped` path, which is already correctly carved out. Decide in δ.
+3. ~~Whether `resume_count` should reset when a resume is archive-mediated rather than live-dir-mediated.~~
+   **RESOLVED 2026-09-07 in δ (task 3730): NO. The `capped` leg stays entirely mediation-agnostic**, and δ touched
+   neither it nor `max_resumes_per_task`.
+
+   The cap bounds how many times we re-enter ONE session's accumulated context. The archive is **transport, not a
+   fresh start**: a rehydrated transcript is byte-identical to the live one it replaces, so the risk the cap exists
+   to bound — a task looping on resumes, burning budget on the same wedged context — is exactly the same either way.
+
+   Resetting on the archive-mediated path would be actively perverse rather than merely generous. That path is
+   *precisely the population δ newly makes eligible*, so the cap would become unreachable on the one path δ opens,
+   converting a bounded throttle into an unbounded one. That is D3's own failure mode — "archive outranks age must
+   not become no age limit" — one level down, and it would arrive **silently**, because `capped` is carved out of
+   the fallback-storm streak and files no L1.
+
+   Doing nothing was also the cheapest correct answer: `resume_count` is incremented at a single site in
+   `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke` with no notion of mediation, so preserving the
+   semantics required no code at all. The reasoning is recorded in the predicate's own reason vocabulary
+   (`orchestrator/src/orchestrator/harness.py::Harness._session_resume_reasons`, the `'capped'` entry) so a future
+   reader meets it where the decision would be undone.
 
 ## 12. Design-invariant walk (G7 — `docs/legibility/design-invariants.md`)
 

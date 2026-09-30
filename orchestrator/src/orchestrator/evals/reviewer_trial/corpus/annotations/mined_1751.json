@@ -33,5 +33,45 @@
         "path": "/home/leo/src/dark-factory/data/escalations/archive/2026-06-15/esc-1751-10.json"
       }
     ]
+  },
+  "context": {
+    "task": {
+      "title": "Dashboard Orchestrators panel: per-orchestrator last-update timestamp",
+      "description": "Add a per-orchestrator \"last update\" timestamp to the dashboard Orchestrators section so a viewer can distinguish a progressing orchestrator from a stalled one (today only the process `started` time is shown).\n\nImplementation:\n- In `discover_orchestrators()` (dashboard/src/dashboard/data/orchestrator.py, ~line 300 where `summary` is built and `tasks` is in scope), compute `last_update = max(t['updated_at'] for t in tasks if t.get('updated_at'))`, or `None` when no task carries `updated_at`. Add `'last_update'` to the per-orchestrator result dict (sibling of `summary`/`started`).\n- In `shape_orchestrators()` (dashboard/src/dashboard/data/redux_api.py, ~line 53), copy it onto each ORCHESTRATORS entry as a sibling of `'started'`: `'last_update': o.get('last_update')`.\n- Render in `OrchTab` (dashboard/src/dashboard/static/redux/tabs.jsx) and the overview row (dashboard/src/dashboard/static/redux/tab_overview.jsx) as a relative time (\"updated 4m ago\"); show \"\u2014\" when `last_update` is absent. Reuse an existing JS time-format helper in static/redux/ if one exists, else add a small local one (tactical \u2014 PRD Open question 1).\n\nSubstrate: tasks already carry `updated_at` (preserved from `updatedAt` at data/tasks.py:66; recency key in data/active_tasks.py). Backend ships the raw ISO string; frontend formats (matches the existing raw-`started` pattern). Empty \u2192 \"\u2014\" (no synthetic data).\n\nPRD: plans/dashboard-orch-update-and-fm-uptime-prd.md task \u03b1\nCapability manifest: plans/dashboard-orch-update-and-fm-uptime.capability-manifest.md\n\nUser-observable signal: An orchestrator row in the Orchestrators tab AND the overview panel shows \"updated <relative> ago\" reflecting its most recently updated task; \"\u2014\" when the tree has no dated tasks.\nConsumer: dashboard operator (Orchestrators tab + overview panel).\nModules touched: dashboard",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1751",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-06-15T07:19:17.516Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/src/dashboard/data/orchestrator.py",
+      "dashboard/src/dashboard/data/redux_api.py",
+      "dashboard/src/dashboard/static/redux/tab_overview.jsx",
+      "dashboard/src/dashboard/static/redux/tabs.jsx",
+      "dashboard/tests/test_orchestrator.py",
+      "dashboard/tests/test_redux_api.py"
+    ],
+    "base_sha": "55a0e228017bace9c961a7f99da9b27728c0c7a6",
+    "branch_sha": "1739325a2a86f34bb1f83467066cf1d3d68bdd4e",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "715f569e6acb53dbda6db9ef5ef4e4f4abd10004",
+      "merge_base_sha": "55a0e228017bace9c961a7f99da9b27728c0c7a6",
+      "diff_reproduces_from": "git diff 55a0e22801 715f569e6a",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

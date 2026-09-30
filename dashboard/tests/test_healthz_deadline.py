@@ -53,6 +53,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 import dashboard.app as app_module
+import dashboard.data.tasks as tasks_module
 from dashboard.app import healthz
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
@@ -228,9 +229,40 @@ def _make_healthz_request(
         db=pool,
         config=config,
         start_time=start_time if start_time is not None else time.monotonic(),
+        # Read by the data-plane check (task 4884). Every test in this module
+        # runs under `stub_mcp_fanout_probe` below, which never touches it.
+        http_client=None,
     )
     app = SimpleNamespace(state=state)
     return cast(Request, SimpleNamespace(app=app))
+
+
+@pytest.fixture(autouse=True)
+def stub_mcp_fanout_probe(monkeypatch):
+    """Hold /healthz's MCP fan-out check at 'ok' for this whole module.
+
+    This module is about the DB-probe deadline; the data-plane probe task 4884
+    added has its own acceptance module (``test_healthz_data_plane.py``). Two
+    reasons this stub is required rather than merely tidy:
+
+    * HERMETICITY — the real probe issues ``fetch_tasks`` against
+      ``config.fused_memory_urls``, which defaults to ``http://localhost:8002``.
+      On a developer machine that server is frequently RUNNING, so without this
+      the module's assertions would depend on live infrastructure.
+    * SEMANTICS — a cold probe against a tmp_path project root cannot complete
+      inside ``_MCP_PROBE_TIMEOUT``, so every case here would exercise the
+      probe's cold path (``'probing'`` until its background fetch is older than
+      ``_MCP_PROBE_OUTSTANDING_LIMIT``, then ``'timeout'``) rather than the
+      deadline arithmetic these tests are about — and the later cases would
+      flip to 503 for a reason that has nothing to do with what they test.
+    """
+    async def _ok(_client, _config, _budget):
+        return 'ok'
+
+    monkeypatch.setattr(app_module, '_probe_mcp_fanout', _ok)
+    app_module._mcp_probe_state_clear()
+    yield
+    app_module._mcp_probe_state_clear()
 
 
 async def _call_healthz(request: Request, *, hard_cap: float) -> tuple[JSONResponse, float]:
@@ -342,6 +374,76 @@ def test_healthz_budget_is_structurally_deliverable(tmp_path):
     assert app_module._DB_PROBE_TIMEOUT * len(targets) <= app_module._HEALTHZ_TOTAL_BUDGET, (
         f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} probes exceeds the '
         f'whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s'
+    )
+
+
+def test_healthz_data_plane_budget_is_structurally_deliverable(tmp_path):
+    """The MCP fan-out probe must fit INSIDE the existing /healthz envelope.
+
+    Sibling of :func:`test_healthz_budget_is_structurally_deliverable`, same
+    idiom: SHIPPED constants only, no fakes, no event loop, and the DB count
+    DERIVED from ``_healthz_db_targets`` rather than hard-coded, so adding a
+    fourth database fails here too.
+
+    The point of this test is that task 4884 adds a data-plane check by FITTING
+    it into the budget that already exists, never by widening one.
+    """
+    config = DashboardConfig(project_root=tmp_path)
+    targets = app_module._healthz_db_targets(config)
+
+    # (b) NON-VACUITY first: an invariant over a zero-valued or empty term is
+    # arithmetically true and checks nothing.
+    assert app_module._MCP_PROBE_TIMEOUT > 0, (
+        '_MCP_PROBE_TIMEOUT must be a real positive budget; a zero probe '
+        'budget would make the sum below trivially satisfiable while the '
+        'probe itself could never observe anything'
+    )
+    assert len(targets) > 0, (
+        '_healthz_db_targets returned nothing, so the DB term below is vacuous'
+    )
+
+    # (a) The whole arithmetic, with the data-plane term included.
+    total = app_module._DB_PROBE_TIMEOUT * len(targets) + app_module._MCP_PROBE_TIMEOUT
+    assert total <= app_module._HEALTHZ_TOTAL_BUDGET, (
+        f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} DB probes + '
+        f'{app_module._MCP_PROBE_TIMEOUT} MCP fan-out probe = {total}s exceeds '
+        f'the whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s. '
+        'As shipped: 0.9*3 + 0.2 = 2.9 <= 3.0, leaving 0.1s of slack so the '
+        'total stays a real backstop for non-probe overhead (JSON '
+        'serialisation, event-loop scheduling) rather than a bound that '
+        'coincides exactly with the sum of its parts.'
+    )
+
+    # (c) STANDING GUARD: this work may not buy its headroom by widening.
+    assert app_module._HEALTHZ_TOTAL_BUDGET <= 3.0, (
+        f'_HEALTHZ_TOTAL_BUDGET was widened to '
+        f'{app_module._HEALTHZ_TOTAL_BUDGET}. The /healthz envelope is not a '
+        'free knob: the whole-handler budget exists because a degraded verdict '
+        'must be DELIVERABLE to `curl -sf --max-time 5` '
+        '(dark-factory-dashboard-watchdog.service:6), measured arriving at '
+        '50.6s before it existed. Task 4884 added the MCP fan-out probe by '
+        'fitting it inside this envelope; a later probe must do the same.'
+    )
+    assert app_module._DB_PROBE_TIMEOUT <= 0.9, (
+        f'_DB_PROBE_TIMEOUT was widened to {app_module._DB_PROBE_TIMEOUT}. '
+        'Widening a per-probe budget spends the same headroom the total '
+        'guards. See the 2026-07-30 incident (192 dashboard restarts in 3 '
+        'hours, ~27% downtime, from a service that was serving throughout) '
+        'for what happens when /healthz stops being a bounded, honest '
+        'diagnostic.'
+    )
+
+    # (d) The grace that absorbs a routine ReadTimeout must be at least one
+    # cache TTL wide, or a single expired entry between two browser polls
+    # reads as a wedge.
+    assert (
+        app_module._MCP_FANOUT_OK_GRACE_SECONDS >= tasks_module._FETCH_TASKS_TTL_SECONDS
+    ), (
+        f'_MCP_FANOUT_OK_GRACE_SECONDS ({app_module._MCP_FANOUT_OK_GRACE_SECONDS}) '
+        f'is narrower than one _fetch_tasks_cache TTL '
+        f'({tasks_module._FETCH_TASKS_TTL_SECONDS}). The warm-cache signal goes '
+        'stale every TTL by construction, so a grace narrower than the TTL '
+        'would let an ordinary expiry between two polls report a wedge.'
     )
 
 

@@ -13,12 +13,18 @@ module-scoped Starlette ``TestClient``.
 
 from __future__ import annotations
 
-import html.parser
 import re
 from typing import NamedTuple
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+    strip_js_comments,
+    walk_balanced,
+)
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -83,41 +89,6 @@ def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
     asserted present by exactly such a grep, matching only prose.
     """
     return strip_js_comments(memory_evals_fmt_js_body)
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware)
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included.
-
-    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
-    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
-    nested ``}`` and miss later keys.
-    Returns the empty string if no matching block is found.
-
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
-    literals.  This is acceptable because the data.js seed block uses simple
-    numeric/array values and does not embed brace characters inside quoted
-    strings.
-    """
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -269,36 +240,34 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
 def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     """Return the literal assigned to ``const <name> =``, delimiters included.
 
-    Same depth walk as ``_extract_df_data_block``, re-anchored: that helper
-    only matches the ``key: {`` seed-object form used by data.js and so cannot
-    locate a module-scope ``const`` declaration.  ``open_char`` selects the
+    A second ANCHOR over the shared ``walk_balanced``, exactly as
+    ``extract_df_data_block`` is the first: that helper only matches the
+    ``key: {`` seed-object form used by data.js and so cannot locate a
+    module-scope ``const`` declaration, but the depth walk underneath is the
+    same one and is no longer written out twice.  ``open_char`` selects the
     delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
     and the ``PARITY_PLAIN`` array.
+
+    Stays LOCAL to this module rather than joining ``_dashboard_helpers``:
+    this anchor has exactly one consumer (memory_evals_fmt.js's two parity
+    declarations), so hoisting it would move code no other suite can reach.
+    The duplication worth removing was the walk, and that is gone.
 
     Returns the empty string if the declaration is not found — callers assert
     on that explicitly, because "the declaration was deleted" and "the
     declaration is empty" are different failures with different fixes.
 
-    Same string-literal caveat as ``_extract_df_data_block``: the walk does not
-    skip delimiters inside quoted strings.  Acceptable here for the same
-    reason — these two declarations hold short identifier keys and plain
+    ``walk_balanced``'s string-literal caveat applies (it does not skip
+    delimiters inside quoted strings) and is stated once, there.  Acceptable
+    here because these two declarations hold short identifier keys and plain
     prose values, neither of which embeds a brace or a bracket.
     """
     close_char = {'{': '}', '[': ']'}[open_char]
     m = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*{re.escape(open_char)}', src)
     if m is None:
         return ''
-    start = m.end() - 1  # index of the opening delimiter
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == open_char:
-            depth += 1
-        elif c == close_char:
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
+    # m.end() - 1 is the index of the opening delimiter.
+    return walk_balanced(src, m.end() - 1, open_char, close_char)
 
 
 # ---------------------------------------------------------------------------
@@ -413,93 +382,6 @@ def _return_label_exprs(badge_body: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_index_html.py / test_tab_escalations.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
-
-
-# ---------------------------------------------------------------------------
 # step-1 test: data.js registers the memory-evals endpoint + seed
 # ---------------------------------------------------------------------------
 
@@ -519,7 +401,7 @@ _MEMORY_EVALS_CONTRACT_KEYS = (
 
 
 def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
-    """data.js must register /api/v2/dashboard/memory-evals -> ['MEMORY_EVALS']
+    """data.js must register /api/v2/dashboard/memory-evals -> {'MEMORY_EVALS': SPEC}
     and seed DF_DATA.MEMORY_EVALS with the server's own default body.
 
     The seed is asserted key-by-key against the ``shape_memory_evals`` contract
@@ -533,21 +415,26 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     assert '/api/v2/dashboard/memory-evals' in data_js_body, (
         "data.js does not register '/api/v2/dashboard/memory-evals'. Add a "
         'static (non-windowed) row to endpointsFor() mapping it to '
-        "['MEMORY_EVALS']."
+        "{'MEMORY_EVALS': <spec>}."
     )
 
     # (b) key and value must be checked as a PAIR — two independent substring
     # hits would pass even if the endpoint mapped to some other DF_DATA key.
+    # The mapped value is a key->spec OBJECT, and the spec is matched as a bare
+    # identifier (`PLAIN`/`DATUM`) rather than pinned to one of them: which spec
+    # a row carries is data.js's to flip, and this test is about WHICH KEY the
+    # endpoint feeds.  The closing brace has to follow immediately, so
+    # 'MEMORY_EVALS' must be the row's only entry.
     assert re.search(
-        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\[\s*['"]MEMORY_EVALS['"]\s*,?\s*\]""",
+        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\{\s*['"]MEMORY_EVALS['"]\s*:\s*\w+\s*,?\s*\}""",
         data_js_body,
     ), (
         "data.js's endpointsFor() must map '/api/v2/dashboard/memory-evals' to "
-        "exactly ['MEMORY_EVALS']."
+        "exactly one key spec, {'MEMORY_EVALS': <spec>}."
     )
 
     # (c) the DF_DATA seed block exists
-    seed_block = _extract_df_data_block(data_js_body, 'MEMORY_EVALS')
+    seed_block = extract_df_data_block(data_js_body, 'MEMORY_EVALS')
     assert seed_block, (
         'data.js has no MEMORY_EVALS seed in the `window.DF_DATA = {...}` '
         'literal. Without it the first render before the fetch completes '
@@ -621,7 +508,7 @@ def test_index_html_registers_tab_memory_evals_load_order(
     guard runs before every position comparison.
     """
     # (a) the tag exists and is a classic synchronous text/babel script
-    found = _find_script_position(index_html_body, _TAB_MEMEVALS_PREFIX)
+    found = find_script_position(index_html_body, _TAB_MEMEVALS_PREFIX)
     assert found is not None, (
         f'No <script src="{_TAB_MEMEVALS_PREFIX}..."> tag in index.html. '
         f'{_LOAD_ORDER_NOTE}'
@@ -674,7 +561,7 @@ def test_index_html_registers_tab_memory_evals_load_order(
             'tab defined there.',
         ),
     ]:
-        _assert_script_loads_before(
+        assert_script_loads_before(
             index_html_body,
             dep_prefix,
             _TAB_MEMEVALS_PREFIX,
@@ -684,16 +571,12 @@ def test_index_html_registers_tab_memory_evals_load_order(
         )
 
     # (b2) memory_evals_fmt.js specifically must be a CLASSIC script — no type
-    #      at all, not even text/babel. _assert_script_loads_before already
+    #      at all, not even text/babel. assert_script_loads_before already
     #      rejects defer/async/type=module; what this adds is the failure MODE a
-    #      `type="text/babel"` .js has, which is silence: Babel-standalone would
-    #      transform it out of the classic-script shared global scope, and
-    #      classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE (which matches only
-    #      `<script src="/static/redux/NAME.js?v=NN"></script>`) would stop
-    #      seeing the file at all. That suite does catch it — its registry entry
-    #      would go unmatched — but it reports a missing script, not a wrong
-    #      tag shape, so this names the actual cause.
-    fmt_found = _find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
+    #      `type="text/babel"` .js has: classic_script_scope.test.mjs catches it
+    #      too, but reports an unmatched script, not a wrong tag shape, so this
+    #      names the actual cause.
+    fmt_found = find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
     assert fmt_found is not None, (
         'No <script src="/static/redux/memory_evals_fmt.js..."> tag in '
         'index.html — tab_memory_evals.jsx destructures window.DF_MEMORY_EVALS_FMT '
@@ -703,13 +586,12 @@ def test_index_html_registers_tab_memory_evals_load_order(
     assert fmt_attrs.get('type') is None, (
         'memory_evals_fmt.js is plain JS, so its <script> tag must carry NO type '
         f'attribute; got type={fmt_attrs.get("type")!r}. A text/babel .js would be '
-        'handed to Babel-standalone and would not join the shared classic-script '
-        'global scope, and classic_script_scope.test.mjs would stop matching the '
-        'tag entirely.'
+        'handed to Babel-standalone instead of loading as the classic script '
+        'classic_script_scope.test.mjs expects.'
     )
 
     # (c) THE load-bearing assertion — before tabs.jsx.
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_MEMEVALS_PREFIX,
         '/static/redux/tabs.jsx',
@@ -719,7 +601,7 @@ def test_index_html_registers_tab_memory_evals_load_order(
     )
 
     # (d) transitively therefore before app.jsx, which destructures DF_TABS last.
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_MEMEVALS_PREFIX,
         '/static/redux/app.jsx',
@@ -1998,11 +1880,9 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     Task 3481 moved them into a plain-JS classic script so `node --test` can
     execute their branching (dashboard/tests/js/memory_evals_fmt.test.mjs)
     instead of this file grepping their source text.  Two copies would drift
-    silently: Babel-standalone downlevels .jsx top-level bindings out of the
-    classic-script shared global scope, so the "Identifier X has already been
-    declared" failure that protects the .js modules from each other
-    (dashboard/tests/js/classic_script_scope.test.mjs) would NOT fire here.
-    This test is the substitute for that protection.
+    silently: a .jsx redefinition of a classic `function` loads without error
+    (the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs), so
+    this test is the substitute for a load-time guard.
     """
     code = tab_memory_evals_jsx_code
 
@@ -2359,9 +2239,9 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
         'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
         'memory_evals_fmt.js (task 3481) so node can execute it. Two '
-        'definitions would drift, and the classic-script shared global scope '
-        'would not even catch it, since Babel downlevels .jsx top-level '
-        'bindings out of that scope.'
+        'definitions would drift, and no load error would catch it: a .jsx '
+        'redefinition of a classic `function` is legal (the SCOPE note in '
+        'dashboard/tests/js/classic_script_scope.test.mjs).'
     )
     assert 'window.DF_MEMORY_EVALS_FMT' in code, (
         'tab_memory_evals.jsx must obtain `trendGaps` from '

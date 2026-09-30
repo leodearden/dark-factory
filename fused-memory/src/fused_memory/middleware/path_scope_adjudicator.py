@@ -16,6 +16,19 @@ FAIL-SAFE ASYMMETRY (the hard constraint):
 AdjudicationVerdict.should_allow_creation == True ← ONLY when verdict=='allow'
   and not failed.  Every other state: should_allow_creation == False.
 
+  That polarity is FAIL-SAFE TOWARD REJECTING, because the designed caller's
+  base state is "reject": every failure mode must preserve the Stage-1
+  rejection.  A caller whose base state is the OPPOSITE — allow, do nothing,
+  stamp nothing, e.g. the task-3122 soft-signal trigger, whose signals are
+  explicitly too weak to gate on — must NOT read ``not
+  should_allow_creation``: that would convert every timeout, breaker-open,
+  exception and malformed response into a positive finding manufactured by
+  infrastructure failure.  Such callers read
+  ``is_confirmed_misroute`` instead, which is fail-safe toward doing
+  nothing.  The two are deliberately NOT complements: both are False for
+  ``uncertain`` and both are False for every failed state.  Each is
+  fail-safe toward its own caller's base state.
+
 Reuses:
 - ``shared.cli_invoke.invoke_with_cap_retry`` (same call shape as TaskCurator)
 - ``AgentResult`` / ``is_zero_output_timeout`` / ``AllAccountsCappedException``
@@ -126,6 +139,11 @@ class AdjudicationVerdict:
     ``should_allow_creation`` is the primary decision gate for callers:
     - ``True`` ONLY when ``verdict == 'allow'`` AND ``failed == False``.
     - ``False`` for reject / uncertain / any failure mode.
+
+    ``is_confirmed_misroute`` is its correctly-polarised counterpart for a
+    caller whose base state is ALLOW rather than REJECT.  See the module
+    header's FAIL-SAFE ASYMMETRY block: the two properties are deliberately
+    not complements.
     """
 
     verdict: Literal['allow', 'reject', 'uncertain'] = 'uncertain'
@@ -137,6 +155,30 @@ class AdjudicationVerdict:
     def should_allow_creation(self) -> bool:
         """Return True iff the adjudicator is confident the heuristic hit was a false positive."""
         return self.verdict == 'allow' and not self.failed
+
+    @property
+    def is_confirmed_misroute(self) -> bool:
+        """Return True iff the adjudicator AFFIRMATIVELY confirmed a misroute.
+
+        True ONLY when ``verdict == 'reject'`` AND ``failed == False``.
+
+        DELIBERATELY NOT ``not should_allow_creation``, and getting that
+        wrong is silent and expensive.  ``should_allow_creation`` is
+        fail-safe toward REJECTING — its designed caller's base state is
+        "reject", so every failure mode must preserve that rejection.  A
+        soft-signal caller's base state is the OPPOSITE: allow, do nothing,
+        no marker, no escalation.  Reading ``not should_allow_creation``
+        there would convert every timeout, breaker-open, exception,
+        budget-misconfig and malformed response into a stamped misroute
+        marker plus an operator escalation — a false accusation manufactured
+        by infrastructure failure, on a signal whose whole premise is that
+        it is too weak to gate on.
+
+        So the two are not complements: BOTH are False for ``uncertain``,
+        and both are False for every failed state.  Each is fail-safe toward
+        its own caller's base state.  No existing caller's behaviour moves.
+        """
+        return self.verdict == 'reject' and not self.failed
 
 
 _VALID_VERDICTS = frozenset({'allow', 'reject', 'uncertain'})

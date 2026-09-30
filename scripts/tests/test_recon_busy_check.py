@@ -14,6 +14,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from recon_busy_check import classify
 
 SCRIPT = Path(__file__).parent.parent / "recon_busy_check.py"
@@ -60,15 +61,21 @@ def test_classify_non_dict_is_unreachable():
 
 # ---------------------------------------------------------------------------
 # CLI (reads /health body from stdin) — driven via subprocess.run
+#
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_scan_task_toolcall_leaks.py and test_drain_check.py.
 # ---------------------------------------------------------------------------
 
-def _run_cli(stdin_text: str) -> subprocess.CompletedProcess:
+_CLI_TIMEOUT = cli_timeout_from_env("RECON_BUSY_CHECK_TEST_TIMEOUT")
+
+
+def _run_cli(stdin_text: str, timeout: float = _CLI_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["python3", str(SCRIPT)],
         input=stdin_text,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
@@ -126,3 +133,31 @@ def test_cli_non_object_json_is_unreachable():
     result = _run_cli("[1, 2, 3]")
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert result.stdout.splitlines()[0] == "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# _run_cli() wiring: the resolved budget must actually reach subprocess.run
+# — this is the regression this task exists to fix. Behavioural (spy on
+# subprocess.run) rather than inspect.signature-based, so it survives a
+# refactor that moves resolution out of the default argument, and it spawns
+# no interpreter.
+# ---------------------------------------------------------------------------
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="idle\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("{}")
+    # The 60.0 default is independently pinned by test_cli_subprocess_timeout.py;
+    # a bound here would break the documented RECON_BUSY_CHECK_TEST_TIMEOUT
+    # override (tune-down case).
+    assert captured["timeout"] == _CLI_TIMEOUT
+
+    # An explicit override must also reach subprocess.run — otherwise
+    # _run_cli's timeout parameter is dead surface no caller ever exercises.
+    _run_cli("{}", timeout=3)
+    assert captured["timeout"] == 3

@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 # Imported from ``shared``, NOT from ``fused_memory.reconciliation.judge`` —
 # judge.py imports THIS module at module scope, so importing it back would be a
@@ -23,6 +27,7 @@ from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
+    RunStatus,
     StageId,
     StageReport,
     Watermark,
@@ -32,6 +37,48 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# The provenance key a citation repair appends to a finding. Deliberate sibling
+# of the ``citation_failures`` key ``verify_cited_memories`` writes: a reader of
+# any finding sees both "this claim lost its backing" and "this claim's backing
+# was re-pointed", in the same shape. It lives in this storage layer because the
+# run owner's wholesale write must recognise a persisted repair
+# (``_carry_forward_citation_repairs``); ``citation_repair`` imports it from here.
+CITATION_REPAIRS_KEY = 'citation_repairs'
+
+# The run statuses a citation repair may touch — an ALLOWLIST, deliberately
+# inverted from the "refuse status == 'running'" check it replaced, because the
+# two failure directions are asymmetric: wrongly PERMITTING yields a write that
+# reports ``status: repaired`` and is then silently overwritten, while wrongly
+# REFUSING yields a loud, recoverable error. So a status absent from the
+# enum-of-today must land on the refusing side by default.
+#
+# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
+# excluded precisely because something does — ``get_interrupted_runs()`` feeds
+# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
+# stage_reports blob from its own loaded copy.
+#
+# It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
+# invariant: a write that does not carry repairs forward must never land on a
+# row holding one of these statuses (``complete_run_if_status`` refuses to).
+REPAIRABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.completed,
+        RunStatus.failed,
+        RunStatus.rolled_back,
+        RunStatus.circuit_breaker,
+    }
+)
+
+# Compared on raw ``.value`` strings so a gate holds whether a status arrives as
+# a coerced ``RunStatus`` or as a bare ``str`` off the journal row. Every
+# member's name happens to equal its value today, so StrEnum hashing would
+# coincide — the gates deliberately do not rest on that coincidence.
+REPAIRABLE_RUN_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
+
+# Each refusal of the owner's compare-and-set is a distinct concurrent commit to
+# the same row, so exhausting this takes a sustained stream of repairs.
+_OWNER_WRITE_MAX_ATTEMPTS = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -195,8 +242,27 @@ class ReconciliationJournal:
     """Persistent journal backed by SQLite — one database per project directory."""
 
     def __init__(self, data_dir: Path):
+        """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
+
+        Nothing coerces it here, and nothing upstream does either (task 4592;
+        why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
+
+        In-process that is deliberate: ``initialize`` mkdirs ``data_dir`` and
+        opens ``reconciliation.db`` under it, and
+        ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
+        (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
+        the dead-letter JSONL) the same way — all anchored at the PROCESS cwd, all
+        in this process, so they agree with each other by construction.
+
+        A CROSS-PROCESS consumer must NOT inherit that relativity: a path handed
+        to a child is resolved against the CHILD's cwd, so the two would silently
+        name different directories. ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir`` is the boundary that absolutizes it for
+        the ``CLAUDE_CONFIG_DIR`` chain, and
+        ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``
+        fails closed if anything bypasses it.
+        """
         self.data_dir = data_dir
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
         self._write_journal: WriteJournal | None = None
 
     def set_write_journal(self, write_journal: WriteJournal) -> None:
@@ -211,106 +277,96 @@ class ReconciliationJournal:
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'reconciliation.db'
-        self._db = await connect_daemon(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(SCHEMA_SQL)
-        await self._db.commit()
+        conn = await connect_daemon(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        async with self._access.write() as db:
+            await db.executescript(SCHEMA_SQL)
 
         # Safe migration: add triggered_by column to existing DBs
-        try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
-            await self._db.commit()
-        except Exception:
-            await self._safe_rollback()  # Column already exists
+        await self._add_column('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
 
         # Safe migration: add instance_id column to existing DBs.  Lets the
         # stale-run reaper distinguish runs owned by the current process from
         # runs orphaned by a prior process whose lock has since been re-acquired
         # by a fresh instance — see _recover_stale_runs.
-        try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN instance_id TEXT')
-            await self._db.commit()
-        except Exception:
-            await self._safe_rollback()  # Column already exists
+        await self._add_column('ALTER TABLE runs ADD COLUMN instance_id TEXT')
 
         # Safe migration: add session-capture columns to existing DBs (task 2744).
         # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
         # session (cleared between stages); attempt is a monotonic count of
         # stage-subprocess launches, the substrate task σ's resume gate consumes.
-        try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN session_id TEXT')
-            await self._db.commit()
-        except Exception:
-            await self._safe_rollback()  # Column already exists
-        try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN stage_cursor TEXT')
-            await self._db.commit()
-        except Exception:
-            await self._safe_rollback()  # Column already exists
-        try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN attempt INTEGER DEFAULT 0')
-            await self._db.commit()
-        except Exception:
-            await self._safe_rollback()  # Column already exists
+        await self._add_column('ALTER TABLE runs ADD COLUMN session_id TEXT')
+        await self._add_column('ALTER TABLE runs ADD COLUMN stage_cursor TEXT')
+        await self._add_column('ALTER TABLE runs ADD COLUMN attempt INTEGER DEFAULT 0')
 
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
-    async def _safe_rollback(self) -> None:
-        """Best-effort rollback — never raises."""
-        if self._db is None:
-            return
-        with contextlib.suppress(Exception):
-            await self._db.rollback()
+    async def _add_column(self, ddl: str) -> None:
+        """Run one ALTER migration, tolerating a DB that already has the column.
 
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction wrapper: commit on success, rollback on any exception.
+        Each ALTER is its OWN write unit: a column that already exists must roll
+        back only its own statement, never a sibling migration that just
+        succeeded.
 
-        Without this, an exception (including ``CancelledError``) between an
-        ``execute()`` and ``commit()`` would leave aiosqlite's implicit
-        transaction open, holding the writer lock until the connection is
-        closed. ``BaseException`` so cancellation also rolls back.
+        "duplicate column name" is the ONLY tolerated failure, and the catch is
+        narrowed to it (loud-over-silent) exactly as ``EventBuffer._migrate`` and
+        ``ReconLedgerStore.initialize`` narrow theirs.  SQLite's ALTER TABLE has
+        no IF NOT EXISTS, so re-running these against an already-migrated DB is
+        expected; a locked or partially-created DB or a disk error is NOT, and
+        swallowing it here would let initialize() log success and leave the
+        failure to re-surface much later as a confusing "no such column" from the
+        first statement that needs the column.
         """
-        db = self._require_db()
+        access = self._require_access()
         try:
-            yield db
-            await db.commit()
-        except BaseException:
-            await self._safe_rollback()
-            raise
+            async with access.write() as db:
+                await db.execute(ddl)
+        except Exception as exc:
+            # The write unit has already rolled itself back.
+            if 'duplicate column name' not in str(exc).lower():
+                raise  # Not the benign "column already exists" case — surface it.
 
     async def close(self) -> None:
-        if self._db:
-            # Final TRUNCATE checkpoint so the next open starts with an empty
-            # WAL. Best-effort: failures don't block the close.
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
+        if self._access is not None:
+            # AtomicConnection.close() TRUNCATEs the WAL best-effort first, so
+            # the next open starts with an empty one.  Nulling _access matches
+            # EventBuffer and ReconLedgerStore: all three then raise the same
+            # 'not initialized' from _require_access() after close, instead of
+            # this store alone surfacing aiosqlite's 'Connection closed'.  That
+            # uniformity is the _require_access() guard ONLY — checkpoint() does
+            # not go through it and does not follow it; see checkpoint() below.
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
+    async def checkpoint(self) -> CheckpointResult:
         """``PRAGMA wal_checkpoint(TRUNCATE)``. Returns ``(busy, log,
-        checkpointed)``. Called by the periodic loop in ``server/main.py``."""
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+        checkpointed)``. Called by the periodic loop in ``server/main.py``.
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
+        Post-close this RAISES 'not initialized', as ReconLedgerStore does;
+        EventBuffer alone answers ``(-1, -1, -1)``.  So a checkpoint tick that
+        races shutdown — a real path, since that loop runs on a timer against
+        stores it does not own the shutdown of — is logged for two of the three
+        stores and silent for the third.  The split is deliberate: each store
+        keeps the contract its callers already had, which is what let this
+        migration leave ``server/main.py`` edit-free.  Pinned by
+        ``test_recon_db_atomicity.py::test_the_post_close_checkpoint_contract_of_each_store``
+        so it cannot drift further, and unified by task 5562's adoption.
+        """
+        return await self._require_access().checkpoint()
+
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
             raise RuntimeError('Journal not initialized — call initialize() first')
-        return self._db
+        return self._access
 
     # ── Watermark ──────────────────────────────────────────────────────
 
     async def get_watermark(self, project_id: str) -> Watermark:
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             'SELECT * FROM watermarks WHERE project_id = ?', (project_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return Watermark(project_id=project_id)
         return Watermark(
@@ -323,7 +379,7 @@ class ReconciliationJournal:
         )
 
     async def update_watermark(self, watermark: Watermark) -> None:
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO watermarks
                    (project_id, last_full_run_id, last_full_run_completed,
@@ -349,7 +405,7 @@ class ReconciliationJournal:
     # ── Runs ───────────────────────────────────────────────────────────
 
     async def start_run(self, run: ReconciliationRun) -> None:
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO runs
                    (id, project_id, run_type, trigger_reason, started_at,
@@ -370,23 +426,138 @@ class ReconciliationJournal:
             )
 
     async def complete_run(self, run_id: str, status: str) -> None:
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
                 (status, datetime.now(UTC).isoformat(), run_id),
             )
 
+    async def complete_run_if_status(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        status: str,
+        stage_reports: dict[str, StageReport | dict],
+    ) -> bool:
+        """Terminalise a run in ONE statement, only if it still holds
+        ``expected_status`` — for a caller acting on a row image it read earlier.
+
+        ``False`` means the row's status moved on since that read (or the row is
+        gone), and nothing was written.
+
+        ``stage_reports`` is written wholesale WITHOUT carrying citation repairs
+        forward, so an ``expected_status`` in ``REPAIRABLE_RUN_STATUSES`` — a row
+        a repair may already have written — raises ``ValueError`` before
+        anything is written.
+        """
+        if str(expected_status) in REPAIRABLE_RUN_STATUS_VALUES:
+            raise ValueError(
+                f'complete_run_if_status: expected_status {str(expected_status)!r} '
+                'is a status citation repair writes under, and this wholesale '
+                'write would erase its repairs'
+            )
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                'UPDATE runs SET stage_reports = ?, status = ?, completed_at = ? '
+                'WHERE id = ? AND status = ?',
+                (
+                    _serialize_stage_reports(stage_reports),
+                    status,
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                    expected_status,
+                ),
+            )
+            applied = cursor.rowcount == 1
+        return applied
+
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
-        serialized = {}
-        for k, v in stage_reports.items():
-            serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
-        async with self._txn() as db:
-            await db.execute(
-                'UPDATE runs SET stage_reports = ? WHERE id = ?',
-                (json.dumps(serialized), run_id),
+        """The run OWNER's wholesale write of ``stage_reports``.
+
+        Never refused for a stale copy, but it can never erase a citation repair
+        a compare-and-set writer persisted
+        (``fused-memory/src/fused_memory/reconciliation/citation_repair.py::repair_memory_citation``):
+        each attempt re-reads the column, carries persisted repairs forward onto
+        a fresh copy of ``stage_reports`` and compare-and-sets on what it read.
+        That closes the window after a repair's own write, which
+        citation_repair's read-after-write could only detect.
+
+        An unknown ``run_id`` writes nothing. Raises ``RuntimeError``, having
+        written nothing, after ``_OWNER_WRITE_MAX_ATTEMPTS`` refusals.
+        """
+        incoming_text = _serialize_stage_reports(stage_reports)
+        for attempt in range(1, _OWNER_WRITE_MAX_ATTEMPTS + 1):
+            row = await self._require_access().read_one(
+                'SELECT stage_reports FROM runs WHERE id = ?', (run_id,)
             )
+            if row is None:
+                return
+            persisted_text = row['stage_reports']
+            merged = json.loads(incoming_text)
+            _carry_forward_citation_repairs(merged, json.loads(persisted_text or '{}'))
+            if await self._compare_and_set_stage_reports_text(
+                run_id, json.dumps(merged), expected_text=persisted_text
+            ):
+                return
+            logger.info(
+                'reconciliation.stage_reports_owner_write_retried',
+                extra={'run_id': run_id, 'attempt': attempt},
+            )
+        raise RuntimeError(
+            f'update_run_stage_reports: run {run_id} changed under each of '
+            f'{_OWNER_WRITE_MAX_ATTEMPTS} compare-and-set attempts; nothing was written'
+        )
+
+    async def compare_and_set_run_stage_reports(
+        self,
+        run_id: str,
+        stage_reports: dict[str, StageReport | dict],
+        *,
+        expected_text: str | None,
+    ) -> bool:
+        """Rewrite ``stage_reports`` only if the column still holds
+        ``expected_text``. Returns whether the write applied.
+
+        This is the serialised half of a read-modify-write of the WHOLE
+        ``stage_reports`` blob: the caller loads the blob, mutates it in Python
+        and writes it back, so a competing wholesale rewrite landing in between
+        would be silently clobbered. Pairing this with
+        ``get_run_with_stage_reports_text`` (which supplies ``expected_text``
+        from the same row read that supplied the caller's copy) makes that
+        interleaving a refusal instead.
+
+        ``False`` covers two cases — the token is stale, or the run row is gone.
+        Both mean the same thing to the caller: its loaded copy is no longer a
+        safe basis for a wholesale rewrite.
+
+        ``update_run_stage_reports`` is the run owner's write, and is never
+        refused for a stale copy: the harness owns the blob wholesale at stage
+        boundaries, and making a normal end-of-stage persist refusable would
+        convert routine work into a failure mode. It retries this same
+        compare-and-set instead, carrying persisted citation repairs forward, so
+        it cannot erase what a writer of this method persisted.
+        """
+        return await self._compare_and_set_stage_reports_text(
+            run_id, _serialize_stage_reports(stage_reports), expected_text=expected_text
+        )
+
+    async def _compare_and_set_stage_reports_text(
+        self, run_id: str, text: str, *, expected_text: str | None
+    ) -> bool:
+        # ``IS``, not ``=``: SQLite's NULL-safe comparison, so a run whose
+        # stage_reports column is NULL is CASable with an ``expected_text=None``
+        # token instead of never matching.
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ? AND stage_reports IS ?',
+                (text, run_id, expected_text),
+            )
+            # Read rowcount inside the write unit, before it commits.
+            applied = cursor.rowcount == 1
+        return applied
 
     async def record_run_session(
         self, run_id: str, *, session_id: str, stage_cursor: str
@@ -410,7 +581,7 @@ class ReconciliationJournal:
         session actually exists before trusting it to ``--resume`` rather than
         resuming the persisted id blindly.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """UPDATE runs
                    SET session_id = ?, stage_cursor = ?, attempt = COALESCE(attempt, 0) + 1
@@ -425,43 +596,206 @@ class ReconciliationJournal:
         while a stage is actually in flight) but retains ``attempt`` as durable
         launch history.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'UPDATE runs SET session_id = NULL, stage_cursor = NULL WHERE id = ?',
                 (run_id,),
             )
 
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
-        db = self._require_db()
-        async with db.execute('SELECT * FROM runs WHERE id = ?', (run_id,)) as cursor:
-            row = await cursor.fetchone()
+        row = await self._require_access().read_one(
+            'SELECT * FROM runs WHERE id = ?', (run_id,)
+        )
         if row is None:
             return None
         return _row_to_run(row)
 
+    #: Run statuses at which ``runs.stage_reports`` is known to have been
+    #: PERSISTED, i.e. every status :meth:`complete_run` can write.
+    #:
+    #: ``reconciliation/harness.py`` mutates ``run.stage_reports`` in memory as
+    #: each stage returns and persists the whole blob after the stage loop —
+    #: from the success path, the error handlers, or the terminal ``finally``
+    #: backstop, each of which completes the run in the same breath. A run on
+    #: its first attempt therefore leaves the column reading ``'{}'`` however
+    #: many stages have finished.
+    #:
+    #: Stated as the statuses that DO persist, not the one that does not, so a
+    #: future non-terminal status reads as unsettled — an inconclusive answer —
+    #: rather than as a confident wrong one.
+    _STAGE_REPORTS_PERSISTED_STATUSES = frozenset(
+        {
+            RunStatus.completed.value,
+            RunStatus.failed.value,
+            RunStatus.rolled_back.value,
+            RunStatus.circuit_breaker.value,
+            RunStatus.interrupted.value,
+        }
+    )
+
+    @staticmethod
+    def _stage_reports_are_settled(
+        run_status: str | None, resumed: bool | None
+    ) -> bool:
+        """Is ``stage_reports`` a FINISHED account of the run, safe to read as
+        evidence that a stage did or did not execute?
+
+        A persisted status is necessary but not sufficient, because
+        ``'interrupted'`` is the one terminal status a run can leave: the
+        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
+        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
+        running only on the in-memory object — :meth:`complete_run` is the sole
+        writer of the column, so a run re-executing this very stage still reads
+        back ``'interrupted'`` on disk. Pairing that terminal-looking status
+        with the stale blob its interrupted attempt flushed is worse than the
+        empty first-attempt case: the stage key is absent precisely BECAUSE
+        this attempt has not re-filed it yet, which is the shape most likely to
+        be a genuine lost write.
+
+        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        is the durable signal. A resumed run that has since reached any other
+        terminal status has been flushed by that run's own ``finally`` and is
+        settled again, which is why this narrows ``'interrupted'`` alone rather
+        than distrusting every run that was ever resumed.
+        """
+        if run_status not in ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES:
+            return False
+        if run_status == RunStatus.interrupted.value:
+            return resumed is False
+        return True
+
+    async def get_run_stage_execution(
+        self, project_id: str, run_id: str, stage: str
+    ) -> dict | None:
+        """Did ``stage`` execute during ``run_id``? Narrow, read-only projection.
+
+        Answers the one question the recon ledger cannot: a gc()-reaped
+        ``cycle_summary`` row is hard-DELETEd, so an absent row is byte-for-byte
+        indistinguishable from one that was never written. The ``runs`` table
+        carries no TTL and therefore outlives the ledger, which is what makes
+        the distinction recoverable at all. Sole caller today is
+        ``services/memory_service.py::MemoryService.get_cycle_summary_presence``.
+
+        ``stage_ran`` is deliberately three-valued:
+
+        - ``True``  — positive evidence the stage executed (it filed a report).
+        - ``False`` — positive evidence it did not, and it stays true regardless
+          of TTL, which is why the presence reader ranks it above "expired".
+        - ``None``  — INDETERMINATE: the stored ``stage_reports`` blob did not
+          parse as a JSON object. That is a fault, not a state, so it is logged
+          at WARNING and must never be collapsed into ``False`` — doing so would
+          silently suppress a real data-loss finding.
+
+        The membership test is keyed on ``stage``, never "is there any report at
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
+        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
+        and a run holding only those did not run the stage.
+
+        ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
+        should consume: ``stage_ran=False`` means "the stage never ran" ONLY
+        when the blob is a finished account of the run. Deciding that needs
+        harness lifecycle knowledge — which statuses flush the blob, and that
+        an adopted run is executing again behind a terminal-looking disk status
+        — so it is answered here, next to the read, rather than re-derived by
+        every consumer (see :meth:`_stage_reports_are_settled`).
+
+        ``resumed`` is the raw evidence behind that verdict: whether the
+        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
+        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
+        this run over at least once. It is three-valued for the same reason
+        ``stage_ran`` is — an unparseable blob answers neither question, and
+        collapsing it to ``False`` would read as positive evidence the run was
+        never adopted.
+
+        Scoped by ``project_id`` — tighter than ``get_run``, which is keyed on
+        ``id`` alone — to match the project-scoped identity of the ledger row it
+        explains. A projection rather than a reuse of ``get_run`` because that
+        is ``SELECT *`` piped through ``_row_to_run``, materialising every
+        ``StageReport`` including the multi-KB ``items_flagged`` blobs, when four
+        columns answer the question.
+
+        Returns ``None`` when no such run row exists for that project.
+        """
+        row = await self._require_access().read_one(
+            """SELECT status, stage_reports, started_at, completed_at
+               FROM runs WHERE id = ? AND project_id = ?""",
+            (run_id, project_id),
+        )
+        if row is None:
+            return None
+
+        try:
+            reports = json.loads(row['stage_reports'] or '{}')
+            if not isinstance(reports, dict):
+                raise ValueError('stage_reports is not a JSON object')
+            stage_ran = stage in reports
+            resumed = '_resume' in reports
+        except (TypeError, ValueError):
+            logger.warning(
+                'reconciliation.get_run_stage_execution: '
+                'unparseable stage_reports for project_id=%s run_id=%s; '
+                'cannot tell whether stage=%s ran, reporting indeterminate',
+                project_id,
+                run_id,
+                stage,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            stage_ran = None
+            resumed = None
+
+        return {
+            'status': row['status'],
+            'stage_ran': stage_ran,
+            'resumed': resumed,
+            'settled': self._stage_reports_are_settled(row['status'], resumed),
+            'started_at': row['started_at'],
+            'completed_at': row['completed_at'],
+        }
+    async def get_run_with_stage_reports_text(
+        self, run_id: str
+    ) -> tuple[ReconciliationRun, str | None] | None:
+        """Read a run AND the raw ``stage_reports`` column text in ONE query.
+
+        The text is the compare-and-set token for
+        ``compare_and_set_run_stage_reports``. This method exists rather than a
+        caller doing ``get_run`` plus a second raw read because the parsed run
+        and the token must come from the SAME row: a writer landing between two
+        separate reads would make the token match what is now in the DB while
+        the caller's mutation was applied to the older parsed copy, so the CAS
+        would wrongly succeed and re-introduce the very lost update it exists to
+        prevent.
+
+        The column value is returned untouched — including ``None`` — because it
+        is a comparison token, not a value to interpret. ``get_run`` is left
+        unchanged; its many callers want only the parsed run.
+        """
+        row = await self._require_access().read_one(
+            'SELECT * FROM runs WHERE id = ?', (run_id,)
+        )
+        if row is None:
+            return None
+        return _row_to_run(row), row['stage_reports']
+
     async def get_recent_runs(
         self, project_id: str, limit: int = 10
     ) -> list[ReconciliationRun]:
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             'SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?',
             (project_id, limit),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [_row_to_run(row) for row in rows]
 
     async def is_run_active(self, project_id: str) -> bool:
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             "SELECT 1 FROM runs WHERE project_id = ? AND status = 'running' LIMIT 1",
             (project_id,),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        )
+        return row is not None
 
     # ── Journal entries ────────────────────────────────────────────────
 
     async def add_entry(self, entry: JournalEntry) -> None:
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO journal_entries
                    (id, run_id, stage, timestamp, operation, target_system,
@@ -482,12 +816,10 @@ class ReconciliationJournal:
             )
 
     async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             'SELECT * FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
             (run_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         entries = []
         for row in rows:
             entries.append(
@@ -513,7 +845,7 @@ class ReconciliationJournal:
     # ── Judge verdicts ─────────────────────────────────────────────────
 
     async def add_verdict(self, verdict: JudgeVerdict) -> None:
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO judge_verdicts
                    (run_id, reviewed_at, severity, findings, action_taken)
@@ -543,7 +875,6 @@ class ReconciliationJournal:
         When ``since`` is provided, only verdicts reviewed at or after that
         timestamp are returned (still bounded by ``limit``).
         """
-        db = self._require_db()
         if since is not None:
             query = (
                 """SELECT jv.* FROM judge_verdicts jv
@@ -560,8 +891,7 @@ class ReconciliationJournal:
                    ORDER BY jv.reviewed_at DESC LIMIT ?"""
             )
             params = (project_id, limit)
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(query, params)
         return [
             JudgeVerdict(
                 run_id=row['run_id'],
@@ -583,7 +913,7 @@ class ReconciliationJournal:
         recoverable marker. ``INSERT OR REPLACE`` makes startup re-marking
         idempotent. The marker is cleared atomically inside ``add_verdict``.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT OR REPLACE INTO judge_pending
                    (run_id, project_id, marked_at) VALUES (?, ?, ?)""",
@@ -594,11 +924,13 @@ class ReconciliationJournal:
     async def _delete_judge_pending(db: aiosqlite.Connection, run_id: str) -> None:
         """Single definition of the judge_pending marker DELETE (task 2708 amendment).
 
-        Takes an already-open connection so it runs inside the caller's
-        transaction: ``add_verdict`` calls it inside the verdict-INSERT ``_txn``
-        (atomic marker-clear), and ``clear_judge_pending`` inside its own
-        ``_txn`` (standalone clear). Sharing one DELETE statement keeps the SQL
-        and keying from drifting between the two paths.
+        Takes the connection an open write unit yielded, so it runs inside the
+        caller's transaction: ``add_verdict`` calls it inside the verdict-INSERT
+        unit (atomic marker-clear), and ``clear_judge_pending`` inside its own
+        unit (standalone clear). Sharing one DELETE statement keeps the SQL and
+        keying from drifting between the two paths.  Passing the connection is
+        also what keeps it off ``AtomicConnection``, whose re-entrancy guard
+        refuses a second access from inside an open unit.
         """
         await db.execute('DELETE FROM judge_pending WHERE run_id = ?', (run_id,))
 
@@ -608,7 +940,7 @@ class ReconciliationJournal:
         Standalone clear (own transaction); shares the single DELETE definition
         with ``add_verdict``'s atomic clear via ``_delete_judge_pending``.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await self._delete_judge_pending(db, run_id)
 
     async def get_pending_judge_runs(self) -> list[tuple[str, str]]:
@@ -617,11 +949,9 @@ class ReconciliationJournal:
         Ordered oldest-marked first. Used by startup recovery to re-fire judge
         tasks whose verdicts were dropped by a restart.
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             'SELECT run_id, project_id FROM judge_pending ORDER BY marked_at'
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [(row['run_id'], row['project_id']) for row in rows]
 
     # ── Halt state (persistent across service restarts) ─────────────────
@@ -633,9 +963,7 @@ class ReconciliationJournal:
         `unhalt_grace_remaining` and other fields against their own policy —
         the journal just stores the raw rows.
         """
-        db = self._require_db()
-        async with db.execute('SELECT * FROM halt_state') as cursor:
-            rows = await cursor.fetchall()
+        rows = await self._require_access().read_all('SELECT * FROM halt_state')
         return [
             {
                 'project_id': row['project_id'],
@@ -656,7 +984,7 @@ class ReconciliationJournal:
         reason: str,
     ) -> None:
         """Record (or refresh) a halt. Clears any prior unhalt_grace counter."""
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO halt_state
                    (project_id, halted_at, cooldown_until, reason,
@@ -690,7 +1018,7 @@ class ReconciliationJournal:
         we retain the halt history for diagnostics. A subsequent halt overwrites
         the row via set_halt.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """UPDATE halt_state
                    SET unhalted_at = ?,
@@ -704,8 +1032,12 @@ class ReconciliationJournal:
         """Atomically decrement the grace counter; returns the value AFTER the decrement.
 
         Returns 0 if no row exists or the counter was already 0.
+
+        The read-back runs on the unit's OWN connection, not through
+        ``read_all``: the caller must see the value its own UPDATE just wrote,
+        and a second access from inside an open unit is refused by design.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """UPDATE halt_state
                    SET unhalt_grace_remaining = MAX(unhalt_grace_remaining - 1, 0)
@@ -723,16 +1055,14 @@ class ReconciliationJournal:
 
     async def get_stale_runs(self, cutoff_seconds: float) -> list[ReconciliationRun]:
         """Return runs still marked 'running' whose started_at is older than cutoff."""
-        db = self._require_db()
         cutoff_dt = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - cutoff_seconds,
             tz=UTC,
         )
-        async with db.execute(
+        rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'running' AND started_at < ?",
             (cutoff_dt.isoformat(),),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [_row_to_run(row) for row in rows]
 
     async def get_running_runs(self) -> list[ReconciliationRun]:
@@ -745,11 +1075,9 @@ class ReconciliationJournal:
         ``get_stale_runs(0.0)`` to avoid a fragile ``started_at < now``
         boundary and to read clearly at the call site.
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'running'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [_row_to_run(row) for row in rows]
 
     async def get_interrupted_runs(self) -> list[ReconciliationRun]:
@@ -762,11 +1090,9 @@ class ReconciliationJournal:
         stage_cursor snapshot and its drained events, so the pass can --resume
         the same run_id rather than re-run it from scratch.
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'interrupted'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [_row_to_run(row) for row in rows]
 
     # ── Chunk boundaries ─────────────────────────────────────────────
@@ -779,7 +1105,7 @@ class ReconciliationJournal:
         run_id: str | None = None,
     ) -> None:
         """Record a backlog chunk processing boundary."""
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO chunk_boundaries
                    (id, project_id, run_id, events_count, status, created_at)
@@ -795,14 +1121,12 @@ class ReconciliationJournal:
 
     async def get_last_completed_chunk(self, project_id: str) -> dict | None:
         """Get the most recently completed chunk for resume-on-failure."""
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             """SELECT * FROM chunk_boundaries
                WHERE project_id = ? AND status = 'completed'
                ORDER BY created_at DESC LIMIT 1""",
             (project_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return None
         return {
@@ -826,7 +1150,7 @@ class ReconciliationJournal:
     ) -> None:
         """Record an action performed during a reconciliation run."""
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO run_actions
                        (id, run_id, action_type, target, operation, detail, causation_id, created_at)
@@ -847,12 +1171,10 @@ class ReconciliationJournal:
 
     async def get_run_actions(self, run_id: str) -> list[dict]:
         """Get all run_actions for a reconciliation run."""
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             'SELECT * FROM run_actions WHERE run_id = ? ORDER BY created_at',
             (run_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [
             {
                 'id': row['id'],
@@ -874,6 +1196,8 @@ class ReconciliationJournal:
         Provides redundant coverage: targeted recon logs to run_actions directly,
         full recon logs via write journal (causation_id = run_id).
         """
+        # Calling another public read is safe here precisely because this
+        # method holds no access of its own: the lock is taken once, not nested.
         actions = await self.get_run_actions(run_id)
 
         if self._write_journal:
@@ -908,35 +1232,32 @@ class ReconciliationJournal:
         zero drops out of ``verdicts`` entirely, matching GROUP BY's
         absent-key convention.
         """
-        db = self._require_db()
+        access = self._require_access()
         since_str = since.isoformat()
 
-        async with db.execute(
+        row = await access.read_one(
             'SELECT COUNT(*) as cnt FROM runs WHERE project_id = ? AND started_at > ?',
             (project_id, since_str),
-        ) as cursor:
-            row = await cursor.fetchone()
-            runs_count = row['cnt'] if row else 0
+        )
+        runs_count = row['cnt'] if row else 0
 
-        async with db.execute(
+        row = await access.read_one(
             """SELECT AVG(
                  CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS REAL)
                ) as avg_dur
                FROM runs WHERE project_id = ? AND started_at > ? AND completed_at IS NOT NULL""",
             (project_id, since_str),
-        ) as cursor:
-            row = await cursor.fetchone()
-            avg_duration = row['avg_dur'] if row else None
+        )
+        avg_duration = row['avg_dur'] if row else None
 
-        async with db.execute(
+        verdict_rows = await access.read_all(
             """SELECT severity, COUNT(*) as cnt
                FROM judge_verdicts jv JOIN runs r ON jv.run_id = r.id
                WHERE r.project_id = ? AND jv.reviewed_at > ?
                GROUP BY severity""",
             (project_id, since_str),
-        ) as cursor:
-            verdict_rows = await cursor.fetchall()
-            verdicts = {row['severity']: row['cnt'] for row in verdict_rows}
+        )
+        verdicts = {row['severity']: row['cnt'] for row in verdict_rows}
 
         # Phantom split.  The cheap GROUP BY above stays exactly as it was;
         # only a bounded CANDIDATE set is fetched and JSON-parsed here.
@@ -965,14 +1286,13 @@ class ReconciliationJournal:
             .replace('_', r'\_')
         )
         phantom_counts: dict[str, int] = {}
-        async with db.execute(
+        candidate_rows = await access.read_all(
             r"""SELECT jv.severity as severity, jv.findings as findings
                FROM judge_verdicts jv JOIN runs r ON jv.run_id = r.id
                WHERE r.project_id = ? AND jv.reviewed_at > ?
                  AND (jv.severity = 'serious' OR jv.findings LIKE ? ESCAPE '\')""",
             (project_id, since_str, marker_like),
-        ) as cursor:
-            candidate_rows = await cursor.fetchall()
+        )
 
         # The decode-and-normalise preamble lives in shared beside the
         # predicate rather than being copy-pasted here and in the dashboard's
@@ -1007,6 +1327,77 @@ def _fmt_dt(val: datetime | None) -> str | None:
     if val is None:
         return None
     return val.isoformat()
+
+
+def _serialize_stage_reports(stage_reports: dict[str, StageReport | dict]) -> str:
+    """The single definition of the ``runs.stage_reports`` column text.
+
+    Shared by ``update_run_stage_reports``,
+    ``compare_and_set_run_stage_reports`` and ``complete_run_if_status`` so the
+    column's serialization has one definition rather than several that must be
+    kept byte-identical by hand (SPOT).
+
+    Serializer determinism is NOT a CAS invariant: the token the CAS compares
+    against is always the raw column text ``get_run_with_stage_reports_text``
+    read back, never a re-serialization, so whichever writer wrote the column
+    the next reader's token matches it by construction. Divergent writers would
+    cost readability, not correctness.
+    """
+    serialized = {}
+    for k, v in stage_reports.items():
+        serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
+    return json.dumps(serialized)
+
+
+def _carry_forward_citation_repairs(
+    incoming: dict[str, Any], persisted: dict[str, Any]
+) -> None:
+    """Copy every persisted citation repair onto the same finding in ``incoming``.
+
+    Both arguments are plain ``stage_reports`` JSON. Findings match by stage key
+    and ``finding_id``. Where the persisted finding carries a non-empty
+    ``CITATION_REPAIRS_KEY`` list, its ``cited_memories`` and repairs win;
+    everything else in ``incoming`` stands. That is sound because repair records
+    are append-only provenance that only a compare-and-set writer creates, and
+    only on a terminal row, while an owner never edits a finding's citations
+    after its stage completes. A finding ``incoming`` no longer carries is left
+    out.
+
+    Mutates only ``incoming``, which the caller builds fresh.
+    """
+    for stage_key, persisted_report in persisted.items():
+        incoming_report = incoming.get(stage_key)
+        if not isinstance(persisted_report, dict) or not isinstance(incoming_report, dict):
+            continue
+        incoming_by_id = flagged_findings_by_id(incoming_report.get('items_flagged'))
+        persisted_by_id = flagged_findings_by_id(persisted_report.get('items_flagged'))
+        for finding_id, persisted_finding in persisted_by_id.items():
+            repairs = persisted_finding.get(CITATION_REPAIRS_KEY)
+            target = incoming_by_id.get(finding_id)
+            if target is None or not (isinstance(repairs, list) and repairs):
+                continue
+            target['cited_memories'] = persisted_finding.get('cited_memories')
+            target[CITATION_REPAIRS_KEY] = repairs
+
+
+def flagged_findings_by_id(items_flagged: Any) -> dict[str, dict[str, Any]]:
+    """Index one stage report's ``items_flagged`` by ``finding_id``.
+
+    The one definition of how a finding is located, shared by the owner's
+    carry-forward and ``citation_repair``, so both always resolve an id to the
+    same finding. An entry that is not a dict, or has no non-empty string
+    ``finding_id``, is not indexed; on a repeated id the first entry wins.
+    """
+    if not isinstance(items_flagged, list):
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in items_flagged:
+        if not isinstance(item, dict):
+            continue
+        finding_id = item.get('finding_id')
+        if isinstance(finding_id, str) and finding_id:
+            indexed.setdefault(finding_id, item)
+    return indexed
 
 
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:

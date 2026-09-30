@@ -828,3 +828,115 @@ class TestTickPhaseOrderLiteral:
         assert result.task_id == 'A'
         assert scheduler.lock_table.is_held('A')
         assert called == [f'_phase_{label}' for label in Scheduler._TICK_PHASE_ORDER]
+
+
+class TestTickTelemetry:
+    """``EventType.scheduler_tick`` — the per-tick latency breakdown.
+
+    The tick had NO instrumentation at all before this: no ``perf_counter``
+    anywhere in ``scheduler.py`` or ``harness.py`` and no duration event, which
+    is why a regression to ~14 minutes per tick (one uncached full-history
+    ``git log`` per candidate in the already-landed gate) survived for months.
+    These tests pin the event's shape so the next such regression is visible in
+    ``runs.db`` rather than reconstructable only from log archaeology.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatching_tick_emits_duration_and_phase_breakdown(
+        self, scheduler: Scheduler,
+    ):
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        result = await scheduler.acquire_next()
+        assert result is not None
+
+        ticks = [e for e in event_store.events if e[0] == 'scheduler_tick']
+        assert len(ticks) == 1, 'exactly one scheduler_tick event per tick'
+        payload = ticks[0][1]
+        assert payload['task_id'] == 'A'
+
+        data = payload['data']
+        # duration lives INSIDE data, not the emit() column — _RecordingEventStore
+        # discards the column, so a column-only duration is untestable.
+        assert isinstance(data['duration_ms'], int)
+        assert data['duration_ms'] >= 0
+        assert data['terminal_phase'] == 'select_scored'
+        assert data['candidates'] is not None
+        phases = data['phases']
+        assert set(phases) <= set(Scheduler._TICK_PHASE_ORDER)
+        assert 'select_scored' in phases, 'the terminal phase must be timed too'
+        assert all(isinstance(v, int) for v in phases.values())
+
+    @pytest.mark.asyncio
+    async def test_early_return_tick_still_emits(self, scheduler: Scheduler):
+        """A tick that ends before the phase loop is still a tick.
+
+        The get_tasks preamble is a real per-tick cost, so the clock starts
+        above it and the empty-project early return reports itself with the
+        ``'no_active_tasks'`` pseudo-label rather than emitting nothing.
+        """
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        ticks = [e for e in event_store.events if e[0] == 'scheduler_tick']
+        assert len(ticks) == 1
+        assert ticks[0][1]['task_id'] is None
+        data = ticks[0][1]['data']
+        assert isinstance(data['duration_ms'], int)
+        assert data['terminal_phase'] == 'no_active_tasks'
+        assert data['phases'] == {}
+        assert data['candidates'] is None
+
+    @pytest.mark.asyncio
+    async def test_paused_tick_does_not_emit(self, scheduler: Scheduler):
+        """A paused scheduler is not attempting dispatch — do not spam the store.
+
+        Without this carve-out a pause held for hours would write one event per
+        ``idle_poll_secs`` for its whole duration.
+        """
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        scheduler.pause('test-pause')
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        assert [e for e in event_store.events if e[0] == 'scheduler_tick'] == []
+
+    @pytest.mark.asyncio
+    async def test_telemetry_failure_never_breaks_dispatch(self, scheduler: Scheduler):
+        """PROPERTY 1: instrumentation must not be able to abort a tick."""
+
+        class _SelectiveBoom:
+            run_id = 'run-test'
+
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def emit(self, event_type, **kwargs):
+                if str(event_type) == 'scheduler_tick':
+                    raise RuntimeError('telemetry exploded')
+                self.events.append((str(event_type), kwargs))
+
+        scheduler.event_store = _SelectiveBoom()  # type: ignore[assignment]
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None, 'dispatch must survive a telemetry failure'
+        assert result.task_id == 'A'

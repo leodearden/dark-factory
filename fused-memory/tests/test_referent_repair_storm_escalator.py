@@ -20,7 +20,9 @@ is per-PROJECT, not per-agent.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import logging
 
 import pytest
 
@@ -30,9 +32,9 @@ from fused_memory.middleware.referent_repair_storm_escalator import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not rrse_mod.HAS_ESCALATION,
-    reason='escalation package unavailable (minimal env); the HAS_ESCALATION '
-           'no-op arm is covered separately below',
+    importlib.util.find_spec('escalation') is None,
+    reason='escalation package unavailable (minimal env); the no-op arm is '
+           'covered in tests/test_folded_escalation.py',
 )
 
 
@@ -272,70 +274,85 @@ class TestDedupeFold:
         assert len(_filed(root_b)) == 1
 
 
-class TestNeverRaises:
-    """Called from the live write path: a raise here fails a write because the
-    COMPLAINT about the write failed."""
+def test_the_fold_is_announced_at_warning_on_this_modules_own_logger(
+    tmp_path, caplog,
+):
+    """A fold is a SUPPRESSION, and this filer's suppressions stay at WARNING.
 
-    def test_a_submit_failure_returns_none_and_logs(self, tmp_path, monkeypatch, caplog):
-        class _BrokenQueue:
-            def __init__(self, *_a, **_kw):
-                pass
+    Once a project is storming, EVERY subsequent episode breaches the threshold and
+    folds into the open record, so the fold line is the only ongoing evidence
+    that the storm is still running. At the helper's INFO default that
+    evidence disappears from a default-threshold log, and an operator reading
+    it sees one old escalation and no sign the regression is still firing.
 
-            def get_by_task(self, *_a, **_kw):
-                return []
+    Asserted on `r.name` as well as `r.levelno`: the line must come from THIS
+    module's logger, not the helper's, or every `caplog` filter and every
+    log-routing rule keyed on `fused_memory.middleware.*` loses the
+    attribution that says WHICH alarm folded.
+    """
+    first = _emit(tmp_path)
+    assert first is not None
 
-            def make_id(self, task_id):
-                return f'esc-{task_id}-1'
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        second = _emit(tmp_path, streak=11, repairs=2)
 
-            def submit(self, _esc):
-                raise OSError('read-only filesystem')
-
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _BrokenQueue)
-
-        with caplog.at_level('ERROR'):
-            assert _emit(tmp_path) is None
-        assert caplog.records, 'a swallowed failure must still be visible'
-
-    def test_a_get_by_task_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
-        """A read failure must not BLOCK the alarm — better a possible
-        duplicate than a silenced storm."""
-        real_queue = rrse_mod.EscalationQueue
-
-        class _UnreadableQueue(real_queue):  # type: ignore[misc,valid-type]
-            def get_by_task(self, *_a, **_kw):
-                raise OSError('queue scan failed')
-
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _UnreadableQueue)
-
-        esc_id = _emit(tmp_path)
-        assert isinstance(esc_id, str)
-        assert len(_filed(tmp_path)) == 1
-
-    def test_a_queue_construction_failure_returns_none(self, tmp_path, monkeypatch):
-        def _explode(*_a, **_kw):
-            raise OSError('cannot create queue dir')
-
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _explode)
-
-        assert _emit(tmp_path) is None
+    assert second == first
+    folds = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.middleware.referent_repair_storm_escalator'
+        and r.levelno == logging.WARNING
+    ]
+    assert len(folds) == 1, (
+        f'expected one WARNING fold line on this module\'s own logger, got '
+        f'{[(r.name, r.levelno) for r in caplog.records]!r}'
+    )
+    message = folds[0].getMessage()
+    assert first in message
+    assert "already open for project_id='dark_factory'" in message
+    assert 'streak now 11' in message
+    assert '2 repair(s) this episode' in message
+    assert 'folding into it rather than filing a duplicate' in message
 
 
-def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog):
-    """The minimal-env path: logged, nothing filed, `None` returned. The
-    repair pass must behave identically whether or not the optional
-    `escalation` workspace package is installed."""
-    monkeypatch.setattr(rrse_mod, 'HAS_ESCALATION', False)
+class TestDelegatesToTheSharedHelper:
+    """What this filer forwards to `file_folded_escalation`."""
 
-    with caplog.at_level('DEBUG'):
-        result = emit_referent_repair_storm_escalation(
-            str(tmp_path),
-            project_id='dark_factory',
-            streak=10,
-            threshold=10,
-            repairs=1,
-            records=_records(),
-        )
+    def test_forwards_this_modules_own_anchor_role_and_category(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
 
-    assert result is None
-    assert not (tmp_path / 'data' / 'escalations').exists()
-    assert caplog.records, 'a no-op alarm must still say so'
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-referent-repair-storm-1'
+
+        monkeypatch.setattr(rrse_mod, 'file_folded_escalation', _spy)
+
+        assert _emit(tmp_path) == 'esc-referent-repair-storm-1'
+
+        assert seen['anchor_task_id'] == 'referent-repair-storm'
+        assert seen['agent_role'] == 'fused-memory/referent-repair-guard'
+        assert seen['category'] == 'referent_repair_storm'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_forwards_the_detail_it_builds(self, tmp_path, monkeypatch):
+        """The helper owns the skeleton, not the content: the record cap and
+        the evidence rendering are this alarm's own."""
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-referent-repair-storm-1'
+
+        monkeypatch.setattr(rrse_mod, 'file_folded_escalation', _spy)
+
+        _emit(tmp_path, streak=13, threshold=10, repairs=2)
+
+        assert 'streak=13' in seen['detail']
+        assert 'threshold=10' in seen['detail']
+        assert 'dark_factory' in seen['summary']
+        assert 'canonical_labels' in seen['suggested_action']

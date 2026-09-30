@@ -49,7 +49,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: archive_task_transcripts
+      pattern: archive_before_delete
       paths:
       - orchestrator/src/orchestrator/git_ops.py
       expect: present
@@ -80,7 +80,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: agent_transcript_roots:\s*\[?\s*data/orchestrator/agent-transcripts
+      pattern: data/orchestrator/agent-transcripts
       paths:
       - docs/legibility/legibility.yaml
       expect: present

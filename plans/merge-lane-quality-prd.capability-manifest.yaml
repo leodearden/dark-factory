@@ -1,0 +1,961 @@
+prd: plans/merge-lane-quality-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 5021
+  title: Merge-lane metrics script + ratchet test + committed baseline
+  capabilities:
+  - name: appendix-a-paths-all-exist-and-parse
+    binding: capability→producer (wired) — all 18 Appendix A source modules + 3 test helpers verified
+      present on main 4811d62883 (merge_queue.py 21,550 lines; git_ops.py 14,721; verify_runner.py 3,531)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the script is the measurer; its own coverage is proven by its seeded-fixture self-test,
+        not by a grep
+  - name: complexipy-and-radon-installable
+    binding: capability→producer (upstream=self) — neither is in uv.lock today (verified at decompose);
+      α adds both to orchestrator/pyproject.toml [dependency-groups] dev
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: complexipy
+      paths:
+      - orchestrator/pyproject.toml
+      expect: present
+  - name: ratchet-test-reads-a-committed-baseline
+    binding: capability→producer (upstream=self) — α writes orchestrator/tests/merge_lane_ratchet_baseline.json
+      and the test that consumes it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: merge_lane_ratchet_baseline
+      paths:
+      - orchestrator/tests/test_merge_lane_ratchet.py
+      - scripts/merge_lane_metrics.py
+      expect: present
+  - name: whole-tree-scan-timeout-marker-exists
+    binding: capability→producer (wired) — WHOLE_TREE_SCAN_TEST_TIMEOUT defined at orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT
+      (5x PYPROJECT_DEFAULT_TIMEOUT); already consumed by test_eval_boundary_suite.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: WHOLE_TREE_SCAN_TEST_TIMEOUT
+      paths:
+      - orchestrator/tests/test_merge_lane_ratchet.py
+      expect: present
+  - name: ratchet-goes-red-on-a-seeded-increase
+    binding: 'rejection-mechanism — the asserted rejection is built AND bound by α itself: a fixture adding
+      +1 to each measure must be observed to turn the test red (INV-10 tier 1). No mechanism exists today;
+      α is its producer.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection is proven by an executed seeded fixture inside the task, not by a pattern
+- label: ζ1
+  task_id: 5022
+  title: 'merge_lane package skeleton: facade + ports'
+  capabilities:
+  - name: merge-lane-package-absent-today-so-zeta1-creates-it
+    binding: capability→producer (upstream=self) — orchestrator/src/orchestrator/merge_lane/ verified
+      ABSENT on main at decompose
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MergeLane
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/__init__.py
+      expect: present
+  - name: ports-protocols-defined
+    binding: capability→producer (upstream=self) — VerifyPort/ClockPort/EscalationPort are new; the PRD
+      sketches them in §Contract→Ports
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyPort
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/ports.py
+      expect: present
+  - name: seven-wrapped-functions-exist-to-adapt
+    binding: 'capability→producer (wired) — all seven verified on main: run_scoped_verification (verify.py),
+      _run_unscoped_typechecks (merge_queue.py), _check_post_merge_pyright + _check_post_merge_equivalence
+      (merge_gates.py), _ensure_verify_disk_space (merge_queue.py), _run_cold_shadow_verify (merge_shadow.py),
+      run_dry_run_unblock (dry_run_unblock.py); VerifyRunnerPool (verify_runner.py)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: production entry points verified at decompose; the adapters wrapping them are ζ1 output,
+        checked by the ports grep above
+  - name: three-result-types-are-defined-not-assumed
+    binding: capability→producer (upstream=self) — DiskGuardOutcome / DryRunProposal / EscalationRecord
+      verified ABSENT on main; the PRD names ζ1/β as their producer and forbids any task assuming them
+      earlier. MergeVerifySpec (verify_runner.py::MergeVerifySpec), VerifyResult (verify.py::VerifyResult)
+      and GateVerdict (merge_gates.py::GateVerdict) DO exist and are imported, not redefined.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class (DiskGuardOutcome|DryRunProposal|EscalationRecord)
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/
+      expect: present
+- label: β
+  task_id: 5023
+  title: Worker accepts injected ports; fakes; conftest autouse fixture
+  capabilities:
+  - name: autouse-dotted-path-patch-removed
+    binding: rejection-mechanism (expect absent) — the string 'orchestrator.merge_queue.run_scoped_verification'
+      is present in orchestrator/tests/conftest.py::_mock_merge_queue_verification on main today; β's
+      signal is that it is gone, replaced by fixture injection
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: orchestrator\.merge_queue\.run_scoped_verification
+      paths:
+      - orchestrator/tests/conftest.py
+      expect: absent
+  - name: merge-lane-fakes-module-exists
+    binding: capability→producer (upstream=self) — orchestrator/tests/_merge_lane_fakes.py is new in β;
+      γ1..γ10 and σ all consume it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class FakeVerifier
+      paths:
+      - orchestrator/tests/_merge_lane_fakes.py
+      expect: present
+  - name: exercise-merge-verify-optout-preserved
+    binding: 'capability→producer (wired) — the marker is registered in orchestrator/pyproject.toml and
+      honoured at orchestrator/tests/conftest.py (request.node.get_closest_marker); σ boundary row 2 depends
+      on it surviving β | NOT a mechanical delivered_check: verified at decompose that this pattern ALREADY
+      passes on main, so it could never distinguish delivered from undelivered.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the marker already exists on main and β must PRESERVE it, so a present-check on it passes
+        whether or not β ran — vacuous as a delivered_check. Preservation is pinned by β's updated test_merge_verify_mock_autouse.py
+        and by σ boundary row 2, which EXERCISES the opt-out.
+  - name: ports-available-upstream
+    binding: DAG-direction — VerifyPort/ClockPort/EscalationPort are produced by ζ1, which is UPSTREAM
+      of β (α → ζ1 → β)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; ζ1 carries the mechanical check for the ports themselves
+- label: γ1
+  task_id: 5024
+  title: Migrate merge-lane test group γ1
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 1 files of sidecar group [γ1] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ2
+  task_id: 5025
+  title: Migrate merge-lane test group γ2
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 12 files of sidecar group [γ2] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ3
+  task_id: 5026
+  title: Migrate merge-lane test group γ3
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 12 files of sidecar group [γ3] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ4
+  task_id: 5027
+  title: Migrate merge-lane test group γ4
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 13 files of sidecar group [γ4] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ5
+  task_id: 5028
+  title: Migrate merge-lane test group γ5
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 13 files of sidecar group [γ5] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ6
+  task_id: 5029
+  title: Migrate merge-lane test group γ6
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 13 files of sidecar group [γ6] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ7
+  task_id: 5030
+  title: Migrate merge-lane test group γ7
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 14 files of sidecar group [γ7] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ8
+  task_id: 5031
+  title: Migrate merge-lane test group γ8
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 14 files of sidecar group [γ8] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ9
+  task_id: 5032
+  title: Migrate merge-lane test group γ9
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 14 files of sidecar group [γ9] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: γ10
+  task_id: 5033
+  title: Migrate merge-lane test group γ10
+  capabilities:
+  - name: group-files-all-exist
+    binding: capability→producer (wired) — all 14 files of sidecar group [γ10] verified present on main
+      at decompose; the sidecar's per-group file counts and line totals were re-derived and match
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: file existence verified at decompose against plans/merge-lane-quality-prd.test-groups.txt
+  - name: fakes-available-upstream
+    binding: DAG-direction — FakeVerifier/FakeClock/FakeEscalations are produced by β, which is UPSTREAM
+      of this leaf (ζ1 → β → γ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only; β carries the mechanical check for the fakes module
+  - name: group-scoped-patch-targets-and-private-reads-reach-zero
+    binding: 'numeric floor — the asserted bound is ZERO, and it is reachable by construction: every dotted-path
+      patch and private-attribute read in this group is rewritten or the test is deleted. The measure
+      is α''s AST-based ratchet, not a text grep — a grep for ''orchestrator.merge_queue.'' cannot distinguish
+      a patch-target string literal from a legitimate module reference, so no mechanical check is bound
+      here.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the measure is the ratchet's AST patch-target/private-read count for this group's paths;
+        a text grep would false-FAIL on legitimate module references
+- label: δ
+  task_id: 5034
+  title: Discard the serial worker; retire the reach-back patch guard
+  capabilities:
+  - name: serial-worker-copy-removed
+    binding: rejection-mechanism (expect absent) — orchestrator/tests/_serial_merge_worker.py (393 lines)
+      exists on main today and anchors ~89 test constructions; δ deletes it and re-homes the behaviours
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _serial_merge_worker
+      paths:
+      - orchestrator/
+      expect: absent
+  - name: reachback-patch-guard-retired
+    binding: rejection-mechanism (expect absent) — orchestrator/tests/test_merge_queue_reachback_patch_guard.py
+      (632 lines) exists today; δ deletes it ONLY once the ratchet patch-target measure is 0, so α's count
+      supersedes the allowlist (plans/merge-queue-reliability-prd.md scope ε)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: test_merge_queue_reachback_patch_guard
+      paths:
+      - orchestrator/
+      expect: absent
+  - name: all-ten-groups-upstream
+    binding: DAG-direction — δ depends on γ1..γ10; the batch-wide zero it asserts cannot be produced by
+      δ itself
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+- label: ε
+  task_id: 5035
+  title: Mutation-score baseline (measurement, no threshold)
+  capabilities:
+  - name: mutmut-installable
+    binding: capability→producer (upstream=self) — mutmut is not in uv.lock today (verified at decompose);
+      ε adds it to the dev group
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mutmut
+      paths:
+      - orchestrator/pyproject.toml
+      expect: present
+  - name: report-committed-with-per-module-counts
+    binding: capability→producer (upstream=self) — plans/merge-lane-quality-prd.mutation-baseline.md is
+      new in ε
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: survived
+      paths:
+      - plans/merge-lane-quality-prd.mutation-baseline.md
+      expect: present
+  - name: no-threshold-asserted
+    binding: 'numeric floor — N/A by construction: ε asserts NO bound. Whether a mutation score becomes
+      a ratchet measure is PRD Open question 4, decided after ε lands and outside this batch. A guessed
+      threshold here would be exactly the bare-guess G6 rejects.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: deliberately unbounded — measurement only
+- label: ζ2
+  task_id: 5036
+  title: Move the lane into the package; delete reach-backs and shims
+  capabilities:
+  - name: worker-module-lands-in-the-package
+    binding: 'capability→producer (upstream=self) — git mv merge_queue.py → merge_lane/worker.py. Pattern
+      is rename-robust ON PURPOSE: §Contract keeps MergeLane as the facade name with SpeculativeMergeWorker
+      as an alias only until η, so a check pinned to the old class name alone would start FAILING after
+      η — and this check gates all 120 externally-wired tasks (PRD decision 10).'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SpeculativeMergeWorker|MergeLane
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/
+      expect: present
+  - name: re-export-shims-gone
+    binding: 'rejection-mechanism — 8 "# noqa: F401 re-export shim" blocks measured in merge_queue.py
+      on main; ζ2 deletes every one. Deliberately NOT a mechanical delivered_check: ζ2 gates 120 external
+      tasks, and a stray occurrence of that string in a comment would hold and then escalate all 120.
+      The ratchet already enforces re-export = 0 as a hard test on every verify leg, which is the stronger
+      guard (INV-10).'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: enforced by α's ratchet measure on every verify leg, not by a text grep amplified across
+        120 dependents
+  - name: function-local-reachback-imports-gone
+    binding: 'numeric floor — bound is ZERO and structurally reachable: the 23 reach-back sites in 6 satellites
+      exist only to break import cycles that the one-way import rule dissolves, and the string-path patches
+      that froze them are already removed by Phase 1 (γ/δ, upstream)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: measured by α's AST function-local-import count over the package; a text grep cannot see
+        import scope
+  - name: phase-1-seams-unfrozen-upstream
+    binding: DAG-direction — ζ2 depends on δ, which depends on γ1..γ10; the move is only safe once the
+      tests no longer pin 79 dotted paths into the monolith
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+- label: η
+  task_id: 5037
+  title: Migrate external importers; delete merge_queue.py
+  capabilities:
+  - name: nine-escalation-server-names-stay-in-the-facade
+    binding: 'capability→producer (wired) — measured on main: escalation/src/escalation/server.py imports
+      NINE names from orchestrator.merge_queue across four lazy blocks (InFlightMergeRegistry; MergeOutcome,
+      MergeRequest, QueuedBranch, WaiterRecord, coalesce_or_enqueue_merge_request, patch_content_contained;
+      _resolve_dispatch_time_merge_base; retire_cancelled_merge_request). The PRD''s cross-PRD table prose
+      says "six" and then lists nine; §Contract says nine — NINE is correct.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator\.merge_lane import
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: old-import-path-unreachable
+    binding: rejection-mechanism (expect absent) — after η, orchestrator/src/orchestrator/merge_queue.py
+      is deleted and no first-party module imports it. NOTE dashboard/data/merge_queue.py is an unrelated
+      module with a colliding name and is deliberately out of the checked paths.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: orchestrator\.merge_queue
+      paths:
+      - orchestrator/src/
+      - escalation/src/
+      expect: absent
+  - name: package-exists-upstream
+    binding: DAG-direction — η depends on ζ2; the facade it re-points importers at is ζ2 output
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+- label: θ
+  task_id: 5038
+  title: Replace _WipHaltMixin with a composed HaltState object
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — _WipHaltMixin exists at orchestrator/src/orchestrator/merge_queue.py::_WipHaltMixin
+      and SpeculativeMergeWorker inherits it (verified on main); the four direct-read bypasses of _lane_halt/_operator_halt
+      are the measured reason composition is needed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class HaltState
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/halt.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: ι
+  task_id: 5039
+  title: Extract merge_lane/intake.py
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — coalesce_or_enqueue_merge_request exists in merge_queue.py
+      at cognitive complexity 103 (measured 45bf/4811d62883) and is imported by the escalation server;
+      ι moves and decomposes it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def coalesce_or_enqueue_merge_request
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/intake.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: κ
+  task_id: 5040
+  title: Extract merge_lane/verify_dispatch.py (VerifyDispatcher)
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — _run_post_merge_verify (175) / _run_inflight_verify (101) /
+      _dispatch_item (49) all exist in merge_queue.py; VerifyPort is produced upstream by ζ1/β
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyDispatcher
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/verify_dispatch.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: λ
+  task_id: 5041
+  title: Extract merge_lane/speculation.py (ChainPlanner, Speculator)
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — build_chain / select_chain_depth / _deep_chain_placement /
+      _land_chain_prefix / MergeDeepConfig.chain_cap all verified present on main; merge_speculation_controller.py
+      (586 lines) exists and is absorbed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ChainPlanner
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/speculation.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: μ
+  task_id: 5042
+  title: Extract merge_lane/landing.py (Lander); decompose advance_main in place
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — _finalize_inflight (102, 69 commits/12wk) exists in merge_queue.py;
+      GitOps.advance_main (113) exists in git_ops.py, which stays OUTSIDE the package per PRD decision
+      9
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class Lander
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/landing.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: ν
+  task_id: 5043
+  title: Extract merge_lane/worktrees.py
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — _owned_merge_worktrees / _owned_merge_wt_keys are worker attributes
+      on main; the worktree-conservation audit already exists and must stay unchanged
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _owned_merge_worktrees
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/worktrees.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: ξ
+  task_id: 5044
+  title: Extract merge_lane/telemetry.py
+  capabilities:
+  - name: source-symbols-exist-to-move
+    binding: capability→producer (wired) — snapshot (58) exists in merge_queue.py and its keys are read
+      by the dashboard; PRD §Contract freezes the key set as additive-only
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def snapshot
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/telemetry.py
+      expect: present
+  - name: package-and-ports-upstream
+    binding: DAG-direction — every Phase 3 task depends transitively on ζ1 (ports), ζ2 (package) and η
+      (importers); none of them assumes a module a downstream task produces
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: cognitive-ceiling-40-per-function
+    binding: 'numeric floor — bound 40 against a demonstrated basis: verify_runner.py, same authors and
+      domain, has total cognitive 275 with max 48 across 3,531 lines (measured 45bf). 40 sits inside a
+      band the codebase already sustains; it is not a guessed threshold. Sonar''s published 15 is the
+      separate NEW-function bound α enforces.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by α's ratchet per function and re-asserted by σ against PRD §Ceilings
+- label: ο
+  task_id: 5045
+  title: 'Residual worker.py: composition root + two loops + stop'
+  capabilities:
+  - name: all-concern-modules-upstream
+    binding: DAG-direction — ο depends on ξ ← ν ← μ ← λ ← κ ← ι ← θ; every concern module it composes
+      is produced upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only
+  - name: worker-file-under-1500-lines
+    binding: 'numeric floor — bound 1,500 lines against a stated basis: one default agent Read call is
+      2,000 lines, and the cluster''s healthiest module (verify_runner.py) already sustains 3,531 lines
+      at max cognitive 48. 1,500 is STRICTER than what demonstrably works, and is reachable only because
+      θ..ξ have removed ~8 concerns and ρ relocates archaeology prose (11,876 of merge_queue.py''s 21,550
+      lines are comment/docstring). This is the batch''s highest-risk bound; it is asserted only at σ,
+      and the ratchet permits equality throughout so no intermediate task is blocked by it.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: measured by scripts/merge_lane_metrics.py; asserted at σ against PRD §Ceilings
+  - name: frozen-constructor-keyword-set-still-accepted
+    binding: capability→producer (wired) — the keyword set harness.py passes is enumerated in PRD §Contract
+      and verified against merge_queue.py::SpeculativeMergeWorker.__init__ on main (git_ops, queue, speculation_depth,
+      event_store, on_merge_landed, escalation_queue, train_callback_factory, merge_store, scheduler,
+      mcp, usage_gate, cost_store, provenance_conflict_sink)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SpeculativeMergeWorker|MergeLane
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/worker.py
+      - orchestrator/src/orchestrator/merge_lane/__init__.py
+      expect: present
+- label: π
+  task_id: 5046
+  title: 'MergeFailureKind: route on structured data'
+  capabilities:
+  - name: reason-prefix-constants-exist-and-are-frozen
+    binding: 'capability→producer (wired) — 18 constants measured across merge_gates.py and merge_queue.py:
+      17 public *_REASON_PREFIX / *_REASON plus the private _MERGE_CANCEL_RETIRE_REASON. The PRD''s "seventeen"
+      is the public set.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class MergeFailureKind
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/types.py
+      - orchestrator/src/orchestrator/merge_lane/__init__.py
+      expect: present
+  - name: workflow-routing-sites-exist-to-convert
+    binding: 'capability→producer (wired) — MEASURED CORRECTION: nine `reason.startswith` sites over eight
+      distinct prefixes in orchestrator/src/orchestrator/workflow.py at 4811d62883 (POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+      appears twice). PRD decision 7 prose says "ten of seventeen"; neither the design nor π''s signal
+      depends on the count.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reason\.startswith
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: routing-equivalence-is-provable-from-pre-pi-behaviour
+    binding: end-to-end capability — the expectation table is built from the PRE-π code so a self-consistently
+      wrong mapping still fails; every prefix is in π's own dependency set (they exist today, unchanged)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: equivalence is a parametrised test property, not a pattern
+- label: ρ
+  task_id: 5047
+  title: Relocate archaeology prose; add the archaeology_blocks measure
+  capabilities:
+  - name: archaeology-blocks-measure-is-produced-by-rho-itself
+    binding: capability→producer (upstream=self) — α's task text does NOT list an archaeology_blocks measure;
+      the PRD calls it "the metrics script's NEW measure". ρ therefore owns adding it. This is the one
+      capability in the batch whose producer could have been mistaken for an upstream task; it is bound
+      to ρ.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: archaeology_blocks
+      paths:
+      - scripts/merge_lane_metrics.py
+      expect: present
+  - name: decisions-doc-is-the-single-home
+    binding: 'capability→producer (upstream=self) — docs/merge-lane/decisions.md verified ABSENT on main;
+      ρ creates it. INV-9: one home, dated pointers elsewhere. Dispatched agents hold no memory-write
+      surface, so the home is git-tracked (PRD decision 8).'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^#
+      paths:
+      - docs/merge-lane/decisions.md
+      expect: present
+  - name: count-is-the-contract-not-a-percentage
+    binding: numeric floor — the bound is a COUNT of 0 archaeology blocks in merge_lane/, not a prose-reduction
+      percentage. A percentage would be an unbacked target; a count is measurable and reachable by relocating
+      every block.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: measured by the new archaeology_blocks measure ρ itself adds
+- label: σ
+  task_id: 5048
+  title: B+H integration gate (boundary rows 1-12)
+  capabilities:
+  - name: every-boundary-row-capability-is-upstream
+    binding: DAG-direction — rows 1-12 exercise the facade (ζ1/ζ2), the ports and fakes (β), each concern
+      module (θ..ο), the structured failure kind (π) and the ceilings (α + ρ). All produced upstream;
+      σ produces no mechanism of its own.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction only — σ IS the check suite
+  - name: real-local-runner-path-is-exercisable
+    binding: capability→producer (wired) — row 2 needs the REAL LocalRunner against a fixture project,
+      reached via the exercise_merge_verify marker; the marker is registered in orchestrator/pyproject.toml
+      and honoured in conftest.py today, and β is required to preserve it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: row 2 is proven by an executed real-LocalRunner land, not by a pattern; the gate module
+        filename is not a stable anchor
+  - name: ceilings-asserted-through-one-encoding
+    binding: INV-5 — σ asserts PRD §Ceilings by calling scripts/merge_lane_metrics.py, not by re-implementing
+      the measures in test code; rows 10/11 use the script's AST measures rather than an ad-hoc grep (INV-10)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by σ calling the metrics script; the gate module filename is not a stable anchor
+  - name: rollback-runbook-recorded
+    binding: 'capability→producer (wired) — the runbook line is real: CLAUDE.md §"Working in the main
+      checkout" documents the direct-commit path and the git-stash prohibition; the blast radius (a broken
+      lane blocks its own revert) is why it is on the record in σ''s task text'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a task-text provenance requirement, not a code capability
+- label: τ
+  task_id: 5049
+  title: Deterministic fleet redeploy
+  capabilities:
+  - name: restart-script-exists-and-is-executable
+    binding: 'capability→producer (wired) — scripts/restart-all-orchestrators.sh verified present and
+      mode 0775 on main at decompose; before_done validation requires it AT FILING TIME, so this had to
+      be checked here, not at dispatch | NOT a mechanical delivered_check: verified at decompose that
+      this pattern ALREADY passes on main, so it could never distinguish delivered from undelivered.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the script already exists on main — a present-check on it passes whether or not τ ran. Its
+        existence and executability are validated by before_done at submit_task time, which is the enforcing
+        mechanism; τ has no dependents for a gate to protect anyway.
+  - name: target-unit-exists
+    binding: capability→producer (wired) — orchestrator-dark-factory.service is a live systemd --user
+      unit (loaded active running) with a unit file at ~/.config/systemd/user/. It equals the dispatching
+      orchestrator's own unit, so the DeterministicRunner takes the detached systemd-run path and closes
+      with done_provenance kind deterministic-deploy-scheduled — exactly the PRD's signal.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: systemd unit liveness is host state, not a repo pattern
+  - name: not-gated-behind-the-paused-fleet-deploy-work
+    binding: 'DAG-direction — τ is deliberately NOT wired behind tasks 3730 / 3733 / 4755 / 5020 (Leo,
+      2026-09-03). PRD decision 11: if 5020 lands first, τ is redundant and harmless.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an explicit non-dependency; recorded so a later reader does not "fix" it

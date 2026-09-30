@@ -1,0 +1,142 @@
+# Test-file groups for plans/merge-lane-quality-prd.md tasks γ1..γ10 (generated 2026-09-03 from the 120 orchestrator/tests files that import or patch orchestrator.merge_queue; greedy LOC balance).
+# One decompose-time leaf per group. Paths are relative to orchestrator/tests/. Lines = file length at generation time.
+
+[γ1] files=1 lines=24618
+test_merge_queue.py	24618
+
+[γ2] files=12 lines=17536
+test_coalesce_integration_gate.py	1001
+test_harness_claimant_clear.py	200
+test_landed_outbox.py	574
+test_merge_item_union.py	286
+test_merge_queue_chain_intact.py	719
+test_merge_queue_host_observability.py	870
+test_merge_queue_main_health_deferred.py	1530
+test_merge_queue_train_attribution.py	463
+test_merge_queue_verify_retry.py	1734
+test_verify_plan_integration.py	1185
+test_workflow_e2e.py	8729
+test_workflow_main_health_routing.py	245
+
+[γ3] files=12 lines=17343
+test_b3_gate.py	1972
+test_concurrent_verify_boundary.py	1170
+test_harness_no_landings_breaker.py	451
+test_merge_queue_persistent_worktree.py	567
+test_merge_queue_redispatch_entries.py	253
+test_merge_queue_resolve_release.py	1583
+test_merge_queue_single_writer_asserts.py	624
+test_merge_queue_supervisor.py	857
+test_merge_queue_verify_base_invariant.py	957
+test_verify_runner.py	7387
+test_workflow_merge_provenance.py	1229
+test_workflow_worktree_missing.py	293
+
+[γ4] files=13 lines=17553
+test_harness_merge_registry_wiring.py	259
+test_harness_service_restart.py	1180
+test_merge_liveness.py	365
+test_merge_queue_concurrent_verify.py	7286
+test_merge_queue_finalize_head_visibility.py	522
+test_merge_queue_landed_dispatch_gate.py	344
+test_merge_queue_restart_hook.py	953
+test_merge_queue_two_layer_integration.py	1974
+test_merge_serial_lane_tripwire.py	697
+test_verify_categories.py	1223
+test_workflow_merge_superseded.py	219
+test_workflow_train_attribution.py	1685
+test_workflow_train_completion.py	846
+
+[γ5] files=13 lines=17421
+test_harness_train_callbacks.py	1194
+test_merge_queue_c3_submit_identity.py	608
+test_merge_queue_deep_dispatch.py	2792
+test_merge_queue_deep_integration_gate.py	5689
+test_merge_queue_duplicate_submission.py	885
+test_merge_queue_flake_recorder.py	476
+test_merge_queue_resource_audit.py	1833
+test_merge_shadow.py	1553
+test_merge_worker_retired.py	79
+test_outcome_kind.py	244
+test_train_integration.py	741
+test_workflow_halt_owner.py	1007
+test_workflow_skew_surfacing.py	320
+
+[γ6] files=13 lines=17416
+test_merge_attempt_disposition.py	74
+test_merge_cancel_retire.py	244
+test_merge_gates.py	1560
+test_merge_queue_build_chain.py	1950
+test_merge_queue_disposition_wiring.py	1215
+test_merge_queue_multihost_wiring.py	5516
+test_merge_queue_orphan_reaper.py	1023
+test_merge_request_ledger.py	471
+test_overlap_footprint.py	321
+test_suffix_conflict_tracker.py	742
+test_verify_plan.py	2792
+test_workflow_dry_run_hook.py	618
+test_workflow_merge_phase_liveness.py	890
+
+[γ7] files=14 lines=17411
+test_fleet_staleness_composition.py	281
+test_merge_disposition.py	1704
+test_merge_queue_bounce.py	936
+test_merge_queue_dispatch_fill_redispatch.py	553
+test_merge_queue_invariant_integration_gate.py	1995
+test_merge_queue_landed_reconciler.py	1061
+test_merge_queue_main_health.py	1464
+test_merge_queue_metrics.py	469
+test_merge_queue_permit_conservation.py	843
+test_merge_queue_reachback_patch_guard.py	632
+test_merge_speculation.py	4332
+test_merge_verify_mock_autouse.py	69
+test_multihost_verify_integration.py	2819
+test_workflow_warm_lane_requeue.py	253
+
+[γ8] files=14 lines=17553
+test_halt_owner.py	715
+test_harness_merge_store_wiring.py	225
+test_inflight_verify_merge_lease.py	227
+test_laptop_warm_verify_boundary.py	4143
+test_merge_drift.py	780
+test_merge_guard_pipeline.py	1164
+test_merge_queue_store.py	1376
+test_merge_queue_verifier_raw_cancel.py	411
+test_merge_queue_warm_cold_shadow.py	2243
+test_merge_skew_end_to_end.py	895
+test_merge_types.py	329
+test_verify_reverse_dep.py	513
+test_warm_lane_integration_gate.py	1602
+test_workflow.py	2930
+
+[γ9] files=14 lines=17514
+test_branch_work_landed.py	2196
+test_harness_reblock_guard.py	176
+test_merge_queue_dry_run_unblock.py	1131
+test_merge_queue_equivalence.py	897
+test_merge_queue_frozen_prefix.py	1418
+test_merge_queue_lifecycle_registry.py	2952
+test_merge_queue_no_landings_breaker.py	535
+test_merge_queue_request_liveness.py	4137
+test_merge_types_invariants.py	265
+test_merge_worktree_lifecycle_integration_gate.py	1607
+test_workflow_first_enqueue_stamp.py	372
+test_workflow_merge_blocked_surfacing.py	336
+test_workflow_merge_thrash.py	679
+test_workflow_train_halt_owner.py	813
+
+[γ10] files=14 lines=17433
+test_atomic_train_merge.py	2464
+test_critical_gate.py	94
+test_harness.py	500
+test_harness_k_from_config.py	249
+test_item_lifecycle.py	436
+test_merge_boundary_effective_module_configs.py	831
+test_merge_queue_auto_heal.py	1218
+test_merge_queue_coalesce.py	2963
+test_merge_queue_conflict_graph.py	898
+test_merge_queue_deep_landing.py	4035
+test_merge_queue_depth_telemetry.py	704
+test_merge_queue_phase_derivation.py	306
+test_merge_queue_speculative_probe.py	1164
+test_verify_scope_inversion_boundary.py	1571

@@ -24,6 +24,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from shared.asyncio_tasks import abandon_task
+
 logger = logging.getLogger(__name__)
 
 # Mirrors GitConfig.load_bearing_oracle_timeout_secs' default (config.py) —
@@ -46,12 +48,27 @@ class TripwireHit:
     overlap_files: tuple[str, ...]
 
 
+# Strong references to abandoned load-bearing-oracle tasks, held until they
+# unwind (why: shared/src/shared/asyncio_tasks.py::abandon_task). Module-local
+# rather than shared because _abandon_oracle's backlog WARNING must count
+# oracle tasks alone, and the tests drain it independently of other packages.
+_ABANDONED_ORACLES: set[asyncio.Task] = set()
+
+# A handful of concurrently-abandoned oracles is already unusual — at most
+# one runs per merge landing. Crossing this many pending cleanups signals a
+# persistent backlog (e.g. a wedged oracle whose grandchild holds the
+# stdout/stderr pipes open — see _run_load_bearing_oracle's docstring) worth
+# a human looking at, not one slow oracle; see _abandon_oracle below.
+_ABANDONED_ORACLES_WARN_THRESHOLD = 8
+
+
 def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
-    """Done-callback for a load-bearing-oracle task abandoned after a
-    timeout (see ``_run_load_bearing_oracle``) — retrieves the task's
-    result/exception so a background cleanup failure never surfaces as an
-    "exception was never retrieved" warning, and logs at DEBUG for
-    diagnostics. Never raises.
+    """``on_done`` hook for a load-bearing-oracle task abandoned by
+    :func:`_abandon_oracle` after an exceptional exit from
+    ``_run_load_bearing_oracle``'s wait — a timeout or the caller being
+    cancelled. Only logs, at DEBUG, how the task ended; releasing the strong
+    reference and consuming the exception belong to
+    ``shared/src/shared/asyncio_tasks.py::track_task``. Never raises.
     """
     try:
         if task.cancelled():
@@ -66,6 +83,29 @@ def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
     except Exception:
         logger.debug(
             '_run_load_bearing_oracle: error inspecting abandoned oracle task', exc_info=True,
+        )
+
+
+def _abandon_oracle(task: asyncio.Task) -> None:
+    """Cancel *task* fire-and-forget and hold a strong reference until it ends.
+
+    Delegates to ``shared/src/shared/asyncio_tasks.py::abandon_task``, with
+    :func:`_log_abandoned_oracle_cleanup` as the ``on_done`` hook.
+
+    Also logs a WARNING naming the registry size once it exceeds
+    :data:`_ABANDONED_ORACLES_WARN_THRESHOLD`: the per-call WARNING already
+    logged by ``_run_load_bearing_oracle`` on timeout reads as a transient
+    hiccup, so a persistent pile-up would otherwise stay invisible until
+    something else notices the memory.
+    """
+    abandon_task(task, _ABANDONED_ORACLES, on_done=_log_abandoned_oracle_cleanup)
+    backlog = len(_ABANDONED_ORACLES)
+    if backlog > _ABANDONED_ORACLES_WARN_THRESHOLD:
+        logger.warning(
+            '_run_load_bearing_oracle: %d abandoned oracle tasks still '
+            'pending cleanup — possible persistent backlog (e.g. a wedged '
+            'oracle grandchild holding the stdout/stderr pipes open)',
+            backlog,
         )
 
 
@@ -105,6 +145,15 @@ async def _run_load_bearing_oracle(
     background (logged via :func:`_log_abandoned_oracle_cleanup`, never
     blocking a caller).
 
+    The task is abandoned this way on EVERY exceptional exit from the
+    ``asyncio.wait`` above, not only budget expiry: if this coroutine's own
+    caller is cancelled while parked there, ``asyncio.wait`` does not cancel
+    what it was waiting on, so the oracle task would otherwise be left
+    referenced only by the event loop's WEAK task set. Either way the task
+    is cancelled and held in the module-level :data:`_ABANDONED_ORACLES`
+    strong-reference registry (via :func:`_abandon_oracle`) until it ends,
+    then released.
+
     Fail-open contract — returns False for ANY of:
     - ``oracle_cmd`` is ``None`` or empty (tripwire disabled / misconfigured).
     - ``changed_files`` is empty.
@@ -116,6 +165,11 @@ async def _run_load_bearing_oracle(
       raised (an oracle hiccup must never wedge the merge-landed hot path —
       log WARNING, return False).
 
+    The one exit that does NOT fail open: if this coroutine's caller is
+    cancelled, the oracle task is abandoned (as above) but the
+    ``CancelledError`` itself PROPAGATES rather than being laundered into
+    ``False`` — a cancelled caller must stay cancelled.
+
     Mirrors ``verify._verify_pipeline_guard_requires_full_gate``'s fail-open
     shape, but takes a config-driven command list instead of a hardcoded
     ``scripts/verify-pipeline-guard.sh`` path.
@@ -126,7 +180,18 @@ async def _run_load_bearing_oracle(
         from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors _verify_pipeline_guard_requires_full_gate
 
         task = asyncio.ensure_future(_run([*oracle_cmd, *changed_files], cwd=project_root))
-        _done, pending = await asyncio.wait({task}, timeout=timeout_secs)
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=timeout_secs)
+        except BaseException:
+            # asyncio.wait() does not cancel what it waits on, and this
+            # catches BaseException (not just Exception) because
+            # CancelledError — the caller being cancelled out from under us
+            # — is a BaseException subclass since 3.8, so the outer
+            # `except Exception` below cannot see it. Without this,
+            # cancellation jumps over the abandon and strands the task in
+            # the loop's WEAK set.
+            _abandon_oracle(task)
+            raise
         if pending:
             logger.warning(
                 '_run_load_bearing_oracle: oracle command exceeded %.1fs for '
@@ -134,8 +199,7 @@ async def _run_load_bearing_oracle(
                 'cleanup to the background',
                 timeout_secs, project_root,
             )
-            task.cancel()
-            task.add_done_callback(_log_abandoned_oracle_cleanup)
+            _abandon_oracle(task)
             return False
         rc, _out, _err = task.result()
         return rc == 0
@@ -230,7 +294,17 @@ async def emit_pipeline_landing_tripwire(
     escalation per landing). Every external call (oracle subprocess inside
     ``_run_load_bearing_oracle``, each ``get_branch_diff``, ``submit``,
     each ``update_task``) is individually guarded, and the whole body is
-    wrapped again as a backstop — this function NEVER raises.
+    wrapped again as a backstop — this function never raises for any
+    oracle/git/task-update FAILURE.
+
+    Caller cancellation is the one exit this does NOT swallow: it
+    propagates BY DESIGN (``_run_load_bearing_oracle`` re-raises
+    ``CancelledError`` rather than failing open — see its docstring and
+    ``_ABANDONED_ORACLES``), and the ``except Exception:`` guards above and
+    below must never be widened to ``except BaseException:`` to suppress
+    it. A cancelled merge-landed hot path must stay cancelled; swallowing
+    ``CancelledError`` here would break cooperative cancellation and
+    re-strand the very oracle task ``_ABANDONED_ORACLES`` now tracks.
     """
     try:
         if not oracle_cmd:

@@ -5,32 +5,21 @@ also contains assert_not_awaited(). See task 673 (lint guard replacing task-571 
 """
 from __future__ import annotations
 
-import importlib.util
 import re
 import shutil
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_asyncmock_assertion_style.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    spec = importlib.util.spec_from_file_location('check_asyncmock_assertion_style', SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_asyncmock_assertion_style')
 find_violations = _checker.find_violations
 
 

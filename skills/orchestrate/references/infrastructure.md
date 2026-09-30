@@ -141,11 +141,29 @@ systemd + git state on every call rather than stored — it self-clears as
 soon as any restart (from either tier, a deploy capstone, or a manual
 operator restart) lands: no stored state, no flap loop.
 
-To avoid racing the polite event-driven tier, the backstop only acts once
-the newest watched commit is older than `STALENESS_GRACE_SECS` (30 minutes)
-— giving Tier 1 a head start — and additionally respects each unit's
-startup grace window and `is_unit_enabled` (an operator-disabled unit is
-left alone).
+To avoid racing the polite event-driven tier, the backstop holds a head
+start for Tier 1 measured as the LATER of two anchors: 30 minutes
+(`STALENESS_GRACE_SECS`) after the shared 8h fleet-deploy min-interval
+window OPENS, and 30 minutes after the newest watched commit. It
+additionally respects each unit's startup grace window and
+`is_unit_enabled` (an operator-disabled unit is left alone).
+
+The first anchor is the load-bearing one at an 8h boundary, and is the
+reason the min-interval clock — not mentioned elsewhere in this section —
+matters here. Both tiers are capped to at most one fleet redeploy per
+`ORCH_RESTART_MIN_INTERVAL_SECS` (8h) by a shared on-disk clock stamped only
+on a verified-fresh redeploy. In a repo that ships the watched paths
+continuously the newest commit is typically hours old by the time that
+window reopens, so the commit anchor alone had already lapsed and gave
+Tier 1 no head start at the moment the two tiers actually contend. Anchoring
+on min-interval expiry is what makes "the backstop does not race Tier 1"
+true at the boundary (task 4754).
+
+The watchdog runs a structurally identical fused-memory staleness pass over
+`fused-memory.service`, applying the same corrected head-start anchor
+against its own separate clock and its own cap — the two clocks are
+deliberately independent, so a fleet redeploy never resets fused-memory's
+window or vice-versa.
 
 ### When to run `--report`
 
@@ -162,9 +180,10 @@ capstone.
 
 Note the verdict is a raw `start_epoch` vs. newest-watched-commit comparison
 only — it does **not** apply the restraint gates (`is_unit_enabled`,
-startup grace, commit grace) that the actual staleness pass applies before
-restarting. A unit reported `stale` may be one the backstop correctly leaves
-alone this tick (e.g. still within commit-grace, giving Tier 1 time to act).
+startup grace, the min-interval clock cap, the min-interval-anchored head
+start, or the commit-age grace) that the actual staleness pass applies
+before restarting. A unit reported `stale` may be one the backstop correctly
+leaves alone this tick (e.g. still inside Tier 1's head start).
 Treat `stale` as "not running code from the newest watched commit," not as a
 prediction that a restart is imminent.
 

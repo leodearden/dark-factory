@@ -24,6 +24,73 @@ class GroundTruthIssue:
 
 
 @dataclass
+class FixtureTaskRecord:
+    """The task record the implementer received before writing the diff.
+
+    For mined fixtures this is the ``tasks.db`` row; for hand-authored
+    fixtures it is a plausible record reconstructed from the diff, flagged
+    ``authored=True``.
+    """
+
+    title: str
+    description: str
+    test_strategy: str
+    details: str = ''
+    authored: bool = False
+    id: str | None = None
+    record_source: dict | None = None  # where/when the record was read, and whether it moved since the merge
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FixtureTaskRecord:
+        return cls(
+            title=data['title'],
+            description=data.get('description', ''),
+            test_strategy=data.get('test_strategy', ''),
+            details=data.get('details', ''),
+            authored=bool(data.get('authored', False)),
+            id=data.get('id'),
+            record_source=data.get('record_source'),
+        )
+
+
+@dataclass
+class FixtureContext:
+    """Per-fixture inputs the context-complete reviewer briefing needs beyond the diff.
+
+    ``base_sha`` is the commit the stored diff applies to (for mined fixtures,
+    the merge commit's first parent); ``branch_sha`` is the reviewed tip
+    (mined fixtures only). Either may be ``None`` with the matching
+    ``*_reason`` saying why nothing was recoverable, and ``plan`` is ``None``
+    with ``plan_reason`` when no plan.json survived.
+    """
+
+    task: FixtureTaskRecord
+    changed_files: list[str]
+    base_sha: str | None = None
+    branch_sha: str | None = None
+    base_sha_reason: str | None = None
+    plan: dict | None = None  # plan.json shape: analysis, design_decisions, steps
+    plan_reason: str | None = None
+    verification: dict | None = None  # how base/branch were checked against the stored diff
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FixtureContext:
+        return cls(
+            task=FixtureTaskRecord.from_dict(data['task']),
+            changed_files=list(data.get('changed_files', [])),
+            base_sha=data.get('base_sha'),
+            branch_sha=data.get('branch_sha'),
+            base_sha_reason=data.get('base_sha_reason'),
+            plan=data.get('plan'),
+            plan_reason=data.get('plan_reason'),
+            verification=data.get('verification'),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class CorpusDiff:
     """A single diff in the evaluation corpus."""
 
@@ -37,6 +104,7 @@ class CorpusDiff:
     cwd: Path | None = None
     split: str | None = None       # "train" | "selection" | "test"
     provenance: dict | None = None  # mining provenance: runs.db refs, escalation refs, merge_sha
+    context: FixtureContext | None = None  # task record, plan, base/branch shas, changed files
 
     def blocking_issues(self) -> list[GroundTruthIssue]:
         return [gt for gt in self.ground_truth if gt.severity == 'blocking']
@@ -91,6 +159,8 @@ class CorpusManifest:
             }
             if diff.provenance is not None:
                 ann_data['provenance'] = diff.provenance
+            if diff.context is not None:
+                ann_data['context'] = diff.context.to_dict()
             ann_file.write_text(json.dumps(ann_data, indent=2))
 
             # Manifest entry (no diff_text — loaded from file)
@@ -126,12 +196,15 @@ class CorpusManifest:
             ann_file = corpus_dir / 'annotations' / f'{diff_id}.json'
             ground_truth = []
             provenance = None
+            context = None
             if ann_file.exists():
                 ann_data = json.loads(ann_file.read_text())
                 ground_truth = [
                     GroundTruthIssue(**gt) for gt in ann_data['ground_truth']
                 ]
                 provenance = ann_data.get('provenance')
+                if ann_data.get('context') is not None:
+                    context = FixtureContext.from_dict(ann_data['context'])
 
             cwd = None
             project = entry.get('project')
@@ -149,6 +222,7 @@ class CorpusManifest:
                 cwd=cwd,
                 split=entry.get('split'),
                 provenance=provenance,
+                context=context,
             ))
 
         return cls(

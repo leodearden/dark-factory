@@ -12,6 +12,10 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import poll_until
 
+from fused_memory.middleware.dead_letter_escalator import (
+    _REPORTED_TO_CALLER,
+    _REPORTED_TO_CALLER_DEFAULT,
+)
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
@@ -102,8 +106,16 @@ class TestIntegrationFlow:
         assert stats['counts'].get('completed', 0) == 0
 
     @pytest.mark.asyncio
-    async def test_add_episode_uuid_survives_full_flow(self, integrated_service):
-        """add_episode uuid passes through queue serialization to graphiti.add_episode."""
+    async def test_add_episode_reaches_backend_with_no_uuid_full_flow(
+        self, integrated_service
+    ):
+        """The full enqueue/serialize/drain path calls graphiti.add_episode with uuid=None.
+
+        Retargeted from the old "uuid survives the full flow" contract (task
+        3561): surviving the flow was the DEFECT. graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so anything but
+        None here is NodeNotFoundError once the write actually executes.
+        """
         svc = integrated_service
         svc.graphiti.add_episode.return_value = None
 
@@ -121,7 +133,7 @@ class TestIntegrationFlow:
         )
         svc.graphiti.add_episode.assert_called_once()
         call_kwargs = svc.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == result.episode_id
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_add_episode_processed_with_callback(self, integrated_service):
@@ -947,3 +959,230 @@ class TestTerminalOutcomeWrittenBack:
         # clobbering it.
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
+
+
+# ---------------------------------------------------------------------------
+# THE ACCEPTANCE TEST (task 3583).
+#
+# The property under test is not "a dead-letter is recorded" — task 3582
+# already established that, on `write_ops.terminal_status`. It is that the
+# failure REACHES someone: observable by reading the escalation queue ALONE,
+# with write_queue.db and write_journal.db never opened. Those two are exactly
+# what an operator does not have once routine `delete_dead_letters` cleanup has
+# run, which is how 28 permanently-failed writes went unnoticed for three and a
+# half months in the esc-3561-3 investigation.
+# ---------------------------------------------------------------------------
+
+
+def _filed_escalations(root):
+    """The parsed escalation payloads under ``{root}/data/escalations``."""
+    import json
+
+    queue_dir = root / 'data' / 'escalations'
+    if not queue_dir.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(queue_dir.glob('esc-*.json'))]
+
+
+async def _poll_for_escalation(root):
+    """Wait for the alarm to land, reading ONLY the escalation queue."""
+    return await poll_until(
+        lambda: _filed_escalations(root) or None,
+        timeout=20.0,
+        interval=0.05,
+        message=f'no escalation was ever filed under {root}/data/escalations',
+    )
+
+
+class TestAddEpisodeDeadLetterIsObservable:
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_add_episode_reaches_the_escalation_queue(
+        self, journaled_service, tmp_path,
+    ):
+        svc, _journal = journaled_service
+        # The esc-3561-3 shape: NodeNotFoundError, one per write, each naming a
+        # different uuid — which is why the fold keys on the class, not the text.
+        svc.graphiti.add_episode = AsyncMock(
+            side_effect=RuntimeError('node 0e1d2c3b-aaaa-bbbb-cccc-444455556666 not found')
+        )
+        # The fixture deliberately does NOT do this, mirroring server/main.py's
+        # initialize()-then-inject order. Without it the escalation correctly
+        # refuses to file rather than guessing a root.
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_episode(
+            content='an episode the caller was told had been accepted',
+            project_id='main',
+        )
+
+        # The synchronous contract is deliberately UNCHANGED: hedging the word
+        # would not fix a caller that gets 'queued' and later gets nothing.
+        assert response.status.value == 'queued'
+        episode_id = response.episode_id
+
+        filed = await _poll_for_escalation(tmp_path)
+
+        assert len(filed) == 1, f'expected one alarm, got {filed}'
+        record = filed[0]
+        assert record['category'] == 'durable_write_dead_letter'
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert 'add_episode' in record['summary'], record['summary']
+        assert "project_id='main'" in record['detail'], record['detail']
+
+        # The line that makes this actionable rather than merely alarming: it
+        # says not only that a write died but that a caller ACTED on a success
+        # that will never be true, and names the id that caller holds.
+        assert 'reported_to_caller=' in record['detail'], record['detail']
+        assert _REPORTED_TO_CALLER['add_episode'].text in record['detail'], (
+            record['detail']
+        )
+        assert episode_id in record['detail'], (
+            'the returned episode_id must appear verbatim so an operator can '
+            'tie the alarm back to the call that was lied to'
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_but_the_escalation_queue_was_needed(
+        self, journaled_service, tmp_path,
+    ):
+        """The negative half of the property: the alarm is self-sufficient.
+
+        Deletes BOTH sqlite files before asserting, reproducing the state an
+        operator is actually in after `delete_dead_letters` — and then reads
+        the escalation and finds the operation, the project, the attempt count
+        and the lost content still there.
+        """
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        await svc.add_episode(
+            content='the only surviving copy of this content', project_id='main',
+        )
+        await _poll_for_escalation(tmp_path)
+
+        await svc.close()
+        await journal.close()
+        for db in tmp_path.rglob('*.db*'):
+            db.unlink()
+
+        record = _filed_escalations(tmp_path)[0]
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert "project_id='main'" in record['detail'], record['detail']
+        assert 'attempts=' in record['detail'], record['detail']
+        assert 'the only surviving copy of this content' in record['detail'], (
+            'the content preview is the last trace of what was lost'
+        )
+
+
+class TestAddMemoryGraphitiLegDeadLetterIsObservable:
+    """The asymmetry the task names, and the regression that anchors it.
+
+    `add_memory`'s Mem0 leg is a direct synchronous call, so its failure is
+    visible to the caller immediately. Its Graphiti leg is enqueued and
+    reported as WRITTEN at enqueue time — a true statement about durable
+    acceptance, and a false one about the graph — and until now its eventual
+    death reached nobody.
+
+    The response is deliberately left unchanged: `add_memory` structurally
+    CANNOT wait for the Graphiti write (that is the whole purpose of the
+    queue), and dropping graphiti from `stores_written` would be strictly
+    worse — the caller would lose the true fact that the write was durably
+    accepted and STILL learn nothing when it later died. So the FAILURE becomes
+    push instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_caller_is_told_graphiti_was_written_at_enqueue_time(
+        self, journaled_service, tmp_path,
+    ):
+        """Today's behaviour, pinned so the regression below is anchored on a
+        measured fact rather than an assumed one."""
+        from fused_memory.models.enums import MemoryCategory
+
+        svc, _journal = journaled_service
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_memory(
+            content='a decision the caller was told had been recorded',
+            category=MemoryCategory.decisions_and_rationale.value,
+            project_id='main',
+        )
+
+        assert SourceStore.graphiti in response.stores_written, (
+            "reported at ENQUEUE time, under add_memory's "
+            '"Durably persisted to SQLite — report as written" comment'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_graphiti_leg_reaches_the_escalation_queue(
+        self, journaled_service, tmp_path,
+    ):
+        from fused_memory.models.enums import MemoryCategory
+
+        svc, _journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(
+            side_effect=RuntimeError('node 0e1d2c3b-aaaa-bbbb-cccc-444455556666 not found')
+        )
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_memory(
+            content='a decision the caller was told had been recorded',
+            category=MemoryCategory.decisions_and_rationale.value,
+            project_id='main',
+        )
+        assert SourceStore.graphiti in response.stores_written
+
+        filed = await _poll_for_escalation(tmp_path)
+        detail = filed[0]['detail']
+
+        assert "operation='add_memory_graphiti'" in detail, detail
+        assert 'add_memory_graphiti' in filed[0]['summary'], filed[0]['summary']
+
+        # THE REGRESSION. Step 14 implemented only the add_episode entry, so
+        # this record currently claims no synchronous success was reported —
+        # which is false, and is exactly the lie the alarm exists to surface.
+        assert 'reported_to_caller=' in detail, detail
+        assert _REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, (
+            'the caller was told graphiti was WRITTEN, not that the write was '
+            'queued; an alarm that misreports what the caller was promised is '
+            'not triageable'
+        )
+        assert _REPORTED_TO_CALLER['add_episode'].text not in detail, (
+            'add_memory never returns a queued status — that is add_episode'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_operation_with_no_synchronous_claim_says_so(
+        self, journaled_service, tmp_path,
+    ):
+        """The neutral default, so an operator is not told a lie was told when
+        it wasn't.
+
+        `mem0_classify_and_add` carries no `_write_op_id` and makes no
+        synchronous promise to anybody — it is enqueued by
+        `_dual_write_callback`, long after the caller has gone.
+        """
+        svc, _journal = journaled_service
+        svc.set_known_projects({'main': str(tmp_path)})
+        svc.mem0.add = AsyncMock(side_effect=RuntimeError('mem0 is down'))
+
+        # Enqueued directly, exactly as `_dual_write_callback` does it: one
+        # item per extracted fact, in the project's mem0_ group, with no
+        # `_write_op_id` because there is no write_ops row to join back to.
+        await svc.durable_queue.enqueue(
+            group_id='mem0_main',
+            operation='mem0_classify_and_add',
+            payload={'fact_text': 'a derived fact nobody will ever see',
+                     'project_id': 'main'},
+        )
+
+        filed = await _poll_for_escalation(tmp_path)
+        detail = filed[0]['detail']
+
+        assert "operation='mem0_classify_and_add'" in detail, detail
+        assert 'write_op_id=None' in detail, (
+            'the operation 3582\'s terminal hook skips — and the hole this '
+            'alarm exists to close'
+        )
+        assert _REPORTED_TO_CALLER_DEFAULT in detail, detail

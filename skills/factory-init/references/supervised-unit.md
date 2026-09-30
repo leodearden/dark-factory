@@ -18,11 +18,14 @@ Concrete file (not templated — the `scripts/orchestrator-*.service` files are 
 ```ini
 [Unit]
 Description=<DESC> Orchestrator (supervised)
-After=network.target fused-memory.service
+After=network.target fused-memory.service orchestrator-<NAME>.socket
 # Wants=, not Requires=: a Requires= turns a single fused-memory boot-race failure
 # into a PERMANENT cancel of our start job. Wants= orders us after it but lets us
 # proceed; ExecStartPre waits for port 8002 and Restart=on-failure self-heals.
 Wants=fused-memory.service
+# The socket holds the escalation port across restarts; Wants= so a socket
+# failure never blocks the orchestrator (it then binds the port itself).
+Wants=orchestrator-<NAME>.socket
 # Restart-rate guard — MUST be under [Unit] (silently ignored under [Service]).
 StartLimitIntervalSec=600
 StartLimitBurst=10
@@ -32,7 +35,10 @@ Type=simple
 # CWD must be dark-factory so `uv run --project orchestrator` resolves the package.
 WorkingDirectory=<DF>
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config <CONFIG>
+# --no-sync: every project's orchestrator shares dark-factory's ONE root .venv, and
+# without this flag a start installs into it. Do NOT add --frozen or --locked back —
+# both are no-ops beside it (task 5553; tests/scripts/test_uv_run_venv_isolation.py).
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project orchestrator orchestrator run --config <CONFIG>
 # Replicate PATH so verify subprocesses find their toolchain (a user service gets a minimal PATH).
 Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 Environment=LANG=en_US.UTF-8
@@ -47,16 +53,37 @@ TimeoutStopSec=90
 TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
+# A deliberate stop also stops the socket, so no later connection restarts a
+# stopped or disabled orchestrator; a restart or crash keeps it bound.
+ExecStopPost=-<DF>/scripts/stop-socket-unless-restarting.sh %n
 
 [Install]
 WantedBy=default.target
+Also=orchestrator-<NAME>.socket
+```
+
+Every orchestrator also gets a socket unit that holds its escalation port
+across restarts (why, and the stop semantics: `OPERATIONS.md` §"Socket
+activation"). `<PORT>` = the project's `escalation.port`:
+
+```ini
+[Unit]
+Description=<DESC> Orchestrator escalation MCP socket (held across restarts)
+
+[Socket]
+ListenStream=127.0.0.1:<PORT>
+
+[Install]
+WantedBy=sockets.target
 ```
 
 Install:
 ```bash
 cp <unit> ~/.config/systemd/user/orchestrator-<NAME>.service
+cp <socket> ~/.config/systemd/user/orchestrator-<NAME>.socket
 systemctl --user daemon-reload
-systemctl --user enable --now orchestrator-<NAME>.service   # --now starts it; only once tasks are pending
+systemctl --user enable orchestrator-<NAME>.socket
+systemctl --user enable --now orchestrator-<NAME>.service   # --now starts it (and its socket); only once tasks are pending
 journalctl --user -u orchestrator-<NAME>.service --since '1 min ago'   # confirm it engaged, not "No pending tasks"
 ```
 
@@ -64,9 +91,11 @@ journalctl --user -u orchestrator-<NAME>.service --since '1 min ago'   # confirm
 
 The live unit alone is lost if `setup-host.sh` re-provisions the host. Persist it:
 
-1. Copy the unit into the repo: `<DF>/scripts/orchestrator-<NAME>.service` (concrete, verbatim).
-2. In `<DF>/scripts/setup-host.sh`, add a `cp "$REPO_ROOT/scripts/orchestrator-<NAME>.service" "$UNIT_DIR/"` next to the other orchestrator `cp` lines, and a `systemctl --user enable orchestrator-<NAME>.service` next to the other `enable` lines.
-3. Commit both to dark-factory.
+1. Copy the unit into the repo: `<DF>/scripts/orchestrator-<NAME>.service` (concrete, verbatim), and the socket as `<DF>/scripts/orchestrator-<NAME>.socket.template` (the `.template` suffix only because `.socket` is not in the lock-charter extension allowlist; it is installed as `orchestrator-<NAME>.socket`).
+2. In `<DF>/scripts/setup-host.sh` section 5 ("Orchestrator systemd units + watchdog"), add `orchestrator-<NAME>.service` and `orchestrator-<NAME>.socket` to the `_orch_units` array. No separate enable-line edit is needed: the enable loop derives the obligation at run time from `grep -q '^\[Install\]'` on the committed template.
+3. Register the same units in `UNITS` in `<DF>/scripts/check_orchestrator_unit_parity.py` (the socket maps to its `.socket.template` path), and add them to `_EXPECTED_UNITS` in `tests/scripts/test_check_orchestrator_unit_parity.py`. Both are hand-maintained lists the per-unit parity gate (and its test) cross-check against `_orch_units` — a unit missing from either silently escapes the gate.
+4. Run `cd <DF> && uv run --project orchestrator pytest tests/scripts/test_check_orchestrator_unit_parity.py tests/scripts/test_orchestrator_socket_units.py` before committing.
+5. Commit all of the above to dark-factory.
 
 ## Layer 3 — watchdog port-probe (optional)
 

@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
+from _orch_helpers import make_prompt_resolution_workflow
 from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
 
 from orchestrator.agents.roles import (
@@ -24,9 +24,6 @@ from orchestrator.agents.roles import (
     REVIEWER_COMPREHENSIVE,
     AgentRole,
 )
-from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
 
 
 def _provenance_kwargs(**overrides: Any) -> dict[str, Any]:
@@ -48,41 +45,12 @@ def _provenance_kwargs(**overrides: Any) -> dict[str, Any]:
     return kwargs
 
 
-def _make_workflow(
-    *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
-) -> TaskWorkflow:
-    """Minimal TaskWorkflow builder for ``_resolve_role_system_prompt`` tests.
-
-    ``_resolve_role_system_prompt`` only touches ``self._prompt_store`` and
-    the ``role``/``model`` passed to it -- git_ops/scheduler/briefing are
-    never invoked -- so this intentionally skips the real-git-repo
-    ``_make_workflow`` convention used by ``_invoke``-exercising tests (e.g.
-    ``test_invoke_role_config_resolution.py``) and passes bare ``MagicMock``s
-    for the collaborators this helper never calls.
-    """
-    assignment = TaskAssignment(
-        task_id='2493',
-        task={'id': '2493', 'title': 'X', 'status': 'pending', 'metadata': {}},
-        modules=[],
-    )
-    config = OrchestratorConfig(project_root=tmp_path)
-    return TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=MagicMock(),
-        scheduler=MagicMock(),
-        briefing=MagicMock(),
-        mcp=None,
-        prompt_store=prompt_store,
-    )
-
-
 class TestResolveRoleSystemPromptUnpinned:
     """(a) Nothing pinned -> the in-code baseline (byte-identical to today)."""
 
     def test_nothing_pinned_returns_in_code_constant(self, tmp_path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
-        workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        workflow = make_prompt_resolution_workflow(tmp_path=tmp_path, prompt_store=store)
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
 
@@ -100,7 +68,7 @@ class TestResolveRoleSystemPromptPinnedPerModel:
 
     def test_pinned_model_gets_override_other_model_stays_baseline(self, tmp_path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
-        workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        workflow = make_prompt_resolution_workflow(tmp_path=tmp_path, prompt_store=store)
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
 
@@ -126,7 +94,7 @@ class TestResolveRoleSystemPromptNoSpec:
 
     def test_role_without_prompt_spec_returns_system_prompt_verbatim(self, tmp_path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
-        workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        workflow = make_prompt_resolution_workflow(tmp_path=tmp_path, prompt_store=store)
         role = AgentRole(name='dummy_role', system_prompt='VERBATIM PROMPT TEXT')
         assert role.prompt_spec is None  # premise: opt-in field defaults to None
 
@@ -153,7 +121,7 @@ class TestResolveRoleSystemPromptLazyStore:
         artifacts_root = tmp_path / 'prompt_artifacts'
         monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(artifacts_root))
 
-        workflow = _make_workflow(tmp_path=tmp_path)  # prompt_store defaults to None
+        workflow = make_prompt_resolution_workflow(tmp_path=tmp_path)  # prompt_store defaults to None
         assert workflow._prompt_store is None  # premise: production injects nothing
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
@@ -183,7 +151,7 @@ class TestResolveRoleSystemPromptUnreadableRoot:
         self, tmp_path, monkeypatch,
     ):
         store = PromptArtifactStore(tmp_path / 'artifacts')
-        workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        workflow = make_prompt_resolution_workflow(tmp_path=tmp_path, prompt_store=store)
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
 

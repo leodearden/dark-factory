@@ -7,11 +7,13 @@ _run_post_merge_verify (the single chokepoint).
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -33,6 +35,7 @@ from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
 )
+from orchestrator.workflow import _normalize_cause_hint
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
 
@@ -107,11 +110,42 @@ def _make_req(
     )
 
 
+def _verifier(result: VerifyResult) -> FakeVerifier:
+    """A ``VerifyPort`` whose scoped verify always returns *result*.
+
+    Injected as ``_run_post_merge_verify(..., verifier=...)`` — the seam the
+    lane's own ports expose — in place of patching the module-global
+    ``run_scoped_verification`` out from under it.
+    """
+    return FakeVerifier(default=VerifyScript(result=result))
+
+
+def _seed_probe_verdict(
+    result: VerifyResult, *, preexisting: bool, main_sha: str = MAIN_SHA,
+) -> None:
+    """Pre-seed the verdict a main-HEAD probe of *result*'s signature returns.
+
+    ``verify_failure_is_preexisting_on_main`` keys a process-wide TTL cache on
+    ``(main_sha, category, normalised cause_hint)`` and answers from it before
+    paying for a worktree, so seeding that key drives the REAL classifier down
+    its cache-hit branch — no git subprocess, no probe worktree, and no mock
+    standing in for the function under test.
+
+    This is the file's own long-standing shape: TestDedupeFingerprrintAndCacheReuse
+    has seeded the cache inline since task 1809 precisely because it "exercises
+    the production code path that concurrent failing merges follow".
+    """
+    _PROBE_CACHE[
+        (main_sha, result.category or '', _normalize_cause_hint(result.cause_hint))
+    ] = (time.monotonic(), preexisting)
+
+
 async def _drive_verify(
     req: MergeRequest,
     merge_wt: Path,
     git_ops: GitOps,
     *,
+    result: VerifyResult,
     event_store: EventStore | None = None,
 ) -> MergeOutcome | None:
     """Call _run_post_merge_verify with standard test parameters."""
@@ -122,6 +156,7 @@ async def _drive_verify(
         max_timeouts=3,
         max_enospc=1,
         event_store=event_store,
+        verifier=_verifier(result),
     )
 
 
@@ -208,20 +243,11 @@ class TestMainHealthClassification:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(True, MAIN_SHA)),
-                ),
-            ):
-                return await _drive_verify(req, merge_wt, git_ops)
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
 
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=COMPILE_ERROR_RESULT)
+        )
         assert outcome is not None
         assert outcome.status == 'blocked', f'Expected blocked; got {outcome.status}'
         assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
@@ -253,20 +279,11 @@ class TestMainHealthClassification:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify(req, merge_wt, git_ops)
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=False)
 
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=COMPILE_ERROR_RESULT)
+        )
         assert outcome is not None
         assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'Task-fault outcome must NOT start with MAIN_HEALTH_RED_REASON_PREFIX; '
@@ -298,26 +315,17 @@ class TestConfigFlagGuard:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        probe_spy = AsyncMock(return_value=(True, MAIN_SHA))
+        # A preexisting-break verdict is sitting in the probe cache, so the
+        # probe WOULD answer "main is red" the instant it was consulted. The
+        # task-fault outcome below is therefore load-bearing evidence that the
+        # flag guard short-circuited before consulting it — a guard that
+        # regressed would return main-health-red here.
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=probe_spy,
-                ),
-            ):
-                return await _drive_verify(req, merge_wt, git_ops)
-
-        outcome = asyncio.run(_run())
-
-        assert probe_spy.call_count == 0, (
-            f'Probe must NOT be called when flag is off; call_count={probe_spy.call_count}'
+        outcome = asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=COMPILE_ERROR_RESULT)
         )
+
         assert outcome is not None
         assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'Expected normal task-fault outcome; got: {outcome.reason!r}'
@@ -387,26 +395,15 @@ class TestSkipGuards:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        probe_spy = AsyncMock(return_value=(True, MAIN_SHA))
+        # As in TestConfigFlagGuard: a preexisting verdict for THIS result's
+        # signature is pre-seeded, so a skip guard that regressed would consult
+        # the probe, get "main is red", and return main-health-red below.
+        _seed_probe_verdict(verify_result, preexisting=True)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=verify_result),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=probe_spy,
-                ),
-            ):
-                return await _drive_verify(req, merge_wt, git_ops)
-
-        outcome = asyncio.run(_run())
-
-        assert probe_spy.call_count == 0, (
-            f'[{label}] Probe must NOT be called; call_count={probe_spy.call_count}'
+        outcome = asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=verify_result)
         )
+
         assert outcome is not None
         assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'[{label}] Expected normal task-fault outcome; got {outcome.reason!r}'
@@ -436,27 +433,12 @@ class TestMainHealthSignalEmission:
 
         event_store = MagicMock(spec=EventStore)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(True, MAIN_SHA)),
-                ),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    event_store=event_store,
-                )
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
 
-        asyncio.run(_run())
+        asyncio.run(_drive_verify(
+            req, merge_wt, git_ops,
+            result=COMPILE_ERROR_RESULT, event_store=event_store,
+        ))
 
         # Must have at least one call to emit() with data['outcome']='main_health_red'
         calls = event_store.emit.call_args_list
@@ -480,27 +462,12 @@ class TestMainHealthSignalEmission:
 
         event_store = MagicMock(spec=EventStore)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    event_store=event_store,
-                )
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=False)
 
-        asyncio.run(_run())
+        asyncio.run(_drive_verify(
+            req, merge_wt, git_ops,
+            result=COMPILE_ERROR_RESULT, event_store=event_store,
+        ))
 
         calls = event_store.emit.call_args_list
         main_health_calls = [
@@ -526,25 +493,12 @@ class TestDedupeFingerprrintAndCacheReuse:
     def test_concurrent_merges_same_signature_fold_and_cache(
         self, tmp_path: Path,
     ) -> None:
-        import time
-
-        from orchestrator.verify import _PROBE_CACHE
-        from orchestrator.workflow import (
-            _normalize_cause_hint as _norm,
-        )
         from orchestrator.workflow import (
             compute_preexisting_main_break_fingerprint,
         )
 
         _PROBE_CACHE.clear()
-
-        # Pre-seed the cache so the real verify_failure_is_preexisting_on_main
-        # hits the cache immediately (no git subprocess / worktree creation).
-        # This exercises the production code path that concurrent failing merges
-        # follow when the first probe already populated the cache.
-        _norm_hint = _norm(COMPILE_ERROR_RESULT.cause_hint)
-        _cache_key = (MAIN_SHA, COMPILE_ERROR_RESULT.category or '', _norm_hint)
-        _PROBE_CACHE[_cache_key] = (time.monotonic(), True)
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
 
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
@@ -561,22 +515,17 @@ class TestDedupeFingerprrintAndCacheReuse:
         req_b = _make_req('102', wt_b, config)
 
         async def _run() -> tuple[MergeOutcome | None, MergeOutcome | None]:
-            # Use the REAL verify_failure_is_preexisting_on_main — it will
-            # call git_ops.get_main_sha() then hit _PROBE_CACHE immediately,
-            # so no subprocess or worktree is created.
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-            ):
-                oc_a = await _run_post_merge_verify(
-                    git_ops, req_a, mwt_a,
-                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
-                )
-                oc_b = await _run_post_merge_verify(
-                    git_ops, req_b, mwt_b,
-                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
-                )
-                return oc_a, oc_b
+            # The REAL verify_failure_is_preexisting_on_main runs — it calls
+            # git_ops.get_main_sha() then hits _PROBE_CACHE immediately, so no
+            # subprocess or worktree is created.
+            return (
+                await _drive_verify(
+                    req_a, mwt_a, git_ops, result=COMPILE_ERROR_RESULT,
+                ),
+                await _drive_verify(
+                    req_b, mwt_b, git_ops, result=COMPILE_ERROR_RESULT,
+                ),
+            )
 
         oc_a, oc_b = asyncio.run(_run())
 
@@ -630,8 +579,8 @@ class TestDedupeFingerprrintAndCacheReuse:
 
 
 class TestClassifyFailSafeBranches:
-    """Cover the two silent fail-safe paths in _classify_main_health_red:
-    (1) probe raises → falls through to normal task-fault outcome
+    """Cover the two silent fail-safe paths around the main-health probe:
+    (1) the probe blows up internally → falls through to normal task-fault
     (2) probe confirms preexisting but fingerprint helper returns '' →
         outcome is still main_health_red with empty dedupe_fingerprint.
     """
@@ -639,9 +588,21 @@ class TestClassifyFailSafeBranches:
     def test_probe_exception_falls_through_to_task_fault(
         self, tmp_path: Path,
     ) -> None:
-        """When verify_failure_is_preexisting_on_main raises, the exception is
-        swallowed and the outcome is the normal 'Post-merge verification failed'
-        task-fault outcome (not a crash, not main_health_red)."""
+        """When the main-health probe blows up, the merge still returns the
+        normal 'Post-merge verification failed' task-fault outcome (not a
+        crash, not main_health_red).
+
+        Driven through the REAL probe: get_main_sha is its very first await,
+        so an exploding git handle sends it down its own documented
+        crash-fail-safe (``(False, '')``), which _classify_main_health_red
+        then reads as "not preexisting". That is the whole public contract —
+        a probe that dies never takes the merge down with it. The narrower
+        pin on _classify_main_health_red's own ``except Exception`` is gone
+        with the patch that used to force it: that branch cannot be reached
+        through the real collaborator, whose entire body is wrapped in
+        ``except Exception: return False, ''``, so the only thing that ever
+        exercised it was the mock standing in its place.
+        """
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
@@ -649,24 +610,12 @@ class TestClassifyFailSafeBranches:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        probe_spy = AsyncMock(side_effect=RuntimeError('probe crashed'))
+        git_ops.get_main_sha = AsyncMock(side_effect=RuntimeError('probe crashed'))
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=probe_spy,
-                ),
-            ):
-                return await _drive_verify(req, merge_wt, git_ops)
+        outcome = asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=COMPILE_ERROR_RESULT)
+        )
 
-        outcome = asyncio.run(_run())
-
-        assert probe_spy.call_count == 1, 'Probe must have been called once'
         assert outcome is not None
         assert outcome.reason.startswith('Post-merge verification failed'), (
             f'Exception in probe must fall through to task-fault outcome; '
@@ -683,10 +632,15 @@ class TestClassifyFailSafeBranches:
     def test_empty_fingerprint_still_routes_main_health_red(
         self, tmp_path: Path,
     ) -> None:
-        """When the probe confirms preexisting (True, sha) but
-        _main_health_fingerprint returns '' due to a composition error,
-        the outcome is still main_health_red with dedupe_fingerprint=''
-        (rather than silently downgrading to task-fault)."""
+        """When the probe confirms preexisting (True, sha) but the fingerprint
+        composition fails, the outcome is still main_health_red with
+        dedupe_fingerprint='' (rather than silently downgrading to task-fault).
+
+        The REAL _main_health_fingerprint runs and returns '' off its own
+        composition-failure branch, driven by exploding the workflow-side
+        composer it delegates to — the same boundary
+        TestMainHealthFingerprintWarning below patches, and not a lane path.
+        """
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
@@ -694,22 +648,16 @@ class TestClassifyFailSafeBranches:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
+
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(True, MAIN_SHA)),
-                ),
-                patch(
-                    'orchestrator.merge_queue._main_health_fingerprint',
-                    return_value='',
-                ),
+            with patch(
+                'orchestrator.workflow.compute_preexisting_main_break_fingerprint',
+                side_effect=RuntimeError('fingerprint composition exploded'),
             ):
-                return await _drive_verify(req, merge_wt, git_ops)
+                return await _drive_verify(
+                    req, merge_wt, git_ops, result=COMPILE_ERROR_RESULT,
+                )
 
         outcome = asyncio.run(_run())
 
@@ -797,34 +745,29 @@ class TestMainHealthDeferralCore:
 
         blocker = asyncio.Event()  # never set — the probe must not be awaited
 
-        async def _blocked_probe(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+        # get_main_sha is the REAL probe's very first await, so a git handle
+        # that never answers is a probe that never resolves — no mock in place
+        # of the function whose deferral is the subject here.
+        async def _blocked_main_sha(*_args: object, **_kwargs: object) -> str:
             await blocker.wait()
-            return (True, MAIN_SHA)  # pragma: no cover - never reached in this test
+            return MAIN_SHA  # pragma: no cover - never reached in this test
 
+        git_ops.get_main_sha = AsyncMock(side_effect=_blocked_main_sha)
         handles = _MainHealthProbeHandles(background_tasks=set())
 
         async def _run() -> tuple[MergeOutcome | None, list[asyncio.Task]]:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+            outcome = await asyncio.wait_for(
+                _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                    verifier=_verifier(COMPILE_ERROR_RESULT),
                 ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(side_effect=_blocked_probe),
-                ),
-            ):
-                outcome = await asyncio.wait_for(
-                    _run_post_merge_verify(
-                        git_ops, req, merge_wt,
-                        timeouts={},
-                        enospc_retries={},
-                        max_timeouts=3,
-                        max_enospc=1,
-                        main_health_probe_handles=handles,
-                    ),
-                    timeout=5,
-                )
+                timeout=5,
+            )
             # Snapshot background_tasks state WHILE the loop is still alive —
             # asyncio.run()'s post-return cleanup cancels + discards any
             # still-pending task, so checking after it returns would always
@@ -919,27 +862,17 @@ class TestSyncPathAndSentinelPreservation:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(True, MAIN_SHA)),
-                ),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    main_health_probe_handles=None,
-                )
+        _seed_probe_verdict(COMPILE_ERROR_RESULT, preexisting=True)
 
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={},
+            enospc_retries={},
+            max_timeouts=3,
+            max_enospc=1,
+            main_health_probe_handles=None,
+            verifier=_verifier(COMPILE_ERROR_RESULT),
+        ))
         assert outcome is not None
         assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'Expected the main-health-red outcome INLINE when handles=None '
@@ -978,27 +911,21 @@ class TestSyncPathAndSentinelPreservation:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _MainHealthProbeHandles(background_tasks=set())
-        probe_spy = AsyncMock(return_value=(True, MAIN_SHA))
+        # A preexisting verdict is pre-seeded for this result's signature, so
+        # a sentinel branch that fell through to the main-health branch would
+        # return main-health-red instead of its own outcome below.
+        _seed_probe_verdict(verify_result, preexisting=True)
 
         async def _run() -> tuple[MergeOutcome | None, set[asyncio.Task]]:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=verify_result),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=probe_spy,
-                ),
-            ):
-                outcome = await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    main_health_probe_handles=handles,
-                )
+            outcome = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                main_health_probe_handles=handles,
+                verifier=_verifier(verify_result),
+            )
             # Snapshot while the loop is alive (see TestMainHealthDeferralCore
             # above) — irrelevant here since nothing should ever be spawned,
             # but kept for parity/defensiveness.
@@ -1014,9 +941,10 @@ class TestSyncPathAndSentinelPreservation:
             f'[{label}] Expected sentinel outcome reason to start with '
             f'{expected_prefix!r}; got {outcome.reason!r}'
         )
-        assert probe_spy.call_count == 0, (
-            f'[{label}] Main-health probe must NOT be called for a sentinel '
-            f'outcome; call_count={probe_spy.call_count}'
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'[{label}] The sentinel branch must return before the main-health '
+            f'branch is reached, even with a preexisting verdict cached; '
+            f'got {outcome.reason!r}'
         )
         assert spawned == set(), (
             f'[{label}] Expected no main-health probe task to be spawned '
@@ -1051,21 +979,15 @@ class TestPostMergeVerifySeedsBaseline:
             summary='all checks passed', failing_test_ids=[],
         )
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=passing_result),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    merge_sha='abcsha',
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts={},
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=1,
+        merge_sha='abcsha',
+            verifier=_verifier(passing_result),
+        ))
         assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
 
         from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
@@ -1096,21 +1018,15 @@ class TestPostMergeVerifySeedsBaseline:
             summary='all checks passed', failing_test_ids=None,
         )
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=passing_result_no_ids),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    merge_sha='scopedsha',
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts={},
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=1,
+        merge_sha='scopedsha',
+            verifier=_verifier(passing_result_no_ids),
+        ))
         assert outcome is None
 
         from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
@@ -1136,22 +1052,16 @@ class TestPostMergeVerifySeedsBaseline:
 
         from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=passing_result),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    merge_sha='',
-                )
-
         before_keys = set(_BASELINE_FAILING_IDS_CACHE)
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={},
+            enospc_retries={},
+            max_timeouts=3,
+            max_enospc=1,
+            merge_sha='',
+            verifier=_verifier(passing_result),
+        ))
         assert outcome is None
         after_keys = set(_BASELINE_FAILING_IDS_CACHE)
         assert after_keys == before_keys, (
@@ -1204,14 +1114,11 @@ class TestBaselineAttributionOverBlockPath:
             merge_wt.mkdir()
             req = _make_req(task_id, tmp_path / f'task-wt-{task_id}', config)
             (tmp_path / f'task-wt-{task_id}').mkdir()
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=branch_result),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
-                )
+            return await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                verifier=_verifier(branch_result),
+            )
 
         outcome1 = asyncio.run(_one_merge('201'))
         assert outcome1 is not None
@@ -1253,17 +1160,11 @@ class TestBaselineAttributionOverBlockPath:
             summary='Failures: tests failed', failing_test_ids=['X', 'Y'],
         )
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                new=AsyncMock(return_value=branch_result),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            verifier=_verifier(branch_result),
+        ))
         assert outcome is not None
         assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'mixed failure (one new id) must NOT route MAIN_HEALTH_RED; got {outcome.reason!r}'
@@ -1296,23 +1197,13 @@ class TestBaselineAttributionOverBlockPath:
             cause_hint='AssertionError somewhere', failing_test_ids=None,
         )
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=branch_result),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
-                )
+        _seed_probe_verdict(branch_result, preexisting=False)
 
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            verifier=_verifier(branch_result),
+        ))
         assert outcome is not None
         assert outcome.reason.startswith('Post-merge verification failed: generic task failure'), (
             f'expected the legacy category-level reason unchanged; got {outcome.reason!r}'
@@ -1371,11 +1262,9 @@ class TestTrivialPassMainRedGate:
     ) -> MergeOutcome | None:
         req = _make_req('2823', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=result),
-        ):
-            return asyncio.run(_drive_verify(req, merge_wt, git_ops))
+        return asyncio.run(
+            _drive_verify(req, merge_wt, git_ops, result=result)
+        )
 
     def test_a_known_red_blocks_trivial_pass(self, tmp_path: Path) -> None:
         """seed red baseline + trivial pass -> blocked/MAIN_RED, worktree cleaned."""

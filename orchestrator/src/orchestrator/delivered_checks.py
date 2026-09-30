@@ -3,17 +3,26 @@ capability-delivered-checks PRD: plans/capability-delivered-checks-prd.md).
 
 Evaluates a single ``metadata.delivered_checks`` entry (PRD §Contract;
 schema defined by ``shared.capability_manifest.DeliveredCheckMeta``, task
-alpha) and returns a :class:`DeliveredCheckResult`. Two kinds:
+alpha) and returns a :class:`DeliveredCheckResult`. Three kinds:
 
-- ``grep`` — evaluated against the COMMITTED tree at *ref* (default
-  ``'main'``) via ``git -C <project_root> grep -E -e <pattern> <ref>``.
-  This is the PRIMARY kind: it reads exactly what's on ``main``, immune to
-  working-checkout dirtiness.
+- ``grep`` — file CONTENTS, evaluated against the COMMITTED tree at *ref*
+  (default ``'main'``) via ``git -C <project_root> grep -E -e <pattern>
+  <ref>``. This is the PRIMARY kind: it reads exactly what's on ``main``,
+  immune to working-checkout dirtiness.
+- ``path`` — file EXISTENCE, also against the committed tree at *ref*, via
+  ``git ls-tree``. For "does file X exist" a grep pattern naming the file
+  can never go green (a test module does not mention its own filename), so
+  that capability needs its own kind.
 - ``script`` — evaluated against the WORKING CHECKOUT (PRD Open-Q 2
   DECIDED: a documented approximation, not a temp-tree materialization of
   *ref*) via ``<project_root>/<script> <args>``, bounded by
   ``timeout_secs``. The escape hatch for capabilities that can't be
-  expressed as a grep pattern.
+  expressed as either.
+
+The two committed-tree kinds read their answer from OPPOSITE places and
+their idioms must not be copied across: ``git grep`` signals match/no-match
+through its RETURN CODE, while ``git ls-tree`` exits 0 either way and
+signals existence through whether it printed anything on STDOUT.
 
 ``Scheduler._compute_delivered_check_cache`` (scheduler.py) is the sole
 caller in production; both the git subprocess runner and the resolved
@@ -28,10 +37,18 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
-from shared.capability_manifest import DeliveredCheckMeta
+from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
+from shared.delivered_check_polarity import (
+    GATE_REF,
+    CheckOutcome,
+    build_grep_argv,
+    build_path_argv,
+    interpret_grep_rc,
+    interpret_path_listing,
+)
 
 from orchestrator import git_ops
 
@@ -72,6 +89,21 @@ class DeliveredCheckResult(Enum):
     ERRORED = 'errored'
 
 
+#: ``shared.delivered_check_polarity.CheckOutcome`` → :class:`DeliveredCheckResult`
+#: (task 3500). The two enums are deliberately distinct vocabularies — one says
+#: whether a PREDICATE held against some tree, the other whether a CAPABILITY is
+#: delivered — and this table is the single place they are joined. Exhaustive
+#: over ``CheckOutcome`` by construction: a new member would raise ``KeyError``
+#: at the delegation site (caught by :func:`run_delivered_check` and reported as
+#: ERRORED) rather than silently returning the wrong verdict for a whole class
+#: of checks.
+_OUTCOME_TO_RESULT: dict[CheckOutcome, DeliveredCheckResult] = {
+    CheckOutcome.PASS: DeliveredCheckResult.DELIVERED,
+    CheckOutcome.FAIL: DeliveredCheckResult.FAILED,
+    CheckOutcome.ERRORED: DeliveredCheckResult.ERRORED,
+}
+
+
 @dataclass(frozen=True)
 class DeliveredChecksVerdict:
     """Aggregate outcome of running a whole ``metadata.delivered_checks``
@@ -95,7 +127,7 @@ async def run_delivered_check(
     check: dict[str, Any],
     *,
     project_root: str | Path,
-    ref: str = 'main',
+    ref: str = GATE_REF,
     runner: _Runner = git_ops._run,
 ) -> DeliveredCheckResult:
     """Evaluate a single delivered-check descriptor. Never raises.
@@ -104,9 +136,9 @@ async def run_delivered_check(
     a task record) — defensively re-validated here via
     :class:`shared.capability_manifest.DeliveredCheckMeta` so a malformed
     entry degrades to :attr:`DeliveredCheckResult.ERRORED` rather than
-    raising. *ref* is only consulted by the ``grep`` kind (the ``script``
-    kind always runs against the working checkout — see the module
-    docstring). *runner* is the injected subprocess seam
+    raising. *ref* is consulted by the ``grep`` and ``path`` kinds, which
+    both read the committed tree (the ``script`` kind always runs against
+    the working checkout — see the module docstring). *runner* is the injected subprocess seam
     (``(argv, **kwargs) -> (returncode, stdout, stderr)``), defaulting to
     :func:`orchestrator.git_ops._run`.
     """
@@ -121,6 +153,8 @@ async def run_delivered_check(
     try:
         if meta.kind == 'grep':
             return await _run_grep_check(meta, project_root=project_root, ref=ref, runner=runner)
+        if meta.kind == 'path':
+            return await _run_path_check(meta, project_root=project_root, ref=ref, runner=runner)
         return await _run_script_check(meta, project_root=project_root, runner=runner)
     except Exception:
         logger.warning(
@@ -143,22 +177,63 @@ async def _run_grep_check(
     ``meta.expect``: ``'present'`` wants a match, ``'absent'`` wants no
     match.
 
-    The explicit ``-e`` separator (reviewer_comprehensive amendment) keeps
-    a pattern beginning with ``'-'`` from being parsed as a ``git grep``
-    option instead of the search pattern — without it, such a pattern
-    would fail with a git error (rc>=2, ERRORED) rather than being used
-    literally.
+    Both halves of that — the argv and the rc mapping, including the
+    ``-e``-separator rationale that used to be spelled out here — now live
+    in ``shared.delivered_check_polarity``; see the delegation comment
+    below and that module's PARITY CONTRACT.
     """
-    argv = ['git', '-C', str(project_root), 'grep', '-E', '-e', meta.pattern, ref]
-    if meta.paths:
-        argv.append('--')
-        argv.extend(meta.paths)
+    # Task 3500: AUTHORING-TIME validation evaluates these same grep checks
+    # (in shared.delivered_check_polarity) before they are ever committed to
+    # a task's metadata, and it MUST reach the identical verdict this runner
+    # will later reach. Rather than trust two implementations to agree on
+    # POSIX-ERE-via-`git grep -E`, the `-e` separator, `--` pathspec
+    # placement and the rc>=2 boundary, both call the same builder and the
+    # same interpreter — so divergence is structurally impossible rather
+    # than merely absent today. A drift here would make the authoring gate a
+    # new source of the wedge it exists to prevent: a check the lint judges
+    # healthy that this runner then fails still blocks its dependent forever.
+    #
+    # `cast` (a runtime no-op): DeliveredCheckMeta's validator guarantees a
+    # non-empty `pattern` whenever kind == 'grep', which is the only way
+    # into this function — pyright just cannot see the cross-field rule.
+    argv = build_grep_argv(
+        cast(str, meta.pattern), meta.paths, project_root=project_root, ref=ref
+    )
     rc, _out, _err = await runner(argv)
-    if rc >= 2:
-        return DeliveredCheckResult.ERRORED
-    matched = rc == 0
-    delivered = matched if meta.expect == 'present' else not matched
-    return DeliveredCheckResult.DELIVERED if delivered else DeliveredCheckResult.FAILED
+    return _OUTCOME_TO_RESULT[interpret_grep_rc(rc, meta.expect)]
+
+
+async def _run_path_check(
+    meta: DeliveredCheckMeta,
+    *,
+    project_root: str | Path,
+    ref: str,
+    runner: _Runner,
+) -> DeliveredCheckResult:
+    """One ``git ls-tree`` probe per entry in ``meta.paths``.
+
+    The probe's argv and its reading — existence from STDOUT, with a
+    non-zero rc checked FIRST as ERRORED — live in
+    ``shared.delivered_check_polarity`` (``build_path_argv`` /
+    ``interpret_path_listing``), whose docstrings say why. The authoring-time
+    lint evaluates path checks through the same two functions (task 3500),
+    so the two gates cannot disagree about what a path check means.
+
+    Multi-path semantics are CONJUNCTIVE and short-circuiting:
+    ``expect='present'`` requires EVERY listed path to exist and
+    ``expect='absent'`` requires every one to be gone, returning on the
+    first path that settles the verdict — an ERRORED probe included, so no
+    further path is probed after a git error. A delivered_check is a
+    dispatch GATE, so it must be biased toward withholding: disjunctive
+    semantics would let it go green while part of the asserted capability
+    was still missing.
+    """
+    for path in meta.paths:
+        rc, out, _err = await runner(build_path_argv(path, project_root=project_root, ref=ref))
+        outcome = interpret_path_listing(rc, out, meta.expect)
+        if outcome is not CheckOutcome.PASS:
+            return _OUTCOME_TO_RESULT[outcome]
+    return DeliveredCheckResult.DELIVERED
 
 
 async def _run_script_check(
@@ -494,14 +569,18 @@ async def gate_mark_done_on_delivered_checks(
 
     if verdict.outcome == 'failed':
         failed_check = verdict.failed_check or {}
-        is_grep = failed_check.get('kind') == 'grep'
+        # Name the field the descriptor ACTUALLY has. The former grep/script
+        # binary named 'script' for anything non-grep, so a path check logged
+        # `script=None` — a field it does not carry, holding a value that is
+        # not the problem.
+        subject_field = CHECK_SUBJECT_FIELD.get(failed_check.get('kind') or '', 'pattern')
         log.warning(
             'Delivered-checks guard [%s]: task %s delivered-check %r (%s=%r) is '
             'absent from main@%s — declared capability not present, NOT marking '
             'done',
             site, task_id, failed_check.get('name'),
-            'pattern' if is_grep else 'script',
-            failed_check.get('pattern') if is_grep else failed_check.get('script'),
+            subject_field,
+            failed_check.get(subject_field),
             sha,
         )
         return DeliveredChecksBlock('failed', sha, verdict.failed_check)

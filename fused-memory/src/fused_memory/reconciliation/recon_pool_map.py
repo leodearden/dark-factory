@@ -79,3 +79,21 @@ CYCLE_SUMMARY_KIND = 'cycle_summary'
 # prompt-side literal in sync is a reviewed invariant, not an enforced one.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE = 'narrative'
+
+# Retention window for authoritative cycle_summary ledger rows (task 2229).
+# The ledger is a control-plane store, not a permanent audit log, and Stage 3
+# only ever consumes recent summaries — so rows are given a bounded TTL and
+# reaped by the existing ReconLedgerStore.gc() expires_at pass rather than kept
+# forever or given bespoke cleanup code.
+#
+# Lives in this leaf, and is re-exported from reconciliation/summary_pool.py
+# under its historical name, for the same lockstep reason as the record_type
+# literals above (task 3731): the WRITER stamps expires_at with it
+# (summary_pool.write_cycle_summary) while the READER now subtracts it to
+# decide whether an absent row was reaped rather than never written
+# (services/memory_service.py::MemoryService.get_cycle_summary_presence).
+# memory_service must not import summary_pool — that would close a
+# service <-> reconciliation import cycle — so a duplicated literal would
+# leave the two sides free to drift, and a drift would silently reclassify
+# reaped rows as genuine data loss.
+CYCLE_SUMMARY_TTL_DAYS = 30

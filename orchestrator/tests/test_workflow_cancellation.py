@@ -617,7 +617,7 @@ def task_assignment() -> TaskAssignment:
 class TestRunSingleCatchHardCancel:
     """Boundary row 14: ``run()`` must RETURN a ``TerminalReport`` on a
     harness-style hard-cancel, never let ``CancelledError`` escape — and
-    must not crash on SM-2 (the outcome<->status half is skipped for the
+    must not trip SM-2 (the outcome<->status half is skipped for the
     hard-cancel exit, since the live scheduler row is still 'in-progress',
     which is NOT an allowed pairing for outcome==CANCELLED).
 
@@ -659,7 +659,7 @@ class TestRunSingleCatchHardCancel:
         # outcome<->status half really was SKIPPED for this exit, not just
         # coincidentally satisfied: 'in-progress' is NOT an allowed pairing
         # for outcome==CANCELLED (_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}
-        # only), yet run() above returned cleanly instead of raising.
+        # only), yet the suite-wide exit-contract guard recorded no violation.
         last_status = await scheduler.get_status(workflow.task_id)
         assert last_status == 'in-progress'
         assert not outcome_allows_status(report.outcome, last_status)

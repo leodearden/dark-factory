@@ -303,18 +303,22 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import (
+    FakeVerifier,
+    RecordingEscalations,
+    hangs_until,
+    make_lane,
+)
 from _orch_helpers import make_placeholder_future
-from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.lane_lifecycle import LaneLifecycle
-from orchestrator.merge_queue import (
-    SpeculativeMergeWorker,
+from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
+from orchestrator.merge_queue import PRODUCTION_CLOCK
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import (
     InFlightMergeRegistry,
@@ -323,6 +327,7 @@ from orchestrator.merge_types import (
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
 )
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -444,7 +449,6 @@ def _build_recovery_harness(mock_orch_config: MagicMock, git_repo: Path) -> Harn
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_task = AsyncMock(return_value={})
     h.scheduler.get_status = AsyncMock(return_value=None)
-    h.scheduler._dispatched = set()
     h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     recovery_git_config = GitConfig(
@@ -454,19 +458,15 @@ def _build_recovery_harness(mock_orch_config: MagicMock, git_repo: Path) -> Harn
         worktree_dir='.worktrees',
         push_after_advance=False,
     )
+    # `worktree_dir='.worktrees'` over *git_repo* is what makes GitOps.__init__
+    # resolve `worktree_base` -- and the LaneLifecycle it builds from it -- onto
+    # exactly the `.worktrees` dir this harness plants into, so neither needs
+    # rebinding afterwards (mirrors test_crash_recovery.py's W11 fix, reached by
+    # construction instead of by reassignment).
     h.git_ops = GitOps(recovery_git_config, git_repo)
-    h.git_ops.worktree_base = (git_repo / '.worktrees').resolve()
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
     h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
-    # GitOps.__init__ built _lane_lifecycle against the ORIGINAL
-    # worktree_base (before the reassignment above) -- rebind it so the
-    # record-driven recovery path reads/writes the same .lane-state dir the
-    # rest of this harness targets (mirrors test_crash_recovery.py's W11 fix).
-    h.git_ops._lane_lifecycle = LaneLifecycle(
-        h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,
-    )
-    h.git_ops._is_registered_worktree = AsyncMock(return_value=True)
     h.event_store = MagicMock()
 
     return h
@@ -947,41 +947,42 @@ class TestIdentityFaceRecoveryDedupe:
 # ---------------------------------------------------------------------------
 
 
-def _gated_tree_liveness_verify(
-    entered: asyncio.Event,
-    release: asyncio.Event,
-    observations: list[bool],
-):
-    """Build a ``run_scoped_verification`` stand-in that holds ONE verify
-    live in its own ``_merge-<hash>`` worktree across a concurrent sweep.
+class _TreeLivenessVerifier(FakeVerifier):
+    """The lane's ``VerifyPort``, holding ONE verify live in its own
+    ``_merge-<hash>`` worktree across a concurrent sweep.
 
-    Returns an async callable matching ``run_scoped_verification``'s call
-    shape (``worktree`` first positional; everything else absorbed via
-    ``*args``/``**kwargs`` so it tolerates the production call site's exact
-    kwarg set drifting -- mirrors test_merge_queue_restart_hook.py's
-    ``_mock_verify_pass`` duck-typed-VerifyResult idiom). Each call:
+    Injected as ``make_lane(..., verifier=...)`` -- the seam that replaced
+    this file's ``patch('orchestrator.merge_queue.run_scoped_verification')``.
+    ``run_scoped`` keeps the base fake's scripted hang (``hangs_until``) and
+    passing ``VerifyResult``, and wraps it in the observations the capstone
+    is actually about:
 
-      1. Appends ``worktree.exists()`` to *observations* -- entry liveness.
+      1. Appends ``worktree.exists()`` to :attr:`observations` -- entry
+         liveness -- and the worktree itself to :attr:`worktrees`, which is
+         how the test learns the live merge tree's path.
       2. Sets *entered* so the test can synchronize past this point.
-      3. Awaits *release* -- holds the verify live while the test drives the
-         concurrent crash-recovery sweep.
+      3. Awaits the scripted release -- holding the verify live while the
+         test drives the concurrent crash-recovery sweep.
       4. Appends ``worktree.exists()`` again -- exit liveness.  A tree
          yanked mid-verify by a concurrent sweep would record a ``False``
          here, directly modelling the 2026-07-22 ENOENT incident.
-
-    Returns a duck-typed passing ``VerifyResult`` (``passed=True``).
     """
 
-    async def _verify(worktree: Path, *args: object, **kwargs: object) -> object:
-        observations.append(worktree.exists())
-        entered.set()
-        await release.wait()
-        observations.append(worktree.exists())
-        return type(
-            'VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None},
-        )()
+    def __init__(self, entered: asyncio.Event, release: asyncio.Event) -> None:
+        super().__init__(default=hangs_until(release))
+        self.entered = entered
+        self.worktrees: list[Path] = []
+        self.observations: list[bool] = []
 
-    return _verify
+    async def run_scoped(  # type: ignore[override]
+        self, worktree: Path, *args: Any, **options: Any,
+    ) -> VerifyResult:
+        self.worktrees.append(worktree)
+        self.observations.append(worktree.exists())
+        self.entered.set()
+        result = await super().run_scoped(worktree, *args, **options)
+        self.observations.append(worktree.exists())
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1071,10 +1072,17 @@ class TestFiveThreeTwoSixReplayGate:
         _, sha2_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
         sha2 = sha2_raw.strip()
 
+        # The two startup handles this test both SEEDS and drives the lane on.
+        # Bound once here: `_recover_pending_merges` reads the journal from
+        # `_merge_store` and enqueues onto `_merge_queue`, so the lane below
+        # must be those SAME two objects, and Harness exposes neither publicly.
+        merge_store = harness._merge_store
+        merge_queue = harness._merge_queue
+
         # Durable journal seeded with TWO entries for task/5326 (descendant
         # variant), both pointing at the same real worktree.
         reqs = _seed_dup_journal(
-            harness._merge_store, '5326', [sha1, sha2], harness.config, wt,
+            merge_store, '5326', [sha1, sha2], harness.config, wt,
         )
 
         # --- Decoys: leased persistent + ephemeral merge trees, infra bands,
@@ -1120,12 +1128,13 @@ class TestFiveThreeTwoSixReplayGate:
 
         entered = asyncio.Event()
         release = asyncio.Event()
-        observations: list[bool] = []
-        gated = AsyncMock(
-            side_effect=_gated_tree_liveness_verify(entered, release, observations),
-        )
-
-        harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        verifier = _TreeLivenessVerifier(entered, release)
+        escalations = RecordingEscalations()
+        # A facade name cannot be used in a union annotation: the exports
+        # resolve through `orchestrator.merge_lane.__getattr__`, so
+        # `MergeLane | None` narrows to a bare None and pyright then rejects
+        # every attribute access on it.
+        lane: Any = None
         worker_task: asyncio.Task | None = None
 
         try:
@@ -1140,162 +1149,173 @@ class TestFiveThreeTwoSixReplayGate:
             assert winner.request_id == reqs[1].request_id, (
                 'the DESCENDANT record must be the recovered winner'
             )
-            assert harness._merge_queue.qsize() == 1
+            assert merge_queue.qsize() == 1
 
-            # (2) Start the merge-worker task with run_scoped_verification
-            # patched to the gated tree-liveness runner; await entry.
-            harness._merge_worker = SpeculativeMergeWorker(
+            # (2) Start the merge-worker task on the gated tree-liveness
+            # verifier -- INJECTED, not patched; await entry.
+            #
+            # The clock is the PRODUCTION one, deliberately and explicitly:
+            # this gate's subject IS real concurrent timing (the reaper's
+            # RESOURCE_AUDIT_WORKTREE_GRACE_SECS window against real mtimes,
+            # the heartbeat loop's own periodic reap, and the inflight-verify
+            # progress watchdog that runs while the verify below is held).  A
+            # hand-advanced clock would race its own background reap against
+            # the explicit sweep this test attributes survivals to.
+            lane = make_lane(
                 harness.git_ops,
-                harness._merge_queue,
-                merge_store=harness._merge_store,
-                escalation_queue=harness._escalation_queue,
+                merge_queue,
+                merge_store=merge_store,
+                escalation_queue=escalations,
+                verifier=verifier,
+                clock=PRODUCTION_CLOCK,
             )
-            with patch('orchestrator.merge_queue.run_scoped_verification', gated):
-                worker_task = asyncio.create_task(
-                    harness._merge_worker.run(), name='capstone-merge-worker',
-                )
-                await asyncio.wait_for(entered.wait(), timeout=60)
+            # The harness's own reap delegate is a no-op without this (it
+            # returns early when `_merge_worker` is None), and driving that
+            # delegate rather than the lane method directly is what keeps the
+            # reaper leg a STARTUP-path observation.
+            harness._merge_worker = lane
+            worker_task = asyncio.create_task(
+                lane.run(), name='capstone-merge-worker',
+            )
+            await asyncio.wait_for(entered.wait(), timeout=60)
 
-                # (3) WHILE the verify is live, run the concurrent sweep: the
-                # merge reaper THEN the crash-recovery sweep (mirrors run()'s
-                # step 1b/1c0a -> 2c ordering -- see the module docstring's
-                # "Concurrency model" section).
-                #
-                # The guarded-removal spy DELEGATES to the real bound method
-                # (this instance attribute shadows the class method, so
-                # cleanup_merge_worktree's `self.remove_merge_worktree_
-                # guarded(...)` call is what gets captured) -- it records
-                # what the reaper OFFERED to C1 and what C1 answered, so
-                # tree survival is attributable to the lease guard rather
-                # than to an inert sweep.
-                spy = _GuardedRemovalSpy(harness.git_ops.remove_merge_worktree_guarded)
-                harness.git_ops.remove_merge_worktree_guarded = spy  # type: ignore[method-assign]
-                await harness._reap_orphaned_merge_worktrees(report['requests'])
-                # Snapshot IMMEDIATELY: worker-driven removals later in this
-                # test (the throwaway verify worktree's own teardown) must
-                # not mask what THIS sweep did.
-                reap_records = list(spy.records)
-                await harness._recover_crashed_tasks()
+            # (3) WHILE the verify is live, run the concurrent sweep: the
+            # merge reaper THEN the crash-recovery sweep (mirrors run()'s
+            # step 1b/1c0a -> 2c ordering -- see the module docstring's
+            # "Concurrency model" section).
+            #
+            # The guarded-removal spy DELEGATES to the real bound method
+            # (this instance attribute shadows the class method, so
+            # cleanup_merge_worktree's `self.remove_merge_worktree_
+            # guarded(...)` call is what gets captured) -- it records
+            # what the reaper OFFERED to C1 and what C1 answered, so
+            # tree survival is attributable to the lease guard rather
+            # than to an inert sweep.
+            spy = _GuardedRemovalSpy(harness.git_ops.remove_merge_worktree_guarded)
+            harness.git_ops.remove_merge_worktree_guarded = spy  # type: ignore[method-assign]
+            await harness._reap_orphaned_merge_worktrees(report['requests'])
+            # Snapshot IMMEDIATELY: worker-driven removals later in this
+            # test (the throwaway verify worktree's own teardown) must
+            # not mask what THIS sweep did.
+            reap_records = list(spy.records)
+            await harness._recover_crashed_tasks()
 
-                # --- MERGE-REAPER leg: attribution, not mere survival -----
-                # The aged LEASED decoy was OFFERED to C1 and survived
-                # BECAUSE C1 refused it ('skipped_lease_held').
-                offered = {p for p, _reason, _outcome in reap_records}
-                assert merge_uuid in offered, (
-                    f'the aged leased decoy was never offered to the C1 '
-                    f'guarded primitive -- the reaper leg is vacuous; '
-                    f'offered={offered}'
-                )
-                uuid_outcomes = spy.outcomes_for(merge_uuid, records=reap_records)
-                assert 'skipped_lease_held' in uuid_outcomes, (
-                    f'C1 must REFUSE removal of a live-leased merge tree; '
-                    f'got outcomes={uuid_outcomes}'
-                )
-                assert merge_uuid.exists(), (
-                    '_merge-cafe5326 must survive the reaper: C1 answered '
-                    'skipped_lease_held'
-                )
-                # REAPER POSITIVE CONTROL: the aged UNLEASED real worktree was
-                # offered too, and C1 itself REMOVED it -- so the leg exercises
-                # the same guarded-removal branch the leased decoy refused, and
-                # the leased decoy's survival above is a real refusal rather
-                # than an inert (or fallback-only) sweep. Both the C1 outcome
-                # and the filesystem are pinned: `'removed'` alone would not
-                # prove the tree is gone, and `not .exists()` alone would also
-                # be satisfied by cleanup_merge_worktree's `'failed'`->rmtree
-                # fallback (which would leave a regressed C1 undetected).
-                assert merge_unleased in offered, (
-                    f'the aged unleased worktree was never offered to C1 -- the '
-                    f'reaper never reached the removal primitive; '
-                    f'offered={offered}'
-                )
-                unleased_outcomes = spy.outcomes_for(
-                    merge_unleased, records=reap_records,
-                )
-                assert 'removed' in unleased_outcomes, (
-                    f'C1 must REMOVE an aged, unleased, unowned merge worktree '
-                    f'through its own guarded-removal branch (not via '
-                    f'cleanup_merge_worktree\'s rmtree fallback); got '
-                    f'outcomes={unleased_outcomes}'
-                )
-                assert not merge_unleased.exists(), (
-                    f'{merge_unleased.name} (aged, unleased, unowned) must be '
-                    f'reaped -- otherwise this leg proves nothing about the '
-                    f'leased decoy that survived it'
-                )
+            # --- MERGE-REAPER leg: attribution, not mere survival -----
+            # The aged LEASED decoy was OFFERED to C1 and survived
+            # BECAUSE C1 refused it ('skipped_lease_held').
+            offered = {p for p, _reason, _outcome in reap_records}
+            assert merge_uuid in offered, (
+                f'the aged leased decoy was never offered to the C1 '
+                f'guarded primitive -- the reaper leg is vacuous; '
+                f'offered={offered}'
+            )
+            uuid_outcomes = spy.outcomes_for(merge_uuid, records=reap_records)
+            assert 'skipped_lease_held' in uuid_outcomes, (
+                f'C1 must REFUSE removal of a live-leased merge tree; '
+                f'got outcomes={uuid_outcomes}'
+            )
+            assert merge_uuid.exists(), (
+                '_merge-cafe5326 must survive the reaper: C1 answered '
+                'skipped_lease_held'
+            )
+            # REAPER POSITIVE CONTROL: the aged UNLEASED real worktree was
+            # offered too, and C1 itself REMOVED it -- so the leg exercises
+            # the same guarded-removal branch the leased decoy refused, and
+            # the leased decoy's survival above is a real refusal rather
+            # than an inert (or fallback-only) sweep. Both the C1 outcome
+            # and the filesystem are pinned: `'removed'` alone would not
+            # prove the tree is gone, and `not .exists()` alone would also
+            # be satisfied by cleanup_merge_worktree's `'failed'`->rmtree
+            # fallback (which would leave a regressed C1 undetected).
+            assert merge_unleased in offered, (
+                f'the aged unleased worktree was never offered to C1 -- the '
+                f'reaper never reached the removal primitive; '
+                f'offered={offered}'
+            )
+            unleased_outcomes = spy.outcomes_for(
+                merge_unleased, records=reap_records,
+            )
+            assert 'removed' in unleased_outcomes, (
+                f'C1 must REMOVE an aged, unleased, unowned merge worktree '
+                f'through its own guarded-removal branch (not via '
+                f'cleanup_merge_worktree\'s rmtree fallback); got '
+                f'outcomes={unleased_outcomes}'
+            )
+            assert not merge_unleased.exists(), (
+                f'{merge_unleased.name} (aged, unleased, unowned) must be '
+                f'reaped -- otherwise this leg proves nothing about the '
+                f'leased decoy that survived it'
+            )
 
-                # Survivors protected by OTHER mechanisms on this leg (see
-                # the module docstring's attribution matrix): `_merge-verify`
-                # never reaches C1 at all (PERSISTENT_MERGE_WORKTREE_NAME
-                # exclusion in reap_orphaned_merge_worktrees), the live
-                # verify's own `_merge-<hash>` tree is protected by the
-                # owned-ledger/grace window, and the infra bands are outside
-                # the reaper's `_merge-` band entirely.
-                call = gated.call_args
-                live_merge_tree = Path(
-                    call.args[0] if call.args else call.kwargs['worktree'],  # type: ignore[index]
-                )
-                assert live_merge_tree.exists(), (
-                    'the live verify\'s own worktree must survive the sweep '
-                    '(zero-ENOENT proxy (a))'
-                )
-                for d in (merge_verify, *infra_dirs.values()):
-                    assert d.exists(), f'{d.name} must survive the concurrent sweep'
+            # Survivors protected by OTHER mechanisms on this leg (see
+            # the module docstring's attribution matrix): `_merge-verify`
+            # never reaches C1 at all (PERSISTENT_MERGE_WORKTREE_NAME
+            # exclusion in reap_orphaned_merge_worktrees), the live
+            # verify's own `_merge-<hash>` tree is protected by the
+            # owned-ledger/grace window, and the infra bands are outside
+            # the reaper's `_merge-` band entirely.
+            live_merge_tree = verifier.worktrees[-1]
+            assert live_merge_tree.exists(), (
+                'the live verify\'s own worktree must survive the sweep '
+                '(zero-ENOENT proxy (a))'
+            )
+            for d in (merge_verify, *infra_dirs.values()):
+                assert d.exists(), f'{d.name} must survive the concurrent sweep'
 
-                # --- CRASH-RECOVERY-SWEEP leg: the cleaned SET is the C2
-                # regression detector, NOT `.exists()` ---------------------
-                # `_build_recovery_harness` spies `cleanup_worktree` as an
-                # AsyncMock (deliberately -- a real delegate would race the
-                # in-flight merge by deleting the live task/5326 worktree
-                # mid-verify), so `.exists()` above is INERT on this leg: a
-                # full C2 regression (the 2026-07-22 "Cleaned up worktree
-                # _merge-verify" force-removal) would leave every tree on
-                # disk and every `.exists()` green. What C2 actually
-                # promises is that the sweep never OFFERS a protected entry
-                # to cleanup_worktree at all -- so pin the offered set.
-                cleaned_paths = {
-                    c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
-                }
-                protected = {
-                    merge_verify, merge_uuid, live_merge_tree, *infra_dirs.values(),
-                }
-                assert cleaned_paths.isdisjoint(protected), (
-                    f'C2 violated -- the crash-recovery sweep cleaned protected '
-                    f'entries: {cleaned_paths & protected}'
-                )
-                # Positive control: the SAME sweep cleaned the planless dir --
-                # proves the sweep is not inert.
-                assert wt_task in cleaned_paths, (
-                    f'positive control: the task-shaped planless dir must be '
-                    f'cleaned by this sweep; cleaned={cleaned_paths}'
-                )
-                # UPPER-BOUND pin (OBSERVED, not inferred): the sweep offers
-                # at most the two task-id-shaped entries -- the planless '999'
-                # decoy and the real task/5326 branch worktree, which is
-                # itself task-id-shaped and planless under this test's
-                # MagicMock scheduler. Pinning the whole set (rather than
-                # `assert_any_call`) makes ANY extra cleanup call a failure,
-                # which is what turns a C2 regression into a red test.
-                # Nothing is actually deleted here -- cleanup_worktree is an
-                # AsyncMock spy -- so the live merge below is unaffected.
-                #
-                # Deliberately `<=`, not `==`: `wt` is in the observed set only
-                # because the MagicMock scheduler makes a real branch worktree
-                # look planless. Pinning its PRESENCE would freeze a mock
-                # artifact into this gate, so a future production change that
-                # (correctly) taught the sweep to skip a worktree backing an
-                # in-flight merge would turn the leg's own regression detector
-                # red. The subset bound keeps every tooth that matters -- any
-                # EXTRA offered path, protected or not, still fails -- while
-                # `wt_task in cleaned_paths` above keeps the positive control.
-                assert cleaned_paths <= {wt_task, wt}, (
-                    f'unexpected cleanup_worktree calls beyond the two '
-                    f'task-id-shaped entries: {cleaned_paths - {wt_task, wt}}'
-                )
+            # --- CRASH-RECOVERY-SWEEP leg: the cleaned SET is the C2
+            # regression detector, NOT `.exists()` ---------------------
+            # `_build_recovery_harness` spies `cleanup_worktree` as an
+            # AsyncMock (deliberately -- a real delegate would race the
+            # in-flight merge by deleting the live task/5326 worktree
+            # mid-verify), so `.exists()` above is INERT on this leg: a
+            # full C2 regression (the 2026-07-22 "Cleaned up worktree
+            # _merge-verify" force-removal) would leave every tree on
+            # disk and every `.exists()` green. What C2 actually
+            # promises is that the sweep never OFFERS a protected entry
+            # to cleanup_worktree at all -- so pin the offered set.
+            cleaned_paths = {
+                c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+            }
+            protected = {
+                merge_verify, merge_uuid, live_merge_tree, *infra_dirs.values(),
+            }
+            assert cleaned_paths.isdisjoint(protected), (
+                f'C2 violated -- the crash-recovery sweep cleaned protected '
+                f'entries: {cleaned_paths & protected}'
+            )
+            # Positive control: the SAME sweep cleaned the planless dir --
+            # proves the sweep is not inert.
+            assert wt_task in cleaned_paths, (
+                f'positive control: the task-shaped planless dir must be '
+                f'cleaned by this sweep; cleaned={cleaned_paths}'
+            )
+            # UPPER-BOUND pin (OBSERVED, not inferred): the sweep offers
+            # at most the two task-id-shaped entries -- the planless '999'
+            # decoy and the real task/5326 branch worktree, which is
+            # itself task-id-shaped and planless under this test's
+            # MagicMock scheduler. Pinning the whole set (rather than
+            # `assert_any_call`) makes ANY extra cleanup call a failure,
+            # which is what turns a C2 regression into a red test.
+            # Nothing is actually deleted here -- cleanup_worktree is an
+            # AsyncMock spy -- so the live merge below is unaffected.
+            #
+            # Deliberately `<=`, not `==`: `wt` is in the observed set only
+            # because the MagicMock scheduler makes a real branch worktree
+            # look planless. Pinning its PRESENCE would freeze a mock
+            # artifact into this gate, so a future production change that
+            # (correctly) taught the sweep to skip a worktree backing an
+            # in-flight merge would turn the leg's own regression detector
+            # red. The subset bound keeps every tooth that matters -- any
+            # EXTRA offered path, protected or not, still fails -- while
+            # `wt_task in cleaned_paths` above keeps the positive control.
+            assert cleaned_paths <= {wt_task, wt}, (
+                f'unexpected cleanup_worktree calls beyond the two '
+                f'task-id-shaped entries: {cleaned_paths - {wt_task, wt}}'
+            )
 
-                # (4) Release the gated verify; await the recovered merge.
-                release.set()
-                outcome = await asyncio.wait_for(winner.result, timeout=60)
+            # (4) Release the gated verify; await the recovered merge.
+            release.set()
+            outcome = await asyncio.wait_for(winner.result, timeout=60)
 
             assert outcome.status == 'done', f'Expected done, got: {outcome}'
             full_branch = f'{harness.config.git.branch_prefix}5326'
@@ -1306,21 +1326,23 @@ class TestFiveThreeTwoSixReplayGate:
             # (5) gamma collapse held under the live path (one verify total);
             # the gated runner never observed a missing worktree (zero-ENOENT
             # proxy); zero spurious cross-check L1 escalations were filed.
-            assert gated.call_count == 1, (
-                f'expected exactly one verify for task/5326; got {gated.call_count}'
+            assert verifier.verified == ['5326'], (
+                f'expected exactly one verify for task/5326; got '
+                f'{verifier.verified}'
             )
-            assert observations and all(observations), (
-                f'gated verify observed a missing worktree: {observations}'
+            assert verifier.observations and all(verifier.observations), (
+                f'gated verify observed a missing worktree: '
+                f'{verifier.observations}'
             )
             cross_check_l1 = [
-                e for e in harness._escalation_queue.get_pending()
+                e for e in escalations.filed
                 if e.category == 'verify_cross_check_mismatch' and e.level == 1
             ]
             assert cross_check_l1 == [], cross_check_l1
         finally:
             release.set()
-            if harness._merge_worker is not None:
-                await harness._merge_worker.stop()
+            if lane is not None:
+                await lane.stop()
             if worker_task is not None:
                 worker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

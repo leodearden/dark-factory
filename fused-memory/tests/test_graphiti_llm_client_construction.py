@@ -155,33 +155,6 @@ class TestBuildLLMClientDefaultOpenAIPath:
             for r in caplog.records
         ), [r.message for r in caplog.records]
 
-    def test_no_max_tokens_kwarg_on_the_default_arm(self, mock_config, monkeypatch):
-        """Byte-identical regression guard for the default (shipped) arm.
-
-        The openai_generic arm passes ``max_tokens=cfg.llm.max_tokens`` to the
-        constructor because ``OpenAIGenericClient.__init__`` re-assigns
-        ``self.max_tokens`` from its own parameter (default 16384), discarding
-        the value ``super().__init__`` just took from the config.
-        ``BaseOpenAIClient.__init__`` performs the IDENTICAL override, so the
-        default arm has always sent upstream's default too. Adding the kwarg
-        here would change the wire request of every existing shipped-config
-        deployment — which this task must not do. Assert the absence of the
-        kwarg rather than pinning upstream's literal default, so a future wheel
-        bump that legitimately changes that constant does not break this guard.
-        """
-        monkeypatch.setattr(
-            graphiti_client_module, 'check_openai_responses_api', lambda: None,
-        )
-        fake_openai_cls = MagicMock(name='OpenAIClient')
-        monkeypatch.setattr(graphiti_client_module, 'OpenAIClient', fake_openai_cls)
-        mock_config.llm.max_tokens = 2048
-
-        build_llm_client(mock_config)
-
-        fake_openai_cls.assert_called_once()
-        assert 'max_tokens' not in fake_openai_cls.call_args.kwargs
-        assert fake_openai_cls.call_args.args == ()
-
 
 class TestBuildLLMClientOpenAIGenericPath:
     """client_class='openai_generic' → graphiti's OpenAIGenericClient.
@@ -248,35 +221,6 @@ class TestBuildLLMClientOpenAIGenericPath:
         client = build_llm_client(generic_config)  # must NOT raise
         assert isinstance(client, OpenAIGenericClient)
 
-    @pytest.mark.parametrize('mode', ['json_object', 'auto'])
-    def test_configured_max_tokens_reaches_the_constructed_client(
-        self, generic_config, mode,
-    ):
-        """``cfg.llm.max_tokens`` must survive construction on BOTH sub-branches.
-
-        Measured against the installed graphiti-core 0.28.2 wheel:
-        ``OpenAIGenericClient.__init__`` (openai_generic_client.py:61-66,88)
-        declares its own ``max_tokens: int = 16384`` and, immediately after
-        ``super().__init__(config, cache)`` has correctly set
-        ``self.max_tokens = config.max_tokens`` (client.py:80), unconditionally
-        re-assigns ``self.max_tokens = max_tokens``. ``_generate_response`` then
-        sends ``max_tokens=self.max_tokens`` (:126), ignoring the per-call
-        argument — so the constructor kwarg is the ONLY lever that reaches the
-        wire, and a client built with ``config=`` alone asks for 16384 output
-        tokens no matter what the operator configured.
-
-        2048 is deliberately distinct from both the schema default (4096,
-        config/schema.py:214) and upstream's 16384, so a pass cannot be a
-        coincidence of either.
-        """
-        generic_config.llm.structured_output_mode = mode
-        generic_config.llm.max_tokens = 2048
-
-        client = build_llm_client(generic_config)
-
-        assert isinstance(client, OpenAIGenericClient)
-        assert client.max_tokens == 2048
-
     def test_missing_api_key_still_returns_none(self, generic_config):
         """The api_key guard is shared, not duplicated per client_class."""
         generic_config.llm.providers.openai.api_key = ''
@@ -300,6 +244,144 @@ class TestBuildLLMClientOpenAIGenericPath:
 
         assert client is fake_anthropic_cls.return_value
         assert not isinstance(client, OpenAIGenericClient)
+
+
+# Deliberately distinct from BOTH the fused-memory schema default (4096,
+# config/schema.py) and graphiti-core's own DEFAULT_MAX_TOKENS, so a passing
+# assertion below cannot be a coincidence of either. Nothing in this file pins
+# upstream's literal default — a wheel bump that changes it must not turn these
+# guards red.
+MAX_TOKENS_SENTINEL = 2048
+
+# Every arm of build_llm_client that reads cfg.llm.max_tokens. Kept as one list
+# so a future arm added without the kwarg goes red automatically — the hazard
+# named at graphiti_client.py's generic-arm comment ("two copies of the argument
+# list are how one arm silently drifts from the other when a kwarg is added").
+MAX_TOKENS_ARMS = (
+    'openai',
+    'openai_generic/auto',
+    'openai_generic/json_object',
+    'anthropic',
+)
+
+
+def _configure_arm(cfg, arm: str, monkeypatch) -> None:
+    """Point ``cfg`` at one arm of ``build_llm_client``.
+
+    Every arm builds a REAL client — no MagicMock class substitution. Both
+    ``AsyncOpenAI`` and ``AsyncAnthropic`` construct network-free with a fake
+    key, and asserting the constructed object's attribute rather than the
+    constructor call's kwargs is what makes these guards survive a wheel bump
+    that renames or drops the parameter.
+    """
+    if arm == 'anthropic':
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        cfg.llm.provider = 'anthropic'
+        cfg.llm.providers.anthropic = AnthropicProviderConfig(
+            api_key='anthropic-test-key',
+        )
+        return
+    if arm == 'openai':
+        # The Responses-API preflight guards an SDK surface, not this
+        # assertion; stubbed exactly as every sibling default-arm test does.
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', lambda: None,
+        )
+        return
+    cfg.llm.client_class = 'openai_generic'
+    # Unroutable — construction only, no request is ever issued.
+    cfg.llm.providers.openai.api_url = 'http://127.0.0.1:9/v1'
+    cfg.llm.structured_output_mode = arm.split('/')[1]
+
+
+def _expected_client_class(arm: str) -> type:
+    """Resolved lazily: ``build_llm_client`` imports the anthropic client inside
+    its branch, and this file must not turn that into an import-time dependency.
+    """
+    if arm == 'anthropic':
+        from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+        return AnthropicClient
+    if arm == 'openai_generic/json_object':
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        return ForceJsonObjectOpenAIGenericClient
+    if arm == 'openai_generic/auto':
+        return OpenAIGenericClient
+    return OpenAIClient
+
+
+class TestConfiguredMaxTokensReachesEveryArm:
+    """``cfg.llm.max_tokens`` is ONE shared knob — every arm must honour it."""
+
+    @pytest.mark.parametrize('arm', MAX_TOKENS_ARMS)
+    def test_configured_max_tokens_reaches_the_constructed_client(
+        self, mock_config, monkeypatch, arm,
+    ):
+        """The configured value must survive construction on EVERY arm.
+
+        Measured against the installed graphiti-core 0.28.2 wheel:
+
+        - ``OpenAIGenericClient.__init__`` (openai_generic_client.py:61-66,88)
+          declares its own ``max_tokens: int = 16384`` and, immediately after
+          ``super().__init__(config, cache)`` has correctly set
+          ``self.max_tokens = config.max_tokens`` (client.py:80),
+          unconditionally re-assigns ``self.max_tokens = max_tokens``.
+          ``_generate_response`` then sends ``max_tokens=self.max_tokens``,
+          ignoring the per-call argument.
+        - ``BaseOpenAIClient.__init__`` (openai_base_client.py:51-67) — the base
+          of ``OpenAIClient``, i.e. the SHIPPED DEFAULT arm — performs the
+          IDENTICAL override, and ``_generate_response`` sends
+          ``max_tokens or self.max_tokens`` (:176,187).
+
+        So on both OpenAI-shaped arms the constructor kwarg is the ONLY lever
+        that reaches the wire: a client built with ``config=`` alone asks for
+        upstream's default output-token budget no matter what the operator
+        configured. Task 3715 fixed that for the generic arm; task 3864 fixed
+        the default arm, which had silently ignored the knob since inception.
+
+        The anthropic arm is already green — ``AnthropicClient.__init__``
+        overrides ``config.max_tokens`` only when ``config is None``, so a
+        passed config wins. It is covered here anyway as a drift guard: a future
+        wheel adding the same unconditional override would go red instead of
+        silently regressing a third arm.
+        """
+        _configure_arm(mock_config, arm, monkeypatch)
+        mock_config.llm.max_tokens = MAX_TOKENS_SENTINEL
+
+        client = build_llm_client(mock_config)
+
+        assert client is not None
+        assert type(client) is _expected_client_class(arm)
+        assert client.max_tokens == MAX_TOKENS_SENTINEL
+
+    @pytest.mark.parametrize('arm', MAX_TOKENS_ARMS)
+    def test_construction_log_names_the_effective_max_tokens(
+        self, mock_config, monkeypatch, caplog, arm,
+    ):
+        """The effective value must be observable in the startup log.
+
+        Task 3864 changed the wire request of every existing shipped-config
+        deployment on the default arm (16384 -> the configured value) with no
+        error, no config edit and nothing else on the operator's side. Under
+        this repo's loud-over-silent posture a silent wire change needs an
+        observable record, and the cheapest correct one is the line that already
+        runs at exactly this seam and already names provider/model/client class.
+
+        Asserts only that some INFO record carries the substring ``max_tokens``
+        and the VALUE — not an exact sentence — so the message stays rewordable.
+        """
+        _configure_arm(mock_config, arm, monkeypatch)
+        mock_config.llm.max_tokens = MAX_TOKENS_SENTINEL
+
+        with caplog.at_level(logging.INFO, logger=graphiti_client_module.__name__):
+            build_llm_client(mock_config)
+
+        infos = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'max_tokens' in m and str(MAX_TOKENS_SENTINEL) in m for m in infos
+        ), f'no INFO record named the effective max_tokens; got {infos}'
 
 
 class _Inner(BaseModel):

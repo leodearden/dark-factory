@@ -4,8 +4,8 @@
 
 | I want to... | Tool | Key args |
 |---|---|---|
-| Store a discrete fact | `add_memory` | content, project_id, category |
-| Ingest raw content for extraction | `add_episode` | content, project_id, source |
+| Store a discrete fact | `add_memory` | content, project_id, category, entities |
+| Ingest raw content for extraction | `add_episode` | content, project_id, source, entities |
 | Find memories by topic | `search` | query, project_id |
 | Look up a specific entity | `get_entity` | name, project_id |
 | Review ingestion history | `get_episodes` | project_id, last_n |
@@ -21,13 +21,16 @@
 
 Use when you have a specific, distilled piece of knowledge. Always include `project_id` and `agent_id`.
 
+Declare what the write is about with `entities`. List the tasks the content names, as in `[{'kind': 'task', 'id': 3127}]`, or pass `[]` when you considered it and none apply. Omitting `entities` always succeeds, and the referents are then inferred. A declaration that your own content contradicts is rejected, and the rejection's hint states the accepted shape.
+
 **Decisions & Rationale** (→ Graphiti):
 ```
 add_memory(
-  content="We chose PostgreSQL over MongoDB for the billing service because we need ACID transactions for payment processing",
+  content="For Task 3127 we chose PostgreSQL over MongoDB for the billing service because we need ACID transactions for payment processing",
   project_id="dark_factory",
   category="decisions_and_rationale",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]
 )
 ```
 
@@ -37,17 +40,19 @@ add_memory(
   content="Python code in this project uses ruff for formatting with line-length=100",
   project_id="dark_factory",
   category="preferences_and_norms",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
 **Observations & Summaries** (→ Mem0):
 ```
 add_memory(
-  content="Session summary: Implemented the context builder module, added unit tests. The ContextBuilder class produces structured briefings from memory + task state. Left TODO: integration test with live backends.",
+  content="Session summary for Task 928: Implemented the context builder module, added unit tests. The ContextBuilder class produces structured briefings from memory + task state. Left TODO: integration test with live backends.",
   project_id="dark_factory",
   category="observations_and_summaries",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 928}]
 )
 ```
 
@@ -57,7 +62,8 @@ add_memory(
   content="To run the fused-memory server locally: 1) Start docker services (cd fused-memory/docker && docker-compose up -d), 2) cd fused-memory && uv run python -m fused_memory.server.main",
   project_id="dark_factory",
   category="procedural_knowledge",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
@@ -67,7 +73,8 @@ add_memory(
   content="The TaskInterceptor middleware wraps TaskmasterBackend and emits ReconciliationEvents for every task state transition",
   project_id="dark_factory",
   category="entities_and_relations",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
@@ -77,7 +84,8 @@ add_memory(
   content="As of 2026-03-15, the reconciliation system supports targeted reconciliation but full-cycle reconciliation is not yet implemented",
   project_id="dark_factory",
   category="temporal_facts",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
@@ -91,7 +99,8 @@ add_episode(
   project_id="dark_factory",
   source="text",
   agent_id="claude-interactive",
-  source_description="architecture discussion about auth system"
+  source_description="architecture discussion about auth system",
+  entities=[]
 )
 ```
 

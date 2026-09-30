@@ -1,0 +1,37 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-08-10T12:33:45.613086+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "high",
+        "category": "correctness",
+        "file": "fused-memory/src/fused_memory/services/completion_claim_gate.py",
+        "line": 560,
+        "title": "filing_dispatch claims about a TASK are adjudicated as terminality, producing false 'mismatch' verdicts on ordinary 'filed task N' narration",
+        "detail": "`verify_claims`/`_verify_task` branch only on `claim.subject`, never on `claim.kind`. A `filing_dispatch` claim asserts that an artefact EXISTS (that is exactly how the ticket path is adjudicated: `_verify_ticket` = does the row exist), but when the ref family resolves to `task` the same claim is checked against TERMINAL_TASK_STATUSES. Verified by running the shipped code:\n\n  extract_completion_claims('Filed follow-up task 3200 for the remaining work', ...) -> CompletionClaim(kind='filing_dispatch', subject='task', ref='3200')\n  verify_claims(..., task_status_probe=lambda r,p: 'pending') -> ClaimVerdict(status='mismatch', observed='pending')\n\nSame for 'The remaining work was submitted as task 3200' and 'I have queued task 3200 for dispatch'. This phrasing is ubiquitous in agent narration in this repo (`submit_task`, 'filed follow-up task N'), and every occurrence now: (a) prefixes the episode's Graphiti source_description with '[unverified_claim] ', (b) stamps metadata['unverified_claim']=True on every derived Mem0 fact, (c) emits a WARNING, and (d) files an `unverified_completion_claim` escalation whose summary asserts the writer's claim was CONTRADICTED ('mismatch: pending') when the claim \u2014 the task was filed \u2014 is in fact true and confirmable. That is a false accusation in an operator-facing record, and the volume makes the tag stop being read, which is the exact failure mode the module docstring says the ref requirement exists to prevent. Fix: for kind == 'filing_dispatch' with subject == 'task', existence (a resolvable status of any value) should verify; only `applied_work` should require terminality. The test suite never exercises filing_dispatch with a task subject (tests/test_completion_claim_gate.py only pairs it with tickets), which is why this passed 101 green tests."
+      },
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "fused-memory/src/fused_memory/services/completion_claim_gate.py",
+        "line": 520,
+        "title": "PR/issue '#N' references are read as task refs, so 'Merged PR #4521' escalates against an unrelated task",
+        "detail": "`TASK_REF_RE` (imported from task_filter) accepts a bare `#` cue, and `_refs_in_clause` applies it with no exclusion for PR/issue/GitHub context. Verified against the shipped code:\n\n  'Merged PR #4521 into main'                     -> ('applied_work','task','4521')\n  'The upstream issue #123 was closed as wontfix' -> ('filing_dispatch','task','123')\n\nIn task_filter the same over-match only risked a recon conflict flag; here it consults the task authority for an id the sentence never claimed anything about. If a task with that id exists and is non-terminal the verdict is `mismatch` (a false accusation about work nobody claimed); if it does not exist, `get_statuses` silently omits it so the verdict is `unverifiable` \u2014 still tagged, still escalated. dark_factory task ids are in the same numeric range as PR numbers, so both outcomes are live. Suggest requiring the `task`/`df` cue (or excluding a preceding PR/pull/issue/GH token) for the `#` arm in this gate."
+      },
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "fused-memory/src/fused_memory/server/tools.py",
+        "line": 1697,
+        "title": "make_commit_probe() runs `git rev-parse --show-toplevel` synchronously on the event loop, defeating the to_thread wrapper directly below it",
+        "detail": "`_claim_commit_presence` calls `probe = make_commit_probe(root)` inline in the coroutine, and `make_commit_probe` eagerly calls `_resolve_git_toplevel(Path(repo_root))` at construction time, which is a blocking `subprocess.run(['git','rev-parse','--show-toplevel'], timeout=_GIT_PROBE_TIMEOUT_SECS)` (recon_claim_verification_guard.py:243, timeout 10.0s). Only the cheap `cat-file` call is dispatched via `asyncio.to_thread`. The docstring two lines above states the reason for the to_thread ('a blocking git call on the event loop would stall every other in-flight MCP request behind one episode's verification') \u2014 that stall is exactly what the un-threaded `rev-parse` reintroduces, once per claimed project per episode, for up to 10s on a slow/NFS/hung-lock repository. Wrap the construction in `await asyncio.to_thread(make_commit_probe, root)` (or make top-level resolution lazy inside the threaded probe). Compounding: nothing caps the number of commit refs per episode, so the subsequent per-sha probes are also serial \u2014 an episode citing many shas serialises N fork/exec round-trips on the write path."
+      }
+    ],
+    "summary": "Reviewed the full task-3142 change set (completion_claim_gate.py, the tools.py ingestion wiring, memory_service/graphiti_client tag plumbing, TaskInterceptor.get_ticket_row) against the surrounding code, and ran the new suites \u2014 101 tests pass. The architecture is sound and unusually well-argued: detection is deterministic and vocabulary-shared with task_filter rather than re-derived, verification is probe-injected and pure, the inverted fail direction (unresolvable -> tag, never reject) is correct for a labelling gate and correctly distinguishes UNRESOLVABLE from a genuine registry miss (INV-2), the tag rides the same channel as temporal_context so it reaches the persisted episodic node and derived Mem0 facts rather than only the tool response, cross-project routing keys probes off the claimed project rather than the writer's, and both the gate and the escalation emitter are fully contained so no defect can cost a caller their write. Three issues found. The significant one is semantic: `_verify_task` ignores `claim.kind`, so a `filing_dispatch` claim that resolves to a task subject ('Filed follow-up task 3200', 'submitted as task 3200', 'queued task 3200') is checked for TERMINAL status and comes back `mismatch: pending` \u2014 I confirmed this by running the shipped extractor and verifier. That is a false accusation, filed as an operator-facing escalation, on phrasing that is everywhere in this repo's agent narration, and it is untested (filing_dispatch is only ever exercised with ticket subjects). A related over-match reads 'Merged PR #4521' as a claim about task 4521. Third, `make_commit_probe()` is constructed on the event loop and eagerly shells out to `git rev-parse --show-toplevel` (10s timeout), which reintroduces precisely the event-loop stall that the `asyncio.to_thread` two lines below was added to prevent."
+  }
+}

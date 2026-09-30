@@ -57,6 +57,24 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'required': ['thinking', 'tool_calls'],
 }
 
+# max_turns for ONE reconciliation-agent CLI invocation.  It caps a single
+# assistant round-trip, not the conversation: AgentLoop.run() drives multi-turn
+# externally, one _call_claude_cli per outer step (bounded by
+# ``agent_max_steps``), threaded with ``resume_session_id``.
+#
+# Never 1.  With --json-schema the model emits a prose turn before it calls
+# ``StructuredOutput``, and a cap of 1 leaves no room for it: the CLI returns
+# ``error_max_turns``, which in the measured runs carried no structured payload,
+# so schema salvage had nothing to recover and the call failed.  That is
+# measured CLI behaviour, not a guarantee — the rates, sample sizes and CLI
+# versions are recorded only in fused-memory/scripts/probe_schema_max_turns.py;
+# re-run it rather than trusting a number copied elsewhere.
+#
+# 10 over-provisions deliberately: max_turns is a ceiling, not a target, and
+# spend stays bounded by cli_invoke's ``max_budget_usd`` and
+# ``agent_cli_timeout_seconds``.
+_AGENT_CLI_MAX_TURNS = 10
+
 
 class CircuitBreakerError(Exception):
     """Raised when mutation count exceeds the per-stage limit."""
@@ -92,6 +110,7 @@ class AgentLoop:
         tools: dict[str, ToolDefinition],
         terminal_tool: str = 'stage_complete',
         usage_gate=None,
+        cwd: Path | None = None,
     ):
         # NOTE: for recon stages running via the CLI path (production), the effective
         # terminal action is `mcp__recon-report__complete` — the stage agent calls that
@@ -109,6 +128,12 @@ class AgentLoop:
         self.token_count: int = 0
         self._cli_session_id: str | None = None
         self._usage_gate = usage_gate
+        # Task 4722 / PRD D5: the codebase root this agent runs in.  The
+        # verifier now supplies the TASK's own project root per call; every
+        # other construction site passes nothing and keeps the process-global
+        # config value, so the fallback is what leaves those sites unaffected.
+        # Resolved once here so `self.cwd` is always a Path.
+        self.cwd: Path = Path(cwd) if cwd is not None else Path(config.explore_codebase_root)
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
@@ -404,11 +429,8 @@ class AgentLoop:
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
                 model=self.config.agent_llm_model,
-                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-                # _call_claude_cli again with resume_session_id.  A single CLI
-                # invocation only needs one assistant turn (schema tool-use → JSON
-                # response happens within the same turn when --json-schema is used).
-                max_turns=1,
+                # See _AGENT_CLI_MAX_TURNS for why this is not 1.
+                max_turns=_AGENT_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
@@ -438,13 +460,13 @@ class AgentLoop:
                 # branches that would invoke rebuild_prompt. If AgentLoop is ever
                 # constructed with a real usage_gate, add a rebuild_prompt hook here
                 # at the same time.
-                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-                # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies, and the
-                # auto-loaded CLAUDE.md is plausibly its main passive codebase
-                # signal.
+                # Task 1989 (sweep verdict): kept at the CODEBASE root (now the
+                # per-call one, task 4722) rather than a neutral cwd. This is a
+                # multi-turn agent that actively adjudicates memory-vs-codebase
+                # discrepancies, and the auto-loaded CLAUDE.md is plausibly its
+                # main passive codebase signal.
                 #
-                # This cwd is the project root and holds a live .mcp.json, which
+                # This cwd is a project root and may hold a live .mcp.json, which
                 # bypassPermissions would otherwise let the CLI ambient-merge and
                 # expose unreviewed. disallowed_tools=['*'] above does NOT cover
                 # that: with output_schema set, cli_invoke expands the wildcard
@@ -463,13 +485,16 @@ class AgentLoop:
                 # turn >= 2 with a green suite here. Tracked as a follow-up test
                 # in shared/tests/test_build_claude_argv.py (out of this task's
                 # locked-module scope).
-                cwd=Path(self.config.explore_codebase_root),
+                cwd=self.cwd,
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
 
             if not result.success:
-                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-                # so `not result.success` is the complete failure guard.
+                # schema_salvaged=True implies success=True (see the
+                # ``schema_salvaged`` assignment in cli_invoke's CLI result
+                # parser), so `not result.success` is the complete failure guard.
+                # Salvage is not the backstop here (see _AGENT_CLI_MAX_TURNS):
+                # this guard is what fires on an ``error_max_turns`` failure.
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.

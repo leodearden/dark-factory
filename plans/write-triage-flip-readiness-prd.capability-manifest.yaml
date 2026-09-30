@@ -1,0 +1,161 @@
+prd: plans/write-triage-flip-readiness-prd.md
+schema_version: 1
+tasks:
+- label: kappa1
+  task_id: 5800
+  title: 'Land the honest write-triage instrument: retrieved-slate eval, production-parity
+    recall, aliases, regenerated artifacts'
+  capabilities:
+  - name: committed-judge-artifact-is-retrieved-mode
+    binding: capability→producer — κ1 regenerates the artifact with --slate-mode retrieved
+      (verified on landing by the grep)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"slate_mode":\s*"retrieved"'
+      paths:
+      - fused-memory/calibration/write_triage_judge_accuracy_report.json
+      expect: present
+  - name: committed-calibration-artifact-is-production-retrieval
+    binding: capability→producer — κ1 regenerates with --retrieval production (verified
+      on landing by the grep)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"retrieval_mode":\s*"production"'
+      paths:
+      - fused-memory/calibration/write_triage_calibration_report.json
+      expect: present
+- label: gamma1
+  task_id: 5801
+  title: 'Gate: instrument landed (predicate)'
+  capabilities:
+  - name: gate-predicate-executable
+    binding: capability→producer — committed with the PRD; existence and X_OK enforced
+      by deterministic_task_guard at submit
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the submit-time guard already enforces existence and executability
+- label: tau
+  task_id: 5802
+  title: Consume the topic-anchored pin in write triage
+  capabilities:
+  - name: pinned-record-enters-band-with-score
+    binding: capability→producer — τ; boundary rows 5 and 7; the pattern anchors the
+      call-site argument, not prose
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^\s+anchor_topics=True,
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage.py
+      expect: present
+- label: rho1
+  task_id: 5803
+  title: Measure reranker arms on the retrieved-slate harness
+  capabilities:
+  - name: reranker-report-with-best-block
+    binding: capability→producer — ρ1; best chosen by the §9 selection rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"best":'
+      paths:
+      - fused-memory/calibration/write_triage_reranker_report.json
+      expect: present
+- label: gamma2
+  task_id: 5804
+  title: 'Gate: reranker verdict (predicate)'
+  capabilities:
+  - name: thresholds-achievable
+    binding: floor — home is the gate task's before_done.args; filing-time basis in
+      PRD §9 (cosine rank-1 0.19, recall@20 0.79); provisional
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: numeric threshold; the gate escalation carries observed values for re-basing
+- label: rho2
+  task_id: 5805
+  title: Integrate rerank_candidates behind write_triage.reranker with a band_signal
+    knob
+  capabilities:
+  - name: reranker-fail-open-counted
+    binding: rejection-mechanism (INV-4) — shares TriageFailOpenCounter; Γ2's fail
+      branch removes the μ←ρ2 edge before cancelling ρ2 so this check never withholds
+      μ
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def rerank_candidates\(
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_rerank.py
+      expect: present
+- label: sigma
+  task_id: 5806
+  title: Judge-specific endpoint knob write_triage.judge_api_url
+  capabilities:
+  - name: judge-url-read-at-credential-resolution
+    binding: capability→producer — σ; the read site, not the allowlist
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: judge_api_url
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_judge.py
+      expect: present
+  - name: judge-url-hot-reloadable
+    binding: capability→producer — σ registers the leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_triage\.judge_api_url
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: present
+- label: mu
+  task_id: 5807
+  title: Configuration matrix and best_config for the flip
+  capabilities:
+  - name: best-config-artifact
+    binding: capability→producer — μ copies score_attachments output verbatim (C2')
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"residual":'
+      paths:
+      - fused-memory/calibration/write_triage_best_config.json
+      expect: present
+- label: gamma3
+  task_id: 5808
+  title: 'Gate: flip readiness (predicate)'
+  capabilities:
+  - name: thresholds-achievable-and-jointly-feasible
+    binding: floor — home is the gate task's before_done.args; filing-time basis in
+      PRD §9 (0.79 × 0.653 = 0.516; 38 strict of 75 with ≤ 76 attaches); provisional
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: numeric threshold; the gate escalation carries observed values for re-basing
+- label: nu
+  task_id: null
+  title: Jev provider arm for the write-triage judge (deferred)
+  capabilities:
+  - name: third-provider-arm
+    binding: capability→producer — ν; vendor API verified from docs; filed deferred,
+      promoted only by Γ3's fail branch
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: deferred leaf; no dispatch gate until promoted
+- label: gamma4
+  task_id: 5810
+  title: 'Gate: flip preconditions on the refreshed tree (predicate)'
+  capabilities:
+  - name: flip-predicate-passes
+    binding: capability→producer — scripts/check_write_triage_flip_preconditions.sh
+      (4810/4949), run by the gate itself
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the gate runs the predicate; a second grep would duplicate it

@@ -376,6 +376,18 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
     attempt was truncated off the front of the transcript window) degrades
     to None attempt fields rather than raising.
 
+    That id is also EXPOSED on each neighborhood as ``tool_use_id``: it is
+    the stable join key letting a caller relate a classified result back to
+    the assistant attempt that produced it WITHOUT a second scan. It is
+    what :func:`find_retry_loops` joins on to annotate a retry group with
+    how many of its calls ended in a DESIGNED outcome
+    (``plans/confusion-census-2026-08-26.md`` §1.1 / R1, task 4751) --
+    a retry group's ``indices`` are tool_use record positions while a
+    neighborhood's ``index`` is the tool_result one, so record index cannot
+    serve as that key. Because it is read off the RESULT block it survives
+    an unmatched attempt, the same degradation contract the None attempt
+    fields above already document.
+
     Returns EVERY structured error -- this is the single scan and the single
     source of truth. Each neighborhood is enriched with ``exit_code`` and
     ``designed_outcome`` (see :func:`classify_error_content`) so callers
@@ -400,6 +412,7 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
         exit_code, designed_outcome = classify_error_content(error_content)
         neighborhoods.append({
             'index': index,
+            'tool_use_id': block.get('tool_use_id'),
             'attempt_tool': attempt.get('name') if attempt else None,
             'attempt_input_summary': (
                 _summarize_input(attempt.get('input')) if attempt else None
@@ -581,6 +594,132 @@ def _signal_text_sources(
     return sources
 
 
+def _dialogue_text_sources(
+    records: list[dict[str, Any]],
+    *,
+    tool_result: bool = False,
+    assistant_text: bool = False,
+    user_text: bool = False,
+) -> list[tuple[int, str]]:
+    """The carriers :func:`_signal_text_sources` yields, minus every one
+    :func:`_is_non_dialogue_carrier` rejects.
+
+    Two layers, two questions: :func:`_signal_text_sources` answers "which
+    native carriers exist", and this answers "which of them are this
+    session's own dialogue". Every signal detector reads this layer.
+
+    Dropping is WHOLE-carrier on every carrier kind, tool_results and
+    assistant text included, so a genuine literal printed beside a harness
+    prompt goes with it. That cost is accepted on measurement: across the
+    2026-09-23 dark-factory corpus the harness rule dropped 59 non-user
+    carriers with signal hits, each one foreign material (a Read of a
+    module holding the marker literals, a task record, a dump of another
+    session). Merely NAMING a harness heading drops nothing, because the
+    heading rules are line-anchored.
+    """
+    return [
+        (index, text)
+        for index, text in _signal_text_sources(
+            records,
+            tool_result=tool_result,
+            assistant_text=assistant_text,
+            user_text=user_text,
+        )
+        if not _is_non_dialogue_carrier(records[index], text)
+    ]
+
+
+CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
+"""The two top-level keys of a trickle-coder judgment, whose canonical source
+is the response schema in scripts/legibility/coder.py::build_prompt.
+Restated rather than imported: this module PRODUCES the digest coder.py
+consumes, and importing the consumer would invert that layering for two key
+names. A lockstep test over the reply build_prompt prescribes holds the two
+in step, so renaming that schema fails a test instead of silently letting
+coder answers back into the signal counts."""
+
+_JSON_FENCE_RE = re.compile(r'\A```(?:json)?\s*\n(.*)\n```\Z', re.DOTALL)
+"""One outer ```/```json fence enclosing an ENTIRE stripped carrier."""
+
+
+def is_coder_judgment_payload(text: str) -> bool:
+    """True when the WHOLE of *text* is a trickle-coder judgment: a JSON
+    object carrying every :data:`CODER_JUDGMENT_KEYS` key, bare or inside at
+    most ONE outer fence spanning the entire carrier -- the two spellings
+    coder.py::parse_coder_output already reads as one payload.
+
+    Deliberately narrower than that parser, which brace-slices an object out
+    of surrounding prose because its job is rescuing a reply. Here that
+    looseness would read an assistant turn that merely QUOTES the schema as
+    machine content and suppress a genuine self-correction in it, and
+    over-excluding genuine dialogue is the worse error -- the same trade-off
+    :func:`is_harness_injected_turn` makes.
+
+    Any carrier json.loads cannot handle answers False, RecursionError
+    included (it is not a ValueError): this runs on every carrier of
+    arbitrary transcripts and must answer, never abort a digest.
+    """
+    stripped = text.strip()
+    fence = _JSON_FENCE_RE.match(stripped)
+    if fence:
+        stripped = fence.group(1).strip()
+    if not stripped.startswith('{'):
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict) and parsed.keys() >= CODER_JUDGMENT_KEYS
+
+
+def is_reingested_content(text: str) -> bool:
+    """True when *text* is machine content re-ingested as session material
+    rather than this session's own dialogue.
+
+    Two shapes are known: a prior trickle-coder answer
+    (:func:`is_coder_judgment_payload`) and an injected harness prompt or
+    briefing (:func:`is_harness_injected_turn`). Both quote signal literals
+    that belong to another session or to the harness. Session b203a05c
+    record 22, a coder answer, fired self_correct; session 6a527d51 record 3,
+    the trickle-coder prompt embedding the digest it codes, fired df_guard.
+
+    Consulted by EVERY signal bucket, never by one: task 5685's ruling is
+    that this contamination is fixed at the content-classification layer,
+    not per bucket. A newly-sighted machine-payload shape is a one-line
+    addition to this union.
+    """
+    return is_coder_judgment_payload(text) or is_harness_injected_turn(text)
+
+
+HUMAN_ORIGIN_KIND: str = 'human'
+"""The only Claude Code ``origin.kind`` that asserts a human typed the record."""
+
+
+def has_non_human_origin(record: dict[str, Any]) -> bool:
+    """True when *record*'s own structured provenance names a non-human
+    producer: Claude Code stamps queued user prompts with ``origin`` (a
+    background task-notification, an auto-continuation, a coordinator or
+    peer message, ...), and any kind but :data:`HUMAN_ORIGIN_KIND` counts.
+
+    Unknown provenance -- no ``origin``, a non-dict one, or one without a str
+    ``kind`` -- answers False, so the record falls through to the text rules.
+    Why there is no text fallback: plans/confusion-reduction-prd.md §7.2.2
+    (generation 4).
+    """
+    origin = record.get('origin')
+    if not isinstance(origin, dict):
+        return False
+    kind = origin.get('kind')
+    return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
+
+
+def _is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
+    """The ONE question the gold bucket and every signal detector ask of a
+    carrier: the record half is provenance, the text half is content. The
+    record half covers every carrier the record holds, tool_results included."""
+    return has_non_human_origin(record) or is_reingested_content(text)
+
+
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect curated self-correction markers in assistant TEXT blocks only.
 
@@ -589,10 +728,13 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     test data, not a real correction) is never scanned -- restricting the
     scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
     structurally excludes both. A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line.
+    suppresses an otherwise-matching line, and a block that is re-ingested
+    machine content as a WHOLE (a prior coder judgment quoting the digest it
+    coded, say) is dropped before the scan by :func:`_dialogue_text_sources`.
+    Block type, whole carrier and single line are three separate filters.
     """
     hits = []
-    for index, text in _signal_text_sources(records, assistant_text=True):
+    for index, text in _dialogue_text_sources(records, assistant_text=True):
         stripped = _strip_decoy_lines(text)
         lowered = stripped.lower()
         for pattern in SELF_CORRECTION_PATTERNS:
@@ -640,11 +782,15 @@ INTERRUPT_PATTERN = 'request interrupted by user'
 def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect NOT_FOUND_PATTERNS in tool_result content only.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A tool_result that is re-ingested machine content as a whole -- a coder
+    judgment, or foreign material carrying a harness prompt such as a dump
+    of another session's digest -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(records, tool_result=True):
+    for index, text in _dialogue_text_sources(records, tool_result=True):
         lowered = _strip_decoy_lines(text).lower()
         for pattern in NOT_FOUND_PATTERNS:
             if pattern in lowered:
@@ -657,11 +803,15 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tool_result content, assistant text, and user-turn text (incl. isMeta
     system injections, excluding isSidechain subagent turns).
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A carrier that is re-ingested machine content as a whole -- the
+    trickle-coder prompt embedding the digest it codes, or a coder judgment
+    quoting that digest back -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(
+    for index, text in _dialogue_text_sources(
         records, tool_result=True, assistant_text=True, user_text=True,
     ):
         lowered = _strip_decoy_lines(text).lower()
@@ -674,18 +824,16 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect the injected interrupt marker in non-sidechain user turns.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line, for parity with the other text-pattern detectors (not_found,
-    df_guard, self_correct) and PRD Sec 13.2's decoy-FAIL suppression
-    contract.
+    A user turn that is re-ingested machine content as a whole -- notably
+    the trickle-coder prompt, whose embedded digest lists earlier
+    '(turn N) request interrupted by user' hits -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line, for parity with the other
+    text-pattern detectors (not_found, df_guard, self_correct) and PRD Sec
+    13.2's decoy-FAIL suppression contract.
     """
     hits = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user' or record.get('isSidechain'):
-            continue
-        text = _user_turn_text(_message_content(record))
-        if not text:
-            continue
+    for index, text in _dialogue_text_sources(records, user_text=True):
         if INTERRUPT_PATTERN in _strip_decoy_lines(text).lower():
             hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
     return hits
@@ -710,34 +858,119 @@ def _input_signature(tool_input: Any) -> str:
         return str(tool_input)
 
 
-def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group tool_use calls by (name, canonical input signature) and flag
-    groups recurring >= RETRY_MIN times as near-identical retry loops.
+def find_retry_loops(
+    records: list[dict[str, Any]],
+    *,
+    neighborhoods: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Group tool_use calls by (name, canonical input signature), flag
+    groups recurring >= RETRY_MIN times as near-identical retry loops, and
+    ANNOTATE each with how many of its calls ended in a DESIGNED outcome.
 
-    Deterministic and dependency-free (sibling to the decoy-FAIL decision,
-    PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
-    canonical-JSON input, again".
+    Grouping stays deterministic and dependency-free (sibling to the
+    decoy-FAIL decision, PRD Sec 13.2): no fuzzy string similarity, no
+    time or adjacency heuristic, just "same tool, same canonical-JSON
+    input, again". The annotation adds no second classifier and no second
+    pattern table -- it JOINS, on ``tool_use_id``, against the
+    already-enriched :func:`iter_error_neighborhoods` scan that task 3610
+    made the single source of truth for "was this result designed?".
+
+    Why (confusion-census-2026-08-26 §1.1 / R1, task 4751): a healthy
+    escalation-watcher rotation makes one date-check and one re-arm call
+    per ~3600s cycle, so ANY rotation of >= RETRY_MIN cycles necessarily
+    crossed this threshold and rendered under "## Retry Loops" -- while the
+    same digest's ``signal_counts`` correctly reported ``tool_error: 0``
+    and tallied the ceilings under ``designed_outcome``. Two layers of one
+    instrument told contradictory stories about one session. Reading ONE
+    classification is what stops that.
+
+    Annotation, never suppression. A group is always returned at its true
+    ``count``, so a genuine retry storm interleaved with bounded-wait
+    ceilings stays fully visible and ambiguity still costs a reader one
+    annotated line rather than a hidden failure (PRD Sec 7.2.1's
+    fail-toward-genuine principle). A group with no designed results
+    reports ``designed_outcome_count`` 0 and an empty ``designed_outcomes``,
+    and renders byte-identically to the pre-4751 format.
+
+    ``designed_outcomes`` holds the DISTINCT ``(exit_code, label)`` pairs
+    in first-appearance order -- deterministic by construction over the
+    group's already-ordered members, and needing no comparison key:
+    ``exit_code`` is ``int | None``, so a naive ``sorted()`` would raise
+    TypeError the moment a declaration carries no code.
+
+    Pass ``neighborhoods=`` to annotate from a scan the caller already
+    holds -- the same efficiency contract and the same resolver
+    (:func:`_neighborhoods_to_partition`) as :func:`iter_genuine_errors`
+    and :func:`iter_designed_outcomes`, which is what keeps a digest at two
+    neighborhood scans rather than three (see :data:`_NEIGHBORHOOD_ANNOTATORS`).
     """
     # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
     # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
     # None here and always has. The declared type is corrected to match rather
     # than the value coerced, which would change what a nameless block renders
     # as in the report for no benefit.
-    groups: dict[tuple[str | None, str], list[int]] = {}
+    #
+    # A member is one (record index, tool_use id) PAIR, accumulated once:
+    # the two are needed for different things -- the index is a tool_use
+    # RECORD position and so cannot address a neighborhood (whose own
+    # `index` is the tool_result position), while the id is the only key
+    # that can -- and keeping them in ONE list makes drifting them apart
+    # structurally impossible rather than a lockstep invariant a later
+    # edit could quietly break.
+    groups: dict[tuple[str | None, str], list[tuple[int, Any]]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
-        groups.setdefault(key, []).append(index)
+        groups.setdefault(key, []).append((index, block.get('id')))
+
+    # Only the DESIGNED half is indexed: a genuine failure needs no
+    # annotation here (it has its own section), and restricting the map is
+    # what makes a hit unambiguous. A None id is excluded so a malformed
+    # id-less block cannot collide with an orphan neighborhood's None.
+    designed_by_id = {
+        n['tool_use_id']: n
+        for n in _neighborhoods_to_partition(records, neighborhoods)
+        if n['designed_outcome'] is not None and n['tool_use_id'] is not None
+    }
 
     loops = []
-    for (name, signature), indices in groups.items():
-        if len(indices) >= RETRY_MIN:
-            loops.append({
-                'tool': name,
-                'signature': signature,
-                'count': len(indices),
-                'indices': indices,
-            })
+    for (name, signature), members in groups.items():
+        if len(members) < RETRY_MIN:
+            continue
+        designed_count = 0
+        pairs: list[tuple[int | None, str]] = []
+        seen: set[tuple[int | None, str]] = set()
+        for _index, tool_use_id in members:
+            hit = designed_by_id.get(tool_use_id)
+            if hit is None:
+                continue
+            designed_count += 1
+            pair = (hit['exit_code'], hit['designed_outcome'])
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+        loops.append({
+            'tool': name,
+            'signature': signature,
+            'count': len(members),
+            'indices': [index for index, _id in members],
+            'designed_outcome_count': designed_count,
+            'designed_outcomes': pairs,
+        })
     return loops
+
+
+_NEIGHBORHOOD_ANNOTATORS = (find_retry_loops,)
+"""The detectors in _SECTION_RENDERERS that scan *records* themselves but
+ALSO annotate from an existing neighborhood scan -- invoked as
+``detector(records, neighborhoods=...)``, the third dispatch shape in
+:func:`_build_sections`.
+
+Sibling to :data:`_NEIGHBORHOOD_PARTITIONS` (which is invoked as
+``detector(neighborhoods=...)`` alone) and declared here rather than
+literally beside it only because :func:`find_retry_loops` is defined
+further down the module. Both exist so _SECTION_RENDERERS remains the
+single declaration of WHICH detector feeds which section, with only HOW it
+is invoked varying."""
 
 
 def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -874,14 +1107,25 @@ anchor plus one corroborator already meets the >=2 threshold, anchoring it
 costs genuine gold turns for zero recall."""
 
 HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
-    '## project context', '## conventions', '## recent decisions',
-    '## task context',
+    '## project context', '## conventions', '## conventions & gotchas',
+    '## recent decisions', '## task context',
 )
 """CORROBORATING heading literals -- the structural sub-blocks a real
-briefing carries alongside an anchor
-(orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
-:1270, '## Conventions' :1277, '## Recent Decisions' :1284, '## Task
-Context' :1294 inside ``_get_memory_context``'s recalled_sections list).
+briefing carries alongside an anchor. Matched as WHOLE lowercased LINES
+(see :func:`is_harness_injected_turn`), so a renamed heading needs its own
+entry rather than matching by prefix.
+
+Two generations, both live, because this filter reads transcripts written
+long before it: today
+``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``
+renders its headings from the section titles in
+``shared/src/shared/briefing_queries.py`` -- '## Conventions & Gotchas' and
+'## Task Context' -- while '## Project Context', '## Conventions' and
+'## Recent Decisions' are the pre-task-3659 spellings, retired from the
+query table but still present throughout the archived corpus. Do not prune
+the retired three: dropping them silently un-classifies every historical
+briefing turn.
+
 Never sufficient alone: a human turn headed '## Conventions' carries no
 anchor and stays gold.
 
@@ -892,13 +1136,21 @@ prompt template (:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212) and was
 listed here until the task 3610 amendment pass, but '# Task' + '# Action'
 is also an ordinary human spec-writing shape, and losing a genuine gold
 turn is a SILENT error where an admitted briefing turn is a visible one.
-It costs almost no recall: every one of those templates begins with
-``{context}``, so a real briefing always carries the '# Context' anchor
-and, whenever memory context is available, its '##' sub-blocks too. The
-corner this declines is the memory-UNAVAILABLE variant of the two
-identity-less templates (build_reviewer_prompt :998, build_merger_prompt
-:1109), which then shows only '# Context' + '# Action' -- a shape the
-pre-3610 all-of-three rule did not catch either, so nothing regresses."""
+It costs almost no recall: every template that carries a memory block
+begins with ``{context}``, so such a briefing always carries the
+'# Context' anchor and, whenever memory context is available, its '##'
+sub-blocks too. The corner this declines is the memory-UNAVAILABLE variant
+of ``BriefingAssembler.build_reviewer_prompt``, the one identity-less
+template that still has a context slot, which then shows only '# Context' +
+'# Action' -- a shape the pre-3610 all-of-three rule did not catch either,
+so nothing regresses. ``BriefingAssembler.build_merger_prompt`` is out of
+this rule's reach entirely: since task 3659 it carries no memory block at
+all, so it emits no '# Context' anchor to be corroborated (D7 -- the merger
+is mechanical and the generic block was never shown to help it). It is
+covered instead by its own :data:`MERGER_HEADINGS` set below, because
+losing it here would have been a REGRESSION, not a declined corner: before
+3659 the merger prompt opened with '# Context' and was classified by this
+very rule."""
 
 RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',
@@ -926,9 +1178,36 @@ and (b) are one source class (harness injection) with two injectors
 (orchestrator briefing vs. judge prompt), which is why these headings live
 here rather than behind a separate 'pasted report' predicate."""
 
+MERGER_HEADINGS: tuple[str, ...] = (
+    '# task intent', '# merge conflicts', '# action',
+)
+"""Injected merge-resolution PROMPT heading literals
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_merger_prompt``,
+a single f-string emitting '# Task Intent', '# Merge Conflicts', '# Action').
+
+This set exists because task 3659 removed the merger's memory block, and
+with it the '# Context' anchor that had been the ONLY heading
+:data:`HARNESS_BRIEFING_HEADINGS` could recognise in a merger dispatch.
+Measured against the real builder: pre-3659 shape -> True (with recalled
+memory AND with the memory-unavailable notice alike), post-3659 shape ->
+False. Without this entry every merge-conflict dispatch -- the docstring
+measures 7 per 14 days -- would be mined as a genuine human turn and
+rendered in the digest's gold 'User Correction' section (PRD Sec 5).
+
+Strict all-of, like every non-briefing injector: the task-3610 relaxation
+was earned by forensics on the briefing shape alone. All three headings are
+'# '-level, which is exactly why the all-of match is required here and why
+these literals must NOT be folded into
+:data:`HARNESS_BRIEFING_SUBHEADINGS` -- a '# '-level corroborator would
+pair with the '# task' anchor and clear the >=2 threshold on its own, the
+false-positive the 3610 amendment pass removed '# action' to prevent. As a
+co-occurring triple they are not an ordinary human shape: '# Merge
+Conflicts' carries the discrimination."""
+
 HARNESS_HEADING_SETS: tuple[tuple[str, ...], ...] = (
     HARNESS_BRIEFING_HEADINGS,
     RECON_RUN_REVIEW_HEADINGS,
+    MERGER_HEADINGS,
 )
 """Every known harness-injected heading set, matched independently: a turn
 is harness-injected when ALL headings of ANY one set co-occur. Adding a
@@ -972,6 +1251,7 @@ literals as one-line additions."""
 
 HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_this context was recalled from the ',
+    '_memory unavailable (',
     '_memory unavailable — proceed with codebase exploration',
     '_no memory context available',
 )
@@ -980,26 +1260,41 @@ HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
 the standing provenance caveat's prefix
 (``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
 section was actually recalled), and its two no-recalled-sections literal
-families (memory-unavailable / no-memory-context-available). The caveat
-marker deliberately stops BEFORE its ``{project_id}`` interpolation
-point: a marker spanning it would be project-specific and would fail for
-every non-dark_factory project the census runs against (this module has
-no knowledge of which project a transcript belongs to). These three
-markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
-as of this commit: the four no-recalled-sections paths (each of the two
-literal families has a plain and a drop_note-bearing variant, both
-covered by the same family marker), PLUS the recalled-sections path
-(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+families (memory-unavailable / no-memory-context-available). Every
+marker deliberately stops BEFORE an interpolation point -- the caveat's
+``{project_id}`` and MEMORY_OUTAGE_NOTICE's ``{reasons}`` -- because a
+marker spanning one is not stable across call sites: the caveat's would
+be project-specific and would fail for every non-dark_factory project the
+census runs against (this module has no knowledge of which project a
+transcript belongs to), and the outage notice's would pin one reason
+class out of three.
+
+The memory-unavailable family has TWO markers, both live, for the reason
+the sibling ``HARNESS_BRIEFING_SUBHEADINGS`` carries two generations of
+heading spellings: task 3659 reworded that notice to name WHY memory was
+unavailable, so ``'_memory unavailable ('`` covers what is rendered today
+and the longer literal covers the archived pre-3659 corpus. Do not prune
+the retired one -- dropping it silently un-classifies every historical
+outage turn.
+
+These four markers are EXHAUSTIVE over ``_get_memory_context``'s return
+paths as of this commit: the no-recalled-sections paths (each of the two
+literal families has a plain, a drop_note-bearing and a notices-bearing
+variant, all three covered by the same family marker, since the family
+line leads the body and the notices and drop_note are appended after it),
+PLUS the recalled-sections path
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+-- covered by the caveat marker ALONE, including
 its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
 trailing "_Memory unavailable for the remaining queries..._" note a
 later-failing query appends, since both are appended AFTER the caveat
 prefix this marker matches on, never before it. That exhaustiveness
 claim is what
 ``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
-(the four no-recalled-sections paths) and
+(every no-recalled-sections shape) and
 ``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
-(the fifth, composite path) together check, so a new return path added
-to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
+(the composite recalled path) together check, so a new return path added
+to that function should arrive with its own marker here. Matched only in CONJUNCTION with
 a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
 never as a relaxation of the briefing anchor+corroborator guard -- that
 guard is load-bearing and its two negative tests
@@ -1096,6 +1391,11 @@ def classify_agent_class(
     alpha never guesses when the caller already knows. Otherwise: a
     genuinely empty transcript classifies as 'unknown'; a non-empty
     transcript with no marker match falls back to 'interactive'.
+
+    Unlike every signal detector, it reads the RAW carriers
+    (:func:`_signal_text_sources`), not :func:`_dialogue_text_sources`: it
+    classifies BY injected markers, so filtering them out would delete its
+    own evidence.
     """
     if override is not None:
         return override
@@ -1124,19 +1424,28 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt/
-    report/context-block turns -- the orchestrator briefing, the
-    trickle-coder and resume prompts, the reconciliation judge's
-    run-review prompt and a lone memory-context block alike (see
-    :func:`is_harness_injected_turn`). Every one of those injected shapes
-    lands in the transcript as ordinary user-role text (isMeta unset), so
-    isMeta alone cannot exclude any of them. This function is the SINGLE
-    source for both the gold user_corrections section and render_digest's
-    n_user_turns score component, so this one filter excludes such a turn
-    from the body AND the score together -- which is exactly what
-    confusion-census-2026-07-31 §3.1 asks for, its clusters 1.1(b) and 1.2
-    being one event observed from two surfaces. User corrections are gold
-    (PRD Sec 5) -- this is the highest-priority digest section.
+    entirely tool_result blocks, a record whose harness provenance names a
+    non-human producer (:func:`has_non_human_origin` -- a background-task
+    notification, an auto-continuation, a coordinator or peer message), and
+    re-ingested machine content (:func:`is_reingested_content`): a pasted
+    coder judgment, and every harness-injected briefing/prompt/report/
+    context-block turn -- the orchestrator briefing, the trickle-coder and
+    resume prompts, the reconciliation judge's run-review prompt and a lone
+    memory-context block alike (see :func:`is_harness_injected_turn`). Every
+    one of those injected shapes lands in the transcript as ordinary
+    user-role text (isMeta unset), so isMeta alone cannot exclude any of
+    them. The gold bucket asks the SAME predicate every scalar detector asks
+    (:func:`_is_non_dialogue_carrier`) rather than holding a private copy of
+    the rule: task 5685's ruling that the fix belongs at the
+    content-classification layer, not per bucket.
+
+    This function is the SINGLE source for both the gold user_corrections
+    section and render_digest's n_user_turns score component, so this one
+    filter excludes such a turn from the body AND the score together --
+    which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
+    clusters 1.1(b) and 1.2 being one event observed from two surfaces.
+    User corrections are gold (PRD Sec 5) -- this is the highest-priority
+    digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -1149,7 +1458,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if is_harness_injected_turn(text):
+        if _is_non_dialogue_carrier(record, text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
@@ -1169,7 +1478,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 2
+DIGEST_INSTRUMENT_VERSION: int = 5
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1187,6 +1496,14 @@ keys do NOT bump it.
   2 -- the relaxed anchor+corroborator briefing filter
        (:func:`is_harness_injected_turn`) plus the genuine/designed error
        split (:func:`iter_genuine_errors`).
+  3 -- the re-ingested-content classifier (:func:`is_reingested_content`,
+       task 5685), consulted by every text-pattern detector and the
+       gold-turn filter.
+  4 -- the non-human-origin record rule (:func:`has_non_human_origin`,
+       task 5956), consulted with the content classifier by the gold-turn
+       filter and every dialogue carrier.
+  5 -- the merger's heading set (MERGER_HEADINGS) and the rescoped
+       memory-block markers, task 3659.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
@@ -1373,7 +1690,15 @@ retry_loops -- because it is explicitly NOT confusion: a declared
 bounded-poll ceiling is a designed loop-continuation (task 3610, 07-31
 census cluster 1.3), reported for visibility and deliberately unweighted
 in SIGNAL_WEIGHTS. When a digest must shed bytes, that is the first
-thing a reader can afford to lose."""
+thing a reader can afford to lose.
+
+That ordering was once a hazard: a byte-pressured digest shed the section
+EXPLAINING that churn was designed before it shed the section PRESENTING
+that churn as loops, stranding the explanation (census 2026-08-26 §1.1).
+It no longer is -- 'retry_loops' lines are now SELF-disambiguating,
+carrying their own designed-outcome count and the rules that fired (see
+:func:`_render_retry_loops`), so the fix is in place rather than in the
+priority order and no re-prioritisation is needed."""
 
 
 def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
@@ -1425,9 +1750,48 @@ def _render_self_corrections(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
-    return [
-        f"- {item['tool']} x{item['count']}: {item['signature']}" for item in items
-    ]
+    """Render each retry group, annotating it with how many of its calls
+    ended in a DESIGNED outcome (census 2026-08-26 R1, task 4751).
+
+    Two contracts this locks:
+
+    * A group with ZERO designed results takes an explicit early branch
+      (``if not designed: ... continue``) that emits the pre-4751 f-string
+      verbatim -- byte-identity is a contract, not an accident of an
+      annotation that happens to render empty, and spelling it as its own
+      branch is what makes "genuine retry storms are untouched" a testable
+      literal-f-string assertion rather than a claim about interpolation.
+    * The annotation sits to the LEFT of the stable ``": {signature}"``
+      terminator, so :func:`_cap_item` byte-truncates the signature first
+      and leaves the annotation legible -- exactly the reason
+      :func:`_exit_marker` promotes an exit code out of raw prose. The
+      groups that most need explaining are the ones with the longest
+      commands, i.e. precisely those the cap would otherwise eat.
+
+    The count is always rendered ALONGSIDE the group's full ``count``,
+    never in place of it: the annotation explains churn, it never hides
+    how much churn there was. Each distinct ``(exit_code, label)`` pair is
+    then named with the SAME ``[exit N] [label]`` spelling
+    :func:`_render_designed_outcomes` uses, so a reader meets one
+    vocabulary in both sections instead of re-deriving the classification
+    from the raw command.
+    """
+    lines = []
+    for item in items:
+        designed = item['designed_outcome_count']
+        if not designed:
+            lines.append(f"- {item['tool']} x{item['count']}: {item['signature']}")
+            continue
+        rules = ', '.join(
+            f'{_exit_marker(code)}[{label}]'
+            for code, label in item['designed_outcomes']
+        )
+        lines.append(
+            f"- {item['tool']} x{item['count']}"
+            f' ({designed} designed-outcome results: {rules})'
+            f": {item['signature']}"
+        )
+    return lines
 
 
 def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
@@ -1583,9 +1947,13 @@ def _build_sections(
     render_digest skips emitting a heading for it.
 
     The two neighborhood partitions (_NEIGHBORHOOD_PARTITIONS) are fed one
-    shared scan instead of scanning *records* once each: which detector
-    serves which section still comes from _SECTION_RENDERERS alone, only
-    HOW it is invoked differs.
+    shared scan instead of scanning *records* once each, and the
+    annotators (_NEIGHBORHOOD_ANNOTATORS) are fed that SAME scan alongside
+    *records*: which detector serves which section still comes from
+    _SECTION_RENDERERS alone, only HOW it is invoked differs. Feeding the
+    shared scan is required, not an optimisation --
+    :func:`find_retry_loops` would otherwise self-scan here and make a
+    single digest pay three full neighborhood passes.
 
     Returns ``(sections, truncated)``, where *truncated* is the set of
     ``(section_key, item_index)`` positions :func:`_cap_item` actually
@@ -1604,11 +1972,12 @@ def _build_sections(
     sections: dict[str, list[str]] = {}
     truncated: set[tuple[str, int]] = set()
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        items = (
-            detector(neighborhoods=neighborhoods)
-            if detector in _NEIGHBORHOOD_PARTITIONS
-            else detector(records)
-        )
+        if detector in _NEIGHBORHOOD_PARTITIONS:
+            items = detector(neighborhoods=neighborhoods)
+        elif detector in _NEIGHBORHOOD_ANNOTATORS:
+            items = detector(records, neighborhoods=neighborhoods)
+        else:
+            items = detector(records)
         lines = []
         for index, line in enumerate(renderer(items)):
             capped = _cap_item(line, item_max_bytes)

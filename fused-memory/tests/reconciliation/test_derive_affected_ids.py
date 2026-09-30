@@ -195,3 +195,21 @@ class TestDeriveAffectedIds:
         }
         result = _derive_affected_ids(finding)
         assert result == ['valid-mem']
+
+    # ------------------------------------------------------------------ #
+    # Top-level task_id is not an identity source (task 4772)
+    # ------------------------------------------------------------------ #
+
+    def test_top_level_task_id_alone_contributes_no_identity(self):
+        """add_finding(task_id=X) with no cite_* call derives no identity."""
+        result = _derive_affected_ids({'task_id': '598'})
+        assert result == [], f'top-level task_id must not contribute identity; got {result!r}'
+
+    def test_top_level_task_id_not_merged_into_cited_identity(self):
+        """With cite_task present, only the cited ids form the identity."""
+        finding = {
+            'task_id': '598',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T'}],
+        }
+        result = _derive_affected_ids(finding)
+        assert result == ['3839'], f'top-level task_id must not merge into cited identity; got {result!r}'

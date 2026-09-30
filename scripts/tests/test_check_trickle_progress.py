@@ -2,7 +2,8 @@
 predicate ("did signal flow?"), sibling to check_trickle_liveness.sh's
 LIVENESS predicate ("did the unit run?").
 
-Driven by SUBPROCESS with ``XDG_STATE_HOME`` pointed at tmp_path and a
+Driven by SUBPROCESS with ``trickle_state.STATE_ROOT_ENV`` pointed at
+tmp_path and a
 FAKE ``git`` shimmed onto PATH that only leaves a marker if ever invoked
 — lifted from scripts/tests/test_check_trickle_liveness.py (COPIED, not
 imported, matching how that file itself copies the fake-`systemctl`
@@ -16,6 +17,7 @@ hand-rolled fixture that could drift from it.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -51,13 +53,14 @@ def _bin_dir(tmp_path):
 
 
 def _run_probe(tmp_path, *args, extra_env=None, cwd=None):
-    """Run the probe by subprocess with XDG_STATE_HOME at tmp_path and the
-    fake git on PATH. Returns (CompletedProcess, git_marker_path)."""
+    """Run the probe by subprocess with the legibility state root at
+    tmp_path and the fake git on PATH. Returns (CompletedProcess,
+    git_marker_path)."""
     bin_dir, git_marker = _bin_dir(tmp_path)
 
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
-    env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    env[trickle_state.STATE_ROOT_ENV] = str(tmp_path / "state")
     env["FAKE_GIT_CALLED_MARKER"] = str(git_marker)
     if extra_env:
         env.update(extra_env)
@@ -69,25 +72,53 @@ def _run_probe(tmp_path, *args, extra_env=None, cwd=None):
     return result, git_marker
 
 
+# Counters AND exit code per entry, so a failed streak can follow
+# productive nights in one seed. exit_code is per-ENTRY rather than
+# per-seed because that is the only shape that can express the history the
+# regression needs: productive nights, then a crash.
+_SEED_OUTCOMES = {
+    "productive": (0, dict(selected_count=2)),
+    "quiet": (0, dict(zero_signal_dropped=5)),
+    "barren-budget": (0, dict(budget_skipped=4)),
+    "barren-cut": (0, dict(below_sampling_cut=3)),
+    # Signal in, run broke downstream -- the 2026-08-18 reify shape.
+    "failed": (1, dict(selected_count=1)),
+    # Failed with NOTHING selected -- `run_nightly` pre-seeds
+    # `NightlyResult(exit_code=1, ...)` BEFORE the digest stage and records
+    # that sentinel when any later stage raises, so a night whose sampler
+    # selected nothing (a quiet night, a codebook/merge crash, an extractor
+    # crash) records `failed` with selected_count=0. Distinct seed entry
+    # because the verdict's claim about WHERE the pipeline broke differs.
+    "failed-early": (1, dict()),
+}
+
+
 def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
-          recorded_at=None, exit_code=0):
+          recorded_at=None):
     """Build a real state file by driving record_run for each entry in
-    *outcomes* (one of 'productive' / 'quiet' / 'barren-budget' /
-    'barren-cut'). The LAST entry's recorded_at is *recorded_at* (default:
-    now), so freshness is exercised against the real writer."""
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    *outcomes* (a key of :data:`_SEED_OUTCOMES`). The LAST entry's
+    recorded_at is *recorded_at* (default: now), so freshness is exercised
+    against the real writer.
+
+    The state root stays SET for the remainder of the test. It is the same
+    root ``_run_probe`` pins into the child env, so nothing needs it
+    unset — and unsetting it would drop
+    ``conftest.py::_isolate_legibility_trickle_state`` for every line
+    after the seed, aiming any later in-process ``record_run`` or
+    ``trickle_state_path`` call at the operator's live
+    ``~/.local/state/dark-factory/legibility/<project>/`` (this helper's
+    default project_id is the literal ``dark_factory``). That fixture's
+    own contract is that only a test deliberately exercising the
+    passwd-anchored DEFAULT may delenv, and must then assert on the
+    resolved path alone; seeding is not that test."""
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
     doc = None
     for i, outcome in enumerate(outcomes):
         # Space earlier runs a day apart, ending on `stamp`.
         at = stamp - timedelta(days=(len(outcomes) - 1 - i))
-        counters = {
-            "productive": dict(selected_count=2, total_records=2),
-            "quiet": dict(zero_signal_dropped=5, total_records=5),
-            "barren-budget": dict(budget_skipped=4, total_records=4),
-            "barren-cut": dict(below_sampling_cut=3, total_records=3),
-        }[outcome]
+        entry_exit_code, counters = _SEED_OUTCOMES[outcome]
         # Annotated: without it the counter values infer as a narrow union
         # that pyright then checks positionally against record_run's later
         # keyword parameters when splatted as **full.
@@ -95,15 +126,17 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
             budget_skipped=0, selected_count=0,
         )
+        # Derived, so every seeded night satisfies SampleResult's
+        # conservation identity by construction.
         full.update(counters)
+        full["total_records"] = sum(full.values())
         doc = trickle_state.record_run(
             project_id,
             target_date=at.date() if hasattr(at, "date") else date(2026, 7, 1),
             recorded_at=at,
-            exit_code=exit_code,
+            exit_code=entry_exit_code,
             **full,
         )
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     return doc
 
 
@@ -125,6 +158,66 @@ def test_script_is_executable():
         f"directly, so a non-executable probe is a dead probe. "
         f"Run: chmod +x {SCRIPT}"
     )
+
+def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
+    tmp_path, monkeypatch
+):
+    """The writer and the reader are DIFFERENT PROCESSES with
+    independently-sourced environments; this pins that they still agree on
+    one file.
+
+    The writer is ``legibility-trickle@<project>.service`` under the
+    ``systemd --user`` manager. The reader is the health timer, an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Under the
+    pre-task-4514 code this exact shape returned ``('missing', None)``:
+    the probe took branch 1 and exited 1 PERMANENTLY, which for a
+    milestone binding is a born-at-L2 ``milestone_check_failed`` for a
+    pipeline that is running perfectly — the outcome the 2026-09-14
+    triage predicted would arrive the moment the probe was bound.
+    """
+    # The root _run_probe pins into the CHILD env; the writer below is
+    # pointed at the same one, so the only thing left disagreeing between
+    # the two sides is the ambient environment.
+    state_root = tmp_path / "state"
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(state_root))
+
+    # The writer's ambient environment.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "writer-xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "writer-home"))
+    trickle_state.record_run(
+        "dark_factory",
+        target_date=date(2026, 7, 1),
+        recorded_at=datetime.now(UTC),
+        exit_code=0,
+        total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
+        below_sampling_cut=0, budget_skipped=0, selected_count=2,
+    )
+
+    # Asserted, not assumed: both sides must land on ONE tmp root. That is
+    # the only thing keeping this test off the operator's real state file,
+    # and a silent disagreement here would make the assertion below pass or
+    # fail for the wrong reason.
+    assert os.environ[trickle_state.STATE_ROOT_ENV] == str(state_root)
+
+    # The reader's ambient environment, disagreeing on both levers.
+    result, git_marker = _run_probe(
+        tmp_path, "dark_factory", 3,
+        extra_env={
+            "XDG_STATE_HOME": str(tmp_path / "reader-xdg"),
+            "HOME": str(tmp_path / "reader-home"),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"the probe resolved a different file than the writer wrote; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "productive" in result.stdout, (
+        f"the probe must report the outcome the writer recorded; "
+        f"stdout={result.stdout!r}"
+    )
+    _assert_no_git(git_marker)
 
 
 def test_streak_below_threshold_exits_zero(tmp_path, monkeypatch):
@@ -228,9 +321,7 @@ def test_missing_state_file_is_its_own_verdict(tmp_path):
 
 def test_corrupt_state_file_is_its_own_verdict(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, outcomes=["productive"])
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     trickle_state.trickle_state_path("dark_factory").write_text("{corrupt")
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
@@ -269,6 +360,36 @@ def test_just_inside_the_freshness_window_exits_zero(tmp_path, monkeypatch):
     _assert_no_git(git_marker)
 
 
+def test_unparseable_recorded_at_is_its_own_verdict(tmp_path, monkeypatch):
+    """Freshness that CANNOT BE ASSESSED is a third thing, distinct from
+    fresh and from stale, and it names its own remedy.
+
+    Covers the branch the shared ``trickle_state.recorded_age_hours``
+    refactor routes through: ``test_stale_recorder_exits_nonzero`` and
+    ``test_just_inside_the_freshness_window_exits_zero`` already pin the
+    age boundary, so this closes the one gap in that refactor's regression
+    net."""
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    path = trickle_state.trickle_state_path("dark_factory")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["recorded_at"] = "not-a-timestamp"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    lowered = result.stderr.lower()
+    assert "recorded_at" in lowered, "must name the field it could not read"
+    assert "freshness" in lowered and "cannot be assessed" in lowered
+    # This file's contract: every failure verdict is DISTINCT and names its
+    # OWN remedy, so an operator is never sent to the wrong one.
+    assert "barren" not in lowered
+    assert "consecutive_failed_runs" not in lowered
+    _assert_no_git(git_marker)
+
+
 def test_max_age_hours_defaults_to_seventy_two(tmp_path, monkeypatch):
     """Third arg is optional and defaults to kappa's 72h window."""
     old = datetime.now(UTC) - timedelta(hours=100)
@@ -290,7 +411,12 @@ def test_wrong_arity_prints_usage(tmp_path):
 
 
 def test_too_many_args_prints_usage(tmp_path):
-    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, "extra")
+    """Arity widened from 2-3 to 2-4 in task 4514 (the new optional
+    ``[max_failed_runs]``), so the over-arity case moves from 4 args to 5.
+
+    Safe to change: tasks 2587/2615 bound only ``check_trickle_liveness.sh``,
+    so no ``done_provenance`` rests on THIS script's arity."""
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 2, "extra")
 
     assert result.returncode != 0
     assert "usage" in result.stderr.lower()
@@ -338,5 +464,257 @@ def test_probe_imports_only_stdlib_under_bare_python(tmp_path, monkeypatch):
     assert result.returncode in (0, 1), (
         f"expected a verdict exit code; got {result.returncode} "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    _assert_no_git(git_marker)
+
+
+# ---------------------------------------------------------------------------
+# The `failed` verdict (task 4514)
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_streak_exits_nonzero(tmp_path, monkeypatch):
+    """THE regression. Before task 4514 this identical history recorded
+    ``outcome=productive``, ``consecutive_barren_runs=0`` and exited 0
+    FOREVER — a permanently broken coder reading as a healthy pipeline."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_the_failed_verdict_is_distinct_from_the_barren_one(
+    tmp_path, monkeypatch
+):
+    """This file's "every failure verdict is DISTINCT" contract. A probe
+    that cannot say WHICH absence it found is the trap it exists to close
+    — and here the barren doors' remedies are actively WRONG."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    stderr = result.stderr
+    assert "failed" in stderr, "must name the outcome"
+    assert "2" in stderr, "must name the consecutive count"
+    assert "exit_code" in stderr or "exit code" in stderr
+    assert "last_productive_at" in stderr
+    assert "journalctl" in stderr, "must name where to read the crash"
+
+    assert "max_daily_digest_bytes" not in stderr, (
+        "raising the byte budget does nothing for a run that crashed"
+    )
+    assert "top_fraction" not in stderr, (
+        "the sampling cut is not the problem when the pipeline broke "
+        "downstream of it"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_the_failed_verdict_takes_precedence_over_the_barren_one(
+    tmp_path, monkeypatch
+):
+    """record_run CARRIES the barren streak forward across failed runs, so
+    a barren streak read during a failure window is stale by construction.
+    Report the failure."""
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget", "barren-budget", "failed", "failed"],
+    )
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "journalctl" in result.stderr, "the FAILED verdict must be the one"
+    assert "max_daily_digest_bytes" not in result.stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_sub_threshold_failed_night_reads_honestly(tmp_path, monkeypatch):
+    """The "OK: last run was productive 0h ago" lie. Below the threshold
+    the probe still exits 0 — one crash is already owned elsewhere — but
+    it must not claim the last run was productive when it was not."""
+    _seed(tmp_path, monkeypatch, outcomes=["productive", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "failed" in result.stdout, "the last run's outcome, reported"
+    assert "consecutive_failed_runs=1" in result.stdout
+    assert "was productive" not in result.stdout, (
+        "the last run was NOT productive; reporting it as such is the "
+        "exact lie this task closes"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_max_failed_runs_is_a_fourth_optional_positional(
+    tmp_path, monkeypatch
+):
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    loose, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 5)
+    assert loose.returncode == 0, (
+        f"stdout={loose.stdout!r} stderr={loose.stderr!r}"
+    )
+    _assert_no_git(git_marker)
+
+    _seed(tmp_path, monkeypatch, outcomes=["failed"])
+    tight, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 1)
+    assert tight.returncode != 0
+    _assert_no_git(git_marker)
+
+
+def test_max_failed_runs_defaults_to_the_module_constant(
+    tmp_path, monkeypatch
+):
+    """Pins ``trickle_state.DEFAULT_MAX_FAILED_RUNS`` as the default under
+    BOTH shorter arities, so neither can drift from it."""
+    assert trickle_state.DEFAULT_MAX_FAILED_RUNS == 2
+
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    two_arg, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+    assert two_arg.returncode != 0
+    _assert_no_git(git_marker)
+
+    three_arg, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
+    assert three_arg.returncode != 0
+    _assert_no_git(git_marker)
+
+
+def test_non_integer_max_failed_prints_usage(tmp_path, monkeypatch):
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, "twice")
+
+    assert result.returncode != 0
+    assert "usage" in result.stderr.lower()
+    _assert_no_git(git_marker)
+
+
+def test_a_failed_streak_that_selected_nothing_makes_no_downstream_claim(
+    tmp_path, monkeypatch
+):
+    """The failed verdict must not assert "signal DID reach the digest
+    stage" next to ``selected_count=0``.
+
+    MEASURED in this worktree before this test was written, seeding two
+    ``failed`` nights with empty counters::
+
+        ... has not COMPLETED for 2 consecutive runs (threshold 2); last
+        recorded exit_code=1. Signal DID reach the digest stage
+        (selected_count=0) and the pipeline broke DOWNSTREAM of it ...
+
+    A sentence that contradicts itself inside its own parenthesis, in the
+    one verdict whose whole job is to steer the remedy. ``run_nightly``
+    pre-seeds ``NightlyResult(exit_code=1, ...)`` before the digest stage
+    and records that sentinel when any later stage raises, so an empty
+    selection under a ``failed`` outcome is an ordinary production shape,
+    not a contrived one.
+    """
+    _seed(tmp_path, monkeypatch, outcomes=["failed-early", "failed-early"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    stderr = result.stderr
+    assert "Signal DID reach" not in stderr, (
+        "nothing was selected, so the probe cannot claim signal reached "
+        "the digest stage"
+    )
+    assert "selected_count=0" in stderr, "the counter is still reported"
+    assert "UNKNOWN" in stderr, (
+        "an unfinished night's counters do not say where signal stopped"
+    )
+    assert "journalctl" in stderr, "the remedy is still the journal"
+    assert "max_daily_digest_bytes" not in stderr
+    assert "top_fraction" not in stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_failed_streak_that_did_select_keeps_the_downstream_claim(
+    tmp_path, monkeypatch
+):
+    """The other half of the same conditional: when the counter IS
+    positive the claim is true and must survive verbatim, because it is
+    what steers the operator away from the sampler."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "Signal DID reach the digest stage (selected_count=1)" in result.stderr
+    assert "DOWNSTREAM" in result.stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_carried_forward_barren_streak_is_its_own_verdict(
+    tmp_path, monkeypatch
+):
+    """A barren streak CARRIED FORWARD under a ``failed`` last run must
+    not be reported in barren-door prose.
+
+    MEASURED in this worktree before this test was written, seeding
+    ``barren, barren, barren, failed`` (streak 3 carried forward,
+    failed streak 1, so the failed branch does not fire at the default
+    threshold of 2)::
+
+        ERROR: ... has been failed for 3 consecutive runs (threshold 3):
+        real signal reached the sampling/budget stage and nothing was
+        digested. Doors: below_sampling_cut=0 budget_skipped=0. Remedy:
+        inspect the recorded counters -- no door counter is set, which
+        should be impossible for a barren run.
+
+    Three lies in one line: the FAILED outcome interpolated into barren
+    prose, zero doors reported for a "barren" run, and a closing sentence
+    telling the operator the state they are in is impossible. The doors
+    come from the FAILED night, which legitimately has none.
+    """
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget"] * 3 + ["failed"],
+    )
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        "three unresolved barren nights do not stop being a finding "
+        "because the fourth night crashed"
+    )
+    stderr = result.stderr
+    assert "should be impossible" not in stderr, (
+        "the probe must never tell an operator their recorded state is "
+        "impossible when the writer produces it by design"
+    )
+    assert "has been failed for" not in stderr, (
+        "the FAILED outcome must never be interpolated into barren prose"
+    )
+    assert "carrying a barren streak" in stderr, (
+        "the carry-forward is the thing that actually happened; name it"
+    )
+    assert "'failed'" in stderr, "name the last recorded outcome"
+    assert "journalctl" in stderr, (
+        "the crashed run is what must be cleared first"
+    )
+    assert "max_daily_digest_bytes" not in stderr, (
+        "no door-specific remedy can be prescribed from a record whose "
+        "counters describe the failed night"
+    )
+    assert "top_fraction" not in stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_barren_streak_under_a_barren_run_keeps_the_door_verdict(
+    tmp_path, monkeypatch
+):
+    """The gate added for the carry-forward case must not silence the
+    ordinary barren streak — the verdict this probe exists for."""
+    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * 3)
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "max_daily_digest_bytes" in result.stderr
+    assert "carrying a barren streak" not in result.stderr, (
+        "the last run WAS barren; this is the door verdict, not the "
+        "carry-forward one"
     )
     _assert_no_git(git_marker)

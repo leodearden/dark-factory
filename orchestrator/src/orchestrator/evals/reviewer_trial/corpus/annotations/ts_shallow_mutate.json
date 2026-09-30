@@ -25,5 +25,39 @@
       "description": "The resultCache is constructed via spread ({ ...(state.messages[idx] as any).resultCache || {} }) which is a shallow copy. The inner objects ({output, is_error}) are new, so this particular spread is safe. However, assigning resultCache inside produce() replaces the entire cache object, breaking any existing reactive subscriptions to individual cache entries in the Solid.js store.",
       "mutation_type": "shallow_mutate"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Key Claude tool results by tool_call_id and carry per-call metadata in claudeStore",
+      "description": "`createClaudeStore` in `gui/src/stores/claudeStore.ts` resolves an incoming `tool_result` back to its call by tool name plus `status === 'pending'`, which breaks down as soon as results come back in a different order than the calls went out. Record the sidecar-supplied `metadata` on the `ToolCallInfo` pushed for each `tool_call` message (defaulting to `{}` when the message carries none), and maintain a `resultCache` on the owning assistant message, keyed by the result's `tool_call_id` and holding `{ output, is_error }`. Extend the `ToolCallInfo`/`AssistantMessage` types to match. Observable outcome: the chat transcript can look a result up by the id of the call it belongs to instead of scanning `toolCalls`, so a turn with several outstanding tool calls renders each call's own output and error state, and per-call metadata is available to the tool-call renderer.",
+      "test_strategy": "Extend `gui/src/__tests__/claudeStore.test.ts` to drive `handleOutboundMessage` through a turn that emits several `tool_call` messages before any result and then delivers the `tool_result` messages in a different order; assert each cached entry carries the `output` and `is_error` of its own call, and that `metadata` from the `tool_call` message reaches the stored `ToolCallInfo` (including the empty-metadata default). Assert the transcript still renders correctly after the turn completes. Run `npm run test` and `npm run typecheck` in `gui/`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "gui/src/stores/claudeStore.ts"
+    ],
+    "base_sha": "09a63c4c253a89ce83a24ca80835f4f9fec9a617",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git log --all --format='%H %cI' --before=2026-04-08 -- gui/src/stores/claudeStore.ts to enumerate 5 candidates newest-first; GIT_INDEX_FILE=<tmp> git read-tree <candidate> && git apply --recount --cached --check --verbose ts_shallow_mutate.diff for each (all fail on hunk 2); pairwise `git diff <a> <b> -- gui/src/stores/claudeStore.ts` across the 4 hunk-1-matching commits to confirm content identity in the relevant region; git log --all -G'toolCalls\\.find\\($' -- gui/src/stores/claudeStore.ts to confirm hunk 2's exact context line never existed as a standalone source line anywhere in history.",
+      "applies_cleanly": false,
+      "tolerance_flags": [
+        "recount_required_hunk_header_undercounts_old_side",
+        "hunk2_final_context_line_is_an_unrecoverable_fragment_of_a_real_single_physical_line"
+      ],
+      "candidates_tested": 5,
+      "reason": "content-matched, not apply-verified: hunk 1 matches this commit's gui/src/stores/claudeStore.ts byte-for-byte (newest of 4 content-identical commits before the 2026-04-07 corpus cut); hunk 2 cannot be applied by git because its final context line `const tc = m.toolCalls.find(` is a truncated fragment of a longer real line (a transcription slip in the hand-authored diff), and both hunk headers undercount the old side. The integrator chose to record the content-matched commit as base_sha so a runner can still show the reviewer the whole pre-change file; treat applies_cleanly=false as the caveat.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

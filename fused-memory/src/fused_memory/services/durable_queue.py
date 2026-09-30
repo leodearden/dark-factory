@@ -14,6 +14,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -195,7 +196,12 @@ CREATE TABLE IF NOT EXISTS write_queue (
     next_retry_at REAL  NOT NULL DEFAULT 0,
     created_at  REAL    NOT NULL,
     completed_at REAL,
-    error       TEXT
+    error       TEXT,
+    -- executed (task 4116): did a backend write for this item land, in any
+    -- attempt; domain on DurableWriteQueue.get_dead_items. Bare NULLable and
+    -- LAST on purpose: ALTER can only append (see QueueItem), and a DEFAULT
+    -- would backfill legacy rows with a false "never landed".
+    executed    INTEGER
 );
 """
 
@@ -210,10 +216,13 @@ CREATE INDEX IF NOT EXISTS idx_wq_status_group
 class QueueItem:
     """Lightweight representation of a row."""
 
+    # Order must match write_queue's column order: __init__ unpacks a
+    # `SELECT *` row positionally, so a mismatch shifts every field silently.
+    # TestExecutedColumnSchema pins the two together.
     __slots__ = (
         'id', 'group_id', 'operation', 'payload', 'callback_type',
         'status', 'attempts', 'max_attempts', 'next_retry_at',
-        'created_at', 'completed_at', 'error',
+        'created_at', 'completed_at', 'error', 'executed',
     )
 
     def __init__(self, row: aiosqlite.Row | tuple):
@@ -221,6 +230,7 @@ class QueueItem:
             self.id, self.group_id, self.operation, self.payload,
             self.callback_type, self.status, self.attempts, self.max_attempts,
             self.next_retry_at, self.created_at, self.completed_at, self.error,
+            self.executed,
         ) = row
 
     def parsed_payload(self) -> dict[str, Any]:
@@ -237,12 +247,53 @@ CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 # this module's deliberate independence from fused-memory-specific components.
 TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 
-# Prefix applied to the reported error when an item dead-letters AFTER
-# _execute_write already returned — i.e. the registered callback (or the
-# completion commit) is what kept failing, not the backend write. 'dead' alone
-# means only "the queue exhausted its attempts"; it does NOT imply the write
-# never happened, and blind-replaying such an item DUPLICATES it. Reported so
-# the two cases are separable in whatever the hook writes them to.
+
+@dataclass(frozen=True)
+class DeadLetterEvent:
+    """Everything an operator alarm needs about one permanently-abandoned write.
+
+    A frozen dataclass rather than positional hook arguments: the event has
+    eight fields with no natural order, and a consumer that had to remember
+    which position held ``operation`` versus ``group_id`` would be a meaningful
+    string in disguise (structured data, not positional convention). Frozen
+    because the hook runs after the item's state is already committed — there
+    is nothing a consumer could usefully mutate, and a mutation would only
+    diverge the alarm from the row it describes.
+
+    ``attempts`` is the COMMITTED count (the value now on the row), not the
+    pre-increment count the claimed item carried, so it matches both the
+    ``write_queue`` row and the dead-letter WARN line.
+
+    ``post_execute`` is the structured form of ``POST_EXECUTE_DEAD_PREFIX``:
+    True means the backend write LANDED and only the post-execute work kept
+    failing, so a blind replay DUPLICATES it. The prefix is still applied to
+    ``error`` — nothing about the journal contract changes — but a consumer
+    branching on remediation should read this flag rather than re-parse it.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    error: str | None
+    write_op_id: str | None
+    payload: dict[str, Any] | None
+    post_execute: bool
+
+
+# (event) -> None. Invoked once per item that reaches 'dead', and never on
+# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is,
+# keeping this module free of any fused-memory-specific import.
+DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
+
+# Prefix applied to the reported error when an item dead-letters after a
+# backend write for it LANDED, in this attempt or an earlier one — i.e. the
+# registered callback (or the completion commit) is what kept failing, not the
+# backend write. 'dead' alone means only "the queue exhausted its attempts"; it
+# does NOT imply the write never happened, and blind-replaying such an item
+# DUPLICATES it. Reported so the two cases are separable in whatever the hook
+# writes them to. The fact itself is the row's `executed` column, reported by
+# DurableWriteQueue.get_dead_items.
 POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )
@@ -266,10 +317,12 @@ class DurableWriteQueue:
         transient_error_names: Iterable[str] | None = None,
         identity_payload_keys: Mapping[str, str] | None = None,
         on_terminal: TerminalHookFn | None = None,
+        on_dead_letter: DeadLetterHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
         self._on_terminal = on_terminal
+        self._on_dead_letter = on_dead_letter
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -306,7 +359,11 @@ class DurableWriteQueue:
         self._db = await connect_daemon(str(db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
+        # Table, then in-place migrate, then indexes — matching ticket_store's
+        # ordering, so a migration-added column is present before any index
+        # that might reference it.
         await self._db.execute(_CREATE_TABLE)
+        await self._migrate()
         await self._db.execute(_CREATE_INDEX)
         await self._db.commit()
         # Recover any items left in_flight from a previous crash
@@ -314,6 +371,38 @@ class DurableWriteQueue:
         # Spin up workers for groups that have pending work
         await self._start_workers_for_pending_groups()
         logger.info('DurableWriteQueue initialized at %s', db_path)
+
+    async def _migrate(self) -> None:
+        """Add columns that post-date a DB's creation.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so
+        additive changes need an explicit ALTER for DBs already on disk.
+        Idempotent: probes ``PRAGMA table_info`` first.
+
+        No ``PRAGMA user_version`` ladder — the project's rule (stated in
+        orchestrator/run_store.py) is that purely additive changes use this
+        light feature-detect idiom.
+        """
+        assert self._db is not None
+        cursor = await self._db.execute('PRAGMA table_info(write_queue)')
+        cols = {row[1] for row in await cursor.fetchall()}
+        if 'executed' not in cols:
+            try:
+                await self._db.execute(
+                    'ALTER TABLE write_queue ADD COLUMN executed INTEGER'
+                )
+                logger.info(
+                    'DurableWriteQueue: migrated write_queue — added executed column'
+                )
+            except Exception as exc:
+                # Multiple processes can open this same DB file, so two
+                # initialize() calls can race between the probe and the ALTER.
+                # Losing that race is benign; anything else is not.
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug(
+                    'DurableWriteQueue: executed column already exists (concurrent init)'
+                )
 
     async def close(self) -> None:
         self._closed = True
@@ -363,10 +452,12 @@ class DurableWriteQueue:
         assert self._db is not None
         now = time.time()
         cursor = await self._db.execute(
+            # `executed` = 0 is a RECORDED negative, distinct from a legacy
+            # row's NULL (unknown); see get_dead_items.
             'INSERT INTO write_queue '
             '(group_id, operation, payload, callback_type, status, attempts, '
-            ' max_attempts, next_retry_at, created_at) '
-            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
+            ' max_attempts, next_retry_at, created_at, executed) '
+            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
             (group_id, operation, json.dumps(payload), callback_type,
              'pending', self._max_attempts, now),
         )
@@ -389,10 +480,11 @@ class DurableWriteQueue:
         try:
             for item in items:
                 cursor = await self._db.execute(
+                    # Explicit `executed = 0` for the same reason as enqueue().
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
-                    ' max_attempts, next_retry_at, created_at) '
-                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
+                    ' max_attempts, next_retry_at, created_at, executed) '
+                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
                     (item['group_id'], item['operation'],
                      json.dumps(item['payload']),
                      item.get('callback_type'),
@@ -480,12 +572,17 @@ class DurableWriteQueue:
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
 
-        The terminal hook, by contrast, runs AFTER the queue's own commit and
-        OUTSIDE the semaphore — see ``_notify_terminal``.
+        Both post-commit hooks, by contrast, run AFTER the queue's own commit
+        and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
+        onto the ``write_ops`` row) and then, for a dead item only,
+        ``_notify_dead_letter`` (the operator alarm).
         """
         terminal: tuple[str, str | None] | None = None
         write_op_id: str | None = None
-        executed = False
+        # Seeded from the row, since an earlier attempt may already have
+        # landed. A NULL (unknown) row seeds False: the prefix asserts a
+        # landing, so it needs positive evidence.
+        executed = bool(item.executed)
         async with self._semaphore:
             try:
                 # Parsed ONCE, and the join key captured BEFORE dispatch:
@@ -503,7 +600,10 @@ class DurableWriteQueue:
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
+                # Made durable BEFORE the callback, because the callback is
+                # what can fail and schedule a retry.
                 executed = True
+                await self._mark_executed(item)
                 # Fire callback before marking completed — failure retries item.
                 # A FRESH parse, deliberately not `payload`: _execute_write pops
                 # journal metadata that the callbacks read back out.
@@ -514,13 +614,20 @@ class DurableWriteQueue:
                 await self._mark_completed(item)
                 terminal = ('completed', None)
             except Exception as exc:
-                terminal = await self._handle_failure(item, exc)
+                terminal = await self._handle_failure(item, exc, executed=executed)
 
         if terminal is not None:
             status, error = terminal
             if status == 'dead' and executed:
                 error = f'{POST_EXECUTE_DEAD_PREFIX}{error}'
             await self._notify_terminal(item.id, write_op_id, status, error)
+            if status == 'dead':
+                # AFTER the journal write-back, deliberately: the durable audit
+                # trail must land before the best-effort alarm gets a chance to
+                # misbehave.
+                await self._notify_dead_letter(
+                    item, write_op_id, error, post_execute=executed
+                )
 
     async def _notify_terminal(
         self,
@@ -551,6 +658,92 @@ class DurableWriteQueue:
             logger.warning(
                 'Item %d: on_terminal hook failed for write_op %s (%s)',
                 item_id, write_op_id, status, exc_info=True,
+            )
+
+    async def _mark_executed(self, item: QueueItem) -> None:
+        """Durably record that this item's backend write LANDED — best-effort.
+
+        A failure is logged and swallowed, never raised. Raising would
+        reschedule the item, and the retry would re-execute a write that has
+        already landed: the duplicate this flag exists to prevent. The fact is
+        not lost with it: ``_handle_failure`` records it again in the commit
+        that settles a failed attempt, and only a failed attempt's row is ever
+        read for it. It goes unrecorded only if the process dies before that
+        commit.
+        """
+        if item.executed:
+            return
+        assert self._db is not None
+        try:
+            await self._db.execute(
+                'UPDATE write_queue SET executed = 1 WHERE id = ?',
+                (item.id,),
+            )
+            await self._db.commit()
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): backend write landed but the '
+                'executed flag could not be persisted; continuing without a '
+                'retry — if this attempt fails, its failure commit records it',
+                item.id, item.operation, item.group_id, exc_info=True,
+            )
+
+    async def _notify_dead_letter(
+        self,
+        item: QueueItem,
+        write_op_id: str | None,
+        error: str | None,
+        *,
+        post_execute: bool,
+    ) -> None:
+        """Report a permanently-abandoned write to the ``on_dead_letter`` hook.
+
+        Shares ``_notify_terminal``'s post-commit, outside-the-semaphore
+        discipline for the same two reasons — the queue's correctness must
+        never depend on a hook, and a hook's own work must not hold a slot in a
+        pool shared across every group — and DIVERGES from it on exactly one
+        point, deliberately: there is no ``or not write_op_id`` guard here.
+
+        That guard is right for the journal write-back, which has nothing to
+        join an outcome back to without a key. It is wrong for an alarm, which
+        needs no join key at all — and inheriting it would silently exempt
+        every ``mem0_classify_and_add`` (one per extracted fact per episode)
+        and every ``replay_from_store`` from the only push signal they have.
+        Those deaths currently reach nothing but a WARNING log.
+
+        A raising hook is logged and swallowed. Unlike the journal write-back,
+        a raise here would not merely lose one record: it escapes
+        ``_process_item`` into ``_worker_loop``, which has no handler, so the
+        worker task dies and the group stops draining. A failed alarm must cost
+        the operator a heads-up, never the queue.
+        """
+        if self._on_dead_letter is None:
+            return
+        try:
+            payload: dict[str, Any] | None = item.parsed_payload()
+        except (ValueError, TypeError):
+            # A payload that will not parse still has to raise the alarm — the
+            # unparseable payload is itself part of what went wrong.
+            payload = None
+        event = DeadLetterEvent(
+            item_id=item.id,
+            group_id=item.group_id,
+            operation=item.operation,
+            # The committed count: _handle_failure wrote item.attempts + 1.
+            attempts=item.attempts + 1,
+            error=error,
+            write_op_id=write_op_id,
+            payload=payload,
+            # Structured, so the consumer never re-parses POST_EXECUTE_DEAD_PREFIX.
+            post_execute=post_execute,
+        )
+        try:
+            await self._on_dead_letter(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_dead_letter hook failed; the '
+                'dead-letter is committed but was NOT escalated',
+                item.id, item.operation, item.group_id, exc_info=True,
             )
 
     async def _mark_completed(self, item: QueueItem) -> None:
@@ -632,13 +825,18 @@ class DurableWriteQueue:
         return ('normal', item.max_attempts)
 
     async def _handle_failure(
-        self, item: QueueItem, exc: Exception
+        self, item: QueueItem, exc: Exception, *, executed: bool
     ) -> tuple[str, str | None] | None:
         """Dead-letter or schedule a retry.
 
         Returns ``('dead', error_msg)`` when the item reached its terminal
         dead state, or ``None`` when it was merely rescheduled — the caller
         uses that to decide whether to fire the terminal hook.
+
+        *executed* (a backend write for this item has landed) is recorded in
+        the same commit, because ``_mark_executed`` is best-effort. The CASE
+        only ever sets the flag: an attempt that did not land leaves the
+        column as it was, so a legacy NULL stays unknown.
         """
         assert self._db is not None
         new_attempts = item.attempts + 1
@@ -647,9 +845,9 @@ class DurableWriteQueue:
         died = new_attempts >= limit
         if died:
             await self._db.execute(
-                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
-                "WHERE id = ?",
-                (new_attempts, error_msg, item.id),
+                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ?, "
+                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                (new_attempts, error_msg, executed, item.id),
             )
             # operation / group_id / classification are what a triager needs
             # first, and the log line is all that survives once the queue row is
@@ -671,8 +869,9 @@ class DurableWriteQueue:
             next_retry = time.time() + delay
             await self._db.execute(
                 "UPDATE write_queue SET status = 'retry', attempts = ?, "
-                "next_retry_at = ?, error = ? WHERE id = ?",
-                (new_attempts, next_retry, error_msg, item.id),
+                "next_retry_at = ?, error = ?, "
+                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                (new_attempts, next_retry, error_msg, executed, item.id),
             )
             # Kept symmetrical with the dead-letter line above so a retry storm
             # is attributable to an operation and a project without a second
@@ -713,7 +912,15 @@ class DurableWriteQueue:
     # -- management -----------------------------------------------------------
 
     async def replay_dead(self, group_id: str | None = None) -> int:
-        """Reset dead items to pending for retry. Returns count reset."""
+        """Reset dead items to pending for retry. Returns count reset.
+
+        Resets the retry BUDGET (attempts, next_retry_at) and clears the last
+        error. Deliberately does NOT clear ``executed``: that flag is sticky
+        for the life of the row. "A backend write for this item landed at some
+        point" does not stop being true because an operator pressed replay —
+        and it is exactly the fact that makes a SECOND blind replay dangerous.
+        Read it before replaying; the rule per value is on get_dead_items.
+        """
         assert self._db is not None
         if group_id:
             cursor = await self._db.execute(
@@ -739,13 +946,29 @@ class DurableWriteQueue:
         return count
 
     async def get_stats(self, group_id: str | None = None) -> dict[str, Any]:
-        """Return counts by status and oldest pending age.
+        """Return counts by status, oldest pending age, and dead-by-operation.
+
+        ``dead_by_operation`` maps operation name -> count over ``status='dead'``
+        rows only.  A nonzero entry means writes of that operation have been
+        PERMANENTLY abandoned: the queue exhausted their attempts and gave up,
+        after the caller was already told the write had been accepted.  It is
+        always present, and ``{}`` when nothing is dead — a probe must never
+        have to distinguish "no deaths" from "an older server".
+
+        This counter is the health-probe CONFIRMATION, not the primary alarm.
+        The push signal is the ``durable_write_dead_letter`` escalation
+        (``middleware/dead_letter_escalator.py::emit_dead_letter_escalation``),
+        which survives cleanup; this reads the live ``write_queue`` table, so
+        it returns to zero once :mcp-tool:`delete_dead_letters` sweeps the rows.
+        ``counts['dead']`` is the same population without the attribution, so
+        the two always sum consistently.
 
         Args:
-            group_id: When given, restrict counts and oldest-pending age to
-                rows whose ``group_id`` matches.  Default ``None`` returns
-                unscoped (global) statistics — preserving the behaviour
-                required by :mcp-tool:`get_queue_stats` and the dashboard.
+            group_id: When given, restrict counts, oldest-pending age and the
+                dead-by-operation breakdown to rows whose ``group_id``
+                matches.  Default ``None`` returns unscoped (global)
+                statistics — preserving the behaviour required by
+                :mcp-tool:`get_queue_stats` and the dashboard.
         """
         assert self._db is not None
 
@@ -784,9 +1007,33 @@ class DurableWriteQueue:
             if min_created is not None:
                 oldest_pending_age = time.time() - min_created
 
+        # No new index: idx_wq_status_group is on (status, group_id,
+        # next_retry_at), so both spellings below seek the status='dead'
+        # prefix — and the scoped one seeks (status, group_id). An index is
+        # not free on a live DB; see write_journal.py's idx_wo_created note,
+        # where adding one measured ~47 s of one-time startup DDL.
+        if group_id is not None:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' AND group_id = ? GROUP BY operation",
+                (group_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' GROUP BY operation"
+            )
+        rows = await cursor.fetchall()
+        dead_by_operation = {
+            row[0] if isinstance(row, tuple) else row['operation']:
+            row[1] if isinstance(row, tuple) else row['cnt']
+            for row in rows
+        }
+
         return {
             'counts': counts,
             'oldest_pending_age_seconds': oldest_pending_age,
+            'dead_by_operation': dead_by_operation,
         }
 
     async def delete_dead(
@@ -911,6 +1158,24 @@ class DurableWriteQueue:
     ) -> list[dict[str, Any]]:
         """Return dead-lettered items, newest-first.
 
+        Each item carries ``executed``, the fact a replay decision turns on,
+        over a THREE-valued domain:
+
+        * ``True`` — a backend write for this item landed; replaying it
+          DUPLICATES that write.
+        * ``False`` — the queue recorded that no backend write landed, so the
+          item is safe to replay.
+        * ``None`` — unknown: the row predates the column (task 4116). Check
+          ``backend_ops`` (joined on the payload's ``_write_op_id``) before
+          replaying. POST_EXECUTE_DEAD_PREFIX on the error reported to
+          ``on_terminal`` can confirm a landing (``error`` here never carries
+          it), but its absence proves nothing: before 4116 the prefix was
+          recomputed per attempt and was lost whenever a landed item retried.
+
+        ``None`` is FALSY, so ``if not row['executed']`` is the wrong test —
+        it reads "unknown" as "safe". Only an explicit ``is False`` licenses a
+        replay.
+
         Args:
             group_id: Optional filter by group_id.
             limit: Optional maximum number of items to return.  When *None*
@@ -944,5 +1209,6 @@ class DurableWriteQueue:
                 'attempts': item.attempts,
                 'error': item.error,
                 'created_at': item.created_at,
+                'executed': None if item.executed is None else bool(item.executed),
             })
         return results

@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -19,6 +20,7 @@ from escalation.queue import iter_all_escalation_paths
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,37 @@ def _load_escalations(escalations_dir: Path) -> list[dict]:
 # Time-window helper
 # ---------------------------------------------------------------------------
 
+
+def _cutoff(days: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window.
+
+    Local copy of :func:`dashboard.data.costs._cutoff` — kept independent
+    rather than imported so this module has no cross-module dependency on
+    another data module's private helper (mirrors
+    :func:`dashboard.data.model_role._cutoff`).
+
+    The ISO-with-offset return value is load-bearing, not cosmetic: it is
+    compared against ``task_results.completed_at``, which orchestrator
+    writes via ``datetime.now(UTC).isoformat()`` (``run_store.py::save_run``).
+    A SQLite-side ``datetime('now', ...)`` call renders SPACE-separated with
+    no offset, so a lexical TEXT comparison against it short-circuits at
+    index 10 on ``'T'`` (0x54) vs ``' '`` (0x20) and silently degrades to
+    DATE granularity — over-including up to a full extra day (task 4624).
+    """
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
+
+
+# KNOWN RESIDUAL EXPOSURE (task 4624, deliberately out of scope — see design
+# decision): `datetime(MAX(completed_at), '-{days} days')` below is the same
+# defect family task 4624 fixed elsewhere in this module. SQLite renders it
+# SPACE-separated with no UTC offset, and callers below compare it lexically
+# against the ISO-with-offset `completed_at` column, which silently degrades
+# to DATE granularity and over-includes rows up to a full extra day. Not
+# fixed here because the semantics differ (anchored to per-project
+# MAX(completed_at), not to `now`) and it would change results for the four
+# panels that consume `_project_cutoffs`. Follow-up filed:
+# tkt_0RTBEQD6PKQPD5P7N30DAXTFFQ (a fused-memory ticket; the curator
+# converts it to a task_id asynchronously).
 _WINDOW_SQL = """\
 SELECT project_id,
        datetime(MAX(completed_at), '-{days} days') AS cutoff
@@ -619,6 +652,7 @@ async def _hour_bucketed_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return per-hour rows for *project_id* over the trailing *days* window.
 
@@ -626,10 +660,23 @@ async def _hour_bucketed_history(
     count of done tasks, count of one-pass (review_cycles=0 done) tasks,
     count of escalated (steward_invocations>0) tasks, and total tasks.
     Caller derives ratios.
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. None (the
+            default) resolves to the current UTC clock.
     """
-    # Bucketing is fully covered by idx_task_results_project (project_id +
-    # completed_at). The strftime appears only in GROUP BY so it does not
-    # defeat the index — confirmed via EXPLAIN QUERY PLAN.
+    # The cutoff is bound as a TEXT parameter (via _cutoff) rather than
+    # computed SQL-side via datetime('now', ...): SQLite's datetime()
+    # renders SPACE-separated with no UTC offset, which — compared
+    # lexically against the ISO-with-offset `completed_at` column —
+    # short-circuits at index 10 and silently degrades to DATE granularity,
+    # over-including up to a full extra day (task 4624).
+    # Binding the cutoff instead keeps idx_task_results_project (project_id
+    # + completed_at) usable as a covering index for the WHERE clause —
+    # re-confirmed via EXPLAIN QUERY PLAN and pinned by
+    # TestHourBucketedHistoryWindowBoundary::test_binds_cutoff_as_parameter_and_keeps_covering_index.
+    # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
+    # it does not defeat the index either.
     rows = await db.execute_fetchall(
         """
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
@@ -639,12 +686,12 @@ async def _hour_bucketed_history(
                steward_invocations
           FROM task_results
          WHERE project_id = ?
-           AND completed_at >= datetime('now', ? || ' days')
+           AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
          ORDER BY bucket
         """,
-        (project_id, f'-{int(days)}'),
+        (project_id, _cutoff(days, now=now)),
     )
     buckets: dict[str, dict] = {}
     for row in rows:
@@ -698,12 +745,23 @@ async def _per_db_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
     The bucket layout only changes when a new task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
+
+    The cache key deliberately excludes ``now``/the derived cutoff: this
+    endpoint is polled every 3s with ``now=None``, so keying on the cutoff
+    would make every request miss and defeat the cache's purpose. This is
+    not a new staleness risk — the previous SQL-side cutoff
+    (``datetime('now', ...)``) already moved between calls while the key
+    stayed fixed, so omitting ``now`` here preserves that existing
+    behaviour exactly (see design decision, task 4624). Callers that vary
+    ``now`` across calls on the same ``db`` (i.e. tests) must clear
+    ``_HISTORY_CACHE`` explicitly.
     """
     if db is None:
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -713,7 +771,7 @@ async def _per_db_history(
     if cached is not None:
         return cached
     try:
-        result = await _hour_bucketed_history(db, project_id, days=days)
+        result = await _hour_bucketed_history(db, project_id, days=days, now=now)
     except Exception:
         logger.debug('per-db history failed', exc_info=True)
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -758,6 +816,7 @@ async def aggregate_performance_history(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Return per-project bucketed history for ttc, one-pass, escalation.
 
@@ -770,9 +829,20 @@ async def aggregate_performance_history(
             escalation_history:    {labels, values},
           }
         }
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. Resolved
+            ONCE here (via :func:`resolve_now`) and threaded through both
+            the project-discovery query and every :func:`_per_db_history`
+            call, so the two legs share a single cutoff instant instead of
+            each reading the clock independently and risking a straddled
+            boundary. None (the default) resolves to the current UTC
+            clock, matching the existing ``app.py`` call site.
     """
     if not dbs:
         return {}
+    effective_now = resolve_now(now)
+    since = _cutoff(days, now=effective_now)
     # Discover project IDs across all DBs.
     pid_sets: list[set[str]] = []
     for db in dbs:
@@ -781,8 +851,8 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                "WHERE completed_at >= datetime('now', ? || ' days')",
-                (f'-{int(days)}',),
+                'WHERE completed_at >= ?',
+                (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
         except Exception:
@@ -796,7 +866,7 @@ async def aggregate_performance_history(
     out: dict[str, dict] = {}
     for pid in pids:
         per_db = [
-            await _per_db_history(db, pid, days=days) for db in dbs
+            await _per_db_history(db, pid, days=days, now=effective_now) for db in dbs
         ]
         merged = _merge_history(per_db)
         out[pid] = {

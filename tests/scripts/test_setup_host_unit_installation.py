@@ -123,8 +123,13 @@ SETUP_HOST_STATEMENTS = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-
 # this asserts the predicate is used as a GUARD.  A grep whose result is
 # discarded would enable the static watchdog service — an error, not a no-op,
 # which under `set -e` aborts the installer.
+#
+# Reads through `_orch_unit_source` (same helper the `cp` above goes through)
+# rather than the bare `scripts/$_unit`, so a `.socket` unit's own committed
+# `<name>.template` is what gets grepped for `[Install]`, not a same-named
+# file that does not exist.
 _ENABLE_INSTALL_GUARD = (
-    "if grep -q '^\\[Install\\]' \"$REPO_ROOT/scripts/$_unit\"; then"
+    'if grep -q \'^\\[Install\\]\' "$REPO_ROOT/$(_orch_unit_source "$_unit")"; then'
 )
 _ENABLE_STATEMENT = 'systemctl --user enable "$_unit"'
 

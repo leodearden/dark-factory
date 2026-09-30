@@ -21,50 +21,73 @@
 // `import { strandBadgeState } from '...'` would come back undefined. We
 // therefore default-import and destructure (mirrors prd_grouping.test.mjs /
 // graph_layout.test.mjs).
+//
+// A STATIC `import` OF THE MODULE IS NO LONGER POSSIBLE, though, and the
+// loader below replaces it. The module now destructures window.DF_DATUM at
+// module scope (task 5588), and an ESM import statement's target body runs
+// BEFORE the importing file's own body — so `globalThis.window` would still be
+// unset when that destructure ran, throwing `ReferenceError: window is not
+// defined` before a single test executed. loadTaskRowCells() installs the
+// shim FIRST and only then requires, which is the same order index.html
+// gives the real page: endpoint_staleness.js -> datum.js -> task_row_cells.js.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import cells from '../../src/dashboard/static/redux/task_row_cells.js';
-
-const { strandBadgeState, agentCellState, STRAND_TITLE } = cells;
+// Safe as a static import (unlike the two below): this module touches no
+// browser global at load — its window assignment is typeof-guarded.
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/task_row_cells.js';
-const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState'];
-const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE'];
+const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
+
+// Loads task_row_cells.js fresh against a shimmed browser-like global, with
+// the load-order chain index.html establishes: DF_ENDPOINT_STALENESS is what
+// datum.js destructures at module scope, datum.js publishes DF_DATUM, and
+// task_row_cells.js destructures THAT. The require.cache entries are busted so
+// each call re-executes both module bodies against the window installed here,
+// rather than reusing a binding captured against a previous test's shim.
+//
+// ONE loader, used by every test in this file including the dual-export one
+// below — a second hand-rolled copy of this chain is exactly the drift these
+// shared modules exist to remove.
+function loadTaskRowCells() {
+  const win = { DF_ENDPOINT_STALENESS: staleness };
+  globalThis.window = win;
+  const require = createRequire(import.meta.url);
+  for (const spec of [DATUM_MODULE_SPECIFIER, MODULE_SPECIFIER]) {
+    delete require.cache[require.resolve(spec)];
+  }
+  require(DATUM_MODULE_SPECIFIER);
+  return { cells: require(MODULE_SPECIFIER), window: win };
+}
+
+const cells = loadTaskRowCells().cells;
+
+const { strandBadgeState, agentCellState, locksCellState, STRAND_TITLE, MUTED_COLOR } = cells;
+
+const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState', 'locksCellState'];
+const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE', 'MUTED_COLOR'];
 
 test('default-imported module exposes the task-row render decisions', () => {
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof cells[name], 'function', `cells.${name} should be a function`);
   }
   assert.equal(typeof cells.STRAND_TITLE, 'string', 'cells.STRAND_TITLE should be a string');
+  assert.equal(typeof cells.MUTED_COLOR, 'string', 'cells.MUTED_COLOR should be a string');
 });
 
 test('module also assigns window.DF_TASK_ROW_CELLS (browser dual-export)', () => {
-  // Shim a bare browser-like global before requiring the module fresh via
-  // CommonJS require, so the module body's `if (typeof window !== 'undefined')`
-  // branch executes against our shim. The top-level `import` above has already
-  // populated the shared require.cache (node's ESM loader delegates CJS
-  // resolution to the CJS loader), so the cache entry must be busted to force a
-  // fresh execution against the now-shimmed window.
-  globalThis.window = {};
-  try {
-    const require = createRequire(import.meta.url);
-    const resolved = require.resolve(MODULE_SPECIFIER);
-    delete require.cache[resolved];
-    const required = require(MODULE_SPECIFIER);
+  // loadTaskRowCells() installs the shimmed window and busts the require.cache
+  // so the module body's `if (typeof window !== 'undefined')` branch executes
+  // against it fresh, rather than reusing the binding the file-scope load made.
+  const { cells: required, window: win } = loadTaskRowCells();
 
-    assert.ok(globalThis.window.DF_TASK_ROW_CELLS, 'window.DF_TASK_ROW_CELLS was not set');
-    assert.deepEqual(
-      Object.keys(globalThis.window.DF_TASK_ROW_CELLS).sort(),
-      EXPECTED_EXPORT_NAMES.slice().sort(),
-    );
-    assert.deepEqual(Object.keys(required).sort(), EXPECTED_EXPORT_NAMES.slice().sort());
-    for (const name of EXPECTED_FUNCTION_NAMES) {
-      assert.equal(typeof globalThis.window.DF_TASK_ROW_CELLS[name], 'function');
-    }
-  } finally {
-    delete globalThis.window;
+  assert.ok(win.DF_TASK_ROW_CELLS, 'window.DF_TASK_ROW_CELLS was not set');
+  assert.deepEqual(Object.keys(win.DF_TASK_ROW_CELLS).sort(), EXPECTED_EXPORT_NAMES.slice().sort());
+  assert.deepEqual(Object.keys(required).sort(), EXPECTED_EXPORT_NAMES.slice().sort());
+  for (const name of EXPECTED_FUNCTION_NAMES) {
+    assert.equal(typeof win.DF_TASK_ROW_CELLS[name], 'function');
   }
 });
 
@@ -156,23 +179,57 @@ test('strandBadgeState: a NON-stranded task with no agent still renders nothing'
 // agentCellState — the cell the badge sits beside, and stays distinct from
 // ---------------------------------------------------------------------------
 
-test('agentCellState: an assigned agent renders its own name, unmuted', () => {
-  assert.deepEqual(agentCellState({ agent: 'x' }), { text: 'x', muted: false });
+test('agentCellState: an assigned agent renders its own name, with no colour override', () => {
+  // This pin carries more weight than it looks. `assert` here is
+  // node:assert/strict, so deepEqual is deepStrictEqual over the WHOLE shape —
+  // it fails if `color` is absent, if `color` is undefined rather than null, or
+  // if a stray key (notably the removed `muted`) comes back. Three things are
+  // therefore asserted at once, and none needs its own test:
+  //
+  //   1. NO COLOUR OVERRIDE for a real agent name — only placeholders dim.
+  //   2. `color` is PRESENT-and-null, never omitted. That is the inverse of the
+  //      `!('marginLeft' in compact)` rigour above, resolved the other way for
+  //      its own reason: compact's site renders no `style` attribute at all,
+  //      whereas both agent-cell sites BRANCH on `color`, so it must always be
+  //      there to branch on. An always-present key is what makes their
+  //      `ac.color ? <span style=...> : ac.text` a total function over a stable
+  //      shape. (Neither descriptor is ever spread — every site reads explicit
+  //      fields.)
+  //   3. `muted` IS GONE — the defect task 4408 closes. It was returned to two
+  //      call sites and honoured by exactly one; OrchTab took `.text` and
+  //      dropped it silently. Returning the colour instead makes the field
+  //      carrying the placeholder-ness the field a site must read to render at
+  //      all. Keeping BOTH would re-create the same failure mode one layer
+  //      down, so a resurrected `muted` must fail — and here it does.
+  assert.deepEqual(agentCellState({ agent: 'x' }), { text: 'x', color: null });
 });
 
 test('agentCellState: no agent falls back to the default "unassigned" placeholder', () => {
-  assert.deepEqual(agentCellState({}), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState({ agent: null }), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState({ agent: '' }), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState(null), { text: 'unassigned', muted: true });
+  // Strict deepEqual again, so this is the placeholder arm of all three
+  // guarantees enumerated above — including that `muted` stays gone here too.
+  assert.deepEqual(agentCellState({}), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: null }), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: '' }), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState(null), { text: 'unassigned', color: MUTED_COLOR });
 });
 
-test('agentCellState: the placeholder is a parameter, because the two sites disagree', () => {
+test('agentCellState: the placeholder STRING is a parameter, because the two sites disagree', () => {
   // tab_tasks.jsx TaskDetail renders the word 'unassigned'; tabs.jsx OrchTab
   // renders an em-dash. Both are pinned so the extraction cannot silently
   // change either one.
-  assert.deepEqual(agentCellState({}, { placeholder: '—' }), { text: '—', muted: true });
-  assert.deepEqual(agentCellState({ agent: 'x' }, { placeholder: '—' }), { text: 'x', muted: false });
+  assert.deepEqual(agentCellState({}, { placeholder: '—' }), { text: '—', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: 'x' }, { placeholder: '—' }), { text: 'x', color: null });
+});
+
+test('agentCellState: the placeholder STYLING is NOT a parameter — one mute colour, both sites', () => {
+  // The invariant task 4408 establishes. WHICH WORD stands in for an absent
+  // agent is per-site; HOW DIM it renders is not. Both sites must receive the
+  // MUTED_COLOR reference itself rather than a re-spelled copy — the same
+  // single-source rigour as `STRAND_TITLE is the single source for every site`
+  // below, applied to the colour instead of the tooltip.
+  assert.equal(agentCellState({}, { placeholder: '—' }).color, agentCellState({}).color);
+  assert.equal(agentCellState({}, { placeholder: '—' }).color, MUTED_COLOR);
+  assert.equal(agentCellState({}).color, MUTED_COLOR);
 });
 
 test('agentCellState and strandBadgeState share no field values — they are distinct surfaces', () => {
@@ -210,4 +267,135 @@ test('STRAND_TITLE is the single source for every site that renders the badge', 
   assert.equal(strandBadgeState({ stranded: true }).title, STRAND_TITLE);
   assert.equal(strandBadgeState({ stranded: true }, { compact: true }).title, STRAND_TITLE);
   assert.equal(strandBadgeState({ stranded: true }, { marginLeft: 4 }).title, STRAND_TITLE);
+});
+
+// ---------------------------------------------------------------------------
+// MUTED_COLOR — exported once so the two agent-cell sites cannot drift apart
+// ---------------------------------------------------------------------------
+
+test('MUTED_COLOR is the dim tertiary custom property TaskDetail already rendered', () => {
+  // Pinned BY VALUE, not merely by shape. TaskDetail hand-wrote 'var(--fg-3)'
+  // in its JSX before this extraction, and the extraction must not silently
+  // re-colour it while moving it: styles.css defines --fg-3 at L=0.62 against
+  // the OrchTab agent cell's inherited --fg-2 at L=0.72, which is what makes
+  // the mute visible there at all.
+  //
+  // This one assertion is the whole constant's coverage, deliberately. An exact
+  // match against a non-empty literal already establishes both that the value
+  // is a string and that it is non-empty, so a separate shape test beside it
+  // would restate this one; the exported TYPE is asserted once in the
+  // module-shape test at the top of the file.
+  assert.equal(MUTED_COLOR, 'var(--fg-3)');
+});
+
+// ---------------------------------------------------------------------------
+// locksCellState — the Locks cell's render decision (task 5588, PRD leaf
+// gamma1; PRD decision 15 / precondition sketch #12)
+//
+// THE DEFECT IT REMOVES. tabs.jsx's LocksCell derives its chips from
+// DF.SCHEDULER, so a project whose scheduler is offline renders an EMPTY chip
+// list — visually identical to a task that genuinely holds no locks. "We don't
+// know" and "nothing is held" are opposite answers for an operator deciding
+// whether a task is blocked, and today they render the same. The Locks datum
+// is what separates them: unknown draws an em-dash carrying its reason, and a
+// blank cell goes back to meaning what it says.
+//
+// WHY THE DECISION IS HERE AND NOT IN A BRANCH INSIDE LocksCell. Both halves
+// of the reason are already written in this module's header and in
+// agentCellState's note: tabs.jsx is at its soft size ceiling, and a decision
+// inside `type="text/babel"` JSX is un-executable by any test — which is how
+// the offline-scheduler case came to be un-asserted in the first place. The
+// Locks column is a cell of the same task row whose other two decisions live
+// here, so the module's stated purpose already covers it.
+// ---------------------------------------------------------------------------
+
+// The placeholder the unknown arm draws, stated as a literal rather than read
+// off DF_DATUM — the expectation is "an em-dash", and deriving it from the
+// module under test would assert only that it equals itself.
+const LOCKS_EM_DASH = '—';
+
+function locksDatum(state, reason) {
+  return {
+    value: ['orchestrator/src/orchestrator/verify.py'],
+    as_of: '2026-09-20T09:00:00+00:00',
+    state,
+    reason,
+    freshness_bound_seconds: 30,
+  };
+}
+
+// buildSchedLockInfo's shape (tabs.jsx LocksCell), as the call site hands it on.
+function lockInfoWith(...paths) {
+  return { rawTaskId: '5588', lockSet: paths, moduleByPath: new Map() };
+}
+
+test('locksCellState: an unknown datum draws an em-dash carrying its reason', () => {
+  // The motivating case: scheduler offline, so nothing is known about this
+  // task's locks. An empty chip list here would read as "no locks held".
+  assert.deepEqual(
+    locksCellState(locksDatum('unknown', 'scheduler offline'), lockInfoWith()),
+    { placeholder: LOCKS_EM_DASH, title: 'scheduler offline' },
+  );
+});
+
+test('locksCellState: an unknown datum draws the em-dash EVEN when lock paths are available', () => {
+  // Pins the ABSENCE of a branch, not a branch. lockInfo is a parameter and is
+  // deliberately never consulted: chips left over from a snapshot the datum
+  // cannot vouch for are precisely the unprovenanced render this leaf removes,
+  // so "we don't know" must win over "here is what we last saw". A future
+  // reader tempted to let drawable chips suppress the placeholder fails here.
+  assert.deepEqual(
+    locksCellState(locksDatum('unknown', 'scheduler offline'), lockInfoWith('a/b.py', 'c/d.py')),
+    { placeholder: LOCKS_EM_DASH, title: 'scheduler offline' },
+  );
+});
+
+test('locksCellState: a fresh datum renders the chip list unchanged, with no tooltip', () => {
+  // Present-and-null rather than an absent key, for the reason agentCellState's
+  // `color` is: the call site BRANCHES on placeholder, so it must always be
+  // there to branch on.
+  assert.deepEqual(
+    locksCellState(locksDatum('fresh', null), lockInfoWith('a/b.py')),
+    { placeholder: null, title: null },
+  );
+});
+
+test('locksCellState: a fresh datum reports no tooltip even if the server sent a reason', () => {
+  // Same rule datumView applies: a fresh value has nothing to explain, so a
+  // stray reason is not surfaced as a tooltip on a value that is simply fine.
+  assert.deepEqual(
+    locksCellState(locksDatum('fresh', 'left over'), lockInfoWith('a/b.py')),
+    { placeholder: null, title: null },
+  );
+});
+
+test('locksCellState: a stale datum still renders the chips, and carries the reason as a tooltip', () => {
+  // The chips are the best information available and the reason says how far
+  // to trust them — unlike the unknown arm, where there IS no information.
+  assert.deepEqual(
+    locksCellState(locksDatum('stale', 'scheduler last answered 4m ago'), lockInfoWith('a/b.py')),
+    { placeholder: null, title: 'scheduler last answered 4m ago' },
+  );
+});
+
+test('locksCellState: a lower_bound datum renders the chips with its reason', () => {
+  // A truncated lock list is still a real list; the reason is what says it is
+  // incomplete. Asserted so all four DATUM_STATES have a pinned arm.
+  assert.deepEqual(
+    locksCellState(locksDatum('lower_bound', 'lock table truncated at 50 rows'), lockInfoWith('a/b.py')),
+    { placeholder: null, title: 'lock table truncated at 50 rows' },
+  );
+});
+
+test('locksCellState: a non-Datum argument throws via assertDatum', () => {
+  // Loud rather than silent, in the browser as well as here (design decision
+  // 4): a call site missed during the migration must fail visibly in dev
+  // instead of quietly rendering an unprovenanced cell.
+  for (const bad of [null, undefined, 42, ['a/b.py'], { lockSet: [] }, locksDatum('made-up', null)]) {
+    assert.throws(
+      () => locksCellState(bad, lockInfoWith()),
+      /locksCellState/,
+      `locksCellState accepted ${JSON.stringify(bad)}`,
+    );
+  }
 });

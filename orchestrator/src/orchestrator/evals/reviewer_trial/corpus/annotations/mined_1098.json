@@ -40,5 +40,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Stage 2 prompt: handle multi-id and no_op set_task_status response shapes",
+      "description": "Fix two classes of Stage 2 reconciliation prompt issues that cause agents to either misinterpret MCP responses or issue unnecessary round-trips: (1) correct the set_task_status response-shape documentation to cover multi-id and no_op cases so the agent does not skip legitimate counter increments; (2) reconsider the unconditional get_task round-trip after every successful resolve_ticket, replacing it with trust-curator semantics that only fall back to get_task when the authoritative response is ambiguous.",
+      "test_strategy": "Update matching pinning tests in `fused-memory/tests/reconciliation/` for both changes:\n- Add test coverage for multi-id and no_op `set_task_status` response shapes.\n- Add/update test for the resolve_ticket verification rule reflecting whichever decision is adopted.",
+      "details": "**Part A \u2014 set_task_status response shapes (fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:108-116)**\n\nTwo response shapes the current rule misses (verified in fused-memory/src/fused_memory/middleware/task_interceptor.py):\n\n1. **Multi-id wrapping (lines 400-417):** When `task_id` is comma-separated, the interceptor returns `{\"success\": bool, \"results\": [{\"task_id\": ..., \"result\": {...}}]}`. The `tasks` array (with `newStatus`) is nested inside each `results[i].result`, not at the top level. An agent following the prompt literally on a multi-id call sees no top-level `tasks` field and either falls back to redundant per-task `get_task` round-trips or mis-attributes the result as ambiguous and skips the counter increment.\n\n2. **`no_op: True` shape (line 455):** When the requested status equals the current status, the interceptor returns `{\"success\": True, \"no_op\": True, \"task_id\": ...}` with no `tasks` array. The current rule (\"response payload is missing or newStatus is absent\") would treat this as a discrepancy and either issue an unnecessary `get_task` fallback or flag it.\n\nFix the prompt to:\n- Either restrict the `tasks[n].newStatus` rule to single-id calls and document `results[i].result.tasks[*]` for multi-id calls \u2014 or instruct the agent to always pass a single id to `set_task_status` for reconciliation work so the documented shape applies.\n- Add: \"If the response contains `no_op: True`, the task was already in the requested status \u2014 treat as a successful no-op (do not increment a success counter, do not flag as a discrepancy).\"\n\n**Part B \u2014 resolve_ticket verification rule (fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:99-106)**\n\nContext: Task 1082 added a rule requiring `get_task` after `resolve_ticket` returns `status=\"created\"` or `status=\"combined\"` with a `task_id`, before incrementing `tasks_created`. A reviewer flagged this as over-engineering: it doubles the per-creation MCP cost in Stage 2's hot path.\n\nArgument for dropping: `resolve_ticket` already returns an authoritative curator decision plus `task_id`. The curator owns task creation and dedup. A storage round-trip check is a failure mode the agent can only flag-and-continue on, so the verification has low marginal value.\n\n1. **Decide**: Review recent reconciliation incident logs for evidence that a post-`resolve_ticket` `get_task` has ever caught a real failure not already represented in the `resolve_ticket` response.\n2. **If adopting (trust curator):** Update the prompt so that `status in ('created', 'combined')` plus the presence of `task_id` is treated as success \u2014 increment `tasks_created` directly. Only fall back to `get_task` when `task_id` is missing or the status is unrecognized (the discrepancy branch the prompt already covers).\n3. **If keeping (defense in depth):** Update the prompt's rationale to make the defense-in-depth justification explicit so future reviewers understand the trade-off.\n\n**Tests:** Update matching pinning tests in `fused-memory/tests/reconciliation/` for both changes:\n- Add test coverage for multi-id and no_op `set_task_status` response shapes.\n- Add/update test for the resolve_ticket verification rule reflecting whichever decision is adopted.\n\n**FILES_TO_MODIFY:**\n  - fused-memory/src/fused_memory/reconciliation/prompts\n  - fused-memory/tests/reconciliation",
+      "authored": false,
+      "id": "1098",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-26T14:09:11.612Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py"
+    ],
+    "base_sha": "9c2d68dd906d4ebdf850d42a7ea3bd780e66f911",
+    "branch_sha": "455dc35995a1a9caee5eb1e71a2778a2d8b08653",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "970a178069dac221535324bb330e34695bc3e877",
+      "merge_base_sha": "9c2d68dd906d4ebdf850d42a7ea3bd780e66f911",
+      "diff_reproduces_from": "git diff 9c2d68dd90 970a178069",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

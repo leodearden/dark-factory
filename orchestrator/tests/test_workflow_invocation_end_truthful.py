@@ -126,6 +126,61 @@ class TestInvocationEndTruthfulTelemetry:
             f'data; got {data!r}'
         )
 
+    async def _invocation_end_data(self, tmp_path: Path, stub_result: AgentResult) -> dict:
+        """Drive ``_invoke`` with *stub_result* and return the sole
+        ``invocation_end`` event's ``data`` dict."""
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        with (
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=stub_result),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='p', cwd=tmp_path)
+        entries = [entry for (etype, entry) in rec.events if etype == EventType.invocation_end]
+        assert len(entries) == 1, f'expected exactly one invocation_end event; got {rec.events!r}'
+        return entries[0]['data']
+
+    async def test_invocation_end_data_includes_ended_awaiting_background_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """The flag that DECIDES the success verdict for a downgraded run must
+        appear in telemetry.  The stub is the exact impossible-looking triple
+        this class produces: success=False with subtype='success' and
+        timed_out=False (task 3639)."""
+        stub_result = AgentResult(
+            success=False,
+            output='done',
+            subtype='success',
+            turns=19,
+            duration_ms=681_000,
+            timed_out=False,
+            ended_awaiting_background=True,
+        )
+        data = await self._invocation_end_data(tmp_path, stub_result)
+        assert data.get('ended_awaiting_background') is True, (
+            f'expected ended_awaiting_background=True in invocation_end data; got {data!r}'
+        )
+
+    async def test_invocation_end_data_includes_ended_awaiting_background_false(
+        self, tmp_path: Path,
+    ) -> None:
+        """PRESENT-and-False on an ordinary success, not absent: absence is
+        exactly what made the class unqueryable (0 of 3,340 rows), leaving the
+        false-positive rate's denominator unknowable."""
+        stub_result = AgentResult(
+            success=True, output='ok', subtype='success', turns=3, duration_ms=1_000,
+        )
+        data = await self._invocation_end_data(tmp_path, stub_result)
+        assert 'ended_awaiting_background' in data, (
+            f'expected ended_awaiting_background key PRESENT in invocation_end data; got {data!r}'
+        )
+        assert data['ended_awaiting_background'] is False, (
+            f'expected ended_awaiting_background=False; got {data["ended_awaiting_background"]!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestInvokeForwardsProgressExtensionParams:

@@ -383,9 +383,53 @@ function focusSubset(tasks, selectedId) {
   return tasks.filter(t => nb.has(t.id));
 }
 
+// ── The per-group focus view: the rendered array AND its count, together ──
+// Returns `{shown, shownCount, focused, emptiedByFocus}` where `shownCount`
+// is `shown.length` BY CONSTRUCTION, so a caller that renders `shown` and
+// displays `shownCount` cannot show a count for an array it did not render.
+//
+// That guarantee is the whole point. Focus state in the Tasks tab is GLOBAL
+// (one focusMode/focusAnchorId for the whole tab) while narrowing is applied
+// PER PROJECT GROUP, so before this existed tab_tasks.jsx fed each group body
+// `focusSubset(filtered, focusAnchorId)` while its header counted the
+// PRE-focus `filtered` — two expressions that were supposed to agree and did
+// not. In the all-projects view every non-anchor group therefore rendered an
+// empty graph under an "N/N shown" header. Returning the count alongside the
+// array makes the agreement structural instead of maintained by discipline.
+//
+// `focused` reproduces the caller's old `focusMode && selectedId != null`
+// guard verbatim: re-clicking a selected node clears only `selectedId`, and
+// without that term the subset would narrow against a stale `focusAnchorId`
+// for one render. There is deliberately no `focusAnchorId != null` term —
+// `focusSubset(list, null)` is already a passthrough, so it would flip
+// `focused` without changing `shown` or `emptiedByFocus`.
+//
+// `emptiedByFocus` requires a non-empty input so a group the STATUS FILTER
+// already emptied is not blamed on focus — "no tasks match the current
+// filter" is the true statement there. Note it is NOT equivalent to "this is
+// not the anchor's project": computeNeighborhood's descendants walk adds
+// cross-project dependents of the anchor even when the anchor itself is
+// absent from `tasks`, so such a group renders a real partial graph.
+//
+// Tolerates a null/undefined `tasks` and a missing options object: the
+// per-project header renders before task data has necessarily arrived, and a
+// throw there would blank the whole Tasks tab.
+function focusGroupView(tasks, options) {
+  const opts = options || {};
+  const list = tasks || [];
+  const focused = !!(opts.focusMode && opts.selectedId != null);
+  const shown = focused ? focusSubset(list, opts.focusAnchorId) : list;
+  return {
+    shown,
+    shownCount: shown.length,
+    focused,
+    emptiedByFocus: focused && list.length > 0 && shown.length === 0,
+  };
+}
+
 // Named GRAPH_LAYOUT_API, never a bare `API` — see the module-unique-const
 // convention in this file's header comment.
-const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
+const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = GRAPH_LAYOUT_API;

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import MockAddEpisodeResult
 
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
@@ -67,13 +69,20 @@ class TestTemporalGuardRoundTrip:
     async def test_execute_graphiti_write_registers_planning_episode(
         self, service_with_real_registry
     ):
-        """_execute_graphiti_write with temporal_context='planning' registers the episode UUID."""
+        """_execute_graphiti_write with temporal_context='planning' registers the episode UUID.
+
+        The uuid under test is the one graphiti_core MINTS (result.episode.uuid),
+        not a payload key (task 3561) — the payload never carries a uuid, and
+        when it did the value named no graph node.
+        """
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-planning-001'
         project_id = 'integ-project'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
 
         payload = {
-            'uuid': ep_uuid,
             'name': 'test-episode',
             'content': 'CostStore extends AgentResult for cost tracking',
             'source': 'text',
@@ -91,13 +100,20 @@ class TestTemporalGuardRoundTrip:
     async def test_execute_graphiti_write_does_not_register_current_episode(
         self, service_with_real_registry
     ):
-        """_execute_graphiti_write without temporal_context does NOT register the episode."""
+        """_execute_graphiti_write without temporal_context does NOT register the episode.
+
+        The minted uuid is supplied on the result (task 3561) so the negative
+        assertion is meaningful: registration would have keyed on exactly this
+        value had temporal_context been set.
+        """
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-current-001'
         project_id = 'integ-project'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
 
         payload = {
-            'uuid': ep_uuid,
             'name': 'test-episode',
             'content': 'CostStore was implemented in cost_store.py',
             'source': 'text',
@@ -223,12 +239,18 @@ class TestTemporalGuardRoundTrip:
         project_id = 'integ-project'
         scope = Scope(project_id=project_id)
 
+        # The uuid graphiti_core mints for this episode (task 3561). It is the
+        # single identity the whole round trip keys on: registration reads it
+        # off result.episode.uuid, and the edge below is attributed to it.
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
+
         # Step 1: planning write via _execute_graphiti_write. group_id is set
         # from scope.graphiti_group_id (not the raw project_id), mirroring
         # memory_service.add_episode()'s real payload construction so the
         # write and the later search below key off the same canonical value.
         payload = {
-            'uuid': ep_uuid,
             'name': 'prd-episode',
             'content': 'PRD: TaskStore manages task lifecycle',
             'source': 'text',
@@ -292,6 +314,14 @@ class TestBatchPlanAutoTagRoundTrip:
         svc, reg = service_with_real_registry
         project_id = 'integ-batch-plan-001'
 
+        # The uuid graphiti_core mints for this episode (task 3561). Registration
+        # keys on result.episode.uuid, NOT on the tool's returned episode_id —
+        # that value is a correlation id for the queued write and names no node.
+        episode_uuid = 'graphiti-minted-batch-plan-uuid'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=episode_uuid))
+        )
+
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
         # within this test (mirrors the real dual_write_episode callback path).
@@ -304,7 +334,7 @@ class TestBatchPlanAutoTagRoundTrip:
 
         mcp_server = create_mcp_server(svc)
 
-        result = await mcp_server._tool_manager.call_tool(
+        await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
                 'content': (
@@ -314,11 +344,10 @@ class TestBatchPlanAutoTagRoundTrip:
                 'project_id': project_id,
             },
         )
-        episode_id = result['episode_id']
 
-        # (a) auto-tag → registered as planned
-        assert await reg.is_planned(episode_id) is True, (
-            f'Batch-plan episode {episode_id!r} should be auto-tagged planning '
+        # (a) auto-tag → registered as planned, under the MINTED uuid
+        assert await reg.is_planned(episode_uuid) is True, (
+            f'Batch-plan episode {episode_uuid!r} should be auto-tagged planning '
             f'and registered in the planned-episode registry'
         )
 
@@ -327,7 +356,7 @@ class TestBatchPlanAutoTagRoundTrip:
             MockEdge(
                 fact='Merge-queue modularization was extracted',
                 uuid='edge-batch-1',
-                episodes=[episode_id],
+                episodes=[episode_uuid],
             )
         ])
         scope = Scope(project_id=project_id)
@@ -382,6 +411,14 @@ class TestProposedResolutionAutoTagRoundTrip:
         svc, reg = service_with_real_registry
         project_id = 'integ-proposed-resolution-001'
 
+        # The uuid graphiti_core mints for this episode (task 3561). Registration
+        # keys on result.episode.uuid, NOT on the tool's returned episode_id —
+        # that value is a correlation id for the queued write and names no node.
+        episode_uuid = 'graphiti-minted-proposed-resolution-uuid'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=episode_uuid))
+        )
+
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
         # within this test (mirrors the real dual_write_episode callback path).
@@ -394,7 +431,7 @@ class TestProposedResolutionAutoTagRoundTrip:
 
         mcp_server = create_mcp_server(svc)
 
-        result = await mcp_server._tool_manager.call_tool(
+        await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
                 'content': (
@@ -405,11 +442,10 @@ class TestProposedResolutionAutoTagRoundTrip:
                 'project_id': project_id,
             },
         )
-        episode_id = result['episode_id']
 
-        # (a) auto-tag → registered as planned
-        assert await reg.is_planned(episode_id) is True, (
-            f'Proposed-resolution episode {episode_id!r} should be auto-tagged '
+        # (a) auto-tag → registered as planned, under the MINTED uuid
+        assert await reg.is_planned(episode_uuid) is True, (
+            f'Proposed-resolution episode {episode_uuid!r} should be auto-tagged '
             f'planning and registered in the planned-episode registry'
         )
 
@@ -422,7 +458,7 @@ class TestProposedResolutionAutoTagRoundTrip:
                     'to FINALIZING occurs'
                 ),
                 uuid='edge-proposed-resolution-1',
-                episodes=[episode_id],
+                episodes=[episode_uuid],
             )
         ])
         scope = Scope(project_id=project_id)

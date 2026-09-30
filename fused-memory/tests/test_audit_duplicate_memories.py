@@ -5,41 +5,28 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 """
 from __future__ import annotations
 
-import importlib.util
+import errno
 import json
+import logging
+import sys
 import types
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+from shared.testing_streams import StdoutWithAFailingFlush
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_duplicate_memories.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_duplicate_memories'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_duplicate_memories')
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
 ann_scores_for_pairs = _mod.ann_scores_for_pairs
@@ -84,27 +71,15 @@ _build_parser = _mod._build_parser
 _run = _mod._run
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``_run(args)`` with ``--apply`` runs a fail-closed capability preflight
-    before it constructs a MemoryService (task 4127). That probe touches the
-    real filesystem, so without this fixture every ``--apply`` test would pass
-    or fail according to whether the machine running pytest happens to be able
-    to write mem0's history directory -- and it genuinely cannot inside an
-    agent sandbox, which is the whole reason the guard exists. This suite is
-    deliberately MOCK-unit (``_FakeMemoryService``, no live Qdrant), so the
-    environment must not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``_run(args)`` with ``--apply`` runs the preflight before it constructs
+    a MemoryService (task 4127). This suite is deliberately MOCK-unit
+    (``_FakeMemoryService``, no live Qdrant).
     ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
     record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -4114,6 +4089,95 @@ class TestRunApplyGuards:
         assert service.deleted == []
 
 
+class _UnopenableFakeMemoryService(_FakeMemoryService):
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+
+def _abort_messages(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.ERROR and r.getMessage().startswith('ABORT:')
+    ]
+
+
+@pytest.mark.asyncio
+class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
+    """A failure that is not stdout's is attributed at its seam, and a stdout
+    failure surfaces before the metrics artifact and before any --apply delete.
+
+    The stdout JSON plan is task 3136's report contract and it is printed
+    BEFORE every side effect, so a reader-closed or full stdout must stop the
+    run there. A block-buffered short plan used to fail only at interpreter
+    shutdown, after irreversible deletions whose report was lost.
+    """
+
+    _CLUSTER = {_PK: [
+        _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+        _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+    ]}
+
+    def _apply_args(self, metrics_root: Path):
+        return _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(metrics_root),
+        ])
+
+    async def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, caplog):
+        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        monkeypatch.setattr(service_mod, 'MemoryService', _UnopenableFakeMemoryService)
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(tmp_path))
+
+        assert rc == _mod.EXIT_RUN_FAILED == 1
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert 'store' in aborts[0]
+        assert 'stdout' not in aborts[0]
+        assert _FakeMemoryService.instances[-1].closed
+        assert not list(tmp_path.rglob('metrics-*.json'))
+
+    async def test_an_unwritable_metrics_root_deletes_nothing(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        metrics_root = blocker / 'metrics'
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(metrics_root))
+
+        assert rc == _mod.EXIT_RUN_FAILED
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert str(metrics_root) in aborts[0]
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    @pytest.mark.parametrize('exc', [
+        BrokenPipeError(errno.EPIPE, 'Broken pipe'),
+        OSError(errno.ENOSPC, 'No space left on device'),
+    ], ids=['closed-reader', 'full-disk'])
+    async def test_a_deferred_stdout_failure_stops_before_metrics_and_deletes(
+        self, monkeypatch, tmp_path, exc,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        metrics_root = tmp_path / 'metrics'
+
+        with monkeypatch.context() as scoped, pytest.raises(type(exc)):
+            scoped.setattr(sys, 'stdout', StdoutWithAFailingFlush(exc))
+            await _run(self._apply_args(metrics_root))
+
+        assert _FakeMemoryService.instances[-1].deleted == []
+        assert not list(metrics_root.rglob('metrics-*.json'))
+
+
 @pytest.mark.asyncio
 class TestRunApplyAnnOnlyClusters:
     """End-to-end: what --apply does with deletions the ANN path alone produced.
@@ -5170,7 +5234,20 @@ def _span_days(earlier: str, later: str) -> float:
 # below read `{sentinel}` no matter what the clauses say. The values are
 # unforgeable for a second reason too: `<` and `>` are outside
 # `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
-_SENTINEL_CORE_FACT = 'status=<sentinel-one>|status=<sentinel-two>'
+#
+# It also names the SAME THREE field names -- `claimant_run_id`,
+# `heartbeat_at`, `status` -- as every real record it is seeded against.
+# `liveness_snapshot_subject_facts`'s field-vocabulary gate only ADDS a
+# clause-derived key when the clause names the SAME field-NAME set as the
+# seeded core_fact, so a sentinel with a narrower vocabulary (`status` alone,
+# say) would close that second gate regardless of what the real record's
+# clauses say, and every assertion below would silently degrade to
+# `{sentinel}` for a FIXTURE reason rather than the behaviour these classes
+# claim to measure.
+_SENTINEL_CORE_FACT = (
+    'claimant_run_id=<sentinel>|heartbeat_at=<sentinel>|'
+    'status=<sentinel-one>|status=<sentinel-two>'
+)
 
 
 class TestLivenessSnapshotSubjectFacts:
@@ -5265,15 +5342,11 @@ class TestLivenessSubjectFactsFallback:
     carrying no readable assignment, and a clause boundary landing inside a
     quoted value.
 
-    An earlier reading of this class claimed the rescope "can only ADD recall
-    if a subject the clauses say nothing about keeps exactly the key it had
-    BEFORE the rescope". That condition is real but NOT sufficient, and
-    believing it shipped a regression: a subject whose clause named only SOME
-    of the record's fields keyed on a partial fact instead, silently vacating
-    the whole-record bucket it used to share -- an empty-set-only fallback
-    never fires for it. The invariant that actually holds is the unconditional
-    one above; `TestLivenessSubjectFactsIsAdditive` pins the
-    non-empty-but-incomplete half this class does not reach.
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. `TestLivenessSubjectFactsIsAdditive` pins
+    that non-empty-but-incomplete half.
 
     Because every pre-rescope bucket membership therefore survives, nothing is
     lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
@@ -5399,14 +5472,14 @@ class TestLivenessSubjectFactsIsAdditive:
     covers the strictly harder one they do not reach -- clause evidence that
     is non-empty but INCOMPLETE.
 
-    Measured against the shipped module before this class landed: record B
-    below names task 94 in its first clause and puts the other two fields in a
-    second clause naming no task, so the subject keyed on the partial
-    `status=in-progress`, matched nothing, and the whole-record bucket it had
-    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
-    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
-    the empty set cannot catch that; a non-empty-but-incomplete set wins
-    outright.
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` ALONE would match nothing, vacating the whole-record
+    bucket it shares with A and making `find_liveness_snapshot_recurrences`
+    return `[]` with an ALL-ZERO disclosure -- the outcome the unconditional
+    seed prevents, pinned below. A fallback that fires only on the empty set
+    cannot catch that; a non-empty-but-incomplete set wins outright.
 
     The invariant that closes it: every subject buckets under *core_fact*
     unconditionally, with the clause-scoped fact ADDED beside it. Every bucket
@@ -5417,8 +5490,11 @@ class TestLivenessSubjectFactsIsAdditive:
     A record whose union key is COHERENT, like both of these, is now given no
     clause-scoped key at all -- a second guard on the same invariant, and the
     one that keeps grouping from turning on where the author put a full stop.
-    The partial key survives only where it earns its keep, on a DIVERGENT
-    record, and the test below pins that the seed still sits beside it there.
+    A clause key earns a bucket of its own only by naming the record's FULL
+    field vocabulary; a PARTIAL one is dropped everywhere, DIVERGENT record
+    included, and the divergent-record test below pins what survives that
+    drop -- the seed is never swapped out, so its subject keeps the
+    whole-record bucket it would have had anyway.
     """
 
     def _pair(self) -> list[dict]:
@@ -5464,14 +5540,16 @@ class TestLivenessSubjectFactsIsAdditive:
             'invisible -- the group itself is the only observable'
         )
 
-    def test_a_divergent_records_incomplete_clause_keeps_the_seed_beside_it(self):
-        """Where the partial key DOES survive, the seed survives with it.
+    def test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own(self):
+        """An INCOMPLETE clause earns no bucket; the seed is never swapped out.
 
         Task 94's clause here names only `status`; task 96's names all three.
-        The union is a chimera, so clause scoping engages -- and the partial
-        `status=in-progress` is ADDED, not swapped in. Swapping would vacate
-        the whole-record bucket 94 shares with any other record asserting the
-        same chimera, which is the regression this class exists to catch.
+        The union is a chimera, so clause scoping engages -- but 94's clause
+        names a strict SUBSET of the record's field vocabulary, so it earns no
+        clause key of its own (`TestLivenessClauseFragmentFalseGroup` pins the
+        harm this prevents). The invariant this class exists for still holds:
+        the seed is never SWAPPED OUT -- 94 keeps the whole-record union it
+        shares with any other record asserting the same chimera.
         """
         record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
                          category=_OS, metadata={'task_id': '94'})
@@ -5479,9 +5557,14 @@ class TestLivenessSubjectFactsIsAdditive:
         assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
 
         assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
-            '94': {_CORE_FACT_DIVERGENT, 'status=in-progress'},
+            '94': {_CORE_FACT_DIVERGENT},
             '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
-        }, 'the incomplete clause key sits BESIDE the seed, never in place of it'
+        }, (
+            "94's incomplete clause earns no bucket of its own, but its seed "
+            '-- the whole-record union -- is never swapped out; '
+            "96's clause names the record's full field vocabulary and keeps "
+            'its clause key beside the seed'
+        )
 
 
 # A record whose whole-record key names `status` TWICE -- the chimera that
@@ -5503,6 +5586,14 @@ _CORE_FACT_DIVERGENT = (
     'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
 )
 _CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
+
+# A record whose WHOLE-record key is exactly the one field `status`. Used to
+# show that a clause-scoped key naming only a STRICT SUBSET of its own
+# record's fields must not join this record's bucket -- a collision the
+# whole-record key would never have produced, because it names only that one
+# field to begin with.
+_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-26 '
+                           'on task 94: status="in-progress".')
 
 
 class TestLivenessOneSubjectOneGroupPerMemberSet:
@@ -5929,6 +6020,76 @@ class TestLivenessPartialKeyFalseGroup:
         assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
+class TestLivenessClauseFragmentFalseGroup:
+    """A clause-scoped key built from a FRAGMENT of its record must never
+    manufacture a group the whole-record key could not have produced.
+
+    A clause key naming a STRICT SUBSET of the fields its own record was
+    recognised to speak about is the same "key built from a fragment of what
+    the record asserts" that `_classify_liveness_snapshot`'s survivors-only
+    refusal already forbids at the record level -- just reached through
+    clause scoping instead of an unread field. `liveness_snapshot_recurrences`
+    is an ARMED `higher_is_worse` count, so a false group here is a false
+    accretion signal, not a cosmetic one.
+    """
+
+    def test_a_fragment_clause_key_never_joins_an_unrelated_whole_record_bucket(self):
+        # (a) PREMISE, asserted first: the weak-whole record classifies for
+        # the reason this test needs it to, not because it failed to
+        # classify at all.
+        assert _classify_liveness_snapshot(_LIVENESS_WEAK_WHOLE_94) == (
+            True, 'status=in-progress',
+        ), 'the fixture must reach the collision by classifying cleanly'
+
+        # (b) PREMISE: task 94's clause in the divergent-partial record
+        # earns no clause-derived key of its own (the full projection,
+        # including 96's surviving clause key beside the seed, is pinned by
+        # TestLivenessSubjectFactsIsAdditive::
+        # test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own
+        # -- not re-asserted here). Checking it here too means the corpus
+        # below can only produce (c)'s harm through the unconditional seed,
+        # never a surviving clause key.
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        subject_facts = liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT)
+        assert subject_facts['94'] == {_CORE_FACT_DIVERGENT}, (
+            "94's clause names only `status`, a strict subset of the "
+            "record's {claimant_run_id, heartbeat_at, status} vocabulary, "
+            'so it must earn no clause key of its own'
+        )
+
+        # (c) THE HARM, at the level the ARMED metric counts. D is the
+        # divergent-partial record; W's WHOLE-record key is exactly the one
+        # field `status=in-progress`. D's own RECORD-level vocabulary is
+        # three fields wide -- claimant_run_id, heartbeat_at, status -- but
+        # that width comes entirely from what D says about task 96; D's own
+        # clause about 94 says only `status`, the same one field W's whole
+        # record says. Pre-fix, D's clause key for 94 joined W's
+        # whole-record bucket anyway, because the gate compares against
+        # D's RECORD-level vocabulary, not what is complete for subject 94
+        # specifically (see liveness_snapshot_subject_facts's docstring for
+        # that trade-off).
+        corpus = [
+            _dated('D', _LIVENESS_DIVERGENT_PARTIAL_94, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('W', _LIVENESS_WEAK_WHOLE_94, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            "a subject named in a clause that omits two of its record's "
+            'three fields must not join an unrelated record whose whole '
+            'assertion is that one field'
+        )
+        assert set(disclosure.values()) == {0}, (
+            'the gate drops an ADDED key while the unconditional seed '
+            'stays, so nothing is vacated and no counter moves'
+        )
+
+
 # The plan keys that existed before task 3098. Pinned so an additive change
 # stays additive: no pre-existing key may be dropped or renamed.
 _PRE_3098_PLAN_KEYS = frozenset({
@@ -6144,6 +6305,74 @@ class TestLivenessRecurrenceMetrics:
             corpus_counts={c: len(v) for c, v in records.items()},
             run_stamp='20260731T000000Z',
         ))
+
+
+class TestLivenessRecurrenceMetricsUnderDualKeying:
+    """A corpus that has not changed must not read higher because one
+    subject is now keyed twice over the same members.
+
+    Every fixture in `TestLivenessRecurrenceMetrics` runs the REAL corpus,
+    whose four records are COHERENT -- the divergence gate never opens,
+    dual keying is never exercised, and nothing at the metrics layer guards
+    the number `liveness_snapshot_recurrences` actually reports. This class
+    arms that guarantee: the count is GROUPS PER SUBJECT, not buckets per
+    (subject, key), at the layer the regression alarm actually reads --
+    not just at the detector level
+    (`TestLivenessOneSubjectOneGroupPerMemberSet`).
+    """
+
+    def _fixture(self):
+        # Same shape TestLivenessOneSubjectOneGroupPerMemberSet._divergent
+        # builds, so the detector-level and metrics-level pins exercise one
+        # corpus: two identical divergent records, D1/D2, over subjects
+        # 94 and 96 -- four buckets that collapse to two groups.
+        corpus = [
+            _dated('D1', _LIVENESS_DIVERGENT_94_96, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('D2', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        plan = build_sweep_plan(corpus)
+        records = {_OS: corpus, _PK: []}
+        return plan, records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_plan_level_cluster_count_is_collapsed_too(self):
+        plan, _records, _plans = self._fixture()
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2, (
+            'four buckets, two findings -- the plan-level count is '
+            'collapsed too, not just the detector return'
+        )
+
+    def test_the_armed_metric_reads_two_not_four(self):
+        _plan, records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'liveness_snapshot_recurrences.{_OS}']
+
+        assert metric.kind == 'count', (
+            "the docstring's ARMED claim, checked here rather than only "
+            'asserted in prose'
+        )
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0, (
+            'one subject keyed twice over the SAME two members must read '
+            'as ONE group, not two'
+        )
+        assert metric.n == 2, 'n is the exposure: the category corpus size'
+
+    def test_details_table_has_no_duplicate_row(self):
+        _plan, records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert len(table) == 2, 'no duplicate row for the human reader'
+        assert len({(row['subject_task_id'], tuple(row['member_ids']))
+                    for row in table}) == 2, (
+            'two distinct (subject, member_ids) pairs -- the other half of '
+            'the harm a structural doubling would cause'
+        )
 
 
 def _liveness_raw_corpus() -> dict[str, list[dict]]:
@@ -6543,14 +6772,6 @@ class TestApplyStoreMutationPreflight:
     what makes that warning enforceable rather than advisory.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     def _raw(self) -> dict:
         """A real two-member cluster, so ``--apply`` has work to refuse."""
         return {_PK: [
@@ -6569,7 +6790,7 @@ class TestApplyStoreMutationPreflight:
         ``finally: await memory.close()`` teardown of a service that was never
         initialized.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -6577,7 +6798,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6591,7 +6812,7 @@ class TestApplyStoreMutationPreflight:
         """It aborts without a single Qdrant read: neither ``fetch_memories``'
         per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
         per-record query fan-out is paid for."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         called: list[str] = []
         monkeypatch.setattr(
@@ -6617,7 +6838,7 @@ class TestApplyStoreMutationPreflight:
     ):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the audit report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--threshold', '0.75',
@@ -6686,7 +6907,7 @@ class TestApplyStoreMutationPreflight:
         ``main`` is a separate claim, tested in
         ``TestApplyStoreMutationPreflightThroughMain``.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply',
@@ -6708,40 +6929,6 @@ class TestApplyStoreMutationPreflightThroughMain:
     same way.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` is three lines with no handler -- the refusal exits the
-        interpreter as an uncaught traceback -- so this ERROR record is the
-        ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'audit_duplicate_memories'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
         self, monkeypatch, tmp_path, caplog,
     ):
@@ -6761,7 +6948,7 @@ class TestApplyStoreMutationPreflightThroughMain:
         import asyncio  # noqa: PLC0415
         import sys  # noqa: PLC0415
 
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         monkeypatch.setattr(sys, 'argv', [
             'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
@@ -6773,11 +6960,11 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'audit_duplicate_memories'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

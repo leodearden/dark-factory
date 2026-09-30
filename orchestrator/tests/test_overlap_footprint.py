@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-import orchestrator.overlap_footprint as _ov_mod
 from orchestrator.overlap_footprint import (
+    _DETECTORS,
     DEFAULT_OVERLAP_DETECTOR,
     DefaultPathOverlapDetector,
     Footprint,
@@ -117,11 +117,17 @@ class _StubDetector:
 
 @pytest.fixture()
 def clean_registry() -> object:
-    """Snapshot and restore _DETECTORS so tests don't leak global state."""
-    snapshot = dict(_ov_mod._DETECTORS)
+    """Snapshot and restore _DETECTORS so tests don't leak global state.
+
+    _DETECTORS is imported by bare name (not reached through the module
+    object) so this fixture carries no attribute-path coupling to
+    overlap_footprint's internals -- the idiom test_merge_lane_package.py
+    uses for ``from orchestrator.git_ops import _run``.
+    """
+    snapshot = dict(_DETECTORS)
     yield
-    _ov_mod._DETECTORS.clear()
-    _ov_mod._DETECTORS.update(snapshot)
+    _DETECTORS.clear()
+    _DETECTORS.update(snapshot)
 
 
 class TestRegistry:

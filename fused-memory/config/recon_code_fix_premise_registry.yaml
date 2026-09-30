@@ -62,6 +62,45 @@
         - "def get_all_valid_edges"
         - "e.invalid_at IS NULL"
 
+- name: valid_edge_query_expired_at_filter_refuted
+  reason: >
+    (cite task 3673's 2026-08-29 retraction block and this task 4984.) A recurring
+    claim asks the valid-edge queries to also filter `AND e.expired_at IS NULL`.
+    REFUTED: `invalid_at` is the field the restore hooks CLEAR
+    (MemoryService._restore_superseded_dependency_edges and
+    _restore_falsely_superseded_sibling_edges both call clear_invalid_at=True), so an
+    expired_at condition would re-hide exactly the edges those hooks restore. Anchored
+    on the expired_at token plus the two specific query surfaces, so a legitimate
+    proposal about those functions that does NOT propose the filter still reaches the
+    architect. Self-corrects the moment the filter genuinely lands (see the
+    must_not_contain assertion below). The SINGLE title anchor is deliberate:
+    match_candidate ANDs title_substrings, so more tokens could only narrow it, and
+    `expired_at` is codebase-rare. ALL the discrimination therefore sits in the two
+    ORed description anchors, and they are deliberately the two QUERY SURFACES this
+    premise was refuted against — nothing else. A generic anchor such as
+    "expired_at IS NULL" or "expired_at filter" would have matched a proposal to add
+    that condition to ANY query anywhere, silently dropping a candidate this
+    architect never examined; that is precisely the false positive the header's
+    operator guidance warns about, and the entry's own claim to be anchored on "the
+    two specific query surfaces" would have been false.
+  title_substrings:
+    - "expired_at"
+  description_substrings:
+    - "get_valid_edges_for_node"
+    - "_ALL_VALID_EDGES_MATCH"
+  source_assertions:
+    - file: src/fused_memory/backends/graphiti_client.py
+      must_contain:
+        - "_ALL_VALID_EDGES_MATCH"
+        - "def get_valid_edges_for_node"
+        - "WHERE e.invalid_at IS NULL"
+      must_not_contain:
+        - "e.expired_at IS NULL"
+    - file: src/fused_memory/services/memory_service.py
+      must_contain:
+        - "_restore_falsely_superseded_sibling_edges"
+        - "clear_invalid_at=True"
+
 - name: stage2_flag_query_stage1_flag_marker_forbidden_regression
   reason: >
     esc-1947-17 asked Stage2's flag-query to also consume stage1_flag_marker,

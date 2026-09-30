@@ -94,7 +94,8 @@ def test_gunzip_one_mirrors_the_gz_mtime_onto_the_plain_file(tmp_path):
 
 def test_gunzip_one_unlinks_the_source_after_corroborating(tmp_path):
     """(c) The source `.gz` is gone once the plain twin is written, read back
-    and stamped — the destroy half of corroborate-before-destroy."""
+    and stamped — the destroy half of the module's corroborate-before-acting
+    ordering contract."""
     gz = _write_gz(tmp_path / "3618" / "enc" / "sess-c.jsonl.gz", _payload())
 
     mig.gunzip_one(gz)
@@ -807,7 +808,7 @@ def test_cli_failures_outrank_conflicts_in_the_exit_code(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# step-20: the DESTINATION side of corroborate-before-destroy
+# step-20: the DESTINATION side of corroborate-before-acting
 #
 # step-1 pins that an unreadable SOURCE is never destroyed. This pins the other
 # half: an unreadable source must not destroy the DESTINATION either. Writing

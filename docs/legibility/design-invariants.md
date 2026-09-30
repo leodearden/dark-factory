@@ -8,7 +8,18 @@ from the task/escalation strand investigation
 (`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
 the reconciliation loop-blocking incident (task 3778); INV-9 was added
 2026-08-24 from the answered-but-unrecorded escalation investigation
-(esc-6107-7, plus five further instances measured 2026-08-22→24). They gate `/prd`
+(esc-6107-7, plus five further instances measured 2026-08-22→24);
+INV-10 was added 2026-08-30 from the doc-guard reconciliation
+(task 4666); INV-11 was added by promoting `no-silent-fail-soft`,
+which this codebase had minted independently across 55 tracked files
+(measured on base eba215060c — a pinned measurement, not a live count:
+it grows as citations accrue) and cited as if canonical while no
+heading defined it (task 3803; rehearsal walked 2026-08-20); INV-12
+was added 2026-09-18 from the exception-register PRD's own incident
+evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`); INV-13 was
+added 2026-09-25 from the two-empty-ledgers investigation — four
+never-written ledgers, each with a live reader rendering emptiness as
+healthy (tasks 3790, 4863, 4718, 5890). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -208,6 +219,23 @@ loop enforcing it *was* the blocked thread. 726 of the sampled
 subprocesses were a byte-identical, render-invariant
 `git worktree list --porcelain`. (task 3778)
 
+That fix was correct; the CENSUS accompanying it was not, and it took three
+further batches to notice. Two methodology defects, both since confirmed
+against the live tree. (1) It enumerated the sites where the blocking
+PRIMITIVE is written and then made a per-MODULE offload claim —
+`services/recon_claim_verification_guard.py` was recorded as "already
+offloaded at its call sites", which was true of the callers it looked at and
+false of the others, so one offloaded caller made the whole module read as
+clean and every other caller was invisible. The census question is "which
+CALLERS reach this primitive without a hop", not "is this module offloaded".
+(2) It enumerated `subprocess.run` only, while the Rule above names
+filesystem and lock too; `read_text` and `yaml.safe_load` misses accounted
+for tasks 4091 and 4201 independently of (1). Tasks 4091 and 4201 each found
+live sites in that blind spot, and task 4484's caller-side re-run found 60 —
+including four same-shape `async def _maybe_*` registry loaders in
+`fused-memory/src/fused_memory/middleware/task_curator.py`, two of which had
+no task filed at all. (tasks 3778, 4091, 4201, 4484)
+
 **House pattern**: `asyncio.to_thread` at the boundary
 (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
 `middleware/task_curator.py::curate_batch_prepared`); the async
@@ -215,6 +243,15 @@ subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
 hoist the loop-invariant probe out of the body and bound the fan-out with
 an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
+Mechanical enforcement now stands behind this slug:
+`shared/tests/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
+(`shared/tests/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
+every coroutine call site reaching a blocking primitive against a
+dispositioned ledger, `shared/tests/loop_blocking_allowlist.py`. A new site
+must be fixed or blessed with a stated reason in the same change, and a landed
+fix must delete its blessing. This is what the Census seam section below asks
+for when a slug is violated across repeated census batches — INV-8 was missed
+across three (3778, 4091, 4201) before the guard was filed as task 4484.
 
 ## INV-9 `one-fact-one-home`
 
@@ -254,6 +291,218 @@ date`; ruling-time amendment (unblock SKILL.md Step 4) bumping
 check + `scripts/member-chain-sweep.py` as the drift detector;
 `reap-decisions` closure-sync.
 
+## INV-10 `guards-exercise-behaviour`
+
+**Rule**: A guard exercises the behaviour it protects; it does not match
+text that describes it. Where the protected claim is an instruction or a
+recipe, the guard RUNS it against a fixture and asserts the outcome.
+Where nothing is runnable, it mirrors a marker-delimited span against the
+live artifact that span must agree with — a config value, a model, a
+family derived from its own source of truth — so that rewording moves
+nothing. A regex or substring over prose is not a guard: it pins wording
+rather than behaviour, goes red on edits that broke nothing, and carries
+an untested matcher whose characteristic failure is a silent green. This
+is INV-1 (`contracts-machine-checked`) applied to the checks themselves.
+
+**Checkable design question(s)**: Does this feature add a test or check
+whose assertion target is TEXT rather than behaviour? If what needs
+protecting is an instruction, a documented command, or a payload example,
+can it be EXECUTED against a fixture instead of matched? If it genuinely
+cannot, which live artifact does it mirror, and what delimits the span?
+If a matcher is unavoidable, what proves the matcher itself correct, and
+what goes red when it silently stops matching? Would fully rewording the
+surrounding sentence, with the mechanism unchanged, turn this check red —
+and if so, why is that the right behaviour?
+
+**Evidence**: eleven prose-pinning test modules or blocks were deleted on
+review between 2026-04-24 and 2026-08-25 — `4ed37e9367`, `d53cd62b68`,
+`3e8d369b24`, `10978d1ddc`, `9427896b8c`, `fabba102c7`, `d733c1bdc7`,
+`9c73deb78d`, `cb6d74359e`, `c3f8fa0b35`, `ba7fcffdbc` — the largest a
+769-line marker-anchored module whose revert message records that it
+"exercised no runtime behaviour". The predicted matcher bug is not
+hypothetical: task 4095's own guard scopes SHA derivations with a
+character class excluding the hyphen, so `skills/orchestrate/SKILL.md`'s
+`task/<task-id>` placeholder makes it report that runbook's CORRECT
+instructions as violations. The same failure reaches non-test checks —
+capability `qdrant-vector-access-for-ann` (task 3210) was gated by a
+file-scoped `grep` that would have reported DELIVERED had the parameter
+landed on the wrong function (`scripts/check_method_param_wiring.py`),
+and `docs/task-authoring.md`'s `delivered_checks` guidance states the
+same rule for that mechanism.
+
+**House pattern**: a three-tier ladder, in preference order. (1) EXECUTE
+the documented thing — `tests/scripts/test_package_source_lookup_convention.py`
+(task 3959) runs the recipe CLAUDE.md hands agents and asserts it resolves
+a real package. (2) MIRROR a marker-delimited span against the live
+artifact — `tests/scripts/test_contributing_lint_command_drift.py` (task
+3558) against `dark-factory-orchestrator.yaml`'s `lint_command`, and
+`scripts/tests/test_design_invariants_consistency.py` (task 3802) against
+this doc's own headings. (3) Nothing else: a substring/regex over prose is
+a finding, not a guard, and "harden the regex" is not a remedy. The
+reviewer's standing discriminator
+(`orchestrator/src/orchestrator/agents/roles.py::REVIEWER_COMPREHENSIVE`)
+is the same test stated from the other side — if fully rewording the
+surrounding sentence while keeping the mechanism leaves the check green,
+it is referential integrity rather than a wording pin.
+
+## INV-11 `no-silent-fail-soft`
+
+**Rule**: A failure or degradation is never indistinguishable from a clean
+success at the point of consumption. Every failure, fallback, coercion or
+partial-enumeration path either REFUSES (raises, errors, exits nonzero) or
+carries the degradation in the RESULT a caller sees — a named delta, a
+false completeness flag, an UNKNOWN/SKIP sentinel — never in a log line
+alone. A log is not a return value: the caller that must act on the
+shortfall is not the reader who would find it there.
+
+**Checkable design question(s)**: For each failure, fallback, coercion or
+partial-enumeration path this feature adds — what value does the caller
+receive, and can that value be told apart from the success value? If the
+answer is "the log says so", the path is silent. If it is "the caller gets
+fewer items", what tells the caller that fewer is not all?
+
+**Evidence**: Already machine-enforced per occurrence, with no slug to
+name it: `shared/tests/test_silent_fallthrough_gate.py` lints all
+first-party source for `except (Exception|BaseException|bare):` returning
+an empty/None value with no WARN+ log and no re-raise, against the
+burn-down allowlist `shared/tests/silent_fallthrough_allowlist.py`
+(scanner `shared/tests/silent_fallthrough_scan.py`, PRD
+`plans/silent-fallthrough-dedup-prd.md`). The concept was ALSO minted
+independently as a bare phrase across 55 tracked files (measured on base
+eba215060c; the figure grows as citations accrue); where those citations
+reached for a number they split five to INV-2 and one to INV-4, and the
+INV-4 one needed both invariants in a single sentence because neither fit
+alone (task 3803).
+
+**House pattern**: refuse at the boundary
+(`fused-memory/src/fused_memory/backends/mem0_client.py`'s truncated-scroll
+raise rather than a short return; `escalation/src/escalation/classify.py`
+raising on an unmodelled status rather than folding it into `excluded`);
+carry the shortfall in the result
+(`fused-memory/scripts/census_memory_metadata.py`'s `coverage.complete =
+false` plus a NAMED entry in `coverage.deltas`, with a nonzero caller
+exit); SKIP is not ALLOW.
+
+**Family boundary**: INV-2, INV-11 and INV-4 are adjacent, and a walker has
+to pick exactly one. INV-2 `structured-facts-at-failure` constrains the
+SHAPE of a signal that already exists — structured facts at the failure
+point, not a log-scrape of what the emitter had in a variable. INV-11
+constrains its EXISTENCE, per occurrence: can the caller tell the returned
+value apart from the success value? INV-4 `storm-escape-required`
+constrains the AGGREGATE audibility of a fail-soft path deliberately
+RETAINED, and presupposes that path is legitimate. One occurrence is
+already an INV-11 defect, where INV-4 only asks about the hundredth.
+
+## INV-12 `exceptions-owned-or-ratified`
+
+**Rule**: For an allow-list that tracks exceptions to a rule intended to be
+uniform, every entry is either `Debt(owner)` — owner a live task or ticket:
+not `done`, `cancelled` or `deferred` — or `Policy(ratified)`, the id of a
+row in the ratification table
+(`docs/legibility/exception-ratifications.yaml`), for an exemption that is a
+deliberate permanent ruling rather than debt. No entry may be neither.
+Inline suppressions are in scope, under their own register and ratchet.
+Entries predating the register's seeding may carry no disposition, but their
+count may only fall, never rise; every entry added or touched after it
+carries one. The ratification table lands with the mechanism (House pattern,
+step γ2) and is not in the tree yet, so `Debt(owner)` is today's only
+available disposition.
+
+**Checkable design question(s)**: Does this feature add or touch an
+allow-list, registry, or inline suppression whose entries silence a
+detector — a lint, a guard test, a census warning, an alarm, a sweep, a
+failure classifier, a finding pipeline? Suppressors are in scope; a list
+whose entries grant a capability (who may promote, what auto-heals, which
+fields hot-reload) is design, reviewed as design, and out of scope here. If
+it is a suppressor: where does each entry's disposition live — a cited live
+task, a cited ticket, or a ratification-table row id — and what notices
+when its owner dies?
+
+**Evidence**: `verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES` (since retired, in
+b5bf73106e; the incident predates the retirement) carried an entry that
+outlived the task that owned it (2733, done 2026-07-18) with no owner
+recorded on the entry itself, and the same test recurred at task 4545's gate
+on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
+only a **liveness** check would have. Two registers still in the tree make
+that point checkable today:
+`orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
+(owner task 5149) and
+`orchestrator/tests/test_serial_merge_worker_import_guard.py::ALLOWLIST`
+(owner task 5034) each assert every entry still names a live REFERENT — a
+real in-band site, a file that really imports the fixture — while neither
+records an owner on an entry at all: a dead referent fails, a dead owner
+does not. A census of the repo's named allow-lists found the same gap under
+tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
+the entries it retires, so nothing notices when one of those tasks completes
+and entries remain.
+
+**House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
+disposition vocabulary, the ratification table, the inline-marker grammar,
+the multiset ratchet kernel, the exception register and the owner-liveness
+sweep. Re-point this at the landed paths once the mechanism lands.
+
+**Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
+adjacent — both ask who owns a thing and what notices when the owner is
+gone — but govern different objects. INV-7 governs held RUNTIME STATES: a
+parked status, an open escalation, a wait loop, legal only while a live
+claimant exists. INV-12 governs TREE-RESIDENT EXCEPTION LISTS: an allow-list
+entry or an inline suppression, legal only while its cited task or ticket is
+live, or it is explicitly ratified. A walker facing a park/wait/hold state
+checks INV-7; a walker facing an exception list or inline suppression checks
+INV-12.
+
+## INV-13 `readers-prove-their-producer`
+
+**Rule**: A reader over a store — a report, a gate, a health counter, a
+judge-prompt section, a dashboard view — lands only with evidence that its
+producer has written to that store in production: a row observed in the live
+store under the producer's real trigger, not a row a test seeded. If the
+producer lands in a later slice, the reader must render "no producer has
+written here" as a state distinct from "nothing happened", never as healthy.
+A cutover that moves a read source states its backfill decision per record
+kind: self-repopulating, migrated, or abandoned.
+
+**Checkable design question(s)**: Does this feature add or move a reader
+over a ledger, table or store? Name the producer and the trigger that fires
+it. Has that trigger fired in production, and did a row appear — measured,
+not assumed? If the producer is a different slice, what does the reader
+print until it lands, and can an operator tell "no producer wired" from "no
+events"? If a read source is cut over, does each record kind carry its own
+backfill decision, or is one kind's reasoning ("markers self-repopulate")
+silently applied to a kind it does not describe?
+
+**Evidence**: measured 2026-09-23 across every zero-row table under `data/`:
+six were healthy transient queues and four were never-written ledgers whose
+readers reported healthy. `recon_ledger` held zero `stage1_flag_suppression`
+rows fleet-wide since the task-2227 read-side cutover, whose no-backfill
+reasoning named only markers; `filter_suppressed` passed everything through
+while 41 stage-authored Mem0 records sat inert (task 4863). `runs.db::flake_debt`
+had zero rows while five tests had been suppressed; `orchestrator flake-ledger`
+printed `OPEN DEBT (no open debt)` and `unowned=0 status ok`, because "unowned"
+was derived from debt rows and a suppression without a row was invisible
+(task 3790). `reconciliation.db::journal_entries` was built by an agent loop
+whose sole caller discards the list, and the judge summarised the empty
+result into every review prompt (task 5890).
+`curator_events.db::invocations` had no `sqlite_sequence` row at all — never
+one insert — while a three-day curator outage went untraced (task 4718). In
+every case each call succeeded and the emptiness was honest; the healthy
+rendering was the defect.
+
+**House pattern**: `orchestrator/src/orchestrator/flake_report.py::compute_non_convergence`
+renders an open row without an owner as `*** NO OWNER (invariant breach) ***`
+rather than folding it into the healthy count; `orchestrator/src/orchestrator/flake_ledger.py::UNKNOWN_TEST_ID`
+counts an observation that names no test instead of dropping it. For the
+producer-has-written check, an AUTOINCREMENT table's `sqlite_sequence` row is
+the cheap probe: absent means never inserted, not merely empty now.
+
+**Family boundary**: INV-11 `no-silent-fail-soft` governs a failure a caller
+cannot tell from success at one call; INV-13 governs a reader whose producer
+never ran — no call fails anywhere. INV-10 `guards-exercise-behaviour`
+governs a guard that asserts prose instead of behaviour; INV-13's rejected
+proof is the fixture-seeded row, a guard-shaped mistake made by a reader. A
+walker facing a swallowed exception checks INV-11; facing a test of a check,
+INV-10; facing a report, gate or counter over a store, INV-13.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -269,4 +518,8 @@ Calibration fixtures — two seeded violations per invariant plus a rehearsal
 verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
 INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
-INV-9 fixtures added 2026-08-24).
+INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
+INV-11 fixtures added with the `no-silent-fail-soft` promotion; INV-12
+fixtures added 2026-09-18 with the `exceptions-owned-or-ratified`
+invariant; INV-13 fixtures added 2026-09-25 with the
+`readers-prove-their-producer` invariant).

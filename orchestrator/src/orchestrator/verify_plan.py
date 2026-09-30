@@ -23,6 +23,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     describe_dropped_clauses,
     has_unpreserved_chain_clauses,
+    keyword_truncation_end,
     parse_config_command,
     promote_cwd_to_project,
     render,
@@ -427,7 +428,12 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    retained = head[: idx + len(keyword)]
+    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
+    # verify._scope_to_keyword's identical line — the shared
+    # `keyword_truncation_end` helper is what makes that lockstep structural
+    # rather than a convention. The old byte-offset slice cut mid-token at the
+    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
@@ -468,6 +474,15 @@ def deselecting_expression_for_command(
     of "which commands are refused" and "where the ini file is looked for" is
     load-bearing: were the two arms to answer differently, the arm with the
     weaker guards would over-fire on a config its command never applies.
+
+    That sharing is also how both arms acquired CLASS-level marker detection
+    (task 4561) without either one being edited: the probe's module-wide tier
+    is ``orchestrator/pytest_markers.py::guaranteed_marker_names``, which now
+    proves a class-level ``pytestmark`` or class decorator too — but only where
+    its all-items-accounted-for guard can show every collected item lives
+    inside a marked class. Widening that ONE tier gave both arms the capability
+    in one place; adding a second call site to "wire up" the other arm would
+    have created exactly the divergence this shared probe exists to prevent.
 
     *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
     while the command's own targets may be cwd-relative — only the CONFIG path
@@ -898,8 +913,12 @@ def effective_merge_module_configs(
     The local runner, the wire spec (and hence the remote's reconstruction of
     it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
     suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
-    than by an assertion that two sites independently agree. Before this
-    helper the expansion was reimplemented inline at two sites inside
+    than by an assertion that two sites independently agree. The parenthetical
+    REMOTE leg was only made true by task 4536, which installs the spec's set
+    as that reconstructed config's registry — see
+    ``verify_runner.run_merge_verify_on_worktree``; until then it was
+    aspirational. Before this helper the expansion was
+    reimplemented inline at two sites inside
     ``run_scoped_verification``, each rebinding a local that never propagated
     out: the run executed the full registry while the suppression gate still
     mapped failing node-ids against the task's own modules, so a red in an
@@ -913,10 +932,19 @@ def effective_merge_module_configs(
     inside ``run_scoped_verification`` stay in place once the boundary has
     already resolved the set.
 
+    WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
+    answers are the dispatching side's by construction — which is which, and
+    why there is deliberately no third answer, is documented once at
+    ``verify_runner.run_merge_verify_on_worktree`` (task 4536).
+
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the
     broad gate degrades to today's scoped coverage instead of silently
     verifying nothing at the very breadth that exists to verify everything.
+    Post-4536 it also serves direct-instantiated configs in tests/evals, which
+    never run discovery and whose registry is therefore empty; a zero-module
+    SPEC installs ``{}`` deliberately (the documented "discovery ran and found
+    no subprojects" value), routing that case to the INV-1 global gate.
 
     Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
     from ``config`` here, so there stays exactly one breadth predicate in the

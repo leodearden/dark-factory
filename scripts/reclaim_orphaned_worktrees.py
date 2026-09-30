@@ -85,6 +85,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -220,6 +221,96 @@ def select_reclaimable(
     return ReclaimDecision(keep=keep, reclaim=reclaim)
 
 
+# The git env vars that retarget git away from the path it is given (incident
+# 2026-08-31). Deliberately NARROW: only names that change WHICH repository (or
+# which config) a command acts on.
+#
+# WHY THIS MODULE IS EXPOSED. Every git call here targets via ``cwd=`` (and
+# ``-C`` would be no better): both only change DIRECTORY, while ``GIT_DIR`` and
+# its siblings SKIP repository discovery outright. So a single ambient
+# ``GIT_DIR`` silently redirects EVERY call in this module — ``worktree list``,
+# ``add -A``, ``commit --no-verify``, ``worktree remove --force``,
+# ``worktree prune`` — into whatever repository it names, with ``--repo`` /
+# ``--parking-root`` / ``cwd`` inert. Measured on the pre-guard script: under
+# ``GIT_DIR=<decoy>/.git`` with ``--repo <sandbox>``, ``git worktree list``
+# enumerated the DECOY's worktrees, the parking-root band guard passed them, and
+# ``worktree remove --force`` DESTROYED a decoy-owned worktree — while the
+# sandbox named by ``--repo`` was never swept at all.
+#
+# ``GIT_CEILING_DIRECTORIES`` cannot catch this and is deliberately PRESERVED: a
+# ceiling bounds the upward WALK of repository discovery, and an explicit
+# ``GIT_DIR`` never walks, so the ceiling is bypassed rather than weakened —
+# and it is the mechanism of a DIFFERENT defence
+# (``df_pytest_isolation._df_git_ceiling_at_basetemp``, incident esc-3072-3),
+# which scrubbing it here would disarm whenever this script runs under the
+# suite. The identity vars (``GIT_AUTHOR_*`` / ``GIT_COMMITTER_*``) are
+# preserved for the same narrowness: they change what a park-commit SAYS, never
+# where it lands.
+#
+# DUPLICATED, NOT IMPORTED, from ``df_pytest_isolation._GIT_REDIRECT_ENV``:
+# this module is STDLIB-ONLY by design (see the module docstring — the systemd
+# wrapper runs plain ``python3`` with no ``uv``/service env) and that module
+# imports pytest, so importing it would break the nightly unit outright.
+# ``scripts/memory-metadata-coverage-census.sh`` carries a third copy for the
+# same reason. The duplication is pinned against drift by
+# ``test_scrubbed_git_env_matches_shared_redirect_classifier``.
+_GIT_REDIRECT_ENV = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+)
+
+# ``git -c`` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0,
+# ...), so they cannot be enumerated by name.
+_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+
+
+def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """A copy of *environ* with the git-REDIRECTING names removed, ``LC_ALL=C``.
+
+    Pure: *environ* (in production ``os.environ``) is never mutated. Drops every
+    name in :data:`_GIT_REDIRECT_ENV` and every name carrying a
+    :data:`_GIT_REDIRECT_ENV_PREFIXES` prefix; keeps everything else verbatim
+    (the unit's ``PATH``/``HOME``, the ceiling, the identity vars) and forces
+    ``LC_ALL=C`` so porcelain output stays locale-stable.
+
+    A targeted removal, NOT a hermetic env rebuild — see the block comment above
+    for which names retarget git and why the two preserved families do not.
+
+    KNOWN GAP, deliberately not closed here: ``GIT_CONFIG_PARAMETERS`` survives
+    this scrub. It is the same injection mechanism as the indexed
+    ``GIT_CONFIG_KEY_n``/``VALUE_n`` family — it is what git itself uses to
+    propagate ``-c`` to subprocesses — and it is read at startup with
+    command-line config precedence. MEASURED on git 2.43.0:
+    ``GIT_CONFIG_PARAMETERS="'core.hooksPath=/decoy/hooks'" git config
+    core.hooksPath`` prints ``/decoy/hooks``, and the name is confirmed present
+    in this function's output. So an ambient value reaches every git call in
+    this module, including the ``commit --no-verify`` in :func:`park_commit`.
+    It is NOT closed in this change because the name list is pinned to
+    ``df_pytest_isolation._GIT_REDIRECT_ENV`` by
+    ``test_scrubbed_git_env_matches_shared_redirect_classifier`` in BOTH
+    directions, so adding it here alone fails that pin — it is a SHARED gap
+    needing one coordinated change across both copies, filed as a follow-up.
+    Note this is config injection, not repository redirection: the
+    ``GIT_DIR``-class leak this guard exists for IS closed.
+    """
+    scrubbed = {
+        key: value
+        for key, value in environ.items()
+        if key not in _GIT_REDIRECT_ENV
+        and not key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+    }
+    scrubbed['LC_ALL'] = 'C'
+    return scrubbed
+
+
 def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run ``git <args>`` in *cwd*, returning ``(returncode, stdout, stderr)``.
 
@@ -236,8 +327,17 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     ``git worktree prune`` in :func:`main` — so the never-raise / always-exit-0
     posture holds even under routine git contention, without each caller needing
     its own ``try/except``.
+
+    It is also where AMBIENT GIT REDIRECTION is removed
+    (:func:`scrubbed_git_env`). Every call in this module targets its
+    repository via ``cwd=``, and ``cwd=``/``-C`` only change DIRECTORY — an
+    ambient ``GIT_DIR`` skips repository discovery entirely and redirects the
+    call into whatever repository it names. The scrub belongs HERE, at the one
+    chokepoint no call site can bypass, rather than at each of the seven call
+    sites: the defect class is "a call site that forgets the guard", so fixing
+    today's seven would leave the hole open for the eighth.
     """
-    env = dict(os.environ, LC_ALL='C')
+    env = scrubbed_git_env(os.environ)
     try:
         proc = subprocess.run(
             ['git', *args],
@@ -250,6 +350,40 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     except (OSError, subprocess.TimeoutExpired) as err:
         return 1, '', str(err)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def is_git_toplevel(path: Path) -> bool:
+    """Whether git resolves *path* itself as the root of the repository it acts on.
+
+    ``git rev-parse --show-toplevel`` under *path*, realpath-compared to *path*
+    on BOTH sides (so a legitimately SYMLINKED checkout passes, while a
+    SUBDIRECTORY — whose toplevel is the enclosing repo — does not). Any
+    non-zero rc, empty output, or ``OSError`` from either ``.resolve()`` is
+    ``False``: fail CLOSED, since "cannot prove the target" and "proved the
+    wrong target" carry the same risk of acting on a repository the caller
+    never named. Inherits never-raise from :func:`_run_git`.
+
+    QUIET by design — it never logs. Each call site owns the single LOUD
+    refusal line so the message can name the action refused.
+
+    THIS IS NOT THE ``GIT_DIR`` DEFENCE — :func:`scrubbed_git_env` is. MEASURED
+    against real git: with ``cwd=<sandbox>`` and ``GIT_DIR=<decoy>/.git``,
+    ``--show-toplevel`` returns ``<sandbox>`` (rc 0) — git treats cwd as the
+    work tree when ``GIT_DIR`` is set and ``GIT_WORK_TREE`` is not — while
+    ``--git-common-dir`` returns ``<decoy>/.git``. So this check PASSES under
+    the exact leak it appears to guard against. It is the residual backstop for
+    the causes the scrub cannot remove: a redirecting git env var added by a
+    future git release, a nested or symlinked checkout, a ``--repo`` pointing at
+    a subdirectory. The same true-but-easily-misread property as fbfeacdd00's
+    census guard. DO NOT delete the scrub believing this subsumes it.
+    """
+    rc, out, _err = _run_git(['rev-parse', '--show-toplevel'], cwd=path)
+    if rc != 0 or not out.strip():
+        return False
+    try:
+        return Path(out.strip()).resolve() == Path(path).resolve()
+    except OSError:
+        return False
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -370,8 +504,32 @@ def park_commit(worktree: Path, reason: str) -> str | None:
     ``add -A`` together make "dirty -> park-commit -> zero content lost" a
     provable property: the content is now on the branch ref, reachable
     independently of the worktree.
+
+    SELF-GUARDED: the snapshot is only ever taken against a worktree git
+    confirms as its OWN toplevel (:func:`is_git_toplevel`), refusing with
+    ``None`` otherwise. ``git add -A`` stages from the WORKTREE ROOT regardless
+    of cwd, so an unverified target does not merely mis-scope the snapshot — it
+    commits the whole tree of whatever repository git resolved. And the very
+    flag that makes the snapshot un-strandable, ``--no-verify``, is the flag
+    that would bypass the pre-commit hooks if such a commit ever landed in the
+    wrong repository. Guarding HERE rather than trusting the caller means a
+    future caller reaching this function directly inherits the guard;
+    ``None`` is deliberate reuse of the existing failure channel, since
+    :func:`reclaim_worktrees` already treats a ``None`` park-commit as
+    "SKIP, never removed (data-loss guard)", so a refusal cannot cascade into a
+    removal.
     """
     if not is_worktree_dirty(worktree):
+        return None
+
+    if not is_git_toplevel(worktree):
+        logger.warning(
+            '%s REFUSING to park-commit %s — it is not the root of the worktree '
+            'git resolves for it; NOT staging or committing (`git add -A` would '
+            'snapshot the whole resolved tree)',
+            _LOG_PREFIX,
+            worktree,
+        )
         return None
 
     rc, _out, err = _run_git(['add', '-A'], cwd=worktree)
@@ -452,14 +610,22 @@ class ReclaimOutcome:
     branch before removal (a subset relationship with ``reclaimed`` in the happy
     path); ``skipped`` — parkings NOT removed by the data-loss guard
     (detached / unresolvable branch, or an un-park-committable dirty tree);
-    ``failed`` — parkings whose removal (or processing) errored. Pure value
-    object.
+    ``failed`` — parkings whose removal (or processing) errored; ``refused`` —
+    the whole sweep declined because ``repo`` could not be verified as the root
+    of the repository git resolves for it (every record then lands in
+    ``skipped``). Pure value object.
+
+    ``refused`` is DEFAULTED so every existing construction stays valid; it is
+    surfaced as ``refused_target`` in the JSON report because ``skipped`` alone
+    cannot distinguish "detached branch" from "refused target", and the
+    always-0 exit code carries no signal at all (INV-4 loud-over-silent).
     """
 
     reclaimed: list[Path] = field(default_factory=list)
     park_committed: list[Path] = field(default_factory=list)
     skipped: list[Path] = field(default_factory=list)
     failed: list[Path] = field(default_factory=list)
+    refused: bool = False
 
 
 def reclaim_worktrees(
@@ -469,6 +635,12 @@ def reclaim_worktrees(
     dry_run: bool,
 ) -> ReclaimOutcome:
     """Reclaim each parking, in the fixed data-loss-guard order (best-effort).
+
+    Guard (0), before ANY per-record work: *repo* must be the root of the
+    repository git resolves for it (:func:`is_git_toplevel`). If it is not, the
+    WHOLE sweep is refused — one LOUD warning, ``refused=True``, every record
+    into ``skipped``, nothing removed or committed. The gate runs regardless of
+    ``dry_run`` so ``--check`` reports the same answer the real run would give.
 
     Per record: (1) require a RESOLVABLE branch (``branch is None`` — detached —
     or ``rev-parse`` fails => SKIP + LOUD, never removed); (2) in ``dry_run``,
@@ -485,6 +657,23 @@ def reclaim_worktrees(
     everything passed here is treated as eligible.
     """
     outcome = ReclaimOutcome()
+
+    # (0) Target verify — fail CLOSED before any destructive verb is reachable.
+    # A refused sweep is a MISSED nightly the next run retries; sweeping a
+    # repository the caller never named is unrecoverable.
+    if not is_git_toplevel(repo):
+        logger.warning(
+            '%s REFUSING the whole sweep — repo %s is not the root of the '
+            'repository git resolves for it; skipping all %d parking(s) '
+            '(nothing removed, nothing committed)',
+            _LOG_PREFIX,
+            repo,
+            len(records),
+        )
+        outcome.refused = True
+        outcome.skipped.extend(record.path for record in records)
+        return outcome
+
     for record in records:
         path = record.path
         branch = record.branch
@@ -619,6 +808,21 @@ def build_report(
     carry the best-effort data-loss-guard skips and per-worktree failures — the
     machine-readable signal (INV-4) a cron/watchdog wrapper reads without
     alarming on the always-0 exit code.
+
+    ``refused_target`` is that same channel for the fail-closed target verify:
+    true when ``repo`` could not be verified as the root of the repository git
+    resolves for it, so the sweep AND the final prune were declined and every
+    ELIGIBLE parking landed in ``skipped``. ELIGIBLE, not scanned: the age floor
+    is applied UPSTREAM of the sweep (:func:`select_reclaimable`), so a parking
+    younger than ``--min-age-hours`` is counted in ``kept`` and never reaches
+    ``skipped`` even under a refusal. A watchdog's refusal predicate is
+    therefore ``refused_target`` itself — ``skipped == scanned`` holds only when
+    no young parking is present, which on a real nightly is the uncommon case.
+    It is reported SEPARATELY because
+    ``skipped`` alone cannot distinguish "detached branch" from "refused
+    target", and the always-0 exit code carries no signal at all. A refused
+    sweep is a MISSED nightly the next run retries — never a wedged timer, and
+    never a sweep of a repository the caller did not name.
     """
     return {
         'root': str(root),
@@ -635,6 +839,7 @@ def build_report(
         'skipped_paths': [str(p) for p in outcome.skipped],
         'failed': len(outcome.failed),
         'failed_paths': [str(p) for p in outcome.failed],
+        'refused_target': outcome.refused,
     }
 
 
@@ -646,7 +851,17 @@ def main(argv: list[str] | None = None) -> int:
     process always exits 0 so a nightly timer does not alarm on a routine
     per-worktree hiccup. ``--check`` never removes/commits. A ``git worktree
     prune`` runs after real (non-check) removals to clear any stale admin
-    entries.
+    entries — gated on ``repo`` being the VERIFIED root of the repository git
+    resolves for it, reusing the verdict :func:`reclaim_worktrees` already
+    recorded on ``outcome.refused`` so the report and the prune can never
+    disagree about one decision.
+
+    When that verify fails, nothing is swept, committed or pruned and the report
+    carries ``refused_target: true`` — the machine-readable channel a
+    cron/watchdog wrapper reads, since the always-0 exit code cannot carry it. A
+    refused sweep is a MISSED nightly the next run retries, which is strictly
+    better than a sweep of a repository the caller never named, and (unlike a
+    raising or non-zero run) it cannot wedge the systemd timer.
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
@@ -673,15 +888,44 @@ def main(argv: list[str] | None = None) -> int:
     outcome = reclaim_worktrees(repo, reclaim_records, dry_run=args.check)
 
     if not args.check:
-        rc, _out, err = _run_git(['worktree', 'prune'], cwd=repo)
-        if rc != 0:
+        # Conditioned on BOTH not-a-dry-run and a VERIFIED target: prune is the
+        # third destructive phase, so a `--repo` that git resolves to some other
+        # repository never has its admin entries rewritten.
+        #
+        # The verdict is REUSED from `outcome.refused`, not re-probed here.
+        # `reclaim_worktrees` runs exactly this gate on this same `repo`
+        # unconditionally (dry-run included) and records the answer, so a second
+        # `is_git_toplevel(repo)` call would add nothing but a way for the two to
+        # DISAGREE: `_run_git` never raises, mapping a 120s timeout or a
+        # transient OSError to rc=1, so one probe can fail where the other
+        # succeeded. That would let the report say `refused_target: false` while
+        # the prune was silently skipped — or, worse, `refused_target: true`
+        # while the prune actually ran — which is precisely the report/behaviour
+        # ambiguity the `refused_target` channel exists to remove. One decision,
+        # one source of truth.
+        #
+        # The OTHER two gates remain INDEPENDENT in-function probes
+        # (:func:`reclaim_worktrees`, :func:`park_commit`): both are callable
+        # directly — the tests already call them that way — so each must carry
+        # its own guard rather than trust a caller. The prune is inline here and
+        # has no other caller, so there is no third caller to protect.
+        if outcome.refused:
             logger.warning(
-                '%s `git worktree prune` failed in %s (rc=%s): %s',
+                '%s REFUSING the final `git worktree prune` — repo %s is not '
+                'the root of the repository git resolves for it',
                 _LOG_PREFIX,
                 repo,
-                rc,
-                err.strip(),
             )
+        else:
+            rc, _out, err = _run_git(['worktree', 'prune'], cwd=repo)
+            if rc != 0:
+                logger.warning(
+                    '%s `git worktree prune` failed in %s (rc=%s): %s',
+                    _LOG_PREFIX,
+                    repo,
+                    rc,
+                    err.strip(),
+                )
 
     report = build_report(
         root=parking_root,

@@ -36,6 +36,15 @@ REIFY_ACCOUNT_DEFS = [
 ]
 
 REIFY_ACCOUNT_NAMES = ['max-f', 'max-e', 'max-c', 'max-d']
+
+#: The dark-factory production pool, as config/usage-accounts.yaml lists it.
+#: Taken 6 -> 7 by task 4741 (commit 6a84ac50c4, ruling on gate esc-4741-1).
+#: 2026-09-30: org-disabled max-b/c/h moved to the end of the failover order
+#: (esc-legibility-trickle-dark_factory-9). max-a is absent by design: it is
+#: reserved for INTERACTIVE use only (see test_reserved_accounts_absent).
+PRODUCTION_POOL_ORDER = [
+    'max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h',
+]
 REIFY_ENV_VARS = [
     'CLAUDE_OAUTH_TOKEN_F',
     'CLAUDE_OAUTH_TOKEN_E',
@@ -576,11 +585,20 @@ class TestDarkFactoryProductionPool:
         return UsageCapConfig(accounts_file=str(accounts_file))
 
     def test_production_pool_accounts_in_expected_order(self, production_config):
-        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-b, max-d] in order."""
+        """Real config/usage-accounts.yaml holds exactly PRODUCTION_POOL_ORDER, in order.
+
+        The ORDER is the point, not just the membership: usage-accounts.yaml's own
+        header says "accounts are tried in list order during failover", so a
+        reordering silently changes which account absorbs the first cap. This pin
+        is deliberately hard-coded rather than derived from the file — a guard that
+        reads its expectation from the artifact it guards cannot fail.
+        """
         names = [a.name for a in production_config.accounts]
-        assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-b', 'max-d'], (
+        assert names == PRODUCTION_POOL_ORDER, (
             f"Production pool mismatch. Got: {names!r}. "
-            "Expected [max-g, max-f, max-e, max-c, max-b, max-d]."
+            f"Expected {PRODUCTION_POOL_ORDER!r}. Update this constant in the SAME "
+            "commit that edits config/usage-accounts.yaml — the pin is the review "
+            "prompt for a failover-order change, not an obstacle to it."
         )
 
     def test_reserved_accounts_absent(self, production_config):
