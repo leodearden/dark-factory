@@ -6,6 +6,9 @@ from fused_memory.reconciliation.consolidation_gate import (
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
+from fused_memory.reconciliation.live_workflow_section import (
+    render_live_workflow_authority_rules,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -817,6 +820,8 @@ git worktree, a recent branch commit (within the last 6 hours), or an active \
 orchestrator process holding the project lock. These signals indicate that a live \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
 lifecycle.
+
+{render_live_workflow_authority_rules()}
 
 **For any task listed in `### Live-Workflow Signals`:**
 

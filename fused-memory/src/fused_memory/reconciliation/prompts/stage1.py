@@ -9,6 +9,9 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
+from fused_memory.reconciliation.live_workflow_section import (
+    render_live_workflow_authority_rules,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
@@ -983,6 +986,8 @@ git worktree, a recent branch commit (within the last 6 hours), or an active \
 orchestrator process holding the project lock. These signals indicate that a live \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
 lifecycle.
+
+{render_live_workflow_authority_rules()}
 
 **For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
 blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \

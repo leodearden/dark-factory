@@ -59,6 +59,41 @@ class LandedToken(StrEnum):
     UNKNOWN = 'landed=unknown'
 
 
+LANDED_COLUMN_RULES_HEADING = '### Reading the landed column'
+
+
+def render_live_workflow_authority_rules() -> str:
+    """The reading rules over this section's rendered tokens, for the Stage 1 and 2 prompts.
+
+    Stage 3 never receives the section, so it must not get rules over it. The
+    block uses ``###`` headings only, because each stage's
+    ``## Live-Workflow Authority`` region is sliced at the next ``## `` heading.
+    """
+    return (
+        f'{LANDED_COLUMN_RULES_HEADING}\n'
+        f'Every row of `{LIVE_WORKFLOW_SECTION_HEADER}` ends with a `landed=` field '
+        f"saying whether the task's work is already on main. A row that reads "
+        f'`{NOT_LIVE_TOKEN}` is listed only because its work landed.\n\n'
+        f"`{LandedToken.TRUE}` means the task's work is already on main: either its "
+        f'branch is gone and a fresh `Merge task/<id> into main` marker is on main, or '
+        f'every commit on its branch has a rebased twin on main. The evidence is named '
+        f'in parentheses. Such a task is NOT stranded work, whatever its status says. '
+        f'Never recommend or perform any of these for it: resume it, redispatch it, '
+        f'reset it to pending, or reopen it. The correct disposition is one '
+        f'info-severity, non-actionable finding saying the work landed but the '
+        f"task's status lags, citing the rendered evidence.\n\n"
+        f'`{LandedToken.FALSE}` means there is no positive evidence of landing, and '
+        f'`{LandedToken.UNKNOWN}` means the landing probe failed. Neither is evidence '
+        f'that the work is unmerged; the stranded rules in this section apply '
+        f'unchanged.\n\n'
+        f'For a task whose status is done, `metadata.done_provenance` (read it with '
+        f"`get_task`) is the merge lane's landing record, and it outranks any branch "
+        f'state. Never set a done task back to pending or in-progress on branch-state '
+        f'grounds. A refused reopen is not grounds to escalate; record an info '
+        f'finding instead (the task-3838 reopen storm).'
+    )
+
+
 def _landed_token(verdict: LandingVerdict) -> str:
     if verdict.landed is None:
         return LandedToken.UNKNOWN
