@@ -90,7 +90,7 @@ def _documented_lint_command(markdown_text: str) -> str:
         begin=MIRROR_BEGIN,
         end=MIRROR_END,
         pattern=_MARKED_LINT_COMMAND,
-        what="`- **Lint**: `<command>`` bullet",
+        what="``- **Lint**: `<command>``` bullet",
         source="CONTRIBUTING.md",
         label=(
             "the Lint bullet in CONTRIBUTING.md that mirrors the `ruff check` leg "
