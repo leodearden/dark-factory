@@ -74,11 +74,10 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
-from orchestrator import rebase_recovery
+from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
     StackBaseLedger,
-    StackInspectionError,
     UnstackOutcome,
     UnstackResult,
     base_owners,
@@ -10085,7 +10084,7 @@ class GitOps:
             )
         try:
             return await self._unstack_recorded(ledger, full_branch, base)
-        except (StackInspectionError, WorktreeMissing) as exc:
+        except (branch_stack.StackInspectionError, WorktreeMissing) as exc:
             return UnstackResult(
                 outcome=UnstackOutcome.BLOCKED,
                 branch=full_branch,
